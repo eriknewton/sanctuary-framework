@@ -1,0 +1,5 @@
+# witness: structural_seams
+--- a/castle-wall-daemon/src/lib.rs
++++ b/castle-wall-daemon/src/lib.rs
+@@ -62,0 +63 @@
++pub fn alternate_wire(bytes: &[u8]) -> serde_json::Value { serde_json::from_slice(bytes).unwrap() }

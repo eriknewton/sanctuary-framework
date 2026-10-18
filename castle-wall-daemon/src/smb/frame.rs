@@ -19,7 +19,7 @@ pub fn encode(value: &Value, schema: &str, maximum: usize) -> Result<Vec<u8>, St
     Ok(result)
 }
 /// Read one frame from a stream, refusing a short EOF before any consumer sees the body.
-pub fn read(reader: &mut impl Read, schema: &str, maximum: usize) -> Result<Value, String> {
+fn read_payload(reader: &mut impl Read, schema: &str, maximum: usize) -> Result<Value, String> {
     // Four bytes are the u32 header; FRAME_HEADER must match constants.json.
     let mut header = [0_u8; std::mem::size_of::<u32>()];
     assert_eq!(header.len(), constants::bound("FRAME_HEADER"));
@@ -38,7 +38,7 @@ pub fn read(reader: &mut impl Read, schema: &str, maximum: usize) -> Result<Valu
 /// Decode exactly one complete frame; surplus bytes are not silently discarded.
 pub fn decode(bytes: &[u8], schema: &str, maximum: usize) -> Result<Value, String> {
     let mut cursor = std::io::Cursor::new(bytes);
-    let value = read(&mut cursor, schema, maximum)?;
+    let value = read_payload(&mut cursor, schema, maximum)?;
     if cursor.position() as usize != bytes.len() {
         return Err("SMB trailing frame".into());
     }
@@ -47,12 +47,12 @@ pub fn decode(bytes: &[u8], schema: &str, maximum: usize) -> Result<Value, Strin
 
 /// Consume the connection on any framing or schema refusal, sending no reply.
 #[cfg(unix)]
-pub fn read_checked(
+pub fn read(
     stream: &mut std::os::unix::net::UnixStream,
     schema: &str,
     maximum: usize,
 ) -> Result<Value, String> {
-    let result = read(stream, schema, maximum);
+    let result = read_payload(stream, schema, maximum);
     // A partial or schema-invalid frame cannot leave a reusable authenticated connection.
     if result.is_err() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -68,6 +68,7 @@ mod tests {
         net::Shutdown,
         os::unix::net::UnixStream,
     };
+    const IO_DEADLINE_SECONDS: u64 = 1; // Bound each refusal probe to one second.
     #[test]
     fn frame_refusal_closes_without_reply() {
         let maximum = constants::bound("FRAME_MAX_SMALL");
@@ -81,7 +82,13 @@ mod tests {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             client.write_all(&bytes).unwrap();
             client.shutdown(Shutdown::Write).unwrap();
-            assert!(read_checked(&mut server, "activate.prepare.request", maximum).is_err());
+            server
+                .set_read_timeout(Some(std::time::Duration::from_secs(IO_DEADLINE_SECONDS)))
+                .unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(IO_DEADLINE_SECONDS)))
+                .unwrap();
+            assert!(read(&mut server, "activate.prepare.request", maximum).is_err());
             let mut reply = Vec::new();
             client.read_to_end(&mut reply).unwrap();
             assert!(reply.is_empty());

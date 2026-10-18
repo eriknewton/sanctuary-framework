@@ -1,5 +1,12 @@
 import { bound } from './constants.js';
 
+/** Format one binary64 RFC 8785 sample; document callers use jcs for the SMB numeric domain. */
+export function number(value: number): string {
+  // Must match jcs.rs::number: this primitive also covers RFC samples outside SMB documents.
+  if (!Number.isFinite(value)) throw new Error('SMB non-finite number');
+  return JSON.stringify(value);
+}
+
 /** Encode a JSON value using RFC 8785, with UTF-16 key ordering and ECMAScript numbers. */
 export function jcs(value: unknown, depth = 0): string {
   // Must match jcs.rs and server/test/smb/vectors/jcs.json; lone surrogates cannot be signed.
@@ -17,8 +24,9 @@ export function jcs(value: unknown, depth = 0): string {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (typeof value === 'string') return string(value);
   if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new Error('SMB non-finite number');
-    return JSON.stringify(value);
+    // Must match jcs.rs::encode: signing cannot widen the strict parser's numeric domain.
+    if (Math.abs(value) > Number.MAX_SAFE_INTEGER) throw new Error('SMB numeric domain');
+    return number(value);
   }
   // The same depth budget as the parser bounds recursive work, including cyclic caller objects.
   if (depth > bound('JSON_MAX_DEPTH')) throw new Error('SMB JSON depth');

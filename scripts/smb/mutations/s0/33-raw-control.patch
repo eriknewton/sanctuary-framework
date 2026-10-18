@@ -1,0 +1,6 @@
+# witness: strict_json_vectors_agree
+--- a/castle-wall-daemon/src/smb/strict_json.rs
++++ b/castle-wall-daemon/src/smb/strict_json.rs
+@@ -47 +47 @@
+-                return serde_json::from_str(&self.text[start..self.position])
++                return serde_json::from_str(&self.text[start..self.position].replace('\n', "\\n"))

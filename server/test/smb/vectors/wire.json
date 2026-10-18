@@ -3935,6 +3935,13 @@
       "valid": false,
       "group": "wire",
       "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "unknown.schema",
+      "group": "unknown",
+      "schema": "unknown_schema",
+      "value": {},
+      "valid": false
     }
   ]
 }

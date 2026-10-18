@@ -1,0 +1,6 @@
+# witness: codec_bounds_agree
+--- a/server/src/smb/jcs.ts
++++ b/server/src/smb/jcs.ts
+@@ -32 +32 @@
+-  if (depth > bound('JSON_MAX_DEPTH')) throw new Error('SMB JSON depth');
++  if (depth > bound('JSON_MAX_DEPTH') + 1) throw new Error('SMB JSON depth');

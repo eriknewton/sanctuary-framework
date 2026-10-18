@@ -1,27 +1,43 @@
 # witness: wire_vectors_agree
 --- a/server/src/smb/wire.json
 +++ b/server/src/smb/wire.json
-@@ -128 +128 @@
+@@ -124 +124,3 @@
 -        "C": "decimal",
-+        "C": {"oneOf": ["decimal", "integer"]},
-@@ -174 +174 @@
++        "C": {
++          "type": "integer"
++        },
+@@ -170 +172,3 @@
 -        "C": "decimal",
-+        "C": {"oneOf": ["decimal", "integer"]},
-@@ -376 +376 @@
++        "C": {
++          "type": "integer"
++        },
+@@ -373 +377,3 @@
 -        "C": "decimal"
-+        "C": {"oneOf": ["decimal", "integer"]}
-@@ -454 +454 @@
++        "C": {
++          "type": "integer"
++        }
+@@ -451 +457,3 @@
 -        "C": "decimal",
-+        "C": {"oneOf": ["decimal", "integer"]},
-@@ -560 +560 @@
++        "C": {
++          "type": "integer"
++        },
+@@ -557 +565,3 @@
 -        "C": "decimal"
-+        "C": {"oneOf": ["decimal", "integer"]}
-@@ -580 +580 @@
++        "C": {
++          "type": "integer"
++        }
+@@ -577 +587,3 @@
 -        "C": "decimal",
-+        "C": {"oneOf": ["decimal", "integer"]},
-@@ -625 +625 @@
++        "C": {
++          "type": "integer"
++        },
+@@ -622 +634,3 @@
 -        "C": "decimal",
-+        "C": {"oneOf": ["decimal", "integer"]},
-@@ -645 +645 @@
++        "C": {
++          "type": "integer"
++        },
+@@ -642 +656,3 @@
 -        "C": "decimal",
-+        "C": {"oneOf": ["decimal", "integer"]},
++        "C": {
++          "type": "integer"
++        },

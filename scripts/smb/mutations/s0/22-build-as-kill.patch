@@ -1,0 +1,6 @@
+# witness: mutation_runner_controls
+--- a/scripts/smb/mutation_runner.py
++++ b/scripts/smb/mutation_runner.py
+@@ -71 +71 @@
+-            return 'broken'
++            return 'killed'

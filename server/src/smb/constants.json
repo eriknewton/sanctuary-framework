@@ -3,7 +3,7 @@
   "constants": {
     "KIB": {
       "value": 1024,
-      "source": "chosen policy"
+      "source": "binary kibibyte: 2^10 bytes"
     },
     "FRAME_HEADER": {
       "value": 4,
@@ -15,71 +15,71 @@
     },
     "BASE64_INPUT": {
       "value": 3,
-      "source": "chosen policy"
+      "source": "RFC 4648 section 4: three octets encode as four characters"
     },
     "BASE64_OUTPUT": {
       "value": 4,
-      "source": "chosen policy"
+      "source": "RFC 4648 section 4: three octets encode as four characters"
     },
     "SECONDS_PER_MINUTE": {
       "value": 60,
-      "source": "chosen policy"
+      "source": "time unit conversion"
     },
     "MINUTES_PER_HOUR": {
       "value": 60,
-      "source": "chosen policy"
+      "source": "time unit conversion"
     },
     "HOURS_PER_DAY": {
       "value": 24,
-      "source": "chosen policy"
+      "source": "time unit conversion"
     },
     "UNLOCK_HOURS": {
       "value": 12,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "SESSION_IDLE_MINUTES": {
       "value": 5,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "SESSION_ABSOLUTE_HOURS": {
       "value": 8,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "DEST_DAYS": {
       "value": 90,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "REQ_MIB": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "RESP_MIB": {
       "value": 8,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "TASK_STORE_MIB": {
       "value": 64,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "WORKSPACE_MIB": {
       "value": 64,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "WORKSPACE_INODES": {
       "value": 4096,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "TASK_ERR_MAX": {
       "value": 65536,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "FRAME_MAX_SMALL": {
       "value": 4096,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "PASSPHRASE_MAX": {
       "value": 1024,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "MAX_VAULT_VALUE_BYTES": {
       "value": 4096,
@@ -87,35 +87,35 @@
     },
     "QUERY_ENVELOPE_MAX": {
       "value": 1024,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "GATE_B_ENVELOPE_MAX": {
       "value": 4096,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "WALL_PROBE": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "AGENT_STOP": {
       "value": 10,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "STOP_VERIFY": {
       "value": 15,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "STATUS_POLL": {
       "value": 5,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "VERB_STATUS_MARGIN": {
       "value": 5,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "RELOCK_MUTEX_DEADLINE": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "QUERY_REPLY_MAX": {
       "value": 2000,
@@ -123,23 +123,23 @@
     },
     "EXIT_RELOCK_STALLED": {
       "value": 70,
-      "source": "chosen policy"
+      "source": "brief section 5: EX_SOFTWARE from sysexits.h"
     },
     "EXIT_REFUSED": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief appendix A2: EXIT_REFUSED"
     },
     "EXIT_USAGE": {
       "value": 64,
-      "source": "chosen policy"
+      "source": "brief appendix A2: EXIT_USAGE"
     },
     "DEST_SKEW": {
       "value": 300,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "B_START_RETRY": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "TMPFS_MAGIC": {
       "value": 16914836,
@@ -147,115 +147,121 @@
     },
     "P_GATE": {
       "value": 850,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "P_WEB": {
       "value": 3501,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "WALL_PROBE_PORT": {
       "value": 852,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "PORT_FLOOR": {
       "value": 1024,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "ID_BITS": {
       "value": 128,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "ID_BYTES": {
-      "value": 16,
-      "source": "chosen policy"
+      "expression": {
+        "op": "div",
+        "args": [
+          "ID_BITS",
+          "BITS_PER_BYTE"
+        ]
+      },
+      "source": "brief section 4 item 2: bits divided by bits per byte"
     },
     "HEX_PER_BYTE": {
       "value": 2,
-      "source": "chosen policy"
+      "source": "two four-bit hexadecimal digits encode one eight-bit byte"
     },
     "ENROLLMENT_CODE_CHARS": {
       "value": 26,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "ENROLLMENT_TTL": {
       "value": 60,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "ENROLLMENT_ATTEMPTS": {
       "value": 5,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "SIGNIN_NONCE_TTL": {
       "value": 60,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "SIGNIN_NONCE_CAP": {
       "value": 16,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "DECISION_NONCE_TTL": {
       "value": 60,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "MUTATION_NONCE_TTL": {
       "value": 60,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "MUTATION_NONCE_CAP": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "VAULT_VERSION": {
       "value": 1,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "VAULT_SALT_BYTES": {
       "value": 16,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "VAULT_KEY_BYTES": {
       "value": 32,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "VAULT_NONCE_BYTES": {
       "value": 24,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "VAULT_TAG_BYTES": {
       "value": 16,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "ARGON2_T": {
       "value": 3,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "ARGON2_P": {
       "value": 4,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "ARGON2_M_KIB": {
       "value": 65536,
-      "source": "chosen policy"
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
     },
     "JSON_MAX_DEPTH": {
       "value": 64,
-      "source": "chosen policy"
+      "source": "chosen policy: bounded parser or retained state work; maximum zero-based container depth (root is zero), must match strict_json.rs and parse-strict.ts"
     },
     "GATE_B_PENDING_MAX": {
       "value": 64,
-      "source": "chosen policy"
+      "source": "chosen policy: bounded parser or retained state work"
     },
     "CLASS_MAX_BYTES": {
       "value": 64,
-      "source": "chosen policy"
+      "source": "brief section 5 (R3 table and added constants)"
     },
     "STRING_MAX_BYTES": {
       "value": 4096,
-      "source": "chosen policy"
+      "source": "chosen policy: bounded parser or retained state work"
     },
     "ARRAY_MAX_ITEMS": {
       "value": 4096,
-      "source": "chosen policy"
+      "source": "chosen policy: bounded parser or retained state work"
     },
     "MIB": {
       "expression": {
@@ -471,8 +477,8 @@
       "source": "brief section 5 / decisions D1-D9"
     },
     "ORIGIN": {
-      "value": "https://<private-name>:3501",
-      "source": "brief section 5 / decisions D1-D9"
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "https://<private-name>:${P_WEB}"
     },
     "MACHINE_ID_PATH": {
       "value": "/etc/sanctuary/service/machine.json",
@@ -507,8 +513,8 @@
       "source": "brief section 5 / decisions D1-D9"
     },
     "AGENT_LEAF": {
-      "value": "/sys/fs/cgroup/system.slice/sanctuary-agent@<A>.service",
-      "source": "brief section 5 / decisions D1-D9"
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "/sys/fs/cgroup/system.slice/${AGENT_UNIT}"
     },
     "WORKSPACE": {
       "value": "/var/lib/sanctuary-agent-workspace",
@@ -575,19 +581,20 @@
       "source": "brief section 5 / decisions D1-D9"
     },
     "K": {
-      "value": "128 random bits, lowercase hex",
-      "source": "brief section 5 / decisions D1-D9"
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "${ID_BITS} random bits, lowercase hex"
     },
     "MACHINE_ID": {
-      "value": "128 random bits minted at provision",
-      "source": "brief section 5 / decisions D1-D9"
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "${ID_BITS} random bits minted at provision"
     },
     "WALL_TABLE": {
-      "value": "table inet sanctuary_wall {\n  chain out { type filter hook output priority filter; policy accept;\n    meta skuid <A> jump agent }\n  chain agent {\n    meta nfproto ipv4 ip daddr 127.0.0.1 tcp dport 850 accept\n    drop\n  }\n}\n",
-      "source": "brief section 5 / decisions D1-D9"
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "table inet sanctuary_wall {\n  chain out { type filter hook output priority filter; policy accept;\n    meta skuid <A> jump agent }\n  chain agent {\n    meta nfproto ipv4 ip daddr ${GATE_ADDR} tcp dport ${P_GATE} accept\n    drop\n  }\n}\n"
     },
     "AGENT_HIDDEN": {
-      "value": [
+      "source": "R3 amended D1 D3 D4",
+      "template": [
         "/tmp",
         "/var/tmp",
         "/dev/shm",
@@ -609,13 +616,12 @@
         "/run/sanctuary-service",
         "/run/sanctuary-service-locks",
         "/run/sanctuary-activate",
-        "/run/sanctuary-task",
+        "${FIFO_PARENT}",
         "/dev/mqueue",
         "/run/sanctuary-wall",
         "/run/sanctuary-gate",
         "/run/sanctuary-owner-enroll"
-      ],
-      "source": "R3 amended D1 D3 D4"
+      ]
     },
     "AGENT_READ_SET": {
       "value": [
@@ -630,10 +636,10 @@
       "source": "R3"
     },
     "AGENT_WRITE_SET": {
-      "value": [
-        "/var/lib/sanctuary-agent-workspace"
-      ],
-      "source": "F-T13"
+      "source": "F-T13",
+      "template": [
+        "${WORKSPACE}"
+      ]
     },
     "H_HIDDEN": {
       "value": [
@@ -661,22 +667,22 @@
       "source": "R3: memory only, restart ends sessions"
     },
     "AGENT_UNIT_PROPERTIES": {
-      "value": {
-        "TimeoutStopSec": "10",
+      "source": "R3/R4 amended; no Install section",
+      "template": {
+        "TimeoutStopSec": "${AGENT_STOP}",
         "KillMode": "control-group",
         "UMask": "0077",
         "RestrictAddressFamilies": "AF_INET",
         "MemorySwapMax": "0",
         "StandardError": "null",
         "BindsTo": "sanctuary-wall.service",
-        "TemporaryFileSystem": "/var/lib/sanctuary-agent-workspace:size=64M,nr_inodes=4096,mode=0700,uid=%i,gid=%i,nosuid,nodev,noexec",
+        "TemporaryFileSystem": "${WORKSPACE}:size=${WORKSPACE_MIB}M,nr_inodes=${WORKSPACE_INODES},mode=0700,uid=%i,gid=%i,nosuid,nodev,noexec",
         "OpenFile": [
-          "/run/sanctuary-task/current/in:task-in",
-          "/run/sanctuary-task/current/out:task-out",
-          "/run/sanctuary-task/current/err:task-err"
+          "${FIFO_DIR}/in:task-in",
+          "${FIFO_DIR}/out:task-out",
+          "${FIFO_DIR}/err:task-err"
         ]
-      },
-      "source": "R3/R4 amended; no Install section"
+      }
     },
     "FILE_MODES": {
       "value": {
@@ -722,6 +728,34 @@
         ]
       },
       "source": "R3 amended F-T19; single use"
+    },
+    "BITS_PER_BYTE": {
+      "value": 8,
+      "source": "octet definition"
+    },
+    "FIFO_RESULT_ENVELOPE_BYTES": {
+      "value": 31,
+      "source": "UTF-8 length of JCS({data_b64: \"\", type: \"result\"}); must match wire.json fifo_result"
+    },
+    "FIFO_RESULT_AVAILABLE_BYTES": {
+      "expression": {
+        "op": "sub",
+        "args": [
+          "TASK_OUT_FRAME_MAX",
+          "FIFO_RESULT_ENVELOPE_BYTES"
+        ]
+      },
+      "source": "brief section 4 item 6: payload budget less the result envelope"
+    },
+    "FIFO_RESULT_ENCODED_MAX": {
+      "expression": {
+        "op": "floor_multiple",
+        "args": [
+          "FIFO_RESULT_AVAILABLE_BYTES",
+          "BASE64_OUTPUT"
+        ]
+      },
+      "source": "RFC 4648: largest complete four-character base64 group that fits the frame"
     }
   }
 }

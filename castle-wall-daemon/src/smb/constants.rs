@@ -16,6 +16,8 @@ fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
     let entry = &source()["constants"][name];
     let result = if let Some(value) = entry.get("value") {
         value.clone()
+    } else if let Some(template) = entry.get("template") {
+        expand(template, visiting)
     } else {
         let expression = &entry["expression"];
         let args: Vec<u64> = expression["args"]
@@ -32,6 +34,8 @@ fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
             "ref" => args[0],
             "add" => args.iter().sum(),
             "sub" => args[0] - args[1],
+            "div" => args[0] / args[1],
+            "floor_multiple" => args[0] / args[1] * args[1],
             "mul" => args.iter().product(),
             "base64" => args[0].div_ceil(args[1]) * args[2],
             _ => panic!("unknown SMB constant expression"),
@@ -39,6 +43,37 @@ fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
     };
     visiting.remove(name);
     result
+}
+// Must match template expansion in server/src/smb/constants.ts; named values stay authoritative.
+fn expand(template: &Value, visiting: &mut BTreeSet<String>) -> Value {
+    match template {
+        Value::String(text) => {
+            let mut rest = text.as_str();
+            let mut out = String::new();
+            while let Some((prefix, tail)) = rest.split_once("${") {
+                out.push_str(prefix);
+                let (key, suffix) = tail.split_once('}').expect("SMB template");
+                let value = resolve(key, visiting);
+                out.push_str(&match value {
+                    Value::String(v) => v,
+                    other => other.to_string(),
+                });
+                rest = suffix;
+            }
+            out.push_str(rest);
+            Value::String(out)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| expand(item, visiting)).collect())
+        }
+        Value::Object(items) => Value::Object(
+            items
+                .iter()
+                .map(|(key, item)| (key.clone(), expand(item, visiting)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 /// Resolve the complete inventory, including expression-derived bounds.
 pub fn all() -> Value {

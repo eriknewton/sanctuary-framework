@@ -1,0 +1,13 @@
+# witness: release_hook_scan
+--- a/castle-wall-daemon/src/smb/mod.rs
++++ b/castle-wall-daemon/src/smb/mod.rs
+@@ -8 +7,0 @@
+-#[cfg(feature = "smb-test-hooks")]
+@@ -9,0 +9,7 @@
++#[cfg(target_os = "linux")]
++#[used]
++#[link_section = ".init_array"]
++static SMB_LINKED_HOOK: extern "C" fn() = {
++    extern "C" fn hook() { test_hooks::smb_test_hook_pause(|marker| { std::hint::black_box(marker); }); }
++    hook
++};

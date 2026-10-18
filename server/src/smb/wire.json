@@ -3,21 +3,18 @@
   "schemas": {
     "decimal": {
       "type": "decimal",
-      "max": "18446744073709551615",
-      "pattern": "^(0|[1-9][0-9]{0,19})$"
+      "max": "18446744073709551615"
     },
     "request_id": {
       "type": "decimal",
       "min": "1",
-      "max": "18446744073709551615",
-      "pattern": "^(0|[1-9][0-9]{0,19})$"
+      "max": "18446744073709551615"
     },
     "hex128": {
       "type": "string",
       "min": "ID_HEX_CHARS",
       "max": "ID_HEX_CHARS",
-      "chars": "0123456789abcdef",
-      "pattern": "^[0-9a-f]{32}$"
+      "chars": "0123456789abcdef"
     },
     "I": {
       "ref": "hex128"
@@ -35,8 +32,7 @@
       "type": "string",
       "min": 1,
       "max": "CLASS_MAX_BYTES",
-      "chars": "abcdefghijklmnopqrstuvwxyz0123456789_.-",
-      "pattern": "^[a-z0-9_.-]{1,64}$"
+      "chars": "abcdefghijklmnopqrstuvwxyz0123456789_.-"
     },
     "digest": {
       "type": "string",
@@ -299,7 +295,8 @@
         },
         "data_b64": {
           "type": "base64",
-          "max": "TASK_OUT_FRAME_MAX"
+          "max": "TASK_OUT_FRAME_MAX",
+          "encoded_max": "FIFO_RESULT_ENCODED_MAX"
         }
       }
     },

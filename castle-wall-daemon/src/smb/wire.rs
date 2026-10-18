@@ -61,7 +61,11 @@ fn matches(spec: &Value, value: &Value, depth: usize) -> bool {
             .count()
             == 1;
     }
-    match spec["type"].as_str().expect("SMB schema operation") {
+    // An unresolved caller-selected schema is a refusal, never a process failure.
+    let Some(operation) = spec["type"].as_str() else {
+        return false;
+    };
+    match operation {
         "object" => value.as_object().is_some_and(|values| {
             let expected = fields(spec);
             // Full-set agreement refuses both unknown and missing fields at the seam.
@@ -110,13 +114,20 @@ fn matches(spec: &Value, value: &Value, depth: usize) -> bool {
             } else {
                 URL_SAFE_NO_PAD
             };
+            // Must match wire.ts: encoded caps reserve the surrounding frame before decoding.
+            if spec
+                .get("encoded_max")
+                .is_some_and(|max| text.len() > bound(max))
+            {
+                return false;
+            }
             // Exact round-trip prevents padding and ignored-character ambiguities.
             engine.decode(text).is_ok_and(|bytes| {
                 bytes.len() <= bound(&spec["max"]) && engine.encode(bytes) == text
             })
         }),
         "json" => true, // validate applies the strict numeric domain to the whole value first.
-        _ => panic!("unknown SMB schema operation"),
+        _ => false,
     }
 }
 /// Validate a caller value against the shared schema and strict JSON domain.

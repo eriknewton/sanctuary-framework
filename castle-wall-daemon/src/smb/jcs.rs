@@ -71,13 +71,24 @@ pub fn encode(value: &Value) -> Result<String, String> {
     encode_at(value, 0)
 }
 fn encode_at(value: &Value, depth: usize) -> Result<String, String> {
-    if depth > super::constants::bound("JSON_MAX_DEPTH") + 1 {
+    // Only containers spend nesting budget; scalar leaves may follow the deepest container.
+    // Must match jcs.ts and strict_json.rs: root container depth is zero.
+    if (value.is_array() || value.is_object()) && depth > super::constants::bound("JSON_MAX_DEPTH")
+    {
         return Err("SMB JSON depth".into());
     }
     Ok(match value {
         Value::Null => "null".into(),
         Value::Bool(v) => v.to_string(),
-        Value::Number(v) => number(v.as_f64().ok_or("SMB number")?)?,
+        Value::Number(v) => {
+            let n = v.as_f64().ok_or("SMB number")?;
+            let max_safe = ((1_u64 << f64::MANTISSA_DIGITS) - 1) as f64;
+            // Must match jcs.ts: signing accepts only the parser's safe numeric domain.
+            if n.abs() > max_safe {
+                return Err("SMB numeric domain".into());
+            }
+            number(n)?
+        }
         Value::String(v) => serde_json::to_string(v).map_err(|_| "SMB string")?,
         Value::Array(values) => format!(
             "[{}]",

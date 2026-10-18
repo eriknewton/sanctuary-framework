@@ -1,0 +1,6 @@
+# witness: structural_seams
+--- a/server/test/smb/contracts.test.ts
++++ b/server/test/smb/contracts.test.ts
+@@ -216 +216 @@
+-  if (!codecOwners.has(path) && /(?:fn|function)\s+(?:jcs|canonicalize|parseStrict|parse_strict|parse_json)\b|JSON\.(?:parse|stringify)\s*\(|serde_json\s*::\s*(?:from_slice|from_str|from_reader|to_string|to_vec|to_writer)(?:_pretty)?\b/.test(text)) found.push('codec');
++  if (!(codecOwners.has(path) || path.endsWith('/jcs.rs')) && /(?:fn|function)\s+(?:jcs|canonicalize|parseStrict|parse_strict|parse_json)\b|JSON\.(?:parse|stringify)\s*\(|serde_json\s*::\s*(?:from_slice|from_str|from_reader|to_string|to_vec|to_writer)(?:_pretty)?\b/.test(text)) found.push('codec');

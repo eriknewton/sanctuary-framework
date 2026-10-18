@@ -5,7 +5,7 @@ import { parseStrict } from './parse-strict.js';
 
 // Must match the data-language interpreter in castle-wall-daemon/src/smb/wire.rs.
 // All message fields and edge registries come from wire.json, never from a second table.
-type Schema = string | { ref?: string; const?: unknown; enum?: unknown[]; oneOf?: Schema[]; type?: string; extends?: string; fields?: Record<string, Schema>; items?: Schema; min?: string | number; max?: string | number; chars?: string; prefix?: string; suffix?: string };
+type Schema = string | { ref?: string; const?: unknown; enum?: unknown[]; oneOf?: Schema[]; type?: string; extends?: string; fields?: Record<string, Schema>; items?: Schema; min?: string | number; max?: string | number; encoded_max?: string | number; chars?: string; prefix?: string; suffix?: string };
 const schemas = source.schemas as Record<string, Schema>;
 /** Shared edge inventory, including frame bounds, capacity and per-kind schemas. */
 export const edges = source.edges as Record<string, { path: string; frame_max: string; pending_max: string | number; requests: Record<string, { request: string; reply: string }> }>;
@@ -47,6 +47,8 @@ function matches(spec: Schema, value: unknown, depth: number): boolean {
     }
     case 'base64': case 'base64url': {
       if (typeof value !== 'string') return false;
+      // Must match wire.rs: reserve the frame envelope before decoding an encoded field.
+      if (schema.encoded_max !== undefined && value.length > bound(schema.encoded_max)) return false;
       const encoding = schema.type === 'base64' ? 'base64' : 'base64url';
       const decoded = Buffer.from(value, encoding);
       // Canonical re-encoding refuses ignored characters and ambiguous base64 padding.

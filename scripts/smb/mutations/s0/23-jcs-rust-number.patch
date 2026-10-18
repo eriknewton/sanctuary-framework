@@ -1,0 +1,6 @@
+# witness: codec_bounds_agree
+--- a/castle-wall-daemon/src/smb/jcs.rs
++++ b/castle-wall-daemon/src/smb/jcs.rs
+@@ -87 +87 @@
+-            if n.abs() > max_safe {
++            if n.abs() > max_safe && false {

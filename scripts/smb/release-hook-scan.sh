@@ -24,12 +24,14 @@ layout = runpy.run_path(str(crate / 'packaging/ubuntu/install-layout.py'))
 env = {k:v for k,v in os.environ.items() if not k.startswith(('CARGO_', 'RUSTFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTUP_TOOLCHAIN'))}
 env.update(CARGO_TERM_COLOR='never', CARGO_BUILD_JOBS='2')
 feature = ['--features', 'smb-test-hooks'] if args.feature_fixture else []
-command = ['cargo', 'build', '--locked', '--release', '--target', layout['TARGET'], '--target-dir', str(scratch/'target'), '--message-format=json']
+command = ['cargo', 'build', '--locked', '--release', '--target', layout['TARGET'], '--target-dir', str(pathlib.Path(os.environ.get('CARGO_TARGET_DIR', str(crate/'target'))) / 'smb-release-scan'), '--message-format=json']
 for binary in layout['BINARIES']: command += ['--bin', binary]
 command += feature
 print('BUILD ' + ' '.join(command), flush=True)
 with (scratch/'cargo.jsonl').open('w') as log:
-    subprocess.run(command, cwd=crate, env=env, stdout=log, check=True, timeout=45*60)
+    build = subprocess.run(command, cwd=crate, env=env, stdout=log, timeout=45*60)
+    if build.returncode: raise SystemExit('SMB_BUILD_FAILURE: release compilation failed')
+# Cached targets are only acceleration: Cargo must produce the complete current artifact inventory.
 artifacts = [json.loads(line) for line in (scratch/'cargo.jsonl').read_text().splitlines()]
 artifacts = [a for a in artifacts if a.get('reason')=='compiler-artifact' and a.get('executable')]
 if {a['target']['name'] for a in artifacts} != set(layout['BINARIES']): raise SystemExit('SCAN FAILURE: incomplete artifact inventory')

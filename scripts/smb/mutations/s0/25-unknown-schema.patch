@@ -1,0 +1,8 @@
+# witness: wire_unknown_schema_refuses
+--- a/castle-wall-daemon/src/smb/wire.rs
++++ b/castle-wall-daemon/src/smb/wire.rs
+@@ -65,3 +65 @@
+-    let Some(operation) = spec["type"].as_str() else {
+-        return false;
+-    };
++    let operation = spec["type"].as_str().expect("SMB schema operation");

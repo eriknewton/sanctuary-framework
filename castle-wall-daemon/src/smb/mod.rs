@@ -58,6 +58,85 @@ mod tests {
         emit(Value::Array(results));
     }
     #[test]
+    fn codec_bounds_agree() {
+        let vectors = fixture("bounds");
+        let mut results = Vec::new();
+        for v in vectors["depth"].as_array().unwrap() {
+            let depth = constants::bound("JSON_MAX_DEPTH") + v["offset"].as_u64().unwrap() as usize;
+            let mut value = if v["shape"] == "array" {
+                json!([])
+            } else {
+                json!({})
+            };
+            let mut raw = if v["shape"] == "array" {
+                "[]".to_owned()
+            } else {
+                "{}".to_owned()
+            };
+            for _ in 0..depth {
+                if v["shape"] == "array" {
+                    value = json!([value]);
+                    raw = format!("[{raw}]");
+                } else {
+                    value = json!({"a":value});
+                    raw = format!("{{\"a\":{raw}}}");
+                }
+            }
+            let encoded = jcs::encode(&value).is_ok();
+            let parsed = strict_json::parse(raw.as_bytes(), constants::bound("REQ_MAX")).is_ok();
+            assert_eq!(encoded, v["valid"].as_bool().unwrap(), "{}", v["name"]);
+            assert_eq!(parsed, encoded);
+            results.push(json!({"encoded":encoded,"parsed":parsed}));
+        }
+        for v in vectors["numbers"].as_array().unwrap() {
+            // Build an exact u64 value without first rounding through binary64.
+            let value = Value::from(v["literal"].as_str().unwrap().parse::<u64>().unwrap());
+            let accepted = jcs::encode(&value).is_ok();
+            assert_eq!(accepted, v["valid"].as_bool().unwrap());
+            results.push(json!(accepted));
+        }
+        emit(json!(results));
+    }
+    #[test]
+    fn wire_unknown_schema_refuses() {
+        wire_vectors("unknown");
+    }
+    #[test]
+    fn normalize_boot_id_agrees() {
+        let uuid = "ABCDEF01-2345-6789-ABCD-EF0123456789";
+        assert_eq!(
+            wire::normalize_boot_id(uuid).unwrap(),
+            "abcdef0123456789abcdef0123456789"
+        );
+        assert!(wire::normalize_boot_id("not-a-uuid").is_err());
+        emit(json!(true));
+    }
+    #[test]
+    fn fifo_result_encoded_bound() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let encoded_max = constants::bound("FIFO_RESULT_ENCODED_MAX");
+        let decoded_max =
+            encoded_max / constants::bound("BASE64_OUTPUT") * constants::bound("BASE64_INPUT");
+        for v in fixture("bounds")["fifo"].as_array().unwrap() {
+            let extra = v["extra_decoded_bytes"].as_u64().unwrap() as usize;
+            let value =
+                json!({"type":"result","data_b64":STANDARD.encode(vec![0; decoded_max + extra])});
+            assert_eq!(
+                wire::validate("fifo_result", &value),
+                v["valid"].as_bool().unwrap()
+            );
+            if extra == 0 {
+                assert!(frame::encode(
+                    &value,
+                    "fifo_result",
+                    constants::bound("TASK_OUT_FRAME_MAX")
+                )
+                .is_ok());
+            }
+        }
+        emit(json!(true));
+    }
+    #[test]
     fn constants_parity() {
         emit(json!({"constants":constants::all(), "wire":wire::source()}));
     }

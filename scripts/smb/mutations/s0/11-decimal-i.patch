@@ -1,6 +1,6 @@
 # witness: wire_pins_128_bit_ids_hex_and_class_string
 --- a/server/src/smb/wire.json
 +++ b/server/src/smb/wire.json
-@@ -23 +23 @@
+@@ -20 +20 @@
 -      "ref": "hex128"
 +      "ref": "decimal"

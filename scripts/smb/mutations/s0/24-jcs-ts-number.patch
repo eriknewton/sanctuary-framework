@@ -1,0 +1,6 @@
+# witness: codec_bounds_agree
+--- a/server/src/smb/jcs.ts
++++ b/server/src/smb/jcs.ts
+@@ -28 +28 @@
+-    if (Math.abs(value) > Number.MAX_SAFE_INTEGER) throw new Error('SMB numeric domain');
++    if (Math.abs(value) > Number.MAX_SAFE_INTEGER && false) throw new Error('SMB numeric domain');
