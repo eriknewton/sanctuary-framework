@@ -856,7 +856,9 @@ describe("slice 2 shell wired consumers", () => {
     h.navigate("approvals");
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
-    expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
+    // The refusal is the retained decision result, not a toast; the server's reason is quoted in it.
+    expect(h.el.main!.innerHTML).toContain('data-decision-status="refused"');
+    expect(h.el.main!.innerHTML).toContain("Allow once was refused for state export by fixture-agent (request wait-1): operator session required (HTTP 401). The decision was not applied.");
     // Retargeted from "Decided at": a refused decision leaves the row waiting with its controls, repainted from the server.
     expect(h.el.main!.innerHTML).toContain("WAITING");
     expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="wait-1"');
@@ -3678,16 +3680,24 @@ describe("Approvals round-one decision and evidence states", () => {
       const expected = failure === "approve" ? ["approve"] : failure === "compile" || failure === "missing draft" ? ["approve", "compile"] : ["approve", "compile", "activate"];
       if (failure === "downgrade confirmed" || failure === "override refused") expected.push("override");
       expect(calls).toEqual(expected);
+      // Every outcome is the retained decision result on the screen; no toast reports a decision.
+      const result = h.el.main!.innerHTML.split('class="decision-result"')[1] ?? "";
+      expect(h.el["toast-host"]!.innerHTML).toBe("");
       if (failure === "approve") {
-        expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: refused");
+        expect(result).toContain('data-decision-status="refused"');
+        expect(result).toContain("Allow once was refused for");
+        expect(result).not.toContain("Allowed once");
         expect(drawer(h)).toContain("WAITING");
       } else {
         expect(drawer(h)).toContain(failure === "none" ? "No approvals waiting" : "DECIDED");
-        if (failure !== "none" && failure !== "downgrade confirmed") expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added:");
+        expect(result).toContain('data-decision-status="acknowledged"');
+        expect(result).toContain("Allowed once: state export by fixture-agent (request " + requestId + ").");
+        if (failure !== "none" && failure !== "downgrade confirmed") expect(result).toContain("The standing rule was not added:");
+        else expect(result).toContain("Standing rule added: agents may state export without asking.");
         // A declined downgrade reads as one sentence, not a second "no standing rule added" after the first.
         if (failure === "downgrade cancelled") {
-          expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added: you chose to keep your protection.");
-          expect(h.el["toast-host"]!.innerHTML).not.toContain("no standing rule added");
+          expect(result).toContain("The standing rule was not added: you chose to keep your protection.");
+          expect(result).not.toContain("no standing rule added");
         }
       }
       expect(runInContext("state.approvals.alwaysAllow", h.context)).toBe(false);
