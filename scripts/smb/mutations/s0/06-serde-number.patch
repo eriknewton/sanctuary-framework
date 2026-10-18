@@ -1,0 +1,5 @@
+# witness: jcs_rfc8785_appendix_b
+--- a/castle-wall-daemon/src/smb/jcs.rs
++++ b/castle-wall-daemon/src/smb/jcs.rs
+@@ -11,0 +12 @@
++    if value.is_finite() { return serde_json::to_string(&value).map_err(|error| error.to_string()); }

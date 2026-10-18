@@ -1,0 +1,43 @@
+# witness: wire_vectors_agree
+--- a/server/src/smb/wire.json
++++ b/server/src/smb/wire.json
+@@ -124 +124,3 @@
+-        "C": "decimal",
++        "C": {
++          "type": "integer"
++        },
+@@ -170 +172,3 @@
+-        "C": "decimal",
++        "C": {
++          "type": "integer"
++        },
+@@ -373 +377,3 @@
+-        "C": "decimal"
++        "C": {
++          "type": "integer"
++        }
+@@ -451 +457,3 @@
+-        "C": "decimal",
++        "C": {
++          "type": "integer"
++        },
+@@ -557 +565,3 @@
+-        "C": "decimal"
++        "C": {
++          "type": "integer"
++        }
+@@ -577 +587,3 @@
+-        "C": "decimal",
++        "C": {
++          "type": "integer"
++        },
+@@ -622 +634,3 @@
+-        "C": "decimal",
++        "C": {
++          "type": "integer"
++        },
+@@ -642 +656,3 @@
+-        "C": "decimal",
++        "C": {
++          "type": "integer"
++        },

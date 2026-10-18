@@ -1,0 +1,383 @@
+{
+  "$comment": "Must match parse-strict.ts and castle-wall-daemon/src/smb/strict_json.rs; numeric_domain compares accepted JCS bytes.",
+  "vectors": [
+    {
+      "name": "1e30",
+      "raw": "1e30",
+      "valid": false,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "1E30",
+      "raw": "1E30",
+      "valid": false,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "9007199254740991",
+      "raw": "9007199254740991",
+      "valid": true,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "-9007199254740991",
+      "raw": "-9007199254740991",
+      "valid": true,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "9007199254740992",
+      "raw": "9007199254740992",
+      "valid": false,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "9007199254740993",
+      "raw": "9007199254740993",
+      "valid": false,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "-9007199254740993",
+      "raw": "-9007199254740993",
+      "valid": false,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "9007199254740991.5",
+      "raw": "9007199254740991.5",
+      "valid": false,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "1e2",
+      "raw": "1e2",
+      "valid": true,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "-0",
+      "raw": "-0",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "0"
+    },
+    {
+      "name": "0.5",
+      "raw": "0.5",
+      "valid": true,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "5e-324",
+      "raw": "5e-324",
+      "valid": true,
+      "group": "numeric_domain"
+    },
+    {
+      "name": "rfc.0000000000000000",
+      "raw": "0",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "0"
+    },
+    {
+      "name": "rfc.8000000000000000",
+      "raw": "-0",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "0"
+    },
+    {
+      "name": "rfc.0000000000000001",
+      "raw": "5e-324",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "5e-324"
+    },
+    {
+      "name": "rfc.8000000000000001",
+      "raw": "-5e-324",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "-5e-324"
+    },
+    {
+      "name": "rfc.7fefffffffffffff",
+      "raw": "1.7976931348623157e+308",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "1.7976931348623157e+308"
+    },
+    {
+      "name": "rfc.ffefffffffffffff",
+      "raw": "-1.7976931348623157e+308",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "-1.7976931348623157e+308"
+    },
+    {
+      "name": "rfc.4340000000000000",
+      "raw": "9007199254740992",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "9007199254740992"
+    },
+    {
+      "name": "rfc.c340000000000000",
+      "raw": "-9007199254740992",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "-9007199254740992"
+    },
+    {
+      "name": "rfc.4430000000000000",
+      "raw": "295147905179352830000",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "295147905179352830000"
+    },
+    {
+      "name": "rfc.7fffffffffffffff",
+      "raw": "NaN",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": null
+    },
+    {
+      "name": "rfc.7ff0000000000000",
+      "raw": "1e999",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": null
+    },
+    {
+      "name": "rfc.44b52d02c7e14af5",
+      "raw": "9.999999999999997e+22",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "9.999999999999997e+22"
+    },
+    {
+      "name": "rfc.44b52d02c7e14af6",
+      "raw": "1e+23",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "1e+23"
+    },
+    {
+      "name": "rfc.44b52d02c7e14af7",
+      "raw": "1.0000000000000001e+23",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "1.0000000000000001e+23"
+    },
+    {
+      "name": "rfc.444b1ae4d6e2ef4e",
+      "raw": "999999999999999700000",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "999999999999999700000"
+    },
+    {
+      "name": "rfc.444b1ae4d6e2ef4f",
+      "raw": "999999999999999900000",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "999999999999999900000"
+    },
+    {
+      "name": "rfc.444b1ae4d6e2ef50",
+      "raw": "1e+21",
+      "valid": false,
+      "group": "numeric_domain",
+      "expected": "1e+21"
+    },
+    {
+      "name": "rfc.3eb0c6f7a0b5ed8c",
+      "raw": "9.999999999999997e-7",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "9.999999999999997e-7"
+    },
+    {
+      "name": "rfc.3eb0c6f7a0b5ed8d",
+      "raw": "0.000001",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "0.000001"
+    },
+    {
+      "name": "rfc.41b3de4355555553",
+      "raw": "333333333.3333332",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "333333333.3333332"
+    },
+    {
+      "name": "rfc.41b3de4355555554",
+      "raw": "333333333.33333325",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "333333333.33333325"
+    },
+    {
+      "name": "rfc.41b3de4355555555",
+      "raw": "333333333.3333333",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "333333333.3333333"
+    },
+    {
+      "name": "rfc.41b3de4355555556",
+      "raw": "333333333.3333334",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "333333333.3333334"
+    },
+    {
+      "name": "rfc.41b3de4355555557",
+      "raw": "333333333.33333343",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "333333333.33333343"
+    },
+    {
+      "name": "rfc.becbf647612f3696",
+      "raw": "-0.0000033333333333333333",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "-0.0000033333333333333333"
+    },
+    {
+      "name": "rfc.43143ff3c1cb0959",
+      "raw": "1424953923781206.2",
+      "valid": true,
+      "group": "numeric_domain",
+      "expected": "1424953923781206.2"
+    },
+    {
+      "name": "{\"a\":1,\"a\":2}",
+      "raw": "{\"a\":1,\"a\":2}",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "{\"a\":1,\"\\u0061\":2}",
+      "raw": "{\"a\":1,\"\\u0061\":2}",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "\"\\ud800\"",
+      "raw": "\"\\ud800\"",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "\"\\udfff\"",
+      "raw": "\"\\udfff\"",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "\"\\ud83d\\ude00\"",
+      "raw": "\"\\ud83d\\ude00\"",
+      "valid": true,
+      "group": "syntax"
+    },
+    {
+      "name": "1e999",
+      "raw": "1e999",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "01",
+      "raw": "01",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "1.",
+      "raw": "1.",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "1e",
+      "raw": "1e",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "[1,]",
+      "raw": "[1,]",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "{\"a\":1,}",
+      "raw": "{\"a\":1,}",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "true false",
+      "raw": "true false",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "[0.5,100]",
+      "raw": "[0.5,100]",
+      "valid": true,
+      "group": "syntax"
+    },
+    {
+      "name": "{\"__proto__\":{\"x\":1}}",
+      "raw": "{\"__proto__\":{\"x\":1}}",
+      "valid": true,
+      "group": "syntax"
+    },
+    {
+      "name": "\"\\u0000\"",
+      "raw": "\"\\u0000\"",
+      "valid": true,
+      "group": "syntax"
+    },
+    {
+      "name": "oversize",
+      "raw": "{}",
+      "valid": false,
+      "maximum": 1,
+      "group": "syntax"
+    },
+    {
+      "name": "utf8",
+      "hex": "22ff22",
+      "valid": false,
+      "group": "syntax"
+    },
+    {
+      "name": "integer.fraction",
+      "raw": "1.5",
+      "valid": false,
+      "schema": "integer",
+      "group": "numeric_domain"
+    },
+    {
+      "name": "integer.exponent",
+      "raw": "1e2",
+      "valid": true,
+      "schema": "integer",
+      "group": "numeric_domain"
+    },
+    {
+      "name": "raw.control",
+      "group": "syntax",
+      "raw": "\"a\nb\"",
+      "valid": false
+    }
+  ]
+}

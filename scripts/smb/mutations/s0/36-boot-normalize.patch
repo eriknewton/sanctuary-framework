@@ -1,0 +1,6 @@
+# witness: normalize_boot_id_agrees
+--- a/castle-wall-daemon/src/smb/wire.rs
++++ b/castle-wall-daemon/src/smb/wire.rs
+@@ -149 +149 @@
+-    let normalized = uuid.replace('-', "").to_lowercase();
++    let normalized = uuid.to_owned();

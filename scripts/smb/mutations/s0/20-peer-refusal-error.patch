@@ -1,0 +1,6 @@
+# witness: peer_refusal_keeps_listener_serving
+--- a/castle-wall-daemon/src/smb/peer.rs
++++ b/castle-wall-daemon/src/smb/peer.rs
+@@ -23 +23 @@
+-        return Ok(AcceptedPeer::Refused);
++        return Err(io::Error::other("SMB peer refused"));

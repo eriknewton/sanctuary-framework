@@ -1,0 +1,6 @@
+# witness: fifo_result_encoded_bound
+--- a/server/src/smb/wire.ts
++++ b/server/src/smb/wire.ts
+@@ -51 +51 @@
+-      if (schema.encoded_max !== undefined && value.length > bound(schema.encoded_max)) return false;
++      if (schema.encoded_max !== undefined && value.length > bound(schema.encoded_max) && false) return false;

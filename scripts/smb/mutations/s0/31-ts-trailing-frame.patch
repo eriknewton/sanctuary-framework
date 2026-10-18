@@ -1,0 +1,6 @@
+# witness: frame_vectors_agree
+--- a/server/src/smb/frame.ts
++++ b/server/src/smb/frame.ts
+@@ -23 +23 @@
+-  if (length > maximum || bytes.length !== header + length) throw new Error('SMB frame length');
++  if (length > maximum || bytes.length < header + length) throw new Error('SMB frame length');
