@@ -22,7 +22,7 @@ pub fn encode(value: &Value, schema: &str, maximum: usize) -> Result<Vec<u8>, St
 fn read_payload(reader: &mut impl Read, schema: &str, maximum: usize) -> Result<Value, String> {
     // Four bytes are the u32 header; FRAME_HEADER must match constants.json.
     let mut header = [0_u8; std::mem::size_of::<u32>()];
-    assert_eq!(header.len(), constants::bound("FRAME_HEADER"));
+    assert_eq!(header.len(), constants::bound("FRAME_HEADER")?);
     reader
         .read_exact(&mut header)
         .map_err(|_| "SMB short header")?;
@@ -60,8 +60,9 @@ pub fn read(
     result
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    #![cfg(unix)]
     use super::*;
     use std::{
         io::{Read, Write},
@@ -71,7 +72,7 @@ mod tests {
     const IO_DEADLINE_SECONDS: u64 = 1; // Bound each refusal probe to one second.
     #[test]
     fn frame_refusal_closes_without_reply() {
-        let maximum = constants::bound("FRAME_MAX_SMALL");
+        let maximum = constants::bound("FRAME_MAX_SMALL").unwrap();
         for bytes in [
             vec![0, 0],
             vec![0, 0, 0, 3, b'{', b'}'],

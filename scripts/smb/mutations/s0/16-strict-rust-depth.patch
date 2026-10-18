@@ -2,5 +2,5 @@
 --- a/castle-wall-daemon/src/smb/strict_json.rs
 +++ b/castle-wall-daemon/src/smb/strict_json.rs
 @@ -103 +103 @@
--                if depth > super::constants::bound("JSON_MAX_DEPTH") {
-+                if depth > super::constants::bound("JSON_MAX_DEPTH") + 1 {
+-                if depth > super::constants::bound("JSON_MAX_DEPTH")? {
++                if depth > super::constants::bound("JSON_MAX_DEPTH")? + 1 {

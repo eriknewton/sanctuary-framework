@@ -223,7 +223,12 @@ function violations(path: string, text: string): string[] {
   if (path.endsWith('.socket') && /^\s*Accept\s*=\s*yes\s*$/mi.test(text)) found.push('socket');
   if (!smbSource(path, text)) return found;
   // Permit data types and value construction only; every other serde spelling needs its owner.
-  let codecs = text.replace(/use\s+serde_json\s*::\s*\{\s*(?:(?:Map|Number|Value|json)\s*,?\s*)+\}\s*;/g, '')
+  let codecs = text.replace(/use\s+serde_json\s*::\s*\{([^{}]*)\}\s*;/g, (statement, list: string) => {
+    const names = list.split(',').map(name => name.trim());
+    if (names.at(-1) === '') names.pop(); // Rust permits one trailing comma.
+    // Only an entire import of permitted data names may bypass codec ownership.
+    return names.length > 0 && names.every(name => ['Map', 'Number', 'Value', 'json'].includes(name)) ? '' : statement;
+  })
     .replace(/\bserde_json\s*::\s*(?:Map|Number|Value|json)\b/g, '');
   // Formatting can serialize a Value through Display. Only these scalar fixture expressions
   // have reviewed types; an unknown formatting call must move through the owning JCS module.
@@ -247,6 +252,44 @@ function violations(path: string, text: string): string[] {
   if (parentEscape || /\b(?:manifest|ipc)\s*(?:::|[,};]|\s+as\b)|\b(?:crate|castle_wall_daemon)\s*::\s*(?!smb\b)|\bsuper\s*::\s*super\b/.test(references)) found.push('legacy-codec');
   return found;
 }
+it('structural_brace_imports_are_bounded', () => {
+  const path = join(crate, 'src/smb/new.rs');
+  for (const list of ['Map', 'Map, Number, Value, json', 'Map, Number, Value, json,', ' Value ,\n json,']) {
+    expect(violations(path, `use serde_json::{${list}};`)).toEqual([]);
+  }
+  for (const list of ['Map, from_str', 'Value, Other', 'Value as Other', 'Map,,Value', '', 'Map Number']) {
+    expect(violations(path, `use serde_json::{${list}};`)).toEqual(['codec']);
+  }
+  const REPETITIONS = 10_000; // Large malformed list exercises the whole import scan without a time assertion.
+  expect(violations(path, 'use\tserde_json::{{Map' + '\tMap'.repeat(REPETITIONS))).toEqual(['codec']);
+  expect(violations(path, 'use serde_json::{Map,' + 'Value,'.repeat(REPETITIONS) + 'Other};')).toEqual(['codec']);
+});
+it('runtime_refusals_agree', () => {
+  expect(() => constant('missing_constant')).toThrow('invalid SMB constant');
+  for (const name of ['missing_constant', 'PLACEHOLDER_PREFIX', 'AGENT_WRITE_SET', 'AGENT_UNIT_PROPERTIES']) {
+    expect(() => bound(name)).toThrow(name === 'missing_constant' ? 'invalid SMB constant' : 'invalid SMB bound');
+  }
+  expect(validate('missing_schema', {})).toBe(false);
+  // 16 byte pairs encode a 128-bit identity as 32 hex characters.
+  const request = { kind: 'scope', id: '1', I: 'ab'.repeat(16), C: '1' };
+  const good = { id: '1', ok: false, error: 'refused' };
+  for (const id of [null, true, 1, [], {}, 'unknown']) {
+    const matcher = new ReplyMatcher('gate-b');
+    expect(() => matcher.register({ ...request, id })).toThrow('SMB request refused');
+    expect(matcher.state).toBe('CLOSED'); expect(matcher.outstanding).toBe(0);
+    const receiving = new ReplyMatcher('gate-b'); receiving.register(request);
+    expect(() => receiving.receive({ ...good, id })).toThrow('SMB reply refused');
+    expect(receiving.state).toBe('CLOSED'); expect(receiving.outstanding).toBe(0);
+  }
+  for (const malformed of [{ kind: 'missing_route', id: '1' }, { kind: false, id: '1' }, { id: '1' }, { kind: 'scope' }, null]) {
+    const matcher = new ReplyMatcher('gate-b');
+    expect(() => matcher.register(malformed)).toThrow('SMB request refused');
+    expect(matcher.state).toBe('CLOSED'); expect(matcher.outstanding).toBe(0);
+  }
+  const matcher = new ReplyMatcher('gate-b');
+  expect(() => matcher.receive(good)).toThrow('SMB reply refused'); expect(matcher.state).toBe('CLOSED');
+  expect(rust('runtime_refusals_agree')).toBe(true);
+});
 it('structural_seams', () => {
   const rustSource = join(crate, 'src/smb/new.rs');
   const tsSource = join(root, 'server/src/smb/new.ts');

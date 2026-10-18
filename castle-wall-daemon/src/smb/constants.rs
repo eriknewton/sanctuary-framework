@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 const SOURCE: &str = include_str!("../../../server/src/smb/constants.json");
 fn source() -> &'static Value {
     static SOURCE_VALUE: OnceLock<Value> = OnceLock::new();
+    // Safety: constants_parity parses embedded constants.json and resolves its entire inventory.
     SOURCE_VALUE.get_or_init(|| super::strict_json::embedded(SOURCE).expect("SMB constants source"))
 }
 fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
@@ -20,16 +21,21 @@ fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
         expand(template, visiting)
     } else {
         let expression = &entry["expression"];
+        // Safety: constants_parity resolves every embedded expression, requiring an args array.
         let args: Vec<u64> = expression["args"]
             .as_array()
             .expect("SMB expression")
             .iter()
             .map(|key| {
-                resolve(key.as_str().unwrap(), visiting)
+                // Safety: constants_parity resolves every embedded expression argument as a string name.
+                let name = key.as_str().unwrap();
+                // Safety: constants_parity evaluates every embedded numeric dependency.
+                resolve(name, visiting)
                     .as_u64()
                     .expect("SMB numeric constant")
             })
             .collect();
+        // Safety: constants_parity evaluates every embedded expression, requiring a string operator.
         Value::from(match expression["op"].as_str().unwrap() {
             "ref" => args[0],
             "add" => args.iter().sum(),
@@ -52,10 +58,12 @@ fn expand(template: &Value, visiting: &mut BTreeSet<String>) -> Value {
             let mut out = String::new();
             while let Some((prefix, tail)) = rest.split_once("${") {
                 out.push_str(prefix);
+                // Safety: constants_parity expands all embedded templates, requiring closed placeholders.
                 let (key, suffix) = tail.split_once('}').expect("SMB template");
                 let value = resolve(key, visiting);
                 out.push_str(&match value {
                     Value::String(v) => v,
+                    // Safety: constants_parity encodes every embedded template substitution as a scalar.
                     other => super::jcs::encode(&other).expect("SMB template scalar"),
                 });
                 rest = suffix;
@@ -77,20 +85,27 @@ fn expand(template: &Value, visiting: &mut BTreeSet<String>) -> Value {
 }
 /// Resolve the complete inventory, including expression-derived bounds.
 pub fn all() -> Value {
+    // Safety: constants_parity enumerates the embedded constants object before resolving all entries.
     Value::Object(
         source()["constants"]
             .as_object()
             .unwrap()
             .keys()
-            .map(|name| (name.clone(), value(name)))
+            .map(|name| (name.clone(), resolve(name, &mut BTreeSet::new())))
             .collect::<Map<_, _>>(),
     )
 }
-/// Read a shared constant; malformed build-time data fails startup.
-pub fn value(name: &str) -> Value {
-    resolve(name, &mut BTreeSet::new())
+/// Read a shared constant, refusing an unknown caller-selected name.
+pub fn value(name: &str) -> Result<Value, String> {
+    // Only embedded entries may reach the build-time expression interpreter.
+    if source()["constants"].get(name).is_none() {
+        return Err("SMB constant name".into());
+    }
+    Ok(resolve(name, &mut BTreeSet::new()))
 }
-/// Read a nonnegative byte, count, or time bound.
-pub fn bound(name: &str) -> usize {
-    usize::try_from(value(name).as_u64().expect("SMB bound")).expect("SMB usize bound")
+/// Read a byte, count, or time bound, refusing nonnumeric or platform-oversize selections.
+pub fn bound(name: &str) -> Result<usize, String> {
+    // Caller-selected constants must be numeric and fit the platform before controlling allocation.
+    let number = value(name)?.as_u64().ok_or("SMB bound")?;
+    usize::try_from(number).map_err(|_| "SMB usize bound".into())
 }

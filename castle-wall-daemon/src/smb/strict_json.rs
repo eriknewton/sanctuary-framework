@@ -8,9 +8,14 @@ pub(super) fn embedded(source: &'static str) -> Result<Value, serde_json::Error>
 }
 
 #[cfg(test)]
-pub(super) fn fixture<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
-    // Test transport includes deliberately invalid wire values, so it cannot use wire validation.
-    serde_json::from_slice(bytes).expect("SMB fixture JSON")
+pub(super) use tests::fixture;
+
+#[cfg(test)]
+mod tests {
+    pub(crate) fn fixture<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+        // Test transport includes invalid wire values, so it cannot use wire validation.
+        serde_json::from_slice(bytes).expect("SMB fixture JSON")
+    }
 }
 
 /// Parse exactly one UTF-8 JSON value without losing duplicate-key evidence.
@@ -112,7 +117,7 @@ impl Parser<'_> {
         match self.peek() {
             Some(b'{') | Some(b'[') => {
                 // The depth budget must match parse-strict.ts, including primitive leaves.
-                if depth > super::constants::bound("JSON_MAX_DEPTH") {
+                if depth > super::constants::bound("JSON_MAX_DEPTH")? {
                     return Err("SMB JSON depth".into());
                 }
                 if self.peek() == Some(b'{') {

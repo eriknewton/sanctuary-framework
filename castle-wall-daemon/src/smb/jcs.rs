@@ -73,7 +73,7 @@ pub fn encode(value: &Value) -> Result<String, String> {
 fn encode_at(value: &Value, depth: usize) -> Result<String, String> {
     // Only containers spend nesting budget; scalar leaves may follow the deepest container.
     // Must match jcs.ts and strict_json.rs: root container depth is zero.
-    if (value.is_array() || value.is_object()) && depth > super::constants::bound("JSON_MAX_DEPTH")
+    if (value.is_array() || value.is_object()) && depth > super::constants::bound("JSON_MAX_DEPTH")?
     {
         return Err("SMB JSON depth".into());
     }

@@ -26,9 +26,9 @@ mod tests {
     }
     fn maximum(v: &Value) -> usize {
         match v.get("maximum") {
-            Some(Value::String(name)) => constants::bound(name),
+            Some(Value::String(name)) => constants::bound(name).unwrap(),
             Some(Value::Number(n)) => n.as_u64().unwrap() as usize,
-            _ => constants::bound("REQ_MAX"),
+            _ => constants::bound("REQ_MAX").unwrap(),
         }
     }
     fn wire_vectors(group: &str) {
@@ -77,7 +77,8 @@ mod tests {
         let vectors = fixture("bounds");
         let mut results = Vec::new();
         for v in vectors["depth"].as_array().unwrap() {
-            let depth = constants::bound("JSON_MAX_DEPTH") + v["offset"].as_u64().unwrap() as usize;
+            let depth = constants::bound("JSON_MAX_DEPTH").unwrap()
+                + v["offset"].as_u64().unwrap() as usize;
             let mut value = if v["shape"] == "array" {
                 json!([])
             } else {
@@ -98,7 +99,8 @@ mod tests {
                 }
             }
             let encoded = jcs::encode(&value).is_ok();
-            let parsed = strict_json::parse(raw.as_bytes(), constants::bound("REQ_MAX")).is_ok();
+            let parsed =
+                strict_json::parse(raw.as_bytes(), constants::bound("REQ_MAX").unwrap()).is_ok();
             assert_eq!(encoded, v["valid"].as_bool().unwrap(), "{}", v["name"]);
             assert_eq!(parsed, encoded);
             results.push(json!({"encoded":encoded,"parsed":parsed}));
@@ -129,9 +131,9 @@ mod tests {
     #[test]
     fn fifo_result_encoded_bound() {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        let encoded_max = constants::bound("FIFO_RESULT_ENCODED_MAX");
-        let decoded_max =
-            encoded_max / constants::bound("BASE64_OUTPUT") * constants::bound("BASE64_INPUT");
+        let encoded_max = constants::bound("FIFO_RESULT_ENCODED_MAX").unwrap();
+        let decoded_max = encoded_max / constants::bound("BASE64_OUTPUT").unwrap()
+            * constants::bound("BASE64_INPUT").unwrap();
         for v in fixture("bounds")["fifo"].as_array().unwrap() {
             let extra = v["extra_decoded_bytes"].as_u64().unwrap() as usize;
             let value =
@@ -144,11 +146,175 @@ mod tests {
                 assert!(frame::encode(
                     &value,
                     "fifo_result",
-                    constants::bound("TASK_OUT_FRAME_MAX")
+                    constants::bound("TASK_OUT_FRAME_MAX").unwrap()
                 )
                 .is_ok());
             }
         }
+        emit(json!(true));
+    }
+    #[test]
+    fn embedded_schema_inventory() {
+        fn check(spec: &Value, visiting: &mut std::collections::BTreeSet<String>) {
+            if let Some(name) = spec
+                .as_str()
+                .or_else(|| spec.get("ref").and_then(Value::as_str))
+            {
+                assert!(visiting.insert(name.into()), "schema reference cycle");
+                let target = wire::source()["schemas"].get(name).expect("schema name");
+                check(target, visiting);
+                visiting.remove(name);
+                return;
+            }
+            let spec = spec.as_object().expect("schema object");
+            if spec.contains_key("const") {
+                return;
+            }
+            if let Some(values) = spec.get("enum") {
+                assert!(values.is_array());
+                return;
+            }
+            if let Some(alternatives) = spec.get("oneOf") {
+                for item in alternatives.as_array().expect("oneOf array") {
+                    check(item, visiting);
+                }
+                return;
+            }
+            let check_bound = |value: &Value| {
+                if let Some(number) = value.as_u64() {
+                    assert!(usize::try_from(number).is_ok());
+                } else {
+                    assert!(constants::bound(value.as_str().expect("bound name")).is_ok());
+                }
+            };
+            match spec["type"].as_str().expect("schema type") {
+                "object" => {
+                    if let Some(parent) = spec.get("extends") {
+                        check(parent, visiting);
+                        let mut parent = parent;
+                        while let Some(name) = parent
+                            .as_str()
+                            .or_else(|| parent.get("ref").and_then(Value::as_str))
+                        {
+                            parent = &wire::source()["schemas"][name];
+                        }
+                        assert_eq!(parent["type"], "object", "extends must supply fields");
+                    }
+                    for field in spec["fields"].as_object().expect("fields object").values() {
+                        check(field, visiting);
+                    }
+                }
+                "array" => {
+                    check_bound(&spec["max"]);
+                    check(&spec["items"], visiting);
+                }
+                "decimal" => {
+                    assert!(spec["max"]
+                        .as_str()
+                        .expect("decimal max string")
+                        .parse::<u64>()
+                        .is_ok());
+                    if let Some(min) = spec.get("min") {
+                        assert!(min
+                            .as_str()
+                            .expect("decimal min string")
+                            .parse::<u64>()
+                            .is_ok());
+                    }
+                }
+                "string" => {
+                    check_bound(&spec["min"]);
+                    check_bound(&spec["max"]);
+                    if let Some(chars) = spec.get("chars") {
+                        assert!(chars.is_string());
+                    }
+                    if let Some(prefix) = spec.get("prefix") {
+                        assert!(constants::value(prefix.as_str().expect("prefix name"))
+                            .unwrap()
+                            .is_string());
+                        check(&spec["suffix"], visiting);
+                    }
+                }
+                "base64" | "base64url" => {
+                    check_bound(&spec["max"]);
+                    if let Some(max) = spec.get("encoded_max") {
+                        check_bound(max);
+                    }
+                }
+                operation => assert!(["integer", "json"].contains(&operation)),
+            }
+        }
+        for spec in wire::source()["schemas"].as_object().unwrap().values() {
+            check(spec, &mut std::collections::BTreeSet::new());
+        }
+        for edge in wire::source()["edges"].as_object().unwrap().values() {
+            for name in ["pending_max", "frame_max"] {
+                if let Some(number) = edge[name].as_u64() {
+                    assert!(usize::try_from(number).is_ok());
+                } else {
+                    assert!(constants::bound(edge[name].as_str().unwrap()).is_ok());
+                }
+            }
+            for route in edge["requests"].as_object().unwrap().values() {
+                for direction in ["request", "reply"] {
+                    let name = route[direction].as_str().expect("route schema name");
+                    assert!(wire::source()["schemas"].get(name).is_some());
+                }
+            }
+        }
+    }
+    #[test]
+    fn runtime_refusals_agree() {
+        assert!(constants::value("missing_constant").is_err());
+        for name in [
+            "missing_constant",
+            "PLACEHOLDER_PREFIX",
+            "AGENT_WRITE_SET",
+            "AGENT_UNIT_PROPERTIES",
+        ] {
+            assert!(constants::bound(name).is_err());
+        }
+        assert!(!wire::validate("missing_schema", &json!({})));
+        // 16 byte pairs encode a 128-bit identity as 32 hex characters.
+        let request = json!({"kind":"scope", "id":"1", "I":"ab".repeat(16), "C":"1"});
+        let good = json!({"id":"1", "ok":false, "error":"refused"});
+        for id in [
+            Value::Null,
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({}),
+            json!("unknown"),
+        ] {
+            let mut malformed = request.clone();
+            malformed["id"] = id.clone();
+            let mut matcher = wire::ReplyMatcher::new("gate-b").unwrap();
+            assert!(matcher.register(&malformed).is_err());
+            assert_eq!(matcher.state, wire::ConnectionState::Closed);
+            assert_eq!(matcher.outstanding(), 0);
+            let mut matcher = wire::ReplyMatcher::new("gate-b").unwrap();
+            matcher.register(&request).unwrap();
+            let mut reply = good.clone();
+            reply["id"] = id;
+            assert!(matcher.receive(&reply).is_err());
+            assert_eq!(matcher.state, wire::ConnectionState::Closed);
+            assert_eq!(matcher.outstanding(), 0);
+        }
+        for malformed in [
+            json!({"kind":"missing_route", "id":"1"}),
+            json!({"kind":false, "id":"1"}),
+            json!({"id":"1"}),
+            json!({"kind":"scope"}),
+            Value::Null,
+        ] {
+            let mut matcher = wire::ReplyMatcher::new("gate-b").unwrap();
+            assert!(matcher.register(&malformed).is_err());
+            assert_eq!(matcher.state, wire::ConnectionState::Closed);
+            assert_eq!(matcher.outstanding(), 0);
+        }
+        let mut matcher = wire::ReplyMatcher::new("gate-b").unwrap();
+        assert!(matcher.receive(&good).is_err());
+        assert_eq!(matcher.state, wire::ConnectionState::Closed);
         emit(json!(true));
     }
     #[test]
@@ -284,7 +450,7 @@ mod tests {
     }
     #[test]
     fn reply_matcher_bounded_waves() {
-        let maximum = constants::bound("GATE_B_PENDING_MAX");
+        let maximum = constants::bound("GATE_B_PENDING_MAX").unwrap();
         for _wave in 0..3 {
             // Repeated admission, closure and late-completion schedules.
             let mut matcher = wire::ReplyMatcher::new("gate-b").unwrap();
