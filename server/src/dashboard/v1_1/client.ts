@@ -5468,6 +5468,9 @@ const FLEET_PROBE = {
   UNKNOWN: "state_UNKNOWN",
   UNPROBED: "state_UNPROBED"
 };
+// The Fleet Switcher's probe words in generateFleetSwitcherHTML in
+// server/src/principal-policy/dashboard-html.ts must match this table's words
+// for the same outcomes, so switching views does not change what the evidence means.
 const FLEET_PROBE_VIEW = {
   state_CHECKING: { word: "Checking", cls: "checking" },
   state_ONLINE: { word: "Online", cls: "good" },
