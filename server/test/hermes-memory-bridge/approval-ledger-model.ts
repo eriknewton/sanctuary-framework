@@ -4,6 +4,8 @@ import {
   HERMES_MEMORY_UNAVAILABLE,
   HERMES_RATE_WINDOW_MS,
   type HermesApprovalAction,
+  type HermesApprovalLedger,
+  HERMES_APPROVAL_DEADLINE_MS,
   type HermesApprovalCommitCheckInput,
   type HermesApprovalDecision,
   type HermesApprovalEntryState,
@@ -365,5 +367,79 @@ export class ApprovalLedgerModel {
 
   private emptySeen(): Record<HermesApprovalLateEvent, boolean> {
     return { deny: false, deadline: false, cancel: false, gone: false, stop: false, latch: false };
+  }
+}
+
+export type PendingTermination = "cancel" | "deadline" | "connectionGone" | "peerShutdown" | "stop" | "latch";
+
+const PENDING_TERMINALS = {
+  cancel: ["CANCELED", "cancel", "denial"],
+  deadline: ["TIMED_OUT", "deadline", "denial"],
+  connectionGone: ["DISCONNECTED", "connection_gone", undefined],
+  peerShutdown: ["CANCELED", "peer_shutdown", "denial"],
+  stop: ["REFUSED", "stopped", "unavailable"],
+  latch: ["REFUSED", "audit", "unavailable"],
+} as const;
+
+/** A pending-only table and filtered prompt history keep the reachable oracle independent of ledger control branches. */
+export class PendingApprovalModel {
+  private pending: { id: string; connectionId: string; recordId: string; textSha256: string; admittedAt: number } | undefined;
+  private readonly gates = new Set<"stop" | "latch">();
+  private prompts: number[] = [];
+  private clock = Number.NEGATIVE_INFINITY;
+
+  admit(id: string, connectionId: string, recordId: string, textSha256: string, now: number): ModelResult {
+    if (!Number.isFinite(now)) return { actions: [], refusal: "invalid_clock" };
+    this.clock = Math.max(this.clock, now);
+    const refusal = this.gates.has("stop") ? "stopped"
+      : this.gates.has("latch") ? "latched"
+        : this.pending !== undefined ? "busy" : undefined;
+    if (refusal !== undefined) return { actions: [], refusal };
+    this.prompts = this.prompts.filter((at) => this.clock - at < HERMES_RATE_WINDOW_MS);
+    if (this.prompts.length === HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE) {
+      return { actions: [], refusal: "prompt_rate" };
+    }
+    this.prompts.push(this.clock);
+    this.pending = { id, connectionId, recordId, textSha256, admittedAt: this.clock };
+    return { actions: [{ kind: "audit", entryId: id, event: "created" }, { kind: "prompt_owner", entryId: id }] };
+  }
+
+  terminate(event: PendingTermination, id: string): ModelResult {
+    const global = event === "stop" || event === "latch";
+    if (global) {
+      if (this.gates.has(event)) return { actions: [] };
+      this.gates.add(event);
+    }
+    const entry = this.pending;
+    if (entry === undefined || (!global && entry.id !== id)) return { actions: [] };
+    const [state, reason, response] = PENDING_TERMINALS[event];
+    this.pending = undefined;
+    const actions: HermesApprovalAction[] = [{
+      kind: "audit", entryId: entry.id, event: "terminal", state, reason, lateEvents: [],
+    }];
+    if (response !== undefined) {
+      actions.push({
+        kind: "respond", entryId: entry.id, response,
+        message: response === "denial" ? HERMES_MEMORY_DENIAL : HERMES_MEMORY_UNAVAILABLE,
+      });
+    }
+    return { actions };
+  }
+
+  snapshot(): ReturnType<HermesApprovalLedger["snapshot"]> {
+    const entry = this.pending;
+    return {
+      stopped: this.gates.has("stop"),
+      latched: this.gates.has("latch"),
+      largestNowMs: this.clock,
+      promptWindowCount: this.prompts.length,
+      entry: entry === undefined ? undefined : {
+        id: entry.id, connectionId: entry.connectionId, recordId: entry.recordId, textSha256: entry.textSha256,
+        state: "PENDING", started: false, settled: false, responded: false,
+        deadlineAt: entry.admittedAt + HERMES_APPROVAL_DEADLINE_MS,
+        seen: { deny: false, deadline: false, cancel: false, gone: false, stop: false, latch: false },
+        responseClass: undefined, terminalReason: undefined, lateEvents: [],
+      },
+    };
   }
 }

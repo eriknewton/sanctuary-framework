@@ -11,6 +11,11 @@ import {
   MAX_RESULT_FRAME_BYTES,
   PROBE_REPLY_BOUND_MS,
   HermesApprovalLedger,
+  HermesBridgeCore,
+  parseRelayToNode,
+  type HermesBridgeAuditRecord,
+  type HermesTimerHandle,
+  type NodeToRelayInput,
   HermesRateWindow,
   type HermesApprovalAction,
   type HermesApprovalCommitCheckInput,
@@ -26,7 +31,7 @@ import {
   MEMORY_BATCH_LOCK_TIMEOUT_MS,
   hermesBridgePassageTextDigest,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
-import { ApprovalLedgerModel } from "./approval-ledger-model.js";
+import { ApprovalLedgerModel, PendingApprovalModel, type PendingTermination } from "./approval-ledger-model.js";
 
 type HermesApprovalRespondAction = Extract<HermesApprovalAction, { readonly kind: "respond" }>;
 
@@ -876,3 +881,158 @@ const TERMINAL_STATES = new Set<HermesApprovalEntryState>([
   "REFUSED",
   "INDETERMINATE",
 ]);
+
+const PENDING_EVENTS: readonly PendingTermination[] = ["cancel", "deadline", "connectionGone", "peerShutdown", "stop", "latch"];
+
+function terminatePending(ledger: HermesApprovalLedger, event: PendingTermination, id: string): HermesApprovalLedgerResult {
+  if (event === "stop") return ledger.stop();
+  if (event === "latch") return ledger.latch("audit");
+  return ledger[event](id);
+}
+
+describe("Hermes reachable pending approval witnesses", () => {
+  it("preserves complete admission state across refusals and prompt-window renewal", () => {
+    const real = new HermesApprovalLedger();
+    const model = new PendingApprovalModel();
+    const admit = (id: string, now: number) => {
+      const before = real.snapshot();
+      const result = real.admit(id, CONNECTION, RECORD, HASH, now);
+      expect(result).toStrictEqual(model.admit(id, CONNECTION, RECORD, HASH, now));
+      expect(real.snapshot()).toStrictEqual(model.snapshot());
+      if (result.refusal !== undefined) {
+        expect(real.snapshot()).toStrictEqual({
+          ...before, largestNowMs: Number.isFinite(now) ? Math.max(before.largestNowMs, now) : before.largestNowMs,
+        });
+      }
+    };
+    for (const now of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) admit(ENTRY, now);
+    for (let index = 0; index < HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE; index += 1) {
+      admit(ENTRY, index);
+      admit("busy", index);
+      expect(real.cancel(ENTRY)).toStrictEqual(model.terminate("cancel", ENTRY));
+      expect(real.snapshot()).toStrictEqual(model.snapshot());
+    }
+    admit("rate", HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE);
+    admit("renewed", HERMES_RATE_WINDOW_MS);
+    admit("backward", 0);
+    expect(real.latch("audit")).toStrictEqual(model.terminate("latch", "renewed"));
+    expect(real.snapshot()).toStrictEqual(model.snapshot());
+    admit("latched", HERMES_RATE_WINDOW_MS);
+    expect(real.stop()).toStrictEqual(model.terminate("stop", "renewed"));
+    expect(real.snapshot()).toStrictEqual(model.snapshot());
+    admit("stopped", HERMES_RATE_WINDOW_MS);
+  });
+
+  it("matches complete pending state and one terminal response across control sequences", () => {
+    for (const first of PENDING_EVENTS) {
+      for (const second of PENDING_EVENTS) {
+        const real = new HermesApprovalLedger();
+        const model = new PendingApprovalModel();
+        const history: HermesApprovalAction[] = [];
+        expect(real.admit(ENTRY, CONNECTION, RECORD, HASH, 0)).toStrictEqual(model.admit(ENTRY, CONNECTION, RECORD, HASH, 0));
+        expect(real.snapshot()).toStrictEqual(model.snapshot());
+        for (const event of ["cancel", "deadline", "connectionGone", "peerShutdown"] as const) {
+          const before = real.snapshot();
+          expect(terminatePending(real, event, "unknown")).toStrictEqual(model.terminate(event, "unknown"));
+          expect(real.snapshot()).toStrictEqual(before);
+        }
+        for (const event of [first, second, first]) {
+          const result = terminatePending(real, event, ENTRY);
+          expect(result, `${first}/${second}/${event}`).toStrictEqual(model.terminate(event, ENTRY));
+          expect(real.snapshot()).toStrictEqual(model.snapshot());
+          history.push(...result.actions);
+          const audits = history.filter((action) => action.kind === "audit" && action.event === "terminal");
+          const responses = history.filter((action) => action.kind === "respond");
+          expect(audits).toHaveLength(1);
+          expect(responses).toHaveLength(first === "connectionGone" ? 0 : 1);
+          if (responses.length !== 0) expect(history.indexOf(responses[0]!)).toBeGreaterThan(history.indexOf(audits[0]!));
+        }
+      }
+    }
+  });
+
+  it.each(["cancel", "timeout", "disconnect", "audit_failure"] as const)(
+    "records the terminal audit before the single pending response: %s",
+    async (termination) => {
+      const history: Array<HermesBridgeAuditRecord | NodeToRelayInput> = [];
+      const timers = new Map<HermesTimerHandle, () => void>();
+      let rejectCreated!: (error: Error) => void;
+      const created = new Promise<void>((_resolve, reject) => { rejectCreated = reject; });
+      const core = new HermesBridgeCore({
+        writeFrame: (frame) => { history.push(frame); },
+        appendAudit: (record) => {
+          history.push(record);
+          return termination === "audit_failure" && record.kind === "created" ? created : Promise.resolve();
+        },
+        nowMs: () => 0,
+        setTimer: (_ms, fire) => { const handle = {}; timers.set(handle, () => { timers.delete(handle); fire(); }); return handle; },
+        clearTimer: (handle) => { timers.delete(handle); },
+        adapter: {
+          insertPassage: async () => { throw new Error("pending requests cannot reach storage"); },
+          getPassage: async () => { throw new Error("insert witness cannot read storage"); },
+          searchPassages: async () => { throw new Error("insert witness cannot search storage"); },
+        },
+        ownerSurface: { promptOwner: () => undefined },
+        abort: new AbortController(),
+      });
+      const receive = (value: Record<string, unknown>) => {
+        const parsed = parseRelayToNode(Buffer.from(JSON.stringify(value)));
+        if (parsed.kind !== "ok") throw new Error("witness envelope must parse");
+        core.relayFrame(parsed.frame);
+      };
+      const publicFrame = (frame: Record<string, unknown>) => receive({
+        type: "frame", connection_id: CONNECTION, frame_b64: Buffer.from(JSON.stringify(frame)).toString("base64"),
+      });
+      try {
+        receive({ type: "accepted", connection_id: CONNECTION });
+        publicFrame({ type: "hello", request_id: "hello", protocol_version: "2026-10-12", client_name: "hermes" });
+        history.length = 0;
+        publicFrame({ type: "tools_call", request_id: "insert", name: "memory_insert", arguments: { text: PASSAGE_TEXT, taint: "user_content" } });
+        const pending = core.snapshot().ledger;
+        const model = new PendingApprovalModel();
+        expect(pending.entry).toBeDefined();
+        model.admit(pending.entry!.id, CONNECTION, pending.entry!.recordId, HASH, 0);
+        expect(pending).toStrictEqual(model.snapshot());
+        expect(history.map((event) => "kind" in event ? event.kind : event.type)).toEqual(["created"]);
+        const deadline = [...timers.values()][0];
+        expect(deadline).toBeDefined();
+        const terminate = () => {
+          if (termination === "cancel") publicFrame({ type: "cancel", mcp_request_id: "insert" });
+          if (termination === "timeout") deadline!();
+          if (termination === "disconnect") receive({ type: "closed", connection_id: CONNECTION });
+          if (termination === "audit_failure") rejectCreated(new Error("audit unavailable"));
+        };
+        terminate();
+        await Promise.resolve();
+        const event: PendingTermination = termination === "timeout" ? "deadline"
+          : termination === "disconnect" ? "connectionGone" : termination === "audit_failure" ? "latch" : "cancel";
+        const expected = model.terminate(event, pending.entry!.id);
+        const terminal = expected.actions.find((action) => action.kind === "audit");
+        expect(terminal?.kind).toBe("audit");
+        expect(core.snapshot().ledger).toStrictEqual(model.snapshot());
+        const expectedHistory: Array<HermesBridgeAuditRecord | NodeToRelayInput> = [
+          { kind: "created", entryId: pending.entry!.id, connectionId: CONNECTION, recordId: pending.entry!.recordId, textSha256: HASH },
+          {
+            kind: "terminal", entryId: pending.entry!.id, connectionId: CONNECTION, recordId: pending.entry!.recordId,
+            state: terminal?.kind === "audit" ? terminal.state : undefined,
+            reason: terminal?.kind === "audit" ? terminal.reason : undefined, lateEvents: [], textSha256: HASH,
+          },
+        ];
+        if (termination !== "disconnect") expectedHistory.push({
+          type: "response", connectionId: CONNECTION, requestId: "insert",
+          publicPayloadBytes: Buffer.from(JSON.stringify({
+            type: "error", request_id: "insert", message: termination === "audit_failure" ? HERMES_MEMORY_UNAVAILABLE : HERMES_MEMORY_DENIAL,
+          })),
+        });
+        expect(history).toEqual(expectedHistory);
+        terminate();
+        await Promise.resolve();
+        expect(history).toEqual(expectedHistory);
+        expect(core.snapshot().ledger).toStrictEqual(model.snapshot());
+        expect(timers.size).toBe(0);
+      } finally {
+        core.relayEof();
+      }
+    },
+  );
+});
