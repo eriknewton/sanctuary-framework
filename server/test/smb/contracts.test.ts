@@ -17,7 +17,7 @@ import { SURROGATE_PLACEHOLDER_PREFIX } from '../../src/credential-surrogate/pla
 const root = resolve(fileURLToPath(new URL('../../../', import.meta.url)));
 const crate = join(root, 'castle-wall-daemon');
 const fixtures = join(root, 'server/test/smb/vectors');
-const env = { ...process.env, CARGO_BUILD_JOBS: '2', CARGO_TERM_COLOR: 'never' };
+const cargoEnv = { CARGO_BUILD_JOBS: '2', CARGO_TERM_COLOR: 'never' };
 // Fixture budgets: five minutes to build, one minute for Rust, and half a minute for small probes.
 const MINUTE_MS = 60 * 1000;
 const BUILD_TIMEOUT_MS = 5 * MINUTE_MS;
@@ -32,14 +32,15 @@ function fixture(name: string): any { return JSON.parse(readFileSync(join(fixtur
 function maximum(v: Vector): number { return typeof v.maximum === 'number' ? v.maximum : bound(v.maximum ?? 'REQ_MAX'); }
 beforeAll(() => {
   const features = process.env.SMB_WITNESS_FEATURES === 'smb-test-hooks' ? ['--features', 'smb-test-hooks'] : [];
-  const build = spawnSync('cargo', ['test', '--locked', '--lib', 'smb', '--no-run', '--message-format=json', ...features], { cwd: crate, env, encoding: 'utf8', timeout: BUILD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+  const build = spawnSync('cargo', ['test', '--locked', '--lib', 'smb', '--no-run', '--message-format=json', ...features], { cwd: crate, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: BUILD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
   if (build.error || build.status !== 0) throw new Error('SMB_BUILD_FAILURE: ' + (build.error?.message ?? build.stderr + build.stdout));
   const artifacts = build.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(item => item.reason === 'compiler-artifact' && item.target.kind.includes('lib') && item.executable);
   if (artifacts.length !== 1) throw new Error('SMB_BUILD_FAILURE: missing real Rust test binary');
   binary = artifacts[0].executable;
 }, BUILD_TIMEOUT_MS);
 function rust(name: string, extraEnv: Record<string, string> = {}): any {
-  const result = spawnSync(binary, ['smb::tests::' + name, '--exact', '--nocapture'], { cwd: crate, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: MINUTE_MS, maxBuffer: 32 * 1024 * 1024 });
+  // The direct parent spread preserves VITEST and lets the credential-isolation guard verify inheritance.
+  const result = spawnSync(binary, ['smb::tests::' + name, '--exact', '--nocapture'], { cwd: crate, env: { ...process.env, ...cargoEnv, ...extraEnv }, encoding: 'utf8', timeout: MINUTE_MS, maxBuffer: 32 * 1024 * 1024 });
   if (result.error || result.status !== 0) throw new Error(`Rust witness ${name}: ${result.error?.message ?? ''}\n${result.stdout}\n${result.stderr}`);
   const lines = result.stdout.split('\n').filter(line => line.startsWith('SMB_RESULT '));
   expect(lines.length, 'real Rust witness must emit exactly one result set').toBe(1);
@@ -125,7 +126,7 @@ it('jcs_binary64_differential', () => {
     const input = join(scratch, 'bits.json'); writeFileSync(input, JSON.stringify(bits));
     const expected = bits.map(bits => { const n = Buffer.from(bits, 'hex').readDoubleBE(); return Number.isFinite(n) ? number(n) : null; });
     expect(rust('number_differential_runner', { SMB_NUMBER_INPUT: input })).toEqual(expected);
-  } finally { execFileSync('find', [scratch, '-delete']); }
+  } finally { execFileSync('find', [scratch, '-delete'], { env: { ...process.env } }); }
 });
 it('frame_vectors_agree', () => {
   const expected = fixture('frame').vectors.map((v: Vector) => {
@@ -147,7 +148,7 @@ it('frame_refusal_closes_without_reply', async () => {
     else { await expect(result).rejects.toThrow(); expect(stream.destroyed).toBe(true); }
     expect(writes).toEqual([]); stream.destroy();
   }
-  const result = spawnSync(binary, ['smb::frame::tests::frame_refusal_closes_without_reply', '--exact'], { cwd: crate, env, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  const result = spawnSync(binary, ['smb::frame::tests::frame_refusal_closes_without_reply', '--exact'], { cwd: crate, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
   expect(result.status, result.stdout + result.stderr).toBe(0);
 });
 it('reply_matcher_fails_closed', () => {
@@ -173,7 +174,7 @@ it('reply_matcher_bounded_waves', () => {
   }
 });
 it.skipIf(!process.env.SMB_CONTAINER_PEER_IMAGE)('container_peer', () => {
-  const result = spawnSync(binary, ['smb::peer::tests::container_peer', '--exact', '--nocapture', '--ignored'], { cwd: crate, env, encoding: 'utf8', timeout: MINUTE_MS * 3 / 4 });
+  const result = spawnSync(binary, ['smb::peer::tests::container_peer', '--exact', '--nocapture', '--ignored'], { cwd: crate, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: MINUTE_MS * 3 / 4 });
   process.stdout.write(result.stdout ?? '');
   expect(result.error).toBeUndefined(); expect(result.status, result.stderr).toBe(0);
 }, MINUTE_MS);
@@ -197,7 +198,7 @@ it('enc_vectors_carry_class_after_a', () => {
   }
 });
 it('default_features_exclude_hooks', () => {
-  const result = execFileSync('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'], { cwd: crate, env, encoding: 'utf8' });
+  const result = execFileSync('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'], { cwd: crate, env: { ...process.env, ...cargoEnv }, encoding: 'utf8' });
   const features = JSON.parse(result).packages.find((p: Vector) => p.name === 'castle-wall-daemon').features;
   expect(features['smb-test-hooks']).toEqual([]);
   const walk = (name: string): string[] => [name, ...(features[name] ?? []).flatMap(walk)];
@@ -335,7 +336,7 @@ it('fifo_result_encoded_bound', () => {
   expect(rust('fifo_result_encoded_bound')).toBe(true);
 });
 it('peer_refusal_keeps_listener_serving', () => {
-  const result = spawnSync(binary, ['smb::peer::tests::peer_refusal_keeps_listener_serving', '--exact'], { cwd: crate, env, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  const result = spawnSync(binary, ['smb::peer::tests::peer_refusal_keeps_listener_serving', '--exact'], { cwd: crate, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
   expect(result.status, result.stdout + result.stderr).toBe(0);
 });
 it('constants_composites_derive_from_names', () => {
@@ -367,19 +368,19 @@ try:
 except subprocess.TimeoutExpired:
     os.killpg(p.pid, signal.SIGKILL)
     p.wait()
-    sys.exit(124)`, 'bash', join(root, 'scripts/smb/release-hook-scan.sh')], { cwd: root, env, encoding: 'utf8', timeout: RELEASE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+    sys.exit(124)`, 'bash', join(root, 'scripts/smb/release-hook-scan.sh')], { cwd: root, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: RELEASE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
   const output = (result.stdout ?? '') + (result.stderr ?? '');
   if (result.error || result.status === 124 || output.includes('SMB_BUILD_FAILURE')) throw new Error('SMB_BUILD_FAILURE: ' + output + result.error);
   expect(result.status, output).toBe(0);
   expect(output).toContain('RELEASE_HOOK_SCAN: PASS');
 }, RELEASE_TIMEOUT_MS);
 it('mutation_runner_controls', () => {
-  const result = spawnSync('python3', [join(root, 'scripts/smb/test_mutation_runner.py')], { cwd: root, env, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  const result = spawnSync('python3', [join(root, 'scripts/smb/test_mutation_runner.py')], { cwd: root, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
   expect(result.status, result.stdout + result.stderr).toBe(0);
 });
 
 it('container_peer_is_opt_in', () => {
-  const result = spawnSync(binary, ['--list', '--ignored'], { cwd: crate, env, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
+  const result = spawnSync(binary, ['--list', '--ignored'], { cwd: crate, env: { ...process.env, ...cargoEnv }, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
   expect(result.status).toBe(0);
   expect(result.stdout).toContain('smb::peer::tests::container_peer: test');
   expect(result.stdout).toContain('smb::peer::tests::peer_client: test');
