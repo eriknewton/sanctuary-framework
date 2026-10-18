@@ -763,7 +763,12 @@ describe("Hermes memory bridge private framing", () => {
     expect(decoder.bufferedBytes()).toBe(0);
   });
 
-  it("rejects over-cap private bodies in the decoder and encoder", () => {
+  it("preserves exact-cap private bodies and rejects over-cap bodies", () => {
+    const exactBody = Buffer.alloc(MAX_PRIVATE_FRAME_BYTES, " ");
+    const exactDecoder = new PrivateFrameDecoder();
+    exactDecoder.push(encodePrivateFrame(exactBody));
+    expect(exactDecoder.next()).toEqual({ kind: "frame", body: exactBody });
+    expect(exactDecoder.next()).toEqual({ kind: "need_more" });
     const bytes = Buffer.alloc(LENGTH_PREFIX_BYTES);
     bytes.writeUInt32BE(MAX_PRIVATE_FRAME_BYTES + 1, 0);
     const decoder = new PrivateFrameDecoder();
@@ -804,6 +809,94 @@ describe("Hermes memory bridge private framing", () => {
 });
 
 describe("Hermes memory bridge relay-to-Node envelopes", () => {
+  it("parses accepted public frame types to exact Node fields", () => {
+    expect(parsePublicFrame(textEncoder.encode(
+      "{\"type\":\"hello\",\"request_id\":\"mcp-hello\",\"protocol_version\":\"2026-10-12\",\"client_name\":\"hermes\"}",
+    ))).toEqual({
+      kind: "ok",
+      frame: { kind: "hello", requestId: "mcp-hello", protocolVersion: "2026-10-12", clientName: "hermes" },
+    });
+    expect(parsePublicFrame(textEncoder.encode("{\"type\":\"tools_list\",\"request_id\":\"mcp-list\"}"))).toEqual({
+      kind: "ok",
+      frame: { kind: "tools_list", requestId: "mcp-list" },
+    });
+    expect(parsePublicFrame(textEncoder.encode(
+      "{\"type\":\"tools_call\",\"request_id\":\"mcp-insert\",\"name\":\"memory_insert\",\"arguments\":{\"text\":\"t\",\"taint\":\"agent_derived_clean\",\"tags\":[\"a\"],\"passage_id\":\"p1\"}}",
+    ))).toEqual({
+      kind: "ok",
+      frame: {
+        kind: "tools_call",
+        requestId: "mcp-insert",
+        name: "memory_insert",
+        arguments: { text: "t", taint: "agent_derived_clean", tags: ["a"], passage_id: "p1" },
+      },
+    });
+    expect(parsePublicFrame(textEncoder.encode(
+      "{\"type\":\"tools_call\",\"request_id\":\"mcp-search\",\"name\":\"memory_search\",\"arguments\":{\"query\":\"alpha\",\"tag\":\"memo\",\"limit\":5}}",
+    ))).toEqual({
+      kind: "ok",
+      frame: {
+        kind: "tools_call",
+        requestId: "mcp-search",
+        name: "memory_search",
+        arguments: { query: "alpha", tag: "memo", limit: 5 },
+      },
+    });
+    expect(parsePublicFrame(textEncoder.encode(
+      "{\"type\":\"tools_call\",\"request_id\":\"mcp-text\",\"name\":\"memory_search\",\"arguments\":{\"text\":\"alpha\"}}",
+    ))).toEqual({
+      kind: "ok",
+      frame: {
+        kind: "tools_call",
+        requestId: "mcp-text",
+        name: "memory_search",
+        arguments: { text: "alpha" },
+      },
+    });
+    expect(parsePublicFrame(textEncoder.encode(
+      "{\"type\":\"tools_call\",\"request_id\":\"mcp-get\",\"name\":\"memory_get\",\"arguments\":{\"passage_id\":\"p7\"}}",
+    ))).toEqual({
+      kind: "ok",
+      frame: {
+        kind: "tools_call",
+        requestId: "mcp-get",
+        name: "memory_get",
+        arguments: { passage_id: "p7" },
+      },
+    });
+    expect(parsePublicFrame(textEncoder.encode("{\"type\":\"cancel\",\"mcp_request_id\":\"mcp-1\"}"))).toEqual({
+      kind: "ok",
+      frame: { kind: "cancel", mcpRequestId: "mcp-1" },
+    });
+    expect(parsePublicFrame(textEncoder.encode("{\"type\":\"shutdown\"}"))).toEqual({
+      kind: "ok",
+      frame: { kind: "shutdown" },
+    });
+    expect(parsePublicFrame(textEncoder.encode("{\"type\":\"ping\"}"))).toEqual({
+      kind: "public_rejection",
+      reason: "ping is answered by the relay",
+      disposition: "silent",
+      frameType: "ping",
+    });
+  });
+
+  it("accepts a public frame exactly at the public cap", () => {
+    const prefix = "{\"type\":\"tools_call\",\"request_id\":\"mcp-1\",\"name\":\"memory_search\",\"arguments\":{\"query\":\"";
+    const suffix = "\"}}";
+    const query = "a".repeat(MAX_PUBLIC_FRAME_BYTES - prefix.length - suffix.length);
+    const atCap = textEncoder.encode(`${prefix}${query}${suffix}`);
+    expect(atCap.byteLength).toBe(MAX_PUBLIC_FRAME_BYTES);
+    expect(parsePublicFrame(atCap)).toEqual({
+      kind: "ok",
+      frame: {
+        kind: "tools_call",
+        requestId: "mcp-1",
+        name: "memory_search",
+        arguments: { query },
+      },
+    });
+  });
+
   it("consumes every fixture vector through its owning wire assertion", () => {
     const consumed = assertFixtureVectors();
     expect(consumed).toBe(fixtureTotal());
@@ -940,7 +1033,9 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
   });
 
   it("pins request id, nonce, connection id, base64, and tool argument constraints", () => {
-    expect(parsePublicFrame(jsonBytes({ type: "tools_list", request_id: "r".repeat(128) })).kind).toBe("ok");
+    expect(parsePublicFrame(jsonBytes({ type: "tools_list", request_id: "r".repeat(128) }))).toEqual({
+      kind: "ok", frame: { kind: "tools_list", requestId: "r".repeat(128) },
+    });
     for (const id of ["r".repeat(129), "", "a\n", "a b", "é", "a\u0000"]) {
       expect(parsePublicFrame(jsonBytes({ type: "tools_list", request_id: id })).kind, JSON.stringify(id)).toBe("public_rejection");
     }
@@ -972,17 +1067,17 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
       request_id: "m",
       name: "memory_search",
       arguments: args,
-    })).kind;
-    expect(call({ query: "a", limit: 1 })).toBe("ok");
-    expect(call({ query: "a", limit: 20 })).toBe("ok");
-    expect(call({ text: "a" })).toBe("ok");
-    expect(call({ text: "a", query: "b" })).toBe("public_rejection");
-    expect(call({ tag: "t" })).toBe("public_rejection");
-    expect(call({ query: "a", limit: 0 })).toBe("public_rejection");
-    expect(call({ query: "a", limit: 21 })).toBe("public_rejection");
-    expect(call({ query: "a", limit: 1.5 })).toBe("public_rejection");
-    expect(call({ query: "a", limit: "5" })).toBe("public_rejection");
-    expect(call({ query: "a", extra: 1 })).toBe("public_rejection");
+    }));
+    for (const arguments_ of [{ query: "a", limit: 1 }, { query: "a", limit: 20 }, { text: "a" }]) {
+      expect(call(arguments_)).toEqual({ kind: "ok", frame: { kind: "tools_call", requestId: "m", name: "memory_search", arguments: arguments_ } });
+    }
+    expect(call({ text: "a", query: "b" }).kind).toBe("public_rejection");
+    expect(call({ tag: "t" }).kind).toBe("public_rejection");
+    expect(call({ query: "a", limit: 0 }).kind).toBe("public_rejection");
+    expect(call({ query: "a", limit: 21 }).kind).toBe("public_rejection");
+    expect(call({ query: "a", limit: 1.5 }).kind).toBe("public_rejection");
+    expect(call({ query: "a", limit: "5" }).kind).toBe("public_rejection");
+    expect(call({ query: "a", extra: 1 }).kind).toBe("public_rejection");
     expect(parsePublicFrame(jsonBytes({
       type: "tools_call",
       request_id: "m",
@@ -1006,7 +1101,10 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
       request_id: "m",
       name: "memory_insert",
       arguments: { text: "t", taint: "user_content", tags: ["a"], passage_id: "p" },
-    })).kind).toBe("ok");
+    }))).toEqual({
+      kind: "ok",
+      frame: { kind: "tools_call", requestId: "m", name: "memory_insert", arguments: { text: "t", taint: "user_content", tags: ["a"], passage_id: "p" } },
+    });
     expect(parsePublicFrame(jsonBytes({
       type: "tools_call",
       request_id: "m",
@@ -1120,5 +1218,7 @@ describe("Hermes memory bridge Node-to-relay encoder", () => {
       publicPayloadBytes,
     });
     expect(encoded.subarray(LENGTH_PREFIX_BYTES).byteLength).toBeLessThanOrEqual(MAX_PRIVATE_FRAME_BYTES);
+    const envelope = parsePayload(encoded);
+    expect(Buffer.from(envelope.result_b64 as string, "base64")).toEqual(Buffer.from(publicPayloadBytes));
   });
 });
