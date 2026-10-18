@@ -33,7 +33,7 @@ Keep passphrases, recovery keys and dashboard tokens out of the agent conversati
 
 Prerequisites for the npm path: Node.js 22 or newer and npm 10 or newer. Before installing, open the [release verification instructions](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#verify-before-you-trust).
 
-Choose the action that matches your task. Install first and check the result afterward. Removal is a separate action: uninstall removes Sanctuary's enforcement footprint, not the npm package, and `protect --unwrap` restores the harness configuration.
+Choose the action that matches your task. Install first and check the result afterward. Removal is a separate action.
 
 **Install for Claude Code**, using the README's headless command:
 
@@ -47,13 +47,13 @@ npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dash
 npx -y @sanctuary-framework/mcp-server doctor --json
 ```
 
-**Remove only when intended**, using a separate command. It removes what it can of Sanctuary's installed enforcement footprint and reports anything left that needs sudo, the Castle Wall host app or a reboot; it does not remove the npm package:
+**Remove only when intended**, using separate commands. The README's [uninstall reference](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart) states what each command removes and what may remain.
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-**Restore the harness configuration** Sanctuary rewrote:
+**Restore the harness configuration:**
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --unwrap
@@ -61,7 +61,7 @@ npx -y @sanctuary-framework/mcp-server protect --unwrap
 
 Treat this as cooperative MCP setup; it does not install and arm the macOS operating-system wall.
 
-Wrapping remains partial: representative harness configuration paths are tested, and the evidence does not cover every harness version or built-in non-MCP tool.
+{% include matrix-evidence.html claim="Agent wrapping (MCP interception)" label="Wrapping" %}
 
 For a guided cooperative setup, use the memory profile and follow the same single-action and human-action contract:
 
@@ -87,7 +87,7 @@ For the full profile, follow the planner through its observed-state checks until
 
 ## Ubuntu 24.04, x86-64
 
-The October 4, 2026 proof applies to a fresh installation of the exact package named in the drill record, on Ubuntu 24.04 x86-64 hosts, for per-account signed-policy allow and deny behavior.
+{% include matrix-evidence.html claim="Egress enforcement: Linux (Castle Wall Phase 1)" label="Ubuntu 24.04 x86-64 enforcement" %}
 
 Installation is manual from the [recorded package release](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1). Download its three assets into one directory and follow that page’s “Verify before installing” checksum step. Then follow the [operator install guide at the same tag](https://github.com/eriknewton/sanctuary-framework/blob/castle-wall-linux-0.1.0-1/castle-wall-daemon/packaging/ubuntu/README.md). The guide calls the checked package `install.deb`; rename the downloaded file or use its full filename in those commands.
 
@@ -95,25 +95,23 @@ The owner signs the policy on a separate workstation with `sanctuary-linux-polic
 
 The full-profile macOS planner is not the Ubuntu installation route.
 
-Other Linux platforms, DNS and hostname paths, real-agent harnesses, upgrades and provisioned removal are outside the recorded proof.
-
 ## Uninstall
 
-Use the README's uninstall command. It removes what it can of Sanctuary's installed enforcement footprint, keeps your fortress state, keys, passphrase custody, recovery material and audit log, and reports anything left that needs sudo, the Castle Wall host app or a reboot. It does not remove the npm package or restore your harness configuration:
+Use the README's uninstall command:
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-To restore the harness configuration Sanctuary rewrote:
+To restore the harness configuration:
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --unwrap
 ```
 
-Read its result and the [uninstall reference](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart). Follow any named operator action. Consult [restore and recovery](/castle-wall-macos-install.html#restore-and-recovery) before changing an existing fortress.
+Read its result and the [uninstall reference](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart), which states what each command removes and what may remain. Follow any named operator action. Consult [restore and recovery](/castle-wall-macos-install.html#restore-and-recovery) before changing an existing fortress.
 
-For Ubuntu, use the exact package's documentation and retain the removal bound above.
+For Ubuntu, use the exact package's documentation.
 
 ## If setup stops
 

@@ -1,0 +1,886 @@
+{
+  "schema": "sanctuary-assurance-matrix/v1",
+  "source": "ASSURANCE_MATRIX.md",
+  "rows": [
+    {
+      "claim": "Agent wrapping (MCP interception)",
+      "platform": "MCP-compatible harnesses",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/test/wrap/wrap-empty-config.test.ts",
+          "href": "server/test/wrap/wrap-empty-config.test.ts"
+        },
+        {
+          "label": "server/test/wrap/wrap-claude-code-paths.test.ts",
+          "href": "server/test/wrap/wrap-claude-code-paths.test.ts"
+        },
+        {
+          "label": "server/test/wrap/config-reader.test.ts",
+          "href": "server/test/wrap/config-reader.test.ts"
+        },
+        {
+          "label": "server/test/wrap/hermes-yaml-injection.test.ts",
+          "href": "server/test/wrap/hermes-yaml-injection.test.ts"
+        },
+        {
+          "label": "server/test/wrap/generic-mcp-wrap-conformance.test.ts",
+          "href": "server/test/wrap/generic-mcp-wrap-conformance.test.ts"
+        },
+        {
+          "label": "server/test/harness/harness-compatibility.test.ts",
+          "href": "server/test/harness/harness-compatibility.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/wrap/wrap-empty-config.test.ts](server/test/wrap/wrap-empty-config.test.ts); [server/test/wrap/wrap-claude-code-paths.test.ts](server/test/wrap/wrap-claude-code-paths.test.ts); [server/test/wrap/config-reader.test.ts](server/test/wrap/config-reader.test.ts); [server/test/wrap/hermes-yaml-injection.test.ts](server/test/wrap/hermes-yaml-injection.test.ts); [server/test/wrap/generic-mcp-wrap-conformance.test.ts](server/test/wrap/generic-mcp-wrap-conformance.test.ts); [server/test/harness/harness-compatibility.test.ts](server/test/harness/harness-compatibility.test.ts)",
+      "bounds": "Tests prove config rewrite and bootstrap behavior for representative harness paths. They do not prove interception for every listed harness version or non-MCP agent surface.",
+      "next": "Harness compatibility drill that launches each supported harness, verifies the Sanctuary MCP entry is the active route, and proves an upstream tool call is observed through the broker."
+    },
+    {
+      "claim": "Approval gating (Tier 1 / Tier 2 / Tier 3 policy)",
+      "platform": "Cross-platform server",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "server/test/principal-policy/approval-gate.test.ts",
+          "href": "server/test/principal-policy/approval-gate.test.ts"
+        },
+        {
+          "label": "server/test/principal-policy/gate-tier1-unreachable-approval.test.ts",
+          "href": "server/test/principal-policy/gate-tier1-unreachable-approval.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/principal-policy/approval-gate.test.ts](server/test/principal-policy/approval-gate.test.ts); [server/test/principal-policy/gate-tier1-unreachable-approval.test.ts](server/test/principal-policy/gate-tier1-unreachable-approval.test.ts)",
+      "bounds": "The policy engine and fail-closed channel behavior are covered in unit tests. Operator UX timing and every transport-specific approval channel are not covered by one end-to-end drill here.",
+      "next": "End-to-end approval drill that exercises Tier 1 deny, Tier 1 approve, Tier 2 anomaly, Tier 3 allow, and unreachable-channel deny through the operator surface."
+    },
+    {
+      "claim": "Critical audit durability (appendCritical)",
+      "platform": "Cross-platform server storage",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #271",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/271"
+        },
+        {
+          "label": "PR #276",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/276"
+        },
+        {
+          "label": "server/test/operational/audit-log-flush.test.ts",
+          "href": "server/test/operational/audit-log-flush.test.ts"
+        },
+        {
+          "label": "server/test/cognitive/audit-durability.test.ts",
+          "href": "server/test/cognitive/audit-durability.test.ts"
+        },
+        {
+          "label": "server/test/audit/critical-followup.test.ts",
+          "href": "server/test/audit/critical-followup.test.ts"
+        }
+      ],
+      "evidence_text": "[PR #271](https://github.com/eriknewton/sanctuary-framework/pull/271); [PR #276](https://github.com/eriknewton/sanctuary-framework/pull/276); [server/test/operational/audit-log-flush.test.ts](server/test/operational/audit-log-flush.test.ts); [server/test/cognitive/audit-durability.test.ts](server/test/cognitive/audit-durability.test.ts); [server/test/audit/critical-followup.test.ts](server/test/audit/critical-followup.test.ts)",
+      "bounds": "Critical Cognitive-layer mutations fail closed on audit write failure in the tested storage adapters. PR #276 migrated 43 additional critical call sites across principal-policy, proxy, Castle Wall blocked-egress, sovereignty-profile, bridge/reputation, broker, and token-issuer. Two synchronous API sites remain flagged for later restructure.",
+      "next": "Filesystem-backed durability drill with injected ENOSPC, EIO, partial-write, process-exit races, and coverage for the remaining sync-API restructure sites on the production storage path."
+    },
+    {
+      "claim": "Tamper-evident audit chain",
+      "platform": "Cross-platform server audit log",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "PR #274",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/274"
+        },
+        {
+          "label": "server/test/operational/audit-log-chain.test.ts",
+          "href": "server/test/operational/audit-log-chain.test.ts"
+        },
+        {
+          "label": "server/src/audit/chain.ts",
+          "href": "server/src/audit/chain.ts"
+        },
+        {
+          "label": "server/src/operational/audit-log.ts",
+          "href": "server/src/operational/audit-log.ts"
+        },
+        {
+          "label": "server/src/cli/audit-chain-export.ts",
+          "href": "server/src/cli/audit-chain-export.ts"
+        },
+        {
+          "label": "server/src/cli/audit-chain-verify.ts",
+          "href": "server/src/cli/audit-chain-verify.ts"
+        },
+        {
+          "label": "server/test/audit/external-verifier-drill.test.ts",
+          "href": "server/test/audit/external-verifier-drill.test.ts"
+        },
+        {
+          "label": "server/test/cli/audit-chain-verify-exit.test.ts",
+          "href": "server/test/cli/audit-chain-verify-exit.test.ts"
+        },
+        {
+          "label": "server/src/audit/checkpoint-identity.ts",
+          "href": "server/src/audit/checkpoint-identity.ts"
+        },
+        {
+          "label": "server/test/audit/checkpoint-signer-wiring.test.ts",
+          "href": "server/test/audit/checkpoint-signer-wiring.test.ts"
+        }
+      ],
+      "evidence_text": "[PR #274](https://github.com/eriknewton/sanctuary-framework/pull/274); [server/test/operational/audit-log-chain.test.ts](server/test/operational/audit-log-chain.test.ts); [server/src/audit/chain.ts](server/src/audit/chain.ts); [server/src/operational/audit-log.ts](server/src/operational/audit-log.ts); [server/src/cli/audit-chain-export.ts](server/src/cli/audit-chain-export.ts); [server/src/cli/audit-chain-verify.ts](server/src/cli/audit-chain-verify.ts); [server/test/audit/external-verifier-drill.test.ts](server/test/audit/external-verifier-drill.test.ts); [server/test/cli/audit-chain-verify-exit.test.ts](server/test/cli/audit-chain-verify-exit.test.ts); [server/src/audit/checkpoint-identity.ts](server/src/audit/checkpoint-identity.ts); [server/test/audit/checkpoint-signer-wiring.test.ts](server/test/audit/checkpoint-signer-wiring.test.ts)",
+      "bounds": "Audit entries carry monotonic sequence, `prev_hash`, `entry_hash`, root-hash recomputation, legacy-anchor migration, and strict-mode verification defaults. The production checkpoint signer and authenticated key resolver are now derived inside the `AuditLog` constructor from its required arguments, so every production call site signs checkpoints when the fortress holds an identity and verifies them through the identity's signed rotation history; a wired-consumer test drives the real `createSanctuaryServer` boot path. Bounds: a fortress with no identity yet, and the root daemon's split audit store, write honestly `unsigned` checkpoints; `audit-chain verify --no-strict` reports findings with exit code 10; single-file export is one-chain-only when multiple audit chains exist, and standalone verification checks rotation-anchor shape/linkage but not the custody-key MAC. This slice wires authenticated verification of SIGNED checkpoints and adds code-level silent-downgrade detection (**IC-05-DG**): signature stripping and targeted deletion of committed signed checkpoints (a prefix, an interior run, or a stripped-boundary prefix) surface while either of two authenticated control records survives, and deletion of the committed tail surfaces the same way except when an authentic earlier signing-head record is also replayed. That replay case, along with erasure of both control records or of the complete signing-evidence set, is a bound owned by off-host verification rather than local detection (register id **IC-05-DG**); erasing both control records over surviving signed evidence leaves a permanently latched recovery warning. This is a code-level claim with no drill evidence yet, so it stays partial pending the external-verifier drill: **IC-05**.",
+      "next": "The external-verifier drill over production-signed and deliberately tampered checkpoints, plus the chain-embedded per-checkpoint high-water follow-up that closes the signing-head-replay bound with local evidence. External anchoring to a third-party transparency log remains separate."
+    },
+    {
+      "claim": "State encryption",
+      "platform": "Cross-platform server storage",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "server/test/security/tamper-detection.test.ts",
+          "href": "server/test/security/tamper-detection.test.ts"
+        },
+        {
+          "label": "server/test/security/iv-uniqueness.test.ts",
+          "href": "server/test/security/iv-uniqueness.test.ts"
+        },
+        {
+          "label": "server/src/core/encryption.ts",
+          "href": "server/src/core/encryption.ts"
+        }
+      ],
+      "evidence_text": "[server/test/security/tamper-detection.test.ts](server/test/security/tamper-detection.test.ts); [server/test/security/iv-uniqueness.test.ts](server/test/security/iv-uniqueness.test.ts); [server/src/core/encryption.ts](server/src/core/encryption.ts)",
+      "bounds": "Tests cover AES-GCM tamper rejection and IV uniqueness. They do not by themselves prove host keychain security or hardware-backed key custody.",
+      "next": "Filesystem storage drill that confirms no plaintext state, unique IVs across persisted writes, and failed decrypt after ciphertext, IV, or tag mutation."
+    },
+    {
+      "claim": "State envelope integrity / default verify-on-read",
+      "platform": "Cross-platform server storage",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "PR #275",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/275"
+        },
+        {
+          "label": "server/test/cognitive/state-envelope-integrity.test.ts",
+          "href": "server/test/cognitive/state-envelope-integrity.test.ts"
+        },
+        {
+          "label": "server/test/cognitive/state-envelope-migration-drill.test.ts",
+          "href": "server/test/cognitive/state-envelope-migration-drill.test.ts"
+        },
+        {
+          "label": "server/test/cognitive/state-read-refuses-unverified.test.ts",
+          "href": "server/test/cognitive/state-read-refuses-unverified.test.ts"
+        },
+        {
+          "label": "server/test/cognitive/state-disclose-unattributed.test.ts",
+          "href": "server/test/cognitive/state-disclose-unattributed.test.ts"
+        },
+        {
+          "label": "server/test/cognitive/state-disclose-unattributed-tool.test.ts",
+          "href": "server/test/cognitive/state-disclose-unattributed-tool.test.ts"
+        },
+        {
+          "label": "server/test/cli/state-disclose-unattributed-cli.test.ts",
+          "href": "server/test/cli/state-disclose-unattributed-cli.test.ts"
+        },
+        {
+          "label": "server/src/cognitive/state-store.ts",
+          "href": "server/src/cognitive/state-store.ts"
+        },
+        {
+          "label": "server/src/cognitive/tools.ts",
+          "href": "server/src/cognitive/tools.ts"
+        }
+      ],
+      "evidence_text": "[PR #275](https://github.com/eriknewton/sanctuary-framework/pull/275); [server/test/cognitive/state-envelope-integrity.test.ts](server/test/cognitive/state-envelope-integrity.test.ts); [server/test/cognitive/state-envelope-migration-drill.test.ts](server/test/cognitive/state-envelope-migration-drill.test.ts); [server/test/cognitive/state-read-refuses-unverified.test.ts](server/test/cognitive/state-read-refuses-unverified.test.ts); [server/test/cognitive/state-disclose-unattributed.test.ts](server/test/cognitive/state-disclose-unattributed.test.ts); [server/test/cognitive/state-disclose-unattributed-tool.test.ts](server/test/cognitive/state-disclose-unattributed-tool.test.ts); [server/test/cli/state-disclose-unattributed-cli.test.ts](server/test/cli/state-disclose-unattributed-cli.test.ts); [server/src/cognitive/state-store.ts](server/src/cognitive/state-store.ts); [server/src/cognitive/tools.ts](server/src/cognitive/tools.ts)",
+      "bounds": "Schema-2 envelopes bind namespace, key, version, kid, metadata, integrity hash, and payload metadata, and are signed under the `sanctuary.state-envelope.v1` domain prefix. `state_read` verifies by default and rollback anchors are persisted with MAC authentication. The rollback floor still has an anchor-deletion replay residual; closing that requires boot-anchored or externally attested storage. A separate private key-resolution hardening item tracked under register id M-01 is closed. Representative legacy entries auto-migrate on first verified read when the local writer identity is available. Since STATE-READ-REFUSE-01 the enforcing read path returns a value only when verification established the writer: an entry whose writer cannot be established is refused with classification `writer_unverified` rather than returned unverified. COMPATIBILITY BOUND: on a genuinely un-migrated pre-v2 fortress whose writer identity is absent from the local identity store, those entries no longer read through `state_read` until that identity is restored, after which the first read verifies and migrates them. `state_list`, `state_export`, and `state_delete` do not route through that path and still reach the affected entries, so the AGENTS.md MUST-NEVER #2 disjunction is satisfied, but state what the owner loses rather than reading that as no loss: for an affected entry the owner keeps metadata through `state_list`, the stored ciphertext through `state_export` and the Exit V2 bundle, and deletion through `state_delete`, and loses content inspection through every shipped surface until the writer identity is restored. Since STATE-DISCLOSE-UNATTRIB-01 the owner has a route back to that content FOR ORDINARY USER NAMESPACES, and not for the reserved `_`-prefixed set or for opaque memory handles, both of which that route refuses by design so that a Tier-1 approval cannot become a way to read internal state; for those the only remedy remains `identity_import`. `state_disclose_unattributed`, an MCP tool and a CLI verb, is Tier-1 and non-relaxable (force-pinned in both the policy loader and the runtime classifier), audits every invocation that reaches the disclosure operation with the namespace and key (a request refused on its arguments before the fortress is opened is refused before any audit log exists; a declined approval is recorded by the approval gate under its own operation, binding an arguments hash rather than the namespace and key), performs no mutation of the state store, and returns a structurally distinct shape carrying no `value` and no `signature_verified` field. Its durable writes are its own audit records plus, on the CLI transport only, the deliberate operator-visible disclosure file described next; every terminal delivery outcome, including a receipt or JSON payload that could not be delivered and a rollback that could not remove that file, is itself audited, with one named exception: if that delivery record cannot be persisted the command warns on stderr and completes rather than failing, so a storage fault leaves the delivery unrecorded instead of leaving the operator with a false diagnosis. On the CLI transport the disclosed content is written byte-for-byte to a newly created operator-only file under the fortress `disclosures/` directory and the terminal receives a receipt naming that file, with untrusted metadata reduced to bounded printable ASCII; `--json` emits the disclosure verbatim to a redirected or piped stdout and refuses a terminal. Its bounds are part of the claim: it refuses an entry whose writer CAN be established, so it is a route for the owner who has lost that identity and not a verification-optional read, and what it returns is unattributed content, not a verified read, so it restores INSPECTION and never restores attribution. The in-process `readUnverified` escape hatch still has no production call site of its own, and export followed by import still does not close the loop, because import re-verifies and skips an entry whose writer key it cannot resolve. An operator holding a backup of the writer identity recovers fully by importing it, which restores verification and migrates the entry; an operator who has lost that identity recovers the content but never the attribution. Outlier legacy shapes still need soak coverage.",
+      "next": "Run a long-running upgrade soak with mixed legacy and schema-2 traffic across all production namespace types, including outlier legacy shapes and missing-local-identity cases."
+    },
+    {
+      "claim": "Config/profile fail-closed",
+      "platform": "Cross-platform server startup and profile storage",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #269",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/269"
+        },
+        {
+          "label": "server/test/unit/core/config.test.ts",
+          "href": "server/test/unit/core/config.test.ts"
+        },
+        {
+          "label": "server/test/sovereignty-profile.test.ts",
+          "href": "server/test/sovereignty-profile.test.ts"
+        },
+        {
+          "label": "server/src/config.ts",
+          "href": "server/src/config.ts"
+        },
+        {
+          "label": "server/src/sovereignty-profile.ts",
+          "href": "server/src/sovereignty-profile.ts"
+        }
+      ],
+      "evidence_text": "[PR #269](https://github.com/eriknewton/sanctuary-framework/pull/269); [server/test/unit/core/config.test.ts](server/test/unit/core/config.test.ts); [server/test/sovereignty-profile.test.ts](server/test/sovereignty-profile.test.ts); [server/src/config.ts](server/src/config.ts); [server/src/sovereignty-profile.ts](server/src/sovereignty-profile.ts)",
+      "bounds": "Config and sovereignty profile corruption are classified, quarantined, and fail closed in tested load paths. This does not prove every future config-like store inherits the same behavior automatically.",
+      "next": "Registry check for persistent config/profile stores that requires corruption tests and fail-closed load behavior for each new store."
+    },
+    {
+      "claim": "Health and attestation evidence-based",
+      "platform": "Cross-platform server tools",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #273",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/273"
+        },
+        {
+          "label": "server/test/attestation-evidence.test.ts",
+          "href": "server/test/attestation-evidence.test.ts"
+        },
+        {
+          "label": "server/test/health-evidence.test.ts",
+          "href": "server/test/health-evidence.test.ts"
+        },
+        {
+          "label": "server/src/health/evidence.ts",
+          "href": "server/src/health/evidence.ts"
+        },
+        {
+          "label": "server/src/index.ts",
+          "href": "server/src/index.ts"
+        }
+      ],
+      "evidence_text": "[PR #273](https://github.com/eriknewton/sanctuary-framework/pull/273); [server/test/attestation-evidence.test.ts](server/test/attestation-evidence.test.ts); [server/test/health-evidence.test.ts](server/test/health-evidence.test.ts); [server/src/health/evidence.ts](server/src/health/evidence.ts); [server/src/index.ts](server/src/index.ts)",
+      "bounds": "`exec_attest` and `monitor_health` now use structured local evidence reports instead of unsupported self-claims. This does not prove TEE-backed execution or remote attestation.",
+      "next": "Evidence drill that verifies reported checks against independent process, config, storage, and audit observations, plus a separate TEE proof before any hardware-attestation claim."
+    },
+    {
+      "claim": "Egress enforcement: Linux (Castle Wall Phase 1)",
+      "platform": "Linux (Ubuntu 24.04, x86-64 only)",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "docs/audit/castle-wall-linux-install-grade-drill-2026-10-04.md",
+          "href": "docs/audit/castle-wall-linux-install-grade-drill-2026-10-04.md"
+        },
+        {
+          "label": "castle-wall-daemon/tests/integration_kernel_binding.rs",
+          "href": "castle-wall-daemon/tests/integration_kernel_binding.rs"
+        },
+        {
+          "label": "castle-wall-daemon/tests/integration_dns_bypass.rs",
+          "href": "castle-wall-daemon/tests/integration_dns_bypass.rs"
+        },
+        {
+          "label": "castle-wall-daemon/tests/integration_linux_runtime_activation.rs",
+          "href": "castle-wall-daemon/tests/integration_linux_runtime_activation.rs"
+        },
+        {
+          "label": ".github/workflows/castle-wall-linux.yml",
+          "href": ".github/workflows/castle-wall-linux.yml"
+        }
+      ],
+      "evidence_text": "[docs/audit/castle-wall-linux-install-grade-drill-2026-10-04.md](docs/audit/castle-wall-linux-install-grade-drill-2026-10-04.md); [castle-wall-daemon/tests/integration_kernel_binding.rs](castle-wall-daemon/tests/integration_kernel_binding.rs); [castle-wall-daemon/tests/integration_dns_bypass.rs](castle-wall-daemon/tests/integration_dns_bypass.rs); [castle-wall-daemon/tests/integration_linux_runtime_activation.rs](castle-wall-daemon/tests/integration_linux_runtime_activation.rs); [.github/workflows/castle-wall-linux.yml](.github/workflows/castle-wall-linux.yml)",
+      "bounds": "The proven claim is exactly: On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Basis, per the 2026-10-04 drill record (first Evidence link): the package built by continuous integration from merged commit `bbd6c7d7` (SHA-256 `0be0eedb7a3ba3f217a3e580b8d893b884d16291a10e79eb28ece3ac86ef8f5b`) was installed cold on three fresh cloud virtual machines from one provider; an owner-signed policy confined one dedicated account (default deny plus one allow rule per IP family, each a single literal address and one TCP port); each server ran boot 0 plus five reboots, each with an automatic start and a same-boot wall restart, for 36 activations and 648 attempts with none replaced. All 432 blocked attempts (IPv4 and IPv6, TCP and UDP) were each joined to the live firewall rule, a decision-log denial and an independent receiver that saw zero packets; all 216 allowed attempts returned an Ed25519-signed, nonce-bound response; an unconfined account was never affected; there was no safety intervention and teardown was bounded. Two independent offline readers from different model families scored the raw captures and agreed after one reconciliation round. KNOWN GAPS, none of which is proven: (1) FAULT INJECTION: the fault-injection witnesses (policy drift to a different account, confinement of descendant processes, loss of the firewall rules, wall process death, uncovered account history, refusal of invalid inputs by the start guard) were not drilled; they rest on tests only, and the implementation notes below are test-level claims, not drill claims. (2) OTHER PLATFORMS: no other distribution, version, kernel, CPU architecture, bare-metal host or provider is evidenced; the three servers shared one provider. (3) NOTHING BEYOND per-account allow/deny: destinations were literal IP addresses over TCP and UDP; DNS, DNS over HTTPS, DNS over TLS, hostname, template, time, address-range and UDP-allow rules were not drilled (hostname, template and time rules are refused until authenticated attribution exists), so this proves transport and address policy, not hostname or TLS security. (4) NOT A REAL AGENT: the confined account ran a test program shipped in the package, and only one confined account per server was drilled; confinement keys on the numeric user id, the package installs no per-agent cgroup binding for enforcement, and the daemon status never reads `Enforcing`, so that status is not enforcement evidence; the decision log was a per-attempt cross-check and is not claimed as a complete per-flow audit trail. (5) ARTIFACT BINDING: the proof binds to the package named above, published byte for byte (same SHA-256, checksum-verified only, no signature or apt repository yet) as the GitHub pre-release [Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1); a later build is not covered until it is re-drilled or shown unchanged; only a fresh install was drilled, and removal or upgrade of a provisioned install is not covered. (6) No sustained-operation or overhead measurement. Implementation notes carried from the earlier row (code and test claims; the drill record states what the drill adds): The shipped daemon boot path now ACTIVATES the kernel runtime: on a privileged Linux host it installs the nftables table under a host ownership lock, binds NFQUEUE with FAIL_OPEN off + a joined verdict thread, starts the manifest watcher, and sends the systemd `READY=1` notification only once the runtime is live, reaching `KernelRuntimeReady`. Watcher-driven policy changes are fully verified and staged, receive an authenticated durable precommit audit, and become live only after that write succeeds. Initial inotify subscription failure may fall back to a synchronously validated 2-second poller only after its degradation audit is durable; any later watcher loss is fatal. Servers-first fail-before: on a supported Linux host a required acquisition or readiness failure (foreign pre-existing table, host-lock conflict, nft verify failure, NFQUEUE/watcher bind failure, or a failed `READY=1` delivery to a configured `NOTIFY_SOCKET`) unwinds acquired resources in order, emits no `READY=1`, and makes boot REFUSE TO START with a typed error (nonzero exit) so systemd restarts it; it never returns a live-but-non-enforcing control-plane-only handle on Linux. After readiness, nft ownership health queries are isolated behind a one-second fail-closed deadline and are single-flight and rate-limited, so an authenticated status query reads the supervisor's published observation instead of forking a proof of its own. The reading is three-valued: a COMPLETED negative proof is a PROVEN loss of nftables, NFQUEUE, or watcher readiness and receives a critical durable `kernel_runtime_lost` audit before ordered teardown and nonzero exit, while a deadline overrun or momentary contention is reported as INDETERMINATE (`probe_unavailable`) rather than as a loss, still withholds every readiness assertion, and fails closed the same way after three consecutive indeterminate readings. The authenticated status wire and the npm consumer negotiate protocol version and capabilities in the handshake, so a daemon and a consumer at different versions degrade to the older shape rather than deadlocking the audit-ACK path. Per the 2026-09-02 owner ruling, a confirmed audit ACK (`audit_drain_ack_response`) is MANDATORY before Sanctuary reports drain health, arms a full activation, or makes a complete-enforcement claim: a pre-v2 daemon keeps operating (the ACK is still sent and the daemon still truncates) but the activation is reported `unconfirmed_audit_ack`, `drainHealthy()` reads false, the health-evidence verdict is `degraded`, and a durable `castle_wall_audit_ack_unconfirmed` record is written, so the weaker basis is never silently healthy. The candidate evaluates the complete signed policy in ordered Rust logic against the kernel runtime it activates. The package ships an agent unit template with no boot autostart; its start is ordered behind the wall's readiness and refused unless one kernel read finds the instance's uid bound and a credential self-check matches that uid. The drill observed, on every boot and wall restart, the confined test program starting only after the wall reported ready, as the confined account with no capabilities and no-new-privileges set; the refusal paths of that guard remain test-only. Tracked as `ic-sweep-linux-enforcement-actually-enforces`. Hostname/template/time rules are refused until authenticated attribution exists; the drill exercised only the two literal-address TCP allow rules named above, so address ranges and every other rule shape are implemented but not drilled. Kernel-runtime readiness is a precondition for enforcement, not enforcement; the drill exercised activation on cloud virtual machines, not on bare metal. STATUS: this row moved from `not_implemented` to `proven` for the narrowed claim above on the strength of the 2026-10-04 drill; an earlier pre-production drill on 2026-09-06 did not establish the enforcement claim and is not cited. Open defect: **IC-02, IC-03, IC-04** (activation wired and the install-grade drill captured for the narrowed claim; the wrapped real-agent drill remains open).",
+      "next": "A fault-injection drill on the shipped artifact (policy drift, descendant confinement, firewall-rule loss, wall process death, uncovered history, start-guard refusals); a drill with a real agent harness in place of the test program, adding DNS, DNS over HTTPS and DNS over TLS paths once hostname attribution exists; the same install-grade drill on a second distribution or version, on another CPU architecture, and on a second provider or bare metal; a signed release channel (detached signature or apt repository) for the published package; any later package build re-drilled or shown unchanged before it inherits this row; and a sustained-operation and overhead capture."
+    },
+    {
+      "claim": "Egress enforcement: macOS (Castle Wall Phase 1)",
+      "platform": "macOS",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md",
+          "href": "docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md"
+        },
+        {
+          "label": "docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md",
+          "href": "docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md"
+        },
+        {
+          "label": "docs/audit/castle-wall-macos-fresh-binary-redrill-2026-06-16.md",
+          "href": "docs/audit/castle-wall-macos-fresh-binary-redrill-2026-06-16.md"
+        },
+        {
+          "label": "docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md",
+          "href": "docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md"
+        },
+        {
+          "label": "docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md",
+          "href": "docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md"
+        },
+        {
+          "label": "castle-wall-macos/README.md",
+          "href": "castle-wall-macos/README.md"
+        },
+        {
+          "label": "castle-wall-macos/Tests/CastleWallExtensionTests/FilterProviderTests.swift",
+          "href": "castle-wall-macos/Tests/CastleWallExtensionTests/FilterProviderTests.swift"
+        },
+        {
+          "label": "server/docs/castle-wall-macos-deploy.md",
+          "href": "server/docs/castle-wall-macos-deploy.md"
+        }
+      ],
+      "evidence_text": "[docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md](docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md); [docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md](docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md); [docs/audit/castle-wall-macos-fresh-binary-redrill-2026-06-16.md](docs/audit/castle-wall-macos-fresh-binary-redrill-2026-06-16.md); [docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md](docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md); [docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md](docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md); [castle-wall-macos/README.md](castle-wall-macos/README.md); [castle-wall-macos/Tests/CastleWallExtensionTests/FilterProviderTests.swift](castle-wall-macos/Tests/CastleWallExtensionTests/FilterProviderTests.swift); [server/docs/castle-wall-macos-deploy.md](server/docs/castle-wall-macos-deploy.md)",
+      "bounds": "The proven claim is exactly: Castle Wall on macOS enforces a signed operator policy with a clean per-uid allow/deny demonstration (an agent uid is blocked on a non-allowlisted destination and reaches its allowlisted one, while the operator uid is unaffected, in the same armed window) that survives attended reboot cycles, proven on a Dev-ID-signed and notarized binary built from the project's mainline source tree. Fresh-binary re-drill 2026-06-16 (Mini1, macOS Tahoe 26.5.1): the binary was built from origin/main's exact tree 053093963dbf, Dev-ID-signed plus notarized and stapled (v807, activated ext sha 26e3c0ce, verified to be the activated binary replacing the prior v774 5fae8f4b); A2 per-uid allow/deny N=3 (agent to non-allowlisted IP 1.1.1.1 blocked 000, agent to allowlisted hostname api.anthropic.com reached 404, operator unaffected 301); A1 attended boot-survival 5 of 5 real reboots with per-uid enforcement holding across every reboot; C6 absent-boot-token fail-closed, C7 launchd KeepAlive recovery after a daemon kill, and a populated boot-audit chain (1052 checkpoints) that verifies clean under the recovered master. The earlier 2026-06-11 drill (system extension v716, N=3) first proved the clean allow/deny demonstration plus graceful disarm 3/3 and dead-man fail-open 3/3 with zero ruleDigestMismatch. Full-scope re-drill 2026-06-20 (Mini1, Tahoe, Erik-present, drill-acceptance applied): re-proven on a fresher signed binary v876 (git 75a48c5794b5; system extension v858 -> v876; Dev-ID-signed plus notarized and stapled, spctl \"Notarized Developer ID\") that carries the #653 native posture-board embed and the #596 async-init crash fix; per-uid allow/deny to https://www.apple.com was deterministic with operator uid 501 3/3 ALLOWED (HTTP 200) and agent uid 502 3/3 BLOCKED (curl (7) couldn't connect, port 443), armed via the GUI toggle and enforced by the safe-mode boot daemon (global pin c3f22755). Attended boot-survival re-drill 2026-06-22 (Mini1, Tahoe 26.5.1, Erik-present, coordinator-verified over SSH): F1 closed. The 2026-06-20 window installed and certified the F1 LaunchDaemon boot service on signed+notarized v876 but deferred the reboot cycles; this 2026-06-22 drill runs the N=5 acceptance criterion on that same build. Every attended cycle: sysext activated/enabled, safe-mode boot daemon auto-started (fresh PID each reboot), operator uid 501 3/3 ALLOWED (HTTP 200), agent uid 502 3/3 BLOCKED (curl (7) port 443, ~10-22ms), box reachable, enforcement live within approximately 45-60 seconds of boot. System Application Firewall OFF (confirms the block is the NE content filter, not ALF). A control reboot with the filter toggled OFF showed no enforcement, confirming filter state (on or off) persists across reboot. Carried-forward honest bounds (must NOT be claimed beyond): this is NOT unattended reboot survival (Mini2 2026-07-29 proved authrestart-to-login-window can deliver a manifest without an arm lease and fail open until F-SAFEMODE-NO-LEASE and F-LEASE-NO-TTL close); NOT \"audited per-rule per-flow\" and NOT \"tamper-evident per-flow audit\" (a per-rule read-out exists, but the unforgeable producer-signed per-flow audit is inert: that is the real C4 gap); a destination allowlist constrains which destinations are reachable, not what an allowed flow carries; per-flow content audit is not implemented (C4); the freshest proof attaches to the drilled tree 75a48c5794b5; one host and one OS version (Tahoe 26.5.1); no p99 overhead; the arm-lease TTL expiry leg remains inconclusive (the headless CLI arm path is still wedged on Tahoe, W7-1); and hardware boot-verification of the GUI host-app launch and the #596 async-init crash fix (this drill tested the daemon + per-uid enforcement, NOT the GUI app launch) remains owed.",
+      "next": "Unattended-reboot drill with as-uid differential after the remaining safe-mode surfacing and lease-TTL fixes land; sustained-operation drill measured in hours; the TTL-expiry leg through the real CLI enable path once the headless-arm wedge (W7-1) is fixed; a second macOS host or OS version; p99 overhead capture; and hardware boot-verification of the GUI host-app launch and the #596 crash fix on a fresh reboot."
+    },
+    {
+      "claim": "Per-agent network stop",
+      "platform": "macOS",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/test/castle-wall/provision/agent-stop.test.ts",
+          "href": "server/test/castle-wall/provision/agent-stop.test.ts"
+        },
+        {
+          "label": "server/test/hub/fortress-tier1.test.ts",
+          "href": "server/test/hub/fortress-tier1.test.ts"
+        },
+        {
+          "label": "server/test/dashboard/v1_1/templates.test.ts",
+          "href": "server/test/dashboard/v1_1/templates.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/castle-wall/provision/agent-stop.test.ts](server/test/castle-wall/provision/agent-stop.test.ts); [server/test/hub/fortress-tier1.test.ts](server/test/hub/fortress-tier1.test.ts); [server/test/dashboard/v1_1/templates.test.ts](server/test/dashboard/v1_1/templates.test.ts)",
+      "bounds": "Tests prove the dashboard stop path refuses without verified-green enforcement, revokes agent-matchable allow rules from the signing source, preserves the habeas lane, reports partial when reload is unconfirmed, and no longer writes a fortress engaged record for zero effect. This is not yet a captured on-hardware stop drill.",
+      "next": "macOS drill on an armed disposable fortress: before/after as-uid probes for every declared endpoint, operator shell unaffected, audit evidence with residual_allow_count 0 and reload_confirmed true, lift restores the rule set byte-for-byte, N>=3 plus one disarmed-wall refusal leg."
+    },
+    {
+      "claim": "Dashboard approval flow",
+      "platform": "Cross-platform local dashboard",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/test/principal-policy/dashboard.test.ts",
+          "href": "server/test/principal-policy/dashboard.test.ts"
+        },
+        {
+          "label": "server/test/principal-policy/approval-aggregator.test.ts",
+          "href": "server/test/principal-policy/approval-aggregator.test.ts"
+        },
+        {
+          "label": "server/test/cli/inbox-approvals.test.ts",
+          "href": "server/test/cli/inbox-approvals.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/principal-policy/dashboard.test.ts](server/test/principal-policy/dashboard.test.ts); [server/test/principal-policy/approval-aggregator.test.ts](server/test/principal-policy/approval-aggregator.test.ts); [server/test/cli/inbox-approvals.test.ts](server/test/cli/inbox-approvals.test.ts)",
+      "bounds": "HTTP approve/deny, timeout-deny, SSE stream, aggregator routes, and CLI approval commands are tested. Live dashboard refresh is partial: five of six inbox sources and status changes can go stale until reload, so dashboard copy must not promise real-time delivery. Open defect: **IC-12**. A browser-level operator drill is not represented in this matrix.",
+      "next": "Browser drill that opens the dashboard, receives a live Tier 1 request, approves and denies through the UI, verifies visible refresh across all inbox sources without reload, and verifies the gate result plus audit receipt."
+    },
+    {
+      "claim": "Export / exit bundle",
+      "platform": "Cross-platform server and CLI",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/test/exit/exit-bundle.test.ts",
+          "href": "server/test/exit/exit-bundle.test.ts"
+        },
+        {
+          "label": "server/test/drills/v1.1-exit-drill.test.ts",
+          "href": "server/test/drills/v1.1-exit-drill.test.ts"
+        },
+        {
+          "label": "server/test/exit/exit-bundle-hardening.test.ts",
+          "href": "server/test/exit/exit-bundle-hardening.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/exit/exit-bundle.test.ts](server/test/exit/exit-bundle.test.ts); [server/test/drills/v1.1-exit-drill.test.ts](server/test/drills/v1.1-exit-drill.test.ts); [server/test/exit/exit-bundle-hardening.test.ts](server/test/exit/exit-bundle-hardening.test.ts)",
+      "bounds": "CLI export and verifier coverage exist, but the whole exit guarantee is partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and imported bundles from a fortress that rotated identity keys can silently lose pre-rotation state. Legacy Operational audit receipts are archive-only in the current verifier, and individual legacy audit signatures are not verified as normal query continuity. Open defect: **IC-07, IC-08, IC-09**.",
+      "next": "External exit drill across fresh and key-rotated fortress directories using shipped CLI and dashboard paths: export, offline verify, import, re-key, visible skipped-entry refusal or warning, conflict refusal, and source-key cleanup verification."
+    },
+    {
+      "claim": "Query anonymity (selective disclosure)",
+      "platform": "Cross-platform server outbound payloads",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "server/test/query-anonymity/header-strip.test.ts",
+          "href": "server/test/query-anonymity/header-strip.test.ts"
+        },
+        {
+          "label": "server/test/query-anonymity/pii-rewrite.test.ts",
+          "href": "server/test/query-anonymity/pii-rewrite.test.ts"
+        },
+        {
+          "label": "server/test/query-anonymity/smart-mode.test.ts",
+          "href": "server/test/query-anonymity/smart-mode.test.ts"
+        },
+        {
+          "label": "server/test/drills/v1.1-privacy-drill.test.ts",
+          "href": "server/test/drills/v1.1-privacy-drill.test.ts"
+        },
+        {
+          "label": "server/test/drills/v1.x-provider-matrix-privacy-drill.test.ts",
+          "href": "server/test/drills/v1.x-provider-matrix-privacy-drill.test.ts"
+        }
+      ],
+      "evidence_text": "[server/test/query-anonymity/header-strip.test.ts](server/test/query-anonymity/header-strip.test.ts); [server/test/query-anonymity/pii-rewrite.test.ts](server/test/query-anonymity/pii-rewrite.test.ts); [server/test/query-anonymity/smart-mode.test.ts](server/test/query-anonymity/smart-mode.test.ts); [server/test/drills/v1.1-privacy-drill.test.ts](server/test/drills/v1.1-privacy-drill.test.ts); [server/test/drills/v1.x-provider-matrix-privacy-drill.test.ts](server/test/drills/v1.x-provider-matrix-privacy-drill.test.ts)",
+      "bounds": "Coverage is bounded by the magic-string corpus and the shipped adapter list at drill time; novel PII shapes not represented in the corpus and provider adapters added after this drill require corpus and matrix extension.",
+      "next": "Drill-on-add: any new outbound adapter or PII shape requires a matrix-extension PR before merge."
+    },
+    {
+      "claim": "Context-gate single source of truth",
+      "platform": "Cross-platform server tools",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #281",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/281"
+        },
+        {
+          "label": "server/test/operational/context-gate.test.ts",
+          "href": "server/test/operational/context-gate.test.ts"
+        },
+        {
+          "label": "server/test/operational/context-gate-enforcer.test.ts",
+          "href": "server/test/operational/context-gate-enforcer.test.ts"
+        },
+        {
+          "label": "server/test/system-prompt-generator-v2.test.ts",
+          "href": "server/test/system-prompt-generator-v2.test.ts"
+        },
+        {
+          "label": "PR #269",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/269"
+        }
+      ],
+      "evidence_text": "[PR #281](https://github.com/eriknewton/sanctuary-framework/pull/281); [server/test/operational/context-gate.test.ts](server/test/operational/context-gate.test.ts); [server/test/operational/context-gate-enforcer.test.ts](server/test/operational/context-gate-enforcer.test.ts); [server/test/system-prompt-generator-v2.test.ts](server/test/system-prompt-generator-v2.test.ts); [PR #269](https://github.com/eriknewton/sanctuary-framework/pull/269)",
+      "bounds": "The persisted sovereignty profile `features.context_gating` is the source of truth; `ContextGateEnforcer` is initialized from the profile at boot; proxy `contextGateFilter` delegates to the live enforcer instead of returning unchanged args; combined-state status is surfaced through health. This does not prove every future outbound surface automatically registers with the shared enforcer.",
+      "next": "Registry guard for new outbound surfaces requiring explicit context-gate routing, plus an end-to-end drill that toggles profile `features.context_gating` and verifies prompt text, proxy filtering, health status, and audit behavior across restart."
+    },
+    {
+      "claim": "Proxy isolation: env (PR #267)",
+      "platform": "Cross-platform stdio MCP upstreams",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #267",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/267"
+        },
+        {
+          "label": "server/test/proxy/client-manager.test.ts",
+          "href": "server/test/proxy/client-manager.test.ts"
+        },
+        {
+          "label": "server/src/proxy/client-manager.ts",
+          "href": "server/src/proxy/client-manager.ts"
+        }
+      ],
+      "evidence_text": "[PR #267](https://github.com/eriknewton/sanctuary-framework/pull/267); [server/test/proxy/client-manager.test.ts](server/test/proxy/client-manager.test.ts); [server/src/proxy/client-manager.ts](server/src/proxy/client-manager.ts)",
+      "bounds": "Stdio upstreams receive a minimal allowlisted environment with deny filtering. This row does not cover SSE URL SSRF or network isolation.",
+      "next": "Regression test that spawns a fixture upstream process and asserts observed environment contains only the allowed keys and explicit safe operator config."
+    },
+    {
+      "claim": "Proxy SSE SSRF protection",
+      "platform": "Cross-platform SSE MCP upstreams",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #278",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/278"
+        },
+        {
+          "label": "server/src/proxy/client-manager.ts",
+          "href": "server/src/proxy/client-manager.ts"
+        }
+      ],
+      "evidence_text": "[PR #278](https://github.com/eriknewton/sanctuary-framework/pull/278); [server/src/proxy/client-manager.ts](server/src/proxy/client-manager.ts)",
+      "bounds": "`ssrf-validator.ts` blocks loopback, RFC1918, link-local, multicast, IPv6 loopback/local, and cloud metadata addresses; DNS resolution is validated before connection; the operator escape hatch is audited through `appendCritical`. This does not prove kernel-level network isolation for SSE transports.",
+      "next": "Network-level SSE drill that attempts DNS rebinding and redirect chains from a fixture upstream, confirms validator rejection plus critical audit evidence, and separately verifies Castle Wall or host firewall enforcement for configured SSE egress."
+    },
+    {
+      "claim": "Dynamic proxy tool discovery",
+      "platform": "Cross-platform MCP upstreams",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #283",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/283"
+        },
+        {
+          "label": "server/src/proxy/client-manager.ts",
+          "href": "server/src/proxy/client-manager.ts"
+        },
+        {
+          "label": "server/test/proxy/client-manager.test.ts",
+          "href": "server/test/proxy/client-manager.test.ts"
+        }
+      ],
+      "evidence_text": "[PR #283](https://github.com/eriknewton/sanctuary-framework/pull/283); [server/src/proxy/client-manager.ts](server/src/proxy/client-manager.ts); [server/test/proxy/client-manager.test.ts](server/test/proxy/client-manager.test.ts)",
+      "bounds": "Dynamic tool-list strategy handles `tools/list_changed` notifications; `ClientManager` refreshes the proxy catalog on reconnect; Tier 1 approval gating, context-gate filtering, and critical audit emission are preserved. This does not prove every possible upstream transport emits timely change notifications.",
+      "next": "End-to-end upstream fixture drill that mutates its tool list under load, verifies stale tools disappear after reconnect or notification, and records policy wrapping plus audit evidence for added and removed tools."
+    },
+    {
+      "claim": "did:key encoding (PR #268, base58btc compliant)",
+      "platform": "Cross-platform identity",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #268",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/268"
+        },
+        {
+          "label": "server/test/identity-did-key.test.ts",
+          "href": "server/test/identity-did-key.test.ts"
+        },
+        {
+          "label": "server/src/core/identity.ts",
+          "href": "server/src/core/identity.ts"
+        }
+      ],
+      "evidence_text": "[PR #268](https://github.com/eriknewton/sanctuary-framework/pull/268); [server/test/identity-did-key.test.ts](server/test/identity-did-key.test.ts); [server/src/core/identity.ts](server/src/core/identity.ts)",
+      "bounds": "New identities use base58btc `did:key` encoding and tests include W3C Ed25519 vectors. Legacy base64url DIDs may still exist in historical state and docs until migration cleanup.",
+      "next": "Migration drill that loads legacy identities, preserves verification, emits new compliant DIDs for new identities, and confirms public docs no longer describe the legacy encoding as current behavior."
+    },
+    {
+      "claim": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
+      "platform": "Cross-platform identity",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #270",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/270"
+        },
+        {
+          "label": "server/test/identity-signing-helpers.test.ts",
+          "href": "server/test/identity-signing-helpers.test.ts"
+        },
+        {
+          "label": "server/test/principal-policy/approval-gate.test.ts",
+          "href": "server/test/principal-policy/approval-gate.test.ts"
+        },
+        {
+          "label": "server/test/security/tool-registry-raw-signing-guard.test.ts",
+          "href": "server/test/security/tool-registry-raw-signing-guard.test.ts"
+        },
+        {
+          "label": "server/docs/tool-registry-raw-signing-policy.md",
+          "href": "server/docs/tool-registry-raw-signing-policy.md"
+        }
+      ],
+      "evidence_text": "[PR #270](https://github.com/eriknewton/sanctuary-framework/pull/270); [server/test/identity-signing-helpers.test.ts](server/test/identity-signing-helpers.test.ts); [server/test/principal-policy/approval-gate.test.ts](server/test/principal-policy/approval-gate.test.ts); [server/test/security/tool-registry-raw-signing-guard.test.ts](server/test/security/tool-registry-raw-signing-guard.test.ts); [server/docs/tool-registry-raw-signing-policy.md](server/docs/tool-registry-raw-signing-policy.md)",
+      "bounds": "Raw `identity_sign` is Tier 1 and typed internal signing helpers are not exposed as MCP tools. Guard enforces classification per registered tool name; non-registered helpers and dynamically constructed tool names remain manual-review surface.",
+      "next": "Static analysis pass on every Ed25519.sign() call site that is not behind a domain-separation wrapper."
+    },
+    {
+      "claim": "Composition root review surface",
+      "platform": "Cross-platform server startup",
+      "status": "planned",
+      "evidence": [
+        {
+          "label": "server/src/index.ts",
+          "href": "server/src/index.ts"
+        },
+        {
+          "label": "server/test/composition/composition-v1.test.ts",
+          "href": "server/test/composition/composition-v1.test.ts"
+        }
+      ],
+      "evidence_text": "[server/src/index.ts](server/src/index.ts); [server/test/composition/composition-v1.test.ts](server/test/composition/composition-v1.test.ts); Wave 4 deferred to v1.4",
+      "bounds": "Composition features have dedicated tests, but the main server composition root remains large and is explicitly deferred to Wave 4 review in v1.4. Reviewability and trust-boundary mapping are not yet proven.",
+      "next": "Wave 4 composition-root review: split startup wiring into bounded modules, add dependency graph tests, and document trust-boundary ownership per module."
+    },
+    {
+      "claim": "Hostile-guest containment: macOS box launcher jails uncooperative plugins (B2 inner-confinement, seccomp-deny-AF_VSOCK)",
+      "platform": "macOS host, Linux guest (Apple Containerization)",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "PR #441",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/441"
+        },
+        {
+          "label": "PR #439",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/439"
+        },
+        {
+          "label": "castle-wall-vmm/Sources/SanctuaryVMM/SanctuaryGuestJail.swift",
+          "href": "castle-wall-vmm/Sources/SanctuaryVMM/SanctuaryGuestJail.swift"
+        },
+        {
+          "label": "castle-wall-daemon/src/jail.rs",
+          "href": "castle-wall-daemon/src/jail.rs"
+        }
+      ],
+      "evidence_text": "[PR #441](https://github.com/eriknewton/sanctuary-framework/pull/441); [PR #439](https://github.com/eriknewton/sanctuary-framework/pull/439); [castle-wall-vmm/Sources/SanctuaryVMM/SanctuaryGuestJail.swift](castle-wall-vmm/Sources/SanctuaryVMM/SanctuaryGuestJail.swift); [castle-wall-daemon/src/jail.rs](castle-wall-daemon/src/jail.rs); launcher-integration drill on the signing/boot host, 2026-06-09, GREEN 3/3: Phase A baseline (jail off) reproduced the vminitd escape (`B2X-EXPLOIT-CONFIRMED`), Phase B (jail on) shut it (`B2X-REJECTED` + `[JAIL]` marker) on all 3 boots; evidence in the PR #441 body and the coordinator drill runbook",
+      "bounds": "The proven claim is exactly: the trusted launcher applies seccomp-deny-AF_VSOCK inner-confinement to an UNCOOPERATIVE plugin and the vminitd escape confirmed without it is shut with it (N=3/3), with AF_UNIX egress intact, via the python-preamble delivery on a python-capable image (`python:3.12-alpine`). It does NOT yet cover python-less guest images: the static `sanctuary-jail` delivery path (binary authenticated by a required operator-pinned SHA-256 computed on its staged copy, ELF shape checks as secondary sanity only, bind-mounted by the launcher, static linkage enforced in CI) is built and unit/CI-verified but has not run its own box drill. It is also one inner-confinement layer, not full plugin-isolation; do not claim \"plugin-isolated on Mac\".",
+      "next": "Static-binary delivery drill on the signing/boot host (coordinator-orchestrated, Erik present, N≥3): forced static delivery shuts the same exploit probe with the shim's `[JAIL]` marker, plus python-less-image fail-closed checks -- see the static-binary addendum in the B2 launcher-integration drill runbook."
+    },
+    {
+      "claim": "Verifiable transparency checkpoint format and offline verifier",
+      "platform": "Cross-platform server and CLI; signing custody macOS helper-as-signer",
+      "status": "proven",
+      "evidence": [
+        {
+          "label": "server/src/transparency/checkpoint.ts",
+          "href": "server/src/transparency/checkpoint.ts"
+        },
+        {
+          "label": "server/src/transparency/emitter.ts",
+          "href": "server/src/transparency/emitter.ts"
+        },
+        {
+          "label": "server/src/transparency/verify.ts",
+          "href": "server/src/transparency/verify.ts"
+        },
+        {
+          "label": "server/src/transparency/against-log.ts",
+          "href": "server/src/transparency/against-log.ts"
+        },
+        {
+          "label": "server/test/transparency/emitter.test.ts",
+          "href": "server/test/transparency/emitter.test.ts"
+        },
+        {
+          "label": "server/test/transparency/verify.test.ts",
+          "href": "server/test/transparency/verify.test.ts"
+        },
+        {
+          "label": "server/test/transparency/against-log.test.ts",
+          "href": "server/test/transparency/against-log.test.ts"
+        },
+        {
+          "label": "server/test/transparency/cli-transparency.test.ts",
+          "href": "server/test/transparency/cli-transparency.test.ts"
+        },
+        {
+          "label": "server/docs/transparency-checkpoints.md",
+          "href": "server/docs/transparency-checkpoints.md"
+        }
+      ],
+      "evidence_text": "[server/src/transparency/checkpoint.ts](server/src/transparency/checkpoint.ts); [server/src/transparency/emitter.ts](server/src/transparency/emitter.ts); [server/src/transparency/verify.ts](server/src/transparency/verify.ts); [server/src/transparency/against-log.ts](server/src/transparency/against-log.ts); [server/test/transparency/emitter.test.ts](server/test/transparency/emitter.test.ts); [server/test/transparency/verify.test.ts](server/test/transparency/verify.test.ts); [server/test/transparency/against-log.test.ts](server/test/transparency/against-log.test.ts); [server/test/transparency/cli-transparency.test.ts](server/test/transparency/cli-transparency.test.ts); [server/docs/transparency-checkpoints.md](server/docs/transparency-checkpoints.md)",
+      "bounds": "Tests prove the format and verifier properties: forged signatures rejected, counter rollback/gap/duplicate and replaced-checkpoint linkage detected, tampered counters detected, fail-closed emission (no unsigned or partial checkpoint on any failure). Offline completeness: a clean PASS / exit 0 means \"verified complete from genesis with the authentic genesis sentinel\" and nothing else. A bundle whose earliest checkpoint is counter N>1 FAILS by default (withheld-prefix `counter_prefix_missing`); a counter-1 record whose `previous_checkpoint_hash` is not the genesis sentinel (`\"GENESIS\"`) FAILS as a forged/withheld origin (`genesis_sentinel_mismatch`) and `--allow-partial` cannot launder it; a misplaced genesis sentinel on a non-earliest record FAILS (`genesis_sentinel_misplaced`). A suffix fragment verifies only under explicit `--allow-partial`, which returns the DISTINCT verdict `PARTIAL` and the dedicated exit code `10` (never PASS / exit 0), so no caller gating on verdict or exit code can read incomplete evidence as a complete-from-genesis verification. Host (`--against-log`) detection: tail truncation, content alteration, and non-prefix in-window deletion are detected against the live log; deletion of the LOWEST covered entry (which mimics rotation by raising the live floor) is detected ONLY when the master-key-MAC'd rotation anchor authenticates the cut (requires the fortress passphrase) and otherwise FAILS closed (`rotation_floor_unauthenticated`). A host PASS therefore means \"the live log matches the signed root over the covered window, OR a pruned prefix was proven by an authenticated rotation anchor\"; a host run that emits only a `merkle root not recomputed` note is NOT evidence the live log matches the signed root. What this row does NOT claim: that the wall was enforcing on the wire (enforcement claims trace to the Castle Wall drill rows, not to this format); the emitting binary hash is self-reported; there is no hosted transparency log and no external anchoring; publishing is a manual operator action. No third-party cross-host verification drill has been captured yet. Under the [Proof-of-Control working draft's tier language](https://github.com/LFDT-ProofOfControl/ov-poc-standard) (C7.1.5, LF Decentralized Trust, public comment to 2026-10-30, not a final standard), a system that evidences evaluation without mediating the effect channel may claim Tier 1 to 2 only; this row does not adopt, implement or claim a tier.",
+      "next": "Cross-host drill: operator publishes a bundle from the enforcement host, an independent party verifies it offline on a different machine with only the published key, and a deliberately truncated log on the host is caught by --against-log; then external anchoring (e.g., Sigstore Rekor) for operator-independent proof."
+    },
+    {
+      "claim": "Sovereign encrypted memory custody (Rung 1, candidate)",
+      "platform": "Cross-platform server storage; plaintext export, ingest, and transcode verbs require a local-human approval dialog available on macOS only, with Linux and Windows failing closed on those verbs today",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "PR #1362",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/1362"
+        },
+        {
+          "label": "PR #1145",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/1145"
+        },
+        {
+          "label": "docs/rung1-fresh-host.md",
+          "href": "docs/rung1-fresh-host.md"
+        },
+        {
+          "label": "server/test/sdw",
+          "href": "server/test/sdw"
+        },
+        {
+          "label": "server/test/structure/rung1-memory-claim-guard.test.ts",
+          "href": "server/test/structure/rung1-memory-claim-guard.test.ts"
+        },
+        {
+          "label": "server/test/cli/memory-file.test.ts",
+          "href": "server/test/cli/memory-file.test.ts"
+        },
+        {
+          "label": "server/test/principal-policy/rung1-allow-files-tier1.test.ts",
+          "href": "server/test/principal-policy/rung1-allow-files-tier1.test.ts"
+        },
+        {
+          "label": "server/src/core/master-rotation.ts",
+          "href": "server/src/core/master-rotation.ts"
+        },
+        {
+          "label": "server/test/core/master-rotation.test.ts",
+          "href": "server/test/core/master-rotation.test.ts"
+        }
+      ],
+      "evidence_text": "[PR #1362](https://github.com/eriknewton/sanctuary-framework/pull/1362); [PR #1145](https://github.com/eriknewton/sanctuary-framework/pull/1145); [docs/rung1-fresh-host.md](docs/rung1-fresh-host.md); [server/test/sdw](server/test/sdw); [server/test/structure/rung1-memory-claim-guard.test.ts](server/test/structure/rung1-memory-claim-guard.test.ts); [server/test/cli/memory-file.test.ts](server/test/cli/memory-file.test.ts); [server/test/principal-policy/rung1-allow-files-tier1.test.ts](server/test/principal-policy/rung1-allow-files-tier1.test.ts); [server/src/core/master-rotation.ts](server/src/core/master-rotation.ts); [server/test/core/master-rotation.test.ts](server/test/core/master-rotation.test.ts)",
+      "bounds": "Rung 1 ships as a candidate. Before relying on a host for daily use, the operator confirms restart persistence on that exact host: store a memory, restart, and read it back with no secret typed. At inference time the stored memory content is exposed to whichever model vendor the operator has chosen; custody covers the vault at rest and in transit between fortresses only. Master-key rotation does not yet cover the SDW memory namespaces; while any of them holds data, rotation refuses at preflight and changes nothing. There is no shipped procedure yet to rotate a fortress that holds memory records.",
+      "next": "An operator-run restart-persistence confirmation captured across a representative host set; memory-namespace coverage in master-key rotation for a fortress that holds memory records; and the Linux and Windows local-human approval dialog that lets plaintext memory verbs run on those platforms."
+    },
+    {
+      "claim": "Signed model-catalog verification (Rung 2 S1, catalog v3)",
+      "platform": "Cross-platform server library surface; no host boot-path wiring",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "PR #1361",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/1361"
+        },
+        {
+          "label": "server/src/intelligence/model-catalog-v3.ts",
+          "href": "server/src/intelligence/model-catalog-v3.ts"
+        },
+        {
+          "label": "server/test/intelligence/model-catalog-v3.test.ts",
+          "href": "server/test/intelligence/model-catalog-v3.test.ts"
+        },
+        {
+          "label": "server/test/intelligence/model-catalog-v3-schema.test.ts",
+          "href": "server/test/intelligence/model-catalog-v3-schema.test.ts"
+        },
+        {
+          "label": "server/test/intelligence/model-catalog-v3-package.test.ts",
+          "href": "server/test/intelligence/model-catalog-v3-package.test.ts"
+        }
+      ],
+      "evidence_text": "[PR #1361](https://github.com/eriknewton/sanctuary-framework/pull/1361); [server/src/intelligence/model-catalog-v3.ts](server/src/intelligence/model-catalog-v3.ts); [server/test/intelligence/model-catalog-v3.test.ts](server/test/intelligence/model-catalog-v3.test.ts); [server/test/intelligence/model-catalog-v3-schema.test.ts](server/test/intelligence/model-catalog-v3-schema.test.ts); [server/test/intelligence/model-catalog-v3-package.test.ts](server/test/intelligence/model-catalog-v3-package.test.ts)",
+      "bounds": "The verification API is built and tested: signed catalog v3, catalog-index v1, and overlay v1 structures verify against a compiled key policy and a byte-pinned schema-digest manifest, with every commitment recomputed from bytes and canonical Ed25519 decoding. There is no production consumer yet: the MCP server boot path does not call this module, so a verified result here does not mean any shipped model-selection surface reads it. Publishing a signed catalog asset is an owner-gated decision that has not been made.",
+      "next": "A wired-consumer test against the real server composition root, run once a signed catalog or overlay asset is published, proving a shipped model-selection surface reads and verifies it."
+    },
+    {
+      "claim": "Fleet licensing and node-count enforcement (first paid tier)",
+      "platform": "Cross-platform server, CLI, and daemon federation roster",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "PR #868",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/868"
+        },
+        {
+          "label": "PR #871",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/871"
+        },
+        {
+          "label": "PR #888",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/888"
+        },
+        {
+          "label": "PR #889",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/889"
+        },
+        {
+          "label": "PR #890",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/890"
+        },
+        {
+          "label": "PR #1338",
+          "href": "https://github.com/eriknewton/sanctuary-framework/pull/1338"
+        },
+        {
+          "label": "server/test/entitlement",
+          "href": "server/test/entitlement"
+        },
+        {
+          "label": "server/test/cli/fleet.test.ts",
+          "href": "server/test/cli/fleet.test.ts"
+        },
+        {
+          "label": "server/test/cli/license.test.ts",
+          "href": "server/test/cli/license.test.ts"
+        },
+        {
+          "label": "server/test/principal-policy/fleet-daemon-enforcement.test.ts",
+          "href": "server/test/principal-policy/fleet-daemon-enforcement.test.ts"
+        },
+        {
+          "label": "server/test/principal-policy/fleet-roster.test.ts",
+          "href": "server/test/principal-policy/fleet-roster.test.ts"
+        }
+      ],
+      "evidence_text": "[PR #868](https://github.com/eriknewton/sanctuary-framework/pull/868); [PR #871](https://github.com/eriknewton/sanctuary-framework/pull/871); [PR #888](https://github.com/eriknewton/sanctuary-framework/pull/888); [PR #889](https://github.com/eriknewton/sanctuary-framework/pull/889); [PR #890](https://github.com/eriknewton/sanctuary-framework/pull/890); [PR #1338](https://github.com/eriknewton/sanctuary-framework/pull/1338); [server/test/entitlement](server/test/entitlement); [server/test/cli/fleet.test.ts](server/test/cli/fleet.test.ts); [server/test/cli/license.test.ts](server/test/cli/license.test.ts); [server/test/principal-policy/fleet-daemon-enforcement.test.ts](server/test/principal-policy/fleet-daemon-enforcement.test.ts); [server/test/principal-policy/fleet-roster.test.ts](server/test/principal-policy/fleet-roster.test.ts)",
+      "bounds": "License issuance, the tamper-evident ledger with anti-rollback anchoring, signed revocation, and node-count enforcement on the daemon federation roster are built and tested, including restart durability for the roster itself. The public roadmap states a durable node-count reboot-survival result; no captured drill artifact for that result is checked into this repository, so this row cites the test and PR evidence rather than a drill citation, and the reboot-survival figure should be read as roadmap-asserted rather than matrix-proven. Scope is licensing and node-count enforcement only: the operator add-machine enrollment flow and the signed compliance-attestation export are separate, later slices and are not covered by this row.",
+      "next": "A coordinator-verified reboot-survival result for the node-count enforcement path, recorded in the internal drill register; the add-machine enrollment flow and the compliance-attestation export reaching their own proven or partial rows once they ship."
+    },
+    {
+      "claim": "Signed model manifest verified at provisioning (Rung 2 activation)",
+      "platform": "Cross-platform server and CLI (`sanctuary init` and `sanctuary protect` with `--provision-local-intelligence`); interactive terminal required; Windows needs a manual Ollama install",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/src/intelligence/packaged-model-manifest.ts",
+          "href": "server/src/intelligence/packaged-model-manifest.ts"
+        },
+        {
+          "label": "server/test/intelligence/packaged-model-manifest.test.ts",
+          "href": "server/test/intelligence/packaged-model-manifest.test.ts"
+        },
+        {
+          "label": "server/test/wrap/local-intelligence.test.ts",
+          "href": "server/test/wrap/local-intelligence.test.ts"
+        },
+        {
+          "label": "server/test/scripts/sign-model-manifest-v2.test.ts",
+          "href": "server/test/scripts/sign-model-manifest-v2.test.ts"
+        },
+        {
+          "label": "docs/local-intelligence.md",
+          "href": "docs/local-intelligence.md"
+        }
+      ],
+      "evidence_text": "[server/src/intelligence/packaged-model-manifest.ts](server/src/intelligence/packaged-model-manifest.ts); [server/test/intelligence/packaged-model-manifest.test.ts](server/test/intelligence/packaged-model-manifest.test.ts); [server/test/wrap/local-intelligence.test.ts](server/test/wrap/local-intelligence.test.ts); [server/test/scripts/sign-model-manifest-v2.test.ts](server/test/scripts/sign-model-manifest-v2.test.ts); [docs/local-intelligence.md](docs/local-intelligence.md); exact-artifact activation drill on the signed v1.8.4 build on a clean macOS host, 2026-09-06 (twelve pre-declared observation classes incl. verification before pull, tampered and foreign-signed refusal before any download, dashboard route attribution, and restoration; record held in the internal drill register)",
+      "bounds": "The provisioning ceremony reads the Sanctuary-signed model manifest shipped inside the package, applies a byte cap and the shared V2 parser, verifies the Ed25519 signature against a dedicated model-catalog root key pinned in the build, checks the build-time byte pin, and refuses with a named audited reason before any model pull; an operator may supply a newer signed manifest by path, verified identically. Tests prove the loader, the wired composition root, and the signing tool round trip. Bounds: light assurance only (the check confirms the digest Ollama reports for each model, not every model byte on disk); no network discovery of newer manifests, so a packaged manifest can be stale; the byte pin covers an altered asset inside an otherwise intact package, and only the package's release provenance covers a rewritten package. Host evidence exists for macOS only (the 2026-09-06 exact-artifact drill); Linux and Windows activation have no host evidence, and the row stays `partial` because the verification is digest-level, not byte-level.",
+      "next": "Byte-level model verification (reading every model layer on disk against the signed manifest) before the bound can be lifted; activation drills on Linux and Windows hosts before the platform column widens."
+    },
+    {
+      "claim": "Credential surrogacy at the egress gate (agent is never issued a bound secret)",
+      "platform": "macOS",
+      "status": "partial",
+      "evidence": [
+        {
+          "label": "server/src/credential-surrogate/index.ts",
+          "href": "server/src/credential-surrogate/index.ts"
+        },
+        {
+          "label": "server/src/egress-gate/surrogate-helper-daemon.ts",
+          "href": "server/src/egress-gate/surrogate-helper-daemon.ts"
+        },
+        {
+          "label": "server/test/egress-gate/surrogate-forward.test.ts",
+          "href": "server/test/egress-gate/surrogate-forward.test.ts"
+        },
+        {
+          "label": "server/test/egress-gate/surrogate-helper-client.test.ts",
+          "href": "server/test/egress-gate/surrogate-helper-client.test.ts"
+        },
+        {
+          "label": "server/test/credential-surrogate/echo-scanner.test.ts",
+          "href": "server/test/credential-surrogate/echo-scanner.test.ts"
+        },
+        {
+          "label": "server/test/egress-gate/surrogate-echo.test.ts",
+          "href": "server/test/egress-gate/surrogate-echo.test.ts"
+        },
+        {
+          "label": "server/test/credential-surrogate/artifacts.test.ts",
+          "href": "server/test/credential-surrogate/artifacts.test.ts"
+        },
+        {
+          "label": "server/test/egress-gate/surrogate-helper-daemon-runtime.test.ts",
+          "href": "server/test/egress-gate/surrogate-helper-daemon-runtime.test.ts"
+        },
+        {
+          "label": "server/test/egress-gate/surrogate-helper-daemon-plist.test.ts",
+          "href": "server/test/egress-gate/surrogate-helper-daemon-plist.test.ts"
+        },
+        {
+          "label": "server/test/egress-gate/surrogate-arming-wiring.test.ts",
+          "href": "server/test/egress-gate/surrogate-arming-wiring.test.ts"
+        },
+        {
+          "label": "server/test/egress-gate/release-barrier.test.ts",
+          "href": "server/test/egress-gate/release-barrier.test.ts"
+        },
+        {
+          "label": "server/test/disclosure/broker/surrogate-policy.test.ts",
+          "href": "server/test/disclosure/broker/surrogate-policy.test.ts"
+        }
+      ],
+      "evidence_text": "[server/src/credential-surrogate/index.ts](server/src/credential-surrogate/index.ts); [server/src/egress-gate/surrogate-helper-daemon.ts](server/src/egress-gate/surrogate-helper-daemon.ts); [server/test/egress-gate/surrogate-forward.test.ts](server/test/egress-gate/surrogate-forward.test.ts); [server/test/egress-gate/surrogate-helper-client.test.ts](server/test/egress-gate/surrogate-helper-client.test.ts); [server/test/credential-surrogate/echo-scanner.test.ts](server/test/credential-surrogate/echo-scanner.test.ts); [server/test/egress-gate/surrogate-echo.test.ts](server/test/egress-gate/surrogate-echo.test.ts); [server/test/credential-surrogate/artifacts.test.ts](server/test/credential-surrogate/artifacts.test.ts); [server/test/egress-gate/surrogate-helper-daemon-runtime.test.ts](server/test/egress-gate/surrogate-helper-daemon-runtime.test.ts); [server/test/egress-gate/surrogate-helper-daemon-plist.test.ts](server/test/egress-gate/surrogate-helper-daemon-plist.test.ts); [server/test/egress-gate/surrogate-arming-wiring.test.ts](server/test/egress-gate/surrogate-arming-wiring.test.ts); [server/test/egress-gate/release-barrier.test.ts](server/test/egress-gate/release-barrier.test.ts); [server/test/disclosure/broker/surrogate-policy.test.ts](server/test/disclosure/broker/surrogate-policy.test.ts)",
+      "bounds": "Slices 1a, 1b-i and 1b-ii, with claims carried by tests, not by a drill. What the tests prove: for a secret the operator binds as a surrogate, the value is stored under a keychain label the broker never reads, the Secret Broker refuses to issue a read or rotate token for that name and refuses `read_secret` and `grant`, root arming mints one placeholder per binding per generation and writes three artifacts each owned by exactly its reader, the helper starts LOCKED and answers a query only for a placeholder in its current table bound to the queried host, port and header while unlocked and unexpired, and the release wrapper exports placeholders and never a value. Forward mode, misroute refusal, helper-state degrade and the response echo guard are built and test-proven but undrilled. The guard checks response header names and values and identity bodies with one bounded carry per response; a match aborts. Unsupported encodings, reaching `MAX_SURROGATE_ECHO_SCAN_BYTES`, and scan failures refuse further delivery and emit fixed causes. Stated bounds that survive slice 1b: the echo bound, transforms inside an identity body and values returned in a later response remain outside detection; unsupported encodings and reaching the scan ceiling stop delivery; a swapped chunked response whose decoded content opens like a chunk-size line that does not complete as valid framing, or opens with whitespace or a sign, is refused rather than delivered (an availability cost, not a detection gap); response framing that only nonstandard parsers accept is outside detection (SURROGATE-1B-II-LENIENT-FRAMING-01); CONNECT tunnels are not swapped, so a placeholder inside `https://` reaches the upstream unchanged and is inert; only forward-mode HTTP clients benefit; misuse in place is not prevented, an agent under prompt injection can still make authenticated calls to the bound destination; memory is not claimed beyond disabled core dumps, so root memory reads and the swap and hibernation files are uncovered; per-request gate events are not chain-audited, they are in the root-readable gate log only (`DEBT(SURROGATE-GATE-EVENTS-CHAIN)`); Linux: nothing.",
+      "next": "The section 5 credential-surrogacy drill on a real armed macOS fortress, captured under docs/audit/ with a date, after slice 1b lands forward mode: bind a secret, arm, unlock, observe the value reach the bound destination and never the agent, observe the misroute refusal and the echo event, reboot and observe the helper come up LOCKED with every value gone. Until that drill is captured this row stays `partial` and no public wording ships."
+    }
+  ]
+}

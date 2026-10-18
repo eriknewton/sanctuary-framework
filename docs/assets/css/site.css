@@ -339,3 +339,10 @@ blockquote { margin: 24px 0; padding: 4px 0 4px 24px; border-left: 2px solid var
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; } }
 @media print { .theme, .mobile-menu, .desktop-nav, .header-install { display: none; } a { color: inherit; } }
+/* Limits page (docs/limits.html): matrix rows rendered verbatim; long hashes and identifiers must wrap at 375 px. */
+.limits-row { border-top: 1px solid var(--rule); padding-top: 8px; }
+.limits-fields { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 16px 0 0; }
+.limits-fields dt { color: var(--ink-2); font-weight: 600; }
+.limits-fields dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 600px) { .limits-fields { grid-template-columns: 1fr; } .limits-fields dd { margin-bottom: 8px; } }
+.matrix-row-missing { color: var(--ink); background: var(--paper-3); }
