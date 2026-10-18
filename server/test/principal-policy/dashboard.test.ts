@@ -1784,6 +1784,14 @@ import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { CASTLE_WALL_AUDIT_PROVENANCE_KEY, CASTLE_WALL_AUDIT_PROVENANCE_VALUE } from "../../src/castle-wall/constants.js";
 
+// Test isolation (AGENTS.md "the operator's machine is not a fixture",
+// defect.dashboard-test-reads-host-producer-key-01): the production producer-key
+// loader prefers a host-wide macOS path before the fortress-relative one, so
+// every channel below pins the load to the Linux branch and reads only its own
+// temporary fortress. Without the pin, a Mac that has the root helper installed
+// supplies a real key and the synthetic unsigned evidence here is dropped.
+const TEMP_FORTRESS_ONLY_PRODUCER_KEY_LOAD = { platform: "linux" } as const;
+
 describe("Overview route parity", () => {
   it("serves matching wall evidence through sovereignty and the additive home on one Dashboard", async () => {
     let dashboard: DashboardApprovalChannel | undefined;
@@ -1792,7 +1800,8 @@ describe("Overview route parity", () => {
     try {
       await bindWithRetry(async () => {
         port = randomTestPort();
-        dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auto_open: false });
+        dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auto_open: false,
+          producer_key_load_options: TEMP_FORTRESS_ONLY_PRODUCER_KEY_LOAD });
         await dashboard.start();
       });
       const storage = new MemoryStorage();
@@ -1818,6 +1827,62 @@ describe("Overview route parity", () => {
       const home = JSON.parse(posture.body);
       expect(home.protection_detected_count).toBe(0);
       expect(home.castle_wall.last_enforcement_evidence_at).toBe(timestamp);
+      expect(live).toEqual({ castle_wall_arm_state: home.castle_wall.arm_state, evidence_basis: home.castle_wall.evidence_basis,
+        last_enforcement_evidence_at: home.castle_wall.last_enforcement_evidence_at, freshness_window_ms: home.castle_wall.freshness_window_ms,
+        audit_integrity_ok: home.castle_wall.audit_integrity_ok });
+    } finally {
+      await dashboard?.stop();
+      await temp.cleanup();
+    }
+  });
+
+  // Witness for defect.dashboard-sovereignty-producer-key-source-divergence-01:
+  // the sovereignty status and the posture home must resolve the Castle Wall
+  // producer key through one injected-or-loaded source. A fortress-relative key
+  // is present on disk while the injected resolver answers null; if either
+  // route reads the disk key instead of the injected one, it drops the unsigned
+  // synthetic entry the other route keeps, and the two disagree on signature
+  // availability for the same audit log.
+  it("resolves the producer key from one source on sovereignty and the posture home when a resolver is injected", async () => {
+    let dashboard: DashboardApprovalChannel | undefined;
+    let port = 0;
+    const temp = await createTempHome("producer-key-source-parity");
+    try {
+      await bindWithRetry(async () => {
+        port = randomTestPort();
+        dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auto_open: false,
+          producer_key_load_options: TEMP_FORTRESS_ONLY_PRODUCER_KEY_LOAD });
+        await dashboard.start();
+      });
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const config = { ...defaultConfig(), storage_path: temp.defaultFortressPath };
+      const identityManager = new IdentityManager(storage, masterKey);
+      const { storedIdentity } = createIdentity("producer-key-source-parity", derivePurposeKey(masterKey, "identity-encryption"), "recovery-key");
+      await identityManager.saveNew(storedIdentity);
+      const originDir = join(temp.defaultFortressPath, "policy", "egress");
+      await mkdir(originDir, { recursive: true });
+      await writeFile(join(originDir, "agent-origin.json"), JSON.stringify({ mode: "uid", agent_uid: 601, system_uid_allow_ceiling: 500 }), { mode: 0o600 });
+      // A well-formed (32-byte) producer public key at the fortress-relative
+      // path the config-path loader reads, so the loaded source would say
+      // "present" while the injected resolver says "no key". Random bytes are
+      // enough: the test never signs with it, it only has to load as present.
+      await writeFile(join(originDir, "audit-producer.pub"), generateRandomKey(), { mode: 0o644 });
+      const timestamp = new Date().toISOString();
+      await auditLog.appendCritical({ layer: "l1", operation: "egress_blocked", identity_id: fortressIdFromStoragePath(temp.defaultFortressPath) + "/uid-601", result: "failure", timestamp,
+        details: { [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE, dest_host: "parity.example" } });
+      dashboard!.setDependencies({ policy: DEFAULT_POLICY, baseline: new BaselineTracker(storage, masterKey), auditLog, identityManager,
+        sanctuaryConfig: config, storage, shrOpts: { config, identityManager, masterKey }, resolvePinnedProducerKey: () => null });
+      const sovereignty = await requestNoKeepAlive(`http://127.0.0.1:${port}/api/sovereignty`);
+      const posture = await requestNoKeepAlive(`http://127.0.0.1:${port}/api/posture/home`);
+      expect(sovereignty.status).toBe(200); expect(posture.status).toBe(200);
+      const live = JSON.parse(sovereignty.body).live_enforcement;
+      const home = JSON.parse(posture.body);
+      // Both routes honour the injected null resolver, so both keep the
+      // unsigned entry on the channel basis; neither reads the disk key.
+      expect(home.castle_wall.last_enforcement_evidence_at).toBe(timestamp);
+      expect(live.last_enforcement_evidence_at).toBe(timestamp);
       expect(live).toEqual({ castle_wall_arm_state: home.castle_wall.arm_state, evidence_basis: home.castle_wall.evidence_basis,
         last_enforcement_evidence_at: home.castle_wall.last_enforcement_evidence_at, freshness_window_ms: home.castle_wall.freshness_window_ms,
         audit_integrity_ok: home.castle_wall.audit_integrity_ok });

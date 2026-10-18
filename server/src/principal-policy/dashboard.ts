@@ -2264,9 +2264,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // signed close; `absent` → channel basis (honest macOS / pre-provision);
       // `unreadable` → fail honestly (the readers force non-green via
       // `producerKeyExpectedButUnavailable`), never the channel basis.
-      await this.ensureProducerKeyLoaded();
+      // The key and the enforcement-availability resolver come from the ONE
+      // shared source (`resolveWallEvidenceSources`) that `/api/sovereignty`
+      // and the aggregator snapshot also read, so no two routes can disagree
+      // on signature availability.
+      const sources = await this.resolveWallEvidenceSources();
       await this.ensureBrokerProducerKeyLoaded();
-      const load = this._producerKeyLoad;
       const brokerLoad = this._brokerProducerKeyLoad;
       // Recognition precursor: resolve the composition render-gate flag via the
       // canonical resolver (default-off). The fortress config carries no composition
@@ -2323,21 +2326,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             const cap = await this.resolveFleetCap();
             return applyFleetCap(roster, cap).roster;
           }),
-        resolvePinnedProducerKey:
-          this.injectedResolvePinnedProducerKey ??
-          (() => (load?.status === "present" ? load.keyB64url : null)),
-        producerKeyExpectedButUnavailable: this.injectedResolvePinnedProducerKey
-          ? this.injectedProducerKeyExpectedButUnavailable
-          : load?.status === "unreadable",
+        resolvePinnedProducerKey: sources.resolvePinnedProducerKey,
+        producerKeyExpectedButUnavailable:
+          sources.producerKeyExpectedButUnavailable,
         resolveBrokerPinnedProducerKey: () =>
           brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
         brokerProducerKeyExpectedButUnavailable:
           brokerLoad?.status === "unreadable",
         resolveProtectionClaimSubject: () =>
           this.resolveProtectionClaimSubject(),
-        resolveEnforcementAvailability:
-          this.injectedResolveEnforcementAvailability ??
-          (() => this.resolveEnforcementAvailability()),
+        resolveEnforcementAvailability: sources.resolveEnforcementAvailability,
         resolveVaultProvisionClaimed: () => this.resolveVaultProvisionClaimed(),
         // Wire the shared registry so the SSE live-refresh stream is available and
         // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
@@ -2531,10 +2529,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
     try {
-      // Reuse the same producer-key load + audit log + origin attribution the
-      // posture dispatcher uses, so the two surfaces can never diverge on green.
-      await this.ensureProducerKeyLoaded();
-      const load = this._producerKeyLoad;
+      // INVARIANT: this route and the posture dispatcher answer from ONE key
+      // source (`resolveWallEvidenceSources`: the injected resolver when one
+      // is set, the config-path load otherwise), so `/api/sovereignty`,
+      // `/v1/status` and `/api/posture/*` can never disagree on whether a
+      // producer signature is available for the same audit log. Reading the
+      // cached load directly here would ignore an injected resolver that the
+      // dispatcher honours, and the two surfaces would drop or keep the same
+      // enforcement entry differently.
+      const sources = await this.resolveWallEvidenceSources();
       if (this.auditLog === null) {
         // No unlocked audit log ⇒ no enforcement evidence to read. Honest
         // `unknown` (amber), never green, never a fabricated placeholder.
@@ -2573,7 +2576,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // diverge on green.
       const exclusiveEgress = await this.resolveExclusiveEgressPosture();
       const protectionClaimSubject = await this.resolveProtectionClaimSubject();
-      const enforcementAvailability = await this.resolveEnforcementAvailability();
+      const enforcementAvailability =
+        await sources.resolveEnforcementAvailability();
       // The vault's own wall claim, read from this fortress. Never throws (the
       // reader collapses every failure to `absent`/`unreadable`), and an
       // absent claim omits the additive field rather than asserting anything.
@@ -2597,9 +2601,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ...(vaultProvision.state !== "absent"
             ? { vaultProvisionClaimed: true }
             : {}),
-          pinnedProducerKeyB64url:
-            load?.status === "present" ? load.keyB64url : null,
-          ...(load?.status === "unreadable"
+          pinnedProducerKeyB64url: sources.resolvePinnedProducerKey(),
+          ...(sources.producerKeyExpectedButUnavailable
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
@@ -2671,6 +2674,53 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       most_recent_attestation_at: evidence.most_recent_attestation_at,
       dispute_count: evidence.dispute_count,
       verascore_linked: evidence.verascore_linked,
+    };
+  }
+
+  /**
+   * The ONE wall-evidence source every castle-wall reading surface consumes:
+   * the pinned producer key (with its fail-honest "expected but unavailable"
+   * flag) and the enforcement-availability resolver. Each is the injected
+   * resolver when `setDependencies` supplied one (the wrap-reuse seam), and
+   * the config-path load or the castle.sock query otherwise.
+   *
+   * INVARIANT: `/api/sovereignty` and `/v1/status` (via
+   * {@link buildStatusCastleWall}), `/api/posture/*` (via the posture
+   * dispatcher) and the aggregator snapshot MUST all resolve the key through
+   * this helper, so they can never disagree on whether a producer signature is
+   * available. Two surfaces that read different key sources can answer
+   * `signed` and `channel basis` for the same audit log, which the operator
+   * sees as one page claiming enforcement evidence and another denying it.
+   * When no resolver is injected (every current production boot) the result
+   * is the cached config-path load, byte-identical to the pre-helper tree.
+   */
+  private async resolveWallEvidenceSources(): Promise<{
+    resolvePinnedProducerKey: () => string | null;
+    producerKeyExpectedButUnavailable: boolean;
+    resolveEnforcementAvailability: () =>
+      | Promise<ResolvedEnforcementAvailability>
+      | ResolvedEnforcementAvailability;
+  }> {
+    const resolveEnforcementAvailability =
+      this.injectedResolveEnforcementAvailability ??
+      (() => this.resolveEnforcementAvailability());
+    if (this.injectedResolvePinnedProducerKey) {
+      return {
+        resolvePinnedProducerKey: this.injectedResolvePinnedProducerKey,
+        producerKeyExpectedButUnavailable:
+          this.injectedProducerKeyExpectedButUnavailable,
+        resolveEnforcementAvailability,
+      };
+    }
+    await this.ensureProducerKeyLoaded();
+    const load = this._producerKeyLoad;
+    return {
+      resolvePinnedProducerKey: () =>
+        load?.status === "present" ? load.keyB64url : null,
+      // `unreadable` means a key is expected here; the readers must fail
+      // honestly rather than drop to the channel basis.
+      producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      resolveEnforcementAvailability,
     };
   }
 
@@ -8230,20 +8280,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // wrap-reuse path) overrides the config-path load; otherwise resolve the
     // key exactly as before. The injected pair preserves the fail-honest
     // contract: `producerKeyExpectedButUnavailable` forces amber, never green
-    // on a weaker basis.
-    let resolvePinnedProducerKey: () => string | null;
-    let producerKeyExpectedButUnavailable: boolean;
-    if (this.injectedResolvePinnedProducerKey) {
-      resolvePinnedProducerKey = this.injectedResolvePinnedProducerKey;
-      producerKeyExpectedButUnavailable =
-        this.injectedProducerKeyExpectedButUnavailable;
-    } else {
-      await this.ensureProducerKeyLoaded();
-      const load = this._producerKeyLoad;
-      resolvePinnedProducerKey = () =>
-        load?.status === "present" ? load.keyB64url : null;
-      producerKeyExpectedButUnavailable = load?.status === "unreadable";
-    }
+    // on a weaker basis. Resolved through the ONE shared
+    // `resolveWallEvidenceSources` helper the sovereignty and posture routes
+    // read, so the snapshot cannot disagree with them on signature availability.
+    const {
+      resolvePinnedProducerKey,
+      producerKeyExpectedButUnavailable,
+      resolveEnforcementAvailability,
+    } = await this.resolveWallEvidenceSources();
     // Dashboard-fold PR-1: assembled by the ONE shared builder so this path
     // and the wrap-auto `startDashboard` path share identical include-or-omit
     // semantics. S5-P is unchanged: the hero shield gets the SAME fail-closed
@@ -8262,9 +8306,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       producerKeyExpectedButUnavailable,
       resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
       resolveProtectionClaimSubject: () => this.resolveProtectionClaimSubject(),
-      resolveEnforcementAvailability:
-        this.injectedResolveEnforcementAvailability ??
-        (() => this.resolveEnforcementAvailability()),
+      resolveEnforcementAvailability,
       resolveVaultProvisionClaimed: () => this.resolveVaultProvisionClaimed(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
