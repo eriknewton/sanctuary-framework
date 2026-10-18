@@ -2966,6 +2966,11 @@ async function onConciergeSend() {
   talkFollowIntent = { scrollEpoch: talkUserScrollEpoch };
   c.sending = true;
   c.error = null;
+  // True once the POST has settled successfully. The catch below reads it to
+  // tell a failed send (nothing reached the service; the draft stays for a
+  // retry) from a failed redraw over a sent message (the draft must not come
+  // back, because another Send would post the same message twice).
+  let posted = false;
   try {
     // Inside the try: c.sending is now true, and only the finally below resets
     // it. A render that throws here (a fail-loud Talk mount check) must still
@@ -2976,30 +2981,43 @@ async function onConciergeSend() {
       method: "POST",
       body: { message: message }
     });
-    const data = res.data || {};
-    // Refetch history so both operator submit + concierge response
-    // render in chronological order. The service persisted both
-    // messages before the response returned; the history endpoint is
-    // the single source of truth for the visible thread.
-    await refreshPanel(HUB + "/chat/concierge/history");
-    // Update the badge directly from the response so it reflects what
-    // served THIS query even before the next render.
-    if (data.served_by) {
-      state.chat.concierge.badge = {
-        substrate: data.served_by,
-        displayLabel: data.display_label || substrateBadgeLabel(data.served_by)
-      };
-    }
+    // INVARIANT: the sent state commits here, at POST settlement and before
+    // any redraw. The service has persisted the message, so the draft clears
+    // now; a redraw that throws after this line is a display problem over a
+    // sent message, never a failed send, and must not leave the draft in the
+    // composer where a retry would post it a second time.
+    posted = true;
     c.composer = "";
-    if (!talkDomOwnerSupported) c.pendingScroll = true;
     // The operator's successful send is an explicit draft clear, unlike a
     // background hydration. A route or panel change can remount Talk while
     // this request is in flight. The shared composer is still disabled until
     // settlement, so clear the currently mounted input regardless of
     // scroll-follow intent.
     if (talkOwner) talkOwner.input.value = "";
+    const data = res.data || {};
+    // Refetch history so both operator submit + concierge response
+    // render in chronological order. The service persisted both
+    // messages before the response returned; the history endpoint is
+    // the single source of truth for the visible thread.
+    await refreshPanel(HUB + "/chat/concierge/history");
+    // Update the badge from the response AFTER the history refresh: the
+    // history loader (fetchConciergeHistory) writes a generic per-substrate
+    // label from the last reply, and the response carries the more specific
+    // display_label for THIS reply, which must be the one left standing.
+    if (data.served_by) {
+      state.chat.concierge.badge = {
+        substrate: data.served_by,
+        displayLabel: data.display_label || substrateBadgeLabel(data.served_by)
+      };
+    }
+    if (!talkDomOwnerSupported) c.pendingScroll = true;
   } catch (e) {
-    c.error = e.message || "Concierge call failed.";
+    // After the POST settled, the only thing that can throw is the redraw of
+    // a message the service already holds: report it as a display problem in
+    // plain words, with no stack, and never as a failed send.
+    c.error = posted
+      ? "Your message was sent, but the screen could not refresh. Reload the page to see the reply."
+      : (e.message || "Concierge call failed.");
   } finally {
     c.sending = false;
     // The settling render still reads the follow request (it lands the reply);
