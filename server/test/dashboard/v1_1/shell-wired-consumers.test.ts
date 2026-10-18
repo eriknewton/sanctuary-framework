@@ -22,6 +22,7 @@
  * fields; activity rows without a verdict wearing no pass mark; and the
  * auto-trigger trend naming each bar shape in words.
  */
+import { mfpScenario } from "./fixtures/mfp-scenarios.js";
 import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
@@ -213,7 +214,7 @@ const SHELL_IDS = [
   "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
-function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
+function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}, options: { deferredHashchange?: boolean; templateContent?: boolean } = {}) {
   fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
@@ -232,7 +233,11 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       const next = String(value).startsWith("#") ? String(value) : "#" + String(value);
       const changed = next !== locationHash;
       locationHash = next;
-      if (changed && winListeners.hashchange) winListeners.hashchange();
+      if (changed && winListeners.hashchange) {
+        // Browser navigation dispatches after the click task and its microtasks have finished.
+        if (options.deferredHashchange) setTimeout(() => winListeners.hashchange!(), 0);
+        else winListeners.hashchange();
+      }
     },
     search: "",
     origin: "http://fixture",
@@ -245,6 +250,8 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       createElement: (tagName: string) => {
         const node = new FakeElement({}, tagName);
         if (tagName === "a") node.click = () => { downloads.push(node); };
+        // Opt-in native template content, for the Talk owner feature check only.
+        if (tagName === "template" && options.templateContent) Object.assign(node, { content: new FakeElement({}, "FRAGMENT") });
         return node;
       },
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
@@ -266,18 +273,20 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       if (overrides[path]) return overrides[path]!(init, path);
       const bare = path.split("?")[0]!;
       if (overrides[bare]) return overrides[bare]!(init, path);
+      // Standing-rule tests require a valid policy view; malformed policy data now fails the whole read.
+      if (path === "/api/policy/current") return Promise.resolve(response({ data: { view: { lines: [] } } }));
       return Promise.resolve(response(path === "/api/posture/home" ? home() : emptyData));
     },
     ...extraGlobals,
   });
   runInContext(getClientScript(), context);
   const navigate = (route: string) => { location.hash = "#" + route; };
-  const click = (attrs: Record<string, string>, inside: string[] = [], checked = false) => {
+  const click = (attrs: Record<string, string>, inside: string[] = [], checked = false, event: { stopPropagation?: () => void; preventDefault?: () => void } = {}) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
     // Both forms stay: slice 5's tests pass `checked: "true"` in attrs, slice 4's pass the third argument.
     target.checked = checked || attrs.checked === "true";
-    docListeners.click!({ target });
+    docListeners.click!({ target, ...event });
   };
   const clickRenderedButton = (action: string) => {
     const markup = [...el.main!.innerHTML.matchAll(/<button\b([^>]*)>/g)].find(m => m[1]!.includes(`data-action="${action}"`));
@@ -287,10 +296,15 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
     const target = new FakeElement(attrs, "BUTTON");
     docListeners.click!({ target });
   };
+  const keydown = (attrs: Record<string, string>, key: string) => {
+    const preventDefault = vi.fn();
+    docListeners.keydown!({ target: new FakeElement(attrs), key, preventDefault });
+    return preventDefault;
+  };
   const type = (text: string) => { el["global-search"]!.value = text; docListeners.input!({ target: el["global-search"] }); };
   const change = (target: FakeElement) => docListeners.change!({ target });
   const input = (action: string, value: string) => { const target = new FakeInput({ "data-action": action }); target.value = value; docListeners.input!({ target }); };
-  return { el, railLink, context, navigate, click, clickRenderedButton, type, change, input, requests, downloads };
+  return { el, railLink, context, navigate, click, clickRenderedButton, keydown, type, change, input, requests, downloads };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => {
@@ -318,10 +332,10 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     expect(h.el["rail-approvals-count"]!.textContent).toBe("1 of 1");
     expect(h.el["rail-approvals-count"]!.className).toContain("hot");
-    expect(h.railLink.getAttribute("title")).toMatch(/^1 of 1 held operations wait on you · queue read \d+s ago$/);
+    expect(h.railLink.getAttribute("title")).toMatch(/^1 of 1 held operation waits on you · queue read \d+s ago\.$/);
     expect(h.el["notify-count"]!.innerHTML).toContain("1 of 1");
     expect(h.el["notify-count"]!.className).not.toContain("unknown");
-    expect(h.el["btn-notifications"]!.getAttribute("aria-label")).toMatch(/1 of 1 held operations wait on you · queue read \d+s ago/);
+    expect(h.el["btn-notifications"]!.getAttribute("aria-label")).toMatch(/1 of 1 held operation waits on you · queue read \d+s ago/);
   });
 
   it("the seal wears the unknown tone before any enforcement evidence", async () => {
@@ -632,7 +646,8 @@ describe("slice 2 shell wired consumers", () => {
     vi.useFakeTimers();
     const h = boot({
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
-      "/api/policy/current": () => Promise.resolve(response({ data: { view: { sections: [] } } })),
+      // Policy fixtures serve the view's real lines field; a malformed policy view now fails the whole read.
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: { lines: [] } } })),
     });
     await settle();
     h.navigate("approvals");
@@ -841,7 +856,9 @@ describe("slice 2 shell wired consumers", () => {
     h.navigate("approvals");
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
-    expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
+    // The refusal is the retained decision result, not a toast; the server's reason is quoted in it.
+    expect(h.el.main!.innerHTML).toContain('data-decision-status="refused"');
+    expect(h.el.main!.innerHTML).toContain("Allow once was refused for state export by fixture-agent (request wait-1): operator session required (HTTP 401). The decision was not applied.");
     // Retargeted from "Decided at": a refused decision leaves the row waiting with its controls, repainted from the server.
     expect(h.el.main!.innerHTML).toContain("WAITING");
     expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="wait-1"');
@@ -947,7 +964,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el["notify-count"]!.innerHTML).toContain("0 of 2");
     const main = h.el.main!.innerHTML;
     expect(main).toContain('data-scoped-empty="1"');
-    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
+    expect(main).toContain("No recognized held operation for fixture-agent-c is waiting in this read. 2 held operations wait outside this agent scope");
     expect(main).not.toContain("qe-check");
     expect(main).not.toContain("Nothing waiting on you.");
   });
@@ -981,7 +998,7 @@ describe("slice 2 shell wired consumers", () => {
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
     expect(drawer()).not.toContain("No approvals waiting");
     expect(drawer()).not.toContain("0 of 0 held operations");
-    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
+    expect(drawer()).toContain("No recognized held operation for fixture-agent-c is waiting in this read. 2 held operations wait outside this agent scope");
   });
 
   it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
@@ -2180,7 +2197,8 @@ describe("slice 5 Evidence wired consumers", () => {
     await settle();
     expect(h.el.main!.innerHTML).toContain("No entries match this view");
     expect(h.el.main!.innerHTML).toContain("0 entries were loaded for the last 24 hours.");
-    expect(h.el.main!.innerHTML).toContain("Clear filters keeps the time range; change it in the top bar.");
+    expect(h.el.main!.innerHTML).toContain("Change the time range in the top bar.");
+    expect(h.el.main!.innerHTML).not.toContain('>Clear filters</a>');
     expect(h.el.main!.innerHTML).not.toContain("No audit entries in this view");
   });
 
@@ -2531,6 +2549,7 @@ describe("slice 3 Overview wired consumers", () => {
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "findings", integrity_finding_count: 2 }));
     expect(h.el.main!.innerHTML).toContain("FAILED");
+    // A positive window count remains displayable even though the verdict covers the whole chain.
     expect(h.el.main!.innerHTML).toContain("2 findings");
     expect(h.el.main!.innerHTML).toContain("digest from 0s ago, not verified");
   });
@@ -2722,7 +2741,7 @@ describe("slice 3 Overview wired consumers", () => {
 
 
 describe("slice 6a Agents wired consumers", () => {
-  const start = async (name = "protected", overrides: Record<string, (init?: RequestInit) => unknown> = {}) => {
+  const start = async (name = "protected", overrides: Record<string, (init?: RequestInit) => unknown> = {}, deferredHashchange = false) => {
     vi.useFakeTimers();
     const sc = agentsScenario(name);
     const h = boot({
@@ -2733,9 +2752,10 @@ describe("slice 6a Agents wired consumers", () => {
       "/api/hub/policies": () => Promise.resolve(response({ data: { policies: sc.policies } })),
       "/api/posture/reach/research-agent": () => Promise.resolve(response(sc.reach)),
       ...overrides,
-    });
+    }, {}, { deferredHashchange });
     await settle();
     h.navigate("agents");
+    if (deferredHashchange) await vi.advanceTimersByTimeAsync(0);
     return { h, sc };
   };
   const detail = (h: Awaited<ReturnType<typeof start>>["h"]) => h.click({ "data-action": "open-agent", "data-agent-id": "research-agent" });
@@ -3081,12 +3101,96 @@ describe("slice 6a Agents wired consumers", () => {
 
   it("6a r2 a loaded reach read past its one-minute age reads expired", async () => {
     const { h } = await start();
-    // AGENT_REACH_MAX_AGE_MS is the client's own constant, so the read is exactly one millisecond past its age.
-    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - AGENT_REACH_MAX_AGE_MS - 1 };', h.context);
+    // Two one-minute reach windows make this read two minutes old without firing the expiry timer.
+    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - 2 * AGENT_REACH_MAX_AGE_MS };', h.context);
     h.navigate("agent-detail");
     const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
     expect(html).toContain("Reach read expired after one minute without interaction.");
     expect(html).not.toContain("The reach source answered without a record for this agent.");
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  for (const [name, setup, sentence] of [
+    ["stopped", "liveUpdatesStopped = true", "Live updates stopped. Retry to resume."],
+    // Five one-minute reach windows date the read five minutes ahead without moving the test clock.
+    ["future", "state.agentReach.readAt += 5 * AGENT_REACH_MAX_AGE_MS", "Reach read time is ahead of this device's clock, so it is not current."],
+  ]) it(`A1 ${name} reach read names its reason and hides lanes`, async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // The page's stopped-source gate hides the whole detail view, so inspect its reach card with the loaded subject.
+    const html = runInContext(setup + '; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))', h.context) as string;
+    expect(html).toContain(escapeHtml(sentence!).replaceAll("'", "&#039;"));
+    expect(html).not.toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  // Numeric text and a symbol are not numbers, so neither may be compared or dated as one.
+  for (const [name, readAt] of [["missing", "undefined"], ["not-a-number", "NaN"], ["text", '"soon"'], ["numeric-text", '"9999999999999999"'], ["symbol", 'Symbol("t")']]) it(`A1 a loaded reach read with a ${name} read time is withheld as undated`, async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // Every case fails at the round 1 head 46a1dd4a, before the undated arm in renderAgentReach (A1 round 2 fail-before
+    // evidence); the symbol case also fails at f894e599, before the numeric read time in the A1 closure.
+    const html = runInContext(`state.agentReach.readAt = ${readAt}; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))`, h.context) as string;
+    expect(html).toContain("Reach read time is unknown, so it is not current.");
+    expect(html).not.toContain("The reach source answered without a record for this agent.");
+    expect(html).not.toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  it("A1 a loaded reach read dated past the clock's range reads ahead of this device's clock", async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // Fails before the read age is computed once in renderAgentReach (A1 round 2 fail-before evidence).
+    // 8.64e15 ms is the largest time a Date can hold, so one more millisecond has no ISO form.
+    const html = runInContext('state.agentReach.readAt = 8.64e15 + 1; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))', h.context) as string;
+    expect(html).toContain(escapeHtml("Reach read time is ahead of this device's clock, so it is not current.").replaceAll("'", "&#039;"));
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  it("A1 a loaded reach read with no record and a symbol read time renders the no-record sentence", async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // Fails before the numeric read time in renderAgentReach (A1 closure fail-before evidence).
+    const html = runInContext('state.agentReach.data = null; state.agentReach.readAt = Symbol("t"); renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))', h.context) as string;
+    expect(html).toContain("The reach source answered without a record for this agent.");
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  it("A1 a loaded reach read exactly one minute old reads expired and one millisecond younger stays current", async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // fail-before-exempt: pins the existing one-minute boundary; a planted change from >= to > in renderAgentReach turns it red.
+    // start() runs under fake timers, so the clock does not move between setting each read time and rendering it.
+    const render = (age: string) => runInContext(`state.agentReach.readAt = Date.now() - (${age}); renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))`, h.context) as string;
+    const atLimit = render("AGENT_REACH_MAX_AGE_MS");
+    expect(atLimit).toContain("Reach read expired after one minute without interaction.");
+    expect(atLimit).not.toContain('class="agent-reach-lane"');
+    expect(atLimit).not.toContain("docs.example.test");
+    const justYounger = render("AGENT_REACH_MAX_AGE_MS - 1");
+    expect(justYounger).not.toContain("Reach read expired after one minute without interaction.");
+    expect(justYounger).toContain('class="agent-reach-lane"');
+    expect(justYounger).toContain("docs.example.test");
+  });
+
+  for (const key of ["Enter", " "]) it(`A1 row inspect ${JSON.stringify(key)} resets the tab and reads reach once`, async () => {
+    const { h } = await start();
+    runInContext('state.agentTab = "evidence"', h.context);
+    const prevented = h.keydown({ "data-action": "agent-row-inspect-open", "data-agent-id": "research-agent" }, key);
+    await settle();
+    expect(prevented).toHaveBeenCalledOnce();
+    expect(runInContext("state.agentTab", h.context)).toBe("overview");
+    expect(runInContext("state.selectedAgentId", h.context)).toBe("research-agent");
+    expect(runInContext("state.route", h.context)).toBe("agent-detail");
+    expect(h.requests.filter(r => r.url === "/api/posture/reach/research-agent")).toHaveLength(1);
+    expect(h.requests.filter(r => r.url === "/api/hub/agents/research-agent/inspect/open")).toHaveLength(1);
   });
 
   it("6a r2 unknown hash state selects All states and keeps the roster", async () => {
@@ -3114,6 +3218,7 @@ describe("slice 6a Agents wired consumers", () => {
     expect(runInContext("agentReachPendingId", h.context)).toBeNull();
   });
 
+  // fail-before-exempt: existing queue behavior; plants remove open-agent loadAgentReach or restore route-guard-back.
   it("6a r2 an agent opened from another route while a read holds admission is read next", async () => {
     const sc = agentsScenario();
     let finish!: (value: unknown) => void;
@@ -3122,15 +3227,20 @@ describe("slice 6a Agents wired consumers", () => {
       "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
       "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finish = resolve; }); },
       "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
-    });
-    detail(h); await settle();
+    }, true);
+    // Establish the first read through row inspection so the open-agent plant targets only the second open.
+    h.click({ "data-action": "agent-row-inspect-open", "data-agent-id": "research-agent" }); await settle();
+    await vi.advanceTimersByTimeAsync(0);
     h.navigate("agents");
-    // The open-agent handler queues the read before it assigns the hash, and a browser fires hashchange in a later
-    // task; this harness fires it synchronously, so the queue step runs here on its own while the route is #agents.
-    runInContext('state.selectedAgentId = "second-agent"; void loadAgentReach("second-agent")', h.context);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runInContext("state.route", h.context)).toBe("agents");
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" });
+    // Keep hashchange queued while the previous transport releases admission in its microtasks.
+    expect(runInContext("state.route", h.context)).toBe("agents");
     finish(response(sc.reach)); await settle();
     expect(calls).toEqual(["research-agent", "second-agent"]);
-    h.navigate("agent-detail"); await settle();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runInContext("state.route", h.context)).toBe("agent-detail");
     const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
     expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
     expect(html).toContain('<div class="mono">docs.example.test');
@@ -3177,10 +3287,69 @@ async function bootOverview3b(change?: (home: Record<string, any>) => void, scen
 function outboundHtml(h: ReturnType<typeof boot>) {
   return h.el.main!.innerHTML.match(/<section class="card outbound-card">[\s\S]*?<\/section>/)?.[0] ?? "";
 }
+function auditTile(h: ReturnType<typeof boot>) {
+  return h.el.main!.innerHTML.match(/<div class="overview-tile"><a[^>]*>Audit chain<\/a>[\s\S]*?<\/div>/)?.[0] ?? "";
+}
 function protectionTile(h: ReturnType<typeof boot>) {
   return h.el.main!.innerHTML.match(/<div class="overview-tile"><a[^>]*>Protection requested<\/a>[\s\S]*?<\/div>/)?.[0] ?? "";
 }
 describe("Overview 3b served evidence", () => {
+  it("A1 mismatched verified flag names chain not verified in both counts", async () => {
+    const h = await bootOverview3b(home => home.digest.chain_verified = false);
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route);
+      const html = outboundHtml(h);
+      for (const label of ["Blocked", "Allowed"]) {
+        const cell = html.match(new RegExp('<div>' + label + ' ([^]*?)</div>'))![1]!;
+        expect(cell).toContain('class="state-chip unknown overview-chip"');
+        expect(cell).toContain("Not evaluated");
+        expect(cell).toContain("chain not verified");
+      }
+      expect(html).not.toContain("audit check not current");
+      expect(html).not.toContain("last verified");
+      expect(html).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+
+  // fail-before-exempt: existing stale-check copy; plant replaces the audit check not current reason.
+  it("A1 eleven-minute verified check retains its age reason", async () => {
+    const h = await bootOverview3b(undefined, "stale-verified");
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route);
+      expect(outboundHtml(h)).toContain("audit check not current");
+      expect(outboundHtml(h)).toContain("last verified 11m ago");
+      expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+
+  it("A1 fail-honest Audit chain chip has no invented zero findings", async () => {
+    const h = await bootOverview3b(undefined, "fail-honest");
+    const tile = auditTile(h);
+    expect(tile).toContain('class="state-chip bad overview-chip"');
+    expect(tile).toContain("FAILED");
+    expect(tile).toContain("chain not verified");
+    expect(tile).not.toContain("0 findings");
+    expect(tile).toContain("not verified");
+  });
+
+  it("A1 Audit chain chip uses the singular for one finding", async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { chain_verdict: "findings", chain_verified: false, integrity_finding_count: 1 }));
+    expect(auditTile(h)).toContain("1 finding");
+    expect(auditTile(h)).not.toContain("1 findings");
+    expect(auditTile(h)).toContain("FAILED");
+  });
+
+  it("A1 Audit chain chip withholds every invalid finding count", async () => {
+    // Exercise absent, nonnumeric, negative, fractional, nonfinite, and unsafe integer counts.
+    for (const count of [undefined, null, "2", -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      const h = await bootOverview3b(home => Object.assign(home.digest, { chain_verdict: "findings", chain_verified: false, integrity_finding_count: count }));
+      expect.soft(auditTile(h), String(count)).toContain("chain not verified");
+      expect.soft(auditTile(h), String(count)).not.toContain(" findings");
+      expect.soft(auditTile(h), String(count)).toContain('class="state-chip bad overview-chip"');
+      expect.soft(auditTile(h), String(count)).toContain("FAILED");
+    }
+  });
+
   for (const [name, mutate, reason] of [
     ["findings zeros", (d: any) => Object.assign(d, { chain_verdict: "findings", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
     ["key unavailable", (d: any) => Object.assign(d, { chain_verdict: "key_unavailable", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
@@ -3338,13 +3507,15 @@ describe("round 2 outbound and tile honesty", () => {
     [undefined, undefined, "window completeness not served"], [null, null, "window completeness not served"],
     [-1, null, "window completeness not served"], [false, "read_limit", "window larger than one read"],
     [false, "sealed_region", "sealed audit region coverage not established"],
-    [false, "retention", "retention removed older entries, so window coverage is not established"],
+    // The coverage reason does not establish whether pruning, a legacy prefix, or a racing append caused it.
+    [false, "retention", "the check could not reach the oldest audit entry, so this window is not fully covered"],
     [false, "coverage_unknown", "window coverage not established"],
     [false, "unexpected", "window coverage not established"], [false, undefined, "window coverage not established"],
   ] as const) it(`states completeness=${complete} reason=${value}`, async () => {
     const h = await bootOverview3b(home => Object.assign(home.digest, { window_complete: complete, window_incomplete_reason: value }));
     for (const route of ["posture", "enforcement"]) {
       h.navigate(route); expect(outboundHtml(h)).toContain(reason);
+      expect(h.el.main!.innerHTML).not.toContain("retention removed older entries");
       expect(outboundHtml(h)).toContain('class="outbound-reason muted"');
       expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
     }
@@ -3456,7 +3627,7 @@ describe("Approvals round-one decision and evidence states", () => {
     await settle();
     h.navigate("approvals");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
-    const line = "Nothing waiting for agent-empty. 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them.";
+    const line = "No recognized held operation for agent-empty is waiting in this read. 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them.";
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
       expect(html).toContain(line);
       expect(html).not.toContain("qe-check");
@@ -3509,16 +3680,24 @@ describe("Approvals round-one decision and evidence states", () => {
       const expected = failure === "approve" ? ["approve"] : failure === "compile" || failure === "missing draft" ? ["approve", "compile"] : ["approve", "compile", "activate"];
       if (failure === "downgrade confirmed" || failure === "override refused") expected.push("override");
       expect(calls).toEqual(expected);
+      // Every outcome is the retained decision result on the screen; no toast reports a decision.
+      const result = h.el.main!.innerHTML.split('class="decision-result"')[1] ?? "";
+      expect(h.el["toast-host"]!.innerHTML).toBe("");
       if (failure === "approve") {
-        expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: refused");
+        expect(result).toContain('data-decision-status="refused"');
+        expect(result).toContain("Allow once was refused for");
+        expect(result).not.toContain("Allowed once");
         expect(drawer(h)).toContain("WAITING");
       } else {
         expect(drawer(h)).toContain(failure === "none" ? "No approvals waiting" : "DECIDED");
-        if (failure !== "none" && failure !== "downgrade confirmed") expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added:");
+        expect(result).toContain('data-decision-status="acknowledged"');
+        expect(result).toContain("Allowed once: state export by fixture-agent (request " + requestId + ").");
+        if (failure !== "none" && failure !== "downgrade confirmed") expect(result).toContain("The standing rule was not added:");
+        else expect(result).toContain("Standing rule added: agents may state export without asking.");
         // A declined downgrade reads as one sentence, not a second "no standing rule added" after the first.
         if (failure === "downgrade cancelled") {
-          expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added: you chose to keep your protection.");
-          expect(h.el["toast-host"]!.innerHTML).not.toContain("no standing rule added");
+          expect(result).toContain("The standing rule was not added: you chose to keep your protection.");
+          expect(result).not.toContain("no standing rule added");
         }
       }
       expect(runInContext("state.approvals.alwaysAllow", h.context)).toBe(false);
@@ -3547,7 +3726,8 @@ describe("Approvals round-one decision and evidence states", () => {
       vi.useFakeTimers();
       const h = boot({
         "/api/hub/inbox": inbox([{ ...tier2, ...(mode === "tier1" ? { tier: "tier1" } : mode === "other" ? { operation_category: "other" } : {}) }]),
-        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { sections: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
+        // Policy fixtures serve the view's real lines field; a malformed policy view now fails the whole read.
+        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { lines: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
       });
       await settle();
       h.navigate("approvals");
@@ -3710,22 +3890,1280 @@ describe("Approvals round-one decision and evidence states", () => {
     h.navigate("approvals");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
-      expect(html).toContain(`Nothing waiting for agent-empty. At least 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
+      expect(html).toContain(`No recognized held operation for agent-empty is waiting in this read. At least 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
       expect(html).not.toContain("1 of 1 held operation");
     }
   });
 
-  it("the fortress count badge is a lower bound on a full page and counts unrecognized holds", async () => {
+  it("the fortress count badge is a lower bound on a full page and separates unrecognized holds", async () => {
     vi.useFakeTimers();
     const holdCount = 3; // Three visible holds amid the rest of a full page.
     const full = boot({ "/api/hub/inbox": inbox([...Array.from({ length: holdCount }, (_, i) => ({ ...heldItem, item_id: `hold-${i}` })), ...pageOthers(cap - holdCount)]) });
     await settle();
-    expect(full.el.fortress!.innerHTML).toContain(`<span class="count" id="queue-count">${holdCount}+</span>`);
+    expect(full.el.fortress!.innerHTML).toContain(`<span class="count" id="queue-count">${holdCount}+ of ${holdCount}+</span>`);
     const unrecognized = boot({ "/api/hub/inbox": inbox([{ ...heldItem, tier: "tier9" }]) });
     await settle();
-    expect(unrecognized.el.fortress!.innerHTML).toContain('<span class="count" id="queue-count">1</span>');
+    expect(unrecognized.el.fortress!.innerHTML).toContain('<span class="count" id="queue-count">0</span>');
+    expect(unrecognized.el.fortress!.innerHTML).toContain("1 held item carries a tier");
     const earned = boot({ "/api/hub/inbox": inbox([]) });
     await settle();
     expect(earned.el.fortress!.innerHTML).toContain('<span class="count zero" id="queue-count">0</span>');
+  });
+});
+
+
+describe("slice 6b Machines Findings Policies wired consumers", () => {
+  async function mfpBoot(route: string, change?: (s: ReturnType<typeof mfpScenario>) => void, overrides = {}) {
+    vi.useFakeTimers();
+    const s = mfpScenario();
+    change?.(s);
+    const h = boot({
+      "/api/fleet/roster": () => Promise.resolve(response(s.roster)),
+      "/api/sentinels/findings": () => Promise.resolve(response({ data: { findings: s.findings } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: s.policy } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: s.agents } })),
+      ...overrides,
+    });
+    await settle(); h.navigate(route); await settle();
+    return h;
+  }
+  it("reads the authenticated roster separately from browser-saved machines", async () => {
+    const h = await mfpBoot("machines");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-roster');
+    expect(html).toContain('Build box');
+    expect(html).toContain('ADMITTED');
+    expect(html).toContain('Saved in this browser');
+    expect(html).toContain('Showing 1 of 1');
+    expect(html).toContain('Enrollment status is not served');
+    expect(html).toContain('Last check');
+  });
+  it("never derives roster trust or drift from attestation or reach", async () => {
+    const h = await mfpBoot("machines", s => {
+      Object.assign(s.roster.nodes[0]!, { trust_state: undefined, policy: undefined, attestation_status: 'verified', reach: 'recent' });
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-roster');
+    expect(html).not.toContain('ADMITTED');
+    expect(html).not.toContain('IN SYNC');
+    expect(html.match(/state-chip unknown/g)!.length).toBeGreaterThanOrEqual(3);
+  });
+  it("shows a roster read failure as Unknown without old rows or a zero", async () => {
+    const h = await mfpBoot("machines", undefined, { '/api/fleet/roster': () => Promise.reject(new Error('unavailable')) });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Showing 0 of 0');
+    expect(h.el.main!.innerHTML).toContain('data-read="/api/fleet/roster"');
+  });
+  it("paginates the roster with a bounded page and an exact denominator", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = Array.from({ length: 51 }, (_, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, label: 'Machine ' + i })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    expect(h.el.main!.innerHTML).not.toContain('Machine 25<');
+    h.click({ 'data-action': 'mfp-page', 'data-list': 'roster', 'data-step': '1' });
+    expect(h.el.main!.innerHTML).toContain('Machine 25<');
+  });
+  it("ranks the served Sentinel vocabulary and declares its five-level display scale", async () => {
+    const h = await mfpBoot("findings");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-findings');
+    for (const level of ['critical', 'high', 'medium', 'low', 'info']) expect(html).toContain('mfp-severity ' + level);
+    expect(html.indexOf('alert outbound observation')).toBeLessThan(html.indexOf('warn outbound observation'));
+    expect(html.indexOf('warn outbound observation')).toBeLessThan(html.indexOf('info outbound observation'));
+    expect(html).toContain('egress-volume');
+    expect(html).toContain('Read-only');
+    expect(html).toContain('Lifecycle is not served');
+    expect(html).not.toMatch(/data-action="finding-(resolve|dismiss|acknowledge)"/);
+  });
+  it("opens finding evidence in a drawer and escapes hostile text throughout", async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    const h = await mfpBoot("findings", s => { s.findings[1]!.summary = hostile; s.findings[1]!.details = { evidence: hostile }; });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('aria-label="Finding evidence"');
+    expect(html).toContain('baseline');
+    expect(html).toContain('&lt;img');
+    expect(html).not.toContain(hostile);
+    expect(html).toContain('egress_blocked');
+    expect(html).toContain('data-action="mfp-finding-close"');
+  });
+  it("keeps findings Unknown when the Sentinel source fails", async () => {
+    const h = await mfpBoot("findings", undefined, { '/api/sentinels/findings': () => Promise.reject(new Error('offline')) });
+    expect(h.el.main!.innerHTML).toContain('Sentinel findings Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('No findings returned');
+  });
+  it("bounds the findings queue and clears a selected record when its source fails", async () => {
+    let failed = false;
+    const s = mfpScenario();
+    s.findings = Array.from({ length: 51 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i }));
+    const h = await mfpBoot("findings", undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response({ data: { findings: s.findings } })) });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'f-0' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    failed = true;
+    h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+  });
+  it("renders policy groups beside the served rule table with truthful metadata", async () => {
+    const h = await mfpBoot("policy");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-policy');
+    // The approval group takes its heading from POLICY_SECTION_TITLES, the same name the rule table uses.
+    for (const label of ['What agents may reach', 'Always asks you first', 'What is never allowed', 'Rule table', 'Version 7', 'Signature state is not served']) expect(html).toContain(label);
+    expect(html).toContain('export your saved state off the machine');
+    expect(html).toContain('data-action="template-picker-open"');
+    expect(html).not.toContain('state-chip good');
+  });
+  it("does not retain policy metadata or rules after a failed read", async () => {
+    const h = await mfpBoot("policy", undefined, { '/api/policy/current': () => Promise.reject(new Error('offline')) });
+    expect(h.el.main!.innerHTML).toContain('Policy Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Version 7');
+    expect(h.el.main!.innerHTML).not.toContain('export your saved state off the machine');
+  });
+  it("bounds served policy lines and escapes their text", async () => {
+    const h = await mfpBoot("policy", s => { s.policy.lines = Array.from({ length: 51 }, () => ({ section: 'approval', text: '<script>bad()</script>' })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    expect(h.el.main!.innerHTML).toContain('&lt;script&gt;');
+    expect(h.el.main!.innerHTML).not.toContain('<script>bad()');
+  });
+  it("shows evidenced empty states for all three screens", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = []; s.findings = []; s.policy.lines = []; });
+    expect(h.el.main!.innerHTML).toContain('No machines in the roster');
+    h.navigate('findings'); await settle();
+    expect(h.el.main!.innerHTML).toContain('No findings returned');
+    h.navigate('policy'); await settle();
+    expect(h.el.main!.innerHTML).toContain('No policy lines returned');
+  });
+  it("rejects malformed roster entries without claiming a checked empty fleet", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = [null as never]; });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+  });
+  it("rejects malformed findings without a lifecycle or empty claim", async () => {
+    const h = await mfpBoot("findings", s => { s.findings = [null as never]; });
+    expect(h.el.main!.innerHTML).toContain('Sentinel findings Unknown');
+  });
+  it("refuses an oversized roster response within its read budget", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes[0]!.label = 'x'.repeat(2 * 1024 * 1024); });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+  });
+  it("bounds repeated snapshots and exposes records beyond the preview cap", async () => {
+    const h = await mfpBoot("findings", s => { s.findings = Array.from({ length: 501 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 501');
+    expect(h.el.main!.innerHTML).toContain('Only the first 500');
+    for (let i = 0; i < 22; i++) h.click({ 'data-action': 'mfp-page', 'data-list': 'findings', 'data-step': '1' });
+    expect(h.el.main!.innerHTML).toContain('Page 20 of 20');
+    expect(h.el.main!.innerHTML).not.toContain('data-finding-id="f-500"');
+    for (let i = 0; i < 3; i++) { h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle(); }
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 501');
+  });
+  it("folds Auto-trigger and Honeypots into both Findings and Policies", async () => {
+    const h = await mfpBoot("findings");
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
+    h.navigate('policy'); await settle();
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
+  });
+  it("6b the roster, findings and policy lists render no link into a raw read", async () => {
+    // Read URLs carry the launch session only inside fetch calls (credentialedReadUrl), never in a rendered link.
+    for (const route of ["machines", "findings", "policy"]) {
+      const h = await mfpBoot(route);
+      expect(h.el.main!.innerHTML).toContain('returned records');
+      expect(h.el.main!.innerHTML).not.toMatch(/href="\/api\//);
+    }
+  });
+  it("6b the Findings screen keeps the anomaly findings the Overview tile counts and links to", async () => {
+    const h = await mfpBoot("findings", undefined, { "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [
+      { finding_id: "anomaly-1", severity: "medium", detector_id: "egress-volume", summary: "Unusual outbound volume", created_at: "2026-10-14T16:46:00.000Z" },
+    ] } })) });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-anomaly-findings');
+    expect(html).toContain('1 open');
+    expect(html).toContain('Unusual outbound volume');
+    expect(html).toContain('data-mfp-findings');
+  });
+  it("6b retains at most the record cap from each roster, findings and policy snapshot", async () => {
+    const h = await mfpBoot("findings", s => {
+      s.findings = Array.from({ length: 501 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i }));
+      s.roster.nodes = Array.from({ length: 501 }, (_, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i }));
+      s.policy.lines = Array.from({ length: 501 }, (_, i) => ({ ...s.policy.lines[0]!, text: 'Policy line ' + i }));
+    });
+    h.navigate('machines'); await settle();
+    h.navigate('policy'); await settle();
+    // The render pages within the cap too, so only the retained state shows whether a snapshot was cut on arrival.
+    expect(runInContext("state.mfp.findings.length", h.context)).toBe(500);
+    expect(runInContext("state.mfp.totals.findings", h.context)).toBe(501);
+    expect(runInContext("state.mfp.roster.nodes.length", h.context)).toBe(500);
+    expect(runInContext("state.policyView.view.lines.length", h.context)).toBe(500);
+  });
+  it("6b each finding row shows the served alert as High, warn as Medium and info as Info", async () => {
+    const h = await mfpBoot("findings");
+    const html = h.el.main!.innerHTML;
+    const row = (summary: string) => (html.match(new RegExp('<tr[^>]*>(?:(?!</tr>)[\\s\\S])*' + summary + '(?:(?!</tr>)[\\s\\S])*</tr>')) || [''])[0];
+    expect(row('alert outbound observation')).toContain('mfp-severity high');
+    expect(row('alert outbound observation')).toContain('>High<');
+    expect(row('warn outbound observation')).toContain('mfp-severity medium');
+    expect(row('info outbound observation')).toContain('mfp-severity info');
+  });
+  it("6b roster trust verdicts never render a green chip", async () => {
+    const h = await mfpBoot("machines", s => {
+      s.roster.nodes = ['admitted', 'revoked', 'untrusted'].map((trust_state, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, trust_state, reach: 'recent', policy: { drift_state: 'in_sync' } })) as never;
+    });
+    const roster = (h.el.main!.innerHTML.match(/<section class="card" data-mfp-roster>[\s\S]*?<\/section>/) || [''])[0];
+    expect(roster).toContain('ADMITTED');
+    expect(roster).toContain('REVOKED');
+    expect(roster).not.toContain('state-chip good');
+  });
+  it("6b escapes hostile roster labels and node ids", async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    const h = await mfpBoot("machines", s => { s.roster.nodes[0]!.label = hostile; s.roster.nodes[0]!.node_id = hostile + '-id'; });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).not.toContain(hostile);
+  });
+  it("6b the evidence drawer previews at most the evidence character limit", async () => {
+    const h = await mfpBoot("findings", s => { s.findings[1]!.details = { evidence: 'z'.repeat(20 * 1024) }; });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    const pre = (h.el.main!.innerHTML.match(/<pre>([\s\S]*?)<\/pre>/) || ['', ''])[1]!;
+    const previewed = (pre.match(/z/g) || []).length;
+    expect(previewed).toBeGreaterThan(0);
+    expect(previewed).toBeLessThanOrEqual(16 * 1024);
+    expect(h.el.main!.innerHTML).toContain('Evidence preview truncated at ' + 16 * 1024 + ' characters of');
+  });
+  it("6b refuses roster entries whose node id or label is not text", async () => {
+    for (const change of [
+      (n: Record<string, unknown>) => { n.node_id = 7; },
+      (n: Record<string, unknown>) => { n.label = { text: 'Build box' }; },
+    ]) {
+      const h = await mfpBoot("machines", s => { change(s.roster.nodes[0] as never); });
+      expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    }
+  });
+
+  // Round 2: public read behavior and reachable per-item controls.
+  const r2Sources = [
+    { route: 'machines', path: '/api/fleet/roster', key: 'roster', unknown: 'Fleet roster Unknown', old: 'Build box', read: 'fetchMfpRead("/api/fleet/roster", "roster")' },
+    { route: 'findings', path: '/api/sentinels/findings', key: 'findings', unknown: 'Sentinel findings Unknown', old: 'alert outbound observation', read: 'fetchMfpRead("/api/sentinels/findings", "findings")' },
+    { route: 'policy', path: '/api/policy/current', key: 'policy', unknown: 'Policy Unknown', old: 'export your saved state off the machine', read: 'readPolicyView()' },
+  ];
+  function r2Body(key: string, label?: string) {
+    const s = mfpScenario();
+    if (label) { s.roster.nodes[0]!.label = label; s.findings[0]!.summary = label; s.policy.lines[0]!.text = label; }
+    return key === 'roster' ? s.roster : { data: key === 'findings' ? { findings: s.findings } : { view: s.policy } };
+  }
+  function r2Retry(h: Awaited<ReturnType<typeof mfpBoot>>, path: string) {
+    const button = h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + path + '"]');
+    expect(button, 'rendered retry for ' + path).not.toBeNull();
+    h.click(button!.attrs);
+  }
+  for (const source of r2Sources) {
+    it('6b r2 retries a rejected ' + source.key + ' read exactly once', async () => {
+      const read = vi.fn(() => Promise.reject(new Error('offline')));
+      const h = await mfpBoot(source.route, undefined, { [source.path]: read });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      const before = read.mock.calls.length;
+      r2Retry(h, source.path); await settle();
+      expect(read.mock.calls.length).toBe(before + 1);
+    });
+    it('6b r2 rejects malformed ' + source.key + ' records with a retry control', async () => {
+      const body = source.key === 'roster' ? { available: true, nodes: [null] }
+        : { data: source.key === 'findings' ? { findings: [null] } : { view: { lines: [null] } } };
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => Promise.resolve(response(body)) });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    it('6b r2 drops the ' + source.key + ' snapshot and total after refresh failure', async () => {
+      let failed = false;
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body(source.key))) });
+      expect(h.el.main!.innerHTML).toContain(source.old);
+      failed = true;
+      h.click({ 'data-action': 'retry-panel', 'data-read': source.path }); await settle();
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).not.toContain(source.old);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(0);
+      expect(runInContext(source.key === 'policy' ? 'state.policyView.view' : 'state.mfp.' + source.key, h.context)).toEqual(source.key === 'findings' ? [] : null);
+    });
+    it('6b r2 times out the ' + source.key + ' read with a retry control', async () => {
+      const h = await mfpBoot(source.route, undefined, { [source.path]: never });
+      await vi.advanceTimersByTimeAsync(runInContext('DASHBOARD_READ_DEADLINE_MS + 1', h.context));
+      await settle();
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).toContain('Read timed out');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    it('6b r2 rejects an oversized ' + source.key + ' body with a retry control', async () => {
+      // Padding exceeds the two MiB body budget without relying on a field-length validator.
+      const body = { ...r2Body(source.key), padding: 'x'.repeat(2 * 1024 * 1024) };
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => Promise.resolve(response(body)) });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    for (const outcome of ['success', 'failure']) {
+      it('6b r2 ignores older ' + source.key + ' ' + outcome + ' after the newer read loads', async () => {
+        let wave = false;
+        const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+        const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+        wave = true;
+        const a = runInContext(source.read, h.context); await settle();
+        const b = runInContext(source.read, h.context); await settle();
+        expect(pending).toHaveLength(2);
+        pending[1]!.resolve(response(r2Body(source.key, 'newer snapshot'))); await b; await settle();
+        if (outcome === 'success') pending[0]!.resolve(response(r2Body(source.key, 'older snapshot')));
+        else pending[0]!.reject(new Error('old failure'));
+        await a; await settle();
+        runInContext('rerender()', h.context);
+        expect(h.el.main!.innerHTML).toContain('newer snapshot');
+        expect(h.el.main!.innerHTML).not.toContain('older snapshot');
+        expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+      });
+    }
+    it('6b keeps the ' + source.key + ' snapshot for the trailing read when a queued refresh supersedes the read', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      const total = runInContext('state.mfp.totals.' + source.key, h.context);
+      expect(total).toBeGreaterThan(0);
+      wave = true;
+      const job = source.key === 'policy' ? 'policyPanelJob' : 'panelJobs.find(function (job) { return job.paths[0] === ' + JSON.stringify(source.path) + '; })';
+      // Two refreshes, as two stream events queue them: the first starts a read and the second supersedes it.
+      const first = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      const trailing = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      expect(pending).toHaveLength(1);
+      pending[0]!.resolve(response(r2Body(source.key, 'superseded snapshot'))); await first; await settle();
+      expect(runInContext('sourceRead(' + JSON.stringify(source.path) + ').state', h.context)).not.toBe('state_FAILED');
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(total);
+      expect(pending).toHaveLength(2);
+      pending[1]!.resolve(response(r2Body(source.key, 'trailing snapshot'))); await trailing; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain('trailing snapshot');
+      expect(h.el.main!.innerHTML).not.toContain('superseded snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+    });
+    it('6b leaves the ' + source.key + ' read Unknown when an older success lands after a newer failure', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      wave = true;
+      const a = runInContext(source.read, h.context); await settle();
+      const b = runInContext(source.read, h.context); await settle();
+      expect(pending).toHaveLength(2);
+      pending[1]!.reject(new Error('newer failure')); await b; await settle();
+      pending[0]!.resolve(response(r2Body(source.key, 'older snapshot'))); await a; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).not.toContain('older snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+    });
+    it('6b keeps the ' + source.key + ' snapshot for the trailing read when a superseded read fails', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      const total = runInContext('state.mfp.totals.' + source.key, h.context);
+      expect(total).toBeGreaterThan(0);
+      wave = true;
+      const job = source.key === 'policy' ? 'policyPanelJob' : 'panelJobs.find(function (job) { return job.paths[0] === ' + JSON.stringify(source.path) + '; })';
+      const first = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      const trailing = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      expect(pending).toHaveLength(1);
+      // The superseded read fails instead of succeeding; the trailing read still owns the source.
+      pending[0]!.reject(new Error('superseded failure')); await first; await settle();
+      expect(runInContext('sourceRead(' + JSON.stringify(source.path) + ').state', h.context)).not.toBe('state_FAILED');
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(total);
+      expect(pending).toHaveLength(2);
+      pending[1]!.resolve(response(r2Body(source.key, 'trailing snapshot'))); await trailing; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain('trailing snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+    });
+  }
+  it('6b keeps an open finding through two activity frames that supersede its read', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    // The activity frame handler queues this refresh through queueStreamRefresh; two frames arrive during one read.
+    const first = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    const second = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    pending[0]!.resolve(response(r2Body('findings'))); await settle();
+    expect(pending).toHaveLength(2);
+    pending[1]!.resolve(response(r2Body('findings'))); await first; await second; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+  });
+  it('6b keeps an open finding when a read superseded by two activity frames fails', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    const first = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    const second = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    pending[0]!.reject(new Error('superseded failure')); await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(pending).toHaveLength(2);
+    pending[1]!.resolve(response(r2Body('findings'))); await first; await second; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+  });
+  it('6b closes the open finding when live updates stop, so a restart cannot reopen it', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    // A stop lands while a findings read is in flight; that read then returns the same finding.
+    const read = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    runInContext('stopLiveUpdates()', h.context);
+    pending[0]!.resolve(response(r2Body('findings'))); await read; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe(null);
+    wave = false;
+    // The operator's Retry restarts live updates and rereads every source, the same finding included.
+    await runInContext('retryPanel("/api/sentinels/findings")', h.context); await settle();
+    runInContext('rerender()', h.context);
+    expect(runInContext('sourceLoaded("/api/sentinels/findings")', h.context)).toBe(true);
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+  });
+  it('6b r2 closes a selected finding through failure and recovery', async () => {
+    let failed = false;
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    failed = true; h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle();
+    failed = false; r2Retry(h, '/api/sentinels/findings'); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+    expect(runInContext('state.mfp.findingId', h.context)).toBeNull();
+  });
+  it('6b r2 renders only server severity values and keeps all five legend words', async () => {
+    const h = await mfpBoot('findings', s => {
+      s.findings = ['critical', 'low', 'high', 'medium', 'other', 'info', 'warn', 'alert'].map((severity, i) => ({ ...s.findings[0]!, severity, finding_id: 'severity-' + i, summary: 'Observation ' + i })) as never;
+    });
+    const html = h.el.main!.innerHTML;
+    const legend = html.match(/<div class="mfp-legend"[\s\S]*?<\/div>/)![0];
+    for (const word of ['Critical', 'High', 'Medium', 'Low', 'Info']) expect(legend).toContain('>' + word + '<');
+    expect(html).toContain('Critical and Low are display levels not emitted');
+    const rows = html.match(/<tbody>([\s\S]*?)<\/tbody>/)![1]!;
+    for (let i = 0; i < 5; i++) {
+      const row = rows.split('</tr>').find(row => row.includes('Observation ' + i))!;
+      expect(row).toContain('UNKNOWN');
+      expect(row).not.toMatch(/mfp-severity|>Critical<|>High<|>Medium<|>Low<|>Info</);
+    }
+    expect(rows.indexOf('Observation 5')).toBeLessThan(rows.indexOf('Observation 0'));
+    expect(rows).not.toMatch(/>Critical<|>Low</);
+  });
+  for (const agent of [null, '', undefined]) {
+    it('6b r2 leaves unserved agent scope unknown for ' + String(agent), async () => {
+      const h = await mfpBoot('findings', s => { s.findings = [{ ...s.findings[0]!, agent_id: agent }] as never; });
+      expect(h.el.main!.innerHTML).toContain('Unknown · agent not served');
+      h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-info' });
+      const drawer = h.el.main!.innerHTML.match(/<aside class="mfp-drawer"[\s\S]*?<\/aside>/)![0];
+      expect(drawer).toContain('Unknown · agent not served');
+      expect(h.el.main!.innerHTML).not.toContain('Fortress-wide');
+    });
+  }
+  it('6b r2 distinguishes unevaluable and proven untrusted nodes', async () => {
+    const h = await mfpBoot('machines', s => { s.roster.nodes = [false, true].map((trust_evaluable, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, trust_state: 'untrusted', trust_evaluable })); });
+    // Main's overviewChip wraps the glyph and word in an overview-chip-head span; the chip state and word are what this pins.
+    expect(h.el.main!.innerHTML).toMatch(/state-chip warn[^>]*><span class="overview-chip-head"><i[^>]*><\/i>NOT EVALUATED/);
+    expect(h.el.main!.innerHTML).toContain('Trust could not be evaluated; treated as untrusted');
+    expect(h.el.main!.innerHTML).toMatch(/state-chip bad[^>]*><span class="overview-chip-head"><i[^>]*><\/i>UNTRUSTED/);
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+  });
+  it('6b r2 rejects a nonboolean trust evaluation flag', async () => {
+    const h = await mfpBoot('machines', s => { Object.assign(s.roster.nodes[0]!, { trust_evaluable: 'false' }); });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Build box');
+    expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="/api/fleet/roster"]')).not.toBeNull();
+  });
+  it('6b r2 uses the shared policy heading and template severities', async () => {
+    const h = await mfpBoot('policy');
+    expect(h.el.main!.innerHTML).toContain('<h3>Always asks you first</h3>');
+    expect(h.el.main!.innerHTML).not.toContain('What asks you first');
+    expect(h.el.main!.innerHTML).toContain('<span class="severity medium">MEDIUM</span>');
+    expect(h.el.main!.innerHTML).toContain('<span class="severity low">LOW</span>');
+  });
+
+
+
+  it('A2 empty trap reads omit both pagers while one trap retains its pager', async () => {
+    let populated = false;
+    const h = await mfpBoot('honeypot', undefined, {
+      '/api/honeypot/tool-traps': () => Promise.resolve(response({ data: { traps: populated ? [{ fake_tool_name: 'tool-one' }] : [] } })),
+      '/api/honeypot/credential-traps': () => Promise.resolve(response({ data: { traps: populated ? [{ fake_credential_name: 'credential-one' }] : [] } })),
+    });
+    expect(h.el.main!.innerHTML).toContain('No tool-call traps deployed.');
+    expect(h.el.main!.innerHTML).toContain('No credential traps deployed.');
+    expect(h.el.main!.innerHTML).not.toContain('Showing 0 of 0');
+    expect(h.el.main!.innerHTML).not.toContain('mfp-pager');
+    populated = true;
+    await runInContext('fetchAll(true)', h.context); await settle();
+    expect(h.el.main!.innerHTML.match(/Showing 1 of 1/g)).toHaveLength(2); // One pager for each populated trap list.
+  });
+  it('A2 empty agents omit the Policy rules pager while a populated read retains it', async () => {
+    const h = await mfpBoot('policy', s => { s.agents = []; });
+    const panel = () => h.el.main!.innerHTML.split('<h2>Per-agent rules</h2>')[1]!.split('</section>')[0]!;
+    expect(panel()).toContain('No protected agents yet.');
+    expect(panel()).not.toContain('Showing 0 of 0');
+    expect(panel()).not.toContain('mfp-pager');
+    const populated = await mfpBoot('policy');
+    expect(populated.el.main!.innerHTML.split('<h2>Per-agent rules</h2>')[1]).toContain('Showing 1 of 1');
+  });
+  it('6b r2 leaves an empty policy read without a pager', async () => {
+    const h = await mfpBoot('policy', s => { s.policy.lines = []; });
+    const panel = h.el.main!.innerHTML.split('data-mfp-policy')[1]!.split('Channel templates')[0]!;
+    expect(panel).toContain('No policy lines returned');
+    expect(panel).not.toContain('Showing 0 of 0');
+    expect(panel).not.toContain('mfp-pager');
+  });
+  for (const list of [
+    { key: 'rules', route: 'auto-trigger', path: '/api/auto-trigger/rules', field: 'rules', row: (i: number) => ({ rule_id: 'rule-' + i, history: [] }), marker: 'rule-26', controls: ['auto-trigger-threshold-save'] },
+    { key: 'recommendations', route: 'auto-trigger', path: '/api/auto-trigger/recommendations', field: 'recommendations', row: (i: number) => ({ rule_id: 'recommendation-' + i }), marker: 'recommendation-26', controls: ['auto-trigger-accept', 'auto-trigger-reject'] },
+    { key: 'credentialTraps', route: 'honeypot', path: '/api/honeypot/credential-traps', field: 'traps', row: (i: number) => ({ fake_credential_name: 'credential-' + i }), marker: 'credential-26', controls: [] },
+    { key: 'toolTraps', route: 'honeypot', path: '/api/honeypot/tool-traps', field: 'traps', row: (i: number) => ({ fake_tool_name: 'tool-' + i }), marker: 'tool-26', controls: [] },
+  ]) {
+    it('6b r2 pages all ' + list.key + ' on both folded screens and the standalone route', async () => {
+      const rows = Array.from({ length: 26 }, (_, i) => list.row(i + 1)); // One beyond the 25-row page.
+      const h = await mfpBoot('findings', undefined, { [list.path]: () => Promise.resolve(response({ data: { [list.field]: rows } })) });
+      // Rule detail hydration is serial, so drain its bounded fixture wave before paging.
+      for (let i = 0; i < rows.length; i++) await settle();
+      for (const route of ['findings', 'policy', list.route]) {
+        runInContext('state.mfp.pages.' + list.key + ' = 0', h.context);
+        h.navigate(route); await settle(); runInContext('rerender()', h.context);
+        expect(h.el.main!.innerHTML).not.toContain(list.marker);
+        expect(h.el.main!.querySelector('[data-action="mfp-page"][data-list="' + list.key + '"][data-step="1"]')).not.toBeNull();
+        h.click({ 'data-action': 'mfp-page', 'data-list': list.key, 'data-step': '1' });
+        expect(h.el.main!.innerHTML).toContain(list.marker);
+        for (const action of list.controls) expect(h.el.main!.innerHTML).toContain('data-action="' + action + '" data-rule-id="' + list.marker + '"');
+        runInContext('state.mfp.pages.' + list.key + ' = 999; rerender()', h.context); // Deliberately beyond the last page.
+        expect(h.el.main!.innerHTML).toContain(list.marker);
+        expect(runInContext('state.mfp.pages.' + list.key, h.context)).toBe(1);
+      }
+      // Per-item controls remain reachable beyond the main snapshot cap too.
+      const extra = Array.from({ length: 501 }, (_, i) => list.row(i + 1));
+      h.context.r2Rows = extra;
+      const target = list.route === 'honeypot' ? 'state.honeypot.' + list.key : 'state.autoTrigger.' + list.key;
+      runInContext(target + ' = r2Rows; state.mfp.pages.' + list.key + ' = 19; rerender()', h.context);
+      h.click({ 'data-action': 'mfp-page', 'data-list': list.key, 'data-step': '1' });
+      expect(h.el.main!.innerHTML).toContain(list.marker.replace('26', '501'));
+      expect(h.el.main!.innerHTML).toContain('Page 21 of 21');
+      expect(h.el.main!.innerHTML).not.toContain('Only the first 500');
+    });
+  }
+
+});
+
+describe("Read-only extraction: Approvals follow-ups", () => {
+  const pageCap = 100; // One inbox page, must match HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts.
+  const tier2 = { ...heldItem, tier: "tier2", operation_category: "state_export" };
+  const other = { ...tier2, item_id: "other", agent_id: "other-agent" };
+  const inbox = (items: unknown[]) => () => Promise.resolve(response({ data: { items } }));
+  const drawer = (h: ReturnType<typeof boot>) => h.el.main!.innerHTML.split('<aside class="card approval-drawer"')[1] || "";
+  const badge = (h: ReturnType<typeof boot>) => h.el.fortress!.innerHTML.match(/id="queue-count">([^<]*)</)![1];
+  const stat = (h: ReturnType<typeof boot>) => h.el.fortress!.innerHTML.match(/<span class="n">([^<]*)<\/span><span class="l">Waiting</)![1];
+  const others = (count: number) => Array.from({ length: count }, (_, i) => ({ ...other, item_id: `notice-${i}`, kind: "blocked_egress" }));
+  const scope = (h: ReturnType<typeof boot>, id: string) => h.click({ "data-action": "agent-scope-select", "data-agent-id": id });
+
+  for (const full of [false, true]) {
+    it(`shares scoped zero and recognized denominator on every waiting count, full=${full}`, async () => {
+      vi.useFakeTimers();
+      const outsideCount = 3; // The three holds are all outside the selected agent scope.
+      const items = Array.from({ length: outsideCount }, (_, i) => ({ ...other, item_id: `held-${i}` }));
+      const h = boot({ "/api/hub/inbox": inbox([...items, ...(full ? others(pageCap - outsideCount) : [])]) });
+      await settle(); h.navigate("approvals"); scope(h, "empty-agent");
+      const count = full ? "0+ of 3+" : "0 of 3";
+      expect(badge(h)).toBe(count);
+      expect(stat(h)).toBe(count);
+      expect(h.el["rail-approvals-count"]!.textContent).toBe(count);
+      expect(h.el["notify-count"]!.innerHTML).toContain(count);
+      for (const element of [h.railLink, h.el["btn-notifications"]!]) {
+        for (const attr of ["title", "aria-label"]) {
+          // Full-page sentences now bound the observed counts to the served page, preserving the scoped denominator.
+          expect(element.getAttribute(attr)).toContain(full ? `0 of 3 held operations in the first ${pageCap} inbox items wait on you` : "0 of 3 held operations wait on you");
+          if (full) expect(element.getAttribute(attr)).toContain("a held operation may be waiting past them");
+        }
+      }
+      h.navigate("dashboard");
+      expect(badge(h)).toBe(count); expect(stat(h)).toBe(count);
+    });
+  }
+
+  it("keeps unrecognized tiers separate and uses singular summaries and accessible names", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([tier2, { ...other, tier: "tier9" }]) });
+    await settle(); h.navigate("approvals"); scope(h, tier2.agent_id);
+    expect(badge(h)).toBe("1"); expect(stat(h)).toBe("1");
+    expect(h.el.fortress!.innerHTML).toContain("1 held operation waiting.");
+    expect(h.el.fortress!.innerHTML).toContain("1 held item carries a tier");
+    for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+      expect(el.getAttribute("aria-label")).toContain("1 of 1 held operation waits on you");
+      expect(el.getAttribute("title")).toContain("1 of 1 held operation waits on you");
+    }
+    const filter = new FakeElement({ "data-action": "approval-filter-state" }, "SELECT");
+    filter.value = "decided"; h.change(filter);
+    expect(drawer(h)).toContain("1 held operation in this scope is waiting on you.");
+  });
+
+  it("puts outside holds above a scoped decided-only table", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([{ ...tier2, resolved: true }, other]) });
+    await settle(); h.navigate("approvals"); scope(h, tier2.agent_id);
+    const queue = h.el.main!.innerHTML.split('<aside')[0]!;
+    expect(queue).toContain("1 held operation waits outside this agent scope");
+    expect(queue.indexOf("outside this agent scope")).toBeLessThan(queue.indexOf('<table class="approval-table">'));
+    expect(queue).toContain('data-approval-row="item-1"');
+  });
+
+  for (const kind of ["non-hold", "decided", "unrecognized"]) {
+    it(`Overview reuses the lower-bound line on a full ${kind} page without a calm zero`, async () => {
+      vi.useFakeTimers();
+      const items = others(pageCap);
+      if (kind !== "non-hold") items[0] = { ...tier2, item_id: "edge", resolved: kind === "decided", tier: kind === "unrecognized" ? "tier9" : "tier2" };
+      let hasAgent = true;
+      const h = boot({ "/api/hub/inbox": inbox(items), "/api/posture/home": () => Promise.resolve(response({ ...home(), agents: hasAgent ? [{ agent_id: "fixture-agent" }] : [] })) }); await settle(); h.navigate("posture");
+      const card = h.el.main!.innerHTML.split('Needs your decision')[1]!.split('</section>')[0]!;
+      const line = runInContext('approvalQueueEvidence().line', h.context) as string;
+      expect(card).toContain(line);
+      expect(card).not.toMatch(/0 of 0|No approvals waiting|Nothing waiting on you|qe-check/);
+      if (kind !== "non-hold") expect(line).toContain("No recognized held operation is waiting in this page.");
+      h.navigate("approvals");
+      // A decided row has its own drawer; the queue still carries its full-page notice instead of an empty drawer sentence.
+      expect(h.el.main!.innerHTML).toContain("held operations beyond it are not shown here.");
+      if (kind !== "decided") expect(h.el.main!.innerHTML).toContain(line);
+      expect(h.el.fortress!.innerHTML).toContain(line);
+      hasAgent = false; await runInContext('fetchAll(true)', h.context); h.navigate("posture");
+      expect(h.el.main!.innerHTML).toContain("Needs your decision");
+      expect(h.el.main!.innerHTML).toContain(line);
+    });
+  }
+
+  for (const active of [["range"], ["server"], ["search"], ["range", "server"], ["range", "search"], ["server", "search"], ["range", "server", "search"]]) {
+    it(`Evidence no-match guidance names only active filters: ${active.join(", ")}`, async () => {
+      vi.useFakeTimers();
+      const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 0, integrity_findings: [] })) });
+      await settle(); h.navigate("activity");
+      if (active.includes("range")) {
+        const range = new FakeElement({ "data-action": "time-range" }, "SELECT"); range.value = "24h"; h.change(range);
+      }
+      const query = active.includes("search") ? "absent" : "";
+      h.navigate("activity?" + new URLSearchParams({ ...(active.includes("server") ? { agent: "absent" } : {}), ...(query ? { q: query } : {}) }).toString());
+      await settle();
+      const empty = h.el.main!.innerHTML.match(/<h3>No entries match this view<\/h3><p>([^<]*)<\/p>([\s\S]*?)<\/div>/)!;
+      expect(empty).not.toBeNull();
+      const names: string[] = active.map(a => a === "range" ? "time range" : a === "server" ? "server filters" : "page-local search");
+      expect(empty[1]).toContain("Active filters: " + names.join(", ") + ". No matches on this page.");
+      for (const name of ["time range", "server filters", "page-local search"].filter(n => !names.includes(n))) expect(empty[1]).not.toContain(name);
+      if (active.length === 1 && active[0] === "range") {
+        expect(empty[1]).toContain("Change the time range in the top bar.");
+        expect(empty[2]).not.toContain('href="#activity"'); expect(empty[2]).not.toContain("Clear filters");
+      } else expect(empty[2]).toContain('href="#activity">Clear filters</a>');
+    });
+  }
+});
+
+describe("Read-only extraction: Approvals round-two surface evidence", () => {
+  const pageCap = 100; // Must match APPROVAL_QUEUE_ITEM_CAP in client.ts and HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts.
+  const recognized = (count: number) => Array.from({ length: count }, (_, i) => ({ ...heldItem, item_id: `recognized-${i}` }));
+  const unknown = (count: number) => recognized(count).map(i => ({ ...i, tier: "tier9" }));
+  const fullPage = (holds: ReturnType<typeof recognized>) => holds.concat(Array.from({ length: pageCap - holds.length }, (_, i) => ({ ...heldItem, item_id: `notice-${i}`, kind: "blocked_egress" })));
+  const bootItems = async (items: unknown[]) => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/posture/home": () => Promise.resolve(response({ ...home(), agents: [{ agent_id: heldItem.agent_id }] })),
+    });
+    await settle(); h.navigate("posture");
+    return h;
+  };
+  const tile = (h: ReturnType<typeof boot>) => h.el.main!.innerHTML.split('>Approvals waiting</a>')[1]!.split('</div>')[0]!;
+  const tierWarning = (count: number) => count === 1 ? "1 held item carries a tier this console does not recognize" : `${count} held items carry a tier this console does not recognize`;
+  const openSeal = (h: ReturnType<typeof boot>) => {
+    const stopPropagation = vi.fn();
+    h.click({ "data-action": "posture-seal-toggle" }, [], false, { stopPropagation });
+    expect(stopPropagation).toHaveBeenCalledOnce();
+    expect(h.el["posture-seal-pop"]!.hidden).toBe(false);
+  };
+
+
+  for (const shape of ['unrecognized-only', 'full-page-none']) {
+    it(`A2 ${shape} uses unknown count styles while earned empty and recognized holds retain their styles`, async () => {
+      const h = await bootItems(shape === 'unrecognized-only' ? unknown(1) : fullPage([]));
+      expect(h.el['rail-approvals-count']!.className).toBe('count unknown');
+      // Retargeted in A2 round 2: an observed hold of a tier this console cannot decide keeps the waiting badge; only a
+      // zero with nothing observed takes the unknown look.
+      expect(h.el['notify-count']!.className).toBe(shape === 'unrecognized-only' ? 'wait' : 'wait unknown');
+      expect(h.el['notify-count']!.hidden).toBe(false);
+      const empty = await bootItems([]);
+      expect(empty.el['rail-approvals-count']!.className).toBe('count');
+      expect(empty.el['notify-count']!.className).toBe('wait');
+      expect(empty.el['notify-count']!.hidden).toBe(true);
+      const held = await bootItems(recognized(1));
+      expect(held.el['rail-approvals-count']!.className).toBe('count hot');
+      expect(held.el['notify-count']!.className).toBe('wait');
+      expect(held.el['notify-count']!.hidden).toBe(false);
+    });
+  }
+  it('A2 a scoped-empty queue with recognized holds elsewhere keeps the hot pill and the waiting badge', async () => {
+    vi.useFakeTimers();
+    const items = [{ ...heldItem, item_id: 'held-a', agent_id: 'fixture-agent-a' }, { ...heldItem, item_id: 'held-b', agent_id: 'fixture-agent-b' }];
+    const model_provider = { vendor: 'fixture-vendor', model_id: 'fixture-model' };
+    const agents = ['fixture-agent-a', 'fixture-agent-b', 'fixture-agent-c'].map(agent_id => ({ agent_id, status: 'active', model_provider }));
+    const h = boot({ '/api/hub/inbox': () => Promise.resolve(response({ data: { items } })), '/api/hub/agents': () => Promise.resolve(response({ data: { agents } })) });
+    await settle(); h.navigate('approvals');
+    h.click({ 'data-action': 'agent-scope-select', 'data-agent-id': 'fixture-agent-c' });
+    expect(h.el['rail-approvals-count']!.textContent).toBe('0 of 2');
+    expect(h.el['rail-approvals-count']!.className).toBe('count hot');
+    expect(h.el['notify-count']!.className).toBe('wait');
+    expect(h.el['notify-count']!.hidden).toBe(false);
+  });
+  // fail-before-exempt: plant (!w.earned && !counted) as (w.full && !counted) in renderApprovalCounts; the redacted zero then reads calm.
+  it('A2 a redacted zero takes the unknown pill and the unknown badge', async () => {
+    vi.useFakeTimers();
+    const h = boot({ '/api/hub/inbox': () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 0 } })) });
+    await settle();
+    expect(h.el['rail-approvals-count']!.className).toBe('count unknown');
+    expect(h.el['notify-count']!.className).toBe('wait unknown');
+    expect(Boolean(h.el['notify-count']!.hidden)).toBe(false);
+  });
+  it('A2 Overview decision card keeps the unknown-tier warning below recognized rows', async () => {
+    const holds = recognized(2); // Two recognized rows plus one unknown hold exercise the mixed branch.
+    const h = await bootItems([...holds, ...unknown(1)]);
+    const card = h.el.main!.innerHTML.split('Needs your decision')[1]!.split('</section>')[0]!;
+    expect(card).toContain('overview-table-decisions');
+    expect(card.match(/data-overview-review=/g)).toHaveLength(holds.length);
+    expect(card.split('</table>')[1]).toContain(tierWarning(1));
+  });
+  it('A2 rail and bell sentences end with a period for every summary branch', async () => {
+    for (const items of [[], recognized(1), unknown(1), fullPage([])]) {
+      const h = await bootItems(items);
+      for (const el of [h.railLink, h.el['btn-notifications']!]) for (const attr of ['title', 'aria-label']) expect(el.getAttribute(attr)).toMatch(/\.$/);
+    }
+    for (const load of [never, () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 0 } }))]) {
+      const h = boot({ '/api/hub/inbox': load }); await settle();
+      for (const el of [h.railLink, h.el['btn-notifications']!]) for (const attr of ['title', 'aria-label']) expect(el.getAttribute(attr)).toMatch(/\.$/);
+    }
+  });
+  it('A2 a full-page Waiting stat marks both observed counts as lower bounds', async () => {
+    const h = await bootItems(fullPage(recognized(2))); // Two in-scope holds and no outside holds reach the omitted denominator.
+    expect(h.el.fortress!.innerHTML).toContain('<span class="n">2+ of 2+</span><span class="l">Waiting</span>');
+    const partial = await bootItems(recognized(2));
+    expect(partial.el.fortress!.innerHTML).toContain('<span class="n">2</span><span class="l">Waiting</span>');
+  });
+
+  for (const count of [0, 2]) { // Zero and two distinguish absence from plural recognized holds.
+    it(`Overview tile marks the fortress-wide full-page recognized count ${count} with its source bound`, async () => {
+      const h = await bootItems(fullPage(recognized(count)));
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      expect(tile(h)).toContain(`<span class="ot-value">${count}+</span>`);
+      expect(tile(h)).toContain(`from the first ${pageCap} inbox items`);
+    });
+  }
+  for (const count of [1, 2]) { // Singular and plural unknown-tier wording are distinct product branches.
+    it(`Overview tile qualifies zero with ${count} unrecognized-tier holds`, async () => {
+      const h = await bootItems(unknown(count));
+      expect(tile(h)).toContain(tierWarning(count) + " · ");
+      expect(tile(h)).toContain('<span class="ot-value">0</span>');
+    });
+  }
+
+  for (const count of [0, 1, 2]) { // Empty, singular and plural sentences each have a distinct grammar boundary.
+    it(`rail and bell describe ${count} recognized holds within the full page and separate the page-edge sentence`, async () => {
+      const h = await bootItems(fullPage(recognized(count)));
+      for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+        for (const attr of ["title", "aria-label"]) {
+          expect(el.getAttribute(attr)).toContain(`${count} of ${count} held ${count === 1 ? "operation" : "operations"} in the first ${pageCap} inbox items ${count === 1 ? "waits" : "wait"} on you`);
+          expect(el.getAttribute(attr)).toMatch(/ · queue read [^.]+\. The inbox has at least/);
+          expect(el.getAttribute(attr)).not.toContain("At least");
+        }
+      }
+      expect(h.el["rail-approvals-count"]!.textContent).toBe(`${count}+ of ${count}+`);
+      expect(h.el["notify-count"]!.innerHTML).toContain(`${count}+ of ${count}+`);
+      expect(h.el["notify-count"]!.hidden).toBe(false);
+    });
+  }
+  for (const count of [1, 2]) {
+    it(`rail and bell name ${count} unrecognized-tier holds after the scope clause`, async () => {
+      const h = await bootItems(unknown(count));
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+        for (const attr of ["title", "aria-label"]) expect(el.getAttribute(attr)).toContain(`0 of 0 held operations wait on you (scoped to outside-agent); ${tierWarning(count)} · queue read `);
+      }
+      expect(h.el["notify-count"]!.hidden).toBe(false);
+    });
+  }
+
+  // fail-before-exempt: plant earned: hidden === 0 in the redacted summary to hide the badge incorrectly.
+  it("redacted zero keeps the badge visible and names the hidden queue", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 0 } })) });
+    await settle();
+    // Real DOM boolean properties coerce the base summary's absent earned field to false.
+    expect(Boolean(h.el["notify-count"]!.hidden)).toBe(false);
+    expect(h.el["btn-notifications"]!.classList.contains("waiting")).toBe(true);
+    for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+      for (const attr of ["title", "aria-label"]) expect(el.getAttribute(attr)).toContain("hidden until you paste the operator token");
+    }
+  });
+
+  it("Overview card header marks the recognized total on a full page as a lower bound", async () => {
+    const holds = recognized(2); // Two holds fit in the Overview card without row truncation.
+    const h = await bootItems(fullPage(holds));
+    const header = h.el.main!.innerHTML.split('Needs your decision')[1]!.split('</h3>')[0]!;
+    expect(header).toContain(`showing ${holds.length} of ${holds.length}+ · `);
+  });
+
+  // A positive server count deliberately disagrees with the empty served page; one entry takes the singular noun.
+  for (const total of [7, 1]) it(`Evidence empty page with a total of ${total} and no filter states the server count and retries its read`, async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })) });
+    await settle();
+    runInContext('state.timeRange = "all";', h.context); h.navigate("activity"); await settle();
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain('<h3>No entries on this page</h3>');
+    expect(entries).toContain(`The server counts ${total} ${total === 1 ? "entry" : "entries"} in this view, but this read shows none.`);
+    expect(entries).not.toContain("No entries match this view");
+    expect(entries).not.toContain("Clear filters");
+    expect(entries).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');
+    const before = h.requests.filter(r => r.url.startsWith("/api/posture/evidence")).length;
+    h.click({ "data-action": "retry-panel", "data-read": "/api/posture/evidence" }); await settle();
+    expect(h.requests.filter(r => r.url.startsWith("/api/posture/evidence"))).toHaveLength(before + 1);
+  });
+
+  // AuditLog.query applies the range before total and paging, so a real range-only no-match read has total zero.
+  for (const range of ["24h", "7d", "30d"]) it(`Evidence with the ${range} range, no rows and a zero total points to the range, not Retry`, async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })) });
+    await settle();
+    runInContext('state.timeRange = "' + range + '";', h.context); h.navigate("activity"); await settle();
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain("No entries match this view");
+    expect(entries).toContain("Active filters: time range.");
+    expect(entries).toContain("Change the time range in the top bar.");
+    expect(entries).not.toContain("No entries on this page");
+    expect(entries).not.toContain('data-action="retry-panel"');
+  });
+
+  for (const count of [0, 1]) {
+    it(`seal Charter approvals row warns about the full-page recognized count ${count}`, async () => {
+      const h = await bootItems(fullPage(recognized(count)));
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      openSeal(h);
+      const row = h.el["posture-seal-pop"]!.innerHTML.split('<div class="pp-line">').find(line => line.includes('Charter approvals</span>'))!;
+      expect(row).toContain(`<span class="pp-v">${count}+ waiting</span>`);
+      expect(row).toContain('class="pp-dot warn"');
+    });
+  }
+  for (const count of [1, 2]) {
+    it(`seal Charter approvals row separates ${count} unrecognized-tier holds from recognized waiting`, async () => {
+      const h = await bootItems(unknown(count));
+      openSeal(h);
+      const row = h.el["posture-seal-pop"]!.innerHTML.split('Charter approvals</span>')[1]!.split('</div>')[0]!;
+      expect(row).toContain(`<span class="pp-v">0 waiting; ${tierWarning(count)}</span>`);
+      expect(h.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot warn"></span><span class="pp-k">Charter approvals');
+    });
+  }
+  // fail-before-exempt: plant the earned-empty Charter approvals value as "0 waiting" instead of "clear".
+  it("seal Charter approvals is clear only with earned-empty evidence", async () => {
+    const h = await bootItems([]);
+    openSeal(h);
+    expect(h.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot"></span><span class="pp-k">Charter approvals</span><span class="pp-v">clear</span>');
+    expect(tile(h)).toContain('<span class="ot-value">0</span>');
+    expect(h.el["notify-count"]!.hidden).toBe(true);
+    const waiting = await bootItems(recognized(1));
+    openSeal(waiting);
+    expect(waiting.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot warn"></span><span class="pp-k">Charter approvals</span><span class="pp-v">1 waiting</span>');
+    for (const mode of ["unloaded", "redacted"]) {
+      const unavailable = boot({ "/api/hub/inbox": mode === "unloaded" ? never : () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 0 } })) });
+      await settle(); openSeal(unavailable);
+      expect(unavailable.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot unknown"></span><span class="pp-k">Charter approvals</span><span class="pp-v">Unknown</span>');
+    }
+  });
+});
+
+describe("Read-only extraction mutation boundaries", () => {
+  it("count, scope, Evidence retry and pager reads never submit a decision or standing rule", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem, { ...heldItem, item_id: "unknown-tier", tier: "tier9" }] } })),
+      "/api/posture/home": () => Promise.resolve(response({ ...home(), agents: [{ agent_id: heldItem.agent_id }] })),
+      "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 1, integrity_findings: [] })),
+      // One beyond the existing 25-row pager makes the read-only Next action reachable.
+      "/api/honeypot/tool-traps": () => Promise.resolve(response({ data: { traps: Array.from({ length: 26 }, (_, i) => ({ fake_tool_name: `readonly-tool-${i + 1}` })) } })),
+    });
+    await settle();
+    for (const route of ["approvals", "posture", "dashboard", "policy", "honeypot"]) {
+      h.navigate(route); await settle();
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      expect(h.el.main!.innerHTML).not.toContain("approval-decision-feedback");
+      expect(h.el.main!.innerHTML).not.toContain("approval-feedback-open");
+    }
+    h.navigate("honeypot"); await settle();
+    expect(h.el.main!.querySelector('[data-action="mfp-page"][data-list="toolTraps"][data-step="1"]')).not.toBeNull();
+    expect(h.el.main!.innerHTML).not.toContain("readonly-tool-26");
+    h.click({ "data-action": "mfp-page", "data-list": "toolTraps", "data-step": "1" });
+    expect(h.el.main!.innerHTML).toContain("readonly-tool-26");
+    expect(runInContext('state.mfp.pages.toolTraps', h.context)).toBe(1);
+    runInContext('state.timeRange = "all";', h.context);
+    h.navigate("activity"); await settle();
+    expect(h.el.main!.innerHTML).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');
+    const before = h.requests.length;
+    h.click({ "data-action": "retry-panel", "data-read": "/api/posture/evidence" }); await settle();
+    expect(h.requests.length).toBeGreaterThan(before);
+    expect(h.requests.filter(r => r.init?.method && r.init.method !== "GET")).toEqual([]);
+    expect(runInContext('state.approvals.inFlightItemId', h.context)).toBeNull();
+    expect(runInContext('state.inbox.every(i => !i.resolved)', h.context)).toBe(true);
+  });
+});
+
+
+describe("Read-only scoped notice evidence boundary", () => {
+  const pageCap = 100; // One inbox page, must match HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts.
+  const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+  const agents = ["agent-a", "agent-b"].map(agent_id => ({ agent_id, status: "active", model_provider }));
+  const decidedA = { ...heldItem, item_id: "decided-a", agent_id: "agent-a", tier: "tier2", resolved: true };
+  const pendingB = { ...heldItem, item_id: "pending-b", agent_id: "agent-b", tier: "tier2" };
+  const unknownA = { ...heldItem, item_id: "unknown-a", agent_id: "agent-a", tier: "tier9" };
+  const scopeA = (h: ReturnType<typeof boot>) => h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-a" });
+  for (const shape of ["unknown", "full-page"]) {
+    it(`decided-history consumer qualifies observed outside holds for ${shape}`, async () => {
+      vi.useFakeTimers();
+      // The unknown hold belongs to selected A; the full page cannot exclude an unseen A hold.
+      const items = shape === "unknown" ? [decidedA, pendingB, unknownA] : [decidedA, pendingB, ...Array.from({ length: pageCap - 2 }, (_, i) => ({ ...pendingB, item_id: `notice-${i}`, kind: "blocked_egress" }))];
+      const h = boot({
+        "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+        "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+      });
+      await settle(); h.navigate("approvals"); scopeA(h);
+      const queue = h.el.main!.innerHTML.split('<aside')[0]!;
+      expect(queue).toContain('data-approval-row="decided-a"');
+      expect(queue).toContain("1 held operation waits outside this agent scope");
+      expect(queue.indexOf("outside this agent scope")).toBeLessThan(queue.indexOf('<table class="approval-table">'));
+      expect(queue).not.toContain("Nothing waiting for agent-a.");
+      expect(queue).toContain("No recognized held operation for agent-a is waiting in this read.");
+      expect(queue).not.toMatch(/Nothing waiting on you|qe-check/);
+      if (shape === "unknown") expect(queue).toContain("1 held item carries a tier this console does not recognize");
+      else expect(queue).toContain("a held operation may be waiting past them");
+    });
+  }
+  it("defensive Evidence Retry is not masked by page-local search", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 7, integrity_findings: [] })) });
+    await settle();
+    runInContext('state.timeRange = "all";', h.context);
+    h.navigate("activity"); await settle();
+    h.input("evidence-filter-query", "absent");
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain("The server counts 7 entries in this view, but this read shows none.");
+    expect(entries).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');
+    expect(entries).not.toContain("Clear filters");
+  });
+  for (const selected of [false, true]) for (const mode of ["earned", "known", "unknown", "loading", "redacted"]) {
+    it(`read-only evidence matrix selected=${selected} mode=${mode}`, async () => {
+      vi.useFakeTimers();
+      const pendingA = { ...decidedA, item_id: "pending-a", resolved: false };
+      const items = mode === "known" ? [decidedA, pendingA, pendingB] : mode === "unknown" ? [decidedA, unknownA] : [decidedA];
+      const h = boot({
+        "/api/hub/inbox": mode === "loading" ? never : () => Promise.resolve(response({ data: { items: mode === "redacted" ? [] : items, pending_approvals_redacted: mode === "redacted", pending_approvals_count: 0 } })),
+        "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+        "/api/posture/home": () => Promise.resolve(response({ ...home(), agents })),
+      });
+      await settle(); h.navigate("approvals");
+      if (selected) scopeA(h);
+      const unknown = mode === "loading" || mode === "redacted";
+      const earned = mode === "earned";
+      const known = mode === "known";
+      const count = mode === "loading" ? "Unknown" : known ? `${selected ? 1 : 2} of 2` : "0 of 0";
+      expect(h.el["rail-approvals-count"]!.textContent).toBe(count);
+      expect(h.el["rail-approvals-count"]!.className).toBe(earned ? "count" : known ? "count hot" : "count unknown");
+      expect(Boolean(h.el["notify-count"]!.hidden)).toBe(earned);
+      for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+        const label = el.getAttribute("aria-label")!;
+        if (mode === "loading") expect(label).toContain("Unknown until the approval queue loads");
+        else if (mode === "redacted") expect(label).toContain("hidden until you paste the operator token");
+        else if (mode === "unknown") expect(label).toContain("1 held item carries a tier this console does not recognize");
+        else expect(label).toContain(known ? `${selected ? 1 : 2} of 2 held operations wait on you` : "0 of 0 held operations wait on you");
+      }
+      if (earned) expect(h.el.fortress!.innerHTML).toContain('qe-check');
+      else {
+        expect(h.el.fortress!.innerHTML).not.toContain('qe-check');
+        expect(h.el.main!.innerHTML).not.toContain("Nothing waiting on you.");
+      }
+      h.navigate("posture");
+      const tile = h.el.main!.innerHTML.split('>Approvals waiting</a>')[1]!.split('</div>')[0]!;
+      if (unknown) expect(tile).toContain(mode === "loading" ? "Not evaluated" : "UNKNOWN");
+      else expect(tile).toContain(`<span class="ot-value">${known ? "2" : "0"}</span>`);
+      if (mode === "unknown") expect(h.el.main!.innerHTML).toContain("1 held item carries a tier this console does not recognize");
+      if (earned) expect(h.el.main!.innerHTML).toContain("No approvals waiting");
+      else expect(h.el.main!.innerHTML).not.toContain("No approvals waiting");
+      h.click({ "data-action": "posture-seal-toggle" }, [], false, { stopPropagation: vi.fn() });
+      const row = h.el["posture-seal-pop"]!.innerHTML.split('<div class="pp-line">').find(line => line.includes('Charter approvals</span>'))!;
+      expect(row).toContain(`class="pp-dot${unknown ? " unknown" : earned ? "" : " warn"}"`);
+      expect(row).toContain(`<span class="pp-v">${unknown ? "Unknown" : earned ? "clear" : known ? "2 waiting" : "0 waiting; 1 held item carries a tier this console does not recognize"}</span>`);
+    });
+  }
+  for (const filters of [{ query: " " }, { agent: "agent-a", query: "absent" }, { layer: "l1" }, { event: "state_write" }]) {
+    it(`defensive inconsistent page keeps Retry with pre-total filters ${JSON.stringify(filters)}`, async () => {
+      vi.useFakeTimers();
+      const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 7, integrity_findings: [] })) });
+      await settle(); h.context.testFilters = filters;
+      runInContext('state.timeRange = "24h";', h.context);
+      h.navigate("activity"); await settle();
+      runInContext('Object.assign(state.evidence.filters, testFilters); rerender();', h.context);
+      const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+      expect(entries).toContain('data-action="retry-panel"');
+      expect(entries).not.toContain("Clear filters");
+    });
+  }
+  it("result post-filter may explain an empty positive-total page even with local search", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 7, integrity_findings: [] })) });
+    await settle();
+    runInContext('state.timeRange = "all";', h.context);
+    h.navigate("activity"); await settle();
+    runInContext('state.evidence.filters.result = "failure"; rerender();', h.context);
+    h.input("evidence-filter-query", "absent");
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain("No entries match this view");
+    expect(entries).toContain("Clear filters");
+    expect(entries).not.toContain('data-action="retry-panel"');
+  });
+
+});
+
+describe("Talk split draft ownership", () => {
+  it("explicit suggestion updates the live mounted draft before a refused send", async () => {
+    const h = boot({ "/api/hub/chat/concierge": () => Promise.resolve(response({ error: "refused" }, 403)) });
+    await settle();
+    const mounted = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { value: "draft A", isConnected: true });
+    Object.assign(h.context, { mounted });
+    runInContext('state.chat.concierge.composer="draft A"; talkOwner={input:mounted};', h.context);
+    h.click({ "data-action": "concierge-suggestion", "data-suggestion-id": "summarize-hour" });
+    expect(mounted.value).toBe("Summarize what happened in this fortress in the last hour.");
+    await settle();
+    expect(runInContext("state.chat.concierge.composer", h.context)).toBe(mounted.value);
+    expect(h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST")).toHaveLength(1);
+  });
+
+  it("a host change carries an unrevoked send follow to the new host's history", async () => {
+    const h = boot(); await settle();
+    const makeHost = () => {
+      const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+        scrollTop: 0, clientHeight: 100, scrollHeight: 500,
+        addEventListener() {}, removeEventListener() {}, isConnected: true,
+      });
+      const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+      const host = new FakeElement();
+      host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+        : selector === 'input[data-action="concierge-input"]' ? input
+        : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+      return { host, history };
+    };
+    const first = makeHost(); const second = makeHost();
+    Object.assign(h.context, { firstHost: first.host, secondHost: second.host });
+    runInContext('attachTalkOwner(firstHost); talkFollowIntent={scrollEpoch:talkUserScrollEpoch}; disposeTalkOwner(); attachTalkOwner(secondHost);', h.context);
+    expect(runInContext("!!talkFollowIntent", h.context)).toBe(true);
+    expect(second.history.scrollTop).toBe(500);
+  });
+
+  it("changed legacy history restores its own mid-thread offset without outer-page scrolling", async () => {
+    const h = boot(); await settle();
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 73, clientHeight: 100, scrollHeight: 500, scrollIntoView: vi.fn(),
+    });
+    Object.assign(h.context, { testHistory: history });
+    runInContext('var snapshot=captureTalkViewport(testHistory); testHistory.scrollTop=0; testHistory.scrollHeight=600; restoreTalkViewport(testHistory,snapshot,false);', h.context);
+    expect(history.scrollTop).toBe(73);
+    expect(history.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("a zero-motion scroll event leaves the follow epoch alone while a moved history bumps it", async () => {
+    const h = boot(); await settle();
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener(name: string, fn: (ev: unknown) => void) { listeners[name] = fn; },
+      removeEventListener() {},
+    });
+    const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+    const host = new FakeElement();
+    host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+      : selector === 'input[data-action="concierge-input"]' ? input
+      : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+    Object.assign(h.context, { testHost: host });
+    runInContext('attachTalkOwner(testHost); talkFollowIntent={scrollEpoch:talkUserScrollEpoch};', h.context);
+    // The VM DOM has no wheel or layout; the real no-motion wheel is covered by
+    // test/e2e/talk-follow-ownership.e2e.ts (d). This proves only the epoch rule.
+    expect(listeners.scroll).toBeTypeOf("function");
+    listeners.scroll!({ isTrusted: true });
+    expect(runInContext("talkFollowIntent.scrollEpoch===talkUserScrollEpoch", h.context)).toBe(true);
+    history.scrollTop = 10; listeners.scroll!({ isTrusted: true });
+    expect(runInContext("talkFollowIntent.scrollEpoch===talkUserScrollEpoch", h.context)).toBe(false);
+  });
+
+  it("contains a wheel at the history's ends so the outer page never moves under the reader", () => {
+    // Native Chromium chained a no-motion wheel at the bottom of the history to the page (0 to 28 px).
+    const rule = /\.concierge-history \{([^}]*)\}/.exec(renderDashboardV11Html());
+    expect(rule?.[1]).toMatch(/overscroll-behavior:\s*contain;/);
+  });
+
+  it("a hidden history's zero geometry never overwrites the saved reader position", async () => {
+    const h = boot(); await settle();
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener() {}, removeEventListener() {},
+    });
+    const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+    const host = new FakeElement();
+    host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+      : selector === 'input[data-action="concierge-input"]' ? input
+      : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+    Object.assign(h.context, { testHost: host });
+    runInContext('talkViewportState={top:73,following:false}; attachTalkOwner(testHost);', h.context);
+    expect(history.scrollTop).toBe(73);
+    // panel.hidden = true drops the layout box: every geometry field reads 0.
+    Object.assign(history, { scrollTop: 0, clientHeight: 0, scrollHeight: 0 });
+    runInContext("disposeTalkOwner();", h.context);
+    expect(runInContext("JSON.stringify(talkViewportState)", h.context)).toBe(JSON.stringify({ top: 73, following: false }));
+  });
+
+  it("a legacy reader who scrolls during an in-flight send is not pulled down by the reply", async () => {
+    const posts: Array<(value: unknown) => void> = [];
+    const h = boot({ "/api/hub/chat/concierge": () => new Promise((resolve) => posts.push(resolve)) });
+    await settle();
+    expect(runInContext("talkDomOwnerSupported", h.context)).toBe(false);
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener(name: string, fn: (ev: unknown) => void) { listeners[name] = fn; },
+      removeEventListener() {},
+    });
+    // The VM DOM does not parse innerHTML into elements, so the written history is this one fake.
+    h.el["concierge-history"] = history;
+    const main = h.el.main!;
+    const ownQuery = main.querySelector.bind(main);
+    main.querySelector = (selector: string) => selector === "#concierge-history" ? history : ownQuery(selector);
+    h.navigate("dashboard"); await settle();
+    const send = async (scrollDuringFlight: boolean) => {
+      runInContext('state.chat.concierge.composer="question"; void onConciergeSend();', h.context);
+      await settle();
+      if (scrollDuringFlight) { history.scrollTop = 200; listeners.scroll?.({ isTrusted: true }); }
+      posts.shift()!(response({ data: { reply_text: "answer", served_by: "local" } }));
+      await settle();
+    };
+    await send(false);
+    expect(history.scrollTop, "an unrevoked send follows its reply").toBe(500);
+    await send(true);
+    expect(history.scrollTop, "a real scroll during the send revoked follow").toBe(200);
+  });
+
+  it("a legacy panel-to-full-page move restores the panel reader's current position, not its last write", async () => {
+    const h = boot(); await settle();
+    const makeHistory = () => Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener() {}, removeEventListener() {},
+    });
+    const panelHistory = makeHistory(); const mainHistory = makeHistory();
+    // The VM DOM does not parse innerHTML, so each host answers with its fake
+    // history only once Talk markup has been written into it.
+    const answer = (host: FakeElement, history: FakeElement) => {
+      const ownQuery = host.querySelector.bind(host);
+      host.querySelector = (selector: string) => selector === "#concierge-history"
+        ? (host.innerHTML.includes('id="concierge-history"') ? history : null) : ownQuery(selector);
+    };
+    answer(h.el["talk-panel-body"]!, panelHistory); answer(h.el.main!, mainHistory);
+    h.el["concierge-history"] = panelHistory;
+    h.click({ "data-action": "talk-toggle" });
+    expect(panelHistory.scrollTop, "the panel opens a long thread at its latest message").toBe(500);
+    panelHistory.scrollTop = 200;
+    h.click({ "data-action": "talk-open-full" });
+    h.navigate("dashboard"); await settle();
+    expect(mainHistory.scrollTop).toBe(200);
+  });
+
+  it("an engine missing Node.isConnected or Element.replaceChildren takes the legacy Talk path", async () => {
+    const connectedNode = { prototype: { isConnected: false } };
+    class NoReplaceChildren {}
+    const missingNode = boot({}, {}, { templateContent: true }); await settle();
+    expect(runInContext("talkDomOwnerSupported", missingNode.context)).toBe(false);
+    const missingReplace = boot({}, { Node: connectedNode, Element: NoReplaceChildren }, { templateContent: true }); await settle();
+    expect(runInContext("talkDomOwnerSupported", missingReplace.context)).toBe(false);
+    const complete = boot({}, { Node: connectedNode }, { templateContent: true }); await settle();
+    expect(runInContext("talkDomOwnerSupported", complete.context)).toBe(true);
+  });
+
+  it("a send whose first render throws still settles, so the next send posts", async () => {
+    const h = boot({ "/api/hub/chat/concierge": () => Promise.resolve(response({ data: { reply_text: "ok" } })) });
+    await settle();
+    const main = h.el.main!;
+    let throwOnce = false;
+    Object.defineProperty(h.el, "main", {
+      configurable: true,
+      get() { if (throwOnce) { throwOnce = false; throw new Error("fixture render failure"); } return main; },
+    });
+    const posts = () => h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST").length;
+    throwOnce = true;
+    runInContext('state.chat.concierge.composer="first"; void onConciergeSend().catch(function () {});', h.context);
+    await settle();
+    expect(runInContext("state.chat.concierge.sending", h.context)).toBe(false);
+    expect(posts(), "the failed render happened before any POST").toBe(0);
+    runInContext('state.chat.concierge.composer="second"; void onConciergeSend();', h.context);
+    await settle();
+    expect(posts()).toBe(1);
+  });
+
+  it("a redraw that throws after the POST settled keeps the message sent: draft cleared, no second POST", async () => {
+    // Capability: a Talk send commits when the POST settles, not when the screen
+    // redraws afterwards. F2.
+    let releasePost: ((value: unknown) => void) | null = null;
+    const h = boot({ "/api/hub/chat/concierge": () => new Promise((resolve) => { releasePost = resolve; }) });
+    await settle();
+    const main = h.el.main!;
+    let throwOnce = false;
+    Object.defineProperty(h.el, "main", {
+      configurable: true,
+      get() { if (throwOnce) { throwOnce = false; throw new Error("fixture render failure"); } return main; },
+    });
+    const posts = () => h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST").length;
+    runInContext('state.chat.concierge.composer="question"; void onConciergeSend();', h.context);
+    await settle();
+    expect(posts()).toBe(1);
+    // The first redraw after the POST settles is the one that throws.
+    throwOnce = true;
+    releasePost!(response({ data: { reply_text: "answer", served_by: "local" } }));
+    await settle();
+    expect(throwOnce, "test premise: the redraw after the POST threw").toBe(false);
+    expect(runInContext("state.chat.concierge.sending", h.context)).toBe(false);
+    expect(runInContext("state.chat.concierge.composer", h.context), "the sent draft is cleared").toBe("");
+    const error = runInContext("state.chat.concierge.error", h.context);
+    expect(error, "the redraw failure is reported over a sent message").toMatch(/was sent/);
+    expect(error).not.toMatch(/fixture render failure/);
+    // The operator presses Send again: nothing is left to send.
+    h.click({ "data-action": "concierge-send" }, [], false, { preventDefault() {} });
+    await settle();
+    expect(posts(), "the sent message is never posted twice").toBe(1);
+  });
+
+  it("after a clean send the badge carries the response's display label, not the history's generic one", async () => {
+    // Capability: the substrate badge names what served this reply. The history
+    // refresh writes a generic per-substrate label; the response's label wins.
+    const h = boot({
+      "/api/hub/chat/concierge": () => Promise.resolve(response({ data: { reply_text: "answer", served_by: "local", display_label: "Concierge: Local model (fixture 7B)" } })),
+      "/api/hub/chat/concierge/history": () => Promise.resolve(response({ data: { messages: [
+        { role: "operator", body: "question", created_at: "2026-10-17T00:00:00.000Z" },
+        { role: "concierge", body: "answer", created_at: "2026-10-17T00:00:01.000Z", served_by: "local" },
+      ] } })),
+    });
+    await settle();
+    runInContext('state.chat.concierge.composer="question"; void onConciergeSend();', h.context);
+    await settle();
+    expect(runInContext("state.chat.concierge.sending", h.context)).toBe(false);
+    expect(runInContext("state.chat.concierge.messages.length", h.context), "test premise: the history refresh landed").toBe(2);
+    expect(runInContext("state.chat.concierge.badge.displayLabel", h.context)).toBe("Concierge: Local model (fixture 7B)");
   });
 });

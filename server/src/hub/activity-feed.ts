@@ -78,6 +78,8 @@ function categorizeOperation(
   operation: string,
 ): HubActivityCategory {
   const op = operation.toLowerCase();
+  // Must match ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE in dashboard/v1_1/templates.ts: a rule filing into a kept
+  // category must keep its sentence true, so privacy accepts only privacy_event or privacy_ names; other records any audit event.
   if (op === "privacy_event" || op.startsWith("privacy_")) return "privacy";
   if (op.includes("approval") || op.includes("approved")) return "approval";
   if (

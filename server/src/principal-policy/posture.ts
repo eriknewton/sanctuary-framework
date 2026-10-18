@@ -1142,22 +1142,28 @@ function blockedDestinationLabel(details: Record<string, unknown> | undefined): 
   return (label + (port !== null && port >= 0 && port <= DESTINATION_PORT_MAX ? ":" + port : "")).slice(0, DESTINATION_LABEL_MAX_CHARS);
 }
 
-/** Settle retention from the eager in-memory view and two cheap public reads; never re-reads the chain from disk. */
+/**
+ * Settle retention from the eager in-memory view and three cheap public reads (the rotation floor, and the chain head
+ * before and after the view); never re-reads the chain from disk.
+ */
 async function routineWindowCoverage(
   auditLog: AuditLog, windowStart: string, readRetained: (limit: number) => ReturnType<AuditLog["query"]>,
 ): Promise<AuditDigest["window_incomplete_reason"]> {
   try {
     const floor = await auditLog.authenticatedRotationFloor();
     if (floor.status === "invalid") return "coverage_unknown";
-    const start = parseIsoInstantWithOffset(windowStart);
-    if (start === undefined) return "coverage_unknown";
-    // The head is read before the view, so an append between the two reads can only lower the view's computed oldest
-    // sequence; that moves the floor lookup to a newer entry or out of the view, never to an older one.
+    // An unparseable window cannot support a coverage claim; parsing is a fail-closed gate, not a retention time bound.
+    if (parseIsoInstantWithOffset(windowStart) === undefined) return "coverage_unknown";
     const head = await auditLog.getChainHead();
     // The posture surface runs the digest inside runEagerReads, so this read serves references into the verified
     // in-memory view; a full on-disk re-read per board paint or stream push is the load this surface must not pay. The
     // read budget is raised to the retention cap so a log retained in full is read in full.
     const retained = await readRetained(Math.max(DIGEST_QUERY_ENTRY_LIMIT, auditLog.getRetentionConfig().maxEntries));
+    // The view's oldest sequence is derived from the first head and the count, so a head that moved while the view was
+    // read cannot support a complete window, and coverage is unknown. Must match "withholds coverage for an append
+    // between the chain head and eager view reads" and
+    // "withholds coverage when a reloaded view races an append" in test/principal-policy/overview-digest.test.ts.
+    if ((await auditLog.getChainHead()).sequence !== head.sequence) return "coverage_unknown";
     // The floor entry is found by position, so every entry in the view must be in hand; an empty log has none to prove from.
     if (retained.entries.length === 0 || retained.entries.length !== retained.total) return "coverage_unknown";
     // A verified chain is contiguous, so the view's oldest sequence follows from the head and the count. The view may
@@ -1171,6 +1177,8 @@ async function routineWindowCoverage(
     // Entry timestamps are caller-supplied and need not rise with sequence, so no retained entry's time bounds what
     // retention removed before it. Coverage holds only while the view still reaches the chain's first entry; otherwise
     // the reason is retention until the audit module serves an authenticated time bound for the pruned prefix.
+    // Must match "covers a pruned prefix still held in the eager view but reports retention outside it" in
+    // test/principal-policy/overview-digest.test.ts: the full view supplies the counts.
     return viewOldestSequence === firstSequence ? null : "retention";
   } catch {
     return "coverage_unknown";
