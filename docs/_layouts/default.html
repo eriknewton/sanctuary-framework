@@ -51,6 +51,7 @@
       <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
     </nav>
     <a class="button header-install" href="{{ '/install/' | relative_url }}">Install</a>
+    {% comment %}Hidden until the footer script runs: without JavaScript the toggle cannot work, so it never renders and the readable dark default stays.{% endcomment %}
     <button class="theme" type="button" hidden>Light theme</button>
     <details class="mobile-menu">
       <summary>Menu</summary>

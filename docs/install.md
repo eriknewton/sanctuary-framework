@@ -91,12 +91,18 @@ The full-profile macOS planner is not the Ubuntu installation route.
 
 Other Linux platforms, DNS and hostname paths, real-agent harnesses, upgrades and provisioned removal are outside the recorded proof.
 
-## Remove an npm installation
+## Uninstall
 
-Use the README's uninstall command:
+Use the README's uninstall command. It removes Sanctuary's enforcement components and keeps your fortress state, keys and audit log; it does not remove the npm package or restore your harness configuration:
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
+```
+
+To restore the harness configuration Sanctuary rewrote:
+
+```bash
+npx -y @sanctuary-framework/mcp-server protect --unwrap
 ```
 
 Read its result and the [uninstall reference](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart). Follow any named operator action. Consult [restore and recovery](/castle-wall-macos-install.html#restore-and-recovery) before changing an existing fortress.

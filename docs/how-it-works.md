@@ -13,7 +13,7 @@ The product’s direction is one dashboard across your agents, machines and data
 
 ## Start with your own agent. Grow toward a fleet.
 
-A private memory vault is the first step. The next stage aims for a complete setup on one dedicated Mac, combining the vault, an operating-system wall and a verified local model; that stage remains in progress. The destination is one console across machines and operating systems. Fleet enrollment and cross-machine policy management belong to that next product stage, not a claim of a completed fleet experience today.
+A private memory vault, released as a candidate, is the first step. The next stage aims for a complete setup on one dedicated Mac, combining the vault, an operating-system wall and a verified local model; that stage remains in progress. The destination is one console across machines and operating systems. Fleet enrollment and cross-machine policy management belong to that next product stage, not a claim of a completed fleet experience today.
 
 Setup integrations include Claude Code, Hermes, OpenClaw, Cursor and Cline. Mastra is fixture-tested only, without a recorded live-agent drill. Wrapping remains partial: configuration tests do not cover every harness version or native tool surface. The current deployment guide ships local mode; operator-cloud deployment is roadmapped. That future mode would also require trust in the host and its provider. Calling an outside model from a local agent is a different step from hosting the agent in the cloud.
 
@@ -25,11 +25,11 @@ On macOS, the wall requires a separate signed app, system extension and privileg
 
 ## Keep memory under your control
 
-Sanctuary stores fortress state in encrypted form and provides memory and state export/import tools. Custody and approval have platform requirements. Encryption tests are not evidence of hardware-backed custody, and complete migration, exit and erasure guarantees remain in progress.
+Sanctuary stores fortress state in encrypted form and provides memory and state export/import tools. Custody and approval have platform requirements. Memory custody is partial and a candidate: confirm that memory survives a restart on your machine before daily use; the model provider you choose sees memory at inference; changing the master key is refused while memory is stored; and plaintext memory export, import and conversion need an approval dialog that only macOS has today, so Linux and Windows refuse them. Encryption tests are not evidence of hardware-backed custody, and complete migration, exit and erasure guarantees remain in progress.
 
 ## Keep supported queries private
 
-In Sanctuary’s query path, fingerprintable headers are stripped by default. With your consent, personal details can be rewritten before a query leaves, using a classifier that processes them locally. This is a protection in the supported query path, not a claim that every connection from every harness passes through it.
+In Sanctuary’s query path, fingerprintable headers are stripped by default. With your consent, personal details can be rewritten before a query leaves, using a classifier that processes them locally. Coverage is limited to tested kinds of personal detail and supported providers. This is a protection in the supported query path, not a claim that every connection from every harness passes through it.
 
 ## Decide which actions require approval
 
@@ -47,6 +47,6 @@ State and memory export/import are part of the product; full exit and erasure ar
 
 Castle Wall supplies the enforced network boundary. Sentinels observe activity. The Charter contains cooperative tools and approval rules. Heralds cover optional recognition and reputation connections. Mantle handles installation and binding to the host. These parts support the product story; their names do not establish that every capability is proven on every platform.
 
-The [Castle Architecture reference](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#castle-architecture) explains the mechanisms. Sanctuary works independently of Concordia and Verascore.
+The [Castle Architecture reference](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#the-castle-architecture) explains the mechanisms. Sanctuary works independently of Concordia and Verascore.
 
 [Choose a supported installation path](/install/) or use the [agent-guided installation contract](/agent-guided-install.html).
