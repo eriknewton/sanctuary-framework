@@ -109,6 +109,7 @@ function toRelSrcPath(absPath: string): string {
  * around the guard.
  */
 const ALLOWLIST: Record<string, string> = {
+  "src/hermes-memory-bridge/process-shell.ts": "The dedicated bridge refuses any exit-import journal before custody, identity loading, adapter composition or readiness. It never opens pending recovery; the operator exit-recover path owns recovery. Must match assertNoInterruptedExitImport and its process-socket refusal tests.",
   "src/disclosure/broker/open.ts": "L3 secret-broker open helper; not wired this fix round, scope bounded to the named sites plus low-risk additions found while auditing.",
   "src/cli/erc8004.ts": "erc8004 verb; not wired this fix round, same bounded-scope reason.",
   "src/cli/sentinel.ts": "sentinel verb family, multiple AuditLog sites across many verbs; not wired this fix round.",

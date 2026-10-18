@@ -5,6 +5,7 @@ export * from "./connection-lifecycle.js";
 export * from "./envelopes.js";
 export * from "./framing.js";
 export * from "./probe-waiter.js";
+export * from "./process-shell.js";
 export * from "./public-results.js";
 export * from "./rate-window.js";
 export * from "./strict-json.js";
