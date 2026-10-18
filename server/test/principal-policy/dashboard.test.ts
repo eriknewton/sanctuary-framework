@@ -1784,6 +1784,15 @@ import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { CASTLE_WALL_AUDIT_PROVENANCE_KEY, CASTLE_WALL_AUDIT_PROVENANCE_VALUE } from "../../src/castle-wall/constants.js";
 
+// Test isolation (AGENTS.md "the operator's machine is not a fixture",
+// defect.dashboard-test-reads-host-producer-key-01): the production producer-key
+// loader prefers a host-wide macOS path before the fortress-relative one, so
+// the channel below pins the load to the Linux branch and reads only its own
+// temporary fortress. Without the pin, a Mac that has the root helper installed
+// supplies a real key and the synthetic unsigned evidence here is dropped on
+// one route and kept on the other.
+const TEMP_FORTRESS_ONLY_PRODUCER_KEY_LOAD = { platform: "linux" } as const;
+
 describe("Overview route parity", () => {
   it("serves matching wall evidence through sovereignty and the additive home on one Dashboard", async () => {
     let dashboard: DashboardApprovalChannel | undefined;
@@ -1792,7 +1801,8 @@ describe("Overview route parity", () => {
     try {
       await bindWithRetry(async () => {
         port = randomTestPort();
-        dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auto_open: false });
+        dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auto_open: false,
+          producer_key_load_options: TEMP_FORTRESS_ONLY_PRODUCER_KEY_LOAD });
         await dashboard.start();
       });
       const storage = new MemoryStorage();
