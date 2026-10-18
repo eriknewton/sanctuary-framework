@@ -235,7 +235,9 @@ function violations(path: string, text: string): string[] {
   for (const [file, calls] of Object.entries(scalarCalls)) {
     if (path === join(crate, 'src/smb', file)) for (const call of calls) codecs = codecs.replace(call, 'SCALAR_FORMAT');
   }
-  if (!codecOwners.has(path) && /(?:fn|function)\s+(?:jcs|canonicalize|parseStrict|parse_strict|parse_json)\b|JSON\s*\.\s*(?:parse|stringify)\s*\(|\bserde_json\b|\bto_string\b|\b(?:format|write|writeln|print|println|eprint|eprintln|format_args|panic)\s*!/.test(codecs)) found.push('codec');
+  // FromStr can decode a Value without naming serde; only explicit numeric primitives bypass ownership.
+  const valueDecode = path.endsWith('.rs') && /\bfrom_str\b|\.\s*parse\b(?!\s*::\s*<\s*(?:[ui](?:8|16|32|64|128|size)|f(?:32|64))\s*>)/.test(codecs);
+  if (!codecOwners.has(path) && (valueDecode || /(?:fn|function)\s+(?:jcs|canonicalize|parseStrict|parse_strict|parse_json)\b|JSON\s*\.\s*(?:parse|stringify)\s*\(|\bserde_json\b|\bto_string\b|\b(?:format|write|writeln|print|println|eprint|eprintln|format_args|panic)\s*!/.test(codecs))) found.push('codec');
   // SMB may reuse the peer credential primitive, but not a non-SMB codec or its reexports.
   let references = text.replace('use crate::ipc::auth::peer_uid_for_stream;', 'PEER_CREDENTIAL_PRIMITIVE');
   // In the SMB root, super names the crate root; only the exact test-module import stays local.
@@ -263,6 +265,22 @@ it('structural_seams', () => {
   for (const source of ['serde_json::Deserializer::from_slice(bytes)', 'serde_json::Deserializer::from_str(text)', 'serde_json::Deserializer::from_reader(reader)', 'use serde_json::Value; value.to_string()', 'use serde_json::{Value}; format!("{value}")', 'serde_json::Value::Null.to_string()', 'use serde_json::*;', 'use serde_json::Value; values.iter().map(Value::to_string)']) {
     expect(violations(rustSource, source), source).toEqual(['codec']);
   }
+  for (const source of [
+    'use serde_json::Value; fn f(s: &str) -> Value { s.parse().unwrap() }',
+    's.parse()', 's.parse::<Value>()', 's.parse::<serde_json::Value>()',
+    'use std::str::FromStr; Value::from_str(s)', 's.parse::<String>()',
+    's.parse::<u64Alias>()', 's . parse :: < Value > ()',
+  ]) {
+    expect(violations(rustSource, source), source).toEqual(['codec']);
+    expect(violations(join(crate, 'src/bin/smb-service.rs'), source), source).toEqual(['codec']);
+    expect(violations(join(crate, 'src/other.rs'), source), source).toEqual([]);
+  }
+  for (const primitive of ['u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize', 'f32', 'f64']) {
+    for (const source of [`s.parse::<${primitive}>()`, `s . parse :: < ${primitive} > ()`]) {
+      expect(violations(rustSource, source), source).toEqual([]);
+    }
+  }
+  expect(violations(rustSource, 'u64::from_str_radix(s, 16)')).toEqual([]);
   for (const source of ['crate::manifest::canonical_json::canonicalize(value)', 'use crate::ipc::messages;', 'use crate::{manifest as legacy};', 'use super::super::ipc as legacy;', 'manifest::canonical_json::canonicalize(value)', 'use ipc::{messages};']) {
     expect(violations(rustSource, source), source).toEqual(['legacy-codec']);
   }

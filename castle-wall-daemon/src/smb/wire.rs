@@ -84,12 +84,12 @@ fn matches(spec: &Value, value: &Value, depth: usize) -> bool {
                 && (text == "0" || !text.starts_with('0'))
                 && text.bytes().all(|b| b.is_ascii_digit())
                 && text.parse::<u64>().is_ok_and(|n| {
-                    n <= spec["max"].as_str().unwrap().parse().unwrap()
+                    n <= spec["max"].as_str().unwrap().parse::<u64>().unwrap()
                         && n >= spec
                             .get("min")
                             .and_then(Value::as_str)
                             .unwrap_or("0")
-                            .parse()
+                            .parse::<u64>()
                             .unwrap()
                 })
         }),
