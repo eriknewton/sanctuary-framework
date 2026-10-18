@@ -60,9 +60,9 @@ pub fn read(
     result
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
-    #![cfg(unix)]
     use super::*;
     use std::{
         io::{Read, Write},

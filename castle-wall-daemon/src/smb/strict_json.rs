@@ -10,14 +10,6 @@ pub(super) fn embedded(source: &'static str) -> Result<Value, serde_json::Error>
 #[cfg(test)]
 pub(super) use tests::fixture;
 
-#[cfg(test)]
-mod tests {
-    pub(crate) fn fixture<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
-        // Test transport includes invalid wire values, so it cannot use wire validation.
-        serde_json::from_slice(bytes).expect("SMB fixture JSON")
-    }
-}
-
 /// Parse exactly one UTF-8 JSON value without losing duplicate-key evidence.
 pub fn parse(bytes: &[u8], maximum: usize) -> Result<Value, String> {
     // Reject before UTF-8 decoding or allocating a value tree to bound untrusted work.
@@ -180,5 +172,13 @@ impl Parser<'_> {
         }
         self.position += literal.len();
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    pub(crate) fn fixture<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+        // Test transport includes invalid wire values, so it cannot use wire validation.
+        serde_json::from_slice(bytes).expect("SMB fixture JSON")
     }
 }
