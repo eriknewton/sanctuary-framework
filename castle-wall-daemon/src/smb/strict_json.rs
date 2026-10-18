@@ -1,6 +1,18 @@
 //! Bounded duplicate-aware parser; must match parse-strict.ts and vectors/strict-json.json.
 use serde_json::{Map, Number, Value};
 
+/// Decode embedded schema data before the bounds used by the wire parser exist.
+pub(super) fn embedded(source: &'static str) -> Result<Value, serde_json::Error> {
+    // Static-only input prevents runtime wire bytes from bypassing duplicate and size checks.
+    serde_json::from_str(source)
+}
+
+#[cfg(test)]
+pub(super) fn fixture<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+    // Test transport includes deliberately invalid wire values, so it cannot use wire validation.
+    serde_json::from_slice(bytes).expect("SMB fixture JSON")
+}
+
 /// Parse exactly one UTF-8 JSON value without losing duplicate-key evidence.
 pub fn parse(bytes: &[u8], maximum: usize) -> Result<Value, String> {
     // Reject before UTF-8 decoding or allocating a value tree to bound untrusted work.

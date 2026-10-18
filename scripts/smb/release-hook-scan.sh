@@ -4,6 +4,11 @@
 # --feature-fixture deliberately builds the forbidden feature and must finish red.
 # --artifact PATH additionally scans a B bundle, staging tree, or extracted Debian payload.
 set -euo pipefail
+# Packaging builds require explicit intent on hosts that may lack the Linux linker.
+if [[ "${SMB_RELEASE_HOOK_SCAN:-}" != 1 ]]; then
+  echo 'release_hook_scan requires SMB_RELEASE_HOOK_SCAN=1' >&2
+  exit 2
+fi
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 scan_scratch="$(mktemp -d "${TMPDIR:-/tmp}/smb-release.XXXXXX")"
 cleanup() {

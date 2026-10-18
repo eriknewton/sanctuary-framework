@@ -75,6 +75,7 @@ export function validateBytes(schema: string, bytes: Uint8Array, maximum: number
 }
 
 /** Normalize a kernel boot UUID before passing it to the hex128 wire schema. */
+// Must match normalize_boot_id in castle-wall-daemon/src/smb/wire.rs; both produce the same wire identity.
 export function normalizeBootId(uuid: string): string {
   const normalized = uuid.replaceAll('-', '').toLowerCase();
   if (!validate('boot_id', normalized)) throw new Error('SMB boot id');

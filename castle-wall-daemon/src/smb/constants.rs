@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 const SOURCE: &str = include_str!("../../../server/src/smb/constants.json");
 fn source() -> &'static Value {
     static SOURCE_VALUE: OnceLock<Value> = OnceLock::new();
-    SOURCE_VALUE.get_or_init(|| serde_json::from_str(SOURCE).expect("SMB constants source"))
+    SOURCE_VALUE.get_or_init(|| super::strict_json::embedded(SOURCE).expect("SMB constants source"))
 }
 fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
     assert!(visiting.insert(name.into()), "SMB constant cycle");
@@ -56,7 +56,7 @@ fn expand(template: &Value, visiting: &mut BTreeSet<String>) -> Value {
                 let value = resolve(key, visiting);
                 out.push_str(&match value {
                     Value::String(v) => v,
-                    other => other.to_string(),
+                    other => super::jcs::encode(&other).expect("SMB template scalar"),
                 });
                 rest = suffix;
             }

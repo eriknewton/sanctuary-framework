@@ -106,6 +106,11 @@ def main(root, scratch, slice_name):
             print('BROKEN: container_peer requires SMB_CONTAINER_PEER_IMAGE', flush=True)
             counts['broken'] += 1
             continue
+        # A skipped release scan supplies no assertion evidence, so its plants are BROKEN.
+        if witness == 'release_hook_scan' and witness_env.get('SMB_RELEASE_HOOK_SCAN') != '1':
+            print('BROKEN: ' + patch.name + ' requires SMB_RELEASE_HOOK_SCAN=1', flush=True)
+            counts['broken'] += 1
+            continue
         report = scratch / 'report.json'
         build = ['cargo', 'test', '--locked', '--lib', 'smb', '--no-run'] + feature
         test = [str(root / 'server/node_modules/.bin/vitest'), 'run', 'test/smb/contracts.test.ts',

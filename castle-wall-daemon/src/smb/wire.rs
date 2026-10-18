@@ -12,7 +12,7 @@ const SOURCE: &str = include_str!("../../../server/src/smb/wire.json");
 /// The sole schema/edge registry, shared with TypeScript.
 pub fn source() -> &'static Value {
     static VALUE: OnceLock<Value> = OnceLock::new();
-    VALUE.get_or_init(|| serde_json::from_str(SOURCE).expect("SMB wire source"))
+    VALUE.get_or_init(|| strict_json::embedded(SOURCE).expect("SMB wire source"))
 }
 fn resolve(spec: &Value) -> &Value {
     if let Some(name) = spec.as_str() {
@@ -145,6 +145,7 @@ pub fn validate_bytes(schema: &str, bytes: &[u8], maximum: usize) -> Result<Valu
     Ok(value)
 }
 /// Normalize a kernel UUID before comparing or emitting the shared boot-id field.
+// Must match normalizeBootId in server/src/smb/wire.ts; both produce the same wire identity.
 pub fn normalize_boot_id(uuid: &str) -> Result<String, String> {
     let normalized = uuid.replace('-', "").to_lowercase();
     if !validate("boot_id", &Value::String(normalized.clone())) {

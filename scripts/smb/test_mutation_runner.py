@@ -1,6 +1,8 @@
 """Passing controls, named assertions, and build accounting for mutation evidence."""
 import json
 import os
+import contextlib
+import io
 from pathlib import Path
 import sys
 import tempfile
@@ -37,8 +39,13 @@ import sys
 bad = {broken_build!r} and (Path(__file__).parent / 'guard').read_text() == 'admit\\n'
 sys.exit(1 if bad else 0)
 ''')
-            verdict = execute_plant(root, patch, 'control', [sys.executable, str(build)],
-                                    [sys.executable, str(test)], dict(os.environ), report)
+            # Inner refusal scenarios are expected evidence, not outer plant failures.
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                verdict = execute_plant(root, patch, 'control', [sys.executable, str(build)],
+                                        [sys.executable, str(test)], dict(os.environ), report)
+            for line in captured.getvalue().splitlines():
+                print('INNER CONTROL: ' + line.replace('BROKEN:', 'expected refusal:'))
             self.assertEqual(source.read_text(), 'refuse\n')
             return verdict
 

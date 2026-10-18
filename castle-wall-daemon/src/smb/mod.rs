@@ -19,10 +19,10 @@ mod tests {
     fn fixture(name: &str) -> Value {
         let root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../server/test/smb/vectors");
-        serde_json::from_slice(&std::fs::read(root.join(format!("{name}.json"))).unwrap()).unwrap()
+        strict_json::fixture(&std::fs::read(root.join(format!("{name}.json"))).unwrap())
     }
     fn emit(value: Value) {
-        println!("SMB_RESULT {}", serde_json::to_string(&value).unwrap());
+        println!("SMB_RESULT {}", jcs::encode(&value).unwrap());
     }
     fn maximum(v: &Value) -> usize {
         match v.get("maximum") {
@@ -56,6 +56,21 @@ mod tests {
         }
         assert!(!results.is_empty());
         emit(Value::Array(results));
+    }
+    #[test]
+    #[ignore = "requires SMB_RELEASE_HOOK_SCAN=1 and the Linux packaging toolchain"]
+    fn release_hook_scan() {
+        // Ignoring keeps an unrequested packaging drill visible instead of reporting a pass.
+        assert_eq!(std::env::var("SMB_RELEASE_HOOK_SCAN").as_deref(), Ok("1"));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let status = std::process::Command::new("bash")
+            .arg(root.join("scripts/smb/release-hook-scan.sh"))
+            .current_dir(root)
+            .status()
+            .expect("release scan process");
+        assert!(status.success(), "release scan must pass");
     }
     #[test]
     fn codec_bounds_agree() {
@@ -289,7 +304,7 @@ mod tests {
         // Optional batch transport for the TypeScript randomized serializer comparison.
         // The normative Appendix B and parser tests above always run without this transport.
         if let Ok(path) = std::env::var("SMB_NUMBER_INPUT") {
-            let bits: Vec<String> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let bits: Vec<String> = strict_json::fixture(&std::fs::read(path).unwrap());
             emit(Value::Array(
                 bits.iter()
                     .map(|bits| {

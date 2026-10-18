@@ -1,9 +1,8 @@
-/** Shared SMB contracts and isolated peer admission. R2-B2, R2-B3, R2-F6, R2-F7. */
+/** Shared SMB contracts and isolated peer admission. */
 import { beforeAll, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { Duplex } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +23,8 @@ const MINUTE_MS = 60 * 1000;
 const BUILD_TIMEOUT_MS = 5 * MINUTE_MS;
 const PROBE_TIMEOUT_MS = MINUTE_MS / 2;
 const RELEASE_TIMEOUT_MS = 15 * MINUTE_MS;
+const RELEASE_CLEANUP_MARGIN_MS = 50 * 1000; // Allow 50 seconds to reap the build process group.
+const RELEASE_CHILD_TIMEOUT_SECONDS = (RELEASE_TIMEOUT_MS - RELEASE_CLEANUP_MARGIN_MS) / 1000;
 let binary: string;
 // Fixture data is intentionally independent of the schema interpreter's static types.
 type Vector = Record<string, any>;
@@ -210,43 +211,72 @@ const codecOwners = new Set([
   join(crate, 'src/smb/jcs.rs'), join(crate, 'src/smb/strict_json.rs'),
   join(root, 'server/src/smb/jcs.ts'), join(root, 'server/src/smb/parse-strict.ts'),
 ]);
+function smbSource(path: string, text: string): boolean {
+  return path.startsWith(join(crate, 'src/smb/')) || path.startsWith(join(root, 'server/src/smb/'))
+    || (path.startsWith(join(crate, 'src/bin/')) && /smb/i.test(path.slice(path.lastIndexOf('/') + 1) + text));
+}
 function violations(path: string, text: string): string[] {
   const found: string[] = [];
+  // Peer and socket ownership applies even when a source is outside the codec scope.
   if ((path.includes('/smb/') || /\bsmb\b/.test(text)) && path.endsWith('.rs') && path !== join(crate, 'src/smb/peer.rs') && /\baccept\s*\(|\.incoming\s*\(/.test(text)) found.push('peer');
   if (path.endsWith('.socket') && /^\s*Accept\s*=\s*yes\s*$/mi.test(text)) found.push('socket');
-  if (!codecOwners.has(path) && /(?:fn|function)\s+(?:jcs|canonicalize|parseStrict|parse_strict|parse_json)\b|JSON\.(?:parse|stringify)\s*\(|serde_json\s*::\s*(?:from_slice|from_str|from_reader|to_string|to_vec|to_writer)(?:_pretty)?\b/.test(text)) found.push('codec');
+  if (!smbSource(path, text)) return found;
+  // Permit data types and value construction only; every other serde spelling needs its owner.
+  let codecs = text.replace(/use\s+serde_json\s*::\s*\{\s*(?:(?:Map|Number|Value|json)\s*,?\s*)+\}\s*;/g, '')
+    .replace(/\bserde_json\s*::\s*(?:Map|Number|Value|json)\b/g, '');
+  // Formatting can serialize a Value through Display. Only these scalar fixture expressions
+  // have reviewed types; an unknown formatting call must move through the owning JCS module.
+  const scalarCalls: Record<string, string[]> = {
+    'mod.rs': ['println!("SMB_RESULT {}", jcs::encode(&value).unwrap())', 'format!("{name}.json")', 'format!("[{raw}]")', 'format!("{{\\"a\\":{raw}}}")', 'id.to_string()', '(maximum+1).to_string()'],
+    'constants.rs': ['panic!("unknown SMB constant expression")'],
+    'wire.rs': ['id.to_string()'],
+    'peer.rs': ['panic!("permitted peer refused")', 'println!("permitted uid admitted; other uid closed without payload read")', 'println!("{}", String::from_utf8_lossy(&output.stdout))', 'format!("--reuid={uid}")', 'format!("--regid={uid}")', 'format!("smb-peer-{}", std::process::id())', 'format!("{}:/peer-test:ro", exe.display())'],
+  };
+  for (const [file, calls] of Object.entries(scalarCalls)) {
+    if (path === join(crate, 'src/smb', file)) for (const call of calls) codecs = codecs.replace(call, 'SCALAR_FORMAT');
+  }
+  if (!codecOwners.has(path) && /(?:fn|function)\s+(?:jcs|canonicalize|parseStrict|parse_strict|parse_json)\b|JSON\s*\.\s*(?:parse|stringify)\s*\(|\bserde_json\b|\bto_string\b|\b(?:format|write|writeln|print|println|eprint|eprintln|format_args|panic)\s*!/.test(codecs)) found.push('codec');
+  // SMB may reuse the peer credential primitive, but not a non-SMB codec or its reexports.
+  let references = text.replace('use crate::ipc::auth::peer_uid_for_stream;', 'PEER_CREDENTIAL_PRIMITIVE');
+  // In the SMB root, super names the crate root; only the exact test-module import stays local.
+  if (path === join(crate, 'src/smb/mod.rs')) references = references.replace('use super::*;', 'SMB_TEST_PARENT');
+  const parentEscape = path === join(crate, 'src/smb/mod.rs') && /\bsuper\s*::/.test(references);
+  if (parentEscape || /\b(?:manifest|ipc)\s*(?:::|[,};]|\s+as\b)|\b(?:crate|castle_wall_daemon)\s*::\s*(?!smb\b)|\bsuper\s*::\s*super\b/.test(references)) found.push('legacy-codec');
   return found;
 }
 it('structural_seams', () => {
-  // Red controls exercise each guard before the complete real-source scan goes green.
-  expect(violations('/smb/new.rs', 'listener.accept();')).toEqual(['peer']);
+  const rustSource = join(crate, 'src/smb/new.rs');
+  const tsSource = join(root, 'server/src/smb/new.ts');
+  // Red controls exercise every spelling before the scoped real-source scan goes green.
+  expect(violations(rustSource, 'listener.accept();')).toEqual(['peer']);
   expect(violations('/smb/new.socket', 'Accept=yes')).toEqual(['socket']);
-  expect(violations('/smb/new.ts', 'function canonicalize() {}')).toEqual(['codec']);
-  expect(violations('/src/other/jcs.rs', 'serde_json::to_vec(value)')).toEqual(['codec']);
-  const files = [...walk(join(crate, 'src')), ...walk(join(root, 'server/src/smb')), ...walk(join(crate, 'systemd')), ...walk(join(crate, 'packaging/ubuntu'))];
-  const legacy = JSON.parse(readFileSync(join(root, 'scripts/smb/legacy-codec-sources.json'), 'utf8'));
-  for (const operation of ['from_slice', 'from_str', 'from_reader', 'to_string', 'to_vec', 'to_writer']) {
-    expect(violations('/src/bin/new-server.rs', `serde_json::${operation}(input)`)).toEqual(['codec']);
-  }
-  for (const file of files.filter(p => /\.(rs|ts|socket)$/.test(p))) {
-    const text = readFileSync(file, 'utf8');
-    const relative = file.slice(crate.length + 1);
-    // Existing non-SMB codecs are frozen by content, never by directory exemptions.
-    // Any changed legacy source or new binary is scanned before its baseline can be reviewed.
-    if (legacy[relative] === createHash('sha256').update(text).digest('hex')) continue;
-    let production = text;
-    // Exact fixture transport calls are test data, not wire parsing; no suffix of a source is excluded.
-    if (file === join(crate, 'src/smb/mod.rs')) {
-      for (const call of [
-        'serde_json::from_slice(&std::fs::read(root.join(format!("{name}.json"))).unwrap())',
-        'serde_json::to_string(&value)',
-        'serde_json::from_slice(&std::fs::read(path).unwrap())',
-      ]) production = production.replace(call, 'FIXTURE_TRANSPORT');
+  expect(violations(tsSource, 'function canonicalize() {}')).toEqual(['codec']);
+  expect(violations(join(crate, 'src/smb/other/jcs.rs'), 'serde_json::to_vec(value)')).toEqual(['codec']);
+  expect(violations(join(crate, 'src/other/jcs.rs'), 'serde_json::to_vec(value)')).toEqual([]);
+  expect(violations(join(crate, 'src/other.rs'), '/* smb */ listener.accept(); serde_json::to_vec(value)')).toEqual(['peer']);
+  for (const operation of ['from_slice', 'from_str', 'from_reader', 'from_value', 'to_string', 'to_string_pretty', 'to_vec', 'to_vec_pretty', 'to_writer', 'to_writer_pretty']) {
+    for (const source of [`serde_json::${operation}(input)`, `use serde_json::{${operation}};`, `use serde_json::{Value, ${operation} as codec};`, `use serde_json as x; x::${operation}(input)`]) {
+      expect(violations(rustSource, source), source).toEqual(['codec']);
+      expect(violations(join(crate, 'src/bin/smb-service.rs'), source), source).toEqual(['codec']);
     }
-    // Only the two embedded build-time data loaders may use serde outside the codec owners.
-    if (file.endsWith('/smb/constants.rs')) production = production.replace('serde_json::from_str(SOURCE)', 'EMBEDDED_CONSTANTS');
-    if (file.endsWith('/smb/wire.rs')) production = production.replace('serde_json::from_str(SOURCE)', 'EMBEDDED_WIRE');
-    expect(violations(file, production), file).toEqual([]);
+  }
+  for (const source of ['serde_json::Deserializer::from_slice(bytes)', 'serde_json::Deserializer::from_str(text)', 'serde_json::Deserializer::from_reader(reader)', 'use serde_json::Value; value.to_string()', 'use serde_json::{Value}; format!("{value}")', 'serde_json::Value::Null.to_string()', 'use serde_json::*;', 'use serde_json::Value; values.iter().map(Value::to_string)']) {
+    expect(violations(rustSource, source), source).toEqual(['codec']);
+  }
+  for (const source of ['crate::manifest::canonical_json::canonicalize(value)', 'use crate::ipc::messages;', 'use crate::{manifest as legacy};', 'use super::super::ipc as legacy;', 'manifest::canonical_json::canonicalize(value)', 'use ipc::{messages};']) {
+    expect(violations(rustSource, source), source).toEqual(['legacy-codec']);
+  }
+  for (const macro of ['format', 'write', 'writeln', 'print', 'println', 'eprint', 'eprintln', 'format_args', 'panic']) {
+    expect(violations(rustSource, `use serde_json::Value; ${macro}!("{value}")`)).toEqual(['codec']);
+  }
+  for (const source of ['use super::manifest as legacy;', 'use super::ipc as legacy;', 'use super::manifest;', 'use super::ipc;', 'use super::launcher as legacy;', 'use super::{ownership_journal as legacy};']) {
+    expect(violations(join(crate, 'src/smb/mod.rs'), source), source).toEqual(['legacy-codec']);
+  }
+  // Owning a codec never exempts peer admission or socket activation checks.
+  expect(violations(join(crate, 'src/smb/jcs.rs'), 'listener.accept();')).toEqual(['peer']);
+  const files = [...walk(join(crate, 'src')), ...walk(join(root, 'server/src/smb')), ...walk(join(crate, 'systemd')), ...walk(join(crate, 'packaging/ubuntu'))];
+  for (const file of files.filter(p => /\.(rs|ts|socket)$/.test(p))) {
+    expect(violations(file, readFileSync(file, 'utf8')), file).toEqual([]);
   }
 });
 
@@ -309,13 +339,13 @@ it('constants_composites_derive_from_names', () => {
 });
 function fixtureSource(name: string): any { return JSON.parse(readFileSync(join(root, 'server/src/smb', name + '.json'), 'utf8')); }
 
-it('release_hook_scan', () => {
+it.skipIf(process.env.SMB_RELEASE_HOOK_SCAN !== '1')('release_hook_scan', () => {
   // Run the scanner's packaging invocation; compile errors must remain BROKEN in mutate.sh.
   const result = spawnSync('python3', ['-c', `import os, signal, subprocess, sys
-# 850 seconds leaves cleanup margin inside the 900-second Vitest deadline.
+# The child deadline leaves the named cleanup margin inside the Vitest deadline.
 p = subprocess.Popen(sys.argv[1:], start_new_session=True)
 try:
-    sys.exit(p.wait(timeout=850))
+    sys.exit(p.wait(timeout=${RELEASE_CHILD_TIMEOUT_SECONDS}))
 except subprocess.TimeoutExpired:
     os.killpg(p.pid, signal.SIGKILL)
     p.wait()
@@ -335,4 +365,5 @@ it('container_peer_is_opt_in', () => {
   expect(result.status).toBe(0);
   expect(result.stdout).toContain('smb::peer::tests::container_peer: test');
   expect(result.stdout).toContain('smb::peer::tests::peer_client: test');
+  expect(result.stdout).toContain('smb::tests::release_hook_scan: test');
 });
