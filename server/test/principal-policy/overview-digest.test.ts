@@ -215,6 +215,92 @@ describe("round 2 destination labels", () => {
 describe("round 2 coverage read bounds", () => {
   // The posture surface builds the digest inside runEagerReads (buildDigest in posture-routes.ts); this mirrors it.
   const eagerDigest = (audit: AuditLog) => audit.runEagerReads(() => digest(audit));
+  // Fails before the head re-check in routineWindowCoverage (round 2 fail-before evidence).
+  it("withholds coverage for an append between the chain head and eager view reads", async () => {
+    let clock: { mockRestore(): void } | undefined;
+    let head: { mockRestore(): void } | undefined;
+    try {
+      // Freeze the backstop clock so a timed reload cannot discard the prefix during this schedule.
+      clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+      const firstSequence = 1; // Audit chains start at sequence one.
+      const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
+      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
+      const readHead = audit.getChainHead.bind(audit);
+      for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
+      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
+      const spy = vi.spyOn(audit, "getChainHead").mockImplementationOnce(async () => {
+        const snapshot = await readHead();
+        await append(audit, appendedCount + 1);
+        return snapshot;
+      });
+      head = spy;
+      const result = await eagerDigest(audit);
+      // The coverage check reads the head once before and once after the view.
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect((await readHead()).sequence).toBe(appendedCount + 1);
+      // Must match routineWindowCoverage in posture.ts: a head that moved during the view read cannot vouch for coverage.
+      expect(result).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+    } finally {
+      head?.mockRestore();
+      clock?.mockRestore();
+    }
+  });
+  // Fails before the head re-check in routineWindowCoverage (round 2 fail-before evidence).
+  it("withholds coverage when a reloaded view races an append", async () => {
+    const reverifyMs = 60 * 1000; // This log's backstop interval; the clock steps past it once to force a disk reload.
+    let clock: { mockRestore(): void } | undefined;
+    let head: { mockRestore(): void } | undefined;
+    try {
+      let now = NOW;
+      clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const firstSequence = 1; // Audit chains start at sequence one.
+      const retainedCount = 2; // Disk keeps two entries, so a view reloaded from disk starts above the first sequence.
+      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount, eagerReverifyIntervalMs: reverifyMs });
+      const readHead = audit.getChainHead.bind(audit);
+      for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
+      now += reverifyMs; // The next eager read reloads the view from disk.
+      expect((await audit.runEagerReads(() => audit.query({}))).entries).toHaveLength(retainedCount);
+      head = vi.spyOn(audit, "getChainHead").mockImplementationOnce(async () => {
+        const snapshot = await readHead();
+        await append(audit, appendedCount + 1);
+        return snapshot;
+      });
+      const result = await eagerDigest(audit);
+      // Must match routineWindowCoverage in posture.ts: a head that moved during the view read cannot vouch for coverage.
+      expect(result).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+    } finally {
+      head?.mockRestore();
+      clock?.mockRestore();
+    }
+  });
+  // fail-before-exempt: existing behavior; plant retention whenever the authenticated base sequence exceeds one.
+  it("covers a pruned prefix still held in the eager view but reports retention outside it", async () => {
+    let clock: { mockRestore(): void } | undefined;
+    try {
+      // Freeze the backstop clock so a timed reload cannot discard the prefix before the eager read.
+      clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+      const firstSequence = 1; // Audit chains start at sequence one.
+      const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
+      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
+      for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
+      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
+      await audit.runEagerReads(async () => {
+        const retained = await audit.query({});
+        const head = await audit.getChainHead();
+        expect(retained.entries).toHaveLength(appendedCount);
+        expect(head.sequence - retained.total + firstSequence).toBe(firstSequence);
+        // Must match routineWindowCoverage in posture.ts: the same full view supplies both counts and coverage.
+        expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null, kernel_blocks: appendedCount });
+      });
+      // A disk read loses the rotated prefix, so its smaller count cannot claim complete coverage.
+      expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention", kernel_blocks: retainedCount });
+    } finally {
+      clock?.mockRestore();
+    }
+  });
   it("settles coverage from the eager view without re-reading the chain from disk", async () => {
     const audit = log(); await append(audit, 1);
     const stream = vi.spyOn(audit, "streamVerifiedChain"); const view = vi.spyOn(audit, "verifiedChainView");
