@@ -21,15 +21,16 @@
  * canonical palette for the paper/ink surfaces. It is not the palette of every
  * page the server serves: the legacy approval board (`generateDashboardHTML`)
  * still runs on its own GitHub-dark `:root`, and this test does not cover it.
- * Two files copy a SUBSET of the canonical values by hand and cannot import the
- * constant:
+ * Three files copy canonical values by hand and cannot import the constant.
+ * The public site mirrors the full block; the other two carry subsets:
  *
  *   - server/docs/design-refs/sprint-piece-2/tokens.css: a static design
  *     reference; no build step reads TypeScript.
+ *   - docs/assets/css/site.css: the public Jekyll site, with no TypeScript import.
  *   - menubar/src/styles/popover.css: a separate Tauri build with no import
  *     path into server/src.
  *
- * Both carry a "must match `PAPER_INK_ROOT_TOKENS_CSS`" pin comment. A comment
+ * All carry a "must match `PAPER_INK_ROOT_TOKENS_CSS`" pin comment. A comment
  * is not a gate: a drifted mirror still parses, still renders, and looks almost
  * right, so the divergence surfaces months later as "the menubar and the console
  * are subtly different colors." This test is the gate the comments describe,
@@ -95,11 +96,13 @@ const MIRROR_ONLY_ALLOWED: Record<string, Record<string, string>> = {
     "--space-7": "the design reference lays out a 48px step the shipped surfaces never use",
   },
   "menubar/src/styles/popover.css": {},
+  "docs/assets/css/site.css": {},
 };
 
 const MIRRORS = [
   "server/docs/design-refs/sprint-piece-2/tokens.css",
   "menubar/src/styles/popover.css",
+  "docs/assets/css/site.css",
 ] as const;
 
 describe("design-token mirrors reconcile with the canonical paper/ink constant", () => {
@@ -154,11 +157,16 @@ describe("design-token mirrors reconcile with the canonical paper/ink constant",
         expect(unexplained).toEqual([]);
       });
 
-      it("mirrors a non-trivial share of the palette in both themes", () => {
+      it("mirrors the required palette in both themes", () => {
         // A mirror that silently emptied out would pass the drift check with
         // nothing to compare, so pin that it still mirrors something real.
         const shared = (block: Block) =>
           Object.keys(mirror[block]).filter((n) => n in CANONICAL[block]).length;
+        if (relPath === "docs/assets/css/site.css") {
+          for (const block of ["light", "dark"] as const) {
+            expect(Object.keys(mirror[block]).sort()).toEqual(Object.keys(CANONICAL[block]).sort());
+          }
+        }
         expect(shared("light")).toBeGreaterThanOrEqual(25);
         expect(shared("dark")).toBeGreaterThanOrEqual(15);
       });

@@ -22,6 +22,7 @@ on:
       - "README.md"
       - "server/package.json"
       - "docs/assurance-matrix.json"
+      - "docs/_data/assurance_matrix.json"
       - "docs/.well-known/product-facts.json"
       - "scripts/check-assurance-matrix.mjs"
       - "scripts/export-assurance-matrix.mjs"
@@ -33,6 +34,7 @@ on:
       - "README.md"
       - "server/package.json"
       - "docs/assurance-matrix.json"
+      - "docs/_data/assurance_matrix.json"
       - "docs/.well-known/product-facts.json"
       - "scripts/check-assurance-matrix.mjs"
       - "scripts/export-assurance-matrix.mjs"
@@ -52,7 +54,8 @@ jobs:
           node-version: "22"
       - name: Assurance matrix guard
         run: node scripts/check-assurance-matrix.mjs
-      # The JSON twin (docs/assurance-matrix.json) and docs/.well-known/product-facts.json
+      # The JSON twin (docs/assurance-matrix.json), its site copy (docs/_data/assurance_matrix.json)
+      # and docs/.well-known/product-facts.json
       # are generated from ASSURANCE_MATRIX.md, README.md and server/package.json.
       # A PR that edits a source without regenerating them fails here; the failure
       # output is the diff plus the regenerate command.

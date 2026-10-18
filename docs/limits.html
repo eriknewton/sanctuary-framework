@@ -1,0 +1,22 @@
+---
+layout: default
+title: Limits | Sanctuary
+description: Every Assurance Matrix claim with its platform, status and known limits, rendered from the matrix.
+permalink: /limits/
+---
+{% comment %}
+Generated page: every entry below is rendered from site.data.assurance_matrix (docs/_data/assurance_matrix.json,
+written by scripts/export-assurance-matrix.mjs from ASSURANCE_MATRIX.md). No limit text is written here by hand.
+Field names (claim, platform, status, bounds) must match FIELD_FOR_HEADER in that script; the row id
+`row.claim | slugify` must match the href built in docs/_includes/matrix-evidence.html. Bounds are HTML-escaped,
+not reformatted, so the decoded text is byte-equal to the matrix cell (checked by scripts/check-site-limits.mjs).
+{% endcomment %}
+<h1>Limits</h1>
+<p>Rendered from the <a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Assurance Matrix</a>, in its own words.</p>
+{% assign matrix_rows = site.data.assurance_matrix.rows %}{% if matrix_rows == nil or matrix_rows.size == 0 %}<p class="matrix-row-missing">MATRIX DATA MISSING</p>{% endif %}
+{% for row in matrix_rows %}{% assign row_id = row.claim | slugify %}
+<section class="limits-row" id="{{ row_id }}" aria-labelledby="{{ row_id }}-title">
+<h2 id="{{ row_id }}-title">{{ row.claim | escape }}</h2>
+<dl class="limits-fields"><dt>Platform</dt><dd class="matrix-platform">{{ row.platform | escape }}</dd><dt>Status</dt><dd class="matrix-status">{{ row.status | escape }}</dd><dt>Known limits</dt><dd class="matrix-bounds">{{ row.bounds | escape }}</dd></dl>
+</section>
+{% endfor %}

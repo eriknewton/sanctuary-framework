@@ -4,10 +4,15 @@
 // WHY THIS EXISTS (2026-10-12):
 // An evaluating agent (an A2A card consumer, a connector directory, a procurement
 // script) reads JSON, not a Markdown table. ASSURANCE_MATRIX.md stays the ONLY
-// truth source; this script derives two public files from it and from the root
-// README, and CI fails when either file drifts from its sources:
+// truth source; this script derives three public files from it and from the root
+// README, and CI fails when any of them drifts from its sources:
 //
 //   docs/assurance-matrix.json          every row of the matrix, same words
+//   docs/_data/assurance_matrix.json    byte-identical copy that Jekyll loads as
+//                                       site.data.assurance_matrix, so the site's
+//                                       /limits/ page and evidence links render
+//                                       the matrix instead of hand-copying it
+//                                       (added 2026-10-18)
 //   docs/.well-known/product-facts.json name, license, install/verify/uninstall
 //                                       commands, per-platform status, bounds
 //
@@ -40,7 +45,7 @@
 // separate packet and is noted in this packet's report.
 //
 // Usage:
-//   node scripts/export-assurance-matrix.mjs            write both files
+//   node scripts/export-assurance-matrix.mjs            write all three files
 //   node scripts/export-assurance-matrix.mjs --check    exit 1 with a diff if stale
 //   node scripts/export-assurance-matrix.mjs --stamp    also write source_commit
 // Exit codes: 0 = written or current; 1 = stale, unparseable, or unsourced text.
@@ -66,6 +71,11 @@ const SERVER_PACKAGE_REL = "server/package.json";
 const SECURITY_POLICY_REL = "SECURITY.md";
 const AUDIT_DIR_REL = "docs/audit/";
 const MATRIX_JSON_REL = "docs/assurance-matrix.json";
+// Jekyll reads data files only from docs/_data/, and GitHub Pages' safe mode refuses
+// symlinks, so the site copy is a second written file with the twin's exact bytes.
+// Its field names (claim, platform, status, bounds) are read by docs/limits.html and
+// docs/_includes/matrix-evidence.html; they must match FIELD_FOR_HEADER below.
+const SITE_DATA_JSON_REL = "docs/_data/assurance_matrix.json";
 const FACTS_JSON_REL = "docs/.well-known/product-facts.json";
 
 const MATRIX_SCHEMA = "sanctuary-assurance-matrix/v1";
@@ -75,6 +85,9 @@ const FACTS_SCHEMA = "sanctuary-product-facts/v1";
 // the column headers in ASSURANCE_MATRIX.md exactly, and the six-column shape
 // must match the `cells.length !== 6` check in scripts/check-assurance-matrix.mjs;
 // a header change is a schema change and must fail here, not misalign silently.
+// The site templates docs/limits.html and docs/_includes/matrix-evidence.html read
+// the claim, platform, status and bounds fields by name; renaming one here must be
+// matched there (scripts/check-site-limits.mjs fails the built site otherwise).
 const EXPECTED_HEADERS = ["Claim", "Platform", "Status", "Evidence", "Known Gap", "Next Proof Needed"];
 const FIELD_FOR_HEADER = {
   Claim: "claim",
@@ -356,8 +369,12 @@ function build(stamp) {
   delete factsForCheck.source_commit;
   assertSourced("product-facts", factsForCheck, [matrixText, readmeText, serverPackageText], Object.keys(platforms));
 
+  // The site data copy is the same serialized text as the twin, never a second
+  // serialization, so the two files cannot disagree; --check compares each one.
+  const matrixJsonText = serialize(matrixJson);
   return [
-    { rel: MATRIX_JSON_REL, text: serialize(matrixJson) },
+    { rel: MATRIX_JSON_REL, text: matrixJsonText },
+    { rel: SITE_DATA_JSON_REL, text: matrixJsonText },
     { rel: FACTS_JSON_REL, text: serialize(facts) },
   ];
 }

@@ -1,28 +1,15 @@
 ---
 layout: default
-title: Journal | Sanctuary Protocol
-description: Design decisions, security write-ups, and reasoning behind the Sanctuary custody stack.
+title: Journal | Sanctuary
+description: Essays and development notes by Erik Newton.
 permalink: /blog/
+wide: true
 ---
-
-<div class="section__heading" style="max-width: 68ch; margin-left: auto; margin-right: auto;">
-  <span class="eyebrow">Journal</span>
-  <h1>Field notes from the custody layer.</h1>
-  <p>Architecture decisions, security reviews, and the reasoning behind every layer in the Sanctuary stack.</p>
-</div>
-
+<header class="page-header"><p class="eyebrow">Journal</p><h1>Notes on agents and autonomy.</h1><p class="lead">Essays and development notes by Erik Newton. Each article reflects its publication date; see <a href="/evidence/">current evidence</a> for capability claims.</p><p><a href="{{ '/feed.xml' | relative_url }}">Subscribe by RSS</a></p></header>
 <ul class="post-list">
-  {% for post in site.posts %}
-  <li>
-    <a href="{{ post.url | relative_url }}">
-      <span class="post-date">{{ post.date | date: "%B %-d, %Y" }}</span>
-      <h2>{{ post.title }}</h2>
-      {% if post.description %}
-        <p class="post-excerpt">{{ post.description | strip_html | truncatewords: 40 }}</p>
-      {% elsif post.excerpt %}
-        <p class="post-excerpt">{{ post.excerpt | strip_html | truncatewords: 40 }}</p>
-      {% endif %}
-    </a>
-  </li>
-  {% endfor %}
+{% for post in site.posts %}
+  <li><time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%B %-d, %Y" }}</time><div><h2><a href="{{ post.url | relative_url }}">{{ post.title }}</a></h2>
+  {% if post.description %}<p>{{ post.description | strip_html | truncatewords: 40 }}</p>{% elsif post.excerpt %}<p>{{ post.excerpt | strip_html | truncatewords: 40 }}</p>{% endif %}
+  </div></li>
+{% endfor %}
 </ul>

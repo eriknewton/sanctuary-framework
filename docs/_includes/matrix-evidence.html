@@ -1,0 +1,7 @@
+{% comment %}
+Evidence word and Limits link for one Assurance Matrix row, looked up by its exact claim text.
+Reads site.data.assurance_matrix (docs/_data/assurance_matrix.json, written by scripts/export-assurance-matrix.mjs);
+the field names claim and status must match FIELD_FOR_HEADER in that script, and the anchor must match the
+`row.claim | slugify` id in docs/limits.html. Fails closed: an unknown claim renders a visible MATRIX ROW MISSING
+marker that scripts/check-site-limits.mjs refuses, never a bare link or an invented status.
+{% endcomment %}{% assign matrix_row = site.data.assurance_matrix.rows | where: "claim", include.claim | first %}{% if matrix_row %}<span class="matrix-evidence">{{ include.label | default: "Evidence" }}: {{ matrix_row.status | escape }}. <a href="{{ '/limits/' | relative_url }}#{{ matrix_row.claim | slugify }}" aria-label="Limits: {{ matrix_row.claim | escape }}">Limits</a></span>{% else %}<strong class="matrix-row-missing">MATRIX ROW MISSING: {{ include.claim | escape }}</strong>{% endif %}
