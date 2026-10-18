@@ -33,7 +33,7 @@ Keep passphrases, recovery keys and dashboard tokens out of the agent conversati
 
 Prerequisites for the npm path: Node.js 22 or newer and npm 10 or newer. Before installing, open the [release verification instructions](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#verify-before-you-trust).
 
-Choose the action that matches your task. Install first and check the result afterward. Removal is a separate action, only when you intend to remove the npm installation.
+Choose the action that matches your task. Install first and check the result afterward. Removal is a separate action: uninstall removes Sanctuary's enforcement footprint, not the npm package, and `protect --unwrap` restores the harness configuration.
 
 **Install for Claude Code**, using the README's headless command:
 
@@ -47,10 +47,16 @@ npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dash
 npx -y @sanctuary-framework/mcp-server doctor --json
 ```
 
-**Remove only when intended**, using a separate command:
+**Remove only when intended**, using a separate command. It removes what it can of Sanctuary's installed enforcement footprint and reports anything left that needs sudo, the Castle Wall host app or a reboot; it does not remove the npm package:
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
+```
+
+**Restore the harness configuration** Sanctuary rewrote:
+
+```bash
+npx -y @sanctuary-framework/mcp-server protect --unwrap
 ```
 
 Treat this as cooperative MCP setup; it does not install and arm the macOS operating-system wall.
@@ -93,7 +99,7 @@ Other Linux platforms, DNS and hostname paths, real-agent harnesses, upgrades an
 
 ## Uninstall
 
-Use the README's uninstall command. It removes Sanctuary's enforcement components and keeps your fortress state, keys and audit log; it does not remove the npm package or restore your harness configuration:
+Use the README's uninstall command. It removes what it can of Sanctuary's installed enforcement footprint, keeps your fortress state, keys, passphrase custody, recovery material and audit log, and reports anything left that needs sudo, the Castle Wall host app or a reboot. It does not remove the npm package or restore your harness configuration:
 
 ```bash
 npx -y @sanctuary-framework/mcp-server uninstall
