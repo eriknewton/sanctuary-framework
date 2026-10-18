@@ -3461,6 +3461,8 @@ export function generateFleetSwitcherHTML(options: {
       box-shadow: var(--shadow);
       padding: 16px;
       display: flex;
+      /* Let the fixed status words and action group wrap while identity keeps its intrinsic text width. */
+      flex-wrap: wrap;
       align-items: center;
       gap: 12px;
     }
@@ -3474,14 +3476,17 @@ export function generateFleetSwitcherHTML(options: {
     .machine-card .status-dot.online { background: var(--sage); }
     .machine-card .status-dot.offline { background: var(--rust); }
     .machine-card .status-dot.checking { background: var(--ochre); }
+    /* Unknown is hollow because a probe without an explicit boolean health answer earns neither the pass nor the failure color. */
+    .machine-card .status-dot.unknown { background: transparent; border: 1px solid var(--ink-3); } /* One CSS pixel outlines the hollow dot. */
     .machine-card .status-label {
       font-family: var(--mono);
       font-size: var(--text-xs);
       color: var(--ink-3);
       flex-shrink: 0;
-      min-width: 56px;
+      /* 11ch = "Not healthy" and "Not checked", the longest status words, in this monospace face, so names align when status and identity share one row. */
+      min-width: 11ch;
     }
-    .machine-card .info { flex: 1; min-width: 0; }
+    .machine-card .info { flex: 1 1 auto; min-width: 0; }
     .machine-card .name {
       font-weight: 600;
       font-size: 15px;
@@ -3564,6 +3569,8 @@ export function generateFleetSwitcherHTML(options: {
 
   <script>
     const STORAGE_KEY = 'sanctuary_fleet_machines';
+    // Must match FLEET_STORAGE_KEY in server/src/dashboard/v1_1/client.ts,
+    // because the Machines screen reads the saved list this page writes.
     const CURRENT_ENDPOINT = ${JSON.stringify(currentEndpoint)};
 
     function loadStoredMachines() {
@@ -3668,15 +3675,35 @@ export function generateFleetSwitcherHTML(options: {
     }
 
     async function checkHealth(url) {
+      // These words must match FLEET_PROBE_VIEW in server/src/dashboard/v1_1/client.ts,
+      // so both views describe the same probe evidence with the same words.
+      const PROBE_VIEW = {
+        state_ONLINE: { word: 'Online', cls: 'online' },
+        state_NOT_HEALTHY: { word: 'Not healthy', cls: 'offline' },
+        state_UNKNOWN: { word: 'Unknown', cls: 'unknown' }
+      };
+      let timeout;
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000);
+        // 3000 ms = FLEET_PROBE_DEADLINE_SECONDS (3) times 1000 ms per second; must match
+        // FLEET_PROBE_DEADLINE_MS in server/src/dashboard/v1_1/client.ts so both views give a machine the same time to answer.
+        timeout = setTimeout(() => controller.abort(), 3000);
         const resp = await fetch(url + '/api/health', { signal: controller.signal });
-        clearTimeout(timeout);
+        // Only a non-redirecting successful response is evidence from this machine's health endpoint.
+        if (!resp.ok || resp.redirected) return PROBE_VIEW.state_UNKNOWN;
         const data = await resp.json();
-        return data.ok === true ? 'online' : 'offline';
+        // Only an explicit boolean true earns the healthy label and pass color.
+        if (data && data.ok === true) return PROBE_VIEW.state_ONLINE;
+        // Only an explicit boolean false earns the unhealthy label and failure color.
+        if (data && data.ok === false) return PROBE_VIEW.state_NOT_HEALTHY;
+        // An unrecognized body supplies no health verdict.
+        return PROBE_VIEW.state_UNKNOWN;
       } catch {
-        return 'offline';
+        // A failed, aborted or unreadable probe is not evidence that the machine is unhealthy.
+        return PROBE_VIEW.state_UNKNOWN;
+      } finally {
+        // The deadline also covers the body read, so a machine that answers headers and then stalls settles to Unknown.
+        clearTimeout(timeout);
       }
     }
 
@@ -3755,8 +3782,9 @@ export function generateFleetSwitcherHTML(options: {
       healthTargets.forEach(async (target) => {
         const { url, dot, label } = target;
         const status = await checkHealth(url);
-        dot.className = 'status-dot ' + status;
-        if (label) label.textContent = status === 'online' ? 'Online' : 'Offline';
+        // The named state supplies both color and word so they describe the same evidence.
+        dot.className = 'status-dot ' + status.cls;
+        if (label) label.textContent = status.word;
       });
     }
 
