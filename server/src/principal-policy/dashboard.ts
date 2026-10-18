@@ -2268,9 +2268,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // shared source (`resolveWallEvidenceSources`) that `/api/sovereignty`
       // and the aggregator snapshot also read, so no two routes can disagree
       // on signature availability.
-      const sources = await this.resolveWallEvidenceSources();
       await this.ensureBrokerProducerKeyLoaded();
       const brokerLoad = this._brokerProducerKeyLoad;
+      // INVARIANT: the key snapshot is captured AFTER the broker-key read
+      // resolves, never before it. A concurrent sovereignty or status request
+      // can reload `_producerKeyLoad` (absent to unreadable) while this
+      // request is parked on that read; a snapshot taken before the read
+      // would resume stale and let this route keep an entry the status route
+      // refuses. This is the last await before the deps are assembled.
+      const sources = await this.resolveWallEvidenceSources();
       // Recognition precursor: resolve the composition render-gate flag via the
       // canonical resolver (default-off). The fortress config carries no composition
       // input today, so this resolves to the honest `false` default; when an input
@@ -2536,8 +2542,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // producer signature is available for the same audit log. Reading the
       // cached load directly here would ignore an injected resolver that the
       // dispatcher honours, and the two surfaces would drop or keep the same
-      // enforcement entry differently.
-      const sources = await this.resolveWallEvidenceSources();
+      // enforcement entry differently. The snapshot itself is taken below,
+      // after every other await in this request (see the capture-order note
+      // on the helper).
       if (this.auditLog === null) {
         // No unlocked audit log ⇒ no enforcement evidence to read. Honest
         // `unknown` (amber), never green, never a fabricated placeholder.
@@ -2577,7 +2584,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const exclusiveEgress = await this.resolveExclusiveEgressPosture();
       const protectionClaimSubject = await this.resolveProtectionClaimSubject();
       const enforcementAvailability =
-        await sources.resolveEnforcementAvailability();
+        await this.wallEnforcementAvailabilitySource()();
       // The vault's own wall claim, read from this fortress. Never throws (the
       // reader collapses every failure to `absent`/`unreadable`), and an
       // absent claim omits the additive field rather than asserting anything.
@@ -2593,6 +2600,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         typeof fortressStoragePath === "string" && fortressStoragePath.length > 0
           ? await readPersistedCastleWallProvision(fortressStoragePath)
           : ({ state: "absent" } as const);
+      // INVARIANT: the key snapshot is the LAST await of this request, after
+      // the exclusive-egress, protection-claim, availability and vault reads
+      // above. A concurrent posture request can reload `_producerKeyLoad`
+      // while this one is parked on any of those; capturing here, right
+      // before the shaper, means this route and the posture dispatcher (which
+      // captures after its own broker read) both answer from the newest load.
+      const sources = await this.resolveWallEvidenceSources();
       return await this.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: this.auditLog as AuditLog,
@@ -2693,6 +2707,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * sees as one page claiming enforcement evidence and another denying it.
    * When no resolver is injected (every current production boot) the result
    * is the cached config-path load, byte-identical to the pre-helper tree.
+   *
+   * CAPTURE ORDER (every caller): the key state is a per-request snapshot of
+   * `_producerKeyLoad`, and a concurrent request on another route can reload
+   * that field (absent to unreadable, say) at any await. A caller therefore
+   * awaits this helper AFTER every other await its request makes (the broker
+   * key read, the exclusive-egress and protection-claim resolves, the vault
+   * provision read) and immediately before it hands the values to the shaper,
+   * so the snapshot is the newest one and two concurrent routes cannot answer
+   * from different generations of the same load.
    */
   private async resolveWallEvidenceSources(): Promise<{
     resolvePinnedProducerKey: () => string | null;
@@ -2702,8 +2725,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       | ResolvedEnforcementAvailability;
   }> {
     const resolveEnforcementAvailability =
-      this.injectedResolveEnforcementAvailability ??
-      (() => this.resolveEnforcementAvailability());
+      this.wallEnforcementAvailabilitySource();
     if (this.injectedResolvePinnedProducerKey) {
       return {
         resolvePinnedProducerKey: this.injectedResolvePinnedProducerKey,
@@ -2722,6 +2744,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
       resolveEnforcementAvailability,
     };
+  }
+
+  /**
+   * The ONE enforcement-availability source: the injected resolver when
+   * `setDependencies` supplied one, the castle.sock query otherwise. Pure
+   * selection, no await, so a caller that needs the availability answer
+   * BEFORE its final key capture (the sovereignty status) can take it from
+   * here without moving the key snapshot earlier.
+   */
+  private wallEnforcementAvailabilitySource(): () =>
+    | Promise<ResolvedEnforcementAvailability>
+    | ResolvedEnforcementAvailability {
+    return (
+      this.injectedResolveEnforcementAvailability ??
+      (() => this.resolveEnforcementAvailability())
+    );
   }
 
   /**
@@ -8283,6 +8321,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // on a weaker basis. Resolved through the ONE shared
     // `resolveWallEvidenceSources` helper the sovereignty and posture routes
     // read, so the snapshot cannot disagree with them on signature availability.
+    // INVARIANT: this capture is the only await in this builder and sits
+    // immediately before the synchronous assembly below, so no concurrent
+    // reload can land between the snapshot and its use (capture-order note on
+    // the helper).
     const {
       resolvePinnedProducerKey,
       producerKeyExpectedButUnavailable,

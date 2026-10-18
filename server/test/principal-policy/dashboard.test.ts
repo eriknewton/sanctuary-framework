@@ -1892,4 +1892,74 @@ describe("Overview route parity", () => {
     }
   });
 
+  // Witness for defect.dashboard-sovereignty-producer-key-source-divergence-01,
+  // concurrent schedule: the posture home captures its producer-key snapshot
+  // only after its broker-key read resolves. While the posture request is
+  // parked on that read, a concurrent sovereignty request reloads the key and
+  // finds it unreadable; when the posture request resumes it must answer from
+  // that newer load, so both routes report the key as expected-but-unavailable.
+  // A snapshot taken before the broker read would resume stale (no key, channel
+  // basis) and keep the entry the sovereignty route refuses.
+  it("captures the producer key after the broker read so a concurrent reload cannot leave the posture home stale", async () => {
+    let dashboard: DashboardApprovalChannel | undefined;
+    let port = 0;
+    const temp = await createTempHome("producer-key-capture-order");
+    try {
+      await bindWithRetry(async () => {
+        port = randomTestPort();
+        dashboard = new DashboardApprovalChannel({ port, host: "127.0.0.1", timeout_seconds: 30, auto_open: false,
+          producer_key_load_options: TEMP_FORTRESS_ONLY_PRODUCER_KEY_LOAD });
+        await dashboard.start();
+      });
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const config = { ...defaultConfig(), storage_path: temp.defaultFortressPath };
+      const identityManager = new IdentityManager(storage, masterKey);
+      const { storedIdentity } = createIdentity("producer-key-capture-order", derivePurposeKey(masterKey, "identity-encryption"), "recovery-key");
+      await identityManager.saveNew(storedIdentity);
+      const originDir = join(temp.defaultFortressPath, "policy", "egress");
+      await mkdir(originDir, { recursive: true });
+      await writeFile(join(originDir, "agent-origin.json"), JSON.stringify({ mode: "uid", agent_uid: 601, system_uid_allow_ceiling: 500 }), { mode: 0o600 });
+      const timestamp = new Date().toISOString();
+      await auditLog.appendCritical({ layer: "l1", operation: "egress_blocked", identity_id: fortressIdFromStoragePath(temp.defaultFortressPath) + "/uid-601", result: "failure", timestamp,
+        details: { [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE, dest_host: "parity.example" } });
+      // No resolver injected: both routes take the config-path load, as every
+      // shipped boot does. No key file exists yet, so the first load is absent.
+      dashboard!.setDependencies({ policy: DEFAULT_POLICY, baseline: new BaselineTracker(storage, masterKey), auditLog, identityManager,
+        sanctuaryConfig: config, storage, shrOpts: { config, identityManager, masterKey } });
+      // The schedule: while the posture request is parked on its broker-key
+      // read, the key file appears malformed on disk (a short write), and a
+      // concurrent sovereignty request reloads it and records unreadable.
+      type BrokerReadHook = { ensureBrokerProducerKeyLoaded: () => Promise<void> };
+      const hooked = dashboard as unknown as BrokerReadHook;
+      const originalBrokerRead = hooked.ensureBrokerProducerKeyLoaded.bind(dashboard);
+      let sovereigntyDuringBrokerRead: { status: number; body: string } | undefined;
+      hooked.ensureBrokerProducerKeyLoaded = async () => {
+        // 5 bytes: shorter than the 32-byte Ed25519 public key the loader
+        // requires, so the load is present-but-unreadable, never absent.
+        await writeFile(join(originDir, "audit-producer.pub"), new Uint8Array(5), { mode: 0o644 });
+        sovereigntyDuringBrokerRead = await requestNoKeepAlive(`http://127.0.0.1:${port}/api/sovereignty`);
+        await originalBrokerRead();
+      };
+      const posture = await requestNoKeepAlive(`http://127.0.0.1:${port}/api/posture/home`);
+      expect(posture.status).toBe(200);
+      expect(sovereigntyDuringBrokerRead?.status).toBe(200);
+      const live = JSON.parse(sovereigntyDuringBrokerRead!.body).live_enforcement;
+      const home = JSON.parse(posture.body);
+      // The concurrent sovereignty request observed the unreadable key.
+      expect(live.evidence_basis).toBe("producer_key_unavailable");
+      expect(live.last_enforcement_evidence_at).toBeNull();
+      // The resumed posture request answers from that same newer load.
+      expect(home.castle_wall.evidence_basis).toBe("producer_key_unavailable");
+      expect(home.castle_wall.last_enforcement_evidence_at).toBeNull();
+      expect(live).toEqual({ castle_wall_arm_state: home.castle_wall.arm_state, evidence_basis: home.castle_wall.evidence_basis,
+        last_enforcement_evidence_at: home.castle_wall.last_enforcement_evidence_at, freshness_window_ms: home.castle_wall.freshness_window_ms,
+        audit_integrity_ok: home.castle_wall.audit_integrity_ok });
+    } finally {
+      await dashboard?.stop();
+      await temp.cleanup();
+    }
+  });
+
 });
