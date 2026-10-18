@@ -7519,32 +7519,36 @@ export class AuditLog {
         const latchRead = await this.readSigningLatchV2();
         if (latchRead.status === "absent") {
           // Arming is decided from DURABLE state (the latch, the head, and
-          // whether any checkpoint record exists, all read under this lock),
-          // never from this process's memory. The named states:
-          //   state_NEVER_ARMED    latch absent, head absent, no SIGNED
-          //                        checkpoint record on disk: a fresh fortress,
-          //                        or the migration shape (an unsigned prefix,
-          //                        then signing starts).
+          // whether a SIGNED checkpoint record exists, all read under this
+          // lock), never from this process's memory. The named states:
+          //   state_NEVER_ARMED    latch absent, head absent, no signed record
+          //                        on disk: a fresh fortress, or the migration
+          //                        shape (an unsigned prefix, then signing
+          //                        starts).
           //   state_ARM_INCOMPLETE latch absent, head present with no
-          //                        committed signed tip (the arm's step 1
-          //                        landed, step 2 did not): the honest crash
-          //                        prefix.
-          //   state_LATCH_ERASED   latch absent and either the head committed
-          //                        a signed tip, or the head is gone while a
-          //                        signed checkpoint record survives.
+          //                        committed signed tip, no signed record on
+          //                        disk: the arm's step 1 landed, step 2 did
+          //                        not, and no record followed.
+          //   state_LATCH_ERASED   latch absent while a signed record
+          //                        survives, WHATEVER the head says (absent,
+          //                        zeroed, or committed).
           // The first two re-run the arm here. LATCH_ERASED is deletion-shaped
           // and is REFUSED: no control record is written and the checkpoint is
           // aborted, so the store keeps exactly the bytes the next load's
-          // recovery pass fails closed on today; re-arming here would mint a
-          // fresh floor above a surviving checkpoint and let its signature be
+          // recovery pass fails closed on today. The signed record is the
+          // deciding evidence, not the head: a head left zeroed by a refused
+          // tip advance (step 4 below) plus a deleted latch would otherwise
+          // read as an honest crash prefix, and re-arming at the tip would mint
+          // a floor above the surviving record and let its signature be
           // stripped unseen. A signed record is never written without its
           // latch in any state.
           const headRead = await this.readSigningHead();
-          const neverArmed = headRead.status === "absent" && !signedRecordExists;
-          const armIncomplete =
+          const headZeroed =
             headRead.status === "valid" &&
             headRead.data.highest_signed_checkpoint_sequence === 0 &&
             headRead.data.lowest_signed_checkpoint_sequence === null;
+          const neverArmed = headRead.status === "absent" && !signedRecordExists;
+          const armIncomplete = headZeroed && !signedRecordExists;
           if (!neverArmed && !armIncomplete) {
             // SAFETY: stderr diagnostic (operator-facing); the programmatic
             // channel is the next load's strict-closed recovery pass.
@@ -7658,7 +7662,14 @@ export class AuditLog {
       // itself: the record is already durable by this line, and a missing
       // tip advance is the self-healing D1 prefix, unlike an arm failure
       // (above), which aborts BEFORE the record because its prefix is the
-      // deletion shape.
+      // deletion shape. DECISION (kept swallowed, proven harmless to the arm
+      // rule): a refused tip advance at arm time leaves a zeroed head beside
+      // a durable SIGNED record; throwing here would report a failed append
+      // for a record that already persisted, and the next load's self-heal
+      // raises the tip. That state can no longer reach a re-arm: the arm
+      // rule above refuses whenever a signed record exists on disk, so a
+      // latch deleted over this zeroed head is LATCH_ERASED (no control
+      // write, next load fails closed), never ARM_INCOMPLETE.
       try {
         await this.writeSigningControlRecord(signal, {
           record: "head",

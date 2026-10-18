@@ -6,8 +6,9 @@
 // FilesystemStorage, and prove the store loads clean and the checkpoint completes, covering from the
 // lowest entry that survives rotation. The rules that fail closed on deletion-shaped states are
 // unchanged: a zero-sequence head anchor replayed over an established store is still rejected, and
-// a signed checkpoint is never written without its latch, so a store whose latch and head are gone
-// while a checkpoint survives gets no new control record and is refused on the next load.
+// a signed checkpoint is never written without its latch, so a store whose latch is gone while a
+// signed checkpoint survives, whatever its signing head says, gets no new control record and is
+// refused on the next load.
 // Private defect id: audit-log-torn-multi-write-sequences-01.
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -191,6 +192,11 @@ function reader(state: string, masterKey: Uint8Array, publicKey?: string): Audit
 const isLatchWrite = (m: Mutation): boolean => m.namespace === CONTROL && m.key === SIGNING_LATCH;
 const isCheckpointRecordWrite = (m: Mutation): boolean =>
   m.namespace === CONTROL && m.kind !== "delete" && m.key.startsWith(CHECKPOINT_PREFIX);
+// The signing head's tip advance: the head write that follows a checkpoint record (the arm's
+// head-ensure write precedes the record and is not this).
+const isHeadTipAdvance = (m: Mutation, prior: readonly Mutation[]): boolean =>
+  m.namespace === CONTROL && m.kind !== "delete" && m.key === SIGNING_HEAD &&
+  prior.some(isCheckpointRecordWrite);
 
 describe("audit log interrupted multi-write sequences load clean and complete", () => {
   it("a zero-sequence head anchor replayed over an established store with its entries deleted is rejected", async () => {
@@ -313,7 +319,34 @@ describe("audit log interrupted multi-write sequences load clean and complete", 
     expect(findings.map((finding) => finding.kind)).toContain("checkpoint_signing_floor_recovered");
   });
 
-  it("latch armed, the checkpoint record itself refused: the store loads clean and the next checkpoint completes under the existing latch", async () => {
+  it("signed checkpoint written, its head tip advance refused, then the latch deleted: the same writer's next interval does not re-arm over the zeroed head, and the next load is refused", async () => {
+    const state = await tempState("audit-zeroed-head-latch-erased-");
+    const masterKey = generateRandomKey();
+    const fixture = checkpointSignerFixture(masterKey);
+    const storage = new ProbeStorage(state);
+    storage.refuse(isHeadTipAdvance);
+    const writer = signedLog(storage, masterKey, fixture, 1);
+    // The record is durable and the append succeeds; only the tip advance was refused, so the
+    // head still reads as if no signed tip was ever committed.
+    await writer.appendCritical(entry("first"));
+    expect(storage.refusals).toBe(1);
+    expect(await checkpointShape(state)).toEqual([[1, 1, false]]);
+    expect(await controlKeys(state)).toContain(SIGNING_LATCH);
+
+    await new FilesystemStorage(state).delete(CONTROL, SIGNING_LATCH);
+    await writer.appendCritical(entry("second"));
+    expect(await entrySequences(state)).toEqual([1, 2]);
+    // No re-arm: the zeroed head is not an honest crash prefix while a signed record survives.
+    expect(await controlKeys(state)).not.toContain(SIGNING_LATCH);
+    expect(await checkpointShape(state)).toEqual([[1, 1, false]]);
+
+    const findings = await reader(state, masterKey, fixture.publicKey).getIntegrityFindings();
+    expect(findings.map((finding) => finding.kind)).toContain("checkpoint_signing_floor_recovered");
+  });
+
+  // A pin, not a fail-before witness: the base already arms the latch before the record, so a
+  // refused record leaves the same latch-armed prefix there; this case holds that shape in place.
+  it("latch armed, the checkpoint record itself refused: the store loads clean and the next checkpoint completes under the existing latch (pin)", async () => {
     const state = await tempState("audit-torn-record-refused-");
     const masterKey = generateRandomKey();
     const fixture = checkpointSignerFixture(masterKey);
