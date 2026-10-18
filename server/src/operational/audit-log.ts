@@ -1842,6 +1842,8 @@ function isPermissionError(err: unknown): boolean {
 // every clean-claiming surface (they all hold only an `AuditLog` handle).
 // `verifySealedLegacyPrefix(storage, masterKey)` in audit-store-split.ts is a
 // thin wrapper over this that derives the MAC key from the master.
+// Must match renderSealedRegion in server/src/dashboard/v1_1/client.ts, which words every status below;
+// its test in test/dashboard/v1_1/shell-wired-consumers.test.ts reads this union.
 export type SealedRegionVerdict =
   /** No VALID boundary present: nothing was sealed by a committed migration. */
   | { status: "not_present" }
@@ -4021,6 +4023,7 @@ export class AuditLog {
 
     const total = filtered.length;
     const limit = options.limit ?? 50;
+    // Must match renderActivityScreen in server/src/dashboard/v1_1/client.ts, which lists this oldest-first page newest first.
     const entries = filtered.slice(-limit); // Most recent entries
 
     return { entries, total, integrity_findings: [...this.integrityFindings] };

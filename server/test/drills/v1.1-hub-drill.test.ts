@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a declares support only for pause, resume and lockdown already exercised by this drill.
 /**
  * Sanctuary v1.1 Acceptance Drill - Pillar 2: Operator Hub.
  *
@@ -23,7 +24,6 @@
  * Acceptance checklist mapping: Pillar 2 of
  * `server/docs/v1.1-acceptance-checklist.md`.
  */
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createServer,
@@ -222,6 +222,10 @@ async function startDrillRig(): Promise<DrillRig> {
 function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
+
+// Support only the drill controls; declaration merging preserves the diagnostic baseline above.
+interface StubAgentController { supports(...args: Parameters<HubAgentController["supports"]>): ReturnType<HubAgentController["supports"]>; }
+StubAgentController.prototype.supports = action => ["pause", "resume", "lockdown"].includes(action);
 
 describe("v1.1 acceptance drill - Pillar 2: operator hub end-to-end", () => {
   let rig: DrillRig;

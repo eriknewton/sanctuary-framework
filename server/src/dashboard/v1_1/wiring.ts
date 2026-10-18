@@ -1170,6 +1170,7 @@ function buildConciergePiiFilter(): ConciergePiiFilter {
  * basis for fortress-scoped liveness checks. It is not remote evidence, but it
  * is a local trust anchor for separating one storage-backed fortress from
  * another.
+ * Must match the Hermes child-side call in ../../hermes-memory-bridge/process-shell.ts.
  */
 export function fortressIdFromStoragePath(storagePath: string): string {
   const digest = createHash("sha256").update(storagePath).digest("hex");

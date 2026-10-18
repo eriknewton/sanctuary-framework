@@ -22,6 +22,52 @@
  */
 
 import type { HubDisplayTemplateArg } from "../../contracts/v1.1/hub-events.js";
+import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
+
+// Must match ACTIVITY_TEMPLATE_NAMESPACES in client.ts, injected from hub/constants.ts.
+const ACTIVITY_TEMPLATE_NAMESPACES = Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES);
+
+/**
+ * Categories whose operation-suffixed ids keep their own registered sentence because every operation filed there
+ * makes that sentence true; all others use the general audit sentence, subject to its verified-agent requirement.
+ * Must match categorizeOperation in hub/activity-feed.ts: privacy accepts privacy_event or the privacy_ prefix,
+ * and other records any audit event. A rule filing into a kept category must preserve its sentence's truth.
+ * Frozen so consumers cannot change this contract after the fallback map has been built.
+ */
+export const ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE: ReadonlyArray<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES> = Object.freeze([
+  "privacy",
+  "other",
+]);
+
+/** The registered sentence an operation-suffixed activity id renders through, and the arg it needs to render. */
+export interface ActivityFallbackTemplate {
+  readonly template: string;
+  /** A typed arg that must carry a nonempty value for the sentence to render; null when the sentence needs none. */
+  readonly requiredArg: "agent_id" | null;
+}
+
+/**
+ * How an operation-suffixed activity id renders, keyed by its category namespace: the category's own sentence where
+ * that sentence is true of every operation in it, the generic audit sentence otherwise. The generic sentence renders
+ * only for a row with a verified agent; any other row keeps the diagnostic fallback.
+ * Must match ACTIVITY_FALLBACK_TEMPLATES in client.ts, which is injected from this map.
+ */
+export const ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE: Readonly<Record<string, ActivityFallbackTemplate>> = Object.freeze(
+  Object.fromEntries(
+    (Object.keys(HUB_ACTIVITY_TEMPLATE_NAMESPACES) as Array<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES>).map(
+      (category) => {
+        const template = ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE.includes(category)
+          ? HUB_ACTIVITY_TEMPLATE_NAMESPACES[category]
+          : HUB_ACTIVITY_TEMPLATE_NAMESPACES.other;
+        // The generic sentence names its agent and reads "(fortress)" when none is served. The hub serves agent_id
+        // only when the producer signature re-verifies, so a row without one has no verified subject and must not be
+        // attributed to the fortress. Privacy names a missing agent as unknown and needs no arg.
+        const requiredArg = template === HUB_ACTIVITY_TEMPLATE_NAMESPACES.other ? "agent_id" : null;
+        return [HUB_ACTIVITY_TEMPLATE_NAMESPACES[category], Object.freeze({ template, requiredArg })];
+      },
+    ),
+  ),
+);
 
 /**
  * Render-context flags pass through to the template fn so a single template
@@ -67,6 +113,16 @@ function arg(
     case "duration_ms":
       return String(found.value);
   }
+}
+
+/**
+ * True when the first arg of `kind`, the one `arg` renders, carries a nonempty string. Must match hasArgValue in
+ * client.ts.
+ */
+function hasArgValue(args: HubDisplayTemplateArg[], kind: HubDisplayTemplateArg["kind"]): boolean {
+  // A null element is skipped, as the client mirror skips it, so a malformed arg list reaches the diagnostic fallback.
+  const found = Array.isArray(args) ? args.find((a) => Boolean(a) && a.kind === kind) : undefined;
+  return found !== undefined && typeof found.value === "string" && found.value.length > 0;
 }
 
 /**
@@ -226,8 +282,15 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     "Fortress lockdown failed; no confined agent was locked.",
   "activity.lifecycle.fortress_lockdown_no_agents": () =>
     "Fortress lockdown found no confined agents to lock.",
+  // Registered but not served: templateIdFor in hub/activity-feed.ts emits activity.lifecycle.agent_policy_change_engaged.
+  // Serving this exact id is not a lookup-only change: hub-service.ts writes agent_policy_change_engaged for both policy
+  // and channel-template bindings, while "Template binding changed" describes only the channel-template writer.
   "activity.agent_policy_change_engaged": (a) =>
     `Template binding changed on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
+  // Registered but not served: templateIdFor emits activity.denial.agent_policy_change_denied, and this id stays
+  // unserved with its engaged counterpart. buildTemplateArgs in hub/activity-feed.ts already maps this writer's
+  // current_template and proposed_template onto the channel_template_id and policy_id this sentence reads; agent_id
+  // is served only when the row's producer signature re-verifies, so any other row would read "(unknown)".
   "activity.agent_policy_change_denied": (a) =>
     `Template binding denied on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
   "activity.config": (a) =>
@@ -251,7 +314,18 @@ export function renderTemplate(
   args: HubDisplayTemplateArg[],
   ctx: TemplateRenderContext = DEFAULT_CTX,
 ): string {
-  const renderer = TEMPLATES[templateId];
+  let renderer = TEMPLATES[templateId];
+  if (!renderer && typeof templateId === "string") {
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category. An operation renders its
+    // category's sentence only where that sentence is true of every operation the hub files there.
+    const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => templateId.startsWith(`${prefix}.`));
+    const fallback = namespace ? ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE[namespace] : undefined;
+    // A row without a verified agent never renders a sentence that would name the fortress as its subject: the hub
+    // serves agent_id only for a re-verified producer signature, so the row keeps the diagnostic fallback instead.
+    if (fallback && (fallback.requiredArg === null || hasArgValue(args, fallback.requiredArg))) {
+      renderer = TEMPLATES[fallback.template];
+    }
+  }
   if (!renderer) {
     return `[unrecognized template: ${templateId}]`;
   }

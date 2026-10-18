@@ -1,4 +1,5 @@
 /** Dashboard reads settle independently and missing evidence stays unknown. */
+// fail-before-exempt: adapts three existing refresh and queue-visibility witnesses that drove a decision on a request the loaded queue did not hold; the client now refuses such a decision locally and sends nothing, so the trailing-read witness drives the post-decision refresh directly and the queue-visibility witnesses decide on a request the loaded queue holds; asserts nothing new. Fail-before coverage for admission lives in approval-decision-result.test.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
@@ -14,7 +15,11 @@ const home = {
   protection_requested_count: 1,
   enforcement_confirmed_count: 0,
 };
-const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+// Policy reads share the pre-decode byte budget, so fixtures expose the same stream as fetch.
+const response = (body: unknown, status = 200) => ({
+  ok: status === 200, status, json: async () => body,
+  body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } }),
+});
 const pending = () => new Promise<never>(() => {});
 function testElement() {
   const classes = new Set<string>();
@@ -55,7 +60,7 @@ function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub"
   const context = createContext({
     document: { getElementById: (id: string) => elements[id] || (id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: hub }) } : null), addEventListener: (event: string, listener: (event: unknown) => void) => { listeners[event] = listener; }, querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} } },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
-    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Element, Date,
+    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, TextDecoder, Element, Date,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, EventSource: class { listeners: Record<string, (event: { data: string }) => void> = {}; constructor() { streams.push(this); } close() {} addEventListener(name: string, listener: (event: { data: string }) => void) { this.listeners[name] = listener; } },
     fetch: (url: string) => {
       urls.push(url);
@@ -112,12 +117,15 @@ describe("dashboard bounded independent hydration", () => {
     vi.useFakeTimers(); const h = harness({ "/api/inbox/unified/prefs": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
     runInContext('state.route = "activity"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Read timed out"); expect(runInContext("state.inboxOps.filters.search", h.context)).toBe(""); expect(h.main.innerHTML).toContain("Activity");
+    expect(h.main.innerHTML).toContain("Read timed out");
+    // The activity route's screen is now titled Evidence (slice 5); the kept inbox still reports its timed-out read.
+    expect(h.main.innerHTML).toContain("Evidence");
+    expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     // Pins the Approvals waiting tile, not a later queue empty state.
-    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
@@ -127,7 +135,8 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('state.route = "agents"; void fetchAll()', h.context); await settle();
     expect(h.main.innerHTML).not.toContain("No protected agents yet");
     expect(h.main.innerHTML).toContain("Unknown");
-    expect(h.main.innerHTML).toContain("Retry Agents");
+    // The shared table keeps the Agents retry route with its current control label.
+    expect(h.main.innerHTML).toContain('data-action="retry-panel" data-read="/api/hub/agents"');
   });
   it("never renders protective home or agent statuses with stale or invalid evidence", async () => {
     vi.useFakeTimers();
@@ -143,10 +152,13 @@ describe("dashboard bounded independent hydration", () => {
         "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", ...evidence }, agents: [{ agent_id: "fixture", enforcement_active: "active", ...evidence }] }),
       });
       await settle();
-      expect.soft(h.main.innerHTML, timestamp).not.toContain(">Enforcing</span>");
+      // fail-before-exempt: protective-render plant recorded in the slice 3b evidence.
+      // Overview uses an uppercase chip word, so this catches stale and invalid evidence.
+      expect.soft(h.main.innerHTML, timestamp).not.toContain(">ENFORCING");
       expect.soft(runInContext("homeFreshnessTimer", h.context), timestamp).toBeNull();
       runInContext('state.route = "agents"; rerender()', h.context);
-      expect.soft(h.main.innerHTML, timestamp).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+      // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+      expect.soft(h.main.innerHTML, timestamp).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     }
   });
   it("shares one panel deadline across dependent intelligence reads", async () => {
@@ -175,8 +187,8 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('rerender()', h.context);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
-    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
+    expect(runInContext("sourceReads.size", h.context)).toBe(23); // Main's twenty-one, which include the Evidence verification read, plus the fleet roster and Sentinel findings; dynamic failures add none.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -256,7 +268,9 @@ describe("dashboard bounded independent hydration", () => {
   it("post-mutation refresh performs a trailing read after an older in-flight read", async () => {
     vi.useFakeTimers(); const h = harness(); await settle();
     runInContext('let releaseOld; let reads = 0; fetch = async function (url) { if (url.includes("/inbox")) { reads++; if (reads === 1) return new Promise(function (resolve) { releaseOld = resolve; }); } return { ok: true, status: 200, json: async function () { return { data: { items: [], agents: [], entries: [], policies: [] } }; } }; }; void fetchAll()', h.context); await settle();
-    runInContext('void onInboxAction("x", "approve")', h.context); await settle();
+    // Retargeted from onInboxAction("x", ...): a decision is admitted only against a loaded queue that holds the
+    // request, so the post-decision refresh is driven directly; fetchAll(true) is what the decision path calls.
+    runInContext('void fetchAll(true)', h.context); await settle();
     runInContext('releaseOld({ ok: true, status: 200, json: async function () { return { data: { items: [{item_id: "obsolete"}] } }; } })', h.context); await settle();
     expect(runInContext('state.inbox', h.context)).toEqual([]);
   });
@@ -538,7 +552,9 @@ describe("dashboard bounded independent hydration", () => {
       "/api/anomaly/findings",
     ]));
     expect(runInContext('sourceRead("/api/anomaly/findings").state', h.context)).toBe("state_LOADING");
-    expect(h.main.innerHTML).not.toContain("No open anomaly findings.");
+    // fail-before-exempt: checked-empty render plant recorded in the slice 3b evidence.
+    // The loading Overview must not retain its current checked-empty Sentinel copy.
+    expect(h.main.innerHTML).not.toContain("No open Sentinel findings");
   });
   it("keeps later rule details unavailable when the shared deadline runs out", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/auto-trigger/rules": () => response({ data: { rules: [{ rule_id: "first" }, { rule_id: "later" }] } }), "/api/auto-trigger/rules/first": pending });
@@ -557,13 +573,14 @@ describe("dashboard bounded independent hydration", () => {
   it("policy activation does not reuse a pre-activation policy read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
     const h = harness({
-      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], marker: "new" } } }),
+      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], policy_version: 2 } } }),
       "/api/policy/drafts/fixture/activate": () => response({ data: { status: "activated" } }),
     }); await settle();
     runInContext('state.route = "policy"; void loadPolicyView()', h.context); await settle();
     runInContext('void activateStandingRule("fixture", "fixture-op", false)', h.context); await settle();
-    release(response({ data: { view: { lines: [], marker: "old" } } })); await settle();
-    expect(runInContext('state.policyView.view.marker', h.context)).toBe("new"); expect(reads).toBe(2);
+    release(response({ data: { view: { lines: [], policy_version: 1 } } })); await settle();
+    // The bounded view retains the real policy version, not a synthetic marker field.
+    expect(runInContext('state.policyView.view.policy_version', h.context)).toBe(2); expect(reads).toBe(2);
   });
   it("recognition mutation cannot be overwritten by a pre-mutation health read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
@@ -597,7 +614,11 @@ describe("dashboard bounded independent hydration", () => {
 describe("D5 closure", () => {
   it.each(["approve", "deny"])("keeps the queue visible while %s is pending or rejected", async action => {
     vi.useFakeTimers(); let reject!: (reason: Error) => void;
-    const h = harness({ ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }) }); await settle();
+    // The decided request is held in the loaded queue, since a decision on an unheld request is refused locally.
+    const h = harness({
+      "/api/hub/inbox": () => response({ data: { items: [{ item_id: "fixture", kind: "approval_pending", tier: "tier2", agent_id: "fixture", resolved: false, created_at: "2026-10-17T16:45:00.000Z" }] } }),
+      ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }),
+    }); await settle();
     runInContext(`
       let hidden = false;
       const count = { textContent: "1", classList: { add() {} } };
@@ -634,15 +655,20 @@ describe("D5 closure", () => {
       state.route = "agents"; rerender();
     `, h.context);
     const rendered = () => h.main.innerHTML + runInContext('renderAgentInspectPanel(state.agents[0])', h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext(`state.posture.home.agents = [{ agent_id: "other", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60000 }]; rerender()`, h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext('state.posture.home.agents[0].agent_id = "fixture"; rerender()', h.context);
-    expect(rendered()).toContain('state-dot live'); expect(rendered()).toMatch(/protected/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).toContain('state-dot live'); expect(rendered()).toContain('state-chip good');
     runInContext('sourceRead("/api/posture/home").state = "state_LOADING"; rerender()', h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext('sourceRead("/api/posture/home").state = "state_LOADED"; state.posture.home.agents[0].last_enforcement_evidence_at = "2000-01-01T00:00:00Z"; rerender()', h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
   });
   it.each(["stream", "polling"])("shows stopped %s updates on every route until Retry", async mode => {
     vi.useFakeTimers(); const h = harness(); await settle();
@@ -690,10 +716,12 @@ describe("D5 closure", () => {
         ? response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] })
         : pending(),
     }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain('state-dot live');
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(h.main.innerHTML).toContain('state-chip good');
     await vi.advanceTimersByTimeAsync(1001);
     await settle();
-    expect(h.main.innerHTML).not.toMatch(/protected|state-dot live|att-agent verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(h.main.innerHTML).not.toMatch(/state-chip good|state-dot live|att-agent verified/i);
   });
   it("coalesces event bursts and invalidates the next read when a later event arrives", async () => {
     vi.useFakeTimers(); const releases: ((value: unknown) => void)[] = [];
@@ -773,11 +801,13 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).toContain("<dt>Protection requested</dt>");
     expect(h.main.innerHTML).not.toContain("<dt>Protected agents</dt>");
     runInContext('state.route = "agents"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("1 agent. Click one");
-    expect(h.main.innerHTML).not.toContain("1 agents.");
+    // The inventory now reports the loaded-row denominator instead of a prose agent count.
+    expect(h.main.innerHTML).toContain("showing 1 of 1");
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(h.main.innerHTML).not.toContain('state-chip good');
     runInContext('state.route = "posture"; rerender()', h.context);
     // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
-    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
+    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown overview-chip"><span class="overview-chip-head"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(h.main.innerHTML).not.toContain("status active");
   });
   it("agent_status events re-read the roster instead of mutating it locally", async () => {
