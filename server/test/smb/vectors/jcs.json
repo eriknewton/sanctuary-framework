@@ -1,0 +1,124 @@
+{
+  "$comment": "Must match jcs.ts and castle-wall-daemon/src/smb/jcs.rs. Appendix B IEEE 754 and JSON Representation columns copied verbatim from https://www.rfc-editor.org/rfc/rfc8785#appendix-B (IETF Trust, 2020).",
+  "numbers": [
+    {
+      "bits": "0000000000000000",
+      "expected": "0"
+    },
+    {
+      "bits": "8000000000000000",
+      "expected": "0"
+    },
+    {
+      "bits": "0000000000000001",
+      "expected": "5e-324"
+    },
+    {
+      "bits": "8000000000000001",
+      "expected": "-5e-324"
+    },
+    {
+      "bits": "7fefffffffffffff",
+      "expected": "1.7976931348623157e+308"
+    },
+    {
+      "bits": "ffefffffffffffff",
+      "expected": "-1.7976931348623157e+308"
+    },
+    {
+      "bits": "4340000000000000",
+      "expected": "9007199254740992"
+    },
+    {
+      "bits": "c340000000000000",
+      "expected": "-9007199254740992"
+    },
+    {
+      "bits": "4430000000000000",
+      "expected": "295147905179352830000"
+    },
+    {
+      "bits": "7fffffffffffffff",
+      "expected": null
+    },
+    {
+      "bits": "7ff0000000000000",
+      "expected": null
+    },
+    {
+      "bits": "44b52d02c7e14af5",
+      "expected": "9.999999999999997e+22"
+    },
+    {
+      "bits": "44b52d02c7e14af6",
+      "expected": "1e+23"
+    },
+    {
+      "bits": "44b52d02c7e14af7",
+      "expected": "1.0000000000000001e+23"
+    },
+    {
+      "bits": "444b1ae4d6e2ef4e",
+      "expected": "999999999999999700000"
+    },
+    {
+      "bits": "444b1ae4d6e2ef4f",
+      "expected": "999999999999999900000"
+    },
+    {
+      "bits": "444b1ae4d6e2ef50",
+      "expected": "1e+21"
+    },
+    {
+      "bits": "3eb0c6f7a0b5ed8c",
+      "expected": "9.999999999999997e-7"
+    },
+    {
+      "bits": "3eb0c6f7a0b5ed8d",
+      "expected": "0.000001"
+    },
+    {
+      "bits": "41b3de4355555553",
+      "expected": "333333333.3333332"
+    },
+    {
+      "bits": "41b3de4355555554",
+      "expected": "333333333.33333325"
+    },
+    {
+      "bits": "41b3de4355555555",
+      "expected": "333333333.3333333"
+    },
+    {
+      "bits": "41b3de4355555556",
+      "expected": "333333333.3333334"
+    },
+    {
+      "bits": "41b3de4355555557",
+      "expected": "333333333.33333343"
+    },
+    {
+      "bits": "becbf647612f3696",
+      "expected": "-0.0000033333333333333333"
+    },
+    {
+      "bits": "43143ff3c1cb0959",
+      "expected": "1424953923781206.2"
+    }
+  ],
+  "documents": [
+    {
+      "value": {
+        "\ue000": 1,
+        "\ud83d\ude00": 2,
+        "a": 3,
+        "\r": 4
+      },
+      "expected": "{\"\\r\":4,\"a\":3,\"\ud83d\ude00\":2,\"\ue000\":1}"
+    },
+    {
+      "value": "\u0000\b\t\n\f\r\"\\/\u20ac",
+      "expected": "\"\\u0000\\b\\t\\n\\f\\r\\\"\\\\/\u20ac\""
+    }
+  ]
+}

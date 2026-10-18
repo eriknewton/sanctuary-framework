@@ -1,0 +1,10 @@
+# witness: wire_pins_128_bit_ids_hex_and_class_string
+--- a/server/src/smb/wire.json
++++ b/server/src/smb/wire.json
+@@ -35,5 +35 @@
+-      "type": "string",
+-      "min": 1,
+-      "max": "CLASS_MAX_BYTES",
+-      "chars": "abcdefghijklmnopqrstuvwxyz0123456789_.-",
+-      "pattern": "^[a-z0-9_.-]{1,64}$"
++      "type": "integer"

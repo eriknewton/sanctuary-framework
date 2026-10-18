@@ -64,6 +64,8 @@ name = "network-agent-standin"
 path = "src/bin/network-agent-standin.rs"
 
 [features]
+# Pause points must never enter the default release feature graph.
+smb-test-hooks = []
 # Compiles the TEST-ISOLATION seams into the crate: `LinuxRuntimePaths::isolated_under`
 # and `nftables::use_isolated_castle_table`. Integration tests that drive the real
 # boot path declare it through `required-features`, so a plain `cargo test` skips

@@ -1,0 +1,6 @@
+# witness: strict_json_numeric_domain_agrees
+--- a/castle-wall-daemon/src/smb/strict_json.rs
++++ b/castle-wall-daemon/src/smb/strict_json.rs
+@@ -81 +81 @@
+-        if !number.is_finite() || number.abs() > max_safe {
++        if !number.is_finite() || (number.abs() > max_safe && false) {

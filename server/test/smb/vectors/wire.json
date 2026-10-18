@@ -1,0 +1,3940 @@
+{
+  "$comment": "Must match wire.ts and castle-wall-daemon/src/smb/wire.rs; contracts.test.ts runs these through the real Rust test binary. inflate means leading JSON whitespace to maximum+1 bytes.",
+  "vectors": [
+    {
+      "name": "activate.prepare.request.valid",
+      "schema": "activate.prepare.request",
+      "value": {
+        "kind": "prepare",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.request.unknown",
+      "schema": "activate.prepare.request",
+      "value": {
+        "kind": "prepare",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.request.missing",
+      "schema": "activate.prepare.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.request.number",
+      "schema": "activate.prepare.request",
+      "value": {
+        "kind": "prepare",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.request.oversize",
+      "schema": "activate.prepare.request",
+      "value": {
+        "kind": "prepare",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.prepare.request.kind",
+      "schema": "activate.prepare.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.request.id",
+      "schema": "activate.prepare.request",
+      "value": {
+        "kind": "prepare",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.reply.valid",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.reply.unknown",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.reply.missing",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.reply.number",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.reply.oversize",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.prepare.reply.kind",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.prepare.reply.id",
+      "schema": "activate.prepare.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.request.valid",
+      "schema": "activate.start.request",
+      "value": {
+        "kind": "start",
+        "id": "1",
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.request.unknown",
+      "schema": "activate.start.request",
+      "value": {
+        "kind": "start",
+        "id": "1",
+        "K": "00000000000000000000000000000000",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.request.missing",
+      "schema": "activate.start.request",
+      "value": {
+        "id": "1",
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.request.number",
+      "schema": "activate.start.request",
+      "value": {
+        "kind": "start",
+        "id": 1,
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.request.oversize",
+      "schema": "activate.start.request",
+      "value": {
+        "kind": "start",
+        "id": "1",
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.start.request.kind",
+      "schema": "activate.start.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.request.id",
+      "schema": "activate.start.request",
+      "value": {
+        "kind": "start",
+        "id": "0",
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.reply.valid",
+      "schema": "activate.start.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.reply.unknown",
+      "schema": "activate.start.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.reply.missing",
+      "schema": "activate.start.reply",
+      "value": {
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.reply.number",
+      "schema": "activate.start.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.reply.oversize",
+      "schema": "activate.start.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.start.reply.kind",
+      "schema": "activate.start.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.start.reply.id",
+      "schema": "activate.start.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.request.valid",
+      "schema": "activate.stop.request",
+      "value": {
+        "kind": "stop",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.request.unknown",
+      "schema": "activate.stop.request",
+      "value": {
+        "kind": "stop",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.request.missing",
+      "schema": "activate.stop.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.request.number",
+      "schema": "activate.stop.request",
+      "value": {
+        "kind": "stop",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.request.oversize",
+      "schema": "activate.stop.request",
+      "value": {
+        "kind": "stop",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.stop.request.kind",
+      "schema": "activate.stop.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.request.id",
+      "schema": "activate.stop.request",
+      "value": {
+        "kind": "stop",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.reply.valid",
+      "schema": "activate.stop.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.reply.unknown",
+      "schema": "activate.stop.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.reply.missing",
+      "schema": "activate.stop.reply",
+      "value": {
+        "ok": true,
+        "state": "LIVE"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.reply.number",
+      "schema": "activate.stop.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "state": "LIVE"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.reply.oversize",
+      "schema": "activate.stop.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.stop.reply.kind",
+      "schema": "activate.stop.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.stop.reply.id",
+      "schema": "activate.stop.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "state": "LIVE"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.request.valid",
+      "schema": "activate.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.request.unknown",
+      "schema": "activate.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.request.missing",
+      "schema": "activate.status.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.request.number",
+      "schema": "activate.status.request",
+      "value": {
+        "kind": "status",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.request.oversize",
+      "schema": "activate.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.status.request.kind",
+      "schema": "activate.status.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.request.id",
+      "schema": "activate.status.request",
+      "value": {
+        "kind": "status",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.reply.valid",
+      "schema": "activate.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.reply.unknown",
+      "schema": "activate.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.reply.missing",
+      "schema": "activate.status.reply",
+      "value": {
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.reply.number",
+      "schema": "activate.status.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.reply.oversize",
+      "schema": "activate.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "activate.status.reply.kind",
+      "schema": "activate.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "activate.status.reply.id",
+      "schema": "activate.status.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "state": "LIVE",
+        "R": {
+          "boot_id": "00000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "unit_name": "x",
+          "K": "00000000000000000000000000000000",
+          "in_ino": "1",
+          "out_ino": "1",
+          "err_ino": "1",
+          "state": "live"
+        },
+        "unit_state": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.request.valid",
+      "schema": "filter.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.request.unknown",
+      "schema": "filter.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.request.missing",
+      "schema": "filter.status.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.request.number",
+      "schema": "filter.status.request",
+      "value": {
+        "kind": "status",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.request.oversize",
+      "schema": "filter.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "filter.status.request.kind",
+      "schema": "filter.status.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.request.id",
+      "schema": "filter.status.request",
+      "value": {
+        "kind": "status",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.reply.valid",
+      "schema": "filter.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.reply.unknown",
+      "schema": "filter.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.reply.missing",
+      "schema": "filter.status.reply",
+      "value": {
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.reply.number",
+      "schema": "filter.status.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.reply.oversize",
+      "schema": "filter.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "filter.status.reply.kind",
+      "schema": "filter.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "filter.status.reply.id",
+      "schema": "filter.status.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "instance_id": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.request.valid",
+      "schema": "gate.admit.request",
+      "value": {
+        "kind": "admit",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.request.unknown",
+      "schema": "gate.admit.request",
+      "value": {
+        "kind": "admit",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.request.missing",
+      "schema": "gate.admit.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.request.number",
+      "schema": "gate.admit.request",
+      "value": {
+        "kind": "admit",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.request.oversize",
+      "schema": "gate.admit.request",
+      "value": {
+        "kind": "admit",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "gate.admit.request.kind",
+      "schema": "gate.admit.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.request.id",
+      "schema": "gate.admit.request",
+      "value": {
+        "kind": "admit",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.reply.valid",
+      "schema": "gate.admit.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.reply.unknown",
+      "schema": "gate.admit.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.reply.missing",
+      "schema": "gate.admit.reply",
+      "value": {
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.reply.number",
+      "schema": "gate.admit.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.reply.oversize",
+      "schema": "gate.admit.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "gate.admit.reply.kind",
+      "schema": "gate.admit.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.admit.reply.id",
+      "schema": "gate.admit.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "conn_id": "1",
+        "inst": "1",
+        "uid": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "client_cookie": "1",
+        "accepted_cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.request.valid",
+      "schema": "gate.recheck.request",
+      "value": {
+        "kind": "recheck",
+        "id": "1",
+        "conn_id": "1",
+        "inst": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.request.unknown",
+      "schema": "gate.recheck.request",
+      "value": {
+        "kind": "recheck",
+        "id": "1",
+        "conn_id": "1",
+        "inst": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.request.missing",
+      "schema": "gate.recheck.request",
+      "value": {
+        "id": "1",
+        "conn_id": "1",
+        "inst": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.request.number",
+      "schema": "gate.recheck.request",
+      "value": {
+        "kind": "recheck",
+        "id": 1,
+        "conn_id": "1",
+        "inst": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.request.oversize",
+      "schema": "gate.recheck.request",
+      "value": {
+        "kind": "recheck",
+        "id": "1",
+        "conn_id": "1",
+        "inst": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "gate.recheck.request.kind",
+      "schema": "gate.recheck.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "conn_id": "1",
+        "inst": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.request.id",
+      "schema": "gate.recheck.request",
+      "value": {
+        "kind": "recheck",
+        "id": "0",
+        "conn_id": "1",
+        "inst": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.reply.valid",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.reply.unknown",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.reply.missing",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.reply.number",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "id": 1,
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.reply.oversize",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "gate.recheck.reply.kind",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate.recheck.reply.id",
+      "schema": "gate.recheck.reply",
+      "value": {
+        "id": "0",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "query.query.request.valid",
+      "schema": "query.query.request",
+      "value": {
+        "kind": "query",
+        "id": "1",
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.request.unknown",
+      "schema": "query.query.request",
+      "value": {
+        "kind": "query",
+        "id": "1",
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.request.missing",
+      "schema": "query.query.request",
+      "value": {
+        "id": "1",
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.request.number",
+      "schema": "query.query.request",
+      "value": {
+        "kind": "query",
+        "id": 1,
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.request.oversize",
+      "schema": "query.query.request",
+      "value": {
+        "kind": "query",
+        "id": "1",
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY",
+      "inflate": true
+    },
+    {
+      "name": "query.query.request.kind",
+      "schema": "query.query.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.request.id",
+      "schema": "query.query.request",
+      "value": {
+        "kind": "query",
+        "id": "0",
+        "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+        "agent_uid": "1",
+        "host": "x",
+        "header": "x"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.reply.valid",
+      "schema": "query.query.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA=="
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.reply.unknown",
+      "schema": "query.query.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA==",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.reply.missing",
+      "schema": "query.query.reply",
+      "value": {
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.reply.number",
+      "schema": "query.query.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.reply.oversize",
+      "schema": "query.query.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY",
+      "inflate": true
+    },
+    {
+      "name": "query.query.reply.kind",
+      "schema": "query.query.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA==",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "query.query.reply.id",
+      "schema": "query.query.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_QUERY"
+    },
+    {
+      "name": "unlock.unlock.request.valid",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unlock",
+        "id": "1",
+        "passphrase_b64": "eA=="
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.request.unknown",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unlock",
+        "id": "1",
+        "passphrase_b64": "eA==",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.request.missing",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "id": "1",
+        "passphrase_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.request.number",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unlock",
+        "id": 1,
+        "passphrase_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.request.oversize",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unlock",
+        "id": "1",
+        "passphrase_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "unlock.unlock.request.kind",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "passphrase_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.request.id",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unlock",
+        "id": "0",
+        "passphrase_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.reply.valid",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.reply.unknown",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.reply.missing",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.reply.number",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "id": 1,
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.reply.oversize",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "unlock.unlock.reply.kind",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.reply.id",
+      "schema": "unlock.unlock.reply",
+      "value": {
+        "id": "0",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.request.valid",
+      "schema": "unlock.lock.request",
+      "value": {
+        "kind": "lock",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.request.unknown",
+      "schema": "unlock.lock.request",
+      "value": {
+        "kind": "lock",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.request.missing",
+      "schema": "unlock.lock.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.request.number",
+      "schema": "unlock.lock.request",
+      "value": {
+        "kind": "lock",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.request.oversize",
+      "schema": "unlock.lock.request",
+      "value": {
+        "kind": "lock",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "unlock.lock.request.kind",
+      "schema": "unlock.lock.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.request.id",
+      "schema": "unlock.lock.request",
+      "value": {
+        "kind": "lock",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.reply.valid",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.reply.unknown",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.reply.missing",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.reply.number",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "id": 1,
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.reply.oversize",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "unlock.lock.reply.kind",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.lock.reply.id",
+      "schema": "unlock.lock.reply",
+      "value": {
+        "id": "0",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.request.valid",
+      "schema": "unlock.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.request.unknown",
+      "schema": "unlock.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.request.missing",
+      "schema": "unlock.status.request",
+      "value": {
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.request.number",
+      "schema": "unlock.status.request",
+      "value": {
+        "kind": "status",
+        "id": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.request.oversize",
+      "schema": "unlock.status.request",
+      "value": {
+        "kind": "status",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "unlock.status.request.kind",
+      "schema": "unlock.status.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.request.id",
+      "schema": "unlock.status.request",
+      "value": {
+        "kind": "status",
+        "id": "0"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.reply.valid",
+      "schema": "unlock.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LOCKED"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.reply.unknown",
+      "schema": "unlock.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LOCKED",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.reply.missing",
+      "schema": "unlock.status.reply",
+      "value": {
+        "ok": true,
+        "state": "LOCKED"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.reply.number",
+      "schema": "unlock.status.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "state": "LOCKED"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.reply.oversize",
+      "schema": "unlock.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LOCKED"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL",
+      "inflate": true
+    },
+    {
+      "name": "unlock.status.reply.kind",
+      "schema": "unlock.status.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "state": "LOCKED",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.status.reply.id",
+      "schema": "unlock.status.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "state": "LOCKED"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "gate-b.scope.request.valid",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.request.unknown",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.request.missing",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.request.number",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": 1,
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.request.oversize",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.scope.request.kind",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.request.id",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "0",
+        "I": "00000000000000000000000000000000",
+        "C": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.reply.valid",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.reply.unknown",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.reply.missing",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.reply.number",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.reply.oversize",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.scope.reply.kind",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.scope.reply.id",
+      "schema": "gate-b.scope.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "W0": {
+          "instance_id": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.request.valid",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "kind": "hold",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA=="
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.request.unknown",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "kind": "hold",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA==",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.request.missing",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.request.number",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "kind": "hold",
+        "id": 1,
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.request.oversize",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "kind": "hold",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.hold.request.kind",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.request.id",
+      "schema": "gate-b.hold.request",
+      "value": {
+        "kind": "hold",
+        "id": "0",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "class": "a",
+        "frozen_b64": "eA=="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.reply.valid",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.reply.unknown",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.reply.missing",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.reply.number",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.reply.oversize",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.hold.reply.kind",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000",
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.hold.reply.id",
+      "schema": "gate-b.hold.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "Q": "00000000000000000000000000000000",
+        "T": "00000000000000000000000000000000",
+        "P": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.request.valid",
+      "schema": "gate-b.await.request",
+      "value": {
+        "kind": "await",
+        "id": "1",
+        "Q": "00000000000000000000000000000000"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.request.unknown",
+      "schema": "gate-b.await.request",
+      "value": {
+        "kind": "await",
+        "id": "1",
+        "Q": "00000000000000000000000000000000",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.request.missing",
+      "schema": "gate-b.await.request",
+      "value": {
+        "id": "1",
+        "Q": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.request.number",
+      "schema": "gate-b.await.request",
+      "value": {
+        "kind": "await",
+        "id": 1,
+        "Q": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.request.oversize",
+      "schema": "gate-b.await.request",
+      "value": {
+        "kind": "await",
+        "id": "1",
+        "Q": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.await.request.kind",
+      "schema": "gate-b.await.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "Q": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.request.id",
+      "schema": "gate-b.await.request",
+      "value": {
+        "kind": "await",
+        "id": "0",
+        "Q": "00000000000000000000000000000000"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.reply.valid",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        }
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.reply.unknown",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        },
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.reply.missing",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.reply.number",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "id": 1,
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.reply.oversize",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.await.reply.kind",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        },
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.await.reply.id",
+      "schema": "gate-b.await.reply",
+      "value": {
+        "id": "0",
+        "ok": true,
+        "decision": {
+          "Q": "00000000000000000000000000000000",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "I": "00000000000000000000000000000000",
+          "C": "1",
+          "cookie": "1",
+          "value": "approve"
+        }
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.request.valid",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "kind": "confirm",
+        "id": "1",
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.request.unknown",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "kind": "confirm",
+        "id": "1",
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.request.missing",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "id": "1",
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.request.number",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "kind": "confirm",
+        "id": 1,
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.request.oversize",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "kind": "confirm",
+        "id": "1",
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.confirm.request.kind",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.request.id",
+      "schema": "gate-b.confirm.request",
+      "value": {
+        "kind": "confirm",
+        "id": "0",
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.reply.valid",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.reply.unknown",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.reply.missing",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.reply.number",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "id": 1,
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.reply.oversize",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.confirm.reply.kind",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.confirm.reply.id",
+      "schema": "gate-b.confirm.reply",
+      "value": {
+        "id": "0",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.request.valid",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "1",
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.request.unknown",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "1",
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.request.missing",
+      "schema": "gate-b.event.request",
+      "value": {
+        "id": "1",
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.request.number",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": 1,
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.request.oversize",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "1",
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.event.request.kind",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "unknown",
+        "id": "1",
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.request.id",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "0",
+        "event": "refusal",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.reply.valid",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.reply.unknown",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.reply.missing",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.reply.number",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "id": 1,
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.reply.oversize",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B",
+      "inflate": true
+    },
+    {
+      "name": "gate-b.event.reply.kind",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "kind": "unknown"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "gate-b.event.reply.id",
+      "schema": "gate-b.event.reply",
+      "value": {
+        "id": "0",
+        "ok": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "r_record.valid",
+      "schema": "r_record",
+      "value": {
+        "boot_id": "00000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "unit_name": "x",
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1",
+        "state": "live"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "r_record.unknown",
+      "schema": "r_record",
+      "value": {
+        "boot_id": "00000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "unit_name": "x",
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1",
+        "state": "live",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "prepared.valid",
+      "schema": "prepared",
+      "value": {
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "prepared.unknown",
+      "schema": "prepared",
+      "value": {
+        "K": "00000000000000000000000000000000",
+        "in_ino": "1",
+        "out_ino": "1",
+        "err_ino": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "start_ticket.valid",
+      "schema": "start_ticket",
+      "value": {
+        "K": "00000000000000000000000000000000"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "start_ticket.unknown",
+      "schema": "start_ticket",
+      "value": {
+        "K": "00000000000000000000000000000000",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "unconfirmed.valid",
+      "schema": "unconfirmed",
+      "value": {},
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "unconfirmed.unknown",
+      "schema": "unconfirmed",
+      "value": {
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "decision.valid",
+      "schema": "decision",
+      "value": {
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "value": "approve"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "decision.unknown",
+      "schema": "decision",
+      "value": {
+        "Q": "00000000000000000000000000000000",
+        "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "I": "00000000000000000000000000000000",
+        "C": "1",
+        "cookie": "1",
+        "value": "approve",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "owner_enroll_request.valid",
+      "schema": "owner_enroll_request",
+      "value": {
+        "version": "1",
+        "person": "00000000000000000000000000000000",
+        "role": "owner",
+        "code_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "expires": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "owner_enroll_request.unknown",
+      "schema": "owner_enroll_request",
+      "value": {
+        "version": "1",
+        "person": "00000000000000000000000000000000",
+        "role": "owner",
+        "code_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "expires": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "vault_plaintext.valid",
+      "schema": "vault_plaintext",
+      "value": {
+        "version": "1",
+        "entries": [
+          {
+            "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+            "agent_uid": "1",
+            "host": "x",
+            "header": "x",
+            "value_b64": "eA=="
+          }
+        ]
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "vault_plaintext.unknown",
+      "schema": "vault_plaintext",
+      "value": {
+        "version": "1",
+        "entries": [
+          {
+            "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+            "agent_uid": "1",
+            "host": "x",
+            "header": "x",
+            "value_b64": "eA=="
+          }
+        ],
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "destinations_body.valid",
+      "schema": "destinations_body",
+      "value": {
+        "version": "1",
+        "fortress_id": "x",
+        "generation": "1",
+        "issued_at": "1",
+        "expires_at": "1",
+        "hosts": [
+          {
+            "host": "x",
+            "port": "443",
+            "header": "x",
+            "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+            "routes": [
+              {
+                "method": "POST",
+                "path": "x",
+                "class": "a"
+              }
+            ]
+          }
+        ]
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "destinations_body.unknown",
+      "schema": "destinations_body",
+      "value": {
+        "version": "1",
+        "fortress_id": "x",
+        "generation": "1",
+        "issued_at": "1",
+        "expires_at": "1",
+        "hosts": [
+          {
+            "host": "x",
+            "port": "443",
+            "header": "x",
+            "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+            "routes": [
+              {
+                "method": "POST",
+                "path": "x",
+                "class": "a"
+              }
+            ]
+          }
+        ],
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "destinations_file.valid",
+      "schema": "destinations_file",
+      "value": {
+        "body": {
+          "version": "1",
+          "fortress_id": "x",
+          "generation": "1",
+          "issued_at": "1",
+          "expires_at": "1",
+          "hosts": [
+            {
+              "host": "x",
+              "port": "443",
+              "header": "x",
+              "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+              "routes": [
+                {
+                  "method": "POST",
+                  "path": "x",
+                  "class": "a"
+                }
+              ]
+            }
+          ]
+        },
+        "signature": {
+          "signature_scheme": "ed25519-v1",
+          "signing_key_id": "x",
+          "signature_b64url": "eA"
+        }
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "destinations_file.unknown",
+      "schema": "destinations_file",
+      "value": {
+        "body": {
+          "version": "1",
+          "fortress_id": "x",
+          "generation": "1",
+          "issued_at": "1",
+          "expires_at": "1",
+          "hosts": [
+            {
+              "host": "x",
+              "port": "443",
+              "header": "x",
+              "placeholder": "sanctuary_surrogate_00000000000000000000000000000000",
+              "routes": [
+                {
+                  "method": "POST",
+                  "path": "x",
+                  "class": "a"
+                }
+              ]
+            }
+          ]
+        },
+        "signature": {
+          "signature_scheme": "ed25519-v1",
+          "signing_key_id": "x",
+          "signature_b64url": "eA"
+        },
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_in.valid",
+      "schema": "fifo_in",
+      "value": {
+        "T_view": "00000000000000000000000000000000",
+        "body": {
+          "fraction": 0.5,
+          "count": 100
+        }
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_in.unknown",
+      "schema": "fifo_in",
+      "value": {
+        "T_view": "00000000000000000000000000000000",
+        "body": {
+          "fraction": 0.5,
+          "count": 100
+        },
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_result.valid",
+      "schema": "fifo_result",
+      "value": {
+        "type": "result",
+        "data_b64": "eA=="
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_result.unknown",
+      "schema": "fifo_result",
+      "value": {
+        "type": "result",
+        "data_b64": "eA==",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_end.valid",
+      "schema": "fifo_end",
+      "value": {
+        "type": "end",
+        "outcome": "done"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_end.unknown",
+      "schema": "fifo_end",
+      "value": {
+        "type": "end",
+        "outcome": "done",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_refused.valid",
+      "schema": "fifo_refused",
+      "value": {
+        "type": "refused",
+        "check": "workspace"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "fifo_refused.unknown",
+      "schema": "fifo_refused",
+      "value": {
+        "type": "refused",
+        "check": "workspace",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "request_envelope.valid",
+      "schema": "request_envelope",
+      "value": {
+        "kind": "x",
+        "id": "1"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "request_envelope.unknown",
+      "schema": "request_envelope",
+      "value": {
+        "kind": "x",
+        "id": "1",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "reply_envelope.valid",
+      "schema": "reply_envelope",
+      "value": {
+        "id": "1",
+        "ok": true
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "reply_envelope.unknown",
+      "schema": "reply_envelope",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "error_envelope.valid",
+      "schema": "error_envelope",
+      "value": {
+        "id": "1",
+        "ok": false,
+        "error": "refused"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "error_envelope.unknown",
+      "schema": "error_envelope",
+      "value": {
+        "id": "1",
+        "ok": false,
+        "error": "refused",
+        "unknown": true
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "REQ_MAX"
+    },
+    {
+      "name": "I.valid",
+      "schema": "I",
+      "value": "abababababababababababababababab",
+      "valid": true,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "I.decimal",
+      "schema": "I",
+      "value": "18446744073709551615",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "I.upper",
+      "schema": "I",
+      "value": "ABABABABABABABABABABABABABABABAB",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "I.uuid",
+      "schema": "I",
+      "value": "abcdef01-2345-6789-abcd-ef0123456789",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "I.short",
+      "schema": "I",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "I.long",
+      "schema": "I",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "boot_id.valid",
+      "schema": "boot_id",
+      "value": "abababababababababababababababab",
+      "valid": true,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "boot_id.decimal",
+      "schema": "boot_id",
+      "value": "18446744073709551615",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "boot_id.upper",
+      "schema": "boot_id",
+      "value": "ABABABABABABABABABABABABABABABAB",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "boot_id.uuid",
+      "schema": "boot_id",
+      "value": "abcdef01-2345-6789-abcd-ef0123456789",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "boot_id.short",
+      "schema": "boot_id",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "boot_id.long",
+      "schema": "boot_id",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "K.valid",
+      "schema": "K",
+      "value": "abababababababababababababababab",
+      "valid": true,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "K.decimal",
+      "schema": "K",
+      "value": "18446744073709551615",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "K.upper",
+      "schema": "K",
+      "value": "ABABABABABABABABABABABABABABABAB",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "K.uuid",
+      "schema": "K",
+      "value": "abcdef01-2345-6789-abcd-ef0123456789",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "K.short",
+      "schema": "K",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "K.long",
+      "schema": "K",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "MACHINE_ID.valid",
+      "schema": "MACHINE_ID",
+      "value": "abababababababababababababababab",
+      "valid": true,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "MACHINE_ID.decimal",
+      "schema": "MACHINE_ID",
+      "value": "18446744073709551615",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "MACHINE_ID.upper",
+      "schema": "MACHINE_ID",
+      "value": "ABABABABABABABABABABABABABABABAB",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "MACHINE_ID.uuid",
+      "schema": "MACHINE_ID",
+      "value": "abcdef01-2345-6789-abcd-ef0123456789",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "MACHINE_ID.short",
+      "schema": "MACHINE_ID",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "MACHINE_ID.long",
+      "schema": "MACHINE_ID",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "class.valid",
+      "schema": "class",
+      "value": "api.write",
+      "valid": true,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "class.number",
+      "schema": "class",
+      "value": 7,
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "class.empty",
+      "schema": "class",
+      "value": "",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "class.long",
+      "schema": "class",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "class.upper",
+      "schema": "class",
+      "value": "API",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "class.unicode",
+      "schema": "class",
+      "value": "\u00e9",
+      "valid": false,
+      "group": "ids",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "event.literal",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "1",
+        "event": "refusal",
+        "I": "abababababababababababababababab",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": true,
+      "group": "event",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "event.old",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "refusal",
+        "id": "1",
+        "I": "abababababababababababababababab",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "event",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "event.missing",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "1",
+        "I": "abababababababababababababababab",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "event",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "event.duplicate",
+      "schema": "gate-b.event.request",
+      "value": {
+        "kind": "event",
+        "id": "1",
+        "event": "refusal",
+        "I": "abababababababababababababababab",
+        "C": "1",
+        "stage": "C6"
+      },
+      "valid": false,
+      "group": "event",
+      "maximum": "FRAME_MAX_SMALL",
+      "raw": "{\"kind\": \"event\", \"id\": \"1\", \"event\": \"refusal\", \"I\": \"abababababababababababababababab\", \"C\": \"1\", \"stage\": \"C6\",\"kind\":\"event\"}"
+    },
+    {
+      "name": "C.refuse.1",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": 1
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "C.refuse.1.5",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": 1.5
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "C.refuse.01",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "01"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "C.refuse.-1",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "-1"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "C.refuse.18446744073709551616",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "18446744073709551616"
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "C.u64",
+      "schema": "gate-b.scope.request",
+      "value": {
+        "kind": "scope",
+        "id": "1",
+        "I": "00000000000000000000000000000000",
+        "C": "18446744073709551615"
+      },
+      "valid": true,
+      "group": "wire",
+      "maximum": "FRAME_MAX_SMALL"
+    },
+    {
+      "name": "unlock.unlock.request.decoded_oversize",
+      "schema": "unlock.unlock.request",
+      "value": {
+        "kind": "unlock",
+        "id": "1",
+        "passphrase_b64": "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    },
+    {
+      "name": "query.query.reply.decoded_oversize",
+      "schema": "query.query.reply",
+      "value": {
+        "id": "1",
+        "ok": true,
+        "gen": "1",
+        "value_b64": "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
+      },
+      "valid": false,
+      "group": "wire",
+      "maximum": "FRAME_MAX_GATE_B"
+    }
+  ]
+}

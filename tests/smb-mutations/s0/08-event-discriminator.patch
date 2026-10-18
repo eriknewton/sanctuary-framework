@@ -1,0 +1,7 @@
+# witness: wire_event_has_one_discriminator
+--- a/server/src/smb/wire.json
++++ b/server/src/smb/wire.json
+@@ -639,3 +638,0 @@
+-          "const": "event"
+-        },
+-        "event": {

@@ -1,0 +1,27 @@
+# witness: wire_vectors_agree
+--- a/server/src/smb/wire.json
++++ b/server/src/smb/wire.json
+@@ -128 +128 @@
+-        "C": "decimal",
++        "C": {"oneOf": ["decimal", "integer"]},
+@@ -174 +174 @@
+-        "C": "decimal",
++        "C": {"oneOf": ["decimal", "integer"]},
+@@ -376 +376 @@
+-        "C": "decimal"
++        "C": {"oneOf": ["decimal", "integer"]}
+@@ -454 +454 @@
+-        "C": "decimal",
++        "C": {"oneOf": ["decimal", "integer"]},
+@@ -560 +560 @@
+-        "C": "decimal"
++        "C": {"oneOf": ["decimal", "integer"]}
+@@ -580 +580 @@
+-        "C": "decimal",
++        "C": {"oneOf": ["decimal", "integer"]},
+@@ -625 +625 @@
+-        "C": "decimal",
++        "C": {"oneOf": ["decimal", "integer"]},
+@@ -645 +645 @@
+-        "C": "decimal",
++        "C": {"oneOf": ["decimal", "integer"]},

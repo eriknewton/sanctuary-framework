@@ -1,0 +1,9 @@
+# witness: container_peer
+--- a/castle-wall-daemon/src/smb/peer.rs
++++ b/castle-wall-daemon/src/smb/peer.rs
+@@ -11 +11,4 @@
+-    let (stream, _) = listener.accept()?;
++    let (mut stream, _) = listener.accept()?;
++    use std::io::Read;
++    let mut first = [0u8; 1];
++    stream.read_exact(&mut first)?;

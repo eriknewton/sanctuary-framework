@@ -1,0 +1,5 @@
+# witness: constants_parity
+--- a/castle-wall-daemon/src/smb/constants.rs
++++ b/castle-wall-daemon/src/smb/constants.rs
+@@ -55,0 +56 @@
++    if name == "FRAME_HEADER" { return Value::from(8); }
