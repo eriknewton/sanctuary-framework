@@ -81,6 +81,9 @@ export interface PostureHome {
    * implied enforcement it could not prove (#634 fake-green fix).
    */
   protection_requested_count: number;
+  /** Registry records plus unprotected harness kinds detected by config-file presence;
+   * each kind counts as its records or one unprotected entry, not an enforcement claim. */
+  protection_detected_count: number;
   /**
    * Count of agents with CONFIRMED live enforcement (`enforcement_active ===
    * "active"`). `0` today: no per-agent enforcement signal exists yet, so the

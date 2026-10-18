@@ -233,10 +233,11 @@ describe("C1: Remote Operator Console", () => {
       const resp = await requestNoKeepAlive(`http://127.0.0.1:${port}/fleet`);
       expect(resp.status).toBe(200);
       // Open Console must remain an obvious, accessible anchor...
-      expect(resp.body).toContain('class="btn-open">Open Console</a>');
+      expect(resp.body).toContain("open.className = 'btn-open';");
+      expect(resp.body).toContain("open.textContent = 'Open Console';");
       // ...but a plain same-tab navigation: no target="_blank" that the
       // browser blocked as a popup in the drill.
-      expect(resp.body).toContain('<a href="${m.url}" class="btn-open">');
+      expect(resp.body).toContain("open.setAttribute('href', acceptedUrl);");
       expect(resp.body).not.toContain('target="_blank"');
     });
 

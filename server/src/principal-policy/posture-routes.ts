@@ -623,7 +623,7 @@ export async function handlePostureRoute(
     }
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/unwrapped`) {
-      const roster = await buildUnwrapped(deps);
+      const roster = await buildUnwrapped(deps, deps.listAgents());
       writeJSON(res, 200, roster);
       return true;
     }
@@ -1073,13 +1073,13 @@ async function buildRecognition(deps: PostureRouteDeps): Promise<RecognitionPane
   );
 }
 
-async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {
+async function buildUnwrapped(deps: PostureRouteDeps, records: LocalAgentRecord[]): Promise<UnwrappedRoster> {
   const detected = deps.detectInstalledHarnesses
     ? await deps.detectInstalledHarnesses()
     : await scanInstalledHarnesses(deps.auditLog as AuditLog, deps.originMachine);
   return buildUnwrappedRoster({
     originMachine: deps.originMachine,
-    wrappedAgents: deps.listAgents(),
+    wrappedAgents: records,
     detectedHarnesses: detected,
   });
 }
@@ -1139,6 +1139,7 @@ function buildReach(
 export type { PostureHome };
 
 export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
+  const records = deps.listAgents();
   // S5-P (codex BLOCKER fix): resolve the exclusive-egress provider EXACTLY
   // ONCE for the whole home payload, then thread the SAME snapshot into both
   // the wall posture and the feature-health panel. Resolving per-builder would
@@ -1156,7 +1157,7 @@ export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
         enforcementAvailability,
       ),
       buildDigest(deps, protectionClaimSubject),
-      buildUnwrapped(deps),
+      buildUnwrapped(deps, records),
       buildFeatureHealth(
         deps,
         exclusiveEgress,
@@ -1171,7 +1172,7 @@ export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   // leak into a per-agent enforcement claim (the #634 fake-green).
   const agents = buildPostureAgentRows({
     originMachine: deps.originMachine,
-    records: deps.listAgents(),
+    records,
   });
   const protectionRequestedCount = agents.filter(
     (a) => a.policy_protected,
@@ -1194,6 +1195,9 @@ export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     custody_exit: custodyExit,
     query_privacy: queryPrivacy,
     protection_requested_count: protectionRequestedCount,
+    // Requested is a subset of records, and records of detected: requested <= detected.
+    // buildUnwrappedRoster drops registered harness kinds, so no kind counts twice.
+    protection_detected_count: records.length + unwrapped.unwrapped.length,
     enforcement_confirmed_count: enforcementConfirmedCount,
     agents,
   };

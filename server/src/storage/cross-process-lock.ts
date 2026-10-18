@@ -400,6 +400,8 @@ function stableLease(): CrossProcessLockLease {
 export interface MasterWriteBarrierLease {
   readonly signal: AbortSignal;
   readonly filesystemBacked: boolean;
+  /** Kernel socket path held by this process for custody-handle reporting. */
+  readonly socketPath?: string;
   /** Prove the admission/root identity still protects this unlock snapshot. */
   assertSessionHeld(): void;
   /** Prove the session is also authorized for a master-derived write. */
@@ -1180,6 +1182,7 @@ export async function acquireMasterWriteBarrier(
       const lease: MasterWriteBarrierLease = {
         signal: controller.signal,
         filesystemBacked: true,
+        socketPath: held.socketPath,
         assertSessionHeld: () => {
           if (released) {
             throw new CrossProcessLockError(

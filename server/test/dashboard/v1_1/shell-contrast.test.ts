@@ -280,6 +280,12 @@ describe("layout rules the slice holds", () => {
     expect(css).toContain(".topbar .btn.btn-talk .btn-label { display: none; }");
   });
 
+  it("the Evidence raw record wraps an unbroken served token inside the pane", () => {
+    const d = declsOf(".evidence-detail .json");
+    expect(d.get("white-space")).toBe("pre-wrap");
+    expect(d.get("overflow-wrap")).toBe("anywhere");
+  });
+
   it("the card head keeps action buttons on one line at the measured narrow widths", () => {
     const buttonRule = declsOf(".card-head-row .btn");
     expect(buttonRule.get("white-space")).toBe("nowrap");

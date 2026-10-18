@@ -294,7 +294,7 @@ describe("posture SSE stream (server)", () => {
     const streamed = JSON.parse(m![1]!);
     // Window timestamps in the digest move between the two reads; compare the
     // structural keys + the honest counts rather than the volatile windows.
-    expect(Object.keys(streamed).sort()).toEqual(Object.keys(home).sort());
+    expect(Object.keys(streamed).sort()).toEqual(Object.keys(home).sort()); assertDigestParity(home, streamed);
     expect(streamed.castle_wall.arm_state).toBe(home.castle_wall.arm_state);
     expect(streamed.protection_requested_count).toBe(
       home.protection_requested_count,
@@ -559,3 +559,17 @@ describe("posture home page client (honesty + reconnect + static-load)", () => {
     expect(html).toContain('pill green">enforcement active');
   });
 });
+
+// Keep the route's home and stream consumers pinned to every additive digest key.
+function assertDigestParity(homePayload: unknown, streamPayload: unknown) {
+  const home = homePayload as import("../../src/principal-policy/posture-home-types.js").PostureHome;
+  const streamed = streamPayload as typeof home;
+  expect(Object.keys(streamed.digest).sort()).toEqual(Object.keys(home.digest).sort());
+  for (const payload of [home, streamed]) {
+    for (const key of ["window_complete", "window_incomplete_reason", "kernel_allow_overrides", "blocked_destinations", "blocked_destination_count"] as const) {
+      expect(payload.digest).toHaveProperty(key);
+      expect(streamed.digest[key]).toEqual(home.digest[key]);
+    }
+    expect(payload).toHaveProperty("protection_detected_count");
+  }
+}

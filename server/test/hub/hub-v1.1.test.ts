@@ -366,7 +366,7 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
       listPolicySummaries: () => policySummaries,
       listBudgetSummaries: () => budgetSummaries,
     },
-    agentController: controller,
+    agentController: options.productionController ? productionControllerFor(registry, auditLog) : controller,
   });
 
   const authToken = options.authConfig?.authToken ?? "test-token-abc";
@@ -432,6 +432,20 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
 function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
+
+// Keep added fixture declarations below withAuth to preserve the pinned diagnostic locations.
+import { CastleWallAgentController } from "../../src/dashboard/v1_1/castle-wall-agent-controller.js";
+import { getClientScript } from "../../src/dashboard/v1_1/client.js";
+import { runInNewContext } from "node:vm";
+interface RigOptions { productionController?: boolean; }
+function productionControllerFor(registry: InMemoryLocalAgentRegistry, auditLog: AuditLog) {
+  return new CastleWallAgentController({
+    storagePath: "/unused-fixture", fortressPath: "/unused-fixture", fortressId: FORTRESS_ID, auditLog,
+    now: () => new Date(), getAgentRecord: id => registry.get(id),
+  });
+}
+interface StubAgentController { supports(...args: Parameters<HubAgentController["supports"]>): ReturnType<HubAgentController["supports"]>; }
+StubAgentController.prototype.supports = () => true;
 
 async function withTmpFortress<T>(
   fn: (storagePath: string) => Promise<T>,
@@ -1845,4 +1859,104 @@ describe("Hub source-file contract scans", () => {
       expect(content).not.toMatch(/\bUBAI\b|Universal Basic AI|Universal Basic Intelligence/);
     }
   });
+});
+
+
+describe("slice 6a composed agent capabilities", () => {
+  it("6a real controller projects unsupported controls false on both served agent reads", async () => {
+    const rig = await startRig({ productionController: true });
+    try {
+      for (const path of ["/agents", "/agents/agent-alpha"]) {
+        const res = await fetch(rig.url + HUB_API_PREFIX + path, { headers: withAuth({}, rig.authToken) });
+        const body = await res.json() as { data: { agents?: LocalAgentRecord[]; agent?: LocalAgentRecord } };
+        const record = body.data.agent ?? body.data.agents![0]!;
+        expect(record.capabilities.can_unwrap).toBe(false);
+        expect(record.capabilities.can_pause).toBe(false);
+        expect(record.capabilities.can_resume).toBe(false);
+        expect(record.capabilities.can_restart).toBe(false);
+        expect(record.capabilities.can_lockdown).toBe(true);
+        // Feed the actual served record through the production control renderer, shared by detail and menu.
+        const script = getClientScript();
+        const controls = script.slice(script.indexOf("const AGENT_CONTROL_LABELS ="), script.indexOf("// Wave 1: the fortress-column"));
+        const html = runInNewContext(controls + '\nrenderAgentControlButtons(record, true)', {
+          record, escHtml: (value: string) => value.replace(/[&<>"']/g, ""),
+        }) as string;
+        expect(html).toMatch(/data-action="agent-unwrap"[^>]*disabled[^>]*>Remove protection/);
+        expect(html).toMatch(/data-action="agent-lockdown"[^>]*>Lock down this agent/);
+
+      }
+      expect(rig.registry.get("agent-alpha")!.capabilities.can_unwrap).toBe(true);
+      const refused = await fetch(rig.url + HUB_API_PREFIX + "/agents/agent-alpha/unwrap", { method: "POST", headers: withAuth({}, rig.authToken) });
+      expect(refused.status).toBe(422);
+      expect(rig.service.listInbox().filter(i => i.kind === "approval_pending")).toEqual([]);
+    } finally { await rig.stop(); }
+  });
+
+  it("6a capability projection intersects all stored flags and fails closed without a support probe", async () => {
+    const controller = new UnsupportedUnwrapController();
+    const rig = await startRig({ controller });
+    try {
+      const record = rig.registry.get("agent-alpha")!;
+      record.capabilities.can_lockdown = false;
+      rig.registry.put(record);
+      const readBoth = async () => {
+        const results = [];
+        for (const path of ["/agents", "/agents/agent-alpha"]) {
+          const res = await fetch(rig.url + HUB_API_PREFIX + path, { headers: withAuth({}, rig.authToken) });
+          const body = await res.json() as { data: { agents?: LocalAgentRecord[]; agent?: LocalAgentRecord } };
+          results.push((body.data.agent ?? body.data.agents![0]!).capabilities);
+        }
+        return results;
+      };
+      for (const flags of await readBoth()) expect(flags).toMatchObject({ can_pause: true, can_resume: true, can_restart: true, can_unwrap: false, can_lockdown: false });
+      for (const probe of [undefined, () => { throw new Error("unavailable"); }, () => Promise.reject(new Error("unavailable")), () => "yes", () => 1]) {
+        Object.defineProperty(controller, "supports", { value: probe, configurable: true });
+        for (const flags of await readBoth()) expect(flags).toMatchObject({ can_pause: false, can_resume: false, can_restart: false, can_unwrap: false, can_lockdown: false });
+      }
+    } finally { await rig.stop(); }
+  });
+
+  it("6a the control route refuses without an explicit true from the support probe and queues no approval", async () => {
+    const controller = new UnsupportedUnwrapController();
+    const rig = await startRig({ controller });
+    try {
+      const post = (action: string) => fetch(rig.url + HUB_API_PREFIX + "/agents/agent-alpha/" + action, { method: "POST", headers: withAuth({}, rig.authToken) });
+      for (const probe of [undefined, () => "yes", () => { throw new Error("unavailable"); }]) {
+        Object.defineProperty(controller, "supports", { value: probe, configurable: true });
+        expect((await post("lockdown")).status).toBe(422);
+        expect((await post("pause")).status).toBe(422);
+      }
+      expect(rig.service.listInbox().filter(i => i.kind === "approval_pending")).toEqual([]);
+    } finally { await rig.stop(); }
+  });
+  it("6a r2 stored non-boolean permission refuses a supported control without queueing", async () => {
+    const controller = new UnsupportedUnwrapController();
+    Object.defineProperty(controller, "supports", { value: () => true });
+    const rig = await startRig({ controller });
+    try {
+      const record = rig.registry.get("agent-alpha")!;
+      record.capabilities.can_lockdown = "yes" as unknown as boolean;
+      rig.registry.put(record);
+      const res = await fetch(rig.url + HUB_API_PREFIX + "/agents/agent-alpha/lockdown", { method: "POST", headers: withAuth({}, rig.authToken) });
+      expect(res.status).toBe(422);
+      expect(rig.service.listInbox().filter(item => item.kind === "approval_pending")).toEqual([]);
+    } finally { await rig.stop(); }
+  });
+  it("6a r2 a stored non-boolean permission reads false on both agent reads", async () => {
+    const controller = new UnsupportedUnwrapController();
+    Object.defineProperty(controller, "supports", { value: () => true });
+    const rig = await startRig({ controller });
+    try {
+      const record = rig.registry.get("agent-alpha")!;
+      record.capabilities.can_lockdown = "yes" as unknown as boolean;
+      rig.registry.put(record);
+      for (const path of ["/agents", "/agents/agent-alpha"]) {
+        const res = await fetch(rig.url + HUB_API_PREFIX + path, { headers: withAuth({}, rig.authToken) });
+        const body = await res.json() as { data: { agents?: LocalAgentRecord[]; agent?: LocalAgentRecord } };
+        // The read projection and the control route share one rule: only a stored boolean true grants a control.
+        expect((body.data.agent ?? body.data.agents![0]!).capabilities.can_lockdown).toBe(false);
+      }
+    } finally { await rig.stop(); }
+  });
+
 });
