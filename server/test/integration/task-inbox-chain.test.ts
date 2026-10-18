@@ -1,4 +1,4 @@
-// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
+// fail-before-exempt: Slice 6a declares false support for a task-inbox fixture that exercises no agent controls.
 import { describe, expect, it } from "vitest";
 
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -17,6 +17,8 @@ import type { Task } from "../../src/operational/task-coordination/index.js";
 import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 const controller: HubAgentController = {
+  // This task-inbox fixture exercises no agent control actions.
+  supports() { return false; },
   async pause() {
     return "paused";
   },

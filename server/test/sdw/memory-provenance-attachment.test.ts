@@ -397,6 +397,8 @@ describe("Memory Integrity C2 encrypted attachment", () => {
       "exit/v2-memory-archive.ts:putPassagesIfAbsent",
       // The Hermes memory bridge inserts owner-approved entries; its provenance context is pinned below.
       "hermes-memory-bridge/bridge-core.ts:insertPassage",
+      // The process-shell forwarder preserves that exact code-owned input; the socket integration verifies the persisted companion.
+      "hermes-memory-bridge/process-shell.ts:insertPassage",
       "sdw/adapters/claude-code-file-adapter.ts:putPassages",
       "sdw/adapters/codex-memory-file-adapter.ts:putPassages",
       "sdw/anthropic-memory-handler.ts:insertPassage",
