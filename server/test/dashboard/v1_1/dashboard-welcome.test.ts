@@ -25,23 +25,21 @@ describe("v1.2 dashboard concierge surface (WP-V1.2-4)", () => {
   it("dashboard route invokes renderDashboardConcierge (replaces v1.1.7 welcome card)", () => {
     const script = getClientScript();
     // v1.2.0-rc.1 Finding UU: route dispatch was refactored to write
-    // through a render-cache so unchanged HTML does not blow away the
-    // chat-history DOM (and any active text selection). The dispatch is
-    // now `nextHtml = renderDashboardConcierge();` followed by a cache
-    // compare; assert both pieces.
+    // through a route dispatcher. Talk now keeps a mounted owner; normal
+    // routes continue to use the render cache.
     expect(script).toContain('case "dashboard": nextHtml = renderDashboardConcierge();');
     expect(script).toContain("function renderDashboardConcierge()");
   });
 
-  it("v1.2.0-rc.1 Finding UU: renderMain caches HTML and skips innerHTML write on no-op poll", () => {
+  it("keeps normal-route caching and hydrates a mounted Talk view without replacing its input", () => {
     const script = getClientScript();
-    // Cache structure declared at module scope.
     expect(script).toContain("__renderCache");
-    // Cache compare branch present (skip write when route + html match).
-    expect(script).toContain("__renderCache.route === state.route && __renderCache.html === nextHtml");
-    // Cache update + write branch present.
+    expect(script).toContain("const mountedTalk = talkMain && talkOwner && talkOwner.host === main && talkOwner.input.isConnected");
+    expect(script).toContain("if (mountedTalk) {");
+    expect(script).toContain("hydrateTalkHost(main);");
+    expect(script).toContain("__renderCache.route !== state.route || __renderCache.html !== nextHtml || talkMain");
     expect(script).toContain("__renderCache.route = state.route");
-    expect(script).toContain("__renderCache.html = nextHtml");
+    expect(script).toContain("main.innerHTML = nextHtml");
   });
 
   it("concierge surface presents the 'Sanctuary Fortress concierge' persona inline", () => {

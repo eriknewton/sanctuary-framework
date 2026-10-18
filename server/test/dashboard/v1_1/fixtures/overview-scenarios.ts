@@ -59,6 +59,8 @@ export async function overviewScenarios(now: number) {
   const scenarios = [
     { name: "healthy", home: healthy }, { name: "fail-honest", home: failHonest },
     { name: "window-not-covered", home: uncovered },
+    { name: "window-not-covered-retention", home: { ...base, digest: { ...base.digest,
+      window_complete: false, window_incomplete_reason: "retention" } } satisfies PostureHome },
     { name: "overrides", home: overrides }, { name: "stale-verified", home: stale },
     { name: "first-run-unprotected", home: firstRun }, { name: "no-evidence", home: noEvidence },
   ];

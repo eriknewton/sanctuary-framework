@@ -1,4 +1,5 @@
 /** Dashboard reads settle independently and missing evidence stays unknown. */
+// fail-before-exempt: adapts three existing refresh and queue-visibility witnesses that drove a decision on a request the loaded queue did not hold; the client now refuses such a decision locally and sends nothing, so the trailing-read witness drives the post-decision refresh directly and the queue-visibility witnesses decide on a request the loaded queue holds; asserts nothing new. Fail-before coverage for admission lives in approval-decision-result.test.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
@@ -14,7 +15,11 @@ const home = {
   protection_requested_count: 1,
   enforcement_confirmed_count: 0,
 };
-const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+// Policy reads share the pre-decode byte budget, so fixtures expose the same stream as fetch.
+const response = (body: unknown, status = 200) => ({
+  ok: status === 200, status, json: async () => body,
+  body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } }),
+});
 const pending = () => new Promise<never>(() => {});
 function testElement() {
   const classes = new Set<string>();
@@ -55,7 +60,7 @@ function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub"
   const context = createContext({
     document: { getElementById: (id: string) => elements[id] || (id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: hub }) } : null), addEventListener: (event: string, listener: (event: unknown) => void) => { listeners[event] = listener; }, querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} } },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
-    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Element, Date,
+    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, TextDecoder, Element, Date,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, EventSource: class { listeners: Record<string, (event: { data: string }) => void> = {}; constructor() { streams.push(this); } close() {} addEventListener(name: string, listener: (event: { data: string }) => void) { this.listeners[name] = listener; } },
     fetch: (url: string) => {
       urls.push(url);
@@ -112,7 +117,10 @@ describe("dashboard bounded independent hydration", () => {
     vi.useFakeTimers(); const h = harness({ "/api/inbox/unified/prefs": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
     runInContext('state.route = "activity"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Read timed out"); expect(runInContext("state.inboxOps.filters.search", h.context)).toBe(""); expect(h.main.innerHTML).toContain("Activity");
+    expect(h.main.innerHTML).toContain("Read timed out");
+    // The activity route's screen is now titled Evidence (slice 5); the kept inbox still reports its timed-out read.
+    expect(h.main.innerHTML).toContain("Evidence");
+    expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
@@ -180,7 +188,7 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
     expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
+    expect(runInContext("sourceReads.size", h.context)).toBe(23); // Main's twenty-one, which include the Evidence verification read, plus the fleet roster and Sentinel findings; dynamic failures add none.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -260,7 +268,9 @@ describe("dashboard bounded independent hydration", () => {
   it("post-mutation refresh performs a trailing read after an older in-flight read", async () => {
     vi.useFakeTimers(); const h = harness(); await settle();
     runInContext('let releaseOld; let reads = 0; fetch = async function (url) { if (url.includes("/inbox")) { reads++; if (reads === 1) return new Promise(function (resolve) { releaseOld = resolve; }); } return { ok: true, status: 200, json: async function () { return { data: { items: [], agents: [], entries: [], policies: [] } }; } }; }; void fetchAll()', h.context); await settle();
-    runInContext('void onInboxAction("x", "approve")', h.context); await settle();
+    // Retargeted from onInboxAction("x", ...): a decision is admitted only against a loaded queue that holds the
+    // request, so the post-decision refresh is driven directly; fetchAll(true) is what the decision path calls.
+    runInContext('void fetchAll(true)', h.context); await settle();
     runInContext('releaseOld({ ok: true, status: 200, json: async function () { return { data: { items: [{item_id: "obsolete"}] } }; } })', h.context); await settle();
     expect(runInContext('state.inbox', h.context)).toEqual([]);
   });
@@ -563,13 +573,14 @@ describe("dashboard bounded independent hydration", () => {
   it("policy activation does not reuse a pre-activation policy read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
     const h = harness({
-      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], marker: "new" } } }),
+      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], policy_version: 2 } } }),
       "/api/policy/drafts/fixture/activate": () => response({ data: { status: "activated" } }),
     }); await settle();
     runInContext('state.route = "policy"; void loadPolicyView()', h.context); await settle();
     runInContext('void activateStandingRule("fixture", "fixture-op", false)', h.context); await settle();
-    release(response({ data: { view: { lines: [], marker: "old" } } })); await settle();
-    expect(runInContext('state.policyView.view.marker', h.context)).toBe("new"); expect(reads).toBe(2);
+    release(response({ data: { view: { lines: [], policy_version: 1 } } })); await settle();
+    // The bounded view retains the real policy version, not a synthetic marker field.
+    expect(runInContext('state.policyView.view.policy_version', h.context)).toBe(2); expect(reads).toBe(2);
   });
   it("recognition mutation cannot be overwritten by a pre-mutation health read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
@@ -603,7 +614,11 @@ describe("dashboard bounded independent hydration", () => {
 describe("D5 closure", () => {
   it.each(["approve", "deny"])("keeps the queue visible while %s is pending or rejected", async action => {
     vi.useFakeTimers(); let reject!: (reason: Error) => void;
-    const h = harness({ ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }) }); await settle();
+    // The decided request is held in the loaded queue, since a decision on an unheld request is refused locally.
+    const h = harness({
+      "/api/hub/inbox": () => response({ data: { items: [{ item_id: "fixture", kind: "approval_pending", tier: "tier2", agent_id: "fixture", resolved: false, created_at: "2026-10-17T16:45:00.000Z" }] } }),
+      ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }),
+    }); await settle();
     runInContext(`
       let hidden = false;
       const count = { textContent: "1", classList: { add() {} } };

@@ -15,7 +15,8 @@ describe("Dashboard copy sweep — Tier 4", () => {
   // JJJJ: Policy tab no longer shows stale "v1.1" badge
   it("JJJJ: policy heading does not contain v1.1 badge", () => {
     expect(script).not.toContain('pill tone-verified">v1.1</span>');
-    expect(script).toContain("One screen for every rule</h1>");
+    // Slice 6b uses the noun heading; the no-stale-version-badge invariant stays unchanged.
+    expect(script).toContain("Policies</h1>");
   });
 
   // LLLL: Health tab no longer says "lands in v1.2"

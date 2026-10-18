@@ -956,6 +956,8 @@ export interface HostLocalBootCredentialOptions {
   storage: StorageBackend;
   /** Fortress root (the directory holding `state/`). */
   storagePath: string;
+  /** HOME captured from the boot environment that owns this exact fortress path. */
+  home?: string;
   /**
    * Test seam: the exact-fortress stored-passphrase read. Defaults to the real
    * {@link readStoredPassphrase}; the observation is built from it by
@@ -1002,6 +1004,7 @@ export async function resolveHostLocalBootCredential(
 ): Promise<HostLocalBootCredential> {
   const resolution = await resolveFortressCustodyCredential({
     storagePath: args.storagePath,
+    home: args.home,
     storage: args.storage,
     allow: HOST_LOCAL_CUSTODY_SOURCES,
     // A boot never creates custody through the resolver. The caller's audited

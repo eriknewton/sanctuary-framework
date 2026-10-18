@@ -1,3 +1,4 @@
+// fail-before-exempt: This change moves the existing credential-store fixture injection allowlist from setup/keychain-fake.ts to setup/keychain-memory-store.ts; the scanner and all credential-binary safety assertions are unchanged and must pass against both production versions.
 /**
  * The chokepoint that keeps tests off the operator's real login keychain.
  *
@@ -578,7 +579,7 @@ describe("no code path in server/test can reach the real credential binary", () 
    * not touch this: nearly all of them already pass an `exec` through
    * KeychainCustodyOptions.
    */
-  const MAY_INJECT = ["setup/keychain-fake.ts", SCANNER_ITSELF];
+  const MAY_INJECT = ["setup/keychain-memory-store.ts", SCANNER_ITSELF];
 
   it("finds no attempt to un-install or re-point the credential store", () => {
     const offenders = files

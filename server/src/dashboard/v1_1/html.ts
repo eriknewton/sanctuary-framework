@@ -704,6 +704,30 @@ body {
   background: var(--indigo-bg); color: var(--indigo); border: 1px solid var(--indigo);
   border-radius: var(--rad); padding: 8px 12px; margin: 8px 0; font-size: var(--text-base);
 }
+/* The one retained decision result (client.ts renderDecisionResult) heads every screen with decision
+   controls. It sits in normal flow, so settling never covers a control or moves the page under the
+   pointer; the border and fill follow the status word only (ochre while sending or unconfirmed, sage
+   when the server acknowledged, rust when it refused), and the text stays ink so it reads in both
+   themes; not_sent (nothing reached the server) keeps the ochre default. Must match the data-decision-status
+   values in client.ts, DECISION_HEADLINE. */
+.decision-result {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3);
+  background: var(--ochre-bg); color: var(--ink); border: 1px solid var(--ochre);
+  border-left-width: 3px; /* 3 = the 1px card border plus 2px, the same accent width the banners use */
+  border-radius: var(--rad); padding: 10px 12px; /* 12 = the banner-warn side padding; 10 = its 8px top padding plus 2px so the headline clears the thicker left accent */
+  margin: 0 0 var(--space-3); font-size: var(--text-base);
+  overflow-wrap: anywhere;
+}
+.decision-result strong { display: block; margin-bottom: 2px; /* 2 = half the 4px line gap between headline and text */ }
+.decision-result p { margin: 0; color: var(--ink-2); line-height: 1.45; /* 1.45 = the page body line-height (the body rule above), restated so the paragraph keeps it if a parent rule overrides it */ }
+.decision-result ul { margin: 6px 0 0; padding-left: 18px; /* 6 = half the 12px side padding; 18 = marker width at the base size */ color: var(--ink-2); }
+.decision-result .btn { flex: none; }
+.decision-result[data-decision-status="acknowledged"] { background: var(--sage-bg); border-color: var(--sage); }
+.decision-result[data-decision-status="refused"] { background: var(--rust-bg); border-color: var(--rust); }
+/* The drawer's one-line echo of the result for the selected request (client.ts renderDecisionInline). */
+.decision-inline { margin: 8px 0 0; /* 8 = the toolbar's own gap, so the echo sits as one more toolbar line */ font-size: var(--text-sm); color: var(--ink-2); }
+.decision-inline[data-decision-status="refused"] { color: var(--rust); }
+.decision-inline[data-decision-status="not_sent"] { color: var(--ochre); } /* ochre, as the block: nothing was refused */
 .btn.chip {
   border-radius: 999px; padding: 4px 12px; font-size: var(--text-sm);
   background: var(--surface-2); border-color: var(--ink-3);
@@ -800,6 +824,10 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  /* A wheel at either end of the history must not chain to the outer page:
+     the Talk follow contract treats a no-motion wheel as "still reading here",
+     and a page that moves under the reader breaks that (native Chromium, 10-16). */
+  overscroll-behavior: contain;
   padding: 18px 4px 6px;
   display: flex; flex-direction: column; gap: 18px;
 }
@@ -1943,6 +1971,71 @@ body {
    dark on a dark field, so the field asks for the dark scheme. */
 [data-theme="dark"] .input { color-scheme: dark; }
 
+/* Slice 5 Evidence: chain verification, field syntax, entries and sticky
+   record pane. Green appears only when the server evidence read reports a
+   verified chain; unknown keeps full weight. */
+.evidence-page { display: flex; flex-direction: column; gap: 16px; }
+.evidence-integrity {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+  padding: 12px; border: 1px solid var(--rule); border-radius: var(--rad-lg); background: var(--surface);
+}
+.evidence-integrity .ei-badge { flex: none; }
+.evidence-integrity .ei-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; min-width: 0; color: var(--ink-2); font-size: var(--text-sm); }
+.evidence-integrity .ei-facts strong { color: var(--ink); }
+.evidence-integrity .ei-facts > * { min-width: 0; overflow-wrap: anywhere; }
+.evidence-integrity .ei-note { margin-left: auto; color: var(--ink-3); font-size: var(--text-xs); }
+.evidence-query .filter-bar { grid-template-columns: minmax(260px, 2fr) repeat(auto-fill, minmax(126px, 1fr)); margin-bottom: 10px; }
+.evidence-query-field { min-width: 260px; }
+.evidence-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.evidence-chip {
+  display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px;
+  border: 1px solid var(--rule-2); border-radius: 7px; background: var(--surface-2);
+  color: var(--ink-2); font-size: var(--text-xs); font-family: var(--mono);
+}
+.evidence-layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; align-items: start; }
+.evidence-entries { min-width: 0; }
+.evidence-table { min-width: 760px; }
+/* A Result chip stays on one line: wrapped, its mark sat alone above the word. */
+.evidence-table .state-chip { flex-wrap: nowrap; white-space: nowrap; }
+.evidence-table .lay {
+  font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.evidence-table tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+/* Beside the 400px record pane the entries column is the viewport less about 696px (the 232px rail, the
+   page padding, the pane and its gap), and the table needs about 480px, so below 1200px the Result column
+   scrolled out of view (about 340px at 1024). There the pane moves under the table, as the Approvals
+   drawer does at 1100px. */
+@media (max-width: 1200px) {
+  .evidence-layout { grid-template-columns: minmax(0, 1fr); }
+  .evidence-detail { position: static; }
+}
+.evidence-detail { position: sticky; top: 12px; }
+.evidence-detail .hd { padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
+.evidence-detail .hd .t { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--ink); }
+.evidence-detail .hd .m { margin-top: 3px; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+.evidence-detail .sec { padding: 12px 0; border-bottom: 1px solid var(--rule); }
+.evidence-detail .sec:last-child { border-bottom: 0; padding-bottom: 0; }
+.evidence-detail .sec h3 { margin: 0 0 8px; font-size: var(--text-sm); }
+.evidence-detail .kv { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 6px 10px; margin: 0; }
+.evidence-detail .kv dt { color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); min-width: 0; overflow-wrap: anywhere; }
+.evidence-detail .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.evidence-detail .chain { display: flex; flex-direction: column; gap: 6px; }
+.evidence-detail .lnk { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px; font-size: var(--text-sm); }
+.evidence-detail .lnk .k { color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; }
+.evidence-detail .lnk .h { font-family: var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
+.evidence-detail .ok { color: var(--sage); }
+.evidence-detail .bad { color: var(--rust); }
+.evidence-detail .json {
+  margin: 0; max-height: 320px; overflow: auto; padding: 10px;
+  border: 1px solid var(--rule); border-radius: var(--rad); background: var(--paper);
+  color: var(--ink-2); font-family: var(--mono); font-size: var(--text-xs); white-space: pre-wrap;
+  /* A served value can be one unbroken token (a hash or a long URL); it wraps inside the pane instead of
+     hiding past its right edge behind a sideways scroll. */
+  overflow-wrap: anywhere;
+}
+.evidence-export .toolbar .btn:disabled { color: var(--ink-4); border-style: dashed; cursor: not-allowed; background: var(--surface-2); }
+
 /* Slice 2b: Machines. One row per saved machine: the probe state as a
    shaped chip with its word, the name over its address, and the console
    link. 132px fits the widest chip ("Not healthy" with its glyph). */
@@ -2040,6 +2133,7 @@ body {
  * 4 inventory tiles and 8px gaps (two design spacing units) are independent of Overview. */
 .agents-tiles { --agents-tile-count: 4; --agents-tile-gap: 8px; display: grid; grid-template-columns: repeat(var(--agents-tile-count), minmax(0, 1fr)); gap: var(--agents-tile-gap); }
 .agents-tiles .overview-tile { overflow-wrap: anywhere; }
+/* The shared agents table serves Overview and Agents, so its chip glyph and word stay together on both screens. */
 .overview-table-agents .state-chip { display: inline-flex; flex-wrap: nowrap; white-space: nowrap; }
 .agent-entity { display: grid; gap: 16px; min-width: 0; }
 .agent-entity-header h1 { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; overflow-wrap: anywhere; }
@@ -2063,6 +2157,55 @@ body {
 .agent-event small { display: block; margin-top: 4px; }
 .agent-event > .muted, .agent-event > .att { grid-column: 3; }
 @media (max-width: 1100px) { .agent-entity-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Slice 6b uses the same table, chip and entity vocabulary as the Overview.
+   1100px matches the design system breakpoint for stacking queue drawers. */
+.mfp-screen { display: grid; gap: 16px; min-width: 0; }
+.mfp-screen .page-head, .mfp-screen p { margin-top: 0; }
+.mfp-screen h1, .policy-center h1 { font-family: var(--serif); }
+.mfp-screen h2, .mfp-drawer h2, .policy-panel h2 { font-size: var(--text-lg); }
+.mfp-screen h3, .mfp-drawer h3, .mfp-policy-groups h3 { font-size: var(--text-md); }
+.mfp-table { font-size: var(--text-cell); }
+.mfp-table th, .mfp-table td { padding: 8px 12px; }
+.mfp-table td { overflow-wrap: anywhere; }
+.mfp-table tr:hover { background: var(--accent-tint-faint); }
+.mfp-table tr.selected { background: var(--indigo-bg); box-shadow: inset 2px 0 var(--accent); }
+.mfp-table .link-btn { text-align: left; overflow-wrap: anywhere; }
+/* A chip in a list cell keeps its mark beside its word: wrapped, the mark sat alone above the word in a narrow column. */
+.mfp-table .state-chip { flex-wrap: nowrap; white-space: nowrap; }
+.mfp-pager, .mfp-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.mfp-pager { margin: 12px 0; color: var(--ink-2); font-size: var(--text-xs); font-family: var(--mono); }
+.mfp-queue-grid, .mfp-policy-grid { display: grid; gap: 16px; min-width: 0; }
+/* 420px gives the evidence drawer the same reading width as the approval drawer. */
+.mfp-queue-grid.has-selection { grid-template-columns: minmax(0, 1fr) minmax(0, 420px); }
+.mfp-policy-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+.mfp-queue-grid > *, .mfp-policy-grid > * { min-width: 0; }
+.mfp-drawer { align-self: start; position: sticky; top: 12px; background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; overflow-wrap: anywhere; }
+.mfp-drawer pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--paper); padding: 12px; font-size: var(--text-xs); }
+.mfp-drawer dd { margin: 4px 0 12px; color: var(--ink-2); }
+.mfp-drawer dt { color: var(--ink-3); }
+.mfp-policy-groups section { padding: 12px 0; border-bottom: 1px solid var(--rule); }
+.mfp-policy-groups li { margin-bottom: 8px; overflow-wrap: anywhere; }
+.mfp-fold { margin: 16px 0; border: 1px solid var(--rule); border-radius: 10px; padding: 12px; min-width: 0; }
+.mfp-fold summary { cursor: pointer; font-weight: 600; }
+.mfp-severity { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: var(--text-xs); white-space: nowrap; }
+.mfp-severity b { display: inline-block; width: 4px; height: 16px; border-radius: 2px; }
+.mfp-severity.critical { color: var(--sev-critical-text); }
+.mfp-severity.critical b { background: var(--sev-critical); }
+.mfp-severity.high { color: var(--sev-high-text); }
+.mfp-severity.high b { background: var(--sev-high); }
+.mfp-severity.medium { color: var(--sev-medium-text); }
+.mfp-severity.medium b { background: var(--sev-medium); }
+.mfp-severity.low { color: var(--sev-low-text); }
+.mfp-severity.low b { background: var(--sev-low); }
+.mfp-severity.info { color: var(--sev-info-text); }
+.mfp-severity.info b { background: var(--sev-info); }
+@media (max-width: 1100px) {
+  .mfp-queue-grid.has-selection, .mfp-policy-grid { grid-template-columns: minmax(0, 1fr); }
+  .mfp-drawer { position: static; }
+}
+
+.browser-machines h1 { font-size: var(--text-lg); margin: 0; }
 
 `;
 
@@ -2332,6 +2475,10 @@ export function renderDashboardV11Html(
     <div class="talk-panel-body" id="talk-panel-body"></div>
   </aside>
   <div id="toast-host" aria-live="polite"></div>
+  <!-- Decision announcements: the one retained decision result (client.ts announceDecision) speaks through this
+       shell-level live region because #main is replaced wholesale on every repaint and a live region created inside
+       it would not be announced. Visually hidden; the visible result renders inside #main. -->
+  <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
   <script id="dashboard-config" type="application/json">${config}</script>
   ${clientBlock}
 </body>
