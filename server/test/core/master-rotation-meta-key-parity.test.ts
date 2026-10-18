@@ -133,10 +133,6 @@ const ROTATION_RECOGNIZED_META_KEYS: readonly MetaKeyWriteSite[] = [
     key: "audit-store-split-established-v1",
     writer: "operational/audit-log.ts (AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY)",
   },
-  {
-    key: "audit-checkpoint-owed-v1",
-    writer: "operational/audit-log.ts (AUDIT_CHECKPOINT_OWED_KEY)",
-  },
   // Primary identity pointer.
   {
     key: "primary_identity_id",

@@ -1,14 +1,14 @@
-// Two audit-log steps are sequences of several storage writes: a rotation's anchor and the deletes
-// below it, and the first signed checkpoint's arm records and its record. When a crash or a refused
-// write stops one of them part way, the next load must open the store as an interrupted step and
-// finish it, never flag it as tampered, and the retry must work from what is on disk, so a process
-// that reopens the store (not only the one that saw the refusal) completes the step. These tests
-// refuse named writes inside each sequence through a filesystem store, reopen with a plain
-// FilesystemStorage, and prove the store loads with no finding and that the step completes. The
-// rules that fail closed on deletion-shaped states are unchanged: a zero-sequence head anchor
-// replayed over an established store is still rejected, a stretch below a rotation anchor is
-// accepted only when every entry's recomputed hash chains to the anchor, and a signed checkpoint
-// is never written without its latch. Private defect id: audit-log-torn-multi-write-sequences-01.
+// The first signed audit checkpoint is a sequence of several storage writes: the signing head, the
+// signing latch, then the checkpoint record. When a refused write stops it part way, the store must
+// reload with no integrity finding and the same process must finish the checkpoint at its next
+// critical append or shutdown flush, from what is on disk rather than from memory. These tests refuse
+// named writes inside that sequence through a filesystem store, reopen with a plain
+// FilesystemStorage, and prove the store loads clean and the checkpoint completes, covering from the
+// lowest entry that survives rotation. The rules that fail closed on deletion-shaped states are
+// unchanged: a zero-sequence head anchor replayed over an established store is still rejected, and
+// a signed checkpoint is never written without its latch, so a store whose latch and head are gone
+// while a checkpoint survives gets no new control record and is refused on the next load.
+// Private defect id: audit-log-torn-multi-write-sequences-01.
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +22,6 @@ import {
 import {
   canonicalJson,
   checkpointSigningBytes,
-  computeAuditEntryHash,
   type AuditCheckpointRecord,
   type AuditCheckpointSigningPayload,
 } from "../../src/audit/chain.js";
@@ -41,6 +40,7 @@ const CONTROL = "_audit_checkpoints";
 const META = "_meta";
 const HEAD_ANCHOR = "__head_anchor";
 const SIGNING_LATCH = "__signing_latch_v2";
+const SIGNING_HEAD = "__signing_head";
 const CHECKPOINT_PREFIX = "audit-checkpoint-";
 // Must match AUDIT_HEAD_ANCHOR_MARKER / AUDIT_HEAD_ANCHOR_MAC_DOMAIN in audit-log.ts and the
 // `audit-head-anchor` purpose label, so the replayed anchor below is one the product itself
@@ -48,8 +48,6 @@ const CHECKPOINT_PREFIX = "audit-checkpoint-";
 const HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 const HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
 const HEAD_ANCHOR_MAC_PURPOSE = "audit-head-anchor";
-// Must match AUDIT_CHECKPOINT_OWED_KEY in audit-log.ts.
-const CHECKPOINT_OWED = "audit-checkpoint-owed-v1";
 
 type Mutation = { kind: "write" | "writeDurable" | "delete"; namespace: string; key: string };
 type Refusal = (mutation: Mutation, prior: readonly Mutation[]) => boolean;
@@ -193,89 +191,8 @@ function reader(state: string, masterKey: Uint8Array, publicKey?: string): Audit
 const isLatchWrite = (m: Mutation): boolean => m.namespace === CONTROL && m.key === SIGNING_LATCH;
 const isCheckpointRecordWrite = (m: Mutation): boolean =>
   m.namespace === CONTROL && m.kind !== "delete" && m.key.startsWith(CHECKPOINT_PREFIX);
-const isEntryDelete = (m: Mutation): boolean => m.kind === "delete" && m.namespace === ENTRIES;
 
 describe("audit log interrupted multi-write sequences load clean and complete", () => {
-  it("rotation anchor written, a later delete refused: the next load accepts the chained stretch and the next append finishes the prune", async () => {
-    const state = await tempState("audit-torn-rotation-");
-    const masterKey = generateRandomKey();
-    const seeded = new AuditLog(new FilesystemStorage(state), masterKey);
-    const seedCount = 10;
-    for (let i = 1; i <= seedCount; i++) await seeded.appendCritical(entry(`seed-${i}`));
-    await seeded.flush();
-
-    // A cap below the seeded count makes the next append's rotation cut several entries at once;
-    // the SECOND delete is refused, so one pruned entry is gone and the rest survive below the
-    // anchored base.
-    const maxEntries = 5;
-    const storage = new ProbeStorage(state);
-    storage.refuse(
-      (m, prior) => isEntryDelete(m) && prior.filter(isEntryDelete).length === 1,
-    );
-    const rotator = new AuditLog(storage, masterKey, { maxEntries });
-    await rotator.appendCritical(entry("over-cap"));
-    await rotator.flush();
-    expect(storage.refusals).toBe(1);
-    const afterCut = seedCount + 1;
-    // Entries 2..11 survive under an anchor whose base is above 2.
-    expect(await entrySequences(state)).toEqual(
-      Array.from({ length: afterCut - 1 }, (_, i) => i + 2),
-    );
-
-    const reopened = new AuditLog(new FilesystemStorage(state), masterKey, { maxEntries });
-    expect(await reopened.getIntegrityFindings()).toEqual([]);
-    await reopened.appendCritical(entry("after-reopen"));
-    await reopened.flush();
-    const survivors = await entrySequences(state);
-    expect(survivors).toHaveLength(maxEntries);
-    expect(survivors.at(-1)).toBe(afterCut + 1);
-    expect(await reader(state, masterKey).getIntegrityFindings()).toEqual([]);
-  });
-
-  it("a stretch below the rotation base is accepted only when each entry's recomputed hash chains to the anchor", async () => {
-    // Reached through a cast: the acceptance predicate is private, and a rename breaks this test
-    // loudly rather than letting it pass vacuously.
-    type Internals = {
-      stretchChainsToRotationBase: (
-        chainedEntries: ReadonlyArray<{ envelope: PersistedAuditEnvelopeV2 }>,
-        anchor: { base_sequence: number; base_prev_hash: string },
-      ) => boolean;
-    };
-    const log = new AuditLog(new FilesystemStorage(await tempState("audit-stretch-")), generateRandomKey());
-    const stretchChains = (log as unknown as Internals).stretchChainsToRotationBase.bind(log);
-
-    const payload = toBase64url(stringToBytes("opaque"));
-    const timestamp = "2026-10-17T00:00:00.000Z";
-    const chain = (first: number, count: number, prevHash: string): PersistedAuditEnvelopeV2[] => {
-      const out: PersistedAuditEnvelopeV2[] = [];
-      let prev = prevHash;
-      for (let sequence = first; sequence < first + count; sequence++) {
-        const base = { sequence, prev_hash: prev, timestamp, encrypted_payload_bytes: payload };
-        const entry_hash = computeAuditEntryHash({ ...base, schema_version: 2 });
-        out.push({ schema_version: 2, ...base, entry_hash });
-        prev = entry_hash;
-      }
-      return out;
-    };
-    // Entries 2..5 with a real chain; the anchor's base is 5 and its base hash is entry 4's.
-    const genuine = chain(2, 4, "f".repeat(64));
-    const anchor = { base_sequence: 5, base_prev_hash: genuine[2]!.entry_hash };
-    const wrap = (envelopes: PersistedAuditEnvelopeV2[]) => envelopes.map((envelope) => ({ envelope }));
-    expect(stretchChains(wrap(genuine), anchor)).toBe(true);
-
-    // A forged stretch: the link fields are edited so the strings chain and the last below-base
-    // `entry_hash` equals the anchor's base hash, but no entry's hash is the digest of its bytes.
-    const forged = genuine.map((envelope, index) => ({
-      ...envelope,
-      encrypted_payload_bytes: toBase64url(stringToBytes(`forged-${index}`)),
-    }));
-    expect(stretchChains(wrap(forged), anchor)).toBe(false);
-
-    // The base entry must itself point at the accepted stretch.
-    const detachedBase = [...genuine.slice(0, 3), { ...genuine[3]!, prev_hash: "0".repeat(64) }];
-    expect(stretchChains(wrap(detachedBase), anchor)).toBe(false);
-  });
-
   it("a zero-sequence head anchor replayed over an established store with its entries deleted is rejected", async () => {
     const state = await tempState("audit-genesis-replay-");
     const masterKey = generateRandomKey();
@@ -321,17 +238,15 @@ describe("audit log interrupted multi-write sequences load clean and complete", 
     expect(await entrySequences(state)).toEqual([1]);
     expect(await checkpointShape(state)).toEqual([]);
     expect(await controlKeys(state)).not.toContain(SIGNING_LATCH);
-    expect(await metaKeys(state)).toContain(CHECKPOINT_OWED);
     expect(await reader(state, masterKey, fixture.publicKey).getIntegrityFindings()).toEqual([]);
 
     await writer.appendCritical(entry("second"));
     expect(await controlKeys(state)).toContain(SIGNING_LATCH);
     expect(await checkpointShape(state)).toEqual([[1, 2, false]]);
-    expect(await metaKeys(state)).not.toContain(CHECKPOINT_OWED);
     expect(await reader(state, masterKey, fixture.publicKey).getIntegrityFindings()).toEqual([]);
   });
 
-  it("latch refused, then a different process reopens the store: its retry re-runs the arm from disk and never writes a signed record without the latch", async () => {
+  it("latch refused, then a different process reopens the store: its next interval re-runs the arm from disk and never writes a signed record without the latch", async () => {
     const state = await tempState("audit-torn-signing-reopen-");
     const masterKey = generateRandomKey();
     const fixture = checkpointSignerFixture(masterKey);
@@ -352,29 +267,6 @@ describe("audit log interrupted multi-write sequences load clean and complete", 
     expect(await reader(state, masterKey, fixture.publicKey).getIntegrityFindings()).toEqual([]);
   });
 
-  it("a process that dies after the aborted checkpoint's append was acknowledged leaves a durable owed marker, and the next process retries at its first critical append", async () => {
-    const state = await tempState("audit-torn-owed-");
-    const masterKey = generateRandomKey();
-    const fixture = checkpointSignerFixture(masterKey);
-    const interval = 3;
-    const storage = new ProbeStorage(state);
-    storage.refuse(isLatchWrite);
-    const crashed = signedLog(storage, masterKey, fixture, interval);
-    for (let i = 1; i <= interval; i++) await crashed.appendCritical(entry(`before-${i}`));
-    // The third append met the interval; its arm was refused and nothing more happens in this
-    // process (no flush: the process is gone).
-    expect(storage.refusals).toBe(1);
-    expect(await checkpointShape(state)).toEqual([]);
-    expect(await metaKeys(state)).toContain(CHECKPOINT_OWED);
-
-    const next = signedLog(new FilesystemStorage(state), masterKey, fixture, interval);
-    await next.appendCritical(entry("after-restart"));
-    // One critical append, not a whole interval: the owed marker primed the retry.
-    expect(await checkpointShape(state)).toEqual([[1, interval + 1, false]]);
-    expect(await metaKeys(state)).not.toContain(CHECKPOINT_OWED);
-    expect(await reader(state, masterKey, fixture.publicKey).getIntegrityFindings()).toEqual([]);
-  });
-
   it("rotation that pruned past an aborted checkpoint: the retry covers from the lowest surviving entry instead of skipping forever", async () => {
     const state = await tempState("audit-torn-rotation-checkpoint-");
     const masterKey = generateRandomKey();
@@ -387,12 +279,38 @@ describe("audit log interrupted multi-write sequences load clean and complete", 
     await writer.appendCritical(entry("third"));
     await writer.flush();
     expect(storage.refusals).toBe(2);
-    // The third append's interval ran before its own rotation pruned entry 2, so the lagging
-    // checkpoint starts at the lowest survivor of that moment (2, entry 1 already pruned) rather
-    // than at the never-coverable sequence 1; rotation then keeps only the newest entry.
+    // Rotation runs before the same append's interval checkpoint, so the lagging checkpoint
+    // covers exactly the end-of-append survivors (entry 3 alone) rather than the never-coverable
+    // sequence 1 or an entry the same append then pruned.
     expect(await entrySequences(state)).toEqual([3]);
-    expect(await checkpointShape(state)).toEqual([[2, 3, false]]);
+    expect(await checkpointShape(state)).toEqual([[3, 3, false]]);
     expect(await reader(state, masterKey, fixture.publicKey).getIntegrityFindings()).toEqual([]);
+  });
+
+  it("latch and head gone while a checkpoint survives: the next interval writes no control record and no checkpoint, and the next load is refused", async () => {
+    const state = await tempState("audit-latch-erased-");
+    const masterKey = generateRandomKey();
+    const fixture = checkpointSignerFixture(masterKey);
+    const writer = signedLog(new FilesystemStorage(state), masterKey, fixture, 1);
+    await writer.appendCritical(entry("first"));
+    expect(await checkpointShape(state)).toEqual([[1, 1, false]]);
+    expect(await controlKeys(state)).toEqual(
+      expect.arrayContaining([SIGNING_LATCH, SIGNING_HEAD]),
+    );
+
+    // Deletion-shaped: both signing control records removed out of band while the signed
+    // checkpoint stays. The same writer still holds the store (no reload, so no recovery pass
+    // runs first); its next interval must neither mint a fresh latch nor write a latch-less record.
+    const tamper = new FilesystemStorage(state);
+    await tamper.delete(CONTROL, SIGNING_LATCH);
+    await tamper.delete(CONTROL, SIGNING_HEAD);
+    await writer.appendCritical(entry("second"));
+    expect(await entrySequences(state)).toEqual([1, 2]);
+    expect(await controlKeys(state)).not.toContain(SIGNING_LATCH);
+    expect(await checkpointShape(state)).toEqual([[1, 1, false]]);
+
+    const findings = await reader(state, masterKey, fixture.publicKey).getIntegrityFindings();
+    expect(findings.map((finding) => finding.kind)).toContain("checkpoint_signing_floor_recovered");
   });
 
   it("latch armed, the checkpoint record itself refused: the store loads clean and the next checkpoint completes under the existing latch", async () => {
