@@ -1,0 +1,5 @@
+# witness: container_peer_is_opt_in
+--- a/castle-wall-daemon/src/smb/peer.rs
++++ b/castle-wall-daemon/src/smb/peer.rs
+@@ -51 +50,0 @@
+-    #[ignore = "requires explicit SMB_CONTAINER_PEER_IMAGE and --ignored"]

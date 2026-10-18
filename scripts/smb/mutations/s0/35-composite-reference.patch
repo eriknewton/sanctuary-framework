@@ -1,0 +1,6 @@
+# witness: constants_composites_derive_from_names
+--- a/server/src/smb/constants.json
++++ b/server/src/smb/constants.json
+@@ -481 +481 @@
+-      "template": "https://<private-name>:${P_WEB}"
++      "template": "https://<private-name>:3502"

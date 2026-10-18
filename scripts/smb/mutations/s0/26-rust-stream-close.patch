@@ -1,0 +1,6 @@
+# witness: frame_refusal_closes_without_reply
+--- a/castle-wall-daemon/src/smb/frame.rs
++++ b/castle-wall-daemon/src/smb/frame.rs
+@@ -58 +58 @@
+-        let _ = stream.shutdown(std::net::Shutdown::Both);
++        let _ = stream;

@@ -1,0 +1,6 @@
+# witness: strict_json_numeric_domain_agrees
+--- a/castle-wall-daemon/src/smb/jcs.rs
++++ b/castle-wall-daemon/src/smb/jcs.rs
+@@ -10 +10 @@
+-        return Ok("0".into());
++        return Ok(if value.is_sign_negative() { "-0" } else { "0" }.into());

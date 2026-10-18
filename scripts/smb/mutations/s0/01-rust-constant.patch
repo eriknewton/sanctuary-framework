@@ -1,0 +1,6 @@
+# witness: constants_parity
+--- a/castle-wall-daemon/src/smb/constants.rs
++++ b/castle-wall-daemon/src/smb/constants.rs
+@@ -16,1 +16,2 @@
+ fn resolve(name: &str, visiting: &mut BTreeSet<String>) -> Value {
++    if name == "FRAME_HEADER" { return Value::from(8); }

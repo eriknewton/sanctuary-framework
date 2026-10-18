@@ -1,0 +1,6 @@
+# witness: reply_matcher_fails_closed
+--- a/server/src/smb/wire.ts
++++ b/server/src/smb/wire.ts
+@@ -104 +104 @@
+-    const schema = this.pending.get(id);
++    const schema = this.pending.get(id) ?? this.pending.values().next().value;

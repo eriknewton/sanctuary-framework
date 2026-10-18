@@ -1,0 +1,6 @@
+# witness: codec_bounds_agree
+--- a/server/src/smb/parse-strict.ts
++++ b/server/src/smb/parse-strict.ts
+@@ -9 +9 @@
+-  return parseStrictJson(bytes, bound('JSON_MAX_DEPTH'));
++  return parseStrictJson(bytes, bound('JSON_MAX_DEPTH') + 1);

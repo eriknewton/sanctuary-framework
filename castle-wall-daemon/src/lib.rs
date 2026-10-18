@@ -58,6 +58,8 @@ pub mod runtime_providers;
 pub mod safety_net_uid;
 #[cfg(test)]
 pub(crate) mod source_scan;
+// One SMB contract surface keeps every later consumer on the same validators.
+pub mod smb;
 pub mod systemd_notify;
 pub mod thread_component;
 

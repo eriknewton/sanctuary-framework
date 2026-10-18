@@ -1,0 +1,6 @@
+# witness: mutation_runner_controls
+--- a/scripts/smb/mutation_runner.py
++++ b/scripts/smb/mutation_runner.py
+@@ -62 +62 @@
+-    if not build() or test() != 'passed':
++    if not build():

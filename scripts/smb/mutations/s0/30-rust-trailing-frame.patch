@@ -1,0 +1,6 @@
+# witness: frame_vectors_agree
+--- a/castle-wall-daemon/src/smb/frame.rs
++++ b/castle-wall-daemon/src/smb/frame.rs
+@@ -42 +42 @@
+-    if cursor.position() as usize != bytes.len() {
++    if cursor.position() as usize != bytes.len() && false {

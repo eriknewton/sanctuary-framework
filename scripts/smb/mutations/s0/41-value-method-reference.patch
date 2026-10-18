@@ -1,0 +1,5 @@
+# witness: structural_seams
+--- a/castle-wall-daemon/src/smb/mod.rs
++++ b/castle-wall-daemon/src/smb/mod.rs
+@@ -10,0 +11 @@
++pub fn alternate_wire(values: &[serde_json::Value]) -> Vec<String> { values.iter().map(serde_json::Value::to_string).collect() }

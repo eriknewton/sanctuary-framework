@@ -1,0 +1,6 @@
+# witness: fifo_result_encoded_bound
+--- a/castle-wall-daemon/src/smb/wire.rs
++++ b/castle-wall-daemon/src/smb/wire.rs
+@@ -120 +120 @@
+-                .is_some_and(|max| text.len() > bound(max))
++                .is_some_and(|max| text.len() > bound(max) && false)
