@@ -14,7 +14,8 @@
  * approval, and an activation answer that cannot be read is unconfirmed, never refused; a decision is sent only
  * against a loaded queue that still holds every admitted request, otherwise nothing is sent and the result says
  * so; the row the operator decided from echoes the outcome; a partly refused batch says so in its headline; an
- * unconfirmed result has no Clear control and stays until the next decision replaces it; a local non-admission
+ * unconfirmed result has no Clear control and stays until a sent decision replaces it, a later click that sends
+ * nothing being noted on it instead; a local non-admission
  * is its own "not sent" outcome, never a refusal; the row Snooze menu and the selection pause while a batch holds
  * the lock; a batch summary is confirmed only when every count and missing id is accounted for; the result block
  * heads the stopped-updates panel too. The decision-result witness for D5-approval; this header carries the bare
@@ -208,7 +209,7 @@ describe("one retained decision result", () => {
       expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
       expect(h.result()).not.toMatch(/refused|failed/);
       // Only the reads the refresh issued after the decision count, so boot traffic cannot satisfy this.
-      if (failing === "every read") expect(h.requests.slice(requestsBeforeDecision).filter((r) => r.init?.method !== "POST" && !r.url.startsWith("/api/hub/inbox")).length).toBeGreaterThan(1);
+      if (failing === "every read") expect(h.requests.slice(requestsBeforeDecision).filter((r) => r.init?.method !== "POST" && r.url.startsWith("/api/") && !r.url.startsWith("/api/hub/inbox")).length, "the refresh issued reads beyond the inbox, and every one failed").toBeGreaterThan(1);
       expect(h.el["decision-announcement"]!.textContent).toBe("Decision taken. Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
       expect(h.el["toast-host"]!.innerHTML).toBe("");
       expect(h.read("state.approvals.lock")).toBeNull();
@@ -273,6 +274,38 @@ describe("one retained decision result", () => {
       expect(h.main()).toContain("WAITING");
     });
   }
+
+  it("a later click that sends nothing is noted on an unconfirmed result and leaves it unclearable", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(++reads === 1 ? response({ data: { items: [held("wait-1")] } }) : response({ error: "read failed" }, 500)),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      "/api/inbox/unified/batch": () => Promise.resolve(response({ error: "storage unavailable" }, 500)),
+    });
+    await settle();
+    h.navigate("activity");
+    h.read('state.inboxOps.selected["wait-1"] = true; state.inboxOps.snoozeDialog = true; rerender();');
+    h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+    await settle();
+    expect(h.posts()).toEqual(["/api/inbox/unified/batch"]);
+    expect(h.result()).toContain('data-decision-status="uncertain"');
+    expect(h.read("state.approvals.result.refresh")).toBe("unavailable");
+    expect(h.read("state.approvals.lock")).toBeNull();
+    // The queue could not be re-read, so the retry is not admitted: it must not replace the unconfirmed result.
+    h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+    await settle();
+    expect(h.posts()).toEqual(["/api/inbox/unified/batch"]);
+    expect(h.result()).toContain('data-decision-status="uncertain"');
+    expect(h.result()).not.toContain("decision-result-clear");
+    expect(h.result()).toContain("did not confirm Snooze for 1 selected item (storage unavailable (HTTP 500)). " + UNCONFIRMED_ADVICE + " " + REREAD + " " + UNCONFIRMED_STAYS + " Your next Snooze was not sent for 1 selected item: " + NOT_SENT_UNREAD);
+    expect(h.el["decision-announcement"]!.textContent).toContain("Decision unconfirmed. ");
+    expect(h.el["decision-announcement"]!.textContent).toContain(" Your next Snooze was not sent for 1 selected item: " + NOT_SENT_UNREAD);
+    h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+    await settle();
+    expect(h.result().split("Your next Snooze was not sent").length - 1, "one note, however many clicks").toBe(1);
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="uncertain">Unconfirmed. See the decision result at the top of this screen.</p>');
+  });
 
   it("an unconfirmed result is replaced only by the next decision", async () => {
     vi.useFakeTimers();

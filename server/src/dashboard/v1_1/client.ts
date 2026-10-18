@@ -6507,9 +6507,17 @@ function decisionNotAdmissible(ids) {
 function state_NOTADMITTEDDecision(fields, reason) {
   // Nothing was sent, so no lock is taken; the retained result still tells the operator what did not happen.
   if (decisionInFlight()) return;
-  state.approvals.result = Object.assign({ status: "not_sent", rule: null, refresh: "loaded", records: [] }, fields, {
-    message: decisionVerb(fields.action) + " was not sent for " + fields.subject + ": " + reason,
-  });
+  const notSent = decisionVerb(fields.action) + " was not sent for " + fields.subject + ": " + reason;
+  const current = state.approvals.result;
+  if (current && current.status === "uncertain") {
+    // Invariant: an unconfirmed result is replaced only by a decision that was sent; a later click that sends
+    // nothing is noted on it (one slot, so repeated clicks cannot grow it) and the warning stays unclearable.
+    current.notSent = "Your next " + notSent;
+    announceDecision(current);
+    rerender();
+    return;
+  }
+  state.approvals.result = Object.assign({ status: "not_sent", rule: null, refresh: "loaded", records: [] }, fields, { message: notSent });
   announceDecision(state.approvals.result);
   rerender();
 }
@@ -6572,7 +6580,7 @@ function announceDecision(result) {
   // The shell live region outlives every #main repaint, so an announcement is never lost to innerHTML replacement.
   const region = document.getElementById("decision-announcement");
   // The re-read note is part of the announcement, so a screen reader hears that the list may be stale.
-  if (region) region.textContent = decisionHeadline(result) + ". " + result.message + (result.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : "");
+  if (region) region.textContent = decisionHeadline(result) + ". " + result.message + (result.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : "") + (result.notSent ? " " + result.notSent : "");
 }
 function state_ADMITTEDDecision(fields) {
   // Invariant: the lock and the retained result are set together, so the paused controls and the status text
@@ -6666,7 +6674,7 @@ function renderDecisionResult() {
   // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock. An
   // unconfirmed result has no Clear at all: the operator owes the queue a check, and only the next decision
   // replaces the warning, so it cannot be dismissed unread.
-  const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS : "";
+  const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS + (r.notSent ? " " + r.notSent : "") : "";
   const clear = r.status === "pending" || r.status === "uncertain" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
   return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + escHtml(r.message + note + stays) + '</p>' + records + '</div>' + clear + '</section>';
 }

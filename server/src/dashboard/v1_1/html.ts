@@ -708,7 +708,7 @@ body {
    controls. It sits in normal flow, so settling never covers a control or moves the page under the
    pointer; the border and fill follow the status word only (ochre while sending or unconfirmed, sage
    when the server acknowledged, rust when it refused), and the text stays ink so it reads in both
-   themes; not_sent (nothing reached the server) keeps the ochre default). Must match the data-decision-status
+   themes; not_sent (nothing reached the server) keeps the ochre default. Must match the data-decision-status
    values in client.ts, DECISION_HEADLINE. */
 .decision-result {
   display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3);
@@ -726,7 +726,8 @@ body {
 .decision-result[data-decision-status="refused"] { background: var(--rust-bg); border-color: var(--rust); }
 /* The drawer's one-line echo of the result for the selected request (client.ts renderDecisionInline). */
 .decision-inline { margin: 8px 0 0; /* 8 = the toolbar's own gap, so the echo sits as one more toolbar line */ font-size: var(--text-sm); color: var(--ink-2); }
-.decision-inline[data-decision-status="refused"], .decision-inline[data-decision-status="not_sent"] { color: var(--rust); }
+.decision-inline[data-decision-status="refused"] { color: var(--rust); }
+.decision-inline[data-decision-status="not_sent"] { color: var(--ochre); } /* ochre, as the block: nothing was refused */
 .btn.chip {
   border-radius: 999px; padding: 4px 12px; font-size: var(--text-sm);
   background: var(--surface-2); border-color: var(--ink-3);
