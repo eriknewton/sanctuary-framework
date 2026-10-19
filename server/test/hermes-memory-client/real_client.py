@@ -260,6 +260,28 @@ async def run(args, root):
                         if arm in ('oversize','depth','unavailable'):
                             await session.send_ping()
             if arm=='eof': assert len(capture)==before,'eofAndSignalProduceNoNewStdout'
+        if arm=='done':
+            # The SDK allocates integer IDs. A raw second stdio peer checks string IDs
+            # and proves that the first peer's shutdown left the relay available.
+            with open(root/'shim-stderr','a') as errlog:
+                async with stdio.stdio_client(params,errlog=errlog) as (read,write):
+                    async def raw_request(value):
+                        data=json.dumps(value).encode()+b'\n'
+                        sent.extend(data)
+                        await shim_process.stdin.send(data)
+                    await raw_request({'jsonrpc':'2.0','method':'initialize','params':{
+                        'protocolVersion':'2025-11-25','capabilities':{},'clientInfo':{'name':'raw-fixture','version':'1'}},'id':'raw-init'})
+                    initialized=await read.receive()
+                    assert initialized.message.root.id=='raw-init','rawTypedIdsInitialize'
+                    await raw_request({'jsonrpc':'2.0','method':'notifications/initialized'})
+                    for request_id in (10,'10'):
+                        await raw_request({'jsonrpc':'2.0','method':'tools/call','params':{
+                            'name':'memory_get','arguments':{'passage_id':'seed'}},'id':request_id})
+                    replies=[(await read.receive()).message.root for _ in range(2)]
+                    assert {(type(reply.id).__name__,str(reply.id)) for reply in replies}=={('int','10'),('str','10')},'rawTypedIdsStayDistinct'
+                    numeric=next(reply for reply in replies if isinstance(reply.id,int))
+                    assert 'Cedar lantern fixture text' in numeric.result['content'][0]['text'],'clientShutdownCancelsOnlyItsConnection'
+            observed['raw_stdio']='numeric 10 and string 10 remain distinct after prior peer shutdown'
         assert (root/'shim-stderr').stat().st_size==0,'contentFreeStderr'
         observed['responses']=[json.loads(line) for line in capture.splitlines()]
         observed['stdout_hex']=capture.hex()
