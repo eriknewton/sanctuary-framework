@@ -17,6 +17,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client import stdio
 from mcp.shared.exceptions import McpError
 
+# Must match SHIM_STDIN_EOF_EXIT_MS in protocol.ts: SDK grace minus exit reserve.
+EOF_GRACE_SECONDS = (2000 - 500) / 1000
+
 NODE_CHILD = r'''
 const fs = require('node:fs'), net = require('node:net');
 const {pathToFileURL} = require('node:url');
@@ -81,22 +84,52 @@ PRELOAD = r'''
 const fs=require('node:fs'),net=require('node:net'),{syncBuiltinESMExports}=require('node:module');
 const originalConnect=net.Socket.prototype.connect,originalWrite=fs.write;
 let outputLines=0,callWritten=false,extra=false;
+const root=__dirname;
+const log=x=>fs.appendFileSync(root+'/native-io.jsonl',JSON.stringify(x)+'\n');
+if(['stdout_eof','stdout_signal'].includes(SCENARIO)) {
+  process.stdin.on('end',()=>fs.writeFileSync(root+'/silent','eof'));
+  process.on('SIGTERM',()=>fs.writeFileSync(root+'/silent','signal'));
+}
 net.Socket.prototype.connect=function(...args){
   if(args[0]==='/Library/Application Support/Sanctuary/HermesMemoryBridge/sockets/memory.sock') args[0]=SOCKET;
   return originalConnect.apply(this,args);
 };
 fs.write=function(fd,buffer,...args){
   const callback=args.at(-1);
+  if(fd===1 && ['stdout_eof','stdout_signal'].includes(SCENARIO) && outputLines>=1 && !extra) {
+    extra=true;
+    // Fill the actual pipe until the kernel refuses bytes, before the selected reply write.
+    const fill=Buffer.alloc(1024,120);let count=0;
+    for(;;) {try {count+=fs.writeSync(fd,fill);}catch(error){if(error.code!=='EAGAIN')throw error;break;}}
+    fs.writeFileSync(root+'/filled',String(count));
+  }
+  if(fd===1 && ['stdout_eof','stdout_signal'].includes(SCENARIO)) {
+    outputLines++;
+    return originalWrite.call(this,fd,buffer,(error,written)=>{
+      log({stdout:true,error:error?.code,written,silent:fs.existsSync(root+'/silent')});
+      if(error?.code==='EAGAIN')fs.writeFileSync(root+'/eagain','yes');
+      callback(error,written,buffer);
+    });
+  }
   if(fd===1){
     if(SCENARIO==='stdout_stall' && outputLines>=1) {const e=Object.assign(Error('fixture pressure'),{code:'EAGAIN'});queueMicrotask(()=>callback(e,0,buffer));return;}
     outputLines++;
   }
   if(fd!==1 && buffer.length>4){
     let frame;try{frame=JSON.parse(buffer.subarray(4));}catch{}
+    if(frame?.type==='shutdown' && ['stdout_eof','stdout_signal'].includes(SCENARIO)) {
+      // 500 ms = SDK process grace (2000) minus shim EOF bound (1500).
+      setTimeout(()=>originalWrite.call(this,fd,buffer,...args),500);return;
+    }
     if(frame?.type==='tools_call'){
       callWritten=true;
+      if(SCENARIO==='relay_eagain' && !extra) {
+        extra=true;let count=0;const padding=Buffer.alloc(1024);
+        for(;;){try{count+=fs.writeSync(fd,padding);}catch(error){if(error.code!=='EAGAIN')throw error;break;}}
+        fs.writeFileSync(root+'/prefill',String(count));
+      }
       if(SCENARIO==='async_failure') queueMicrotask(()=>Promise.reject(Error('fixture rejection')));
-      if(SCENARIO==='short_write') return originalWrite.call(this,fd,buffer.subarray(0,buffer.length-1),...args);
+      if(SCENARIO==='short_write') return originalWrite.call(this,fd,buffer.subarray(0,buffer.length-1),(error,written)=>callback(error||Object.assign(Error('fixture transport'),{code:'EPIPE'}),written,buffer));
       if(SCENARIO==='pong' && !extra){
         extra=true;
         const body=Buffer.from('{"type":"ping"}'),prefix=Buffer.alloc(4);prefix.writeUInt32BE(body.length);
@@ -105,7 +138,10 @@ fs.write=function(fd,buffer,...args){
       }
     }
   }
-  return originalWrite.call(this,fd,buffer,...args);
+  return originalWrite.call(this,fd,buffer,(error,written)=>{
+    if(fd!==1)log({relay:true,length:buffer.length,error:error?.code,written});
+    callback(error,written,buffer);
+  });
 };
 syncBuiltinESMExports();
 '''
@@ -158,7 +194,7 @@ async def run(args, root):
     repo = Path(args.repo)
     arm = args.arm
     (root/'child.cjs').write_text(NODE_CHILD.replace('REPO', json.dumps(str(repo))).replace('SCENARIO', json.dumps(arm)))
-    (root/'preload.cjs').write_text(PRELOAD.replace('SOCKET', json.dumps(str(root/'memory.sock'))).replace('SCENARIO', json.dumps(arm)))
+    (root/'preload.cjs').write_text(PRELOAD.replace('SOCKET', json.dumps(str(root/('proxy.sock' if arm=='relay_eagain' else 'memory.sock')))).replace('SCENARIO', json.dumps(arm)))
     config = dict(schema_version=1,node_executable=args.node,node_entry=str(root/'child.cjs'),bridge_log=str(root/'bridge.log'),
                   relay_log=str(root/'relay.log'),public_socket=str(root/'memory.sock'),private_dir=str(root),owner_uid=501,
                   hermes_account='fixture',hermes_uid=502,group='fixture',fortress_id='hermes-memory',agent_id='hermes',identity_fingerprint='a'*64)
@@ -176,14 +212,43 @@ async def run(args, root):
         return CaptureProcess(proc,CaptureReceive(proc.stdout,capture),CaptureSend(proc.stdin,sent,arm))
     stdio._create_platform_compatible_process = create
     observed = {'arm':arm,'exceptions':[],'responses':[]}
+    proxy = None; proxy_tasks = set()
+    async def delayed_peer(reader, writer):
+        current=asyncio.current_task();proxy_tasks.add(current)
+        remote_writer=None
+        try:
+            remote_reader,remote_writer=await asyncio.open_unix_connection(str(root/'memory.sock'))
+            async def downstream():
+                while data:=await remote_reader.read(65540):
+                    writer.write(data);await writer.drain()
+            downstream_task=asyncio.create_task(downstream());proxy_tasks.add(downstream_task)
+            prefix=await reader.readexactly(4)
+            hello=await reader.readexactly(int.from_bytes(prefix,'big'))
+            reader._transport.pause_reading()
+            remote_writer.write(prefix+hello);await remote_writer.drain()
+            while not (root/'prefill').exists(): await asyncio.sleep(0.01)
+            # The fixture peer delays reading until the first native call write sees a full socket.
+            await asyncio.sleep(0.1)
+            reader._transport.resume_reading()
+            padding=await reader.readexactly(int((root/'prefill').read_text()))
+            assert not any(padding),'relayEagainFixturePadding'
+            while data:=await reader.read(65540):
+                remote_writer.write(data);await remote_writer.drain()
+        finally:
+            writer.close()
+            if remote_writer: remote_writer.close()
+            proxy_tasks.discard(current)
     try:
         deadline = time.monotonic()+10
         while not (root/'memory.sock').exists():
             if native.poll() is not None or time.monotonic()>deadline:
                 raise AssertionError('nativeRelayReady: '+(root/'native.log').read_text()+' '+(root/'bridge.log').read_text()+' '+(root/'relay.log').read_text())
             await anyio.sleep(0.02)
+        if arm=='relay_eagain': proxy=await asyncio.start_unix_server(delayed_peer,str(root/'proxy.sock'),limit=131080)
         params = StdioServerParameters(command=args.node,args=['--require',str(root/'preload.cjs'),str(repo/'server/dist/cli.js'),'hermes-memory-client'],
             env={'HOME':str(root),'SANCTUARY_NO_UPDATE_CHECK':'1'})
+        if arm in ('stdout_eof','stdout_signal'):
+            return await raw_silent_pipe(args,root,params)
         with open(root/'shim-stderr','w') as errlog:
             async with stdio.stdio_client(params,errlog=errlog) as (read,write):
                 async with ClientSession(read,write) as session:
@@ -202,6 +267,22 @@ async def run(args, root):
                             assert exc.error.code==-32002,'unknownArgumentsNeverReachAdapter'
                         events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
                         assert sum('get' in row for row in events)==1,'unknownArgumentsNeverReachAdapter'
+                    elif arm in ('large_frames','relay_eagain'):
+                        sizes = [9000, 65536 + 4] if arm=='large_frames' else [9000]
+                        for size in sizes:
+                            # 35 bytes = r + 32 hex + dot + one serial digit, for these first calls.
+                            envelope={'type':'tools_call','request_id':'r'+'a'*32+'.2','name':'memory_search','arguments':{'text':''}}
+                            length=size-4-len(json.dumps(envelope,separators=(',',':')).encode())
+                            try: result=await session.call_tool('memory_search',{'text':'x'*length})
+                            except McpError as exc: raise AssertionError('realRelayLargeFramesSettle: '+str(exc)) from exc
+                            assert 'seed' in result.content[0].text,'realRelayLargeFramesSettle'
+                        events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
+                        frames=[row['public'] for row in events if row.get('public',{}).get('type')=='tools_call']
+                        assert [4+len(json.dumps(frame,separators=(',',':')).encode()) for frame in frames]==sizes,'realRelayExactFrameSizes'
+                        io=[json.loads(line) for line in (root/'native-io.jsonl').read_text().splitlines()]
+                        observed['native_writes']=io
+                        if arm=='relay_eagain':
+                            assert next(row for row in io if row.get('length')==9000).get('error')=='EAGAIN','realRelayFirstWriteEagain'
                     elif arm=='cancel':
                         task=asyncio.create_task(session.call_tool('memory_insert',{'text':'pending fixture','taint':'user_content'}))
                         deadline=time.monotonic()+10
@@ -222,7 +303,21 @@ async def run(args, root):
                         cancels=[row['public'] for row in events if row.get('public',{}).get('type')=='cancel']
                         assert len(cancels)==1 and cancels[0]['mcp_request_id']==calls[0]['request_id'],'clientCancelTargetsOriginalCall exact wire'
                     elif arm=='eof':
-                        before=len(capture)
+                        task=asyncio.create_task(session.call_tool('memory_get',{'passage_id':'seed'}))
+                        deadline=time.monotonic()+10
+                        while '"get":"seed"' not in (root/'events.jsonl').read_text():
+                            assert time.monotonic()<deadline,'realEofAdmission'
+                            await anyio.sleep(0.01)
+                        before=len(capture); started=time.monotonic()
+                        await shim_process.stdin.aclose()
+                        with anyio.move_on_after(EOF_GRACE_SECONDS) as scope:
+                            await shim_process.wait()
+                        assert not scope.cancel_called,'realEofExitsWithinGrace'
+                        observed['eof_exit_ms']=(time.monotonic()-started)*1000
+                        assert len(capture)==before,'realEofNoStdout'
+                        try: await task
+                        except McpError as exc:
+                            observed['exceptions'].append({'code':exc.error.code,'message':exc.error.message})
                     else:
                         async def signal_after_admission():
                             deadline=time.monotonic()+10
@@ -253,8 +348,8 @@ async def run(args, root):
                             observed['exceptions'].append({'code':exc.error.code,'message':exc.error.message})
                         finally:
                             if task: await task
-                        expected={'oversize':-32602,'depth':-32602,'malformed':-32700,'buffered':-32700,
-                            'malformed_relay':-32603,'pong':-32603,'async_failure':-32603,'socket_loss':-32004,'short_write':-32004,
+                        expected={'oversize':-32602,'depth':-32602,'malformed':-32004,'buffered':-32004,
+                            'malformed_relay':-32004,'pong':-32004,'async_failure':-32004,'socket_loss':-32004,'short_write':-32004,
                             'deadline':-32005,'unavailable':-32004,'stdout_stall':-32000,'signal':-32000}[arm]
                         assert observed['exceptions'] and observed['exceptions'][0]['code']==expected, 'realClientArmOutcome: '+json.dumps(observed)
                         if arm in ('oversize','depth','unavailable'):
@@ -286,7 +381,7 @@ async def run(args, root):
         observed['responses']=[json.loads(line) for line in capture.splitlines()]
         observed['stdout_hex']=capture.hex()
         observed['stdin_ids']=[json.loads(line).get('id') for line in sent.splitlines() if 'id' in json.loads(line)]
-        ids=[row['id'] for row in observed['responses']]
+        ids=[row['id'] for row in observed['responses'] if row['id'] is not None]
         assert len(ids)==len(set(ids)),'exactlyOneResponsePerId'
         if arm=='buffered': assert 2 in ids,'bufferedUnreadIdsDrainBeforeClose'
         if arm not in ('eof','signal','stdout_stall','done','cancel'):
@@ -298,6 +393,10 @@ async def run(args, root):
         else: observed['acceptance']='PASS'
         return observed
     finally:
+        if proxy:
+            proxy.close();await proxy.wait_closed()
+        for task in proxy_tasks: task.cancel()
+        if proxy_tasks: await asyncio.gather(*list(proxy_tasks),return_exceptions=True)
         stdio._create_platform_compatible_process=original
         try:
             with anyio.CancelScope(shield=True):
@@ -315,6 +414,46 @@ async def run(args, root):
                 try: os.kill(child_pid,0)
                 except ProcessLookupError: pass
                 else: raise AssertionError('nativeRelayMustReapChild')
+
+async def raw_silent_pipe(args, root, params):
+    """Raw pipes are necessary because the SDK continuously drains its stdout reader."""
+    proc=await asyncio.create_subprocess_exec(args.node,*params.args,stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,env={**os.environ,'HOME':str(root)})
+    # Pause asyncio's reader too; it otherwise silently drains the kernel pipe into its own buffer.
+    transport=proc.stdout._transport
+    try:
+        initialize={'jsonrpc':'2.0','method':'initialize','params':{'protocolVersion':'2025-11-25',
+            'capabilities':{},'clientInfo':{'name':'raw','version':'1'}},'id':0}
+        proc.stdin.write(json.dumps(initialize).encode()+b'\n');await proc.stdin.drain()
+        response=await proc.stdout.readline();assert json.loads(response)['id']==0,'rawSilentInitialize'
+        transport.pause_reading()
+        proc.stdin.write(json.dumps({'jsonrpc':'2.0','method':'notifications/initialized'}).encode()+b'\n')
+        proc.stdin.write(json.dumps({'jsonrpc':'2.0','method':'tools/call','params':{'name':'memory_get',
+            'arguments':{'passage_id':'seed'}},'id':1}).encode()+b'\n');await proc.stdin.drain()
+        async def marker(name):
+            deadline=time.monotonic()+5
+            while not (root/name).exists():
+                assert time.monotonic()<deadline,'rawSilentMarker '+name
+                await asyncio.sleep(0.005)
+        await marker('eagain')
+        started=time.monotonic()
+        if args.arm=='stdout_eof': proc.stdin.close();await proc.stdin.wait_closed()
+        else: proc.send_signal(signal.SIGTERM)
+        await marker('silent')
+        # Bytes already accepted before the event are filler only; draining now makes stdout writable.
+        transport.resume_reading()
+        output=await proc.stdout.read()
+        await proc.wait()
+        assert time.monotonic()-started < EOF_GRACE_SECONDS,'silentPipeExitWithinGrace'
+        count=int((root/'filled').read_text())
+        assert output==b'x'*count,'silentPipeNoBytesAfterStop'
+        io=[json.loads(line) for line in (root/'native-io.jsonl').read_text().splitlines()]
+        assert not any(row.get('silent') and row.get('written',0)>0 for row in io),'silentPipeNoNativeWriteAfterStop'
+        assert await proc.stderr.read()==b'','rawSilentContentFreeStderr'
+        return {'arm':args.arm,'acceptance':'PASS','filler_bytes':count,'post_stop_bytes':len(output)-count,'native_writes':io}
+    finally:
+        transport.resume_reading()
+        if proc.returncode is None: proc.kill();await proc.wait()
 
 async def bounded_run(args, root):
     # A wrapper timeout cancels the task so both process cleanup paths still run.

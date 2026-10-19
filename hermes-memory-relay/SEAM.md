@@ -229,7 +229,7 @@ MCP call results must match `CallToolResultSchema` with an actual content array;
 | Result delivery | First settlement winner, wanted ID, validated schema and bounded immutable bytes |
 | Ping | Reserved typed FIFO entry; before hello it remains held |
 | Pong delivery | Oldest unexpired FIFO record; expired positions consume late pongs silently |
-| Cancel | Unsettled fully written wire record, once, with control credit |
+| Cancel | Intent selected before settlement; complete wire frame before sending, once, with control credit |
 | Shutdown | Only this public connection, after eligible cancel, once |
 | Output resume | Finish the existing line before any other line; timers and relay reads continue |
 | Non-EOF drain | Settle outstanding IDs and complete buffered request lines within the total bound |
