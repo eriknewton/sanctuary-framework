@@ -13,6 +13,7 @@ export const MAX_POLICY_BYTES = MAX_PUBLIC_FRAME_BYTES;
 const MILLISECONDS_PER_SECOND = 1_000;
 
 // Must match the complete profile fixture in test/principal-policy/authority-profile.test.ts.
+// AUTHORITY_DESIGN_r4.md, profile (lines 62-74), fixes the thresholds at 5, 10 and 20.
 const PROFILE: PrincipalPolicy = {
   version: AUTHORITY_PROFILE_VERSION,
   tier1_always_approve: ["memory_insert"],
@@ -24,18 +25,18 @@ const PROFILE: PrincipalPolicy = {
   tier2_anomaly: {
     new_namespace_access: "approve",
     new_counterparty: "approve",
-    frequency_spike_multiplier: 5, // Profile requires a fivefold frequency increase.
-    max_signs_per_minute: 10, // Profile signing ceiling per minute.
-    bulk_read_threshold: 20, // Profile bulk-read ceiling per minute.
+    frequency_spike_multiplier: 5,
+    max_signs_per_minute: 10,
+    bulk_read_threshold: 20,
     first_session_policy: "approve",
   },
 };
 
 function matchesProfile(value: unknown, expected: unknown): boolean {
   if (Array.isArray(expected)) {
-    // Tier lists are exact sets: duplicate entries cannot substitute for a missing operation.
+    // Equal length and full coverage of the duplicate-free profile exclude both duplicates and omissions.
     return Array.isArray(value) && value.length === expected.length &&
-      new Set(value).size === value.length && expected.every((item) => value.includes(item));
+      expected.every((item) => value.includes(item));
   }
   if (isRecord(expected)) {
     // Complete own-key equality rejects omissions and extensions before forced tiers can repair intent.
@@ -58,6 +59,9 @@ function freezeRecursively<T>(value: T): T {
  * sha256:<hex> digest and the complete authority profile, then freeze the
  * effective policy. This pure preparatory parser does no file I/O or activation;
  * its future caller must establish file custody and ongoing integrity separately.
+ * Nested policy objects retain the strict parser's null prototype.
+ * Refusals have one generic message; parser causes are internal diagnostics only
+ * and must not be printed by callers.
  */
 export function parseStrictAuthorityPolicy(bytes: Uint8Array, expectedDigest: string): PrincipalPolicy {
   // Bound work before hashing or parsing; an oversized policy is never truncated into acceptable input.
@@ -65,8 +69,14 @@ export function parseStrictAuthorityPolicy(bytes: Uint8Array, expectedDigest: st
   // The protected digest binds exact source bytes, not a reserialized or default-merged interpretation.
   const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
   if (digest !== expectedDigest) throw new Error("Invalid authority policy");
-  // AB4: decoded duplicate keys must be rejected before any schema or forced-tier normalization.
-  const parsed = parseStrictJsonObject(bytes);
+  let parsed: Record<string, unknown>;
+  try {
+    // AB4: decoded duplicate keys must be rejected before any schema or forced-tier normalization.
+    parsed = parseStrictJsonObject(bytes);
+  } catch (cause) {
+    // Parser diagnostics must not become policy refusal text; Error.cause is non-enumerable.
+    throw new Error("Invalid authority policy", { cause });
+  }
   if (!matchesProfile(parsed, PROFILE)) throw new Error("Invalid authority policy");
   // Validation above established the complete shape; only the shared forced-tier function may add operations.
   const policy = enforceForcedTiers(parsed as unknown as PrincipalPolicy);

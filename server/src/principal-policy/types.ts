@@ -116,10 +116,11 @@ export interface ApprovalRequest {
   /**
    * Gate-minted decision identity, available before the channel callback.
    * Must match requestApproval in gate.ts: non-enumerable and immutable, and
-   * equal to the settled GateResult and critical decision audit identifier.
+   * equal to the GateResult and critical decision audit identifier when settlement succeeds.
    * It is correlation only, never proof that approval or durability occurred.
-   * Optional for legacy requests constructed outside ApprovalGate; every gate
-   * callback receives it. Consumers requiring correlation must reject absence.
+   * Optional for legacy requests constructed outside ApprovalGate. Channels that
+   * forward the same request object retain it; spreading, cloning or serializing
+   * the request drops it. Consumers requiring correlation must reject absence.
    */
   readonly approval_audit_id?: string;
   operation: string;

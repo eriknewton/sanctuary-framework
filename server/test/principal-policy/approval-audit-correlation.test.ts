@@ -72,15 +72,16 @@ describe("approval audit correlation", () => {
     let settled = false;
     const resultPromise = gate.evaluate("state_export", {}).then((result) => { settled = true; return result; });
     const request = await entered.promise;
+    const idAtEntry = request.approval_audit_id;
     // Always settle parked work, including when a pre-change assertion would fail.
     decision.resolve(response("approve", "human"));
     await auditEntered.promise;
     const wasSettled = settled;
     auditRelease.resolve();
     const result = await resultPromise;
-    expect(request.approval_audit_id).toBeTypeOf("string");
+    expect(idAtEntry).toMatch(/^gate-approval-[0-9a-f]{32}$/u); // 16 random bytes encoded as hex.
     expect(wasSettled).toBe(false);
-    expect(result.approval_audit_id).toBe(request.approval_audit_id);
+    expect(result.approval_audit_id).toBe(idAtEntry);
   });
 
   it("fails closed on audit failure even after exposing a callback identifier", async () => {
@@ -89,9 +90,11 @@ describe("approval audit correlation", () => {
       callbackId = request.approval_audit_id;
       return response("approve", "human");
     });
-    vi.spyOn(audit, "appendCritical").mockRejectedValue(new Error("fixture audit failure"));
+    const appendCritical = vi.spyOn(audit, "appendCritical").mockRejectedValue(new Error("fixture audit failure"));
     await expect(gate.evaluate("state_export", {})).rejects.toThrow("fixture audit failure");
     expect(callbackId).toBeTypeOf("string");
+    expect(appendCritical).toHaveBeenCalledTimes(1);
+    expect(appendCritical.mock.calls[0]![0].details?.approval_audit_id).toBe(callbackId);
   });
 
   it("uses distinct request-local identifiers for concurrent identical arguments", async () => {
