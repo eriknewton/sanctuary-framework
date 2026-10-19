@@ -1,4 +1,4 @@
-// fail-before-exempt: this branch only allowlists local-model-gateway; the guard inspects tracked root entries, so reversing server/src cannot make it fail.
+// fail-before-exempt: This change allowlists the hermes-memory-relay and local-model-gateway root packages; this guard inspects tracked root entries, not server/src behavior, so reversing server/src must not make it fail.
 /**
  * ROOT-ALLOWLIST guard (DoE review L-3).
  *
@@ -82,6 +82,8 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "castle-wall-vmm",
   "docs",
   "examples",
+  // Swift relay that admits only the confined Hermes agent; a root-level SwiftPM package like castle-wall-macos.
+  "hermes-memory-relay",
   "integrations",
   // Swift local model gateway between the confined agent and Ollama; a root-level SwiftPM package like castle-wall-macos.
   "local-model-gateway",

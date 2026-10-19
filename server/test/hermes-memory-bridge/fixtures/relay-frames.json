@@ -2,6 +2,7 @@
   "valid": [
     {
       "name": "public hello",
+      "probe_drain_repeat": 1,
       "direction": "publicInbound",
       "frame": {
         "type": "hello",
@@ -22,6 +23,7 @@
     },
     {
       "name": "public tool call",
+      "probe_drain_repeat": 1,
       "direction": "publicInbound",
       "frame": {
         "type": "tools_call",
@@ -35,6 +37,7 @@
     },
     {
       "name": "public cancel",
+      "probe_drain_repeat": 8,
       "direction": "publicInbound",
       "frame": {
         "type": "cancel",
@@ -44,6 +47,7 @@
     },
     {
       "name": "public ping",
+      "probe_drain_repeat": 2,
       "direction": "publicInbound",
       "frame": {
         "type": "ping"
