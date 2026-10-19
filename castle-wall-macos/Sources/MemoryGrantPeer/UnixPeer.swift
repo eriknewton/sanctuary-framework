@@ -31,6 +31,7 @@ public enum UnixPeerVerifier {
 
         var type: Int32 = 0
         var typeLength = socklen_t(MemoryLayout.size(ofValue: type))
+        // Consumed by DarwinPeerCredentialProvider.peerUid in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift; kernel admission has one implementation.
         guard getsockopt(socket, SOL_SOCKET, SO_TYPE, &type, &typeLength) == 0,
               typeLength == MemoryLayout.size(ofValue: type) else {
             throw UnixPeerError.inspectionFailed

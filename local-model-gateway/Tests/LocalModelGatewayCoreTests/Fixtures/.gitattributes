@@ -1,0 +1,2 @@
+# Preserve the exact CRLF HTTP fixtures consumed by WireTests.testFixedWireBytes.
+*.http binary

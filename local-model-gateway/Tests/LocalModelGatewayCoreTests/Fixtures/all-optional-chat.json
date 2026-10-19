@@ -1,0 +1,15 @@
+{
+  "model": "qwen3.5:9b",
+  "messages": [
+    {"role":"user","content":[{"type":"text","text":"question"}],"name":"principal"},
+    {"role":"assistant","content":null,"name":"responder","reasoning":"considered","tool_calls":[{"id":"call_optional","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+    {"role":"tool","content":"result","name":"lookup","tool_call_id":"call_optional"}
+  ],
+  "max_tokens": 1,
+  "temperature": 2e0,
+  "stream": true,
+  "stream_options": {"include_usage":false},
+  "options": {"num_ctx":131072},
+  "think": false,
+  "tools": [{"type":"function","function":{"name":"lookup","description":"optional fixture","parameters":{},"strict":false}}]
+}
