@@ -1,3 +1,4 @@
+// fail-before-exempt: this branch only allowlists local-model-gateway; the guard inspects tracked root entries, so reversing server/src cannot make it fail.
 /**
  * ROOT-ALLOWLIST guard (DoE review L-3).
  *

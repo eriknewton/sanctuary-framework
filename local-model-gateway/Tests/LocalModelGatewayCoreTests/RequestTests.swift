@@ -92,6 +92,11 @@ final class RequestTests: XCTestCase {
             refused("{\"name\":\"\(model)\"}", .modelMismatch, route: .show)
         }
     }
+    func testModelRefusalPrecedesSchemaRefusal() {
+        // Both bodies also fail the messages schema; the model reason must remain observable first.
+        refused(#"{"model":"qwen3.5:cloud","messages":"bad"}"#, .modelLocalitySuffix)
+        refused(#"{"model":"other","messages":"bad"}"#, .modelMismatch)
+    }
     func testShowVariants() throws {
         XCTAssertEqual(RequestSerializer.body(try parse(" \n{\"na\\u006de\" : \"qwen3.5:9b\"}\t", route: .show)), GatewayProtocol.showBody)
         for body in [#"{"model":"qwen3.5:9b"}"#, #"{"name":"qwen3.5:9b","model":"qwen3.5:cloud"}"#,
@@ -105,6 +110,10 @@ final class RequestTests: XCTestCase {
     }
     func testAllowedShapesAndRoundTrip() throws {
         let fixture = try String(contentsOf: Bundle.module.url(forResource: "allowed-chat", withExtension: "json", subdirectory: "Fixtures")!, encoding: .utf8)
+        // Compare bytes directly: round trips alone cannot detect a field dropped on both parses.
+        // Preserve the decomposed e + U+0301 key separately from precomposed U+00E9.
+        let expected = #"{"max_tokens":65536,"messages":[{"content":"system","role":"system"},{"content":[{"text":"developer","type":"text"}],"role":"developer"},{"content":"question","name":"principal","role":"user"},{"content":null,"reasoning":"reasoning","role":"assistant","tool_calls":[{"function":{"arguments":"{\"key\":1}","name":"lookup"},"id":"call1","type":"function"}]},{"content":"result","role":"tool","tool_call_id":"call1"},{"content":"answer","role":"assistant"}],"model":"qwen3.5:9b","options":{"num_ctx":131072},"stream":true,"stream_options":{"include_usage":true},"temperature":1.00,"think":false,"tools":[{"function":{"description":"fixture","name":"lookup","parameters":{"properties":{"Model":{"enum":[1.00,1e+2,null,false]},"e\#u{0301}":{"type":"number"},"é":{"type":"string"}},"type":"object"},"strict":true},"type":"function"}]}"#
+        XCTAssertEqual(RequestSerializer.body(try parse(fixture)), bytes(expected))
         for body in [basic, chatField(#""stream":true,"stream_options":{"include_usage":true}"#), fixture,
                      chatField(#""temperature":2e0,"max_tokens":1,"tools":[],"think":false,"options":{"num_ctx":131072}"#)] {
             let first = try parse(body)
@@ -115,11 +124,21 @@ final class RequestTests: XCTestCase {
         let canonical = RequestSerializer.body(try parse())
         XCTAssertEqual(canonical, bytes(#"{"max_tokens":65536,"messages":[{"content":"hello","role":"user"}],"model":"qwen3.5:9b","stream":false}"#))
     }
+    func testEveryOptionalFieldCanonicalBytes() throws {
+        // Explicit max_tokens uses its lower bound, temperature its upper bound, and num_ctx the
+        // pinned context size. Distinct values also exercise false strict/include_usage retention.
+        let fixture = try String(contentsOf: Bundle.module.url(forResource: "all-optional-chat", withExtension: "json", subdirectory: "Fixtures")!, encoding: .utf8)
+        let expected = #"{"max_tokens":1,"messages":[{"content":[{"text":"question","type":"text"}],"name":"principal","role":"user"},{"content":null,"name":"responder","reasoning":"considered","role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"lookup"},"id":"call_optional","type":"function"}]},{"content":"result","name":"lookup","role":"tool","tool_call_id":"call_optional"}],"model":"qwen3.5:9b","options":{"num_ctx":131072},"stream":true,"stream_options":{"include_usage":false},"temperature":2e0,"think":false,"tools":[{"function":{"description":"optional fixture","name":"lookup","parameters":{},"strict":false},"type":"function"}]}"#
+        let canonical = RequestSerializer.body(try parse(fixture))
+        XCTAssertEqual(canonical, bytes(expected))
+        XCTAssertEqual(RequestSerializer.body(try parse(String(decoding: canonical, as: UTF8.self))), bytes(expected))
+    }
     func testSchemaTypesAndRoles() throws {
         for field in [#""stream":1"#, #""stream_options":{"include_usage":true}"#, #""stream":false,"stream_options":{}"#,
                       #""stream":true,"stream_options":{"include_usage":1}"#, #""options":{}"#, #""options":{"num_ctx":1}"#,
                       #""options":{"num_ctx":131072.0}"#, #""think":true"#, #""tools":null"#, #""tools":[null]"#,
                       #""tools":[{"type":"function","function":{"name":"f","parameters":[]}}]"#,
+                      #""tools":[{"type":"x","function":{"name":"f","parameters":{}}}]"#,
                       #""tools":[{"type":"function","function":{"name":"f","parameters":{},"strict":1}}]"#] {
             refused(chatField(field), .schema)
         }
@@ -131,6 +150,7 @@ final class RequestTests: XCTestCase {
                          #"[{"role":"user","content":"x","tool_calls":[]}]"#,
                          #"[{"role":"tool","content":"x"}]"#,
                          #"[{"role":"assistant","content":"x","tool_calls":[null]}]"#,
+                         #"[{"role":"assistant","content":null,"tool_calls":[{"id":"i","type":"x","function":{"name":"f","arguments":"{}"}}]}]"#,
                          #"[{"role":"assistant","content":"x","tool_calls":[{"id":"i","type":"function","function":{"name":"f","arguments":{}}}]}]"#] {
             refused(#"{"model":"qwen3.5:9b","messages":\#(messages)}"#, .schema)
         }

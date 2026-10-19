@@ -62,7 +62,8 @@ final class WalkerTests: XCTestCase {
         // Doubling linear work costs 2; allow another 50% for sorting and debug scheduling.
         let doublingFactor = 2.0 * 1.5
         let repetitions = 3 // Median of three excludes a single scheduler interruption.
-        let probeMembers = 2_000 // Small early probe keeps a quadratic mutation bounded before max-B.
+        // Ten thousand members amortize scheduler noise while bounding the early quadratic probe.
+        let probeMembers = 10_000
         let budget = GatewayLimits.fixture.body
         for fixture in fixtures where [.part, .message, .tool, .call].contains(fixture.kind) {
             // Base-36 keys are a fixed dense vocabulary; no key matches this object's protocol fields.

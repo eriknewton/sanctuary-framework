@@ -169,7 +169,7 @@ private struct RequestSchema {
     mutating func id(_ value: JSON?) -> [UInt8] { text(value, min: 1, max: GatewayProtocol.identifierBytes) }
     mutating func integer(_ value: JSON?, min: Int, max: Int) -> [UInt8] {
         guard case .number(let n) = value,
-              !n.contains(46), !n.contains(101), !n.contains(69),
+              !n.contains(46), !n.contains(101), !n.contains(69), // ASCII '.', 'e', 'E': integer fields exclude fractions and exponents.
               let i = Int(String(decoding: n, as: UTF8.self)), i >= min, i <= max else { record(.schema); return [] }
         return n
     }
