@@ -51,11 +51,11 @@ export const EXIT_CLEAN = 0;
 export const EXIT_FATAL_BRIDGE = 70;
 export const EXIT_STARTUP_REFUSED = 78;
 
-// Must match `childReadyTimeoutMilliseconds` in the relay package Constants.swift.
+// Must match `childReadyTimeoutMilliseconds` in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift.
 export const CHILD_READY_TIMEOUT_MS = 5_000;
-// Must match `childSigtermGraceMilliseconds` in the relay package Constants.swift.
+// Must match `childSigtermGraceMilliseconds` in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift.
 export const RELAY_CHILD_SIGTERM_GRACE_MS = 3_000;
-// Must match `relayChildExitBoundMilliseconds` in the relay package Constants.swift.
+// Must match `relayChildExitBoundMilliseconds` in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift.
 export const RELAY_CHILD_EXIT_BOUND_MS = PROBE_REPLY_BOUND_MS + RELAY_CHILD_SIGTERM_GRACE_MS;
 
 export const DRAIN_TAIL_MS = 400;
@@ -770,7 +770,7 @@ function state_FD_CHECKED(argv: readonly string[]): number {
 }
 
 function state_ENV_REPLACED(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  // Must match ChildSupervisor.configuredEnvironment in the relay package: the relay passes exactly these keys.
+  // Must match ChildSupervisor.configuredEnvironment in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift: the relay passes exactly these keys.
   const allowed = new Set<string>(HERMES_BRIDGE_ENV_ALLOWLIST);
   const offenders = Object.keys(env).filter((key) => !allowed.has(key)).sort();
   if (offenders.length > 0) {

@@ -284,6 +284,8 @@ describe("Hermes memory process shell", () => {
     expect(source).toMatch(/stream\.on\("data", \(chunk: Buffer\) => \{\n    if \(stopped\) return;\n    decoder\.push\(chunk\);/);
     expect(source).toContain('if (resolved.kind === "keychain-key") resolved.key.fill(0);');
     expect(source).toContain('this.failAndThrow("encode_failed", error);');
+    expect(source).toContain("in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift.");
+    expect(source).not.toContain("Constants.swift");
   });
 
   it("keeps startup subtractions out of the process shell surface", async () => {
@@ -559,11 +561,15 @@ describe("Hermes memory process shell", () => {
         close: () => closeSync(fd),
         observeBytes: async () => {
           const buffer = Buffer.alloc(64);
+          // An independent open description keeps child stdio flags from changing observation semantics.
+          const observer = openSync(fifoPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
           try {
-            return readSync(fd, buffer, 0, buffer.byteLength, null);
+            return readSync(observer, buffer, 0, buffer.byteLength, null);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "EAGAIN") return 0;
             throw error;
+          } finally {
+            closeSync(observer);
           }
         },
       };
