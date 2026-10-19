@@ -63,14 +63,16 @@ html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 :root {
   /* F reserves six body lines, two space-2 padding edges and two 1px borders.
      Talk uses the same height so its panel ends above the feedback row. */
-  --feedback-height: calc(6 * 1.45 * 14px + 2 * var(--space-2) + 2px);
+  --body-line-height: 1.45;
+  --feedback-line: calc(var(--body-line-height) * var(--text-md));
+  --feedback-height: calc(6 * var(--feedback-line) + 2 * var(--space-2) + 2px);
 }
 body {
   font-family: var(--sans);
   font-size: var(--text-md);
   background: var(--paper);
   color: var(--ink);
-  line-height: 1.45;
+  line-height: var(--body-line-height);
 }
 /* Slice 2 shell (2026-10-13): a full-width top bar over a left rail and the
    main column, as on the ratified Overview canvas. 232px is the canvas rail
@@ -433,11 +435,11 @@ body {
    when a retained result is cleared or an ordinary toast expires. */
 .feedback {
   grid-area: feedback; position: relative; min-width: 0; min-height: 0;
-  /* Contain the absolutely positioned announcement inside this scrollport. */
   overflow-y: scroll; overflow-x: hidden; overflow-anchor: none;
   padding: var(--space-2); border: 1px solid var(--rule);
   background: var(--paper); overflow-wrap: anywhere;
 }
+.feedback:focus-visible { outline: 2px solid var(--indigo); outline-offset: -2px; }
 .toast {
   background: var(--ink); color: var(--paper); padding: var(--space-2);
   border-radius: var(--rad); font-size: var(--text-sm);
@@ -721,7 +723,7 @@ body {
 /* Retained outcomes render inside F; its reserved shell track does not depend on
    their text. Status colors must match DECISION_HEADLINE in client.ts. */
 .decision-result {
-  display: grid; grid-template-columns: minmax(0, 1fr) 88px; /* Clear: two 44px touch targets. */
+  display: grid; grid-template-columns: minmax(0, 1fr) 88px; /* Design 2B: one 44px-minimum Clear button plus label room. */
   align-items: start; gap: var(--space-2);
   background: var(--ochre-bg); color: var(--ink); border: 1px solid var(--ochre);
   border-left-width: 3px; /* 3 = the 1px card border plus 2px, the same accent width the banners use */
@@ -1585,12 +1587,6 @@ body {
   .sidebar nav a .rail-label, .sidebar nav a .count, .nav-footer, .nav-group-label { display: none; }
   .sidebar nav a { justify-content: center; padding: 0 6px; }
   .scope .id, .scope .scope-sep { display: none; }
-}
-
-/* Below the existing 760px content breakpoint the workspace uses the full width. */
-@media (max-width: 760px) {
-  .app, .app.route-full { grid-template-columns: minmax(0, 1fr); grid-template-areas: "topbar" "main" "feedback"; }
-  .sidebar { display: none; }
 }
 
 /* ===================================================================
@@ -2464,18 +2460,16 @@ export function renderDashboardV11Html(
         </div>
       </div>
     </aside>
-    <main class="main" id="main"><div class="boot-placeholder"><h2>Checking how safe you are.</h2><p>Reading this machine's posture from your local Sanctuary. The posture routes stay behind your operator token, so nothing renders until that check completes.</p></div></main>
+    <main class="main" id="main" tabindex="-1"><div class="boot-placeholder"><h2>Checking how safe you are.</h2><p>Reading this machine's posture from your local Sanctuary. The posture routes stay behind your operator token, so nothing renders until that check completes.</p></div></main>
     <aside class="fortress" id="fortress"><p class="muted">Loading fortress column.</p></aside>
     <section class="feedback" id="feedback" aria-label="Feedback" tabindex="0">
-      <!-- Must match renderFeedback in client.ts; this host alone is replaced. -->
-      <div id="decision-feedback-result"></div>
       <div id="toast-host" aria-live="polite"></div>
-      <!-- Decision announcements: the one retained decision result (client.ts announceDecision) speaks through this
-       shell-level live region because #main is replaced wholesale on every repaint and a live region created inside
-       it would not be announced. Visually hidden; the visible result renders inside #feedback. -->
-      <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+      <!-- Must match renderFeedback in client.ts; it replaces only this host's children. -->
+      <div id="decision-feedback-result"></div>
     </section>
   </div>
+  <!-- announceDecision in client.ts uses this permanent body-level live region across route redraws. -->
+  <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
   <aside class="talk-panel" id="talk-panel" aria-label="Talk to your fortress" hidden>
     <div class="talk-panel-head"><strong>Talk</strong><a href="#dashboard" data-action="talk-open-full">Open as a full page</a><button type="button" class="iconbtn" data-action="talk-close" aria-label="Close the Talk panel" title="Close">${ICON_CLOSE}</button></div>
     <div class="talk-panel-body" id="talk-panel-body"></div>

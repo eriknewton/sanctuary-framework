@@ -736,6 +736,9 @@ function toast(message, kind) {
   el.className = "toast" + (kind === "error" ? " error" : "");
   el.textContent = message;
   host.appendChild(el);
+  // A new toast is exposed inside F without scrolling the workspace or page.
+  const feedback = document.getElementById("feedback");
+  if (feedback) feedback.scrollTop = el.offsetTop;
   const toastLifetimeMs = 4 * 1000; // Four seconds, preserving the existing toast lifetime.
   setTimeout(function () { el.remove(); }, toastLifetimeMs);
 }
@@ -6683,15 +6686,17 @@ function decisionRecordLine(item, action) {
 }
 // The host id must match decision-feedback-result in html.ts. Clear uses this
 // patch directly so it does not replace route nodes or restore input focus.
+let lastFeedbackHtml = null;
 function renderFeedback() {
   const host = document.getElementById("decision-feedback-result");
   if (!host) return;
   const html = renderDecisionResult();
-  if (host.innerHTML !== html) host.innerHTML = html;
+  // Compare emitted strings: DOM serialization changes quote entities and would replace focused Clear.
+  if (lastFeedbackHtml !== html) { host.innerHTML = html; lastFeedbackHtml = html; }
 }
 function renderDecisionResult() {
   const r = state.approvals.result;
-  if (!r) return "";
+  if (!r || r.cleared) return "";
   const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
   const records = r.records.length
     ? '<ul>' + r.records.map(function (rec) { return '<li>' + escHtml(rec.message) + '</li>'; }).join("") + '</ul>' : "";
@@ -6713,9 +6718,9 @@ function renderDecisionBatchInline() {
   // A partly taken batch keeps its whole short message here, so the refusal is not dropped with the second sentence.
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
     : r.status === "acknowledged" ? (decisionHeadline(r) === DECISION_HEADLINE.acknowledged ? decisionFirstSentence(r.message) : r.message)
-    : r.status === "refused" ? "Refused. See the decision result in Feedback below."
-    : r.status === "not_sent" ? "Not sent. See the decision result in Feedback below."
-    : "Unconfirmed. See the decision result in Feedback below.";
+    : r.status === "refused" ? "Refused."
+    : r.status === "not_sent" ? "Not sent."
+    : "Unconfirmed.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 function renderDecisionInline(item) {
@@ -6724,9 +6729,9 @@ function renderDecisionInline(item) {
   if (!r || r.kind !== "item" || r.itemId !== item.item_id || item.resolved) return "";
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
     : r.status === "acknowledged" ? decisionDone(r.action) + "."
-    : r.status === "refused" ? "Refused. See the decision result in Feedback below."
-    : r.status === "not_sent" ? "Not sent. See the decision result in Feedback below."
-    : "Unconfirmed. See the decision result in Feedback below.";
+    : r.status === "refused" ? "Refused."
+    : r.status === "not_sent" ? "Not sent."
+    : "Unconfirmed.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 
@@ -7255,6 +7260,12 @@ function bindHashRoute() {
 // Escape closes, in order, the search results, an open top-bar popover, and
 // the Talk panel.
 document.addEventListener("keydown", function (ev) {
+  // With no focused control, native page keys must target the workspace scroller.
+  if (document.activeElement === document.body && !ev.ctrlKey && !ev.metaKey && !ev.altKey &&
+      ["PageDown", "PageUp", "Home", "End", "ArrowDown", "ArrowUp", " "].includes(ev.key)) {
+    const main = document.getElementById("main");
+    if (main && typeof main.focus === "function") main.focus({ preventScroll: true });
+  }
   if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && String(ev.key || "").toLowerCase() === "k") {
     const input = document.getElementById("global-search");
     if (input && typeof input.focus === "function") {
@@ -7598,10 +7609,11 @@ document.addEventListener("click", function (ev) {
     return focusApprovalDrawer();
   }
   if (action === "decision-result-clear") {
-    // A result leaves the screen only through its own control, never while its decision holds the lock, and an
+    // F hides a result only through its own control, never while its decision holds the lock, and an
     // unconfirmed result has no such control: a stray click on a stale button must not clear it either.
     if (decisionInFlight() || (state.approvals.result && state.approvals.result.status === "uncertain")) return;
-    state.approvals.result = null;
+    // Clear hides only F; keep status echoes stable on background redraws until the next decision.
+    if (state.approvals.result) state.approvals.result.cleared = true;
     return renderFeedback();
   }
   if (action === "approval-always-allow") {

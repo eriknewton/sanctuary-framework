@@ -304,7 +304,7 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
     await settle();
     expect(h.result().split("Your next Snooze was not sent").length - 1, "one note, however many clicks").toBe(1);
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="uncertain">Unconfirmed. See the decision result in Feedback below.</p>');
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="uncertain">Unconfirmed.</p>');
   });
 
   it("an unconfirmed result is replaced only by the next decision", async () => {
@@ -399,7 +399,7 @@ describe("one retained decision result", () => {
     expect(h.result()).toContain('data-decision-status="refused"');
     expect(h.result()).toContain("Delete was refused for 2 selected items: delete_confirmation_required (HTTP 400).");
     expect(h.result()).not.toContain("Deleted");
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="refused">Refused. See the decision result in Feedback below.</p>');
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="refused">Refused.</p>');
     expect(h.main()).toContain("2 selected");
     expect(h.read('state.inboxOps.selected["wait-1"] === true && state.inboxOps.selected["wait-2"] === true')).toBe(true);
   });
@@ -646,7 +646,7 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.posts()).toEqual([]);
     expect(h.result()).toContain("Snooze was not sent for 2 selected items: 1 of the 2 selected items is no longer waiting in the loaded queue, so nothing was sent.");
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="not_sent">Not sent. See the decision result in Feedback below.</p>');
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="not_sent">Not sent.</p>');
     expect(h.read('state.inboxOps.selected["wait-1"] === true && state.inboxOps.selected["done-1"] === true')).toBe(true);
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
@@ -727,7 +727,10 @@ describe("one retained decision result", () => {
     expect(h.result()).toBe("");
     expect(h.main()).toBe(mainBeforeClear);
     expect(h.requests).toHaveLength(requestsBeforeClear);
-    expect(h.read("state.approvals.result")).toBeNull();
+    expect(h.read("state.approvals.result.cleared")).toBe(true);
+    h.read("rerender()");
+    expect(h.result()).toBe("");
+    expect(h.main()).toBe(mainBeforeClear);
   });
 
   for (const [label, activate, rule, text] of [

@@ -19,7 +19,7 @@ const held = (id: string, tier = "tier2") => ({
 });
 
 /** Boot the shipping shell with local reads and a refused decision to retain in F. */
-export async function prepareFeedback(page: Page, url: string, routeName: string) {
+export async function prepareFeedback(page: Page, url: string, routeName: string, retainDecision = true) {
   const requests: string[] = [];
   await page.clock.install({ time: new Date(FIXTURE_TIME) });
   await page.clock.pauseAt(new Date(FIXTURE_TIME));
@@ -31,6 +31,15 @@ export async function prepareFeedback(page: Page, url: string, routeName: string
     const html = (await response.text()).replace('void loadPanel(panelJobs[0]);', `
       window.feedbackDriver = {
         toast,
+        redraws: 0,
+        backgroundRedraw() {
+          // Timer stand-in for the shipping redraw called by poll and reconnect completion.
+          setTimeout(() => { rerender(); window.feedbackDriver.redraws++; }, 0);
+        },
+        quoteResult() {
+          state.approvals.result.message = 'The operator said "no" and it is retained.';
+          renderFeedback();
+        },
         locked: () => decisionInFlight(),
         // One hundred sentences overflow the six-line F even at desktop width.
         varyResult() {
@@ -62,18 +71,20 @@ export async function prepareFeedback(page: Page, url: string, routeName: string
     await route.fulfill({ json: data });
   });
   await page.goto(url + "/#" + routeName);
-  const seed = page.locator('[data-action="inbox-approve"][data-item-id="seed"]').first();
-  await expect(seed).toBeEnabled();
-  await seed.click();
-  await expect(page.locator('#feedback [data-decision-status="refused"]')).toContainText("Fixture refusal");
-  await expect(page.locator('[data-action="decision-result-clear"]')).toBeEnabled();
+  if (retainDecision) {
+    const seed = page.locator('[data-action="inbox-approve"][data-item-id="seed"]').first();
+    await expect(seed).toBeEnabled();
+    await seed.click();
+    await expect(page.locator('#feedback [data-decision-status="refused"]')).toContainText("Fixture refusal");
+    await expect(page.locator('[data-action="decision-result-clear"]')).toBeEnabled();
+  }
   await page.evaluate("document.fonts.ready");
   await page.clock.runFor(SETTLE_FRAMES_MS);
   return requests;
 }
 
 /** Record every existing main element, its ancestors and predecessors, not just a hand-picked control. */
-export async function recordFeedbackBaseline(page: Page, controlSelector: string, bottom: boolean) {
+export async function recordFeedbackBaseline(page: Page, controlSelector: string, bottom: boolean, background = false) {
   expect(await page.evaluate("['static', 'relative'].includes(getComputedStyle(document.getElementById('feedback')).position)"), "F stays in flow").toBe(true);
   expect(await page.locator('#main #feedback').count(), "F is outside the route body").toBe(0);
   await page.locator(controlSelector).scrollIntoViewIfNeeded();
@@ -84,8 +95,12 @@ export async function recordFeedbackBaseline(page: Page, controlSelector: string
     const feedback = document.getElementById('feedback');
     const control = document.querySelector(${JSON.stringify(controlSelector)});
     const app = document.getElementById('app');
+    if (window.feedbackRecord) feedbackRecord.disconnect();
+    // Background redraws may repaint unrelated chrome; retain all main predecessors
+    // and shell boxes without claiming persistent rail/fortress descendants.
+    const candidates = ${background} ? [main, ...main.querySelectorAll('*'), ...app.children] : [...app.querySelectorAll('*')];
     const nodes = [...new Set([document.documentElement, document.body, app,
-      ...app.querySelectorAll('*')])].filter(n => n === feedback || !feedback.contains(n));
+      ...candidates])].filter(n => n === feedback || !feedback.contains(n));
     const rect = n => {
       const r = n.getBoundingClientRect();
       let sx = 0, sy = 0;
@@ -96,7 +111,7 @@ export async function recordFeedbackBaseline(page: Page, controlSelector: string
     const baseline = nodes.map(n => ({ n, rect: rect(n), scroll: scroll(n),
       action: n.getAttribute('data-action'), subject: n.getAttribute('data-item-id'), disabled: n.disabled }));
     const failures = [];
-    let samples = 0, mutations = 0;
+    let samples = 0, observerCallbacks = 0, mutations = 0;
     function sample() {
       samples++;
       if (feedbackDriver.locked()) failures.push('decision lock changed');
@@ -118,13 +133,15 @@ export async function recordFeedbackBaseline(page: Page, controlSelector: string
         failures.push('target hit test changed');
     }
     const mo = new MutationObserver(records => {
+      observerCallbacks++;
       mutations += records.filter(r => !feedback.contains(r.target) || (r.target === feedback && r.type === 'attributes')).length;
       sample();
     });
-    mo.observe(app, { subtree: true, childList: true, attributes: true, characterData: true });
-    const fm = new MutationObserver(sample);
+    mo.observe(${background} ? main : app, { subtree: true, childList: true, attributes: true, characterData: true });
+    const observedSample = () => { observerCallbacks++; sample(); };
+    const fm = new MutationObserver(observedSample);
     fm.observe(feedback, { subtree: true, childList: true, attributes: true, characterData: true });
-    const ro = new ResizeObserver(sample);
+    const ro = new ResizeObserver(observedSample);
     nodes.forEach(n => ro.observe(n));
     // Freeze user scroll input without changing CSS overflow or content geometry.
     main.addEventListener('wheel', e => e.preventDefault(), { passive: false });
@@ -132,19 +149,23 @@ export async function recordFeedbackBaseline(page: Page, controlSelector: string
     main.addEventListener('keydown', e => {
       if (['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
     });
-    window.feedbackRecord = { sample, failures, stats: () => ({ samples, mutations }) };
+    window.feedbackRecord = { sample, failures, disconnect: () => { mo.disconnect(); fm.disconnect(); ro.disconnect(); }, resetObservers: () => { observerCallbacks = 0; },
+      stats: () => ({ samples, observerCallbacks, mutations }) };
     sample();
   })()`);
+  // Drain the mandatory initial ResizeObserver delivery before counting the transition.
+  await page.clock.runFor(SETTLE_FRAMES_MS);
+  await page.evaluate("feedbackRecord.resetObservers()");
 }
 
 /** One baseline, one CSS pixel tolerance; every observer sample must agree. */
-export async function assertFeedbackIsolation(page: Page, witness: string) {
+export async function assertFeedbackIsolation(page: Page, witness: string, requireObserver = true) {
   await page.clock.runFor(SETTLE_FRAMES_MS);
-  const result = await page.evaluate<{ failures: string[]; stats: { samples: number; mutations: number } }>(`(() => {
+  const result = await page.evaluate<{ failures: string[]; stats: { samples: number; observerCallbacks: number; mutations: number } }>(`(() => {
     feedbackRecord.sample();
     return { failures: [...new Set(feedbackRecord.failures)], stats: feedbackRecord.stats() };
   })()`);
   expect(result.failures, witness + ': feedback preserves main geometry, offsets, identity, eligibility and hit target').toEqual([]);
   expect(result.stats.mutations, witness + ': changes only F interior').toBe(0);
-  expect(result.stats.samples, witness + ': observers sampled the transition').toBeGreaterThan(1);
+  if (requireObserver) expect(result.stats.observerCallbacks, witness + ': observers sampled the transition after setup').toBeGreaterThan(0);
 }
