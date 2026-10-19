@@ -81,6 +81,8 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "castle-wall-vmm",
   "docs",
   "examples",
+  // Swift relay that admits only the confined Hermes agent; a root-level SwiftPM package like castle-wall-macos.
+  "hermes-memory-relay",
   "integrations",
   "menubar",
   "package.json",
