@@ -1,0 +1,3 @@
+import HermesMemoryRelayCore
+
+HermesMemoryRelayEntrypoint.run(CommandLine.arguments)
