@@ -815,6 +815,10 @@ export class ApprovalGate {
     // load-bearing; aggregator is additive observation).
     const correlationId = `${requestTimestamp}:${operation}:${Math.random().toString(16).slice(2, 6)}`;
     const approvalAuditId = `gate-approval-${randomBytes(16).toString("hex")}`;
+    // Must match ApprovalRequest.approval_audit_id in types.ts: this is the gate's
+    // decision identity, not caller evidence of approval; consumers still verify the settled result/audit.
+    // Non-enumerability preserves existing serialized requests; immutability prevents callback substitution.
+    Object.defineProperty(request, "approval_audit_id", { value: approvalAuditId });
     if (this.onApprovalEvent) {
       try {
         this.onApprovalEvent({

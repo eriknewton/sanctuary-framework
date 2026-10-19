@@ -113,6 +113,15 @@ export interface PrincipalPolicy {
 
 /** Approval request sent to the human */
 export interface ApprovalRequest {
+  /**
+   * Gate-minted decision identity, available before the channel callback.
+   * Must match requestApproval in gate.ts: non-enumerable and immutable, and
+   * equal to the settled GateResult and critical decision audit identifier.
+   * It is correlation only, never proof that approval or durability occurred.
+   * Optional for legacy requests constructed outside ApprovalGate; every gate
+   * callback receives it. Consumers requiring correlation must reject absence.
+   */
+  readonly approval_audit_id?: string;
   operation: string;
   tier: 1 | 2;
   reason: string;
