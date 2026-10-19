@@ -312,7 +312,14 @@ async def run(args, root):
                         await shim_process.stdin.aclose()
                         with anyio.move_on_after(EOF_GRACE_SECONDS) as scope:
                             await shim_process.wait()
-                        assert not scope.cancel_called,'realEofExitsWithinGrace'
+                        exited_in_grace = not scope.cancel_called
+                        if not exited_in_grace:
+                            # Reap a failed fixture before SDK context teardown can mask the timed assertion.
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, McpError): await task
+                            shim_process.kill()
+                            with anyio.fail_after(5): await shim_process.wait()
+                        assert exited_in_grace,'realEofExitsWithinGrace'
                         observed['eof_exit_ms']=(time.monotonic()-started)*1000
                         assert len(capture)==before,'realEofNoStdout'
                         try: await task
