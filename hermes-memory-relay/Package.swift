@@ -10,8 +10,11 @@ let package = Package(
         .library(name: "HermesMemoryRelayCore", targets: ["HermesMemoryRelayCore"]),
         .executable(name: "HermesMemoryRelay", targets: ["HermesMemoryRelay"])
     ],
+    dependencies: [.package(path: "../castle-wall-macos")],
     targets: [
-        .target(name: "HermesMemoryRelayCore"),
+        .target(name: "HermesMemoryRelayCore", dependencies: [
+            .product(name: "MemoryGrantPeer", package: "castle-wall-macos")
+        ]),
         .executableTarget(
             name: "HermesMemoryRelay",
             dependencies: ["HermesMemoryRelayCore"]

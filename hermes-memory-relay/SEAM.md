@@ -2,7 +2,7 @@
 
 This file is the relay-to-Node contract for the Hermes memory bridge. The Node bridge must consume `Tests/HermesMemoryRelayCoreTests/Fixtures/relay-frames.json`; the Swift tests consume that same file now. Any change to this contract updates both this document and the fixture in the same change. Stream vectors carry literal `bytes_hex`; recipe names are not part of the slice-2 contract.
 
-Slice status: this package implements the relay core and modeled seams. The accept loop and real `posix_spawn` wiring arrive in slice 3b.
+Slice status: this package implements the relay core and modeled seams. Runtime integration is incomplete and native acceptance is not established. The Node capability is scoped memory search and get; writes not yet available. `ready` does not establish policy pinning; `state_POLICY_PINNED` is `not_provided`.
 
 ## Transport
 
@@ -54,6 +54,9 @@ PROBE_REPLY_BOUND_MS = 2000
 CHILD_READY_TIMEOUT_MS = 5000
 RELAY_CHILD_EXIT_BOUND_MS = 2000 probe bound + 3000 SIGTERM grace = 5000
 MAX_PUBLIC_CONNECTIONS = 4
+PROBE_DRAIN_MAX_BYTES = 65540 retained partial + 65536 read chunk = 131076
+PROBE_DRAIN_MAX_FRAMES = 8 controls + 1 call = 9
+RELAY_CHILD_REAP_BOUND_MS = 1000
 ```
 
 `relay-frames.json` uses this `expected_action` vocabulary:
@@ -74,10 +77,9 @@ discard_late_probe_reply: Node consumes and discards a relay `probe_reply` for a
 fatal_bridge: Node treats the relay-to-Node private channel as broken, refuses every waiting entry, and exits nonzero within RELAY_CHILD_EXIT_BOUND_MS.
 ```
 
-`node_to_relay` fixture vectors are byte-exact targets for Node's encoder when valid and frames Node must never emit when invalid. For `node_to_relay`, valid means `expected_action` is `accept` or `decode_response_and_forward`; every other vector is invalid encoder output except that the first `close` in `close_then_late_response_discarded` is a valid close and the later response is invalid. Node's encoder closes the connection instead of emitting an over-cap private response, emits standard base64 with required padding, keeps inner and outer ids identical, refuses lone surrogates and payloads deeper than `MAX_JSON_NESTING_DEPTH`, never emits a private frame over `MAX_PRIVATE_FRAME_BYTES`, never emits a `response` after its own `close`, and only emits ids it received from the relay. `relay_to_node` fixture vectors are examples of relay-built bytes, not byte-exact targets, because JSON key order is not fixed; Node parses each example and asserts `expected_action`. Both sides enforce `MAX_PRIVATE_FRAME_BYTES` on inherited-fd JSON payload bytes. The relay measures the encoded private JSON payload before writing. An over-cap Node-to-relay private frame is a fatal relay error.
+`node_to_relay` and `relay_to_node` fixture envelopes are compared by parse equality, not encoder byte order. State-dependent vectors require the matching accepted connection, in-flight request, or issued probe pair. Forwarded public payload bytes remain exact. Both sides enforce `MAX_PRIVATE_FRAME_BYTES`. Node emits padded standard base64 and matching inner and outer request IDs. An oversized public result becomes a fixed denial response and leaves the connection usable; an unparseable request or oversized private frame follows its channel's close or fatal path.
 
-The relay sends `relay_shutdown {}` before a graceful close. EOF on the inherited fd without that frame means the relay died. After `relay_shutdown` or EOF, Node refuses every waiting entry and exits within `RELAY_CHILD_EXIT_BOUND_MS = 5000`.
-Node's shutdown work, including the probe bound, lock poll, post-guard write, rollback, and margin, must sum to at most `RELAY_CHILD_EXIT_BOUND_MS`, and Node asserts that sum at startup.
+The relay sends `relay_shutdown {}` after closing admission, allows `PROBE_REPLY_BOUND_MS = 2000` for child exit, then sends SIGTERM to the exact spawned child and allows 3000 ms of grace. `RELAY_CHILD_EXIT_BOUND_MS = 5000` is this outer stop window, not a durable-write guarantee. After SIGKILL, `RELAY_CHILD_REAP_BOUND_MS = 1000` covers scheduler latency while the child leaves the kernel. The total outer bound is 6000 ms. A reap timeout reports `reap_timeout` and exits `EX_SOFTWARE`; cleanup never unlinks an object whose ownership is unproven. The public socket is removed only after reaping, and the instance flock is released last without unlinking its file. Forced death may leave a corpus lock; the next startup refuses pending exact operator recovery.
 
 ## Public Frames
 
@@ -144,7 +146,7 @@ forwarded public hello, tools_list, tools_call -> markNodeFrameWritten(nil)
 accepted, closed, probe_reply, relay_shutdown -> markNodeFrameWritten(nil)
 ```
 
-The relay enforces `MAX_PUBLIC_CONNECTIONS = 4`; the fifth public connection is closed before `accepted` and never reaches Node. A terminal connection path frees the public slot immediately.
+The relay enforces `MAX_PUBLIC_CONNECTIONS = 4`; the fifth public connection is closed before `accepted` and never reaches Node. A terminal connection path frees the public slot immediately. The runtime retains at most four live records and a monotonic UInt64 issued counter. An ID at or below that counter and absent from the live map is closed; a larger ID is never-issued. No historical connection objects or finished approval entries are retained.
 
 ## Relay To Client
 
@@ -175,7 +177,7 @@ When the relay receives `probe { connection_id, nonce }`, it routes to and drain
 
 1. Parse any complete frames already retained by the `BoundedFrameStream`.
 2. Poll the public fd with zero timeout.
-3. If readable, read until `EAGAIN` and parse every complete frame.
+3. If readable, read incrementally toward `EAGAIN`, bounded by `PROBE_DRAIN_MAX_BYTES = 131076` and `PROBE_DRAIN_MAX_FRAMES = 9`. Readable data left at either bound closes the connection before reply.
 4. Forward every resulting `cancel`, `shutdown`, and synthesized `closed` to Node.
 5. Convert `POLLHUP`, EOF, partial frame, over-cap length, malformed frame, or poison to terminal `closed { connection_id }`.
 6. Deliver any client-bound output produced by the drain.
@@ -183,7 +185,7 @@ When the relay receives `probe { connection_id, nonce }`, it routes to and drain
 
 Socketpair FIFO ordering is the barrier: Node observes forwarded control events before the matching `probe_reply`. Node, not the relay, compares the echoed probe nonce and refuses the waiting check on mismatch or on `PROBE_REPLY_BOUND_MS = 2000` timeout. A probe for a connection already in `state_CLOSED` gets `probe_reply` immediately. A probe naming an unknown or mismatched live connection id is a fatal relay error.
 
-Late `probe_reply` is normal on the Node side. The relay can send `closed` and then `probe_reply` for the same connection when a client hangs up during a probe, answer a probe for a closed connection, or answer after Node's `PROBE_REPLY_BOUND_MS` timeout. Node keeps every nonce it issued until its reply arrives: the outstanding nonce per connection, plus an abandoned-nonce set for probes given up on by timeout, `closed`, EOF, or shutdown. `ABANDONED_PROBE_NONCE_CAP = 16` is global with oldest-first eviction; the cap is safe because Node's approval queue permits one pending approval globally, so at most one probe is outstanding at a time. A `probe_reply` whose nonce is outstanding resolves the waiter. A `probe_reply` whose nonce is abandoned is consumed and discarded, even if the connection is already closed. A closed connection id remains known, tombstoned only for this nonce check. `fatal_bridge` applies only to a `probe_reply` for a connection id Node never saw in `accepted`, or for a nonce Node never issued.
+Late `probe_reply` is normal on the Node side only for an issued `(connection_id, nonce)` pair. Must match `ABANDONED_PROBE_NONCE_CAP` in `server/src/hermes-memory-bridge/constants.ts`: the cap is 16, with no eviction. Live and abandoned pairs consume capacity; new probes refuse when capacity is exhausted. A matching live pair resolves its waiter; a matching abandoned pair is consumed silently. Unmatched and already-consumed replies are immediately fatal. Closed connection objects and separate tombstone sets are not retained for this check.
 
 ## Connection State
 

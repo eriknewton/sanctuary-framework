@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MemoryGrantPeer
 
 public enum RelayProtocolConstants {
     // These values must match the Values block in hermes-memory-relay/SEAM.md.
@@ -65,17 +66,29 @@ public enum RelayProtocolConstants {
     public static let maxClientOutboundFramesPerConnection = 1 + 1 + controlResponseAllowancePerConnection
     // 64 KiB per read caps scanner work to one public frame's byte budget per socket read.
     public static let maxPublicReadChunkBytes = maxPublicFrameBytes
+    // 131076 = one retained partial frame plus one public read chunk.
+    public static let probeDrainMaxBytes = maxPartialFrameBytes + maxPublicReadChunkBytes
+    // 9 = one call plus eight queued controls from a conforming client.
+    public static let probeDrainMaxFrames = controlQueueDepthPerConnection + 1
+    // 1000 ms covers scheduler latency after uncatchable SIGKILL; this is not a durable-write bound.
+    public static let relayChildReapBoundMilliseconds = 1_000
     // 64 levels is deeper than any allowlisted public frame needs; the fixed bound keeps scanning iterative and stack-bounded.
     public static let maxJSONNestingDepth = 64
     // 2000 ms is the r6 probe bound that keeps commit checks below the tool deadline.
     public static let probeReplyBoundMilliseconds = 2_000
-    // 5000 ms is the child composition readiness budget inherited from brief C3.
+    // Must match CHILD_READY_TIMEOUT_MS in server/src/hermes-memory-bridge/process-shell.ts.
+    // 5000 ms is the child composition readiness budget.
     public static let childReadyTimeoutMilliseconds = 5_000
+    // Must match RELAY_CHILD_SIGTERM_GRACE_MS in server/src/hermes-memory-bridge/process-shell.ts.
     // 3000 ms is the SIGTERM grace after the bounded probe drain.
     public static let childSigtermGraceMilliseconds = 3_000
+    // Must match RELAY_CHILD_EXIT_BOUND_MS in server/src/hermes-memory-bridge/process-shell.ts.
     public static let relayChildExitBoundMilliseconds = probeReplyBoundMilliseconds + childSigtermGraceMilliseconds
     // 3 is the fixed inherited fd named by S9 and passed through --relay-fd.
     public static let childInheritedRelayFD = Int32(3)
+    // Installation v1 fixes the owner and Hermes account UIDs; neither comes from public bytes.
+    public static let ownerUID = uid_t(501)
+    public static let hermesUID = uid_t(502)
     public static let rootUid = uid_t(0)
     // 80 is the standard macOS admin group id returned by Directory Services.
     public static let macOSAdminGroupID = gid_t(80)
@@ -519,7 +532,7 @@ public struct BoundedFrameStream {
         try appendDecoded(bytes).map(\.frame)
     }
 
-    public mutating func appendDecoded(_ bytes: Data) throws -> [DecodedRelayFrame] {
+    public mutating func appendDecoded(_ bytes: Data, maximumFrames: Int = Int.max) throws -> [DecodedRelayFrame] {
         guard !poisoned else {
             throw FrameStreamError.poisoned
         }
@@ -527,6 +540,12 @@ public struct BoundedFrameStream {
 
         var frames: [DecodedRelayFrame] = []
         while buffer.count >= RelayProtocolConstants.frameLengthPrefixBytes {
+            // A barrier cannot spend unbounded work parsing even a single bounded read chunk.
+            if frames.count >= maximumFrames {
+                poisoned = true
+                buffer.removeAll(keepingCapacity: false)
+                return frames
+            }
             let length = Self.decodeLengthPrefix(buffer)
             if length > UInt32(maxFrameBytes) {
                 // Length is checked before slicing payload bytes so a peer cannot make the relay allocate an over-cap frame.
@@ -810,41 +829,9 @@ public struct DarwinPeerCredentialProvider: PeerCredentialProvider {
     public init() {}
 
     public func peerUid(forFileDescriptor fd: Int32) throws -> uid_t {
-        var socketType = Int32()
-        var socketTypeLength = socklen_t(MemoryLayout<Int32>.size)
         // Must match UnixPeerVerifier.requirePeer in castle-wall-macos/Sources/MemoryGrantPeer/UnixPeer.swift.
-        if getsockopt(fd, SOL_SOCKET, SO_TYPE, &socketType, &socketTypeLength) != 0
-            || socketTypeLength != MemoryLayout<Int32>.size {
-            throw PeerCheckError.peerInspectionFailed
-        }
-        if socketType != SOCK_STREAM {
-            throw PeerCheckError.peerSocketNotStream
-        }
-        var storage = sockaddr_storage()
-        var storageLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let connected = withUnsafeMutablePointer(to: &storage) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-                getpeername(fd, sockaddrPointer, &storageLength)
-            }
-        }
-        if connected != 0
-            || storageLength < MemoryLayout<sa_family_t>.size + MemoryLayout<UInt8>.size
-            || storageLength > MemoryLayout<sockaddr_storage>.size {
-            throw PeerCheckError.peerInspectionFailed
-        }
-        if storage.ss_family != sa_family_t(AF_UNIX) {
-            throw PeerCheckError.peerSocketNotConnectedUnix
-        }
-        var euid = uid_t()
-        var egid = gid_t()
-        let status = getpeereid(fd, &euid, &egid)
-        if status != 0 {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        if euid == uid_t.max || egid == gid_t.max {
-            throw PeerCheckError.peerUidUnavailable
-        }
-        return euid
+        // The canonical verifier establishes socket shape and the protected install UID together.
+        return try UnixPeerVerifier.requirePeer(socket: fd, expectedUID: RelayProtocolConstants.hermesUID).effectiveUID
     }
 }
 
@@ -1077,6 +1064,7 @@ public struct RelayConnection {
     private var controlResponsesOutstanding = 0
     private var currentRequestID: String?
     private var closedSent = false
+    private var lastDecodedFrameCount = 0
 
     public init(connectionID: String) {
         self.connectionID = connectionID
@@ -1084,12 +1072,14 @@ public struct RelayConnection {
         _ = Self.longestAllowedFullResultPrivateResponseFitsFrameCap
     }
 
-    public mutating func receivePublicBytes(_ data: Data) -> [RelayOutput] {
+    public mutating func receivePublicBytes(_ data: Data, maximumFrames: Int = Int.max) -> [RelayOutput] {
+        lastDecodedFrameCount = 0
         guard state != .state_CLOSED else {
             return []
         }
         do {
-            let frames = try stream.appendDecoded(data)
+            let frames = try stream.appendDecoded(data, maximumFrames: maximumFrames)
+            lastDecodedFrameCount = frames.count
             var output = frames.flatMap { handlePublicFrame($0.frame, payloadBytes: $0.payloadBytes) }
             if stream.isPoisoned {
                 output.append(contentsOf: closeOnce(closePublic: true))
@@ -1252,13 +1242,26 @@ public struct RelayConnection {
             ]), completion: nil)]
         }
         var output: [RelayOutput] = []
-        for event in publicFD.zeroTimeoutReadToWouldBlock() {
+        var remainingBytes = RelayProtocolConstants.probeDrainMaxBytes
+        var remainingFrames = RelayProtocolConstants.probeDrainMaxFrames
+        while state != .state_CLOSED, remainingBytes > 0, remainingFrames > 0,
+              let event = publicFD.next(maximumBytes: min(remainingBytes, RelayProtocolConstants.maxPublicReadChunkBytes)) {
             switch event {
             case .data(let bytes):
-                output.append(contentsOf: receivePublicBytes(bytes))
+                guard !bytes.isEmpty, bytes.count <= remainingBytes else {
+                    output.append(contentsOf: closeOnce(closePublic: true))
+                    break
+                }
+                remainingBytes -= bytes.count
+                output.append(contentsOf: receivePublicBytes(bytes, maximumFrames: remainingFrames))
+                remainingFrames -= lastDecodedFrameCount
             case .eof, .hangup:
                 output.append(contentsOf: closeOnce(closePublic: true))
             }
+        }
+        // Exhausting either budget with readable data cannot establish the drained decision boundary.
+        if (remainingBytes == 0 || remainingFrames == 0) && publicFD.isReadable {
+            output.append(contentsOf: closeOnce(closePublic: true))
         }
         if stream.hasPartialFrame || stream.isPoisoned {
             output.append(contentsOf: closeOnce(closePublic: true))
@@ -1427,7 +1430,8 @@ public enum PublicFDProbeEvent: Equatable {
 }
 
 public protocol PublicFDProbeSource {
-    func zeroTimeoutReadToWouldBlock() -> [PublicFDProbeEvent]
+    var isReadable: Bool { get }
+    func next(maximumBytes: Int) -> PublicFDProbeEvent?
 }
 
 public struct PathMetadata: Equatable {
@@ -1536,17 +1540,21 @@ public protocol RelayInstanceLock {
 }
 
 public final class DarwinInstanceLock: RelayInstanceLock {
-    private var heldFDs: [String: Int32] = [:]
+    private var heldFD: Int32?
+
+    deinit { if let fd = heldFD { close(fd) } }
 
     public init() {}
 
     public func tryLock(_ path: String) -> Bool {
-        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, RelayProtocolConstants.privateDirectoryMode)
+        guard heldFD == nil else { return false }
+        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, RuntimeConfiguration.protectedFileMode)
         guard fd >= 0 else {
             return false
         }
         var info = stat()
-        if fstat(fd, &info) != 0 || (info.st_mode & S_IFMT) != S_IFREG {
+        if fstat(fd, &info) != 0 || (info.st_mode & S_IFMT) != S_IFREG
+            || info.st_uid != getuid() || info.st_mode & 0o7777 != RuntimeConfiguration.protectedFileMode {
             close(fd)
             return false
         }
@@ -1554,7 +1562,7 @@ public final class DarwinInstanceLock: RelayInstanceLock {
             close(fd)
             return false
         }
-        heldFDs[path] = fd
+        heldFD = fd
         return true
     }
 }
@@ -1732,6 +1740,7 @@ public struct ChildSupervisor {
         agentID: String,
         fortressID: String
     ) -> [String: String] {
+        // Must match HERMES_BRIDGE_ENV_ALLOWLIST in server/src/hermes-memory-bridge/process-shell.ts.
         let allowedKeys = Set([
             "HOME",
             "LANG",
@@ -1807,9 +1816,6 @@ public struct RelayStartupCoordinator {
 
 public enum HermesMemoryRelayEntrypoint {
     public static func run(_ arguments: [String]) -> Never {
-        signal(SIGPIPE, SIG_IGN)
-        let executable = arguments.first ?? "HermesMemoryRelay"
-        FileHandle.standardError.write(Data("\(executable): relay runtime is configured by LaunchAgent in a later slice.\n".utf8))
-        exit(EX_USAGE)
+        exit(RelayRuntime.main(arguments))
     }
 }

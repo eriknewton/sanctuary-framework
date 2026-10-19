@@ -2290,10 +2290,12 @@ private struct StubAccountLookup: AccountUIDLookup {
     }
 }
 
-private struct StubProbeSource: PublicFDProbeSource {
+private final class StubProbeSource: PublicFDProbeSource {
     var events: [PublicFDProbeEvent]
-    func zeroTimeoutReadToWouldBlock() -> [PublicFDProbeEvent] {
-        events
+    init(events: [PublicFDProbeEvent]) { self.events = events }
+    var isReadable: Bool { !events.isEmpty }
+    func next(maximumBytes: Int) -> PublicFDProbeEvent? {
+        events.isEmpty ? nil : events.removeFirst()
     }
 }
 
