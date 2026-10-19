@@ -1,0 +1,6 @@
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+Content-Length: 76
+Connection: close
+
+{"error":{"message":"Not found","type":"gateway_error","code":"not_found"}}

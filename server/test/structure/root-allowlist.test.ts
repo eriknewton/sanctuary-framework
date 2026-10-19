@@ -1,3 +1,4 @@
+// fail-before-exempt: this branch only allowlists local-model-gateway; the guard inspects tracked root entries, so reversing server/src cannot make it fail.
 /**
  * ROOT-ALLOWLIST guard (DoE review L-3).
  *
@@ -82,6 +83,8 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "docs",
   "examples",
   "integrations",
+  // Swift local model gateway between the confined agent and Ollama; a root-level SwiftPM package like castle-wall-macos.
+  "local-model-gateway",
   "menubar",
   "package.json",
   "plugin",

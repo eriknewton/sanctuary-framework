@@ -1,0 +1,6 @@
+HTTP/1.1 504 Gateway Timeout
+Content-Type: application/json
+Content-Length: 82
+Connection: close
+
+{"error":{"message":"Gateway deadline","type":"gateway_error","code":"deadline"}}

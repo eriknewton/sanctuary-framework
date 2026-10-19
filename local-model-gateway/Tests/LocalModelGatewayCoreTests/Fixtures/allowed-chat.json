@@ -1,0 +1,17 @@
+{
+  "model": "qwen3.5:9b",
+  "messages": [
+    {"role":"system","content":"system"},
+    {"role":"developer","content":[{"type":"text","text":"developer"}]},
+    {"role":"user","content":"question","name":"principal"},
+    {"role":"assistant","content":null,"reasoning":"reasoning","tool_calls":[{"id":"call1","type":"function","function":{"name":"lookup","arguments":"{\"key\":1}"}}]},
+    {"role":"tool","content":"result","tool_call_id":"call1"},
+    {"role":"assistant","content":"answer"}
+  ],
+  "tools":[{"type":"function","function":{"name":"lookup","description":"fixture","parameters":{"type":"object","properties":{"é":{"type":"string"},"é":{"type":"number"},"Model":{"enum":[1.00,1e+2,null,false]}}},"strict":true}}],
+  "stream":true,
+  "stream_options":{"include_usage":true},
+  "temperature":1.00,
+  "options":{"num_ctx":131072},
+  "think":false
+}
