@@ -1,0 +1,6 @@
+HTTP/1.1 502 Bad Gateway
+Content-Type: application/json
+Content-Length: 82
+Connection: close
+
+{"error":{"message":"Upstream failure","type":"gateway_error","code":"upstream"}}

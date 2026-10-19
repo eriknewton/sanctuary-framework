@@ -1,0 +1,6 @@
+HTTP/1.1 413 Content Too Large
+Content-Type: application/json
+Content-Length: 84
+Connection: close
+
+{"error":{"message":"Request too large","type":"gateway_error","code":"too_large"}}

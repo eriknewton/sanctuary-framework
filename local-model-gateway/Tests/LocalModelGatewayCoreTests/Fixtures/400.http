@@ -1,0 +1,6 @@
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+Content-Length: 88
+Connection: close
+
+{"error":{"message":"Invalid request","type":"gateway_error","code":"invalid_request"}}
