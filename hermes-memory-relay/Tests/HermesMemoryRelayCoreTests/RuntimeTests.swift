@@ -73,7 +73,7 @@ final class RuntimeTests: XCTestCase {
                                    socketGroup: getgid(), instanceLock: DarwinInstanceLock(),
                                    verifySocketPath: { throw RuntimeFailure.socket },
                                    verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false }, reapChild: Darwin.waitpid)
-        // Four live slots each reserve accepted, call, eight controls, closed, probe reply; one shutdown slot.
+        // Four live or draining slots each reserve accepted, call, eight controls, closed, probe reply; one shutdown slot.
         let requiredPrivateQueueCap = 4 * (1 + 1 + 8 + 1 + 1) + 1
         for _ in 0..<(requiredPrivateQueueCap - 1) {
             try runtime.enqueueNode(RelayFrame(type: "closed", fields: ["connection_id": .string("c1")]), id: nil, kind: nil)
@@ -141,12 +141,6 @@ final class RuntimeTests: XCTestCase {
         let requiredPongAllowance = 2
         for _ in 0..<requiredPongAllowance { _ = connection.receivePublicBytes(ping) }
         XCTAssertTrue(connection.receivePublicBytes(ping).compactMap(nodeType).contains("closed"), "controlResponseAllowanceWaitsForWrite")
-    }
-
-    func testParkedAdmissionModelCapacity() throws {
-        var admission = RelayAdmissionController()
-        for _ in 0..<4 { XCTAssertEqual(try admission.acceptPeer().compactMap(nodeType), ["accepted"]) }
-        XCTAssertEqual(try admission.acceptPeer(), [.closePublicConnection], "fifthConnectionNeverReachesNode")
     }
 
     func testSpawnUsesOnlyConfiguredEnvironment() throws {
@@ -232,10 +226,18 @@ final class RuntimeTests: XCTestCase {
     }
 
     func testProtectedConfigThroughBothEntrypoints() throws {
-        let repository = FileManager.default.homeDirectoryForCurrentUser.path
-        let cases = ["valid", "mode", "owner", "leaf-link", "ancestor-link", "group-write", "other-write", "oversize", "oversize-stat"]
+        // Darwin's per-user temp root has protected ancestors even when a runner sets TMPDIR=/tmp.
+        var temporaryPath = [CChar](repeating: 0, count: Int(PATH_MAX))
+        XCTAssertGreaterThan(confstr(_CS_DARWIN_USER_TEMP_DIR, &temporaryPath, temporaryPath.count), 0)
+        // realpath resolves /var to /private/var before the production no-symlink ancestor walk.
+        let resolvedTemporaryPath = try XCTUnwrap(realpath(temporaryPath, nil))
+        defer { free(resolvedTemporaryPath) }
+        let temporaryRoot = String(cString: resolvedTemporaryPath)
+        let cases = ["valid", "mode", "owner", "leaf-link", "ancestor-link", "group-write", "other-write", "oversize", "oversize-stat",
+                     "wrong-name", "private-mode", "exec-group-write", "exec-other-write", "entry-group-write", "entry-other-write",
+                     "exec-no-x", "admin-member"]
         for scenario in cases {
-            var template = Array((repository + "/.hmr-XXXXXX").utf8CString)
+            var template = Array((temporaryRoot + "/hmr-XXXXXX").utf8CString)
             let root = try XCTUnwrap(mkdtemp(&template)).withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
             defer { try? FileManager.default.removeItem(atPath: root) }
             let privateDir = root + "/private"
@@ -252,6 +254,15 @@ final class RuntimeTests: XCTestCase {
             var input = path
             switch scenario {
             case "mode": XCTAssertEqual(chmod(path, 0o644), 0)
+            case "wrong-name":
+                input = privateDir + "/other.json"
+                try FileManager.default.copyItem(atPath: path, toPath: input)
+            case "private-mode": XCTAssertEqual(chmod(privateDir, 0o750), 0) // Adds group read and search.
+            case "exec-group-write": XCTAssertEqual(chmod(node, 0o720), 0) // Owner executable plus group write.
+            case "exec-other-write": XCTAssertEqual(chmod(node, 0o702), 0) // Owner executable plus other write.
+            case "entry-group-write": XCTAssertEqual(chmod(entry, 0o620), 0) // Owner read/write plus group write.
+            case "entry-other-write": XCTAssertEqual(chmod(entry, 0o602), 0) // Owner read/write plus other write.
+            case "exec-no-x": XCTAssertEqual(chmod(node, 0o600), 0) // Owner read/write without execute.
             case "leaf-link":
                 try FileManager.default.moveItem(atPath: path, toPath: privateDir + "/actual")
                 XCTAssertEqual(symlink(privateDir + "/actual", path), 0)
@@ -280,7 +291,7 @@ final class RuntimeTests: XCTestCase {
                         if scenario == "owner" { info.st_uid = RelayProtocolConstants.hermesUID }
                         if scenario == "oversize-stat" { info.st_size = off_t(RuntimeConfiguration.maximumConfigBytes + 1) }
                         return info
-                    }, lookup: RuntimeFixtureAccount(), admin: RuntimeFixtureAdmin(), groupExists: { _ in true })
+                    }, lookup: RuntimeFixtureAccount(), admin: RuntimeFixtureAdmin(member: scenario == "admin-member"), groupExists: { _ in true })
                 }, compose: { _ in composed = true; throw RuntimeFailure.readiness })
                 XCTAssertEqual(code, scenario == "valid" && option == "--check-config" ? EX_OK : EX_CONFIG,
                                "protectedConfig \(scenario) \(option)")
@@ -290,10 +301,7 @@ final class RuntimeTests: XCTestCase {
         }
     }
 
-    func testProbeDrainRejectsSingleOverBudgetRead() throws {
-        var connection = RelayConnection(connectionID: "c1")
-        // Two legal maximum calls total 131080 bytes, four beyond the 131076-byte barrier budget.
-        // Without the byte check they become one forwarded call and one busy denial, never a parser error.
+    private func twoMaximumCalls() throws -> Data {
         func largeCall(_ id: String) throws -> Data {
             let empty = RelayFrame(type: "tools_call", fields: ["request_id": .string(id), "name": .string("memory_search"),
                 "arguments": .object(["query": .string("")])])
@@ -302,12 +310,33 @@ final class RuntimeTests: XCTestCase {
             full.fields["arguments"] = .object(["query": .string(String(repeating: "x", count: padding))])
             return try BoundedFrameStream.encode(full)
         }
-        let bytes = try largeCall("r1") + largeCall("r2")
-        XCTAssertGreaterThan(bytes.count, RelayProtocolConstants.probeDrainMaxBytes)
-        let source = IncrementalProbe([.data(bytes)])
+        return try largeCall("r1") + largeCall("r2")
+    }
+
+    func testProbeDrainRejectsSingleOverBudgetRead() throws {
+        var connection = RelayConnection(connectionID: "c1")
+        // This deliberately nonconforming source isolates the defensive per-read check.
+        let source = OversizedProbe(bytes: try twoMaximumCalls())
         let result = connection.handleProbe(probe(), publicFD: source)
         XCTAssertEqual(result.compactMap(nodeType), ["closed", "probe_reply"], "singleReadByteBudget")
         XCTAssertEqual(source.reads, 1, "singleReadByteBudget")
+    }
+
+    func testProbeDrainEnforcesCumulativeByteBudget() throws {
+        var connection = RelayConnection(connectionID: "c1")
+        let bytes = try twoMaximumCalls()
+        // Two legal payloads plus their four-byte prefixes: 2 x (65536 + 4) = 131080.
+        let requiredInputBytes = 131080
+        // One retained partial frame plus one read chunk: (65536 + 4) + 65536 = 131076.
+        let requiredConsumedBytes = 131076
+        let expectedReadSizes = [65536, 65536, 4] // Two full reads and the four remaining budget bytes.
+        XCTAssertEqual(bytes.count, requiredInputBytes, "cumulativeByteBudget")
+        let source = IncrementalProbe([.data(bytes)])
+        let result = connection.handleProbe(probe(), publicFD: source)
+        XCTAssertEqual(result.compactMap(nodeType).suffix(2), ["closed", "probe_reply"], "cumulativeByteBudget")
+        XCTAssertEqual(source.consumedBytes, requiredConsumedBytes, "cumulativeByteBudget")
+        XCTAssertEqual(source.readSizes, expectedReadSizes, "cumulativeByteBudget")
+        XCTAssertEqual(source.reads, expectedReadSizes.count, "cumulativeByteBudget")
     }
 
     func testFullConformingProbeGrammar() throws {
@@ -322,7 +351,7 @@ final class RuntimeTests: XCTestCase {
         let result = connection.handleProbe(probe(), publicFD: source)
         XCTAssertFalse(result.contains(.closePublicConnection), "fullConformingProbeGrammar")
         XCTAssertEqual(result.compactMap(nodeType).last, "probe_reply", "fullConformingProbeGrammar")
-        XCTAssertEqual(source.reads, 12, "fullConformingProbeGrammar")
+        XCTAssertEqual(source.reads, RelayProtocolConstants.probeDrainMaxFrames, "fullConformingProbeGrammar")
     }
 
     func testShutdownSlotCannotBeUsedByTraffic() throws {
@@ -399,12 +428,32 @@ final class RuntimeTests: XCTestCase {
 private final class IncrementalProbe: PublicFDProbeSource {
     var events: [PublicFDProbeEvent]
     var reads = 0
+    var readSizes: [Int] = []
+    var consumedBytes: Int { readSizes.reduce(0, +) }
     init(_ events: [PublicFDProbeEvent]) { self.events = events }
     var isReadable: Bool { !events.isEmpty }
     func next(maximumBytes: Int) -> PublicFDProbeEvent? {
         guard !events.isEmpty else { return nil }
         reads += 1
-        return events.removeFirst()
+        let event = events.removeFirst()
+        guard case .data(let bytes) = event else { return event }
+        // Preserve the unread tail so the fixture obeys the same maximumBytes contract as native reads.
+        let chunk = Data(bytes.prefix(maximumBytes))
+        if bytes.count > chunk.count { events.insert(.data(Data(bytes.dropFirst(chunk.count))), at: 0) }
+        readSizes.append(chunk.count)
+        return .data(chunk)
+    }
+}
+
+private final class OversizedProbe: PublicFDProbeSource {
+    let bytes: Data
+    var reads = 0
+    init(bytes: Data) { self.bytes = bytes }
+    var isReadable: Bool { reads == 0 }
+    func next(maximumBytes: Int) -> PublicFDProbeEvent? {
+        guard isReadable else { return nil }
+        reads += 1
+        return .data(bytes)
     }
 }
 
@@ -412,5 +461,6 @@ struct RuntimeFixtureAccount: AccountUIDLookup {
     func uid(forAccountName name: String) throws -> uid_t { RelayProtocolConstants.hermesUID }
 }
 struct RuntimeFixtureAdmin: AdminGroupMembership {
-    func isAdmin(uid: uid_t) throws -> Bool { false }
+    var member = false
+    func isAdmin(uid: uid_t) throws -> Bool { member }
 }

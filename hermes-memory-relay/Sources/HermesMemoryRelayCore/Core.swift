@@ -71,6 +71,8 @@ public enum RelayProtocolConstants {
     // 12 public frames: one primary hello/tools_list/tools_call, one busy-denied call, eight
     // forwarded controls (cancel or terminal shutdown), and two pings producing the pong allowance.
     // Responses and accepted/closed/probe frames travel on the private side and do not consume this budget.
+    // Two maximum-size legal calls total 2 x 65540 = 131080 bytes, exceeding the 131076-byte budget.
+    // The drain closes that connection (fails closed); 12 bounds frame count, not frames of any legal size.
     // Must match PROBE_DRAIN_MAX_FRAMES in hermes-memory-relay/SEAM.md.
     public static let probeDrainMaxFrames = 1 + 1 + controlQueueDepthPerConnection + controlResponseAllowancePerConnection
     // 1000 ms covers scheduler latency after uncatchable SIGKILL; this is not a durable-write bound.
@@ -912,44 +914,6 @@ public struct ValidatedHermesInstallIdentity: Equatable {
     }
 }
 
-public enum RelayConnectionIDError: Error, Equatable {
-    case exhausted
-}
-
-public struct RelayConnectionIDMinter {
-    private var nextCounter: UInt64 = 1
-
-    public init() {}
-
-    public mutating func mint() throws -> String {
-        guard nextCounter < UInt64.max else {
-            throw RelayConnectionIDError.exhausted
-        }
-        defer { nextCounter += 1 }
-        return "c\(nextCounter)"
-    }
-}
-
-public struct RelayAdmissionController {
-    private var minter = RelayConnectionIDMinter()
-    private var activeConnectionIDs: Set<String> = []
-
-    public init() {}
-
-    public mutating func acceptPeer() throws -> [RelayOutput] {
-        guard activeConnectionIDs.count < RelayProtocolConstants.maxPublicConnections else {
-            return [.closePublicConnection]
-        }
-        let connectionID = try minter.mint()
-        activeConnectionIDs.insert(connectionID)
-        return [.toNode(RelayFrame(type: "accepted", fields: ["connection_id": .string(connectionID)]), completion: nil)]
-    }
-
-    public mutating func markClosed(connectionID: String) {
-        activeConnectionIDs.remove(connectionID)
-    }
-}
-
 public enum RelayShutdownModel {
     public static func gracefulShutdownFrame() -> RelayFrame {
         RelayFrame(type: "relay_shutdown")
@@ -1783,58 +1747,6 @@ public struct ChildSupervisor {
             throw ChildSupervisorError.unexpectedReadyFrame
         }
         try FrameAllowlist.validate(frame, direction: .nodeToRelay)
-    }
-}
-
-public enum RelayStartupState: Equatable {
-    case state_AWAIT_LOCK
-    case state_AWAIT_CHILD_READY
-    case state_SERVING
-}
-
-public protocol RelayStartupOperations {
-    func acquireInstanceLock() throws
-    func validateSocketPathUnderLock() throws
-    func spawnChild() throws
-    func waitForChildReady(timeoutMilliseconds: Int) throws
-    func unlinkLeftoverSocketWhileLocked() throws
-    func bindPublicSocket() throws
-    func chmodPublicSocket() throws
-    func verifyPublicSocket() throws
-    func killChild()
-    func reapChild()
-}
-
-public struct RelayStartupCoordinator {
-    private let operations: RelayStartupOperations
-    private(set) public var state: RelayStartupState = .state_AWAIT_LOCK
-
-    public init(operations: RelayStartupOperations) {
-        self.operations = operations
-    }
-
-    public mutating func start() throws {
-        try operations.acquireInstanceLock()
-        try operations.validateSocketPathUnderLock()
-        var childStarted = false
-        do {
-            try operations.spawnChild()
-            childStarted = true
-            state = .state_AWAIT_CHILD_READY
-            try operations.waitForChildReady(timeoutMilliseconds: RelayProtocolConstants.childReadyTimeoutMilliseconds)
-            try operations.unlinkLeftoverSocketWhileLocked()
-            // The public socket is bound only after Node reports ready so failed composition never exposes a callable socket.
-            try operations.bindPublicSocket()
-            try operations.chmodPublicSocket()
-            try operations.verifyPublicSocket()
-            state = .state_SERVING
-        } catch {
-            if childStarted {
-                operations.killChild()
-                operations.reapChild()
-            }
-            throw error
-        }
     }
 }
 

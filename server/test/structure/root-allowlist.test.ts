@@ -1,3 +1,4 @@
+// fail-before-exempt: This change allowlists the hermes-memory-relay root package; this guard inspects tracked root entries, not server/src behavior, so reversing server/src must not make it fail.
 /**
  * ROOT-ALLOWLIST guard (DoE review L-3).
  *

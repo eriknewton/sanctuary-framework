@@ -524,7 +524,7 @@ describe("Hermes memory process shell", () => {
     } finally { killChild(child); await childExit(child); }
   }, 30_000);
 
-  it("supervisionConvergesBothDirections: relay EOF drains the real CLI child", async () => {
+  it("supervisionConvergesBothDirections: relay EOF drains the real CLI-handler subprocess", async () => {
     const fixture = await seededFortress("supervision-eof");
     const child = spawnObservedCli(fixture.env, "");
     const relay = child.stdio[3] as Duplex;

@@ -5,7 +5,8 @@ import Foundation
 nonisolated(unsafe) private var relayStopSignal: sig_atomic_t = 0
 
 enum RuntimeLimits {
-    // One accepted, one call, eight controls, one closed, and one probe reply per live slot.
+    // One accepted, one call, eight controls, one closed, and one probe reply per live or draining slot,
+    // plus one slot reserved for the single relay_shutdown frame.
     static let privateQueueFrames = RelayProtocolConstants.maxPublicConnections
         * (1 + 1 + RelayProtocolConstants.controlQueueDepthPerConnection + 1 + 1) + 1
     static let privateQueueBytes = privateQueueFrames

@@ -308,14 +308,6 @@ final class FrameFixtureTests: XCTestCase {
 }
 
 final class PeerVerifierTests: XCTestCase {
-    func testConnectionIdsAreRelayMintedAndMonotonic() throws {
-        var minter = RelayConnectionIDMinter()
-
-        XCTAssertEqual(try minter.mint(), "c1")
-        XCTAssertEqual(try minter.mint(), "c2")
-        XCTAssertEqual(try minter.mint(), "c3")
-    }
-
     func testPeerVerifierRefusesUnsafeExpectedUidsAtStartup() throws {
         let credentials = StubCredentials(peerUid: testExpectedUid)
         let admin = StubAdminMembership(adminUIDs: [testAdminUid])
@@ -824,42 +816,6 @@ final class ChildSupervisorTests: XCTestCase {
     func testReadyFrameIsRequiredBeforeBind() throws {
         XCTAssertNoThrow(try ChildSupervisor.validateReadyFrame(RelayFrame(type: "ready")))
         XCTAssertThrowsError(try ChildSupervisor.validateReadyFrame(RelayFrame(type: "response", fields: ["connection_id": .string("c"), "request_id": .string("r"), "result_b64": .string("e30=")])))
-    }
-}
-
-final class RelayStartupCoordinatorTests: XCTestCase {
-    func testPublicSocketBindsOnlyAfterChildReady() throws {
-        let operations = StubStartupOperations()
-        var coordinator = RelayStartupCoordinator(operations: operations)
-
-        try coordinator.start()
-
-        XCTAssertEqual(operations.events, [
-            "lock",
-            "validate",
-            "spawn",
-            "ready:\(RelayProtocolConstants.childReadyTimeoutMilliseconds)",
-            "unlink",
-            "bind",
-            "chmod",
-            "verify"
-        ])
-        XCTAssertEqual(coordinator.state, .state_SERVING)
-    }
-
-    func testReadyFailureLeavesPublicSocketUnbound() throws {
-        let operations = StubStartupOperations(readyError: ChildSupervisorError.childReadyTimeout)
-        var coordinator = RelayStartupCoordinator(operations: operations)
-
-        XCTAssertThrowsError(try coordinator.start())
-        XCTAssertEqual(operations.events, [
-            "lock",
-            "validate",
-            "spawn",
-            "ready:\(RelayProtocolConstants.childReadyTimeoutMilliseconds)",
-            "kill",
-            "reap"
-        ])
     }
 }
 
@@ -1753,29 +1709,6 @@ final class RelayConnectionLifecycleTests: XCTestCase {
 }
 
 final class RelayAdmissionTests: XCTestCase {
-    func testAdmissionEmitsAcceptedAndClosesFifthConnectionBeforeNode() throws {
-        var admission = RelayAdmissionController()
-        for index in 1...RelayProtocolConstants.maxPublicConnections {
-            XCTAssertEqual(try admission.acceptPeer(), [
-                .toNode(RelayFrame(type: "accepted", fields: ["connection_id": .string("c\(index)")]), completion: nil)
-            ])
-        }
-
-        XCTAssertEqual(try admission.acceptPeer(), [.closePublicConnection])
-    }
-
-    func testClosedConnectionFreesAdmissionSlot() throws {
-        var admission = RelayAdmissionController()
-        for index in 1...RelayProtocolConstants.maxPublicConnections {
-            _ = try admission.acceptPeer()
-            admission.markClosed(connectionID: "c\(index)")
-        }
-
-        XCTAssertEqual(try admission.acceptPeer(), [
-            .toNode(RelayFrame(type: "accepted", fields: ["connection_id": .string("c5")]), completion: nil)
-        ])
-    }
-
     func testShutdownModelEmitsRelayShutdown() {
         XCTAssertEqual(RelayShutdownModel.gracefulShutdownFrame(), RelayFrame(type: "relay_shutdown"))
     }
@@ -2342,57 +2275,5 @@ private final class StubLock: RelayInstanceLock {
 
     func tryLock(_ path: String) -> Bool {
         available
-    }
-}
-
-private final class StubStartupOperations: RelayStartupOperations {
-    var events: [String] = []
-    var readyError: Error?
-
-    init(readyError: Error? = nil) {
-        self.readyError = readyError
-    }
-
-    func acquireInstanceLock() throws {
-        events.append("lock")
-    }
-
-    func validateSocketPathUnderLock() throws {
-        events.append("validate")
-    }
-
-    func spawnChild() throws {
-        events.append("spawn")
-    }
-
-    func waitForChildReady(timeoutMilliseconds: Int) throws {
-        events.append("ready:\(timeoutMilliseconds)")
-        if let readyError {
-            throw readyError
-        }
-    }
-
-    func bindPublicSocket() throws {
-        events.append("bind")
-    }
-
-    func unlinkLeftoverSocketWhileLocked() throws {
-        events.append("unlink")
-    }
-
-    func chmodPublicSocket() throws {
-        events.append("chmod")
-    }
-
-    func verifyPublicSocket() throws {
-        events.append("verify")
-    }
-
-    func killChild() {
-        events.append("kill")
-    }
-
-    func reapChild() {
-        events.append("reap")
     }
 }

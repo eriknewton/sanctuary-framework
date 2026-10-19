@@ -255,6 +255,13 @@ final class RuntimeContractTests: XCTestCase {
         """, expectsReady: true, witness: "lockedReclaimConsumer", scenario: "leftover-socket")
     }
 
+    func testProductionSocketPathRejectsUnsafeAncestorsBeforeSpawn() throws {
+        for scenario in ["production-socket-owner", "production-socket-group-write"] {
+            try nativeRun(body: "process.exit(0);", expectsReady: false,
+                          witness: "productionSocketPath", scenario: scenario)
+        }
+    }
+
     func testSIGTERMLegIsRequired() throws {
         let began = DispatchTime.now().uptimeNanoseconds
         try nativeRun(body: """
@@ -264,9 +271,11 @@ final class RuntimeContractTests: XCTestCase {
         channel.write(frame({type:'ready'}));
         const ready=setInterval(()=>{if(fs.existsSync(socketPath)){clearInterval(ready);process.kill(process.ppid,'SIGTERM');}},10);
         """, expectsReady: true, witness: "sigtermLeg", scenario: "graceful")
-        // The 2000 ms signal step plus one 1000 ms scheduler allowance must finish before SIGKILL at 5000 ms.
+        // One second of test scheduling slack includes Node startup; load can exhaust it before SIGTERM.
+        let schedulerAllowanceMilliseconds = 1_000
+        // The signal step plus that test allowance must finish before the product SIGKILL deadline.
         XCTAssertLessThanOrEqual((DispatchTime.now().uptimeNanoseconds - began) / 1_000_000,
-            UInt64(RelayProtocolConstants.probeReplyBoundMilliseconds + RelayProtocolConstants.relayChildReapBoundMilliseconds), "sigtermLeg deadline")
+            UInt64(RelayProtocolConstants.probeReplyBoundMilliseconds + schedulerAllowanceMilliseconds), "sigtermLeg deadline")
     }
 
     func testReapTimeoutPreservesSocket() throws { try unreapedRun("reap-timeout") }
@@ -421,6 +430,13 @@ final class RuntimeContractTests: XCTestCase {
             let runtime = fixtureRuntime(config, root: root)
             if scenario == "reap-timeout" || scenario == "ownership-loss" { fixtureRuntimeToReap = runtime }
             code = runtime.run()
+            if scenario.hasPrefix("production-socket-") {
+                XCTAssertEqual(code, EX_CONFIG, "productionSocketPath refusal")
+                XCTAssertNil(runtime.child, "productionSocketPath no child spawned")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: config.bridgeLog), "productionSocketPath no child log")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: socketPath), "productionSocketPath no socket")
+                return
+            }
             XCTAssertLessThanOrEqual(runtime.peakPrivateQueueFrames, RuntimeLimits.privateQueueFrames, "churnShutdown queue cap")
             XCTAssertLessThanOrEqual(runtime.peakPrivateQueueBytes, RuntimeLimits.privateQueueBytes, "churnShutdown byte cap")
         }
@@ -494,9 +510,11 @@ final class RuntimeContractTests: XCTestCase {
     }
 
     private func fixtureRuntime(_ config: RuntimeConfiguration, root: String) -> RelayRuntime {
-        if FileManager.default.fileExists(atPath: root + "/production-peer") {
+        let unsafeOwner = FileManager.default.fileExists(atPath: root + "/production-socket-owner")
+        let writableAncestor = FileManager.default.fileExists(atPath: root + "/production-socket-group-write")
+        if unsafeOwner || writableAncestor || FileManager.default.fileExists(atPath: root + "/production-peer") {
             return try! RelayRuntime.productionRuntime(config, lookup: RuntimeFixtureAccount(), admin: RuntimeFixtureAdmin(),
-                home: root, group: getgid(), fileSystem: FixtureSocketMetadata(root: root), observeRejectedPeer: { fd in
+                home: root, group: getgid(), fileSystem: FixtureSocketMetadata(root: root, unsafeOwner: unsafeOwner, writableAncestor: writableAncestor), observeRejectedPeer: { fd in
                     var item = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
                     _ = poll(&item, 1, Int32(RelayProtocolConstants.probeReplyBoundMilliseconds))
                     // SO_NREAD observes the receive queue length without reading or peeking any client byte.
@@ -806,11 +824,18 @@ final class RuntimeContractTests: XCTestCase {
     """
 }
 
-// Only root-owned socket-path metadata is simulated; the peer check always inspects the real connected descriptor.
+// Socket metadata is the only filesystem port here; the peer check inspects the real connected descriptor.
 private struct FixtureSocketMetadata: RelayFileSystem {
     let root: String
+    var unsafeOwner = false
+    var writableAncestor = false
     func lstat(_ path: String) throws -> PathMetadata {
-        PathMetadata(owner: path == root ? getuid() : 0, group: getgid(),
+        if path == "/tmp" {
+            // Hermes uid is neither root nor the owner pin; 0775 adds group write to a valid ancestor.
+            return PathMetadata(owner: unsafeOwner ? RelayProtocolConstants.hermesUID : 0, group: getgid(),
+                mode: writableAncestor ? 0o775 : 0o755, isDirectory: true, isSymlink: false)
+        }
+        return PathMetadata(owner: path == root ? getuid() : 0, group: getgid(),
             mode: path == root ? RelayProtocolConstants.socketDirectoryMode : 0o755,
             isDirectory: true, isSymlink: false)
     }
