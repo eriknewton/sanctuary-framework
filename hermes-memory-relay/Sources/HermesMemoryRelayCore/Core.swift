@@ -71,6 +71,7 @@ public enum RelayProtocolConstants {
     // 9 = one call plus eight queued controls from a conforming client.
     public static let probeDrainMaxFrames = controlQueueDepthPerConnection + 1
     // 1000 ms covers scheduler latency after uncatchable SIGKILL; this is not a durable-write bound.
+    // Must match RELAY_CHILD_REAP_BOUND_MS in server/src/hermes-memory-bridge/process-shell.ts.
     public static let relayChildReapBoundMilliseconds = 1_000
     // 64 levels is deeper than any allowlisted public frame needs; the fixed bound keeps scanning iterative and stack-bounded.
     public static let maxJSONNestingDepth = 64
@@ -1640,6 +1641,10 @@ public struct ChildSpawnPlan: Equatable {
     public var stdoutLogPath: String
     public var stderrLogPath: String
 
+    // Must match validateHermesBridgeEnvironment in server/src/hermes-memory-bridge/process-shell.ts.
+    // CoreFoundation may add its encoding hint after exec; the actual spawn array still contains exactly six configured keys.
+    var environmentEntries: [String] { environment.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" } }
+
     public init(
         executablePath: String,
         arguments: [String],
@@ -1816,6 +1821,11 @@ public struct RelayStartupCoordinator {
 
 public enum HermesMemoryRelayEntrypoint {
     public static func run(_ arguments: [String]) -> Never {
-        exit(RelayRuntime.main(arguments))
+        run(arguments, main: RelayRuntime.main)
+    }
+
+    // Tests supply required filesystem/uid composition through the same entrypoint, never a runtime flag.
+    static func run(_ arguments: [String], main: ([String]) -> Int32) -> Never {
+        exit(main(arguments))
     }
 }

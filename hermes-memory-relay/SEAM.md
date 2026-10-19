@@ -19,7 +19,7 @@ run
 3
 ```
 
-Child stdin is `/dev/null`. Child stdout and stderr go to the bridge log opened by the relay with append, no-follow, and close-on-exec flags. The child environment is an allowlist: `HOME`, `LANG`, `TMPDIR`, plus `HERMES_MEMORY_BRIDGE_IDENTITY`, `HERMES_MEMORY_AGENT_ID`, and `HERMES_MEMORY_FORTRESS_ID`. The relay sets those identity variables from install configuration, never from its own inherited environment.
+Child stdin is `/dev/null`. Child stdout and stderr go to the bridge log opened by the relay with append, no-follow, and close-on-exec flags. The child environment is an allowlist: `HOME`, `LANG`, `TMPDIR`, plus `HERMES_MEMORY_BRIDGE_IDENTITY`, `HERMES_MEMORY_AGENT_ID`, and `HERMES_MEMORY_FORTRESS_ID`. The relay sets those identity variables from install configuration, never from its own inherited environment. The native spawn array contains exactly these six keys. On macOS, Node may additionally observe the CoreFoundation encoding hint initialized by the OS; the child validates its format and own uid. No other extra environment key is accepted. The configured `TMPDIR` is `/tmp`, so custody uses the platform rendezvous rather than an instance-specific path.
 
 Every frame on the inherited fd is:
 

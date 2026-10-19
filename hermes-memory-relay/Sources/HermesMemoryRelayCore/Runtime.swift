@@ -12,10 +12,12 @@ private enum RuntimeLimits {
         * (RelayProtocolConstants.maxPrivateFrameBytes + RelayProtocolConstants.frameLengthPrefixBytes)
     // Checking signals one hundred times per probe interval bounds stop observation to 20 ms.
     static let pollMilliseconds = RelayProtocolConstants.probeReplyBoundMilliseconds / 100
+    // One hundred observations across the reap allowance gives a 10 ms poll interval.
+    static let reapPollMilliseconds = RelayProtocolConstants.relayChildReapBoundMilliseconds / 100
     static let nanosecondsPerMillisecond: UInt64 = 1_000_000
 }
 
-private struct QueuedWrite {
+struct QueuedWrite {
     let bytes: Data
     var offset = 0
     let connectionID: String?
@@ -83,6 +85,7 @@ public final class RelayRuntime {
     private let environment: [String: String]
     private let verifyPeer: (Int32) throws -> Void
     private let verifySocketPath: () throws -> Void
+    private let ordinaryReadsEnabled: () -> Bool
     private let socketGroup: gid_t
     private let instanceLock: RelayInstanceLock
     private var listener: Int32 = -1
@@ -90,6 +93,7 @@ public final class RelayRuntime {
     private var logFD: Int32 = -1
     private var child: pid_t?
     private var childReaped = false
+    private var childOwnershipLost = false
     private var boundIdentity: (dev_t, ino_t)?
     private var receiver = PrivateFrameReceiver()
     private var issued: UInt64 = 0
@@ -102,25 +106,19 @@ public final class RelayRuntime {
     // Required dependencies permit native test composition without an executable option that weakens admission.
     init(configuration: RuntimeConfiguration, environment: [String: String], socketGroup: gid_t,
          instanceLock: RelayInstanceLock, verifySocketPath: @escaping () throws -> Void,
-         verifyPeer: @escaping (Int32) throws -> Void) {
+         verifyPeer: @escaping (Int32) throws -> Void, ordinaryReadsEnabled: @escaping () -> Bool) {
         config = configuration
         self.environment = environment
         self.socketGroup = socketGroup
         self.instanceLock = instanceLock
         self.verifySocketPath = verifySocketPath
         self.verifyPeer = verifyPeer
+        self.ordinaryReadsEnabled = ordinaryReadsEnabled
     }
 
     /// Run the installed CLI or the exact same validation-only parser used before installation.
     public static func main(_ arguments: [String]) -> Int32 {
-        signal(SIGPIPE, SIG_IGN)
-        guard arguments.count == 3, arguments[1] == "--config" || arguments[1] == "--check-config" else {
-            FileHandle.standardError.write(Data("usage: HermesMemoryRelay --config|--check-config <path>\n".utf8))
-            return EX_USAGE
-        }
-        do {
-            let config = try RuntimeConfiguration.load(path: arguments[2])
-            if arguments[1] == "--check-config" { return EX_OK }
+        main(arguments, loadConfiguration: RuntimeConfiguration.load, compose: { config in
             guard let account = getpwuid(config.ownerUID), let home = account.pointee.pw_dir,
                   let group = getgrnam(config.group) else { throw RuntimeFailure.configuration }
             let configuredHome = String(cString: home)
@@ -132,12 +130,28 @@ public final class RelayRuntime {
             let pathCheck = SocketPathValidator(socketDirectory: RuntimeConfiguration.parent(config.publicSocket),
                                                 expectedSocketDirectoryOwner: config.ownerUID,
                                                 expectedSocketDirectoryGroup: groupID)
-            let runtime = RelayRuntime(configuration: config,
-                                       environment: ["HOME": configuredHome, "LANG": "en_US.UTF-8", "TMPDIR": config.privateDirectory],
+            // The custody rendezvous must share the platform temp root with other same-uid processes.
+            // A per-instance TMPDIR can exceed Darwin socket limits and split the lock rendezvous.
+            return RelayRuntime(configuration: config,
+                                       environment: ["HOME": configuredHome, "LANG": "en_US.UTF-8", "TMPDIR": "/tmp"],
                                        socketGroup: groupID, instanceLock: DarwinInstanceLock(),
                                        verifySocketPath: { try pathCheck.validate(fileSystem: NativeRelayFileSystem()) },
-                                       verifyPeer: { try verifier.requirePeer(fileDescriptor: $0) })
-            return runtime.run()
+                                       verifyPeer: { try verifier.requirePeer(fileDescriptor: $0) }, ordinaryReadsEnabled: { true })
+        })
+    }
+
+    // Required composition ports keep fixture metadata out of the production command-line surface.
+    static func main(_ arguments: [String], loadConfiguration: (String) throws -> RuntimeConfiguration,
+                     compose: (RuntimeConfiguration) throws -> RelayRuntime) -> Int32 {
+        signal(SIGPIPE, SIG_IGN)
+        guard arguments.count == 3, arguments[1] == "--config" || arguments[1] == "--check-config" else {
+            FileHandle.standardError.write(Data("usage: HermesMemoryRelay --config|--check-config <path>\n".utf8))
+            return EX_USAGE
+        }
+        do {
+            let config = try loadConfiguration(arguments[2])
+            if arguments[1] == "--check-config" { return EX_OK }
+            return try compose(config).run()
         } catch {
             FileHandle.standardError.write(Data("HermesMemoryRelay state_CONFIG_CHECKED: startup refused\n".utf8))
             return EX_CONFIG
@@ -213,7 +227,7 @@ public final class RelayRuntime {
         try checked(posix_spawn_file_actions_adddup2(&actions, bridgeLogFD, STDOUT_FILENO))
         try checked(posix_spawn_file_actions_adddup2(&actions, bridgeLogFD, STDERR_FILENO))
         let argv = plan.arguments.map { strdup($0) } + [nil]
-        let env = plan.environment.sorted { $0.key < $1.key }.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        let env = plan.environmentEntries.map { strdup($0) } + [nil]
         defer { argv.forEach { free($0) }; env.forEach { free($0) } }
         var pid: pid_t = 0
         let outcome = argv.withUnsafeBufferPointer { args in
@@ -280,7 +294,7 @@ public final class RelayRuntime {
             // A close during private processing cannot transfer readiness to a reused descriptor.
             guard let connection = clients[id], connection.fd == fd else { continue }
             let events = descriptors[clientStart + offset].revents
-            if events & Int16(POLLIN | POLLHUP | POLLERR | POLLNVAL) != 0 {
+            if ordinaryReadsEnabled(), events & Int16(POLLIN | POLLHUP | POLLERR | POLLNVAL) != 0 {
                 let source = NativeProbeSource(fd: fd)
                 if let event = source.next(maximumBytes: RelayProtocolConstants.maxPublicReadChunkBytes) {
                     let output: [RelayOutput]
@@ -351,7 +365,7 @@ public final class RelayRuntime {
         }
     }
 
-    private func enqueueNode(_ frame: RelayFrame, id: String?, kind: NodeWriteKind?) throws {
+    func enqueueNode(_ frame: RelayFrame, id: String?, kind: NodeWriteKind?) throws {
         let bytes = try BoundedFrameStream.encode(frame)
         // Churn shares one transport ceiling; closing clients cannot reset private-queue headroom.
         guard bytes.count <= RelayProtocolConstants.maxPrivateFrameBytes + RelayProtocolConstants.frameLengthPrefixBytes,
@@ -370,7 +384,7 @@ public final class RelayRuntime {
         connection.output.append(QueuedWrite(bytes: bytes, connectionID: id, nodeCompletion: nil, clientCompletion: kind))
     }
 
-    private func writeHead(_ queue: inout [QueuedWrite], fd: Int32) throws -> QueuedWrite? {
+    func writeHead(_ queue: inout [QueuedWrite], fd: Int32) throws -> QueuedWrite? {
         guard !queue.isEmpty else { return nil }
         let count = queue[0].bytes.withUnsafeBytes { buffer in
             write(fd, buffer.baseAddress!.advanced(by: queue[0].offset), buffer.count - queue[0].offset)
@@ -397,17 +411,20 @@ public final class RelayRuntime {
     }
 
     private func state_STOPPING() -> Bool {
+        let stopStarted = now()
         stopping = true
         state = "state_STOPPING"
         if listener >= 0 { close(listener); listener = -1 }
         clients.removeAll()
         if child != nil && !childReaped {
             try? enqueueNode(RelayShutdownModel.gracefulShutdownFrame(), id: nil, kind: nil)
-            waitForChild(milliseconds: RelayProtocolConstants.probeReplyBoundMilliseconds, flush: true)
-            if !childReaped, let pid = child { _ = kill(pid, SIGTERM) }
-            waitForChild(milliseconds: RelayProtocolConstants.childSigtermGraceMilliseconds, flush: false)
-            if !childReaped, let pid = child { _ = kill(pid, SIGKILL) }
-            waitForChild(milliseconds: RelayProtocolConstants.relayChildReapBoundMilliseconds, flush: false)
+            waitForChild(until: stopStarted + milliseconds(RelayProtocolConstants.probeReplyBoundMilliseconds), flush: true)
+            if !childReaped && !childOwnershipLost, let pid = child { _ = kill(pid, SIGTERM) }
+            waitForChild(until: stopStarted + milliseconds(RelayProtocolConstants.relayChildExitBoundMilliseconds), flush: false)
+            if !childReaped && !childOwnershipLost, let pid = child { _ = kill(pid, SIGKILL) }
+            // All phases share the original deadline, so delayed polls never extend the 6000 ms stop budget.
+            waitForChild(until: stopStarted + milliseconds(RelayProtocolConstants.relayChildExitBoundMilliseconds
+                + RelayProtocolConstants.relayChildReapBoundMilliseconds), flush: false)
         }
         if privateFD >= 0 { close(privateFD); privateFD = -1 }
         let reaped = child == nil || childReaped
@@ -423,12 +440,14 @@ public final class RelayRuntime {
         return reaped
     }
 
-    private func waitForChild(milliseconds duration: Int, flush: Bool) {
-        let deadline = now() + milliseconds(duration)
-        while !tryReap(), now() < deadline {
+    private func waitForChild(until deadline: UInt64, flush: Bool) {
+        while !tryReap(), !childOwnershipLost, now() < deadline {
             if flush { try? flushNode() }
+            let current = now()
+            guard current < deadline else { break }
+            let remaining = (deadline - current) / RuntimeLimits.nanosecondsPerMillisecond
             var item = pollfd(fd: -1, events: 0, revents: 0)
-            _ = poll(&item, 0, Int32(RuntimeLimits.pollMilliseconds))
+            _ = poll(&item, 0, Int32(min(UInt64(RuntimeLimits.reapPollMilliseconds), remaining)))
         }
     }
 
@@ -438,6 +457,7 @@ public final class RelayRuntime {
         var status: Int32 = 0
         let result = waitpid(pid, &status, WNOHANG)
         if result == pid { childReaped = true }
+        if result < 0 && errno != EINTR { childOwnershipLost = true }
         // An unproven wait result never permits signalling or deleting another process's objects.
         return childReaped
     }

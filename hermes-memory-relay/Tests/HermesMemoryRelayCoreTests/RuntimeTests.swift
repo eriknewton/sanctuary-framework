@@ -24,6 +24,15 @@ final class RuntimeTests: XCTestCase {
             ["node_executable": "/opt//node"], ["agent_id": ""], ["identity_fingerprint": "no"]
         ] {
             XCTAssertThrowsError(try RuntimeConfiguration.parse(fixture(changes)), "invalidConfigNeverSpawnsOrBinds")
+            var composed = false
+            let code = RelayRuntime.main(["relay", "--config", "/tmp/relay-config.json"], loadConfiguration: { _ in
+                try RuntimeConfiguration.parse(self.fixture(changes))
+            }, compose: { _ in
+                composed = true
+                throw RuntimeFailure.configuration
+            })
+            XCTAssertEqual(code, EX_CONFIG, "invalidConfigNeverSpawnsOrBinds")
+            XCTAssertFalse(composed, "invalidConfigNeverSpawnsOrBinds")
         }
         let original = String(decoding: try fixture(), as: UTF8.self)
         for duplicate in ["owner_uid", "schema_version", "node_entry"] {
@@ -60,6 +69,16 @@ final class RuntimeTests: XCTestCase {
     }
 
     func testRuntimeFloodRetentionIsBounded() throws {
+        let runtime = RelayRuntime(configuration: try RuntimeConfiguration.parse(fixture()), environment: [:],
+                                   socketGroup: getgid(), instanceLock: DarwinInstanceLock(),
+                                   verifySocketPath: { throw RuntimeFailure.socket },
+                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false })
+        // Four live slots each reserve accepted, call, eight controls, closed, probe reply; one shutdown slot.
+        let requiredPrivateQueueCap = 4 * (1 + 1 + 8 + 1 + 1) + 1
+        for _ in 0..<requiredPrivateQueueCap {
+            try runtime.enqueueNode(RelayFrame(type: "closed", fields: ["connection_id": .string("c1")]), id: nil, kind: nil)
+        }
+        XCTAssertThrowsError(try runtime.enqueueNode(RelayFrame(type: "closed", fields: ["connection_id": .string("c1")]), id: nil, kind: nil), "runtimeFloodRetentionIsBounded")
         var connection = RelayConnection(connectionID: "c1")
         let cancel = try BoundedFrameStream.encode(RelayFrame(type: "cancel", fields: ["mcp_request_id": .string("r1")]))
         let source = IncrementalProbe(Array(repeating: .data(cancel), count: 100))
@@ -76,6 +95,43 @@ final class RuntimeTests: XCTestCase {
         for _ in 0..<RelayProtocolConstants.controlQueueDepthPerConnection { _ = connection.receivePublicBytes(cancel) }
         connection.markNodeFrameWritten(nil)
         XCTAssertTrue(connection.receivePublicBytes(cancel).compactMap(nodeType).contains("closed"), "controlSlotsRetireOnExactWrite")
+    }
+
+    func testNativeControlSlotsRetireOnExactWrite() throws {
+        let runtime = RelayRuntime(configuration: try RuntimeConfiguration.parse(fixture()), environment: [:],
+                                   socketGroup: getgid(), instanceLock: DarwinInstanceLock(),
+                                   verifySocketPath: { throw RuntimeFailure.socket },
+                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false })
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { sockets.forEach { close($0) } }
+        for fd in sockets { XCTAssertEqual(fcntl(fd, F_SETFL, O_NONBLOCK), 0) }
+        // A one-KiB requested send buffer forces a partial write of the 64-KiB frame on Darwin.
+        var capacity = Int32(RelayProtocolConstants.bytesPerKiB)
+        XCTAssertEqual(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &capacity, socklen_t(MemoryLayout.size(ofValue: capacity))), 0)
+        let payload = Data(repeating: UInt8(ascii: "x"), count: RelayProtocolConstants.maxPublicFrameBytes)
+        var queue = [QueuedWrite(bytes: payload, connectionID: "c1", nodeCompletion: .forwardedControlFrame, clientCompletion: nil)]
+        XCTAssertNil(try runtime.writeHead(&queue, fd: sockets[0]), "controlSlotsRetireOnExactWrite partial write")
+        XCTAssertEqual(queue.count, 1, "controlSlotsRetireOnExactWrite")
+        guard !queue.isEmpty else { return }
+        let partial = queue[0].offset
+        XCTAssertGreaterThan(partial, 0, "controlSlotsRetireOnExactWrite")
+        XCTAssertLessThan(partial, payload.count, "controlSlotsRetireOnExactWrite")
+        XCTAssertNil(try runtime.writeHead(&queue, fd: sockets[0]), "controlSlotsRetireOnExactWrite EAGAIN")
+        XCTAssertEqual(queue[0].offset, partial, "controlSlotsRetireOnExactWrite EAGAIN")
+        var received = Data(), buffer = [UInt8](repeating: 0, count: payload.count)
+        var completed: QueuedWrite?
+        // At least one byte must progress per successful turn; this bound also detects a stalled writer.
+        for _ in 0...payload.count {
+            let count = read(sockets[1], &buffer, buffer.count)
+            if count > 0 { received.append(contentsOf: buffer.prefix(count)) }
+            if !queue.isEmpty { completed = try runtime.writeHead(&queue, fd: sockets[0]) ?? completed }
+            if received.count == payload.count && queue.isEmpty { break }
+        }
+        XCTAssertEqual(received, payload, "controlSlotsRetireOnExactWrite exact bytes")
+        XCTAssertEqual(completed?.connectionID, "c1", "controlSlotsRetireOnExactWrite")
+        if case .forwardedControlFrame? = completed?.nodeCompletion {} else { XCTFail("controlSlotsRetireOnExactWrite token") }
+        XCTAssertTrue(queue.isEmpty, "controlSlotsRetireOnExactWrite")
     }
 
     func testControlResponseAllowanceWaitsForWrite() throws {
@@ -100,6 +156,74 @@ final class RuntimeTests: XCTestCase {
         ], bridgeIdentity: "pin", agentID: "hermes", fortressID: "hermes-memory")
         XCTAssertEqual(Set(output.keys), Set(["HOME", "LANG", "TMPDIR", "HERMES_MEMORY_BRIDGE_IDENTITY", "HERMES_MEMORY_AGENT_ID", "HERMES_MEMORY_FORTRESS_ID"]), "spawnUsesOnlyConfiguredEnvironment")
         XCTAssertEqual(output["HERMES_MEMORY_AGENT_ID"], "hermes")
+        let plan = try ChildSupervisor.spawnPlan(config: ChildSupervisorConfig(
+            executablePath: "/opt/node", bridgeEntryPath: "/opt/cli.js", bridgeLogPath: "/tmp/log",
+            relayFD: 4, baseEnvironment: ["HOME": "/tmp/home", "LANG": "C", "TMPDIR": "/tmp/tmp", "SECRET": "excluded"],
+            bridgeIdentity: "pin", agentID: "hermes", fortressID: "hermes-memory"))
+        // These are the entries materialized by posix_spawn, before the OS initializes the child.
+        XCTAssertEqual(Set(plan.environmentEntries), Set([
+            "HOME=/tmp/home", "LANG=C", "TMPDIR=/tmp/tmp", "HERMES_MEMORY_BRIDGE_IDENTITY=pin",
+            "HERMES_MEMORY_AGENT_ID=hermes", "HERMES_MEMORY_FORTRESS_ID=hermes-memory"
+        ]), "spawnUsesOnlyConfiguredEnvironment")
+    }
+
+    func testFlockPrecedesEverySocketOperation() throws {
+        var pattern = Array("/tmp/hmr-XXXXXX".utf8CString)
+        guard let pointer = mkdtemp(&pattern) else { throw RuntimeFailure.configuration }
+        let root = String(cString: pointer)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let lock = DarwinInstanceLock()
+        XCTAssertTrue(lock.tryLock(root + "/relay.lock"))
+        let socketPath = root + "/memory.sock"
+        let serving = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(serving, 0)
+        defer { close(serving) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            buffer.copyBytes(from: socketPath.utf8CString.map { UInt8(bitPattern: $0) })
+        }
+        func usingAddress(_ action: (UnsafePointer<sockaddr>, socklen_t) -> Int32) -> Int32 {
+            withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    action($0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+        }
+        XCTAssertEqual(usingAddress { Darwin.bind(serving, $0, $1) }, 0)
+        XCTAssertEqual(listen(serving, 1), 0)
+        XCTAssertEqual(fcntl(serving, F_SETFL, O_NONBLOCK), 0)
+        var original = stat()
+        XCTAssertEqual(lstat(socketPath, &original), 0)
+        let config = try RuntimeConfiguration.parse(fixture([
+            "private_dir": root, "public_socket": socketPath,
+            "bridge_log": root + "/bridge.log", "relay_log": root + "/relay.log"
+        ]))
+        var socketWork = false
+        let runtime = RelayRuntime(configuration: config, environment: [:], socketGroup: getgid(),
+                                   instanceLock: DarwinInstanceLock(), verifySocketPath: { socketWork = true },
+                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { true })
+        XCTAssertEqual(runtime.run(), EX_CONFIG, "flockPrecedesEverySocketOperation")
+        XCTAssertFalse(socketWork, "flockPrecedesEverySocketOperation")
+        var retained = stat()
+        XCTAssertEqual(lstat(socketPath, &retained), 0, "flockPrecedesEverySocketOperation")
+        XCTAssertEqual(retained.st_ino, original.st_ino, "flockPrecedesEverySocketOperation")
+        let client = socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { close(client) }
+        XCTAssertEqual(usingAddress { connect(client, $0, $1) }, 0, "flockPrecedesEverySocketOperation")
+        let accepted = accept(serving, nil, nil)
+        XCTAssertGreaterThanOrEqual(accepted, 0, "flockPrecedesEverySocketOperation")
+        if accepted >= 0 { close(accepted) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: config.bridgeLog), "flockPrecedesEverySocketOperation")
+        withExtendedLifetime(lock) {}
+    }
+
+    func testRuntimeSeparatesChannelAllowlists() throws {
+        let privateOnly = RelayFrame(type: "ready")
+        XCTAssertThrowsError(try FrameAllowlist.validate(privateOnly, direction: .publicInbound), "runtimeSeparatesChannelAllowlists")
+        let publicOnly = RelayFrame(type: "ping")
+        XCTAssertThrowsError(try FrameAllowlist.validate(publicOnly, direction: .nodeToRelay), "runtimeSeparatesChannelAllowlists")
     }
 
     private func probe() -> RelayFrame {

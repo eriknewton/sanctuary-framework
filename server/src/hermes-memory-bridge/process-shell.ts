@@ -57,6 +57,9 @@ export const CHILD_READY_TIMEOUT_MS = 5_000;
 export const RELAY_CHILD_SIGTERM_GRACE_MS = 3_000;
 // Must match `relayChildExitBoundMilliseconds` in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift.
 export const RELAY_CHILD_EXIT_BOUND_MS = PROBE_REPLY_BOUND_MS + RELAY_CHILD_SIGTERM_GRACE_MS;
+// Must match `relayChildReapBoundMilliseconds` in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift.
+// Uncatchable SIGKILL leaves only kernel exit and scheduler latency within this final allowance.
+export const RELAY_CHILD_REAP_BOUND_MS = 1_000;
 
 export const DRAIN_TAIL_MS = 400;
 export const BARRIER_RELEASE_BOUND_MS = KERNEL_LOCK_RELEASE_TIMEOUT_MS;
@@ -154,6 +157,12 @@ class StartupRefusal extends Error {
   constructor(readonly state: string, message: string) {
     super(message);
     this.name = "HermesBridgeStartupRefusal";
+  }
+}
+
+class CorpusLockRefusal extends StartupRefusal {
+  constructor(readonly lockPath: string) {
+    super(STATE_CONFIG_CHECKED, "leftover corpus lock requires operator recovery");
   }
 }
 
@@ -354,6 +363,8 @@ class AuditForwarder extends SingleBindForwarder<AuditLog> {
 
 class FrameWriterForwarder {
   private writer: HermesSocketWriter | undefined;
+
+  get bound(): boolean { return this.writer !== undefined; }
 
   bind(writer: HermesSocketWriter): void {
     if (this.writer !== undefined) throw new Error("Hermes bridge writer was already bound");
@@ -649,6 +660,10 @@ export async function hermesBridgeMain(options: HermesBridgeMainOptions): Promis
   } catch (error) {
     if (error instanceof StartupRefusal) {
       stderr.write(`hermes-memory-bridge ${error.state}: startup refused\n`);
+      if (error instanceof CorpusLockRefusal) {
+        // Only the locally derived lock path is disclosed; raw storage errors and custody values are never logged.
+        stderr.write(`corpus_lock=${JSON.stringify(error.lockPath)}; recovery: stop the relay and all fortress writers, verify none remain, then explicitly remove only this exact lock and restart; never auto-delete\n`);
+      }
       return EXIT_STARTUP_REFUSED;
     }
     stderr.write(`hermes-memory-bridge ${STATE_GATE_WIRED}: startup refused\n`);
@@ -716,6 +731,7 @@ export async function runHermesBridgeProcess(options: HermesBridgeProcessOptions
     const controller = new ShellController(composition.auditForwarder, barrier, stream, stderr);
     const writer = new HermesSocketWriter(stream, () => controller.writerFailed());
     composition.writerForwarder.bind(writer);
+    assertHermesBridgeBindings({ ...composition.report.forwardersBound, writer: composition.writerForwarder.bound });
     controller.attach(core, writer);
     controller.addCleanup(() => stream?.removeAllListeners());
     controller.addCleanup(() => establishedCustody.masterKey.fill(0));
@@ -770,8 +786,23 @@ function state_FD_CHECKED(argv: readonly string[]): number {
 }
 
 function state_ENV_REPLACED(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return validateHermesBridgeEnvironment(env, process.platform, process.getuid?.());
+}
+
+/** Validate the relay environment against the host platform and the receiving process's own uid. */
+export function validateHermesBridgeEnvironment(
+  env: NodeJS.ProcessEnv, platform: NodeJS.Platform, uid: number | undefined,
+): NodeJS.ProcessEnv {
   // Must match ChildSupervisor.configuredEnvironment in hermes-memory-relay/Sources/HermesMemoryRelayCore/Core.swift: the relay passes exactly these keys.
   const allowed = new Set<string>(HERMES_BRIDGE_ENV_ALLOWLIST);
+  const encoding = env.__CF_USER_TEXT_ENCODING;
+  // CoreFoundation injects this OS encoding hint after spawn; it carries no authority and is not a caller-controlled configuration input.
+  // Must match the six-key spawn plan in Core.swift (ChildSupervisor.configuredEnvironment); this tolerance never adds a spawn key.
+  if (platform === "darwin" && uid !== undefined && encoding !== undefined
+      && /^0x[0-9A-F]+:0x[0-9A-F]+:0x[0-9A-F]+$/u.test(encoding)
+      && encoding.split(":")[0] === `0x${uid.toString(16).toUpperCase()}`) {
+    allowed.add("__CF_USER_TEXT_ENCODING");
+  }
   const offenders = Object.keys(env).filter((key) => !allowed.has(key)).sort();
   if (offenders.length > 0) {
     throw new StartupRefusal(STATE_ENV_REPLACED, `unexpected environment keys: ${offenders.join(",")}`);
@@ -901,7 +932,7 @@ async function assertNoLeftoverCorpusLock(storage: FilesystemStorage): Promise<v
     },
   );
   if (exists) {
-    throw new StartupRefusal(STATE_CONFIG_CHECKED, `leftover corpus lock remains at ${lockPath}`);
+    throw new CorpusLockRefusal(lockPath);
   }
 }
 
@@ -1076,6 +1107,20 @@ async function composeHermesBridge(input: {
 }
 
 function state_GATE_WIRED(): void {}
+
+/** Refuse readiness unless every required bridge consumer is bound at the composition boundary. */
+export function assertHermesBridgeBindings(bindings: {
+  readonly adapter: boolean;
+  readonly audit: boolean;
+  readonly badSignerScanner: boolean;
+  readonly writer: boolean;
+}): void {
+  // Ready promises reachable consumers; constructing an unbound forwarder does not establish that promise.
+  if (bindings.adapter !== true || bindings.audit !== true || bindings.badSignerScanner !== true || bindings.writer !== true) {
+    throw new StartupRefusal(STATE_GATE_WIRED, "required bridge consumer is unavailable");
+  }
+}
+
 function state_CHILD_READY(): void {
   void STATE_CHILD_READY;
 }

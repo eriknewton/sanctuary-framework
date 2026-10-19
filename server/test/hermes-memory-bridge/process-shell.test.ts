@@ -390,6 +390,39 @@ describe("Hermes memory process shell", () => {
     }
   }, 30_000);
 
+  it("supervisionConvergesBothDirections: relay EOF drains the real CLI child", async () => {
+    const fixture = await seededFortress("supervision-eof");
+    // This child receives the configured environment at spawn; no test bootstrap rewrites process.env.
+    const script = `
+      const { pathToFileURL } = await import("node:url");
+      const { installInMemoryKeychainStore } = await import(pathToFileURL(${JSON.stringify(keychainStoreEntry)}).href);
+      installInMemoryKeychainStore();
+      process.argv = [process.execPath, ${JSON.stringify(cliEntry)}, ...process.argv.slice(1)];
+      await import(pathToFileURL(${JSON.stringify(cliEntry)}).href);
+    `;
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script,
+      "hermes-memory-bridge", "run", "--relay-fd", "3"], {
+      cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "pipe"], env: fixture.env,
+    });
+    const relay = child.stdio[3] as Duplex;
+    const stderr = collectChildStderr(child);
+    relay.on("error", () => undefined);
+    try {
+      expect(await readNodeFrame(relay)).toEqual({ type: "ready" });
+      // A pending production insert keeps real work live until EOF actually reaches the core.
+      relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "pending-eof", name: "memory_insert",
+        arguments: { text: "unapproved EOF fixture", taint: "user_content" } }));
+      await waitUntil(() => stderr().includes("owner approval is deferred"));
+      relay.end();
+      const outcome = await boundedValue(childExit(child), RELAY_CHILD_SIGTERM_GRACE_MS, "not_drained" as const);
+      expect(outcome, "supervisionConvergesBothDirections").toEqual({ code: EXIT_CLEAN, signal: null });
+    } finally {
+      killChild(child);
+      await childExit(child);
+    }
+  }, 30_000);
+
   it("refuses VITEST in the real CLI subprocess", async () => {
     const fixture = await seededFortress("vitest-refusal");
     const child = spawnBridgeCli({ ...fixture.env, VITEST: "true" });
@@ -1862,7 +1895,7 @@ describe("Hermes memory process shell", () => {
     })).rejects.toMatchObject({ state: "state_FORTRESS_UNLOCKED" });
   });
 
-  it("waits for a post-allow document write before a signal stop resolves cleanly", async () => {
+  it("relayStopPreservesPassedLease: waits for a post-allow document write before a signal stop resolves cleanly", async () => {
     const fixture = await seededFortress("signal-drain");
     const pair = await socketPair();
     let stderrText = "";
