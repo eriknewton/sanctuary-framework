@@ -1,6 +1,9 @@
 /// Bounded response diagnostics for per-layer witnesses; no upstream content is retained.
 public enum ResponseFailure: Error, Equatable, Sendable { case protocolViolation, falseDone, invalidEventJSON }
 
+/// Explicit terminal cause; deadlines have distinct pre-commit HTTP semantics.
+public enum ResponseFailureCause: Sendable { case deadline, reset, protocolViolation }
+
 /// Pure upstream HTTP/SSE decoder. Feed one byte only after draining the prior returned output.
 /// This keeps the output queue at one event; socket ownership and deadlines belong to G2.
 public struct ResponseFramer: Sendable {
@@ -13,7 +16,7 @@ public struct ResponseFramer: Sendable {
     public private(set) var failure: ResponseFailure?
     /// The runtime closes after draining the final segment; a closed parser never revives.
     public var isClosed: Bool { state == .closed }
-    /// The runtime chooses fixed 504 before commitment and B27 after commitment on deadline.
+    /// Commitment determines whether a failure returns a fixed HTTP response or a B27 chunk.
     public var isStreamingCommitted: Bool { committed }
     public init(request: ValidatedRequest, limits: GatewayLimits) {
         streaming = request.streaming; self.limits = limits
@@ -22,16 +25,16 @@ public struct ResponseFramer: Sendable {
     public mutating func receive(_ byte: UInt8) -> [UInt8] {
         guard state != .closed else { return [] }
         do { return try step(byte) } catch {
-            failure = (error as? ResponseFailure) ?? .protocolViolation; return fail()
+            failure = (error as? ResponseFailure) ?? .protocolViolation; return fail(cause: .protocolViolation)
         }
     }
     /// Must be called only for genuine transport EOF, never a timeout/reset. Holds DONE until here.
     public mutating func endOfInput() -> [UInt8] {
         guard state != .closed else { return [] }
-        guard state == .framedEnd || state == .closeBody else { return fail() }
+        guard state == .framedEnd || state == .closeBody else { return fail(cause: .protocolViolation) }
         if sse {
             // HTTP termination and exact DONE are both required; finish_reason alone is not completion.
-            guard sawDone, event.isEmpty else { return fail() }
+            guard sawDone, event.isEmpty else { return fail(cause: .protocolViolation) }
             state = .closed
             return chunk(GatewayProtocol.done) + bytes("0\r\n\r\n")
         }
@@ -42,15 +45,16 @@ public struct ResponseFramer: Sendable {
             // Regenerated framing cannot propagate Location, cookies or upstream credentials.
             let reason = status == 200 ? "OK" : "Upstream Error"
             return bytes("HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n") + body
-        } catch { return fail() }
+        } catch { return fail(cause: .protocolViolation) }
     }
     /// Reset, deadline, malformed transport or cancellation of upstream work uses this terminal path.
     /// The writer must never splice it into a partially delivered event (G2 terminal-reserve contract).
-    public mutating func fail() -> [UInt8] {
+    public mutating func fail(cause: ResponseFailureCause) -> [UInt8] {
         guard state != .closed else { return [] }
         state = .closed; body = []; event = []; header = []; sizeLine = []
         // Incomplete chunking is intentional; never emit a zero chunk on truncation (B27).
-        return committed ? chunk(GatewayProtocol.truncation) : FixedResponse.upstream.wire
+        if committed { return chunk(GatewayProtocol.truncation) }
+        return cause == .deadline ? FixedResponse.deadline.wire : FixedResponse.upstream.wire
     }
     private mutating func step(_ byte: UInt8) throws -> [UInt8] {
         switch state {

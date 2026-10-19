@@ -30,7 +30,7 @@ final class ResponseTests: XCTestCase {
             XCTAssertEqual(framer.endOfInput(), bytes("e\r\ndata: [DONE]\n\n\r\n0\r\n\r\n"))
             XCTAssertTrue(framer.isClosed)
             XCTAssertEqual(framer.endOfInput(), [])
-            XCTAssertEqual(framer.fail(), [])
+            XCTAssertEqual(framer.fail(cause: .reset), [])
             XCTAssertEqual(framer.receive(0), [])
         }
         // HTTP chunks deliberately split every SSE byte; event and transfer boundaries are unrelated.
@@ -45,12 +45,12 @@ final class ResponseTests: XCTestCase {
                 XCTAssertTrue(out.suffix(chunk(GatewayProtocol.truncation).count).elementsEqual(chunk(GatewayProtocol.truncation)))
                 XCTAssertFalse(out.suffix(5).elementsEqual(bytes("0\r\n\r\n")))
             }
-            // Both reset and deadline enter the same explicit pure terminal action; G2 supplies the cause.
-            for _ in ["reset", "deadline"] {
+            // Both causes truncate after commitment; their pre-commit responses are tested separately.
+            for cause in [ResponseFailureCause.reset, .deadline] {
                 var framer = ResponseFramer(request: try parse(chatField(#""stream":true"#)), limits: .fixture)
                 _ = feed(responseHeader() + chunk(tail), to: &framer)
-                XCTAssertEqual(framer.fail(), chunk(GatewayProtocol.truncation))
-                XCTAssertEqual(framer.fail(), [])
+                XCTAssertEqual(framer.fail(cause: cause), chunk(GatewayProtocol.truncation))
+                XCTAssertEqual(framer.fail(cause: .reset), [])
             }
         }
     }
@@ -123,6 +123,7 @@ final class ResponseTests: XCTestCase {
         XCTAssertEqual(try response(header + chunk(event + GatewayProtocol.done) + bytes("0\r\n\r\n"), limits: limits), streamHeader + chunk(event) + chunk(GatewayProtocol.done) + bytes("0\r\n\r\n"))
         let eventShort = try GatewayLimits(body: event.count - 1, headers: header.count, response: limits.response)
         XCTAssertEqual(try response(header + chunk(event), limits: eventShort), streamHeader + chunk(GatewayProtocol.truncation))
+        // One combined chunk exceeds the declared chunk budget before any event is emitted.
         let aggregateShort = try GatewayLimits(body: event.count, headers: header.count, response: limits.response - 1)
         XCTAssertEqual(try response(header + chunk(event + GatewayProtocol.done), limits: aggregateShort), streamHeader + chunk(GatewayProtocol.truncation))
         let headerShort = try GatewayLimits(body: event.count, headers: header.count - 1, response: limits.response)
@@ -142,4 +143,49 @@ final class ResponseTests: XCTestCase {
         // The extra byte must refuse immediately, before the shared JSON parser is reached.
         XCTAssertEqual(aggregate.receive(32), FixedResponse.upstream.wire)
     }
+    func testPrecommitDeadline() throws {
+        var framer = ResponseFramer(request: try parse(), limits: .fixture)
+        XCTAssertEqual(framer.fail(cause: .deadline), FixedResponse.deadline.wire)
+        XCTAssertEqual(framer.fail(cause: .reset), [])
+        XCTAssertEqual(framer.endOfInput(), [])
+        XCTAssertEqual(framer.receive(0), [])
+    }
+    func testPrecommitReset() throws {
+        var framer = ResponseFramer(request: try parse(), limits: .fixture)
+        XCTAssertEqual(framer.fail(cause: .reset), FixedResponse.upstream.wire)
+        XCTAssertEqual(framer.fail(cause: .deadline), [])
+    }
+    func testPrecommitProtocolFailure() throws {
+        var framer = ResponseFramer(request: try parse(), limits: .fixture)
+        XCTAssertEqual(framer.fail(cause: .protocolViolation), FixedResponse.upstream.wire)
+    }
+    func testSSECarriageReturnLayer() throws {
+        var framer = ResponseFramer(request: try parse(chatField(#""stream":true"#)), limits: .fixture)
+        // CR is legal JSON whitespace here, so only the SSE layer can refuse it.
+        XCTAssertEqual(feed(responseHeader() + chunk(bytes("data: {}\r\n\n")), to: &framer), streamHeader + chunk(GatewayProtocol.truncation))
+        XCTAssertEqual(framer.failure, .protocolViolation)
+    }
+    func testSSEMultilineLayer() throws {
+        var framer = ResponseFramer(request: try parse(chatField(#""stream":true"#)), limits: .fixture)
+        // The embedded LF is valid JSON whitespace, isolating the SSE single-line rule.
+        XCTAssertEqual(feed(responseHeader() + chunk(bytes("data: {\n}\n\n")), to: &framer), streamHeader + chunk(GatewayProtocol.truncation))
+        XCTAssertEqual(framer.failure, .protocolViolation)
+    }
+    func testNonstreamErrorStatus() throws {
+        for status in [400, 401, 413, 429, 500, 599] {
+            XCTAssertEqual(try response(responseHeader("application/json", framing: "Content-Length: 2\r\n", status: status) + bytes("{}"), streaming: false), FixedResponse.upstream.wire)
+        }
+    }
+    func testStreamAggregateCapAfterEvent() throws {
+        let closeHeader = responseHeader(framing: "")
+        let limits = try GatewayLimits(body: event.count, headers: closeHeader.count,
+                                       response: event.count + GatewayProtocol.done.count - 1)
+        var framer = ResponseFramer(request: try parse(chatField(#""stream":true"#)), limits: limits)
+        XCTAssertEqual(feed(closeHeader + event, to: &framer), streamHeader + chunk(event))
+        // No declared chunk length can reject early: the last DONE byte crosses the aggregate cap.
+        XCTAssertEqual(feed(GatewayProtocol.done, to: &framer), chunk(GatewayProtocol.truncation))
+        XCTAssertTrue(framer.isClosed)
+        XCTAssertEqual(framer.endOfInput(), [])
+    }
+
 }

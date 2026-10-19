@@ -5,7 +5,10 @@ indirect enum JSON: Equatable, Sendable {
     var members: [Member]? { if case .object(let m) = self { m } else { nil } }
     var elements: [JSON]? { if case .array(let a) = self { a } else { nil } }
     var string: [UInt8]? { if case .string(let s) = self { s } else { nil } }
-    subscript(_ name: String) -> JSON? { members?.first { $0.key == bytes(name) }?.value }
+    subscript(_ name: String) -> JSON? {
+        let key = bytes(name)
+        return members?.first { $0.key == key }?.value
+    }
 }
 
 struct StrictJSON {
@@ -31,7 +34,7 @@ struct StrictJSON {
     mutating func value(depth: Int) throws -> JSON {
         whitespace(); nodes += 1
         // Counting every value and key bounds aggregate work as well as recursion.
-        guard nodes <= budget / 2, depth <= GatewayProtocol.depth, offset < input.count else {
+        guard nodes <= jsonNodeCap(budget), depth <= GatewayProtocol.depth, offset < input.count else {
             throw Refusal.syntax
         }
         switch input[offset] {
@@ -42,7 +45,7 @@ struct StrictJSON {
             if take(125) { return .object(members) }
             repeat {
                 whitespace(); let key = try string(); nodes += 1
-                guard nodes <= budget / 2 else { throw Refusal.syntax }
+                guard nodes <= jsonNodeCap(budget) else { throw Refusal.syntax }
                 // Decoded byte identity catches escaped duplicates without merging distinct Unicode names.
                 guard keys.insert(key).inserted else { throw Refusal.duplicate }
                 whitespace(); try require(58)

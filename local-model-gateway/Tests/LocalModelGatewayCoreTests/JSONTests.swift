@@ -54,4 +54,15 @@ final class JSONTests: XCTestCase {
         var out: [UInt8] = []; emitJSON(value, into: &out)
         XCTAssertEqual(out, bytes("[1.00,1E+2,-0,1e-300,9007199254740993]"))
     }
+    func testObjectKeysConsumeNodes() throws {
+        let input = bytes(#"{"a":0}"#)
+        let budget = input.count
+        // Leave exactly two nodes: object plus value fit, but the key must consume a third.
+        var parser = StrictJSON(input: input, budget: budget, nodes: jsonNodeCap(budget) - 2)
+        XCTAssertThrowsError(try parser.parse()) { XCTAssertEqual($0 as? Refusal, .syntax) }
+        var exact = StrictJSON(input: input, budget: budget, nodes: jsonNodeCap(budget) - 3)
+        _ = try exact.parse()
+        XCTAssertEqual(exact.nodes, jsonNodeCap(budget))
+    }
+
 }

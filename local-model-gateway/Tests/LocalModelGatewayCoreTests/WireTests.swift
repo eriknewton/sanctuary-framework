@@ -125,4 +125,15 @@ final class WireTests: XCTestCase {
         XCTAssertEqual(error.count, 105)
         XCTAssertEqual(chunk(error), bytes("69\r\n") + error + bytes("\r\n"))
     }
+    func testGETDeclaredBodyRefusesAtHeaders() throws {
+        for route in [Route.tags, .models] {
+            var framer = RequestFramer(limits: .fixture)
+            let headers = route.method + bytes(" ") + route.target + bytes(" HTTP/1.1\r\nHost: 127.0.0.1:11436\r\nContent-Length: 1\r\n\r\n")
+            // Header completion, without a body byte or EOF, must already close the request.
+            XCTAssertThrowsError(try framer.receive(headers)) { XCTAssertEqual($0 as? Refusal, .schema) }
+            XCTAssertThrowsError(try framer.receive([0])) { XCTAssertEqual($0 as? Refusal, .extraBytes) }
+            XCTAssertNoThrow(try framer.endOfInput())
+        }
+    }
+
 }

@@ -20,12 +20,14 @@ struct HeaderBlock {
         self.fields = fields
     }
     func one(_ name: String) throws -> [UInt8]? {
-        let matches = fields.filter { $0.name == bytes(name) }
+        let key = bytes(name)
+        let matches = fields.filter { $0.name == key }
         guard matches.count <= 1 else { throw Refusal.framing }
         return matches.first?.value
     }
     func forbid(_ names: [String]) throws {
-        guard !fields.contains(where: { names.map(bytes).contains($0.name) }) else { throw Refusal.framing }
+        let forbidden = names.map(bytes)
+        guard !fields.contains(where: { forbidden.contains($0.name) }) else { throw Refusal.framing }
     }
 }
 
@@ -60,7 +62,7 @@ func decimalLength(_ raw: [UInt8]) throws -> Int {
 
 /// One connection's pure request framing state. A refusal or completed request is absorbing.
 public struct RequestFramer: Sendable {
-    private enum State: Sendable { case headers, body, complete, refused }
+    private enum State: Sendable { case headers, body, complete, closed }
     private var state = State.headers
     private var header: [UInt8] = [], body: [UInt8] = []
     private var route: Route?, length = 0
@@ -84,20 +86,20 @@ public struct RequestFramer: Sendable {
                 case .body:
                     body.append(byte)
                     if body.count == length { state = .complete }
-                case .complete, .refused: throw Refusal.extraBytes
+                case .complete, .closed: throw Refusal.extraBytes
                 }
             }
             if state == .complete {
                 // Only the shared schema can issue the serializer's input type.
                 let request = try ValidatedRequest.parse(route: route!, body: body, limits: limits)
-                state = .refused; body = []; return request
+                state = .closed; body = []; return request
             }
             return nil
-        } catch { state = .refused; header = []; body = []; throw error }
+        } catch { state = .closed; header = []; body = []; throw error }
     }
     /// EOF before the declared body is complete is a framing refusal, never a partial request.
     public mutating func endOfInput() throws {
-        guard state == .refused else { state = .refused; throw Refusal.framing }
+        guard state == .closed else { state = .closed; throw Refusal.framing }
     }
     private mutating func parseHeaders() throws {
         let block = try HeaderBlock(Array(header.dropLast(GatewayProtocol.headerEnd.count)))

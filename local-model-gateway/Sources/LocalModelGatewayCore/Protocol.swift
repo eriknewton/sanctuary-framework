@@ -21,7 +21,7 @@ public struct GatewayLimits: Equatable, Sendable {
     public let response: Int
     public var event: Int { body }
     public init(body: Int, headers: Int, response: Int) throws {
-        // Positive, add-safe budgets prevent overflow in framing and node accounting.
+        // Half the integer range leaves room to add two independently bounded lengths without overflow.
         guard body > 0, headers > 0, response > 0,
               max(body, headers, response) <= Int.max / 2 else { throw Refusal.size }
         self.body = body; self.headers = headers; self.response = response
@@ -75,7 +75,7 @@ func asciiLower(_ value: [UInt8]) -> [UInt8] {
 }
 
 // Go 1.26 encoding/json foldName: ASCII folding plus the only non-ASCII simple-fold
-// cycles reaching ASCII, U+017F long s and U+212A Kelvin sign. Must match CaseTests.
+// cycles reaching ASCII, U+017F long s and U+212A Kelvin sign. Must match RequestTests.testCaseLayers.
 func goFold(_ value: [UInt8]) -> [UInt8] {
     var result: [UInt8] = []
     for scalar in String(decoding: value, as: UTF8.self).unicodeScalars {
@@ -87,3 +87,7 @@ func goFold(_ value: [UInt8]) -> [UInt8] {
     }
     return result
 }
+
+// G-r2 defines N = floor(payloadBudget / 2): one minimal scalar byte plus its separator
+// amortizes to two bytes. Integer division supplies the floor, shared by node and array checks.
+func jsonNodeCap(_ payloadBudget: Int) -> Int { payloadBudget / 2 }
