@@ -736,7 +736,8 @@ function toast(message, kind) {
   el.className = "toast" + (kind === "error" ? " error" : "");
   el.textContent = message;
   host.appendChild(el);
-  setTimeout(function () { el.remove(); }, 4000);
+  const toastLifetimeMs = 4 * 1000; // Four seconds, preserving the existing toast lifetime.
+  setTimeout(function () { el.remove(); }, toastLifetimeMs);
 }
 
 // ── Template registry (mirror of server templates.ts) ──────────────────
@@ -1550,12 +1551,9 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
-  // The retained decision result heads every screen that can take a decision, so the outcome of the last
-  // decision is on the screen the operator decided from and survives a route change.
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
-  // Composed after every replacement of the route body above, including the stopped-updates panel, so no path
-  // can drop a retained result from the screen.
-  if (DECISION_RESULT_ROUTES.indexOf(state.route) >= 0) nextHtml = renderDecisionResult() + nextHtml;
+  // F is outside the route body, including stopped-updates and Talk screens.
+  renderFeedback();
   // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
   // a composer that left the document while still owned was replaced by some
   // other writer, and a silent remount would discard the draft it held.
@@ -6535,7 +6533,7 @@ function state_NOTADMITTEDDecision(fields, reason) {
     // nothing is noted on it (one slot, so repeated clicks cannot grow it) and the warning stays unclearable.
     current.notSent = "Your next " + notSent;
     announceDecision(current);
-    rerender();
+    renderFeedback();
     return;
   }
   state.approvals.result = Object.assign({ status: "not_sent", rule: null, refresh: "loaded", records: [] }, fields, { message: notSent });
@@ -6569,9 +6567,6 @@ async function onInboxAction(itemId, action) {
 const DECISION_BUSY_REASON = "Another decision is being sent.";
 const DECISION_REREAD_NOTE = "The queue could not be re-read after this decision, so this list may be out of date.";
 const DECISION_UNCERTAIN_ADVICE = "The decision may or may not have been applied. Check the queue before deciding again.";
-// The routes whose renderers emit inbox-* or inbox-batch-* controls: Approvals, Overview, Evidence and
-// Agent detail (with its inspect panel). A new decision surface joins this list in the same change.
-const DECISION_RESULT_ROUTES = ["approvals", "posture", "activity", "agent-detail"];
 const DECISION_VERB = { approve: "Allow once", deny: "Deny", dismiss: "Dismiss", archive: "Archive", delete: "Delete", snooze: "Snooze" };
 const DECISION_DONE = { approve: "Allowed once", deny: "Denied", dismiss: "Dismissed", archive: "Archived", delete: "Deleted", snooze: "Snoozed" };
 const DECISION_REREAD_BUSY_REASON = "The queue is being re-read after a decision.";
@@ -6686,6 +6681,14 @@ function decisionRecordLine(item, action) {
   if (!item || (action !== "approve" && action !== "deny")) return "";
   return isCharterApprovalItem(item) ? " Recorded in your audit log." : " Marked decided in this inbox.";
 }
+// The host id must match decision-feedback-result in html.ts. Clear uses this
+// patch directly so it does not replace route nodes or restore input focus.
+function renderFeedback() {
+  const host = document.getElementById("decision-feedback-result");
+  if (!host) return;
+  const html = renderDecisionResult();
+  if (host.innerHTML !== html) host.innerHTML = html;
+}
 function renderDecisionResult() {
   const r = state.approvals.result;
   if (!r) return "";
@@ -6704,28 +6707,26 @@ function decisionFirstSentence(message) {
   return first.slice(-1) === "." ? first : first + ".";
 }
 function renderDecisionBatchInline() {
-  // The Evidence inbox repeats the one-line status of the last batch beside its toolbar, since the result block
-  // at the top of the screen can sit above the fold when the operator decided from this section.
+  // The Evidence inbox repeats the last batch status beside its toolbar; full text stays in F.
   const r = state.approvals.result;
   if (!r || r.kind !== "batch") return "";
   // A partly taken batch keeps its whole short message here, so the refusal is not dropped with the second sentence.
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
     : r.status === "acknowledged" ? (decisionHeadline(r) === DECISION_HEADLINE.acknowledged ? decisionFirstSentence(r.message) : r.message)
-    : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
-    : r.status === "not_sent" ? "Not sent. See the decision result at the top of this screen."
-    : "Unconfirmed. See the decision result at the top of this screen.";
+    : r.status === "refused" ? "Refused. See the decision result in Feedback below."
+    : r.status === "not_sent" ? "Not sent. See the decision result in Feedback below."
+    : "Unconfirmed. See the decision result in Feedback below.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 function renderDecisionInline(item) {
-  // The drawer and every row with decision controls repeat the one-line status for the decided request, since the
-  // result block at the top of the screen can sit above the fold; the full text stays in the result block.
+  // The drawer and rows repeat the status for the decided request; full text stays in F.
   const r = state.approvals.result;
   if (!r || r.kind !== "item" || r.itemId !== item.item_id || item.resolved) return "";
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
     : r.status === "acknowledged" ? decisionDone(r.action) + "."
-    : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
-    : r.status === "not_sent" ? "Not sent. See the decision result at the top of this screen."
-    : "Unconfirmed. See the decision result at the top of this screen.";
+    : r.status === "refused" ? "Refused. See the decision result in Feedback below."
+    : r.status === "not_sent" ? "Not sent. See the decision result in Feedback below."
+    : "Unconfirmed. See the decision result in Feedback below.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 
@@ -7601,7 +7602,7 @@ document.addEventListener("click", function (ev) {
     // unconfirmed result has no such control: a stray click on a stale button must not clear it either.
     if (decisionInFlight() || (state.approvals.result && state.approvals.result.status === "uncertain")) return;
     state.approvals.result = null;
-    return rerender();
+    return renderFeedback();
   }
   if (action === "approval-always-allow") {
     // An in-flight decision retains its consent state until settlement.
