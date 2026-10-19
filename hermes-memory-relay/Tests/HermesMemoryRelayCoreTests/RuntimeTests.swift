@@ -72,10 +72,10 @@ final class RuntimeTests: XCTestCase {
         let runtime = RelayRuntime(configuration: try RuntimeConfiguration.parse(fixture()), environment: [:],
                                    socketGroup: getgid(), instanceLock: DarwinInstanceLock(),
                                    verifySocketPath: { throw RuntimeFailure.socket },
-                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false })
+                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false }, reapChild: Darwin.waitpid)
         // Four live slots each reserve accepted, call, eight controls, closed, probe reply; one shutdown slot.
         let requiredPrivateQueueCap = 4 * (1 + 1 + 8 + 1 + 1) + 1
-        for _ in 0..<requiredPrivateQueueCap {
+        for _ in 0..<(requiredPrivateQueueCap - 1) {
             try runtime.enqueueNode(RelayFrame(type: "closed", fields: ["connection_id": .string("c1")]), id: nil, kind: nil)
         }
         XCTAssertThrowsError(try runtime.enqueueNode(RelayFrame(type: "closed", fields: ["connection_id": .string("c1")]), id: nil, kind: nil), "runtimeFloodRetentionIsBounded")
@@ -101,7 +101,7 @@ final class RuntimeTests: XCTestCase {
         let runtime = RelayRuntime(configuration: try RuntimeConfiguration.parse(fixture()), environment: [:],
                                    socketGroup: getgid(), instanceLock: DarwinInstanceLock(),
                                    verifySocketPath: { throw RuntimeFailure.socket },
-                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false })
+                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { false }, reapChild: Darwin.waitpid)
         var sockets = [Int32](repeating: -1, count: 2)
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
         defer { sockets.forEach { close($0) } }
@@ -143,7 +143,7 @@ final class RuntimeTests: XCTestCase {
         XCTAssertTrue(connection.receivePublicBytes(ping).compactMap(nodeType).contains("closed"), "controlResponseAllowanceWaitsForWrite")
     }
 
-    func testFifthConnectionNeverReachesNode() throws {
+    func testParkedAdmissionModelCapacity() throws {
         var admission = RelayAdmissionController()
         for _ in 0..<4 { XCTAssertEqual(try admission.acceptPeer().compactMap(nodeType), ["accepted"]) }
         XCTAssertEqual(try admission.acceptPeer(), [.closePublicConnection], "fifthConnectionNeverReachesNode")
@@ -160,8 +160,13 @@ final class RuntimeTests: XCTestCase {
             executablePath: "/opt/node", bridgeEntryPath: "/opt/cli.js", bridgeLogPath: "/tmp/log",
             relayFD: 4, baseEnvironment: ["HOME": "/tmp/home", "LANG": "C", "TMPDIR": "/tmp/tmp", "SECRET": "excluded"],
             bridgeIdentity: "pin", agentID: "hermes", fortressID: "hermes-memory"))
-        // These are the entries materialized by posix_spawn, before the OS initializes the child.
-        XCTAssertEqual(Set(plan.environmentEntries), Set([
+        // Six entries plus the terminating null pointer are inspected before the OS initializes the child.
+        let materialized = RelayRuntime.withSpawnEnvironment(plan) { values in
+            XCTAssertEqual(values.count, 7, "spawnUsesOnlyConfiguredEnvironment actual array")
+            XCTAssertNil(values.last!, "spawnUsesOnlyConfiguredEnvironment terminator")
+            return values.compactMap { $0.map { String(cString: $0) } }
+        }
+        XCTAssertEqual(Set(materialized), Set([
             "HOME=/tmp/home", "LANG=C", "TMPDIR=/tmp/tmp", "HERMES_MEMORY_BRIDGE_IDENTITY=pin",
             "HERMES_MEMORY_AGENT_ID=hermes", "HERMES_MEMORY_FORTRESS_ID=hermes-memory"
         ]), "spawnUsesOnlyConfiguredEnvironment")
@@ -203,7 +208,7 @@ final class RuntimeTests: XCTestCase {
         var socketWork = false
         let runtime = RelayRuntime(configuration: config, environment: [:], socketGroup: getgid(),
                                    instanceLock: DarwinInstanceLock(), verifySocketPath: { socketWork = true },
-                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { true })
+                                   verifyPeer: { _ in throw RuntimeFailure.socket }, ordinaryReadsEnabled: { true }, reapChild: Darwin.waitpid)
         XCTAssertEqual(runtime.run(), EX_CONFIG, "flockPrecedesEverySocketOperation")
         XCTAssertFalse(socketWork, "flockPrecedesEverySocketOperation")
         var retained = stat()
@@ -226,6 +231,162 @@ final class RuntimeTests: XCTestCase {
         XCTAssertThrowsError(try FrameAllowlist.validate(publicOnly, direction: .nodeToRelay), "runtimeSeparatesChannelAllowlists")
     }
 
+    func testProtectedConfigThroughBothEntrypoints() throws {
+        let repository = FileManager.default.homeDirectoryForCurrentUser.path
+        let cases = ["valid", "mode", "owner", "leaf-link", "ancestor-link", "group-write", "other-write", "oversize", "oversize-stat"]
+        for scenario in cases {
+            var template = Array((repository + "/.hmr-XXXXXX").utf8CString)
+            let root = try XCTUnwrap(mkdtemp(&template)).withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+            defer { try? FileManager.default.removeItem(atPath: root) }
+            let privateDir = root + "/private"
+            try FileManager.default.createDirectory(atPath: privateDir, withIntermediateDirectories: false,
+                                                   attributes: [.posixPermissions: 0o700])
+            let node = root + "/node", entry = root + "/entry.js", path = privateDir + "/relay-config.json"
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: URL(fileURLWithPath: node))
+            XCTAssertEqual(chmod(node, 0o700), 0)
+            try Data("fixture".utf8).write(to: URL(fileURLWithPath: entry))
+            let bytes = try fixture(["node_executable": node, "node_entry": entry,
+                "private_dir": privateDir, "bridge_log": privateDir + "/bridge.log", "relay_log": privateDir + "/relay.log"])
+            try bytes.write(to: URL(fileURLWithPath: path))
+            XCTAssertEqual(chmod(path, 0o600), 0)
+            var input = path
+            switch scenario {
+            case "mode": XCTAssertEqual(chmod(path, 0o644), 0)
+            case "leaf-link":
+                try FileManager.default.moveItem(atPath: path, toPath: privateDir + "/actual")
+                XCTAssertEqual(symlink(privateDir + "/actual", path), 0)
+            case "ancestor-link":
+                XCTAssertEqual(symlink(root, root + "/alias"), 0)
+                input = root + "/alias/private/relay-config.json"
+                let linked = try fixture(["node_executable": node, "node_entry": entry,
+                    "private_dir": root + "/alias/private", "bridge_log": privateDir + "/bridge.log", "relay_log": privateDir + "/relay.log"])
+                try linked.write(to: URL(fileURLWithPath: path))
+            case "group-write": XCTAssertEqual(chmod(root, 0o720), 0)
+            case "other-write": XCTAssertEqual(chmod(root, 0o702), 0)
+            case "oversize":
+                // Legal JSON plus whitespace isolates the size check from the schema parser.
+                let oversized = bytes + Data(repeating: UInt8(ascii: " "), count: RuntimeConfiguration.maximumConfigBytes)
+                try oversized.write(to: URL(fileURLWithPath: path))
+                XCTAssertThrowsError(try RuntimeConfiguration.parse(oversized), "protectedConfig oversize parser")
+            default: break
+            }
+            for option in ["--check-config", "--config"] {
+                var composed = false, observedStat = false
+                let code = RelayRuntime.main(["relay", option, input], loadConfiguration: { file in
+                    try RuntimeConfiguration.load(path: file, descriptorMetadata: { fd in
+                        var info = try RuntimeConfiguration.descriptorMetadata(fd)
+                        observedStat = true
+                        // Unprivileged host cannot chown to another uid; preserve every real stat field except owner.
+                        if scenario == "owner" { info.st_uid = RelayProtocolConstants.hermesUID }
+                        if scenario == "oversize-stat" { info.st_size = off_t(RuntimeConfiguration.maximumConfigBytes + 1) }
+                        return info
+                    }, lookup: RuntimeFixtureAccount(), admin: RuntimeFixtureAdmin(), groupExists: { _ in true })
+                }, compose: { _ in composed = true; throw RuntimeFailure.readiness })
+                XCTAssertEqual(code, scenario == "valid" && option == "--check-config" ? EX_OK : EX_CONFIG,
+                               "protectedConfig \(scenario) \(option)")
+                XCTAssertEqual(composed, scenario == "valid" && option == "--config", "protectedConfig \(scenario) \(option)")
+                if scenario == "owner" { XCTAssertTrue(observedStat, "protectedConfig owner real stat") }
+            }
+        }
+    }
+
+    func testProbeDrainRejectsSingleOverBudgetRead() throws {
+        var connection = RelayConnection(connectionID: "c1")
+        // Two legal maximum calls total 131080 bytes, four beyond the 131076-byte barrier budget.
+        // Without the byte check they become one forwarded call and one busy denial, never a parser error.
+        func largeCall(_ id: String) throws -> Data {
+            let empty = RelayFrame(type: "tools_call", fields: ["request_id": .string(id), "name": .string("memory_search"),
+                "arguments": .object(["query": .string("")])])
+            let padding = RelayProtocolConstants.maxPublicFrameBytes - (try BoundedFrameStream.encodedPayload(empty).count)
+            var full = empty
+            full.fields["arguments"] = .object(["query": .string(String(repeating: "x", count: padding))])
+            return try BoundedFrameStream.encode(full)
+        }
+        let bytes = try largeCall("r1") + largeCall("r2")
+        XCTAssertGreaterThan(bytes.count, RelayProtocolConstants.probeDrainMaxBytes)
+        let source = IncrementalProbe([.data(bytes)])
+        let result = connection.handleProbe(probe(), publicFD: source)
+        XCTAssertEqual(result.compactMap(nodeType), ["closed", "probe_reply"], "singleReadByteBudget")
+        XCTAssertEqual(source.reads, 1, "singleReadByteBudget")
+    }
+
+    func testFullConformingProbeGrammar() throws {
+        var connection = RelayConnection(connectionID: "c1")
+        struct DrainVector: Decodable { let frame: RelayFrame; let probe_drain_repeat: Int? }
+        struct Fixture: Decodable { let valid: [DrainVector] }
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "relay-frames", withExtension: "json"))
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        let frames = fixture.valid.flatMap { Array(repeating: $0.frame, count: $0.probe_drain_repeat ?? 0) }
+        XCTAssertEqual(frames.count, RelayProtocolConstants.probeDrainMaxFrames, "fullConformingProbeGrammar shared pin")
+        let source = IncrementalProbe(try frames.map { .data(try BoundedFrameStream.encode($0)) })
+        let result = connection.handleProbe(probe(), publicFD: source)
+        XCTAssertFalse(result.contains(.closePublicConnection), "fullConformingProbeGrammar")
+        XCTAssertEqual(result.compactMap(nodeType).last, "probe_reply", "fullConformingProbeGrammar")
+        XCTAssertEqual(source.reads, 12, "fullConformingProbeGrammar")
+    }
+
+    func testShutdownSlotCannotBeUsedByTraffic() throws {
+        let runtime = RelayRuntime(configuration: try RuntimeConfiguration.parse(fixture()), environment: [:],
+            socketGroup: getgid(), instanceLock: DarwinInstanceLock(), verifySocketPath: {}, verifyPeer: { _ in },
+            ordinaryReadsEnabled: { false }, reapChild: Darwin.waitpid)
+        let traffic = RelayFrame(type: "closed", fields: ["connection_id": .string("c1")])
+        for _ in 0..<(RuntimeLimits.privateQueueFrames - 1) { try runtime.enqueueNode(traffic, id: nil, kind: nil) }
+        XCTAssertThrowsError(try runtime.enqueueNode(traffic, id: nil, kind: nil), "reservedShutdownSlot")
+        XCTAssertNoThrow(try runtime.enqueueNode(RelayShutdownModel.gracefulShutdownFrame(), id: nil, kind: nil), "reservedShutdownSlot")
+    }
+
+    func testControlReservationTracksActualEnqueue() throws {
+        let runtime = RelayRuntime(configuration: try RuntimeConfiguration.parse(fixture()), environment: [:],
+            socketGroup: getgid(), instanceLock: DarwinInstanceLock(), verifySocketPath: {}, verifyPeer: { _ in },
+            ordinaryReadsEnabled: { false }, reapChild: Darwin.waitpid)
+        let traffic = RelayFrame(type: "closed", fields: ["connection_id": .string("c1")])
+        var core = RelayConnection(connectionID: "c1")
+        let cancel = try BoundedFrameStream.encode(RelayFrame(type: "cancel", fields: ["mcp_request_id": .string("r1")]))
+        let output = core.receivePublicBytes(cancel)
+        guard case .toNode(let frame, let kind) = try XCTUnwrap(output.first) else { return XCTFail("controlEnqueueAccounting") }
+        XCTAssertEqual(core.queuedControlCount, 0, "controlEnqueueAccounting before queue")
+        try runtime.enqueueReservedNode(frame, id: "c1", kind: kind, core: &core)
+        XCTAssertEqual(core.queuedControlCount, 1, "controlEnqueueAccounting accepted")
+        XCTAssertEqual(core.reservedControlCount, 0, "controlEnqueueAccounting accepted")
+        for _ in 1..<(RuntimeLimits.privateQueueFrames - 1) { try runtime.enqueueNode(traffic, id: nil, kind: nil) }
+        _ = core.receivePublicBytes(cancel)
+        XCTAssertThrowsError(try runtime.enqueueReservedNode(frame, id: "c1", kind: kind, core: &core), "controlEnqueueAccounting refused")
+        XCTAssertEqual(core.queuedControlCount, 1, "controlEnqueueAccounting refused")
+        XCTAssertEqual(core.reservedControlCount, 0, "controlEnqueueAccounting refused")
+        core.markNodeFrameWritten(kind)
+        XCTAssertEqual(core.queuedControlCount, 0, "controlEnqueueAccounting written")
+    }
+
+    func testSpawnChildEndpointClosesAndDeliversEOF() throws {
+        var pattern = Array("/tmp/hmr-XXXXXX".utf8CString)
+        let root = String(cString: try XCTUnwrap(mkdtemp(&pattern)))
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let script = root + "/eof.cjs"
+        try """
+        const fs=require('node:fs');const channel=new(require('node:net').Socket)({fd:3});
+        channel.on('end',()=>{fs.writeFileSync(process.env.HOME+'/eof','observed');process.exit(0);});
+        channel.on('error',()=>process.exit(1));channel.resume();
+        setTimeout(()=>process.exit(2),2000);
+        """.write(toFile: script, atomically: false, encoding: .utf8)
+        let node = try XCTUnwrap(["/usr/local/bin/node", "/opt/homebrew/bin/node"].first { FileManager.default.isExecutableFile(atPath: $0) })
+        let config = try RuntimeConfiguration.parse(fixture(["node_executable": node, "node_entry": script,
+            "bridge_log": root + "/bridge.log", "relay_log": root + "/relay.log", "private_dir": root, "public_socket": root + "/memory.sock"]))
+        let runtime = RelayRuntime(configuration: config, environment: ["HOME": root, "LANG": "C", "TMPDIR": "/tmp"],
+            socketGroup: getgid(), instanceLock: DarwinInstanceLock(), verifySocketPath: {}, verifyPeer: { _ in },
+            ordinaryReadsEnabled: { false }, reapChild: Darwin.waitpid)
+        try runtime.state_SPAWN_CHILD()
+        let pid = try XCTUnwrap(runtime.child)
+        var reaped = false
+        defer { if !reaped { _ = kill(pid, SIGKILL); var status: Int32 = 0; _ = waitpid(pid, &status, 0) } }
+        XCTAssertEqual(runtime.childEndpointFlags & FD_CLOEXEC, FD_CLOEXEC, "childEndpointCLOEXEC")
+        runtime.closePrivateChannel()
+        var status: Int32 = 0
+        XCTAssertEqual(waitpid(pid, &status, 0), pid, "childEndpointEOF")
+        reaped = true
+        XCTAssertEqual(status, 0, "childEndpointEOF")
+        XCTAssertEqual(try String(contentsOfFile: root + "/eof", encoding: .utf8), "observed", "childEndpointEOF")
+    }
+
     private func probe() -> RelayFrame {
         RelayFrame(type: "probe", fields: ["connection_id": .string("c1"), "nonce": .string(String(repeating: "a", count: 32))])
     }
@@ -245,4 +406,11 @@ private final class IncrementalProbe: PublicFDProbeSource {
         reads += 1
         return events.removeFirst()
     }
+}
+
+struct RuntimeFixtureAccount: AccountUIDLookup {
+    func uid(forAccountName name: String) throws -> uid_t { RelayProtocolConstants.hermesUID }
+}
+struct RuntimeFixtureAdmin: AdminGroupMembership {
+    func isAdmin(uid: uid_t) throws -> Bool { false }
 }

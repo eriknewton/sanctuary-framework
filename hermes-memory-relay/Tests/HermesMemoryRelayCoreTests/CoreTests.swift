@@ -1232,6 +1232,7 @@ final class RelayConnectionLifecycleTests: XCTestCase {
         for index in 0..<RelayProtocolConstants.controlQueueDepthPerConnection {
             XCTAssertFalse(connection.receivePublicBytes(Self.cancelBytes(requestID: "mcp-\(index)")).contains(.closePublicConnection))
         }
+        connection.markNodeFrameQueued(.forwardedControlFrame)
         connection.markNodeFrameWritten(.forwardedControlFrame)
         XCTAssertFalse(connection.receivePublicBytes(Self.cancelBytes(requestID: "mcp-extra")).contains(.closePublicConnection))
         XCTAssertTrue(connection.receivePublicBytes(Self.cancelBytes(requestID: "mcp-overflow")).contains(.closePublicConnection))
@@ -1522,7 +1523,8 @@ final class RelayConnectionLifecycleTests: XCTestCase {
         for index in 0..<(RelayProtocolConstants.controlQueueDepthPerConnection * 2) {
             let outputs = connection.handlePublicFrame(RelayFrame(type: "cancel", fields: ["mcp_request_id": .string("mcp-\(index)")]))
             XCTAssertFalse(outputs.contains(.closePublicConnection), "control \(index)")
-            connection.markNodeFrameWritten(.forwardedControlFrame)
+            connection.markNodeFrameQueued(.forwardedControlFrame)
+        connection.markNodeFrameWritten(.forwardedControlFrame)
         }
 
         var pings = RelayConnection(connectionID: "conn-ping-drain")

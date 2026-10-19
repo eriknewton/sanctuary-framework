@@ -43,6 +43,15 @@ describe("relay runtime shared contracts", () => {
     const canonical = await readFile(new URL("hermes-memory-relay/Tests/HermesMemoryRelayCoreTests/Fixtures/relay-frames.json", root));
     const node = await readFile(fileURLToPath(new URL("./fixtures/relay-frames.json", import.meta.url)));
     expect(node.equals(canonical)).toBe(true);
+    // Must match probeDrainMaxFrames in Core.swift and PROBE_DRAIN_MAX_FRAMES in SEAM.md.
+    const drain = JSON.parse(canonical.toString()).valid.flatMap(
+      (vector: { frame: { type: string }; probe_drain_repeat?: number }) =>
+        Array<{ type: string }>(vector.probe_drain_repeat ?? 0).fill(vector.frame),
+    );
+    expect(drain.length).toBe(1 + 1 + 8 + 2);
+    expect(drain.map((frame: { type: string }) => frame.type)).toEqual([
+      "hello", "tools_call", ...Array<string>(8).fill("cancel"), "ping", "ping",
+    ]);
   });
 });
 

@@ -2,7 +2,7 @@
 
 This file is the relay-to-Node contract for the Hermes memory bridge. The Node bridge must consume `Tests/HermesMemoryRelayCoreTests/Fixtures/relay-frames.json`; the Swift tests consume that same file now. Any change to this contract updates both this document and the fixture in the same change. Stream vectors carry literal `bytes_hex`; recipe names are not part of the slice-2 contract.
 
-Slice status: this package implements the relay core and modeled seams. Runtime integration is incomplete and native acceptance is not established. The Node capability is scoped memory search and get; writes not yet available. `ready` does not establish policy pinning; `state_POLICY_PINNED` is `not_provided`.
+Slice status: this package implements the relay runtime. Installed-platform acceptance is not established. The Node capability is scoped memory search and get; writes not yet available. `ready` does not establish policy pinning; `state_POLICY_PINNED` is `not_provided`.
 
 ## Transport
 
@@ -55,7 +55,7 @@ CHILD_READY_TIMEOUT_MS = 5000
 RELAY_CHILD_EXIT_BOUND_MS = 2000 probe bound + 3000 SIGTERM grace = 5000
 MAX_PUBLIC_CONNECTIONS = 4
 PROBE_DRAIN_MAX_BYTES = 65540 retained partial + 65536 read chunk = 131076
-PROBE_DRAIN_MAX_FRAMES = 8 controls + 1 call = 9
+PROBE_DRAIN_MAX_FRAMES = 8 controls + 1 primary call + 1 busy-denied call + 2 pings = 12
 RELAY_CHILD_REAP_BOUND_MS = 1000
 ```
 
@@ -137,7 +137,7 @@ If Node's parser or validator rejects a forwarded public call frame whose top-le
 
 Public `cancel` does not remove the relay's in-flight state: every forwarded `hello`, `tools_list`, or `tools_call` has exactly one `response` or one `close` for that connection, including after any later `cancel`. A `response` for a connection with nothing in flight, or a second `response` after the relay already accepted or denied the call, is a fatal relay error.
 
-Every relay-to-Node output carries the completion kind the writer must pass back after that exact frame is written:
+Forwarded controls reserve a slot that becomes queued only after transport acceptance (`markNodeFrameQueued`); refusal cancels that reservation. Every relay-to-Node output carries the completion kind shown below, which the writer passes back after that exact frame is written:
 
 ```text
 forwarded public cancel -> markNodeFrameWritten(.forwardedControlFrame)
@@ -146,7 +146,7 @@ forwarded public hello, tools_list, tools_call -> markNodeFrameWritten(nil)
 accepted, closed, probe_reply, relay_shutdown -> markNodeFrameWritten(nil)
 ```
 
-The relay enforces `MAX_PUBLIC_CONNECTIONS = 4`; the fifth public connection is closed before `accepted` and never reaches Node. A terminal connection path frees the public slot immediately. The runtime retains at most four live records and a monotonic UInt64 issued counter. An ID at or below that counter and absent from the live map is closed; a larger ID is never-issued. No historical connection objects or finished approval entries are retained.
+The relay enforces `MAX_PUBLIC_CONNECTIONS = 4`; the fifth public connection is closed before `accepted` and never reaches Node. A terminal connection closes its public fd immediately; its admission slot remains charged until its private output drains. The runtime retains at most four live or draining records and a monotonic UInt64 issued counter. An ID at or below that counter and absent from the live map is closed; a larger ID is never-issued. No historical connection objects or finished approval entries are retained.
 
 ## Relay To Client
 
@@ -177,7 +177,7 @@ When the relay receives `probe { connection_id, nonce }`, it routes to and drain
 
 1. Parse any complete frames already retained by the `BoundedFrameStream`.
 2. Poll the public fd with zero timeout.
-3. If readable, read incrementally toward `EAGAIN`, bounded by `PROBE_DRAIN_MAX_BYTES = 131076` and `PROBE_DRAIN_MAX_FRAMES = 9`. Readable data left at either bound closes the connection before reply.
+3. If readable, read incrementally toward `EAGAIN`, bounded by `PROBE_DRAIN_MAX_BYTES = 131076` and `PROBE_DRAIN_MAX_FRAMES = 12`. Readable data left at either bound closes the connection before reply.
 4. Forward every resulting `cancel`, `shutdown`, and synthesized `closed` to Node.
 5. Convert `POLLHUP`, EOF, partial frame, over-cap length, malformed frame, or poison to terminal `closed { connection_id }`.
 6. Deliver any client-bound output produced by the drain.

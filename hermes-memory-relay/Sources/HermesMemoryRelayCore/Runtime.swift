@@ -4,7 +4,7 @@ import Foundation
 // The signal handler only stores a signal number; the single event loop owns all cleanup.
 nonisolated(unsafe) private var relayStopSignal: sig_atomic_t = 0
 
-private enum RuntimeLimits {
+enum RuntimeLimits {
     // One accepted, one call, eight controls, one closed, and one probe reply per live slot.
     static let privateQueueFrames = RelayProtocolConstants.maxPublicConnections
         * (1 + 1 + RelayProtocolConstants.controlQueueDepthPerConnection + 1 + 1) + 1
@@ -26,11 +26,12 @@ struct QueuedWrite {
 }
 
 private final class LiveConnection {
-    let fd: Int32
+    var fd: Int32
     var core: RelayConnection
     var output: [QueuedWrite] = []
     init(fd: Int32, id: String) { self.fd = fd; core = RelayConnection(connectionID: id) }
-    deinit { close(fd) }
+    deinit { if fd >= 0 { close(fd) } }
+    func closePublic() { if fd >= 0 { close(fd); fd = -1 }; output.removeAll() }
 }
 
 struct NativeRelayFileSystem: RelayFileSystem {
@@ -87,11 +88,13 @@ public final class RelayRuntime {
     private let verifySocketPath: () throws -> Void
     private let ordinaryReadsEnabled: () -> Bool
     private let socketGroup: gid_t
-    private let instanceLock: RelayInstanceLock
+    private let socketLifecycle: RelaySocketLifecycle
+    private let reapChild: (pid_t, UnsafeMutablePointer<Int32>, Int32) -> pid_t
     private var listener: Int32 = -1
     private var privateFD: Int32 = -1
     private var logFD: Int32 = -1
-    private var child: pid_t?
+    private(set) var child: pid_t?
+    private(set) var childEndpointFlags: Int32 = -1
     private var childReaped = false
     private var childOwnershipLost = false
     private var boundIdentity: (dev_t, ino_t)?
@@ -99,6 +102,8 @@ public final class RelayRuntime {
     private var issued: UInt64 = 0
     private var clients: [String: LiveConnection] = [:]
     private var nodeOutput: [QueuedWrite] = []
+    private(set) var peakPrivateQueueFrames = 0
+    private(set) var peakPrivateQueueBytes = 0
     private var ready = false
     private var stopping = false
     private var state = "state_CONFIG_CHECKED"
@@ -106,11 +111,14 @@ public final class RelayRuntime {
     // Required dependencies permit native test composition without an executable option that weakens admission.
     init(configuration: RuntimeConfiguration, environment: [String: String], socketGroup: gid_t,
          instanceLock: RelayInstanceLock, verifySocketPath: @escaping () throws -> Void,
-         verifyPeer: @escaping (Int32) throws -> Void, ordinaryReadsEnabled: @escaping () -> Bool) {
+         verifyPeer: @escaping (Int32) throws -> Void, ordinaryReadsEnabled: @escaping () -> Bool,
+         reapChild: @escaping (pid_t, UnsafeMutablePointer<Int32>, Int32) -> pid_t) {
         config = configuration
         self.environment = environment
         self.socketGroup = socketGroup
-        self.instanceLock = instanceLock
+        self.socketLifecycle = RelaySocketLifecycle(lockPath: configuration.privateDirectory + "/relay.lock",
+            socketPath: configuration.publicSocket, lock: instanceLock, fileSystem: NativeRelayFileSystem())
+        self.reapChild = reapChild
         self.verifySocketPath = verifySocketPath
         self.verifyPeer = verifyPeer
         self.ordinaryReadsEnabled = ordinaryReadsEnabled
@@ -121,23 +129,29 @@ public final class RelayRuntime {
         main(arguments, loadConfiguration: RuntimeConfiguration.load, compose: { config in
             guard let account = getpwuid(config.ownerUID), let home = account.pointee.pw_dir,
                   let group = getgrnam(config.group) else { throw RuntimeFailure.configuration }
-            let configuredHome = String(cString: home)
-            let groupID = group.pointee.gr_gid
-            let identity = try HermesInstallIdentity(pinnedUID: config.hermesUID, accountName: config.hermesAccount)
-                .validate(lookup: DarwinAccountUIDLookup())
-            let verifier = try PeerVerifier(installIdentity: identity, ownerUid: config.ownerUID,
-                                           credentials: DarwinPeerCredentialProvider(), adminMembership: DarwinAdminGroupMembership())
-            let pathCheck = SocketPathValidator(socketDirectory: RuntimeConfiguration.parent(config.publicSocket),
-                                                expectedSocketDirectoryOwner: config.ownerUID,
-                                                expectedSocketDirectoryGroup: groupID)
-            // The custody rendezvous must share the platform temp root with other same-uid processes.
-            // A per-instance TMPDIR can exceed Darwin socket limits and split the lock rendezvous.
-            return RelayRuntime(configuration: config,
-                                       environment: ["HOME": configuredHome, "LANG": "en_US.UTF-8", "TMPDIR": "/tmp"],
-                                       socketGroup: groupID, instanceLock: DarwinInstanceLock(),
-                                       verifySocketPath: { try pathCheck.validate(fileSystem: NativeRelayFileSystem()) },
-                                       verifyPeer: { try verifier.requirePeer(fileDescriptor: $0) }, ordinaryReadsEnabled: { true })
+            return try productionRuntime(config, lookup: DarwinAccountUIDLookup(), admin: DarwinAdminGroupMembership(),
+                home: String(cString: home), group: group.pointee.gr_gid,
+                fileSystem: NativeRelayFileSystem(), observeRejectedPeer: { _ in })
         })
+    }
+
+    // Host metadata ports permit unprivileged witnesses without replacing the production peer composition.
+    static func productionRuntime(_ config: RuntimeConfiguration, lookup: AccountUIDLookup,
+                                  admin: AdminGroupMembership, home: String, group: gid_t,
+                                  fileSystem: RelayFileSystem, observeRejectedPeer: @escaping (Int32) -> Void) throws -> RelayRuntime {
+        let identity = try HermesInstallIdentity(pinnedUID: config.hermesUID, accountName: config.hermesAccount)
+            .validate(lookup: lookup)
+        let verifier = try PeerVerifier(installIdentity: identity, ownerUid: config.ownerUID,
+            credentials: DarwinPeerCredentialProvider(expectedUID: identity.pinnedUID), adminMembership: admin)
+        let pathCheck = SocketPathValidator(socketDirectory: RuntimeConfiguration.parent(config.publicSocket),
+            expectedSocketDirectoryOwner: config.ownerUID, expectedSocketDirectoryGroup: group)
+        // The custody rendezvous shares the platform temp root with other same-uid processes.
+        return RelayRuntime(configuration: config, environment: ["HOME": home, "LANG": "en_US.UTF-8", "TMPDIR": "/tmp"],
+            socketGroup: group, instanceLock: DarwinInstanceLock(),
+            verifySocketPath: { try pathCheck.validate(fileSystem: fileSystem) }, verifyPeer: { fd in
+                do { try verifier.requirePeer(fileDescriptor: fd) }
+                catch { observeRejectedPeer(fd); throw error }
+            }, ordinaryReadsEnabled: { true }, reapChild: Darwin.waitpid)
     }
 
     // Required composition ports keep fixture metadata out of the production command-line surface.
@@ -168,7 +182,7 @@ public final class RelayRuntime {
         do {
             state = "state_AWAIT_LOCK"
             // No socket metadata, unlink, bind or accept occurs before the lifetime flock.
-            guard instanceLock.tryLock(config.privateDirectory + "/relay.lock") else { throw RuntimeFailure.lock }
+            try socketLifecycle.acquireBeforeSocketWork()
             try verifySocketPath()
             logFD = try openLog(config.relayLog)
             state = "state_ENV_REPLACED"
@@ -197,13 +211,16 @@ public final class RelayRuntime {
         return result
     }
 
-    private func state_SPAWN_CHILD() throws {
+    func state_SPAWN_CHILD() throws {
         var sockets = [Int32](repeating: -1, count: 2) // A socketpair has exactly two endpoints.
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else { throw RuntimeFailure.spawn }
         privateFD = sockets[0]
         let childFD = sockets[1]
         defer { close(childFD) }
         try nonblocking(privateFD)
+        // Both original endpoints must close on exec; only the explicit fd-3 spawn action survives.
+        try Self.closeOnExec(childFD)
+        childEndpointFlags = fcntl(childFD, F_GETFD)
         let plan = try ChildSupervisor.spawnPlan(config: ChildSupervisorConfig(
             executablePath: config.nodeExecutable, bridgeEntryPath: config.nodeEntry, bridgeLogPath: config.bridgeLog,
             relayFD: childFD, baseEnvironment: environment, bridgeIdentity: config.identityFingerprint,
@@ -227,11 +244,10 @@ public final class RelayRuntime {
         try checked(posix_spawn_file_actions_adddup2(&actions, bridgeLogFD, STDOUT_FILENO))
         try checked(posix_spawn_file_actions_adddup2(&actions, bridgeLogFD, STDERR_FILENO))
         let argv = plan.arguments.map { strdup($0) } + [nil]
-        let env = plan.environmentEntries.map { strdup($0) } + [nil]
-        defer { argv.forEach { free($0) }; env.forEach { free($0) } }
+        defer { argv.forEach { free($0) } }
         var pid: pid_t = 0
-        let outcome = argv.withUnsafeBufferPointer { args in
-            env.withUnsafeBufferPointer { values in
+        let outcome = Self.withSpawnEnvironment(plan) { values in
+            argv.withUnsafeBufferPointer { args in
                 posix_spawn(&pid, plan.executablePath, &actions, &attributes, args.baseAddress!, values.baseAddress!)
             }
         }
@@ -241,12 +257,7 @@ public final class RelayRuntime {
 
     private func state_BIND_SOCKET() throws {
         try verifySocketPath()
-        let fileSystem = NativeRelayFileSystem()
-        do {
-            let old = try fileSystem.lstat(config.publicSocket)
-            guard old.isSocket, old.owner == config.ownerUID else { throw RuntimeFailure.socket }
-            try fileSystem.unlink(config.publicSocket)
-        } catch RelayFileSystemError.noEntry { /* No previous socket to reclaim. */ }
+        try socketLifecycle.unlinkLeftoverSocketWhileLocked()
         listener = socket(AF_UNIX, SOCK_STREAM, 0)
         guard listener >= 0 else { throw RuntimeFailure.socket }
         try nonblocking(listener)
@@ -275,7 +286,7 @@ public final class RelayRuntime {
     private func eventTurn(admitting: Bool) throws {
         var descriptors = [pollfd(fd: privateFD, events: Int16(POLLIN | (nodeOutput.isEmpty ? 0 : POLLOUT)), revents: 0)]
         if admitting && listener >= 0 { descriptors.append(pollfd(fd: listener, events: Int16(POLLIN), revents: 0)) }
-        let snapshot = clients.map { ($0.key, $0.value.fd) }
+        let snapshot = clients.filter { $0.value.fd >= 0 }.map { ($0.key, $0.value.fd) }
         let clientStart = descriptors.count
         for (id, fd) in snapshot {
             descriptors.append(pollfd(fd: fd, events: Int16(POLLIN | (clients[id]!.output.isEmpty ? 0 : POLLOUT)), revents: 0))
@@ -355,25 +366,45 @@ public final class RelayRuntime {
     private func apply(_ outputs: [RelayOutput], id: String) throws {
         for output in outputs {
             switch output {
-            case .toNode(let frame, let kind): try enqueueNode(frame, id: id, kind: kind)
+            case .toNode(let frame, let kind):
+                if let connection = clients[id] {
+                    try enqueueReservedNode(frame, id: id, kind: kind, core: &connection.core)
+                } else { try enqueueNode(frame, id: id, kind: kind) }
             case .toClient(let frame, let kind): try enqueueClient(try BoundedFrameStream.encode(frame), id: id, kind: kind)
             case .toClientPayload(let payload, let kind):
                 try enqueueClient(BoundedFrameStream.encodeLengthOnly(UInt32(payload.count)) + payload, id: id, kind: kind)
-            case .closePublicConnection: clients.removeValue(forKey: id)
+            case .closePublicConnection: clients[id]?.closePublic()
             case .fatalRelayError: throw RuntimeFailure.transport
             }
         }
+        retireDrainedConnections()
+    }
+
+    private func retireDrainedConnections() {
+        // Closed peers retain their admission slot until every private frame is written; churn cannot reset headroom.
+        for (id, connection) in clients where connection.fd < 0 {
+            if !nodeOutput.contains(where: { $0.connectionID == id }) { clients.removeValue(forKey: id) }
+        }
+    }
+
+    func enqueueReservedNode(_ frame: RelayFrame, id: String, kind: NodeWriteKind?, core: inout RelayConnection) throws {
+        do { try enqueueNode(frame, id: id, kind: kind) }
+        catch { core.cancelNodeFrameReservation(kind); throw error }
+        // The queue owns this token only after accepting the frame; a refused enqueue owns no control slot.
+        core.markNodeFrameQueued(kind)
     }
 
     func enqueueNode(_ frame: RelayFrame, id: String?, kind: NodeWriteKind?) throws {
         let bytes = try BoundedFrameStream.encode(frame)
-        // Churn shares one transport ceiling; closing clients cannot reset private-queue headroom.
+        // Client traffic cannot consume the final slot reserved for the single relay_shutdown frame.
         guard bytes.count <= RelayProtocolConstants.maxPrivateFrameBytes + RelayProtocolConstants.frameLengthPrefixBytes,
-              nodeOutput.count < RuntimeLimits.privateQueueFrames,
+              nodeOutput.count < RuntimeLimits.privateQueueFrames - (frame.type == "relay_shutdown" ? 0 : 1),
               nodeOutput.reduce(bytes.count, { $0 + $1.bytes.count }) <= RuntimeLimits.privateQueueBytes else {
             throw RuntimeFailure.transport
         }
         nodeOutput.append(QueuedWrite(bytes: bytes, connectionID: id, nodeCompletion: kind, clientCompletion: nil))
+        peakPrivateQueueFrames = max(peakPrivateQueueFrames, nodeOutput.count)
+        peakPrivateQueueBytes = max(peakPrivateQueueBytes, nodeOutput.reduce(0) { $0 + $1.bytes.count })
     }
 
     private func enqueueClient(_ bytes: Data, id: String, kind: ClientWriteKind) throws {
@@ -400,6 +431,7 @@ public final class RelayRuntime {
         if let written = try writeHead(&nodeOutput, fd: privateFD), let id = written.connectionID {
             clients[id]?.core.markNodeFrameWritten(written.nodeCompletion)
         }
+        retireDrainedConnections()
     }
 
     private func flushClient(_ connection: LiveConnection, id: String) throws {
@@ -422,13 +454,16 @@ public final class RelayRuntime {
             if !childReaped && !childOwnershipLost, let pid = child { _ = kill(pid, SIGTERM) }
             waitForChild(until: stopStarted + milliseconds(RelayProtocolConstants.relayChildExitBoundMilliseconds), flush: false)
             if !childReaped && !childOwnershipLost, let pid = child { _ = kill(pid, SIGKILL) }
-            // All phases share the original deadline, so delayed polls never extend the 6000 ms stop budget.
+            // The 6000 ms budget starts on entry to STOPPING, at most one bounded event turn after signal observation.
             waitForChild(until: stopStarted + milliseconds(RelayProtocolConstants.relayChildExitBoundMilliseconds
                 + RelayProtocolConstants.relayChildReapBoundMilliseconds), flush: false)
         }
-        if privateFD >= 0 { close(privateFD); privateFD = -1 }
+        closePrivateChannel()
         let reaped = child == nil || childReaped
-        if !reaped { log("state_STOPPING reap_timeout") }
+        if !reaped {
+            let cause = childOwnershipLost ? "child_ownership_lost" : "reap_timeout"
+            log("state_STOPPING \(cause); leftover_socket=\(config.publicSocket); stop all relay and child processes before inspecting and reclaiming this exact socket")
+        }
         // Reap must precede unlink, and dev/inode identity prevents deleting a replacement socket.
         if reaped, let identity = boundIdentity,
            let current = try? RuntimeConfiguration.metadata(config.publicSocket),
@@ -455,11 +490,27 @@ public final class RelayRuntime {
         if childReaped { return true }
         guard let pid = child else { return false }
         var status: Int32 = 0
-        let result = waitpid(pid, &status, WNOHANG)
+        let result = reapChild(pid, &status, WNOHANG)
         if result == pid { childReaped = true }
         if result < 0 && errno != EINTR { childOwnershipLost = true }
         // An unproven wait result never permits signalling or deleting another process's objects.
         return childReaped
+    }
+
+    func closePrivateChannel() {
+        if privateFD >= 0 { close(privateFD); privateFD = -1 }
+    }
+
+    static func closeOnExec(_ fd: Int32) throws {
+        guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else { throw RuntimeFailure.spawn }
+    }
+
+    // This is the actual C array passed to posix_spawn, before any OS initialization in the child.
+    static func withSpawnEnvironment<T>(_ plan: ChildSpawnPlan,
+        _ body: (UnsafeBufferPointer<UnsafeMutablePointer<CChar>?>) throws -> T) rethrows -> T {
+        let env = plan.environmentEntries.map { strdup($0) } + [nil]
+        defer { env.forEach { free($0) } }
+        return try env.withUnsafeBufferPointer(body)
     }
 
     private func openLog(_ path: String) throws -> Int32 {

@@ -68,8 +68,11 @@ public enum RelayProtocolConstants {
     public static let maxPublicReadChunkBytes = maxPublicFrameBytes
     // 131076 = one retained partial frame plus one public read chunk.
     public static let probeDrainMaxBytes = maxPartialFrameBytes + maxPublicReadChunkBytes
-    // 9 = one call plus eight queued controls from a conforming client.
-    public static let probeDrainMaxFrames = controlQueueDepthPerConnection + 1
+    // 12 public frames: one primary hello/tools_list/tools_call, one busy-denied call, eight
+    // forwarded controls (cancel or terminal shutdown), and two pings producing the pong allowance.
+    // Responses and accepted/closed/probe frames travel on the private side and do not consume this budget.
+    // Must match PROBE_DRAIN_MAX_FRAMES in hermes-memory-relay/SEAM.md.
+    public static let probeDrainMaxFrames = 1 + 1 + controlQueueDepthPerConnection + controlResponseAllowancePerConnection
     // 1000 ms covers scheduler latency after uncatchable SIGKILL; this is not a durable-write bound.
     // Must match RELAY_CHILD_REAP_BOUND_MS in server/src/hermes-memory-bridge/process-shell.ts.
     public static let relayChildReapBoundMilliseconds = 1_000
@@ -827,12 +830,13 @@ public protocol AdminGroupMembership {
 }
 
 public struct DarwinPeerCredentialProvider: PeerCredentialProvider {
-    public init() {}
+    private let expectedUID: uid_t
+    public init(expectedUID: uid_t = RelayProtocolConstants.hermesUID) { self.expectedUID = expectedUID }
 
     public func peerUid(forFileDescriptor fd: Int32) throws -> uid_t {
         // Must match UnixPeerVerifier.requirePeer in castle-wall-macos/Sources/MemoryGrantPeer/UnixPeer.swift.
         // The canonical verifier establishes socket shape and the protected install UID together.
-        return try UnixPeerVerifier.requirePeer(socket: fd, expectedUID: RelayProtocolConstants.hermesUID).effectiveUID
+        return try UnixPeerVerifier.requirePeer(socket: fd, expectedUID: expectedUID).effectiveUID
     }
 }
 
@@ -1059,7 +1063,8 @@ public struct RelayConnection {
     public let connectionID: String
     private(set) public var state: RelayConnectionState = .state_SERVING
     private var stream = BoundedFrameStream()
-    private var queuedControlCount = 0
+    private(set) var queuedControlCount = 0
+    private(set) var reservedControlCount = 0
     private var busyDenialOutstanding = false
     private var resultFramesOutstanding = 0
     private var controlResponsesOutstanding = 0
@@ -1157,6 +1162,19 @@ public struct RelayConnection {
         }
         state = .state_SERVING
         currentRequestID = nil
+    }
+
+    /// Confirm transport acceptance before treating a decoded control reservation as queued work.
+    public mutating func markNodeFrameQueued(_ kind: NodeWriteKind?) {
+        if kind == .forwardedControlFrame && reservedControlCount > 0 {
+            reservedControlCount -= 1
+            queuedControlCount += 1
+        }
+    }
+
+    /// Release a control reservation when the transport refuses to enqueue its frame.
+    public mutating func cancelNodeFrameReservation(_ kind: NodeWriteKind?) {
+        if kind == .forwardedControlFrame && reservedControlCount > 0 { reservedControlCount -= 1 }
     }
 
     public mutating func markNodeFrameWritten(_ kind: NodeWriteKind?) {
@@ -1275,9 +1293,10 @@ public struct RelayConnection {
     }
 
     private mutating func enqueueControl(_ frame: RelayFrame, payloadBytes: Data) -> [RelayOutput] {
-        queuedControlCount += 1
+        // Reservations bound decoding; only a successful transport enqueue becomes queued work.
+        reservedControlCount += 1
         // Control events are capped per connection so a caller cannot grow retained state while a tool call is outstanding.
-        if queuedControlCount > RelayProtocolConstants.controlQueueDepthPerConnection {
+        if queuedControlCount + reservedControlCount > RelayProtocolConstants.controlQueueDepthPerConnection {
             return poisonAndClose()
         }
         return envelopeOutput(for: frame, payloadBytes: payloadBytes)
@@ -1336,7 +1355,7 @@ public struct RelayConnection {
     }
 
     private mutating func forwardShutdown(payloadBytes: Data) -> [RelayOutput] {
-        envelopeOutput(for: RelayFrame(type: "shutdown"), payloadBytes: payloadBytes) + closeOnce(closePublic: true)
+        enqueueControl(RelayFrame(type: "shutdown"), payloadBytes: payloadBytes) + closeOnce(closePublic: true)
     }
 
     private static func isForwardedControlFrame(_ frame: RelayFrame) -> Bool {

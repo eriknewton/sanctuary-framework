@@ -224,6 +224,102 @@ final class RuntimeContractTests: XCTestCase {
         }
     }
 
+    func testProductionPeerCompositionRejectsBeforeRead() throws {
+        XCTAssertNotEqual(getuid(), RelayProtocolConstants.hermesUID)
+        try nativeRun(body: """
+        channel.on('data',()=>{throw Error('productionPeerComposition accepted frame');});
+        channel.write(frame({type:'ready'}));
+        const connect=setInterval(()=>{
+          if(!fs.existsSync(socketPath)) return; clearInterval(connect);
+          const client=net.createConnection(socketPath);
+          client.on('connect',()=>client.write(Buffer.from([255,255,255,255])));
+          client.on('error',()=>{});
+          client.on('close',()=>{console.log('WITNESS_PASS');process.exit(0);});
+        },10);
+        """, expectsReady: true, witness: "productionPeerComposition", scenario: "production-peer")
+    }
+
+    func testProductionBindReclaimsThroughLockedHelper() throws {
+        try nativeRun(body: """
+        let bytes=Buffer.alloc(0);
+        channel.on('data',chunk=>{
+          bytes=Buffer.concat([bytes,chunk]);
+          if(bytes.length<4 || bytes.length<4+bytes.readUInt32BE(0))return;
+          const message=JSON.parse(bytes.subarray(4,4+bytes.readUInt32BE(0)));
+          require('node:assert/strict').equal(message.type,'accepted','lockedReclaimConsumer');
+          console.log('WITNESS_PASS');process.exit(0);
+        });
+        channel.write(frame({type:'ready'}));
+        // Two relay poll intervals let bind replace the deliberately pre-existing socket.
+        setTimeout(()=>{const client=net.createConnection(socketPath);client.on('error',()=>{});},40);
+        """, expectsReady: true, witness: "lockedReclaimConsumer", scenario: "leftover-socket")
+    }
+
+    func testSIGTERMLegIsRequired() throws {
+        let began = DispatchTime.now().uptimeNanoseconds
+        try nativeRun(body: """
+        clearTimeout(timer);
+        process.on('SIGTERM',()=>{console.log('WITNESS_PASS SIGTERM');process.exit(0);});
+        channel.on('data',()=>{});
+        channel.write(frame({type:'ready'}));
+        const ready=setInterval(()=>{if(fs.existsSync(socketPath)){clearInterval(ready);process.kill(process.ppid,'SIGTERM');}},10);
+        """, expectsReady: true, witness: "sigtermLeg", scenario: "graceful")
+        // The 2000 ms signal step plus one 1000 ms scheduler allowance must finish before SIGKILL at 5000 ms.
+        XCTAssertLessThanOrEqual((DispatchTime.now().uptimeNanoseconds - began) / 1_000_000,
+            UInt64(RelayProtocolConstants.probeReplyBoundMilliseconds + RelayProtocolConstants.relayChildReapBoundMilliseconds), "sigtermLeg deadline")
+    }
+
+    func testReapTimeoutPreservesSocket() throws { try unreapedRun("reap-timeout") }
+    func testOwnershipLossPreservesSocket() throws { try unreapedRun("ownership-loss") }
+    private func unreapedRun(_ scenario: String) throws {
+        try nativeRun(body: """
+        clearTimeout(timer);
+        fs.writeFileSync(socketPath+'.pid',String(process.pid));
+        channel.on('data',()=>{console.log('WITNESS_PASS');process.exit(0);});
+        channel.write(frame({type:'ready'}));
+        const ready=setInterval(()=>{if(fs.existsSync(socketPath)){clearInterval(ready);process.kill(process.ppid,'SIGTERM');}},10);
+        """, expectsReady: true, witness: "reapBeforeUnlink", scenario: scenario)
+    }
+
+    // Gate-1 schedule: 150 waves of four clients, 60000-byte queries and eight cancels;
+    // pause 200 ms every tenth wave. The 20000 ms harness ceiling is four readiness intervals.
+    func testChurnWithPausedNodeDeliversShutdown() throws {
+        try nativeRun(body: """
+        clearTimeout(timer);
+        const deadline=setTimeout(()=>{throw Error('churn did not complete');},20000);
+        const assert=require('node:assert/strict');
+        let bytes=Buffer.alloc(0), waves=0, ending=false, accepted=0;
+        channel.on('data',chunk=>{
+          bytes=Buffer.concat([bytes,chunk]);
+          while(bytes.length>=4 && bytes.length>=4+bytes.readUInt32BE(0)) {
+            const n=bytes.readUInt32BE(0),m=JSON.parse(bytes.subarray(4,4+n));bytes=bytes.subarray(4+n);
+            if(m.type==='accepted') accepted++;
+            if(m.type==='relay_shutdown') {
+              assert.ok(ending,'churnShutdown premature stop');
+              assert.equal(waves,150,'churnShutdown waves');assert.ok(accepted>4,'churnShutdown admission progress');
+              clearTimeout(deadline);console.log('WITNESS_PASS');process.exit(0);
+            }
+          }
+        });
+        channel.on('end',()=>{throw Error('churnShutdown unexpected EOF');});
+        channel.write(frame({type:'ready'}));
+        const big='x'.repeat(60000);
+        const wave=()=>{
+          if(waves===150){ending=true;process.kill(process.ppid,'SIGTERM');return;}
+          waves++;
+          if(waves%10===0){channel.pause();setTimeout(()=>channel.resume(),200);}
+          let closed=0;
+          for(let i=0;i<4;i++){
+            const c=net.createConnection(socketPath);c.on('error',()=>{});
+            c.on('connect',()=>{const parts=[frame({type:'tools_call',request_id:'r'+i,name:'memory_search',arguments:{query:big}})];
+              for(let k=0;k<8;k++)parts.push(frame({type:'cancel',mcp_request_id:'r'+i}));c.end(Buffer.concat(parts));});
+            c.on('close',()=>{if(++closed===4)setTimeout(wave,2);});
+          }
+        };
+        const ready=setInterval(()=>{if(fs.existsSync(socketPath)){clearInterval(ready);wave();}},10);
+        """, expectsReady: true, witness: "churnShutdown", scenario: "graceful")
+    }
+
     private func nativeRun(body: String, expectsReady: Bool, witness: String, seeded: Bool = false, scenario: String = "", expectedLog: String? = nil) throws {
         var pattern = Array("/tmp/hmr-XXXXXX".utf8CString)
         guard let pointer = mkdtemp(&pattern) else { throw RuntimeFailure.configuration }
@@ -294,14 +390,59 @@ final class RuntimeContractTests: XCTestCase {
             "fortress_id": "hermes-memory", "agent_id": "hermes", "identity_fingerprint": fingerprint
         ]
         let config = try RuntimeConfiguration.parse(JSONSerialization.data(withJSONObject: fields))
-        if scenario == "reject-peer" { try Data().write(to: URL(fileURLWithPath: root + "/reject-peer")) }
+        if !scenario.isEmpty { try Data().write(to: URL(fileURLWithPath: root + "/" + scenario)) }
+        if scenario == "leftover-socket" {
+            let stale = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard stale >= 0 else { throw RuntimeFailure.socket }
+            defer { close(stale) }
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+            withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: Array(socketPath.utf8) + [0]) }
+            let result = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(stale, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+            }
+            XCTAssertEqual(result, 0, "lockedReclaimConsumer fixture")
+        }
         let code: Int32
-        if seeded {
+        var fixtureRuntimeToReap: RelayRuntime?
+        var fixtureChildReaped = false
+        defer {
+            if !fixtureChildReaped, let pid = fixtureRuntimeToReap?.child {
+                _ = kill(pid, SIGKILL)
+                var status: Int32 = 0
+                _ = waitpid(pid, &status, 0)
+            }
+        }
+        if seeded || scenario == "production-peer" {
             try JSONSerialization.data(withJSONObject: fields).write(to: URL(fileURLWithPath: root + "/relay-config.json"))
             code = try runEntrypoint(root: root)
-        } else { code = fixtureRuntime(config, root: root).run() }
-        XCTAssertEqual(code, seeded && expectedLog == nil && scenario != "restart" ? EX_OK : (expectsReady ? EX_SOFTWARE : EX_CONFIG), witness)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: socketPath), "supervisionConvergesBothDirections")
+        } else {
+            let runtime = fixtureRuntime(config, root: root)
+            if scenario == "reap-timeout" || scenario == "ownership-loss" { fixtureRuntimeToReap = runtime }
+            code = runtime.run()
+            XCTAssertLessThanOrEqual(runtime.peakPrivateQueueFrames, RuntimeLimits.privateQueueFrames, "churnShutdown queue cap")
+            XCTAssertLessThanOrEqual(runtime.peakPrivateQueueBytes, RuntimeLimits.privateQueueBytes, "churnShutdown byte cap")
+        }
+        if scenario == "production-peer" {
+            XCTAssertEqual(try? String(contentsOfFile: root + "/peer-refused", encoding: .utf8), "4", "productionPeerComposition zero bytes read")
+        }
+        if scenario == "reap-timeout" || scenario == "ownership-loss" {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: socketPath), "reapBeforeUnlink")
+            let log = try String(contentsOfFile: config.relayLog, encoding: .utf8)
+            XCTAssertTrue(log.contains(scenario == "reap-timeout" ? "reap_timeout" : "child_ownership_lost"), "reapBeforeUnlink cause")
+            XCTAssertTrue(log.contains("leftover_socket=" + socketPath), "reapBeforeUnlink diagnostic")
+            let pid = try XCTUnwrap(Int32(String(contentsOfFile: socketPath + ".pid", encoding: .utf8)))
+            var status: Int32 = 0
+            _ = kill(pid, SIGKILL)
+            let result = waitpid(pid, &status, 0)
+            fixtureChildReaped = result == pid || (result < 0 && errno == ECHILD)
+            XCTAssertEqual(result, pid, "reapBeforeUnlink fixture cleanup")
+        }
+        XCTAssertEqual(code, scenario == "graceful" ? EX_OK : seeded && expectedLog == nil && scenario != "restart" ? EX_OK : (expectsReady ? EX_SOFTWARE : EX_CONFIG), witness)
+        if scenario != "reap-timeout" && scenario != "ownership-loss" {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: socketPath), "supervisionConvergesBothDirections")
+        }
         let output = try String(contentsOfFile: root + "/bridge.log", encoding: .utf8)
         if let expectedLog {
             XCTAssertTrue(output.contains(expectedLog), "\(witness): \(output)")
@@ -315,7 +456,7 @@ final class RuntimeContractTests: XCTestCase {
             }
         } else if witness == "realCLIEnvironmentAdmission" {
             XCTAssertTrue(output.contains("state_FORTRESS_UNLOCKED: startup refused"), "realCLIEnvironmentAdmission: \(output)")
-        } else if witness != "malformedReadyLeavesNoSocket" {
+        } else if witness != "malformedReadyLeavesNoSocket" && scenario != "ownership-loss" {
             XCTAssertTrue(output.contains("WITNESS_PASS"), "\(witness): \(output)")
         }
         if scenario == "restart" {
@@ -353,7 +494,18 @@ final class RuntimeContractTests: XCTestCase {
     }
 
     private func fixtureRuntime(_ config: RuntimeConfiguration, root: String) -> RelayRuntime {
-        RelayRuntime(configuration: config, environment: ["HOME": root, "LANG": "C", "TMPDIR": "/tmp"],
+        if FileManager.default.fileExists(atPath: root + "/production-peer") {
+            return try! RelayRuntime.productionRuntime(config, lookup: RuntimeFixtureAccount(), admin: RuntimeFixtureAdmin(),
+                home: root, group: getgid(), fileSystem: FixtureSocketMetadata(root: root), observeRejectedPeer: { fd in
+                    var item = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                    _ = poll(&item, 1, Int32(RelayProtocolConstants.probeReplyBoundMilliseconds))
+                    // SO_NREAD observes the receive queue length without reading or peeking any client byte.
+                    var unread: Int32 = -1, size = socklen_t(MemoryLayout<Int32>.size)
+                    XCTAssertEqual(getsockopt(fd, SOL_SOCKET, SO_NREAD, &unread, &size), 0)
+                    try! String(unread).write(toFile: root + "/peer-refused", atomically: false, encoding: .utf8)
+                })
+        }
+        return RelayRuntime(configuration: config, environment: ["HOME": root, "LANG": "C", "TMPDIR": "/tmp"],
                      socketGroup: getgid(), instanceLock: DarwinInstanceLock(), verifySocketPath: {
             let info = try RuntimeConfiguration.metadata(root)
             guard info.st_uid == getuid(), info.st_mode & 0o777 == 0o700 else { throw RuntimeFailure.configuration }
@@ -370,7 +522,13 @@ final class RuntimeContractTests: XCTestCase {
             }
             // Fixture peers authenticate their actual kernel uid; production still pins Hermes uid 502.
             _ = try UnixPeerVerifier.requirePeer(socket: fd, expectedUID: getuid())
-        }, ordinaryReadsEnabled: { !FileManager.default.fileExists(atPath: root + "/drain-only") })
+        }, ordinaryReadsEnabled: { !FileManager.default.fileExists(atPath: root + "/drain-only") }, reapChild: { pid, status, options in
+            if FileManager.default.fileExists(atPath: root + "/reap-timeout") { return 0 }
+            if FileManager.default.fileExists(atPath: root + "/ownership-loss"), FileManager.default.fileExists(atPath: config.publicSocket) {
+                errno = ECHILD; return -1
+            }
+            return Darwin.waitpid(pid, status, options)
+        })
     }
 
     private func quoted(_ value: String) -> String {
@@ -646,4 +804,16 @@ final class RuntimeContractTests: XCTestCase {
       });
     }, 10);
     """
+}
+
+// Only root-owned socket-path metadata is simulated; the peer check always inspects the real connected descriptor.
+private struct FixtureSocketMetadata: RelayFileSystem {
+    let root: String
+    func lstat(_ path: String) throws -> PathMetadata {
+        PathMetadata(owner: path == root ? getuid() : 0, group: getgid(),
+            mode: path == root ? RelayProtocolConstants.socketDirectoryMode : 0o755,
+            isDirectory: true, isSymlink: false)
+    }
+    func unlink(_ path: String) throws { throw RuntimeFailure.socket }
+    func chmod(_ path: String, _ mode: mode_t) throws { throw RuntimeFailure.socket }
 }

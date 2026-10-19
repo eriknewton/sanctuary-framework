@@ -59,22 +59,35 @@ public struct RuntimeConfiguration: Equatable {
         for path in [result.nodeExecutable, result.nodeEntry, result.bridgeLog, result.relayLog,
                      result.publicSocket, result.privateDirectory] { try normalizedAbsolute(path) }
         guard result.publicSocket.utf8.count <= maximumSocketPathBytes,
-              result.identityFingerprint.utf8.count == 64,
-              result.identityFingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              result.identityFingerprint.utf8.count == 64, // SHA-256: 32 bytes times two hex characters.
+              result.identityFingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }), // ASCII 0-9 and a-f.
               validID(result.fortressID), validID(result.agentID) else { throw RuntimeFailure.configuration }
         return result
     }
 
     /// Open one owner-only config without following links, then validate its protected inputs.
     public static func load(path: String) throws -> RuntimeConfiguration {
+        try load(path: path, descriptorMetadata: descriptorMetadata, lookup: DarwinAccountUIDLookup(),
+                 admin: DarwinAdminGroupMembership(), groupExists: { getgrnam($0) != nil })
+    }
+
+    static func descriptorMetadata(_ fd: Int32) throws -> stat {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw RuntimeFailure.configuration }
+        return info
+    }
+
+    // Only host facts are ports. The same file, path and permission predicates run in CLI and fixture startup.
+    static func load(path: String, descriptorMetadata: (Int32) throws -> stat,
+                     lookup: AccountUIDLookup, admin: AdminGroupMembership, groupExists: (String) -> Bool) throws -> RuntimeConfiguration {
         try normalizedAbsolute(path)
         try validateChain(parent(path), owner: RelayProtocolConstants.ownerUID)
         let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else { throw RuntimeFailure.configuration }
         defer { close(fd) }
-        var info = stat()
+        let info = try descriptorMetadata(fd)
         // Descriptor metadata binds the bytes being parsed, rather than a prior path observation.
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+        guard info.st_mode & S_IFMT == S_IFREG,
               info.st_uid == RelayProtocolConstants.ownerUID,
               info.st_mode & 0o7777 == protectedFileMode,
               info.st_size > 0, info.st_size <= maximumConfigBytes else { throw RuntimeFailure.configuration }
@@ -89,11 +102,11 @@ public struct RuntimeConfiguration: Equatable {
         }
         let config = try parse(bytes)
         guard path == config.privateDirectory + "/relay-config.json" else { throw RuntimeFailure.configuration }
-        try config.validateProtectedInputs()
+        try config.validateProtectedInputs(lookup: lookup, admin: admin, groupExists: groupExists)
         return config
     }
 
-    func validateProtectedInputs() throws {
+    func validateProtectedInputs(lookup: AccountUIDLookup, admin: AdminGroupMembership, groupExists: (String) -> Bool) throws {
         guard getuid() == ownerUID, geteuid() == ownerUID else { throw RuntimeFailure.configuration }
         try Self.validateChain(privateDirectory, owner: ownerUID)
         let directory = try Self.metadata(privateDirectory)
@@ -112,10 +125,10 @@ public struct RuntimeConfiguration: Equatable {
             try Self.validateChain(Self.parent(path), owner: ownerUID)
         }
         let identity = try HermesInstallIdentity(pinnedUID: hermesUID, accountName: hermesAccount)
-            .validate(lookup: DarwinAccountUIDLookup())
+            .validate(lookup: lookup)
         _ = try PeerVerifier(installIdentity: identity, ownerUid: ownerUID,
-                            credentials: DarwinPeerCredentialProvider(), adminMembership: DarwinAdminGroupMembership())
-        guard getgrnam(group) != nil else { throw RuntimeFailure.configuration }
+                            credentials: DarwinPeerCredentialProvider(expectedUID: identity.pinnedUID), adminMembership: admin)
+        guard groupExists(group) else { throw RuntimeFailure.configuration }
         // Public socket metadata is intentionally inspected only after acquiring the instance flock.
     }
 

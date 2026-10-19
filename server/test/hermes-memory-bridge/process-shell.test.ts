@@ -390,20 +390,138 @@ describe("Hermes memory process shell", () => {
     }
   }, 30_000);
 
+  it("cliWrongProbePairIsImmediatelyFatal", async () => {
+    const fixture = await seededFortress("cli-wrong-probe");
+    const child = spawnObservedCli(fixture.env, "");
+    const relay = child.stdio[3] as Duplex;
+    try {
+      expect(await readNodeFrame(relay)).toEqual({ type: "ready" });
+      relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: "a".repeat(32) }));
+      expect(await boundedValue(childExit(child), RELAY_CHILD_SIGTERM_GRACE_MS, "still_running"),
+        "cliWrongProbePairIsImmediatelyFatal").toEqual({ code: EXIT_FATAL_BRIDGE, signal: null });
+    } finally { killChild(child); await childExit(child); }
+  }, 30_000);
+
+  it("cliIssuedNonceCapIsConsumed", async () => {
+    const fixture = await seededFortress("cli-nonce-cap");
+    const coreEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/bridge-core.ts", import.meta.url));
+    const constantsEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/constants.ts", import.meta.url));
+    // Seed the actual composed waiter's retained state; a real fixture-approved insert consumes that cap.
+    // Approval exists only in this subprocess fixture, never in the installed CLI.
+    const instrument = `
+      const { HermesBridgeCore } = await import(pathToFileURL(${JSON.stringify(coreEntry)}).href);
+      const { ABANDONED_PROBE_NONCE_CAP } = await import(pathToFileURL(${JSON.stringify(constantsEntry)}).href);
+      const original = HermesBridgeCore.prototype.onDrained;
+      let installed = false;
+      HermesBridgeCore.prototype.onDrained = function(listener) {
+        if (!installed) {
+          installed = true;
+          for (let i=0;i<ABANDONED_PROBE_NONCE_CAP;i++) {
+            const entry='retained-'+i;
+            const action=this.waiter.start(entry,'c1').actions[0];
+            this.waiter.timeout(entry,action.nonce);
+          }
+          const retained=this.waiter.snapshot().abandoned.map(pair=>pair.nonce);
+          const prompt=this.ports.ownerSurface.promptOwner;
+          this.ports.ownerSurface.promptOwner=(id,summary)=>{
+            prompt(id,summary);
+            queueMicrotask(()=>{const entry=this.snapshot().ledger.entry;this.ownerApprove(entry.id,entry.textSha256);});
+          };
+          process.on('exit',()=>process.stderr.write('CLI_RETAINED_NONCES='+JSON.stringify({
+            before:retained, after:this.waiter.snapshot().abandoned.map(pair=>pair.nonce)
+          })+'\\n'));
+        }
+        return original.call(this,listener);
+      };
+    `;
+    const child = spawnObservedCli(fixture.env, instrument);
+    const relay = child.stdio[3] as Duplex, stderr = collectChildStderr(child);
+    try {
+      expect(await readNodeFrame(relay)).toEqual({ type: "ready" });
+      relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "cap", name: "memory_insert",
+        arguments: { text: "bounded nonce fixture", taint: "user_content", passage_id: "nonce-cap" } }));
+      const response = await readNodeFrame(relay);
+      expect(response.type, "cliIssuedNonceCapIsConsumed").toBe("response");
+      if (response.type === "response") {
+        expect(JSON.parse(Buffer.from(String(response.result_b64), "base64").toString()).type,
+          "cliIssuedNonceCapIsConsumed").toBe("error");
+      }
+      relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await childExit(child)).toEqual({ code: EXIT_CLEAN, signal: null });
+      const line = stderr().split("\n").find(value => value.startsWith("CLI_RETAINED_NONCES="));
+      expect(line, "cliIssuedNonceCapIsConsumed actual waiter observed").toBeDefined();
+      const observed = JSON.parse(line!.slice("CLI_RETAINED_NONCES=".length));
+      expect(observed.before).toHaveLength(16); // 16 is the seam's no-eviction nonce cap.
+      expect(observed.after, "cliIssuedNonceCapIsConsumed no eviction").toEqual(observed.before);
+    } finally { killChild(child); await childExit(child); }
+  }, 30_000);
+
+  it("cliProbeWaitStopsOnTransportTermination", async () => {
+    const fixture = await seededFortress("cli-live-probe-eof");
+    const coreEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/bridge-core.ts", import.meta.url));
+    const child = spawnObservedCli(fixture.env, `
+      const { HermesBridgeCore }=await import(pathToFileURL(${JSON.stringify(coreEntry)}).href);
+      const original=HermesBridgeCore.prototype.onDrained;
+      let installed=false;
+      HermesBridgeCore.prototype.onDrained=function(listener){
+        if(!installed){
+          installed=true;
+          this.ports.ownerSurface.promptOwner=()=>queueMicrotask(()=>{
+            const entry=this.snapshot().ledger.entry;this.ownerApprove(entry.id,entry.textSha256);
+          });
+          process.on('exit',()=>process.stderr.write('CLI_PROBE_LIVE='+Boolean(this.waiter.snapshot().live)+'\\n'));
+        }
+        return original.call(this,listener);
+      };
+    `);
+    const relay=child.stdio[3] as Duplex, stderr=collectChildStderr(child);
+    try {
+      expect(await readNodeFrame(relay)).toEqual({ type: "ready" });
+      relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "wait", name: "memory_insert",
+        arguments: { text: "pending probe fixture", taint: "user_content", passage_id: "probe-eof" } }));
+      expect(await readNodeFrame(relay)).toMatchObject({ type: "probe", connection_id: "c1" });
+      relay.end();
+      expect(await boundedValue(childExit(child), RELAY_CHILD_SIGTERM_GRACE_MS, "still_running"),
+        "cliProbeWaitStopsOnTransportTermination").toEqual({ code: EXIT_CLEAN, signal: null });
+      expect(stderr(), "cliProbeWaitStopsOnTransportTermination").toContain("CLI_PROBE_LIVE=false");
+    } finally { killChild(child); await childExit(child); }
+  }, 30_000);
+
+  it("cliMissingDependencyRefusesBeforeReady", async () => {
+    const fixture = await seededFortress("cli-missing-dependency");
+    // Remove an actual composition binding in an isolated loader, with no product flag or forced exit.
+    const hook = `
+      export async function load(url, context, nextLoad) {
+        const result=await nextLoad(url,context);
+        if(url.split('?')[0]===${JSON.stringify(new URL("../../src/hermes-memory-bridge/process-shell.ts", import.meta.url).href)}) {
+          const source=String(result.source), anchor='auditForwarder.bind(auditLog);';
+          if(source.split(anchor).length!==2) throw Error('missing-dependency fixture anchor');
+          return {...result,source:source.replace(anchor,'/* fixture omitted audit binding */')};
+        }
+        return result;
+      }
+    `;
+    const child = spawnObservedCli(fixture.env, `
+      const { register }=await import('node:module');
+      register('data:text/javascript,'+encodeURIComponent(${JSON.stringify(hook)}),import.meta.url);
+    `);
+    const relay = child.stdio[3] as Duplex, stderr = collectChildStderr(child);
+    const bytes: Buffer[] = [];
+    relay.on("data", chunk => bytes.push(Buffer.from(chunk)));
+    try {
+      expect(await boundedValue(childExit(child), RELAY_CHILD_SIGTERM_GRACE_MS, "still_running"),
+        "cliMissingDependencyRefusesBeforeReady").toEqual({ code: EXIT_STARTUP_REFUSED, signal: null });
+      expect(Buffer.concat(bytes).length, "cliMissingDependencyRefusesBeforeReady no ready").toBe(0);
+      expect(stderr(), "cliMissingDependencyRefusesBeforeReady boundary").toContain("state_GATE_WIRED: startup refused");
+    } finally { killChild(child); await childExit(child); }
+  }, 30_000);
+
   it("supervisionConvergesBothDirections: relay EOF drains the real CLI child", async () => {
     const fixture = await seededFortress("supervision-eof");
-    // This child receives the configured environment at spawn; no test bootstrap rewrites process.env.
-    const script = `
-      const { pathToFileURL } = await import("node:url");
-      const { installInMemoryKeychainStore } = await import(pathToFileURL(${JSON.stringify(keychainStoreEntry)}).href);
-      installInMemoryKeychainStore();
-      process.argv = [process.execPath, ${JSON.stringify(cliEntry)}, ...process.argv.slice(1)];
-      await import(pathToFileURL(${JSON.stringify(cliEntry)}).href);
-    `;
-    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script,
-      "hermes-memory-bridge", "run", "--relay-fd", "3"], {
-      cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "pipe"], env: fixture.env,
-    });
+    const child = spawnObservedCli(fixture.env, "");
     const relay = child.stdio[3] as Duplex;
     const stderr = collectChildStderr(child);
     relay.on("error", () => undefined);
@@ -2647,6 +2765,25 @@ async function fortressCustodySocket(storage: StorageBackend, before: readonly s
   const sockets = candidates.filter((path) => !prior.has(path));
   expect(sockets).toHaveLength(1);
   return sockets[0]!;
+}
+
+// Exercise the actual CLI handler in a child while retaining the test isolation marker.
+// The handler's explicit environment port supplies fixture configuration; process.env is never rewritten.
+// Native Swift entrypoint tests separately prove the actual six-key posix_spawn environment and CLI dispatcher.
+function spawnObservedCli(env: NodeJS.ProcessEnv, instrumentation: string): ChildProcess {
+  const script = `
+    const { pathToFileURL } = await import("node:url");
+    const { installInMemoryKeychainStore } = await import(pathToFileURL(${JSON.stringify(keychainStoreEntry)}).href);
+    installInMemoryKeychainStore();
+    ${instrumentation}
+    const { hermesBridgeMain } = await import(pathToFileURL(${JSON.stringify(processShellSource)}).href);
+    process.exitCode = await hermesBridgeMain({argv:process.argv.slice(2),env:JSON.parse(process.env.HMR_FIXTURE_ENV)});
+  `;
+  return spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script,
+    "hermes-memory-bridge", "run", "--relay-fd", "3"], {
+    cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "pipe"],
+    env: { ...process.env, VITEST: process.env.VITEST ?? "true", HMR_FIXTURE_ENV: JSON.stringify(env) },
+  });
 }
 
 function spawnBridgeCli(env: NodeJS.ProcessEnv): ChildProcess {
