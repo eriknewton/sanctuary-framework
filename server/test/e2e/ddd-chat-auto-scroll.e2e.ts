@@ -140,6 +140,24 @@ async function isInHistoryViewport(
   });
 }
 
+/** Compare settled layouts: message visibility alone does not mean the send or history read has finished. */
+async function settledHistoryScrollTop(page: Page): Promise<number> {
+  let top: number | null = null;
+  await expect.poll(async () => {
+    // Check readiness and take the sample in one browser task, so a reconnect
+    // cannot insert its loading card between a readiness assertion and the read.
+    top = await page.evaluate<number | null>(`(() => {
+      const history = document.getElementById("concierge-history");
+      const status = document.querySelector("#main [data-talk-read-status]");
+      const send = document.querySelector('#main [data-action="concierge-send"]');
+      if (!history || !status || status.childElementCount || !send || send.disabled) return null;
+      return history.scrollTop;
+    })()`);
+    return top;
+  }, { message: "scroll sample waits for send and history-read settlement" }).not.toBeNull();
+  return top!;
+}
+
 test.describe("Finding DDD: concierge chat auto-scroll on real DOM", () => {
   test("Scenario A: send-message brings the latest reply into the history's visible region; input bar stays visible", async ({
     page,
@@ -310,18 +328,12 @@ test.describe("Finding DDD: concierge chat auto-scroll on real DOM", () => {
     // the history viewport). Trigger a background rerender. Operator
     // should remain at-bottom; a regression that yanked them to the
     // top of history would be visible here.
-    const beforeScroll = await page.evaluate(() => {
-      const h = document.getElementById("concierge-history");
-      return h ? h.scrollTop : -1;
-    });
+    const beforeScroll = await settledHistoryScrollTop(page);
     await page.evaluate(() => {
       window.dispatchEvent(new Event("hashchange"));
     });
     await page.waitForTimeout(200);
-    const afterScroll = await page.evaluate(() => {
-      const h = document.getElementById("concierge-history");
-      return h ? h.scrollTop : -1;
-    });
+    const afterScroll = await settledHistoryScrollTop(page);
 
     // Looser bound: small layout shift is acceptable; a jump to the
     // top of history is not.

@@ -168,6 +168,16 @@ class FakeElement {
     this.children.push(child);
     return child;
   }
+  // Model DOM insertion order so the shipping newest-first toast path remains observable.
+  get firstChild(): FakeElement | FakeText | null { return this.children[0] ?? null; }
+  insertBefore(child: FakeElement | FakeText, reference: FakeElement | FakeText | null) {
+    if (reference === null) return this.appendChild(child);
+    const index = this.children.indexOf(reference);
+    if (index < 0) throw new Error("Insertion reference is not a child");
+    if (child instanceof FakeElement) child.parentElement = this;
+    this.children.splice(index, 0, child);
+    return child;
+  }
   removeChild(child: FakeElement | FakeText) {
     const index = this.children.indexOf(child);
     if (index >= 0) this.children.splice(index, 1);
@@ -211,7 +221,7 @@ const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
-  "machines-summary", "machines-age", "machines-list", "toast-host",
+  "machines-summary", "machines-age", "machines-list", "toast-host", "decision-feedback-result",
 ];
 
 function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}, options: { deferredHashchange?: boolean; templateContent?: boolean } = {}) {
@@ -858,7 +868,7 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     // The refusal is the retained decision result, not a toast; the server's reason is quoted in it.
     expect(h.el.main!.innerHTML).toContain('data-decision-status="refused"');
-    expect(h.el.main!.innerHTML).toContain("Allow once was refused for state export by fixture-agent (request wait-1): operator session required (HTTP 401). The decision was not applied.");
+    expect(h.el["decision-feedback-result"]!.innerHTML).toContain("Allow once was refused for state export by fixture-agent (request wait-1): operator session required (HTTP 401). The decision was not applied.");
     // Retargeted from "Decided at": a refused decision leaves the row waiting with its controls, repainted from the server.
     expect(h.el.main!.innerHTML).toContain("WAITING");
     expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="wait-1"');
@@ -3681,7 +3691,7 @@ describe("Approvals round-one decision and evidence states", () => {
       if (failure === "downgrade confirmed" || failure === "override refused") expected.push("override");
       expect(calls).toEqual(expected);
       // Every outcome is the retained decision result on the screen; no toast reports a decision.
-      const result = h.el.main!.innerHTML.split('class="decision-result"')[1] ?? "";
+      const result = h.el["decision-feedback-result"]!.innerHTML.split('class="decision-result"')[1] ?? "";
       expect(h.el["toast-host"]!.innerHTML).toBe("");
       if (failure === "approve") {
         expect(result).toContain('data-decision-status="refused"');

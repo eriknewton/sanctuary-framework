@@ -59,42 +59,51 @@ const OVERVIEW_COMPACT_ROW_MIN_PX = OVERVIEW_COMPACT_COLUMNS * OVERVIEW_TILE_MIN
 const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
 ${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
+html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+:root {
+  /* F reserves six body lines, two space-2 padding edges and two 1px borders.
+     Talk uses the same height so its panel ends above the feedback row. */
+  --body-line-height: 1.45;
+  --feedback-line: calc(var(--body-line-height) * var(--text-md));
+  --feedback-height: calc(6 * var(--feedback-line) + 2 * var(--space-2) + 2px);
+}
 body {
   font-family: var(--sans);
   font-size: var(--text-md);
   background: var(--paper);
   color: var(--ink);
-  line-height: 1.45;
+  line-height: var(--body-line-height);
 }
 /* Slice 2 shell (2026-10-13): a full-width top bar over a left rail and the
    main column, as on the ratified Overview canvas. 232px is the canvas rail
    width; 56px the canvas top-bar height; 360px the fortress column, which
    shows only beside Talk's full-page route (every other route is route-full). */
 .app {
-  min-height: 100vh;
+  height: 100dvh;
+  min-width: 0; min-height: 0;
   display: grid;
   grid-template-columns: 232px 1fr 360px;
-  grid-template-rows: 56px 1fr;
+  grid-template-rows: 56px minmax(0, 1fr) var(--feedback-height);
   grid-template-areas:
     "topbar topbar topbar"
-    "sidebar main fortress";
+    "sidebar main fortress"
+    "feedback feedback feedback";
 }
 .app.route-full {
   grid-template-columns: 232px 1fr;
   grid-template-areas:
     "topbar topbar"
-    "sidebar main";
+    "sidebar main"
+    "feedback feedback";
 }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-/* The rail (RailItem preview). It stays in view while the main column
-   scrolls: sticky under the 56px top bar, its own scroll when it outgrows
-   the viewport. Chrome recedes: surface and rule only; color is spent on
+/* The rail (RailItem preview) scrolls independently inside the workspace.
+   Chrome recedes: surface and rule only; color is spent on
    state (the waiting pill) and on the one accent (the active marker). */
 .sidebar {
   grid-area: sidebar; background: var(--surface); border-right: 1px solid var(--rule);
   padding: var(--space-3) var(--space-2); display: flex; flex-direction: column;
-  position: sticky; top: 56px; height: calc(100vh - 56px); overflow-y: auto;
+  min-width: 0; min-height: 0; overflow-y: auto;
 }
 .sidebar nav { display: flex; flex-direction: column; gap: 2px; }
 /* S2: version / deployment / mode / attestation sit in the rail footer,
@@ -275,7 +284,7 @@ body {
    332px of the screen beneath in view (1024 - 232 - 460), so Talk opens
    beside the screen rather than over it; capped at the viewport. */
 .talk-panel {
-  position: fixed; top: 56px; right: 0; bottom: 0; width: min(460px, 100vw); z-index: 45;
+  position: fixed; top: 56px; right: 0; bottom: var(--feedback-height); width: min(460px, 100vw); z-index: 45;
   background: var(--paper); border-left: 1px solid var(--rule); display: flex; flex-direction: column;
 }
 .talk-panel[hidden] { display: none; }
@@ -372,7 +381,9 @@ body {
 [data-theme="dark"] .btn-icon .icon-moon { display: none; }
 [data-theme="dark"] .btn-icon .icon-sun { display: inline; }
 .btn-icon .icon-moon, .btn-icon .icon-sun { line-height: 0; }
-.main { grid-area: main; overflow-y: auto; padding: 16px 24px; }
+.main { grid-area: main; min-width: 0; min-height: 0; overflow-y: auto; padding: 16px 24px; }
+/* Main receives page-key focus only as a scroll target; controls retain their own rings. */
+.main:focus { outline: none; }
 /* Every bare link in the main column reads the accent, visited and hover
    included. Why: dark is the default theme, and the user-agent link blue on
    the dark --paper is 2.04:1 (visited 1.74:1), under the 4.5:1 text floor;
@@ -382,7 +393,7 @@ body {
    Settings tabs, the fold's "Open on its own page") keeps its own rule; only
    the links that fell through to the user-agent blue change. */
 :where(.main a:not(.btn), .main a:not(.btn):visited, .main a:not(.btn):hover) { color: var(--accent); }
-.fortress { grid-area: fortress; overflow-y: auto; border-left: 1px solid var(--rule); background: var(--paper-2); padding: var(--space-3); display: flex; flex-direction: column; gap: 10px; }
+.fortress { grid-area: fortress; min-width: 0; min-height: 0; overflow-y: auto; border-left: 1px solid var(--rule); background: var(--paper-2); padding: var(--space-3); display: flex; flex-direction: column; gap: 10px; }
 .app.route-full .fortress { display: none; }
 .card {
   background: var(--surface); border: 1px solid var(--rule);
@@ -422,11 +433,19 @@ body {
 .glyph.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .glyph.away { background: var(--rust); border: 0; border-radius: 0; }
 .glyph.offline { background: transparent; border: 2px solid var(--locked); border-radius: 0; }
+/* Feedback has one in-flow shell track. Only its interior scrolls or changes
+   when a retained result is cleared or an ordinary toast expires. */
+.feedback {
+  grid-area: feedback; position: relative; min-width: 0; min-height: 0;
+  overflow-y: scroll; overflow-x: hidden; overflow-anchor: none;
+  padding: var(--space-2); border: 1px solid var(--rule);
+  background: var(--paper); overflow-wrap: anywhere;
+}
+/* Match the shared keyboard ring, inset by its width so F cannot clip it. */
+.feedback:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .toast {
-  position: fixed; bottom: 16px; right: 16px;
-  background: var(--ink); color: var(--paper); padding: 8px 12px;
-  border-radius: var(--rad); font-size: var(--text-sm); z-index: 1000;
-  max-width: 360px;
+  background: var(--ink); color: var(--paper); padding: var(--space-2);
+  border-radius: var(--rad); font-size: var(--text-sm);
 }
 .toast.error { background: var(--rust); color: var(--paper); }
 .layer-card { background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--rad); padding: var(--space-2); }
@@ -704,14 +723,11 @@ body {
   background: var(--indigo-bg); color: var(--indigo); border: 1px solid var(--indigo);
   border-radius: var(--rad); padding: 8px 12px; margin: 8px 0; font-size: var(--text-base);
 }
-/* The one retained decision result (client.ts renderDecisionResult) heads every screen with decision
-   controls. It sits in normal flow, so settling never covers a control or moves the page under the
-   pointer; the border and fill follow the status word only (ochre while sending or unconfirmed, sage
-   when the server acknowledged, rust when it refused), and the text stays ink so it reads in both
-   themes; not_sent (nothing reached the server) keeps the ochre default. Must match the data-decision-status
-   values in client.ts, DECISION_HEADLINE. */
+/* Retained outcomes render inside F; its reserved shell track does not depend on
+   their text. Status colors must match DECISION_HEADLINE in client.ts. */
 .decision-result {
-  display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3);
+  display: grid; grid-template-columns: minmax(0, 1fr) 88px; /* Design 2B: one 44px-minimum Clear button plus label room. */
+  align-items: start; gap: var(--space-2);
   background: var(--ochre-bg); color: var(--ink); border: 1px solid var(--ochre);
   border-left-width: 3px; /* 3 = the 1px card border plus 2px, the same accent width the banners use */
   border-radius: var(--rad); padding: 10px 12px; /* 12 = the banner-warn side padding; 10 = its 8px top padding plus 2px so the headline clears the thicker left accent */
@@ -733,32 +749,13 @@ body {
   background: var(--surface-2); border-color: var(--ink-3);
 }
 .btn.chip:hover:not(:disabled) { background: var(--paper-3); border-color: var(--ink-2); }
-/* Finding DDD (v1.2.0-rc.5): the concierge card uses a bounded
- * max-height + the history is the inner scroll container with
- * min-height: 0 (so flex shrink works in WebKit) + the composer is
- * flex-shrink: 0 (so it stays pinned at the bottom of the card
- * regardless of how much history is above). The pre-rc.5 layout used
- * min-height: calc(100vh - 180px) on the card and min-height: 360px
- * on the history; with no height bound, the card grew to fit content,
- * the history never scrolled internally (scrollHeight === clientHeight),
- * and on long threads the composer was pushed below the page fold.
- * Operator quote from Pass 5 drill: "It does move the response up
- * dynamically, but the input box is below the fold, so I still have
- * to scroll." rc.5 closes that with a structural layout fix.
- */
-/* Sprint Piece 2 PR 2 (2026-05-03): concierge surface polish.
- * Translates Claude Design references at
- * server/docs/design-refs/sprint-piece-2/surface-concierge.jsx and the
- * Surface 1 block of surfaces.css. The bounded-card layout above is
- * preserved verbatim because rc.5 and the DDD e2e suite depend on it;
- * the Claude Design reference uses height: 720px for the card, but
- * production keeps the calc-based bounded height so the card adapts
- * to the operator viewport. The polish lands the persona glyph-ring,
- * mono uppercase author labels, paper-2 background for concierge
- * replies, suggest-grid empty-state cards, and the composer input-wrap
- * with the keyboard-shortcut pill.
- */
+/* Talk's card flexes inside its bounded workspace. The history keeps a zero
+   minimum height and the composer does not shrink, so long threads scroll
+   inside the card. The DDD and Talk ownership browser specs cover this path. */
 .concierge-wrap { max-width: 880px; margin: 0 auto; }
+/* Both Talk hosts take their height from the workspace, leaving F visible. */
+.spine-hero { height: 100%; min-height: 0; display: flex; flex-direction: column; }
+.spine-hero > :not(.concierge-card) { flex-shrink: 0; }
 .page-head {
   display: flex; align-items: flex-end; justify-content: space-between;
   gap: var(--space-4);
@@ -782,9 +779,7 @@ body {
 }
 .concierge-card {
   display: flex; flex-direction: column;
-  height: calc(100vh - 180px);
-  max-height: calc(100vh - 180px);
-  min-height: 360px;
+  flex: 1; min-height: 0;
   padding: 18px 22px 14px;
   gap: 0;
 }
@@ -1504,7 +1499,8 @@ body {
    APPROVALS column behind a sideways scroll; 680px fits that box with 34px
    to spare, so the cells wrap instead. */
 @media (max-width: 1100px) {
-  .app, .app.route-full { grid-template-columns: 220px 1fr; grid-template-areas: "topbar topbar" "sidebar main"; }
+  .app, .app.route-full { grid-template-columns: 220px 1fr; grid-template-areas: "topbar topbar" "sidebar main"
+    "feedback feedback"; }
   .fortress { display: none; }
   .template-grid { grid-template-columns: 1fr; }
   /* center h1s keep --text-display (26px); a 30px override here would grow them. */
@@ -2467,18 +2463,20 @@ export function renderDashboardV11Html(
         </div>
       </div>
     </aside>
-    <main class="main" id="main"><div class="boot-placeholder"><h2>Checking how safe you are.</h2><p>Reading this machine's posture from your local Sanctuary. The posture routes stay behind your operator token, so nothing renders until that check completes.</p></div></main>
+    <main class="main" id="main" tabindex="-1"><div class="boot-placeholder"><h2>Checking how safe you are.</h2><p>Reading this machine's posture from your local Sanctuary. The posture routes stay behind your operator token, so nothing renders until that check completes.</p></div></main>
     <aside class="fortress" id="fortress"><p class="muted">Loading fortress column.</p></aside>
+    <section class="feedback" id="feedback" aria-label="Feedback" tabindex="0">
+      <div id="toast-host" aria-live="polite"></div>
+      <!-- Must match renderFeedback in client.ts; it replaces only this host's children. -->
+      <div id="decision-feedback-result"></div>
+    </section>
   </div>
+  <!-- announceDecision in client.ts uses this permanent body-level live region across route redraws. -->
+  <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
   <aside class="talk-panel" id="talk-panel" aria-label="Talk to your fortress" hidden>
     <div class="talk-panel-head"><strong>Talk</strong><a href="#dashboard" data-action="talk-open-full">Open as a full page</a><button type="button" class="iconbtn" data-action="talk-close" aria-label="Close the Talk panel" title="Close">${ICON_CLOSE}</button></div>
     <div class="talk-panel-body" id="talk-panel-body"></div>
   </aside>
-  <div id="toast-host" aria-live="polite"></div>
-  <!-- Decision announcements: the one retained decision result (client.ts announceDecision) speaks through this
-       shell-level live region because #main is replaced wholesale on every repaint and a live region created inside
-       it would not be announced. Visually hidden; the visible result renders inside #main. -->
-  <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
   <script id="dashboard-config" type="application/json">${config}</script>
   ${clientBlock}
 </body>

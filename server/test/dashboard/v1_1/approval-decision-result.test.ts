@@ -18,7 +18,7 @@
  * nothing being noted on it instead; a local non-admission
  * is its own "not sent" outcome, never a refusal; the row Snooze menu and the selection pause while a batch holds
  * the lock; a batch summary is confirmed only when every count and missing id is accounted for; the result block
- * heads the stopped-updates panel too. The decision-result witness for D5-approval; this header carries the bare
+ * remains beside the stopped-updates panel too. The decision-result witness for D5-approval; this header carries the bare
  * id only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -114,7 +114,7 @@ const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
-  "machines-summary", "machines-age", "machines-list", "toast-host", "decision-announcement",
+  "machines-summary", "machines-age", "machines-list", "toast-host", "decision-announcement", "decision-feedback-result",
 ];
 
 type Override = (init?: RequestInit, url?: string) => unknown;
@@ -180,7 +180,7 @@ function boot(overrides: Record<string, Override> = {}) {
   const posts = () => requests.filter((r) => r.init?.method === "POST").map((r) => r.url);
   const main = () => el.main!.innerHTML;
   // The result block only, so the panels' own error text cannot satisfy or defeat an assertion about it.
-  const result = () => (main().split('class="decision-result"')[1] ?? "").split("</section>")[0]!;
+  const result = () => (el["decision-feedback-result"]!.innerHTML.split('class="decision-result"')[1] ?? "").split("</section>")[0]!;
   const read = (expression: string) => runInContext(expression, context);
   return { el, context, navigate, click, requests, posts, main, result, read };
 }
@@ -304,7 +304,7 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
     await settle();
     expect(h.result().split("Your next Snooze was not sent").length - 1, "one note, however many clicks").toBe(1);
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="uncertain">Unconfirmed. See the decision result at the top of this screen.</p>');
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="uncertain">Unconfirmed.</p>');
   });
 
   it("an unconfirmed result is replaced only by the next decision", async () => {
@@ -399,7 +399,7 @@ describe("one retained decision result", () => {
     expect(h.result()).toContain('data-decision-status="refused"');
     expect(h.result()).toContain("Delete was refused for 2 selected items: delete_confirmation_required (HTTP 400).");
     expect(h.result()).not.toContain("Deleted");
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="refused">Refused. See the decision result at the top of this screen.</p>');
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="refused">Refused.</p>');
     expect(h.main()).toContain("2 selected");
     expect(h.read('state.inboxOps.selected["wait-1"] === true && state.inboxOps.selected["wait-2"] === true')).toBe(true);
   });
@@ -569,7 +569,7 @@ describe("one retained decision result", () => {
     expect(h.read("JSON.stringify(state.inboxOps.selected)"), "after release the row menu works again").toBe('{"wait-2":true}');
   });
 
-  it("the result block heads the stopped-updates panel too", async () => {
+  it("the result block remains beside the stopped-updates panel too", async () => {
     vi.useFakeTimers();
     const h = boot({
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1")] } })),
@@ -584,7 +584,7 @@ describe("one retained decision result", () => {
     expect(h.main()).toContain("Live updates stopped");
     expect(h.result()).toContain('data-decision-status="acknowledged"');
     expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1).");
-    expect(h.main().indexOf('class="decision-result"')).toBeLessThan(h.main().indexOf("Live updates stopped"));
+    expect(h.main()).not.toContain('class="decision-result"');
   });
 
   it("controls stay paused with the re-read reason until the queue re-read settles", async () => {
@@ -646,7 +646,7 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.posts()).toEqual([]);
     expect(h.result()).toContain("Snooze was not sent for 2 selected items: 1 of the 2 selected items is no longer waiting in the loaded queue, so nothing was sent.");
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="not_sent">Not sent. See the decision result at the top of this screen.</p>');
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="not_sent">Not sent.</p>');
     expect(h.read('state.inboxOps.selected["wait-1"] === true && state.inboxOps.selected["done-1"] === true')).toBe(true);
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
@@ -721,9 +721,16 @@ describe("one retained decision result", () => {
     h.navigate("approvals");
     expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1).");
     expect(h.result()).toContain('data-action="decision-result-clear"');
+    const mainBeforeClear = h.main();
+    const requestsBeforeClear = h.requests.length;
     h.click({ "data-action": "decision-result-clear" });
-    expect(h.main()).not.toContain("decision-result");
-    expect(h.read("state.approvals.result")).toBeNull();
+    expect(h.result()).toBe("");
+    expect(h.main()).toBe(mainBeforeClear);
+    expect(h.requests).toHaveLength(requestsBeforeClear);
+    expect(h.read("state.approvals.result.cleared")).toBe(true);
+    h.read("rerender()");
+    expect(h.result()).toBe("");
+    expect(h.main()).toBe(mainBeforeClear);
   });
 
   for (const [label, activate, rule, text] of [

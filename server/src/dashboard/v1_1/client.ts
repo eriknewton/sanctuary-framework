@@ -735,8 +735,12 @@ function toast(message, kind) {
   const el = document.createElement("div");
   el.className = "toast" + (kind === "error" ? " error" : "");
   el.textContent = message;
-  host.appendChild(el);
-  setTimeout(function () { el.remove(); }, 4000);
+  // Newest first keeps F at its origin so expiry cannot hide the retained headline.
+  host.insertBefore(el, host.firstChild);
+  const feedback = document.getElementById("feedback");
+  if (feedback) feedback.scrollTop = 0;
+  const toastLifetimeMs = 4 * 1000; // Four seconds, preserving the existing toast lifetime.
+  setTimeout(function () { el.remove(); }, toastLifetimeMs);
 }
 
 // ── Template registry (mirror of server templates.ts) ──────────────────
@@ -1399,6 +1403,11 @@ function hydrateTalkHost(host) {
   template.innerHTML = renderDashboardConcierge();
   const fresh = template.content.querySelector(".concierge-wrap");
   if (!fresh) throw new Error("Talk render shell missing");
+  // Read-status and badge changes resize history even when its messages are unchanged.
+  // Capture before any presentation write so shrinking the viewport cannot erase follow intent.
+  const history = owner.history;
+  const viewport = captureTalkViewport(history);
+  const requestedFollow = talkFollowRequested();
   ["[data-talk-read-status]", ".concierge-meta", "[data-talk-error]"].forEach(function (selector) {
     const livePart = host.querySelector(selector);
     const freshPart = fresh.querySelector(selector);
@@ -1414,11 +1423,10 @@ function hydrateTalkHost(host) {
   });
   const freshHistory = fresh.querySelector("#concierge-history");
   if (!freshHistory) throw new Error("Talk history anchor missing");
-  const history = owner.history;
   const changed = history.innerHTML !== freshHistory.innerHTML;
+  // Only real message admission starts a thread; an empty-to-empty refresh must preserve the suggestion reader's offset.
+  const firstMessages = changed && !history.querySelector(".concierge-msg") && !!freshHistory.querySelector(".concierge-msg");
   if (changed) {
-    const viewport = captureTalkViewport(history);
-    const requestedFollow = talkFollowRequested();
     // Compare and copy text separators as well as message elements. Cloning
     // only .children drops the renderer's newline nodes, making a later
     // unchanged refresh look different and replace selected reply text.
@@ -1431,8 +1439,6 @@ function hydrateTalkHost(host) {
     } else {
       history.replaceChildren(...newNodes.map(function (node) { return node.cloneNode(true); }));
     }
-    restoreTalkViewport(history, viewport || talkViewportState, requestedFollow);
-    owner.watch.lastTop = history.scrollTop;
   }
   const sending = state.chat.concierge.sending;
   owner.input.disabled = sending;
@@ -1442,6 +1448,10 @@ function hydrateTalkHost(host) {
   send.disabled = sending;
   const label = sending ? "Sending..." : "Send";
   if (send.textContent !== label) send.textContent = label;
+  // Preserve the reader across the complete hydration, including chrome-only refreshes.
+  restoreTalkViewport(history, viewport || talkViewportState, firstMessages || (changed && requestedFollow));
+  // Rebase only our own motion so a reader scroll awaiting its event still revokes the send's follow request.
+  if (!viewport || history.scrollTop !== viewport.top) owner.watch.lastTop = history.scrollTop;
   state.chat.concierge.pendingScroll = false;
 }
 
@@ -1550,12 +1560,9 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
-  // The retained decision result heads every screen that can take a decision, so the outcome of the last
-  // decision is on the screen the operator decided from and survives a route change.
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
-  // Composed after every replacement of the route body above, including the stopped-updates panel, so no path
-  // can drop a retained result from the screen.
-  if (DECISION_RESULT_ROUTES.indexOf(state.route) >= 0) nextHtml = renderDecisionResult() + nextHtml;
+  // F is outside the route body, including stopped-updates and Talk screens.
+  renderFeedback();
   // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
   // a composer that left the document while still owned was replaced by some
   // other writer, and a silent remount would discard the draft it held.
@@ -6535,7 +6542,7 @@ function state_NOTADMITTEDDecision(fields, reason) {
     // nothing is noted on it (one slot, so repeated clicks cannot grow it) and the warning stays unclearable.
     current.notSent = "Your next " + notSent;
     announceDecision(current);
-    rerender();
+    renderFeedback();
     return;
   }
   state.approvals.result = Object.assign({ status: "not_sent", rule: null, refresh: "loaded", records: [] }, fields, { message: notSent });
@@ -6569,9 +6576,6 @@ async function onInboxAction(itemId, action) {
 const DECISION_BUSY_REASON = "Another decision is being sent.";
 const DECISION_REREAD_NOTE = "The queue could not be re-read after this decision, so this list may be out of date.";
 const DECISION_UNCERTAIN_ADVICE = "The decision may or may not have been applied. Check the queue before deciding again.";
-// The routes whose renderers emit inbox-* or inbox-batch-* controls: Approvals, Overview, Evidence and
-// Agent detail (with its inspect panel). A new decision surface joins this list in the same change.
-const DECISION_RESULT_ROUTES = ["approvals", "posture", "activity", "agent-detail"];
 const DECISION_VERB = { approve: "Allow once", deny: "Deny", dismiss: "Dismiss", archive: "Archive", delete: "Delete", snooze: "Snooze" };
 const DECISION_DONE = { approve: "Allowed once", deny: "Denied", dismiss: "Dismissed", archive: "Archived", delete: "Deleted", snooze: "Snoozed" };
 const DECISION_REREAD_BUSY_REASON = "The queue is being re-read after a decision.";
@@ -6686,9 +6690,25 @@ function decisionRecordLine(item, action) {
   if (!item || (action !== "approve" && action !== "deny")) return "";
   return isCharterApprovalItem(item) ? " Recorded in your audit log." : " Marked decided in this inbox.";
 }
+// The host id must match decision-feedback-result in html.ts. Clear uses this
+// patch directly so it does not replace route nodes or restore input focus.
+let lastFeedbackHtml = null;
+function renderFeedback() {
+  const host = document.getElementById("decision-feedback-result");
+  if (!host) return;
+  const html = renderDecisionResult();
+  // Compare emitted strings: DOM serialization changes quote entities and would replace focused Clear.
+  if (lastFeedbackHtml !== html) {
+    host.innerHTML = html;
+    lastFeedbackHtml = html;
+    // A changed result starts at F's origin so stale scrolling cannot hide its headline.
+    const feedback = document.getElementById("feedback");
+    if (feedback) feedback.scrollTop = 0;
+  }
+}
 function renderDecisionResult() {
   const r = state.approvals.result;
-  if (!r) return "";
+  if (!r || r.cleared) return "";
   const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
   const records = r.records.length
     ? '<ul>' + r.records.map(function (rec) { return '<li>' + escHtml(rec.message) + '</li>'; }).join("") + '</ul>' : "";
@@ -6704,28 +6724,26 @@ function decisionFirstSentence(message) {
   return first.slice(-1) === "." ? first : first + ".";
 }
 function renderDecisionBatchInline() {
-  // The Evidence inbox repeats the one-line status of the last batch beside its toolbar, since the result block
-  // at the top of the screen can sit above the fold when the operator decided from this section.
+  // The Evidence inbox repeats the last batch status beside its toolbar; full text stays in F.
   const r = state.approvals.result;
   if (!r || r.kind !== "batch") return "";
   // A partly taken batch keeps its whole short message here, so the refusal is not dropped with the second sentence.
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
     : r.status === "acknowledged" ? (decisionHeadline(r) === DECISION_HEADLINE.acknowledged ? decisionFirstSentence(r.message) : r.message)
-    : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
-    : r.status === "not_sent" ? "Not sent. See the decision result at the top of this screen."
-    : "Unconfirmed. See the decision result at the top of this screen.";
+    : r.status === "refused" ? "Refused."
+    : r.status === "not_sent" ? "Not sent."
+    : "Unconfirmed.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 function renderDecisionInline(item) {
-  // The drawer and every row with decision controls repeat the one-line status for the decided request, since the
-  // result block at the top of the screen can sit above the fold; the full text stays in the result block.
+  // The drawer and rows repeat the status for the decided request; full text stays in F.
   const r = state.approvals.result;
   if (!r || r.kind !== "item" || r.itemId !== item.item_id || item.resolved) return "";
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
     : r.status === "acknowledged" ? decisionDone(r.action) + "."
-    : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
-    : r.status === "not_sent" ? "Not sent. See the decision result at the top of this screen."
-    : "Unconfirmed. See the decision result at the top of this screen.";
+    : r.status === "refused" ? "Refused."
+    : r.status === "not_sent" ? "Not sent."
+    : "Unconfirmed.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 
@@ -7254,6 +7272,12 @@ function bindHashRoute() {
 // Escape closes, in order, the search results, an open top-bar popover, and
 // the Talk panel.
 document.addEventListener("keydown", function (ev) {
+  // With no focused control, native page keys must target the workspace scroller.
+  if (document.activeElement === document.body && !ev.ctrlKey && !ev.metaKey && !ev.altKey &&
+      ["PageDown", "PageUp", "Home", "End", "ArrowDown", "ArrowUp", " "].includes(ev.key)) {
+    const main = document.getElementById("main");
+    if (main && typeof main.focus === "function") main.focus({ preventScroll: true });
+  }
   if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && String(ev.key || "").toLowerCase() === "k") {
     const input = document.getElementById("global-search");
     if (input && typeof input.focus === "function") {
@@ -7597,11 +7621,16 @@ document.addEventListener("click", function (ev) {
     return focusApprovalDrawer();
   }
   if (action === "decision-result-clear") {
-    // A result leaves the screen only through its own control, never while its decision holds the lock, and an
+    // F hides a result only through its own control, never while its decision holds the lock, and an
     // unconfirmed result has no such control: a stray click on a stale button must not clear it either.
     if (decisionInFlight() || (state.approvals.result && state.approvals.result.status === "uncertain")) return;
-    state.approvals.result = null;
-    return rerender();
+    const clearHadFocus = document.activeElement === tgt;
+    // Clear hides only F; keep status echoes stable on background redraws until the next decision.
+    if (state.approvals.result) state.approvals.result.cleared = true;
+    renderFeedback();
+    // Removing focused Clear must retain the keyboard user's place without moving decision controls.
+    if (clearHadFocus) document.getElementById("feedback").focus({ preventScroll: true });
+    return;
   }
   if (action === "approval-always-allow") {
     // An in-flight decision retains its consent state until settlement.
