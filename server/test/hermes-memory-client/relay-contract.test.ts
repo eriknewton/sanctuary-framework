@@ -13,14 +13,12 @@ const arms = ["done", "async_failure", "eof", "signal", "malformed", "oversize",
 
 describe.skipIf(process.platform !== "darwin")("native Python MCP consumer", () => {
   beforeAll(async () => {
-    const built = await run("npm", ["run", "build"], { cwd: `${repo}/server`, timeout: 120_000, maxBuffer: 1024 * 1024 });
-    expect(built.stderr).not.toContain("ERROR");
+    // The suite never rebuilds dist itself: a clean build deletes dist while sibling tests spawn dist/cli.js.
     const sourceDir = `${repo}/server/src/hermes-memory-client`;
     const sources = [`${repo}/server/src/cli.ts`, ...(await readdir(sourceDir)).filter(name => name.endsWith(".ts")).map(name => `${sourceDir}/${name}`)];
     const newest = Math.max(...await Promise.all(sources.map(async path => (await stat(path)).mtimeMs)));
-    expect((await stat(`${repo}/server/dist/cli.js`)).mtimeMs, "realClientBuildIsCurrent").toBeGreaterThanOrEqual(newest);
-    process.stdout.write("realClient build: npm run build completed for current source\n");
-  }, 125_000);
+    expect((await stat(`${repo}/server/dist/cli.js`)).mtimeMs, "realClientBuildIsCurrent: run npm run build first").toBeGreaterThanOrEqual(newest);
+  }, 10_000);
   for (const arm of arms) it(`realClient_${arm}`, async () => {
     await access(bundle);
     const result = await run(python, [fileURLToPath(new URL("./real_client.py", import.meta.url)), "--repo", repo,

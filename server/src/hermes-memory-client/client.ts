@@ -475,6 +475,10 @@ export class HermesMemoryClient {
     this.drainDeadline = this.ports.now() + P.SHIM_DISCONNECT_TIMEOUT_MS;
     // Cancellation precedes settlement; a selected response never causes a new relay cancel.
     if (this.primary) this.cancel(this.primary);
+    // DEBT(HMC-RELAY-FAULT-CODE): a relay protocol fault correlated to one request settles that request with the
+    // drain response below rather than its own terminal internal error; the connection still closes. The merged
+    // relay emits only the two fixed error texts, so only a relay fault reaches this; accepted under the
+    // two-round stop and tracked privately.
     if (!silent) for (const record of this.records.values()) this.select(record,
       P.errorLine(record.id!, record.insert ? "unknown" : "unavailable"));
     this.shutdown(); this.wake();
