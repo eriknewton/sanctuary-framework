@@ -99,6 +99,8 @@ for (const config of configurations) {
           expect(panel!.y + panel!.height, "Talk panel ends above F").toBeLessThanOrEqual(feedback!.y + 1);
           await page.locator('[data-action="talk-open-full"]').click();
           await expect(page.locator('#decision-feedback-result')).toContainText("Retained feedback.");
+          // Retained feedback already exists while hash navigation is still mounting Talk.
+          await expect(page.locator('#main [data-action="concierge-input"]')).toBeVisible();
           const input = await page.locator('[data-action="concierge-input"]').boundingBox();
           expect(input!.y + input!.height, "full-page Talk composer ends above F").toBeLessThanOrEqual(feedback!.y + 1);
         }

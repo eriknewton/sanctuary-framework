@@ -206,6 +206,53 @@ async function scrollReaderTo(page: Page, top: number): Promise<void> {
 }
 
 test.describe("Talk mounted owner on a real engine", () => {
+  for (const following of [true, false]) {
+    test(`a held background history read preserves ${following ? "bottom follow" : "the reader offset"} through status-only hydration`, async ({ page, dashboard }) => {
+      // Expose the shipping stream-refresh entry point; the driver supplies no layout or follow logic.
+      await page.route(dashboard.url + "/", async route => {
+        const response = await route.fetch();
+        const body = (await response.text()).replace("void loadPanel(panelJobs[0]);",
+          "window.refreshTalkHistory = () => queueStreamRefresh([HUB + '/chat/concierge/history']); void loadPanel(panelJobs[0]);");
+        await route.fulfill({ response, body });
+      });
+      // Keep reconnects from adding uncontrolled refreshes to this fault schedule.
+      await page.route("**/api/stream", () => {});
+      await installConciergeStub(page, { seed: DEFAULT_SEED });
+      await gotoRoute(page, dashboard.url, "dashboard");
+      await waitForSeededHistory(page);
+      await expect(page.locator('[data-talk-read-status]')).toBeEmpty();
+      await page.evaluate("document.fonts.ready");
+      await expectOverflow(page);
+      await scrollReaderTo(page, following ? (await historyGeometry(page))!.max : READER_OFFSET_PX);
+      const before = (await historyGeometry(page))!;
+      expect(await atBottom(page)).toBe(following);
+      await page.evaluate('window.retainedTalkReply = document.querySelector(".concierge-msg-concierge:last-child")');
+
+      // A held GET makes the loading layout observable for as long as the assertions need it.
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      await page.route(/\/api\/hub\/chat\/concierge\/history/, async route => {
+        await held;
+        await route.fallback();
+      });
+      try {
+        await page.evaluate('void window.refreshTalkHistory()');
+        await expect(page.locator('[data-talk-read-status]')).toContainText("Read in progress.");
+        const loading = (await historyGeometry(page))!;
+        expect(loading.client, "the real status card shrinks history").toBeLessThan(before.client);
+        if (following) expect(await atBottom(page), "status-only loading keeps the latest reply in view").toBe(true);
+        else expect(loading.top, "status-only loading keeps the reader's offset").toBe(before.top);
+      } finally {
+        release();
+      }
+      await expect(page.locator('[data-talk-read-status]')).toBeEmpty();
+      expect(await page.evaluate('window.retainedTalkReply === document.querySelector(".concierge-msg-concierge:last-child")'),
+        "an unchanged refresh preserves the reply node").toBe(true);
+      if (following) expect(await atBottom(page), "read completion keeps following").toBe(true);
+      else expect((await historyGeometry(page))!.top, "read completion keeps the reader's offset").toBe(before.top);
+    });
+  }
+
   test("(a) a suggestion click then a refused send keeps the suggestion visible and as the next send's payload", async ({ page, dashboard }) => {
     const stub = await installConciergeStub(page, { postStatus: 403 });
     await gotoRoute(page, dashboard.url, "dashboard");

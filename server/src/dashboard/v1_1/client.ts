@@ -1403,6 +1403,11 @@ function hydrateTalkHost(host) {
   template.innerHTML = renderDashboardConcierge();
   const fresh = template.content.querySelector(".concierge-wrap");
   if (!fresh) throw new Error("Talk render shell missing");
+  // Read-status and badge changes resize history even when its messages are unchanged.
+  // Capture before any presentation write so shrinking the viewport cannot erase follow intent.
+  const history = owner.history;
+  const viewport = captureTalkViewport(history);
+  const requestedFollow = talkFollowRequested();
   ["[data-talk-read-status]", ".concierge-meta", "[data-talk-error]"].forEach(function (selector) {
     const livePart = host.querySelector(selector);
     const freshPart = fresh.querySelector(selector);
@@ -1418,11 +1423,10 @@ function hydrateTalkHost(host) {
   });
   const freshHistory = fresh.querySelector("#concierge-history");
   if (!freshHistory) throw new Error("Talk history anchor missing");
-  const history = owner.history;
   const changed = history.innerHTML !== freshHistory.innerHTML;
+  // The first loaded thread opens at its latest message; the empty-state suggestions have no reader offset to inherit.
+  const firstMessages = changed && !history.querySelector(".concierge-msg");
   if (changed) {
-    const viewport = captureTalkViewport(history);
-    const requestedFollow = talkFollowRequested();
     // Compare and copy text separators as well as message elements. Cloning
     // only .children drops the renderer's newline nodes, making a later
     // unchanged refresh look different and replace selected reply text.
@@ -1435,8 +1439,6 @@ function hydrateTalkHost(host) {
     } else {
       history.replaceChildren(...newNodes.map(function (node) { return node.cloneNode(true); }));
     }
-    restoreTalkViewport(history, viewport || talkViewportState, requestedFollow);
-    owner.watch.lastTop = history.scrollTop;
   }
   const sending = state.chat.concierge.sending;
   owner.input.disabled = sending;
@@ -1446,6 +1448,9 @@ function hydrateTalkHost(host) {
   send.disabled = sending;
   const label = sending ? "Sending..." : "Send";
   if (send.textContent !== label) send.textContent = label;
+  // Preserve the reader across the complete hydration, including chrome-only refreshes.
+  restoreTalkViewport(history, viewport || talkViewportState, firstMessages || (changed && requestedFollow));
+  owner.watch.lastTop = history.scrollTop;
   state.chat.concierge.pendingScroll = false;
 }
 
