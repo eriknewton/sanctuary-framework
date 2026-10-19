@@ -197,7 +197,7 @@ In flight means any forwarded request awaiting its `response`: `tools_call`, `to
 
 ## Stdio client contract
 
-`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory search and get are available through the bridge; writes are not yet available. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; inherited environment cannot select a socket, identity, write flag, or boot mode.
+`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory search and get are available through the bridge; writes are not yet available. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; the shim code reads no environment selector for socket, identity, write flag, or boot mode. The agent account can reach the socket directly, so inherited environment is not a security boundary here.
 
 The client constants in `server/src/hermes-memory-client/protocol.ts` must match `RelayProtocolConstants` in `Sources/HermesMemoryRelayCore/Core.swift`: public payload 65536 bytes excluding the 4-byte prefix, retained socket frame 65540 bytes, 64 composite levels below the public root, two outstanding pongs, and eight queued/reserved forwarded controls. The client cannot observe `markNodeFrameWritten`, so its `CONTROL_CAP` conservatively limits controls over the connection lifetime, reserving the eighth credit for shutdown. A socket write never refunds credit.
 
@@ -215,10 +215,10 @@ MCP call results must match `CallToolResultSchema` with an actual content array;
 | Admission deadline | Fixed -32005, outcome unknown, at most one eligible cancel |
 | Size or depth with recovered ID | -32602, continue; rejected tails retain only a bounded ID scanner |
 | Invalid framing or lifecycle | Correlate outstanding IDs and drain while stdout remains usable |
-| Malformed relay result or unsolicited pong | Fixed -32603, correlated drain |
+| Malformed relay result or unsolicited pong | Fixed -32603 for the protocol fault; other admitted IDs receive unavailable, insert outcome unknown |
 | EOF or signal | No new stdout writes; eligible cancel, shutdown, bounded exit |
 | Dead stdout | Cancel where eligible, bounded exit; delivery cannot be guaranteed |
-| Short native call write | Correlated outcome unknown, no cancel and no second frame write |
+| Native call write error | Correlated outcome unknown, no cancel and no replay; partial progress resumes at its offset and EAGAIN waits for writability |
 
 | Continuing effect | Required evidence |
 |---|---|

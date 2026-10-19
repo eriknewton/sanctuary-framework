@@ -6,7 +6,7 @@ type State = "CONNECTING" | "HELD_INITIALIZE" | "AWAIT_INITIALIZE" | "INITIALIZE
 type RecordKind = "hello" | "initialize" | "call" | "list" | "ping" | "local";
 type RecordEntry = {
   id?: P.McpId; wire?: string; kind: RecordKind; insert: boolean; wanted: boolean; settled: boolean;
-  sent: boolean; cancelSent: boolean; wireDone: boolean; outputDone: boolean; line?: Buffer;
+  sent: boolean; cancelPending: boolean; cancelSent: boolean; wireDone: boolean; outputDone: boolean; line?: Buffer;
   admitted: number; deadline?: number; settleDeadline?: number; outputDeadline?: number;
 };
 /** A sink reports the actual accepted byte count, including a short native write. */
@@ -18,6 +18,7 @@ export interface ClientPorts {
   relayOutput: ByteSink;
   output: ByteSink;
   connect: (ready: () => void, failed: () => void) => void;
+  stopOutput: () => void;
   close: () => void;
   now: () => number;
   schedule: (run: () => void) => void;
@@ -43,6 +44,7 @@ export class HermesMemoryClient {
   private controlCount = 0;
   private shutdownSent = false;
   private relayWriting = false;
+  private writingPrimary?: RecordEntry;
   private pendingPrimary?: { record: RecordEntry; frame: Buffer };
   private pendingControl: Buffer[] = [];
   private outputWriting = false;
@@ -53,7 +55,6 @@ export class HermesMemoryClient {
   private connectDeadline: number;
   private initializationDeadline: number;
   private drainDeadline?: number;
-  private drainKind: P.ErrorKind = "unavailable";
   private drainReadRemaining = P.MAX_STDIO_LINE_BYTES;
   private serial = 0n;
   private readonly wirePrefix = "r" + randomBytes(16).toString("hex") + "."; // 16 bytes = 128 bits, encoded as 32 hex characters.
@@ -97,10 +98,13 @@ export class HermesMemoryClient {
   readonly signal = (): void => { this.state_DRAINING("unavailable", true); };
   readonly internalFailure = (): void => { this.state_DRAINING("internal"); };
   private readonly onEof = (): void => { this.state_DRAINING("unavailable", true); };
-  private readonly onInputError = (): void => { this.state_DRAINING("parse"); };
+  private readonly onInputError = (): void => { this.inputFault("parse"); };
   private readonly onSocketLoss = (): void => {
-    this.connected = false;
+    this.connected = false; this.pendingControl = []; this.pendingPrimary = undefined; this.relayWriting = false;
     if (this.primary) this.primary.wireDone = true;
+    // Socket death during frame delivery cannot establish whether the peer accepted the operation.
+    if (this.writingPrimary?.id !== undefined) this.select(this.writingPrimary, P.errorLine(this.writingPrimary.id, "unknown"));
+    this.writingPrimary = undefined;
     this.state_DRAINING("unavailable");
   };
   private readonly wake = (): void => {
@@ -119,7 +123,7 @@ export class HermesMemoryClient {
   }
   private current(): State { return this.state === "STALLED" ? this.savedState : this.state; }
   private record(kind: RecordKind, id?: P.McpId): RecordEntry {
-    return { kind, id, insert: false, wanted: true, settled: false, sent: false, cancelSent: false,
+    return { kind, id, insert: false, wanted: true, settled: false, sent: false, cancelPending: false, cancelSent: false,
       wireDone: kind !== "hello" && kind !== "list" && kind !== "call" && kind !== "ping", outputDone: false,
       admitted: this.ports.now() };
   }
@@ -170,19 +174,18 @@ export class HermesMemoryClient {
     try { request = P.parseStrictJsonObject(line.bytes, P.STDIO_DEPTH); }
     catch (error) {
       if (error instanceof P.StrictJsonError && error.code === "depth_exceeded") this.rejectedBound(line.recovered);
-      else this.state_DRAINING(error instanceof P.StrictJsonError && error.code === "top_level_not_object" ? "invalid" : "parse");
+      else this.inputFault(error instanceof P.StrictJsonError && error.code === "top_level_not_object" ? "invalid" : "parse", line.recovered);
       return;
     }
     const id = request.id;
     if (this.current() === "DRAINING") {
-      if (P.validId(id) && !this.records.has(P.idKey(id))) this.local(id, this.drainKind, true);
+      if (P.validId(id) && !this.records.has(P.idKey(id))) this.local(id, P.isRecord(request.params) && request.params.name === "memory_insert" ? "unknown" : "unavailable", true);
       return;
     }
     if (request.jsonrpc !== "2.0" || typeof request.method !== "string" || ("id" in request && !P.validId(id))) {
-      if (P.validId(id) && !this.records.has(P.idKey(id))) this.local(id, "invalid", true);
-      this.state_DRAINING("invalid"); return;
+      this.inputFault("invalid", P.validId(id) ? id : undefined); return;
     }
-    if (P.validId(id) && this.records.has(P.idKey(id))) { this.state_DRAINING("invalid"); return; }
+    if (P.validId(id) && this.records.has(P.idKey(id))) { this.inputFault("invalid"); return; }
     if (!("id" in request)) { this.notification(request); return; }
     if (!P.validId(id)) { this.state_DRAINING("invalid"); return; }
     if (request.method === "initialize") { this.state_INITIALIZE(request, id); return; }
@@ -190,10 +193,18 @@ export class HermesMemoryClient {
     if (this.current() !== "READY") { this.local(id, "invalid", true); this.state_DRAINING("invalid"); return; }
     this.state_READY(request, id);
   }
+  private inputFault(kind: P.ErrorKind, id?: P.McpId): void {
+    if (id !== undefined && !this.records.has(P.idKey(id))) this.local(id, kind, true);
+    else if (this.current() !== "DRAINING") {
+      // The terminal diagnostic cannot borrow an admitted request's correlation ID.
+      this.select(this.record("local"), P.errorLine(null, kind));
+    }
+    this.state_DRAINING(kind);
+  }
   private rejectedBound(id: P.McpId | undefined): void {
-    if (id === undefined) { this.state_DRAINING("invalid"); return; }
-    if (this.records.has(P.idKey(id))) { this.state_DRAINING("invalid"); return; }
-    this.local(id, this.current() === "DRAINING" ? this.drainKind : "params", this.current() === "DRAINING");
+    if (id === undefined) { this.inputFault("invalid"); return; }
+    if (this.records.has(P.idKey(id))) { this.inputFault("invalid"); return; }
+    this.local(id, this.current() === "DRAINING" ? "unavailable" : "params", this.current() === "DRAINING");
   }
   private state_INITIALIZE(request: Record<string, unknown>, id: P.McpId): void {
     if (!["CONNECTING", "AWAIT_INITIALIZE"].includes(this.current()) || this.initialization) {
@@ -275,18 +286,19 @@ export class HermesMemoryClient {
       // The reserved primary owns one encoded frame while a preceding control write completes.
       this.pendingPrimary = { record, frame }; return;
     }
-    this.relayWriting = true;
+    this.relayWriting = true; this.writingPrimary = record;
     this.ports.relayOutput.write(frame, (error, written) => {
-      this.relayWriting = false;
+      this.relayWriting = false; this.writingPrimary = undefined;
       if (this.state === "CLOSED") return;
       if (error || written !== frame.length) {
         // A short frame is never replayed or followed by an interleaved cancel.
-        record.wireDone = true; this.connected = false;
+        record.wireDone = true; this.connected = false; this.pendingControl = []; this.pendingPrimary = undefined;
         if (record.id !== undefined) this.select(record, P.errorLine(record.id, "unknown"));
         this.state_DRAINING("unavailable"); return;
       }
       record.sent = true;
-      if (this.current() === "DRAINING" || !record.wanted) this.cancel(record);
+      if (record.cancelPending || this.current() === "DRAINING" || !record.wanted) this.cancel(record);
+      if (this.current() === "DRAINING") this.shutdown();
       this.flushControl(); this.wake();
     });
   }
@@ -322,13 +334,17 @@ export class HermesMemoryClient {
       // An admitted but unwritten frame can retire locally without a relay cancellation.
       this.pendingPrimary = undefined; record.wireDone = true; record.deadline = undefined; return;
     }
-    if (!record.wire || !record.sent || record.cancelSent || record.wireDone || record.settled) return;
-    record.cancelSent = true;
+    if (!record.wire || record.cancelSent || record.wireDone || (record.settled && !record.cancelPending)) return;
+    // The first cancellation also bounds a frame still waiting for socket writability.
     record.settleDeadline ??= this.ports.now() + P.SHIM_CANCEL_SETTLE_MS;
+    // A cancellation selected before write completion remains eligible after its timeout reply settles.
+    if (!record.sent) { record.cancelPending = true; return; }
+    record.cancelPending = false;
+    record.cancelSent = true;
     this.queueControl(P.relayFrame({ type: "cancel", mcp_request_id: record.wire }), true);
   }
   private shutdown(): void {
-    if (this.shutdownSent || !this.connected) return;
+    if (this.shutdownSent || !this.connected || this.writingPrimary) return;
     this.shutdownSent = true;
     this.queueControl(P.relayFrame({ type: "shutdown" }), true, true);
   }
@@ -448,18 +464,19 @@ export class HermesMemoryClient {
   }
   private deadOutput(): void {
     if (this.primary) this.cancel(this.primary);
-    this.silent = true; this.state_DRAINING("unavailable", true);
+    this.state_DRAINING("unavailable", true);
   }
   private state_DRAINING(kind: P.ErrorKind, silent = false): void {
     if (this.state === "CLOSED") return;
-    if (silent) { this.silent = true; this.outputs.length = 0; this.inputTail = Buffer.alloc(0); this.inputOffset = 0; }
+    if (silent) { this.silent = true; this.ports.stopOutput(); this.outputWriting = false; this.outputs.length = 0; this.inputTail = Buffer.alloc(0); this.inputOffset = 0; }
     if (this.current() === "DRAINING") { this.wake(); return; }
-    this.state = "DRAINING"; this.drainKind = kind;
+    if (!silent && kind === "internal") this.select(this.record("local"), P.errorLine(null, kind));
+    this.state = "DRAINING";
     this.drainDeadline = this.ports.now() + P.SHIM_DISCONNECT_TIMEOUT_MS;
     // Cancellation precedes settlement; a selected response never causes a new relay cancel.
     if (this.primary) this.cancel(this.primary);
     if (!silent) for (const record of this.records.values()) this.select(record,
-      P.errorLine(record.id!, record.insert && kind === "unavailable" ? "unknown" : kind));
+      P.errorLine(record.id!, record.insert ? "unknown" : "unavailable"));
     this.shutdown(); this.wake();
   }
   private state_CLOSED(): void {
@@ -469,6 +486,7 @@ export class HermesMemoryClient {
     this.ports.input.off("readable", this.wake); this.ports.input.off("end", this.onEof); this.ports.input.off("error", this.onInputError);
     this.ports.relayInput.off("readable", this.wake); this.ports.relayInput.off("end", this.onSocketLoss);
     this.ports.relayInput.off("error", this.onSocketLoss); this.ports.relayInput.off("close", this.onSocketLoss);
+    this.writingPrimary = undefined;
     this.records.clear(); this.outputs.length = 0; this.pings.length = 0; this.pendingControl = [];
     this.socketTail = Buffer.alloc(0); this.inputTail = Buffer.alloc(0); this.primary = undefined; this.initialization = undefined; this.pendingPrimary = undefined;
     this.ports.close(); this.resolve(0);

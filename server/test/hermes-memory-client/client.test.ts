@@ -7,7 +7,7 @@ import { HermesBridgeCore } from "../../src/hermes-memory-bridge/bridge-core.js"
 import { parsePublicFrame } from "../../src/hermes-memory-bridge/envelopes.js";
 import { HERMES_TOOLS_LIST_PAYLOAD } from "../../src/hermes-memory-bridge/public-results.js";
 
-function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean; holdPing?: boolean } = {}) {
+function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean; holdPing?: boolean; holdCall?: boolean } = {}) {
   const input = new PassThrough(); const relayInput = new PassThrough();
   const frames: Record<string, any>[] = []; const lines: string[] = [];
   let now = 0; let closed = false;
@@ -16,12 +16,12 @@ function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean;
   const completions: (() => void)[] = [];
   const relayCompletions: (() => void)[] = [];
   const ports: ClientPorts = {
-    input, relayInput, connect: ready => ready(), close() { closed = true; }, now: () => now,
+    input, relayInput, stopOutput() {}, connect: ready => ready(), close() { closed = true; }, now: () => now,
     schedule: run => tasks.push(run), timer: run => { timer = run; return 1 as unknown as ReturnType<typeof setTimeout>; }, clearTimer() {},
     relayOutput: { write(bytes, done) {
       const frame = JSON.parse(bytes.subarray(4).toString()); frames.push(frame);
       const complete = () => done(null, options.short && frame.type === "tools_call" ? bytes.length - 1 : bytes.length);
-      if (options.holdPing && frame.type === "ping") relayCompletions.push(complete); else complete();
+      if ((options.holdPing && frame.type === "ping") || (options.holdCall && frame.type === "tools_call")) relayCompletions.push(complete); else complete();
     } },
     output: { write(bytes, done) {
       const complete = () => { lines.push(bytes.toString()); done(null, bytes.length); };
@@ -81,7 +81,7 @@ describe("memory client contracts", () => {
       expect(f.responses().at(-1).error, "clientPreservesFixedDenials").toEqual({ code: -32002, message: "Memory request denied." });
       await f.call(2); await f.relay({ type: "error", request_id: f.frames.at(-1)!.request_id, message: "private-detail" });
       expect(f.lines.join(""), "clientPreservesFixedDenials").not.toContain("private-detail");
-      expect(f.responses().at(-1).error.code).toBe(-32603);
+      expect(f.responses().at(-1).error.code).toBe(-32004);
     } finally { await f.stop(); }
   });
   it("clientCannotAddAuthorityFields", async () => {
@@ -152,7 +152,7 @@ describe("memory client contracts", () => {
     const f = fixture(); try {
       await f.initialize(); await f.call(1, "memory_insert");
       await f.raw('bad\n{"jsonrpc":"2.0","method":"tools/call","params":{"name":"memory_get"},"id":2}\n{"jsonrpc":"2.0","method":"ping","id":3}\n');
-      expect(f.responses().map(x => x.id), "bufferedUnreadIdsDrainBeforeClose").toEqual([0, 1, 2, 3]);
+      expect(f.responses().map(x => x.id), "bufferedUnreadIdsDrainBeforeClose").toEqual([0, null, 1, 2, 3]);
       expect(f.closed()).toBe(true);
     } finally { await f.stop(); }
   });
@@ -236,7 +236,7 @@ it("invalidCatalogNeverProducesSuccess", async () => {
     { tools: [...HERMES_TOOLS_LIST_PAYLOAD.tools, { name: "extra", input_schema: {} }] }]) {
     const f = fixture(); try {
       await f.initialize(); await f.send({ jsonrpc: "2.0", method: "tools/list", id: 1 }); await f.reply(payload);
-      expect(f.responses().at(-1).error.code, "invalidCatalogNeverProducesSuccess").toBe(-32603);
+      expect(f.responses().at(-1).error.code, "invalidCatalogNeverProducesSuccess").toBe(-32004);
     } finally { await f.stop(); }
   }
 });
@@ -272,7 +272,7 @@ it("utf8DuplicatesAndSurrogatesCannotBecomeCalls", async () => {
   for (const bytes of [Buffer.from([255, 10]), Buffer.from('{"id":1,"id":2}\n'), Buffer.from('{"x":"\\ud800"}\n')]) {
     const f = fixture(); try {
       await f.initialize(); await f.call(1); await f.raw(bytes);
-      expect(f.responses().at(-1).error.code, "utf8DuplicatesAndSurrogatesCannotBecomeCalls").toBe(-32700);
+      expect(f.responses().at(-1).error.code, "utf8DuplicatesAndSurrogatesCannotBecomeCalls").toBe(-32004);
       expect(f.frames.filter(x => x.type === "tools_call")).toHaveLength(1);
     } finally { await f.stop(); }
   }
@@ -397,5 +397,79 @@ it("signalDiscardsUnwrittenPrimary", async () => {
     expect(f.frames.filter(frame => frame.type === "tools_call" || frame.type === "cancel"), "signalDiscardsUnwrittenPrimary").toHaveLength(0);
     expect(f.frames.at(-1)!.type).toBe("shutdown");
     expect(f.responses().map(row => row.id)).toEqual([0]); expect(f.closed()).toBe(true);
+  } finally { await f.stop(); }
+});
+
+it("drainDuringCallWriteOrdersCancelBeforeShutdown", async () => {
+  const f = fixture({ holdCall: true }); try {
+    await f.initialize(); await f.call(1);
+    f.client.signal(); await f.pump();
+    f.relayCompletions.shift()!(); await f.pump();
+    expect(f.frames.slice(-2).map(frame => frame.type), "drainDuringCallWriteOrdersCancelBeforeShutdown").toEqual(["cancel", "shutdown"]);
+  } finally { await f.stop(); }
+});
+it("deadlineDuringCallWriteArmsSettlement", async () => {
+  const f = fixture({ holdCall: true }); try {
+    await f.initialize(); await f.call(1); await f.advance(P.SHIM_CALL_DEADLINE_MS);
+    f.relayCompletions.shift()!(); await f.pump();
+    expect(f.frames.filter(frame => frame.type === "cancel"), "deadlineDuringCallWriteArmsSettlement").toHaveLength(1);
+    await f.advance(P.SHIM_CANCEL_SETTLE_MS);
+    expect(f.closed(), "deadlineDuringCallWriteArmsSettlement").toBe(true);
+  } finally { await f.stop(); }
+});
+it("drainErrorsBelongToTheirOwnRequest", async () => {
+  for (const kind of ["memory_get", "memory_search", "memory_insert", "list"]) {
+    for (const trigger of ["parse", "invalid", "pong", "frame", "input", "internal"]) {
+      const f = fixture(); try {
+        await f.initialize();
+        if (kind === "list") await f.send({ jsonrpc: "2.0", method: "tools/list", id: 1 }); else await f.call(1, kind);
+        await f.send({ jsonrpc: "2.0", method: "ping", id: 2 });
+        if (trigger === "parse") await f.raw('{"id":3,"broken":}\n');
+        if (trigger === "invalid") await f.send({ jsonrpc: "wrong", method: "ping", id: 3 });
+        if (trigger === "pong") { await f.relay({ type: "pong" }); await f.relay({ type: "pong" }); }
+        if (trigger === "frame") await f.relay({ type: "invalid" });
+        if (trigger === "input") { f.input.emit("error", new Error("fixture")); await f.pump(); }
+        if (trigger === "internal") { f.client.internalFailure(); await f.pump(); }
+        const call = f.responses().find(row => row.id === 1);
+        expect(call?.error, "drainErrorsBelongToTheirOwnRequest").toEqual({ code: -32004,
+          message: kind === "memory_insert" ? "Memory service unavailable. Outcome unknown." : "Memory service unavailable." });
+        if (trigger !== "pong") expect(f.responses().find(row => row.id === 2)?.error.code, "drainErrorsBelongToTheirOwnRequest").toBe(-32004);
+        if (["parse", "invalid"].includes(trigger)) expect(f.responses().find(row => row.id === 3)?.error.code, "drainErrorsBelongToTheirOwnRequest").toBe(trigger === "parse" ? -32700 : -32600);
+      } finally { await f.stop(); }
+    }
+  }
+});
+it("truncatedNumericIdIsNeverRecovered", async () => {
+  const scanner = new P.IdScanner();
+  for (const byte of Buffer.from('{"id":1.' + "0".repeat(800) + '5}')) scanner.feed(byte);
+  expect(scanner.id, "truncatedNumericIdIsNeverRecovered").toBeUndefined();
+});
+
+it("unsendableControlsDoNotDelayDrain", async () => {
+  for (const loss of ["socket", "write"]) {
+    const f = fixture({ holdCall: true, short: loss === "write" }); try {
+      await f.initialize(); await f.call(1); await f.send({ jsonrpc: "2.0", method: "ping", id: 2 });
+      if (loss === "socket") f.relayInput.emit("end"); else f.relayCompletions.shift()!();
+      await f.pump();
+      expect(f.closed(), "unsendableControlsDoNotDelayDrain").toBe(true);
+      expect(f.responses().find(row => row.id === 1)?.error.message, "unsendableControlsDoNotDelayDrain").toBe("Memory service unavailable. Outcome unknown.");
+    } finally { await f.stop(); }
+  }
+});
+it("oversizeTruncatedIdGetsOnlyNoIdDiagnostic", async () => {
+  const f = fixture(); try {
+    await f.initialize(); await f.call(1, "memory_insert");
+    await f.raw('{"padding":"' + "x".repeat(P.MAX_STDIO_LINE_BYTES) + '","id":1.' + "0".repeat(800) + '5}\n');
+    expect(f.responses().filter(row => row.id === null).map(row => row.error.code), "oversizeTruncatedIdGetsOnlyNoIdDiagnostic").toEqual([-32600]);
+    expect(f.responses().filter(row => row.id === 1).map(row => row.error.code), "oversizeTruncatedIdGetsOnlyNoIdDiagnostic").toEqual([-32004]);
+  } finally { await f.stop(); }
+});
+
+it("unfinishedCallWriteHasBoundedSettlement", async () => {
+  const f = fixture({ holdCall: true }); try {
+    await f.initialize(); await f.call(1); await f.advance(P.SHIM_CALL_DEADLINE_MS);
+    await f.advance(P.SHIM_CANCEL_SETTLE_MS); await f.advance(P.SHIM_DISCONNECT_TIMEOUT_MS);
+    expect(f.closed(), "unfinishedCallWriteHasBoundedSettlement").toBe(true);
+    expect(f.frames.filter(frame => frame.type === "cancel"), "unfinishedCallWriteHasBoundedSettlement").toHaveLength(0);
   } finally { await f.stop(); }
 });

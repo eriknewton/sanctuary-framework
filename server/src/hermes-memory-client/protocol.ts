@@ -42,7 +42,7 @@ export type McpId = string | number;
 export const validId = (id: unknown): id is McpId => typeof id === "number" ? Number.isSafeInteger(id)
   : typeof id === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(id);
 export const idKey = (id: McpId): string => `${typeof id}:${id}`;
-export function errorLine(id: McpId, kind: ErrorKind): Buffer {
+export function errorLine(id: McpId | null, kind: ErrorKind): Buffer {
   const [code, message] = ERRORS[kind];
   return Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
 }
@@ -78,6 +78,7 @@ export class IdScanner {
   private quoted = false;
   private escaped = false;
   private token = "";
+  private overflow = false;
   private phase: "key" | "colon" | "value" | "after" = "key";
   private key = "";
   private seen = false;
@@ -86,12 +87,15 @@ export class IdScanner {
   // Six ASCII bytes per escaped UTF-16 code unit, plus the two string delimiters.
   private static readonly TOKEN_CAP = MAX_MCP_ID_CHARS * 6 + 2;
   private append(byte: number): void {
-    if (this.token.length <= IdScanner.TOKEN_CAP) this.token += String.fromCharCode(byte);
+    if (this.token.length < IdScanner.TOKEN_CAP) this.token += String.fromCharCode(byte);
+    else this.overflow = true;
   }
   private capture(): void {
     if (this.key !== "id") return;
     if (this.seen) this.duplicate = true;
     this.seen = true;
+    // A truncated numeric token may parse as a different valid ID, so it cannot correlate a reply.
+    if (this.overflow) return;
     try { const value: unknown = JSON.parse(this.token); if (validId(value)) this.candidate = value; } catch { /* No correlation without an ID. */ }
   }
   feed(byte: number): void {
@@ -106,12 +110,12 @@ export class IdScanner {
             try { this.key = JSON.parse(this.token) as string; } catch { this.key = ""; }
             this.phase = "colon";
           } else { this.capture(); this.phase = "after"; }
-          this.token = "";
+          this.token = ""; this.overflow = false;
         }
       }
       return;
     }
-    if (byte === 34) { this.quoted = true; this.token = ""; if (this.depth === 1) this.append(byte); return; }
+    if (byte === 34) { this.quoted = true; this.token = ""; this.overflow = false; if (this.depth === 1) this.append(byte); return; }
     if (byte === 123 || byte === 91) { this.depth++; return; }
     if (byte === 125 || byte === 93) {
       if (this.depth === 1 && this.phase === "value") this.capture();
@@ -121,7 +125,7 @@ export class IdScanner {
     if (byte === 58 && this.phase === "colon") { this.phase = "value"; return; }
     if (byte === 44) {
       if (this.phase === "value") this.capture();
-      this.phase = "key"; this.key = ""; this.token = ""; return;
+      this.phase = "key"; this.key = ""; this.token = ""; this.overflow = false; return;
     }
     if (this.phase === "value" && byte !== 32 && byte !== 9 && byte !== 13) this.append(byte);
   }
