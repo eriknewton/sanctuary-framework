@@ -29,10 +29,11 @@ describe("isolated memory CLI", () => {
   it("bridgeDownIsClosedMcpFailure", async () => {
     const root = await mkdtemp("/tmp/hmc-");
     const guard = `${root}/guard.cjs`;
-    await writeFile(guard, `const cp=require('node:child_process');for(const key of ['spawn','spawnSync','exec','execSync','execFile','execFileSync'])cp[key]=()=>{throw Error('forbidden subprocess');};require('node:module').syncBuiltinESMExports();const net=require('node:net');const connect=net.Socket.prototype.connect;net.Socket.prototype.connect=function(...args){if(typeof args[0]==='string')args[0]=${JSON.stringify(root + "/absent.sock")};return connect.apply(this,args);};`);
+    await writeFile(guard, `const cp=require('node:child_process');for(const key of ['spawn','spawnSync','exec','execSync','execFile','execFileSync'])cp[key]=()=>{throw Error('forbidden subprocess');};require('node:module').syncBuiltinESMExports();const net=require('node:net');const connect=net.Socket.prototype.connect;net.Socket.prototype.connect=function(...args){if(typeof args[0]==='string')args[0]=process.env.HMC_GUARD_ABSENT_SOCKET;return connect.apply(this,args);};`);
     try {
+      // The guard reads the redirect target from its environment so no test path is spliced into generated code.
       const result = await run(process.execPath, ["--import", "tsx", "--require", guard, cli, "hermes-memory-client"], {
-        timeout: 10_000, env: { HOME: root, PATH: process.env.PATH, SANCTUARY_NO_UPDATE_CHECK: "1" },
+        timeout: 10_000, env: { HOME: root, PATH: process.env.PATH, SANCTUARY_NO_UPDATE_CHECK: "1", HMC_GUARD_ABSENT_SOCKET: `${root}/absent.sock` },
       }).then(result => ({ ...result, code: 0 })).catch(error => error as { stdout: string; stderr: string; code: number });
       expect(result.stdout, "bridgeDownIsClosedMcpFailure").toBe("");
       expect(result.stderr, "bridgeDownIsClosedMcpFailure").toBe("");
