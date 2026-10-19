@@ -382,6 +382,8 @@ body {
 [data-theme="dark"] .btn-icon .icon-sun { display: inline; }
 .btn-icon .icon-moon, .btn-icon .icon-sun { line-height: 0; }
 .main { grid-area: main; min-width: 0; min-height: 0; overflow-y: auto; padding: 16px 24px; }
+/* Main receives page-key focus only as a scroll target; controls retain their own rings. */
+.main:focus { outline: none; }
 /* Every bare link in the main column reads the accent, visited and hover
    included. Why: dark is the default theme, and the user-agent link blue on
    the dark --paper is 2.04:1 (visited 1.74:1), under the 4.5:1 text floor;
@@ -439,7 +441,8 @@ body {
   padding: var(--space-2); border: 1px solid var(--rule);
   background: var(--paper); overflow-wrap: anywhere;
 }
-.feedback:focus-visible { outline: 2px solid var(--indigo); outline-offset: -2px; }
+/* Match the shared keyboard ring, inset by its width so F cannot clip it. */
+.feedback:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .toast {
   background: var(--ink); color: var(--paper); padding: var(--space-2);
   border-radius: var(--rad); font-size: var(--text-sm);

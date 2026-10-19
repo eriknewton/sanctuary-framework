@@ -168,6 +168,16 @@ class FakeElement {
     this.children.push(child);
     return child;
   }
+  // Model DOM insertion order so the shipping newest-first toast path remains observable.
+  get firstChild(): FakeElement | FakeText | null { return this.children[0] ?? null; }
+  insertBefore(child: FakeElement | FakeText, reference: FakeElement | FakeText | null) {
+    if (reference === null) return this.appendChild(child);
+    const index = this.children.indexOf(reference);
+    if (index < 0) throw new Error("Insertion reference is not a child");
+    if (child instanceof FakeElement) child.parentElement = this;
+    this.children.splice(index, 0, child);
+    return child;
+  }
   removeChild(child: FakeElement | FakeText) {
     const index = this.children.indexOf(child);
     if (index >= 0) this.children.splice(index, 1);

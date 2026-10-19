@@ -735,10 +735,10 @@ function toast(message, kind) {
   const el = document.createElement("div");
   el.className = "toast" + (kind === "error" ? " error" : "");
   el.textContent = message;
-  host.appendChild(el);
-  // A new toast is exposed inside F without scrolling the workspace or page.
+  // Newest first keeps F at its origin so expiry cannot hide the retained headline.
+  host.insertBefore(el, host.firstChild);
   const feedback = document.getElementById("feedback");
-  if (feedback) feedback.scrollTop = el.offsetTop;
+  if (feedback) feedback.scrollTop = 0;
   const toastLifetimeMs = 4 * 1000; // Four seconds, preserving the existing toast lifetime.
   setTimeout(function () { el.remove(); }, toastLifetimeMs);
 }
@@ -6692,7 +6692,13 @@ function renderFeedback() {
   if (!host) return;
   const html = renderDecisionResult();
   // Compare emitted strings: DOM serialization changes quote entities and would replace focused Clear.
-  if (lastFeedbackHtml !== html) { host.innerHTML = html; lastFeedbackHtml = html; }
+  if (lastFeedbackHtml !== html) {
+    host.innerHTML = html;
+    lastFeedbackHtml = html;
+    // A changed result starts at F's origin so stale scrolling cannot hide its headline.
+    const feedback = document.getElementById("feedback");
+    if (feedback) feedback.scrollTop = 0;
+  }
 }
 function renderDecisionResult() {
   const r = state.approvals.result;
@@ -7612,9 +7618,13 @@ document.addEventListener("click", function (ev) {
     // F hides a result only through its own control, never while its decision holds the lock, and an
     // unconfirmed result has no such control: a stray click on a stale button must not clear it either.
     if (decisionInFlight() || (state.approvals.result && state.approvals.result.status === "uncertain")) return;
+    const clearHadFocus = document.activeElement === tgt;
     // Clear hides only F; keep status echoes stable on background redraws until the next decision.
     if (state.approvals.result) state.approvals.result.cleared = true;
-    return renderFeedback();
+    renderFeedback();
+    // Removing focused Clear must retain the keyboard user's place without moving decision controls.
+    if (clearHadFocus) document.getElementById("feedback").focus({ preventScroll: true });
+    return;
   }
   if (action === "approval-always-allow") {
     // An in-flight decision retains its consent state until settlement.

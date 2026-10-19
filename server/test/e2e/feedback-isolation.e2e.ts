@@ -45,6 +45,9 @@ for (const config of configurations) {
           await page.evaluate('feedbackDriver.toast("Toast expiry feedback. ".repeat(100), "error")');
           await expect(page.locator('#feedback .toast')).toBeVisible();
         }
+        if (witness === "G-clear") {
+          await page.locator('[data-action="decision-result-clear"]').focus();
+        }
         await recordFeedbackBaseline(page, selector, config.surface === "A");
         const requestCount = requests.length;
         if (witness === "F-feedback") {
@@ -53,8 +56,9 @@ for (const config of configurations) {
           await expect(page.locator('#feedback')).toContainText("Ordinary feedback");
           await expect(page.locator('#decision-feedback-result')).toContainText("Retained feedback.");
         } else if (witness === "G-clear") {
-          await page.locator('[data-action="decision-result-clear"]').click();
+          await page.keyboard.press('Enter');
           await expect(page.locator('#decision-feedback-result')).toBeEmpty();
+          await expect(page.locator('#feedback')).toBeFocused();
           await expect(page.locator('#main .decision-inline').first()).toHaveText("Refused.");
         } else {
           await page.clock.runFor(TOAST_LIFETIME_MS);
@@ -82,12 +86,19 @@ for (const config of configurations) {
           await expect.poll(() => requests.filter(r => r.startsWith("POST ")).length).toBe(2);
         }
         if (config.target === "later" && witness === "F-feedback") {
+          if (config.surface === "A") {
+            // The liveness decision replaces the earlier variation; vary its settled result before navigation.
+            await expect(page.locator('#decision-feedback-result')).toContainText("Fixture refusal");
+            await expect(page.locator('[data-action="decision-result-clear"]')).toBeEnabled();
+            await page.evaluate('feedbackDriver.varyResult()');
+          }
+          await expect(page.locator('#decision-feedback-result')).toContainText("Retained feedback.");
           await page.locator('#btn-talk').click();
           const feedback = await page.locator('#feedback').boundingBox();
           const panel = await page.locator('#talk-panel').boundingBox();
           expect(panel!.y + panel!.height, "Talk panel ends above F").toBeLessThanOrEqual(feedback!.y + 1);
           await page.locator('[data-action="talk-open-full"]').click();
-          await expect(page.locator('#decision-feedback-result')).toContainText(config.surface === "A" ? "Fixture refusal" : "Retained feedback.");
+          await expect(page.locator('#decision-feedback-result')).toContainText("Retained feedback.");
           const input = await page.locator('[data-action="concierge-input"]').boundingBox();
           expect(input!.y + input!.height, "full-page Talk composer ends above F").toBeLessThanOrEqual(feedback!.y + 1);
         }
@@ -130,6 +141,44 @@ test('narrow toast is visible with retained result and scrolled F', async ({ pag
   expect(await page.evaluate('window.scrollY')).toBe(0);
 });
 
+test('narrow refusal headline survives two toast expiries', async ({ page, dashboard }) => {
+  await page.setViewportSize(FEEDBACK_VIEWPORTS.N);
+  await prepareFeedback(page, dashboard.url, "activity");
+  const feedback = page.locator('#feedback');
+  // Keep the refused result overflowing after expiry so native clamping cannot conceal a stale offset.
+  await page.evaluate('feedbackDriver.varyResult(); document.getElementById("feedback").scrollTop = document.getElementById("feedback").scrollHeight');
+  expect(await feedback.evaluate(el => el.scrollTop), 'the retained refusal overflows F').toBeGreaterThan(0);
+  await page.evaluate('feedbackDriver.toast("First toast"); feedbackDriver.toast("Newest toast", "error")');
+  const liveToastText = await page.locator('#toast-host .toast').allTextContents();
+  const liveScroll = await feedback.evaluate(el => el.scrollTop);
+  await page.clock.runFor(TOAST_LIFETIME_MS);
+  await expect(page.locator('#toast-host .toast')).toHaveCount(0);
+  await expect(page.locator('#decision-feedback-result strong')).toHaveText('Decision refused');
+  const visible = await page.evaluate<boolean>(`(() => {
+    const headline = document.querySelector('#decision-feedback-result strong');
+    const f = document.getElementById('feedback');
+    const box = f.getBoundingClientRect(), rect = headline.getBoundingClientRect();
+    // The midpoint of each dimension hits the headline itself, not clipped or covered content.
+    return rect.top >= box.top + f.clientTop && rect.bottom <= box.top + f.clientTop + f.clientHeight &&
+      rect.left >= box.left && rect.right <= box.right &&
+      document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2) === headline;
+  })()`);
+  expect(visible, 'retained refusal headline lies inside F and passes the hit test after expiry').toBe(true);
+  expect(liveToastText).toEqual(['Newest toast', 'First toast']);
+  expect(liveScroll).toBe(0);
+});
+
+test('changed feedback resets stale F scroll', async ({ page, dashboard }) => {
+  await page.setViewportSize(FEEDBACK_VIEWPORTS.N);
+  await prepareFeedback(page, dashboard.url, "activity");
+  await page.evaluate('document.getElementById("feedback").scrollTop = document.getElementById("feedback").scrollHeight');
+  expect(await page.locator('#feedback').evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+  // Grow the result so a browser clamp on shorter content cannot impersonate the product reset.
+  await page.evaluate('feedbackDriver.varyResult()');
+  await expect(page.locator('#decision-feedback-result')).toContainText('Retained feedback.');
+  expect(await page.locator('#feedback').evaluate(el => el.scrollTop)).toBe(0);
+});
+
 test('Page Down with nothing focused scrolls main', async ({ page, dashboard }) => {
   await page.setViewportSize({ width: 1399, height: 500 });
   // Start on Settings without ever clicking or focusing a descendant of main.
@@ -138,6 +187,8 @@ test('Page Down with nothing focused scrolls main', async ({ page, dashboard }) 
   await page.evaluate('document.activeElement.blur(); document.getElementById("main").scrollTop = 0');
   expect(await page.evaluate('document.activeElement === document.body')).toBe(true);
   await page.keyboard.press('PageDown');
+  await expect(page.locator('#main')).toBeFocused();
+  await expect(page.locator('#main')).toHaveCSS('outline-style', 'none');
   // Let native smooth keyboard scrolling settle in the controlled browser clock.
   await page.clock.runFor(500);
   await expect.poll(() => page.locator('#main').evaluate(el => el.scrollTop)).toBeGreaterThan(0);
@@ -155,6 +206,8 @@ test('quoted result preserves focused Clear on background redraw', async ({ page
 
 test('Feedback focus is visible and announcements stay outside its scroller', async ({ page, dashboard }) => {
   await prepareFeedback(page, dashboard.url, "activity");
+  // Distinct from --indigo so a hard-coded accent cannot impersonate the shared ring token.
+  await page.evaluate('document.documentElement.style.setProperty("--focus", "rgb(1, 2, 3)")');
   await page.keyboard.press('Tab');
   await page.locator('#feedback').focus();
   await expect(page.locator('#feedback')).toBeFocused();
@@ -164,6 +217,7 @@ test('Feedback focus is visible and announcements stay outside its scroller', as
     return el.matches(':focus-visible') && css.outlineStyle !== 'none' && parseFloat(css.outlineWidth) > 0;
   })()`);
   expect(ring, 'keyboard focus has a visible ring').toBe(true);
+  await expect(page.locator('#feedback')).toHaveCSS('outline-color', 'rgb(1, 2, 3)');
   await expect(page.locator('body > #decision-announcement')).toHaveAttribute('aria-live', 'polite');
   await expect(page.locator('#feedback #decision-announcement')).toHaveCount(0);
 });
