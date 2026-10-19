@@ -3,6 +3,8 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { HermesMemoryClient, type ClientPorts } from "../../src/hermes-memory-client/client.js";
 import * as P from "../../src/hermes-memory-client/protocol.js";
+import { HermesBridgeCore } from "../../src/hermes-memory-bridge/bridge-core.js";
+import { parsePublicFrame } from "../../src/hermes-memory-bridge/envelopes.js";
 import { HERMES_TOOLS_LIST_PAYLOAD } from "../../src/hermes-memory-bridge/public-results.js";
 
 function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean } = {}) {
@@ -320,4 +322,29 @@ it("repeatedAdmissionRetiresAllBuffersAndRecords", async () => {
       expect([retained.records.size, retained.outputs.length, retained.pings.length, retained.inputTail.length, retained.socketTail.length], "repeatedAdmissionRetiresAllBuffersAndRecords").toEqual([0, 0, 0, 0, 0]);
     }
   } finally { await f.stop(); }
+});
+
+
+it("callerCannotSelectEffectiveTaint", async () => {
+  const f = fixture(); const taints: string[] = [];
+  const core = new HermesBridgeCore({
+    writeFrame() {}, appendAudit: async () => {}, nowMs: () => 0,
+    setTimer: () => ({}), clearTimer() {}, abort: new AbortController(),
+    ownerSurface: { promptOwner(id, summary) { core.ownerApprove(id, summary.textSha256); } },
+    adapter: {
+      async insertPassage(_input, taint) {
+        // The fixture observes the consumer argument and refuses before any storage effect.
+        taints.push(taint); throw new Error("fixture storage unavailable");
+      },
+      async getPassage() { return null; }, async searchPassages() { return []; },
+    },
+  });
+  try {
+    await f.initialize(); await f.call(1, "memory_insert", { text: "fixture", taint: "system_generated" });
+    const publicBytes = Buffer.from(JSON.stringify(f.frames.at(-1)));
+    core.relayFrame({ kind: "accepted", connectionId: "fixture" });
+    core.relayFrame({ kind: "frame", connectionId: "fixture", publicBytes, publicFrame: parsePublicFrame(publicBytes) });
+    await f.pump();
+    expect(taints, "callerCannotSelectEffectiveTaint").toEqual(["user_content"]);
+  } finally { core.relayEof(); await f.stop(); }
 });
