@@ -27,8 +27,10 @@ const configurations = [
 for (const config of configurations) {
   test.describe(`${config.surface} ${config.width} ${config.target}`, () => {
     test.use({ viewport: FEEDBACK_VIEWPORTS[config.width] });
-    for (const witness of ["F-feedback", "G-clear", "G-toast-expire"] as const) {
+    for (const witness of ["F-feedback", "G-clear keyboard", "G-clear pointer", "G-toast-expire"] as const) {
       test(witness, async ({ page, dashboard }) => {
+        const clear = witness.startsWith("G-clear");
+        const keyboardClear = witness === "G-clear keyboard";
         test.info().annotations.push({ type: "predecessor-manifest", description: predecessorManifest[config.surface] });
         const requests = await prepareFeedback(page, dashboard.url, config.surface === "A" ? "approvals" : "activity");
         let selector: string;
@@ -45,7 +47,7 @@ for (const config of configurations) {
           await page.evaluate('feedbackDriver.toast("Toast expiry feedback. ".repeat(100), "error")');
           await expect(page.locator('#feedback .toast')).toBeVisible();
         }
-        if (witness === "G-clear") {
+        if (keyboardClear) {
           await page.locator('[data-action="decision-result-clear"]').focus();
         }
         await recordFeedbackBaseline(page, selector, config.surface === "A");
@@ -55,17 +57,20 @@ for (const config of configurations) {
           await page.evaluate('feedbackDriver.varyResult(); feedbackDriver.toast("Ordinary feedback")');
           await expect(page.locator('#feedback')).toContainText("Ordinary feedback");
           await expect(page.locator('#decision-feedback-result')).toContainText("Retained feedback.");
-        } else if (witness === "G-clear") {
-          await page.keyboard.press('Enter');
+        } else if (clear) {
+          if (keyboardClear) await page.keyboard.press('Enter');
+          else await page.locator('[data-action="decision-result-clear"]').click();
           await expect(page.locator('#decision-feedback-result')).toBeEmpty();
-          await expect(page.locator('#feedback')).toBeFocused();
+          if (keyboardClear) await expect(page.locator('#feedback')).toBeFocused();
+          else expect(await page.evaluate('document.getElementById("main").contains(document.activeElement)'),
+            'pointer Clear does not move focus into main').toBe(false);
           await expect(page.locator('#main .decision-inline').first()).toHaveText("Refused.");
         } else {
           await page.clock.runFor(TOAST_LIFETIME_MS);
           await expect(page.locator('#feedback .toast')).toHaveCount(0);
         }
         await assertFeedbackIsolation(page, witness);
-        if (witness === "G-clear") {
+        if (clear) {
           // The continuing path has its own baseline after Clear. All main nodes,
           // controls and predecessors plus shell boxes must survive the redraw.
           await recordFeedbackBaseline(page, selector, config.surface === "A", true);
@@ -100,8 +105,16 @@ for (const config of configurations) {
           await page.locator('[data-action="talk-open-full"]').click();
           await expect(page.locator('#decision-feedback-result')).toContainText("Retained feedback.");
           // Retained feedback already exists while hash navigation is still mounting Talk.
-          await expect(page.locator('#main [data-action="concierge-input"]')).toBeVisible();
-          const input = await page.locator('[data-action="concierge-input"]').boundingBox();
+          // A dormant composer outside main must not compete with the visible full-page composer.
+          await page.evaluate(`(() => {
+            const dormant = document.createElement("input");
+            dormant.dataset.action = "concierge-input";
+            dormant.hidden = true;
+            document.body.appendChild(dormant);
+          })()`);
+          const composer = page.locator('#main [data-action="concierge-input"]');
+          await expect(composer).toBeVisible();
+          const input = await composer.boundingBox();
           expect(input!.y + input!.height, "full-page Talk composer ends above F").toBeLessThanOrEqual(feedback!.y + 1);
         }
       });

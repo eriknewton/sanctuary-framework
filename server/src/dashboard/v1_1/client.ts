@@ -1424,8 +1424,8 @@ function hydrateTalkHost(host) {
   const freshHistory = fresh.querySelector("#concierge-history");
   if (!freshHistory) throw new Error("Talk history anchor missing");
   const changed = history.innerHTML !== freshHistory.innerHTML;
-  // The first loaded thread opens at its latest message; the empty-state suggestions have no reader offset to inherit.
-  const firstMessages = changed && !history.querySelector(".concierge-msg");
+  // Only real message admission starts a thread; an empty-to-empty refresh must preserve the suggestion reader's offset.
+  const firstMessages = changed && !history.querySelector(".concierge-msg") && !!freshHistory.querySelector(".concierge-msg");
   if (changed) {
     // Compare and copy text separators as well as message elements. Cloning
     // only .children drops the renderer's newline nodes, making a later
@@ -1450,7 +1450,8 @@ function hydrateTalkHost(host) {
   if (send.textContent !== label) send.textContent = label;
   // Preserve the reader across the complete hydration, including chrome-only refreshes.
   restoreTalkViewport(history, viewport || talkViewportState, firstMessages || (changed && requestedFollow));
-  owner.watch.lastTop = history.scrollTop;
+  // Rebase only our own motion so a reader scroll awaiting its event still revokes the send's follow request.
+  if (!viewport || history.scrollTop !== viewport.top) owner.watch.lastTop = history.scrollTop;
   state.chat.concierge.pendingScroll = false;
 }
 
