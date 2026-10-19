@@ -43,6 +43,7 @@ export class HermesMemoryClient {
   private controlCount = 0;
   private shutdownSent = false;
   private relayWriting = false;
+  private pendingPrimary?: { record: RecordEntry; frame: Buffer };
   private pendingControl: Buffer[] = [];
   private outputWriting = false;
   private outputOffset = 0;
@@ -269,7 +270,11 @@ export class HermesMemoryClient {
   }
   private sendPrimary(frame: Record<string, unknown>): void { this.writePrimary(this.primary!, P.relayFrame(frame)); }
   private writePrimary(record: RecordEntry, frame: Buffer): void {
-    if (!this.connected || this.relayWriting) { this.state_DRAINING("unavailable"); return; }
+    if (!this.connected) { this.state_DRAINING("unavailable"); return; }
+    if (this.relayWriting) {
+      // The reserved primary owns one encoded frame while a preceding control write completes.
+      this.pendingPrimary = { record, frame }; return;
+    }
     this.relayWriting = true;
     this.ports.relayOutput.write(frame, (error, written) => {
       this.relayWriting = false;
@@ -297,7 +302,14 @@ export class HermesMemoryClient {
     this.pendingControl.push(frame); this.flushControl(); return true;
   }
   private flushControl(): void {
-    if (this.relayWriting || !this.connected || this.pendingControl.length === 0 || this.state === "CLOSED") return;
+    if (this.relayWriting || !this.connected || this.state === "CLOSED") return;
+    if (this.pendingControl.length === 0) {
+      const pending = this.pendingPrimary; this.pendingPrimary = undefined;
+      if (pending && this.current() !== "DRAINING" && pending.record.wanted && !pending.record.settled) {
+        this.writePrimary(pending.record, pending.frame);
+      }
+      return;
+    }
     const frame = this.pendingControl.shift()!; this.relayWriting = true;
     this.ports.relayOutput.write(frame, (error, written) => {
       this.relayWriting = false;
@@ -306,6 +318,10 @@ export class HermesMemoryClient {
     });
   }
   private cancel(record: RecordEntry): void {
+    if (this.pendingPrimary?.record === record) {
+      // An admitted but unwritten frame can retire locally without a relay cancellation.
+      this.pendingPrimary = undefined; record.wireDone = true; record.deadline = undefined; return;
+    }
     if (!record.wire || !record.sent || record.cancelSent || record.wireDone || record.settled) return;
     record.cancelSent = true;
     record.settleDeadline ??= this.ports.now() + P.SHIM_CANCEL_SETTLE_MS;
@@ -454,7 +470,7 @@ export class HermesMemoryClient {
     this.ports.relayInput.off("readable", this.wake); this.ports.relayInput.off("end", this.onSocketLoss);
     this.ports.relayInput.off("error", this.onSocketLoss); this.ports.relayInput.off("close", this.onSocketLoss);
     this.records.clear(); this.outputs.length = 0; this.pings.length = 0; this.pendingControl = [];
-    this.socketTail = Buffer.alloc(0); this.inputTail = Buffer.alloc(0); this.primary = undefined; this.initialization = undefined;
+    this.socketTail = Buffer.alloc(0); this.inputTail = Buffer.alloc(0); this.primary = undefined; this.initialization = undefined; this.pendingPrimary = undefined;
     this.ports.close(); this.resolve(0);
   }
 }

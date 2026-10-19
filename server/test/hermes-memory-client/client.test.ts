@@ -7,19 +7,21 @@ import { HermesBridgeCore } from "../../src/hermes-memory-bridge/bridge-core.js"
 import { parsePublicFrame } from "../../src/hermes-memory-bridge/envelopes.js";
 import { HERMES_TOOLS_LIST_PAYLOAD } from "../../src/hermes-memory-bridge/public-results.js";
 
-function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean } = {}) {
+function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean; holdPing?: boolean } = {}) {
   const input = new PassThrough(); const relayInput = new PassThrough();
   const frames: Record<string, any>[] = []; const lines: string[] = [];
   let now = 0; let closed = false;
   let timer: (() => void) | undefined;
   const tasks: (() => void)[] = [];
   const completions: (() => void)[] = [];
+  const relayCompletions: (() => void)[] = [];
   const ports: ClientPorts = {
     input, relayInput, connect: ready => ready(), close() { closed = true; }, now: () => now,
     schedule: run => tasks.push(run), timer: run => { timer = run; return 1 as unknown as ReturnType<typeof setTimeout>; }, clearTimer() {},
     relayOutput: { write(bytes, done) {
       const frame = JSON.parse(bytes.subarray(4).toString()); frames.push(frame);
-      done(null, options.short && frame.type === "tools_call" ? bytes.length - 1 : bytes.length);
+      const complete = () => done(null, options.short && frame.type === "tools_call" ? bytes.length - 1 : bytes.length);
+      if (options.holdPing && frame.type === "ping") relayCompletions.push(complete); else complete();
     } },
     output: { write(bytes, done) {
       const complete = () => { lines.push(bytes.toString()); done(null, bytes.length); };
@@ -50,7 +52,7 @@ function fixture(options: { stall?: boolean; short?: boolean; noHello?: boolean 
   const stop = async () => { client.signal(); await pump(); await advance(P.SHIM_STDIN_EOF_EXIT_MS); input.destroy(); relayInput.destroy(); };
   const responses = () => lines.map(line => JSON.parse(line));
   return { initialize, send, raw, reply, relay, call, cancel, advance, stop, pump, frames, lines, responses, client,
-    options, completions, input, relayInput, closed: () => closed };
+    options, completions, relayCompletions, input, relayInput, closed: () => closed };
 }
 
 describe("memory client contracts", () => {
@@ -347,4 +349,53 @@ it("callerCannotSelectEffectiveTaint", async () => {
     await f.pump();
     expect(taints, "callerCannotSelectEffectiveTaint").toEqual(["user_content"]);
   } finally { core.relayEof(); await f.stop(); }
+});
+
+
+it("callWaitsForInProgressPingWrite", async () => {
+  const f = fixture();
+  try {
+    await f.initialize(); f.options.holdPing = true;
+    await f.send({ jsonrpc: "2.0", method: "ping", id: 2 });
+    await f.call(1);
+    expect(f.frames.some(frame => frame.type === "tools_call")).toBe(false);
+    f.relayCompletions.shift()!(); await f.pump();
+    expect(f.frames.at(-1)!.type, "callWaitsForInProgressPingWrite").toBe("tools_call");
+    await f.reply({ content: [] }); await f.relay({ type: "pong" });
+    expect(f.responses().filter(row => row.id === 1), "callWaitsForInProgressPingWrite")
+      .toEqual([{ jsonrpc: "2.0", id: 1, result: { content: [] } }]);
+    expect(f.closed()).toBe(false);
+  } finally { await f.stop(); }
+});
+
+it("unwrittenPrimaryRetiresWithoutRelayCancel", async () => {
+  for (const disposition of ["cancel", "deadline"] as const) {
+    const f = fixture();
+    try {
+      await f.initialize(); f.options.holdPing = true;
+      await f.send({ jsonrpc: "2.0", method: "ping", id: 2 }); await f.call(1);
+      const retained = f.client as unknown as { pendingPrimary?: { frame: Buffer } };
+      expect(retained.pendingPrimary!.frame.length).toBeLessThanOrEqual(P.MAX_SOCKET_TAIL_BYTES);
+      if (disposition === "cancel") await f.cancel(1); else await f.advance(P.SHIM_CALL_DEADLINE_MS);
+      expect(retained.pendingPrimary, "unwrittenPrimaryRetiresWithoutRelayCancel").toBeUndefined();
+      expect(f.frames.filter(frame => frame.type === "cancel" || frame.type === "tools_call")).toHaveLength(0);
+      await f.call(3); f.relayCompletions.shift()!(); await f.pump();
+      expect(f.frames.filter(frame => frame.type === "tools_call"), "unwrittenPrimaryRetiresWithoutRelayCancel").toHaveLength(1);
+      await f.reply({ content: [] });
+      expect(f.responses().filter(row => row.id === 1)).toHaveLength(disposition === "cancel" ? 0 : 1);
+      expect(f.responses().find(row => row.id === 3).result).toEqual({ content: [] });
+    } finally { await f.stop(); }
+  }
+});
+
+it("signalDiscardsUnwrittenPrimary", async () => {
+  const f = fixture();
+  try {
+    await f.initialize(); f.options.holdPing = true;
+    await f.send({ jsonrpc: "2.0", method: "ping", id: 2 }); await f.call(1);
+    f.client.signal(); f.relayCompletions.shift()!(); await f.pump();
+    expect(f.frames.filter(frame => frame.type === "tools_call" || frame.type === "cancel"), "signalDiscardsUnwrittenPrimary").toHaveLength(0);
+    expect(f.frames.at(-1)!.type).toBe("shutdown");
+    expect(f.responses().map(row => row.id)).toEqual([0]); expect(f.closed()).toBe(true);
+  } finally { await f.stop(); }
 });
