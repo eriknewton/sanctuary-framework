@@ -491,6 +491,8 @@ describe("Hermes memory process shell", () => {
   }, 30_000);
 
   it("cliMissingDependencyRefusesBeforeReady", async () => {
+  // 20000 ms = two thirds of this test's 30000 ms timeout, leaving room for teardown after a still_running outcome.
+  const CLI_STARTUP_REFUSAL_TEST_BOUND_MS = 20_000;
     const fixture = await seededFortress("cli-missing-dependency");
     // Remove an actual composition binding in an isolated loader, with no product flag or forced exit.
     const hook = `
@@ -512,7 +514,10 @@ describe("Hermes memory process shell", () => {
     const bytes: Buffer[] = [];
     relay.on("data", chunk => bytes.push(Buffer.from(chunk)));
     try {
-      expect(await boundedValue(childExit(child), RELAY_CHILD_SIGTERM_GRACE_MS, "still_running"),
+      // The refusal property is the exit code and the absence of ready, not startup latency: this child's
+      // startup includes tsx transpiling the CLI graph, which is test-harness work and exceeded the 3000 ms
+      // SIGTERM grace under the full Linux suite. The bound is the test's own, well inside its 30 s timeout.
+      expect(await boundedValue(childExit(child), CLI_STARTUP_REFUSAL_TEST_BOUND_MS, "still_running"),
         "cliMissingDependencyRefusesBeforeReady").toEqual({ code: EXIT_STARTUP_REFUSED, signal: null });
       expect(Buffer.concat(bytes).length, "cliMissingDependencyRefusesBeforeReady no ready").toBe(0);
       expect(stderr(), "cliMissingDependencyRefusesBeforeReady boundary").toContain("state_GATE_WIRED: startup refused");
