@@ -187,6 +187,8 @@ export function kernelBackedCrossProcessLockPlatformSupported(
 
 export type CrossProcessLockErrorKind =
   | "capability"
+  // A malformed or substituted scaffold is evidence of tampering, never environmental loss.
+  | "scaffold-integrity"
   | "contention"
   | "holder-lost"
   | "operation_aborted"
@@ -1096,7 +1098,8 @@ export async function acquireMasterWriteBarrier(
     // Environmental capability loss (non-owner uid / non-local fs / looser
     // perms): degrade per the caller's declared intent rather than bricking a
     // path that opened before the barrier existed (S5/S5b). Any other error
-    // (contention, holder-lost, io, a non-capability capability) still throws.
+    // still throws. A malformed or substituted scaffold is evidence of tampering,
+    // so scaffold-integrity must refuse the process rather than degrade.
     if (
       error instanceof CrossProcessLockError &&
       error.kind === "capability" &&
@@ -1935,6 +1938,13 @@ async function ensureInertLockScaffold(
         constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
       );
     } catch (error) {
+      if (errorCode(error) === "ELOOP" || errorCode(error) === "EISDIR") {
+        // A malformed scaffold is evidence of tampering, so refuse rather than degrade.
+        throw new CrossProcessLockError(
+          `custody lock scaffold must be a regular file, not a symlink or directory (${lockPath})`,
+          "scaffold-integrity",
+        );
+      }
       if (errorCode(error) !== "ENOENT") throw error;
       // A concurrent sweep in another process may unlink an aged scaffold
       // between create and validate. Recreation is safe because the socket owns
@@ -1950,14 +1960,23 @@ async function ensureInertLockScaffold(
       if (held.nlink === 0) continue;
       const shape = classifyCustodyLockScaffold(held, uid);
       if (shape === "unsafe") {
+        // A malformed scaffold is evidence of tampering, so refuse rather than degrade.
         throw new CrossProcessLockError(
           `custody lock scaffold must be a uid-owned, single-link, zero-byte regular file with mode 0600; ` +
             `only an exact legacy 0644 scaffold can be repaired automatically (${lockPath})`,
-          "capability",
+          "scaffold-integrity",
         );
       }
       if (shape === "legacy-0644") {
-        await handle.chmod(0o600);
+        try {
+          await handle.chmod(0o600);
+        } catch (error) {
+          // An unrepaired malformed scaffold is evidence of tampering, so refuse rather than degrade.
+          throw new CrossProcessLockError(
+            `custody lock scaffold mode repair failed (${lockPath}): ${errorMessage(error)}`,
+            "scaffold-integrity",
+          );
+        }
         await handle.sync();
         repaired = true;
       }
@@ -1966,9 +1985,10 @@ async function ensureInertLockScaffold(
       // descriptor before the shared retry budget reruns full validation.
       if (secured.nlink === 0) continue;
       if (classifyCustodyLockScaffold(secured, uid) !== "secure") {
+        // A malformed scaffold is evidence of tampering, so refuse rather than degrade.
         throw new CrossProcessLockError(
           `custody lock scaffold mode repair did not produce a secure inode (${lockPath})`,
-          "capability",
+          "scaffold-integrity",
         );
       }
       let named;
@@ -1984,9 +2004,10 @@ async function ensureInertLockScaffold(
         // Zero links proves the validated inode disappeared before replacement;
         // a still-linked inode is substitution and must retain its refusal.
         if ((await handle.stat()).nlink === 0) continue;
+        // A substituted scaffold is evidence of tampering, so refuse rather than degrade.
         throw new CrossProcessLockError(
           `custody lock scaffold changed during validation (${lockPath})`,
-          "capability",
+          "scaffold-integrity",
         );
       }
     } finally {

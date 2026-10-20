@@ -181,11 +181,13 @@ export async function withExitAdmissionLock<T>(
     // Only acquisition/reaper failure is an admission refusal. A
     // CrossProcessLockError thrown BY the protected operation (notably custody
     // holder-loss during rotation) must retain its real classification instead
-    // of being rewritten as fictitious admission-lock contention.
+    // of being rewritten as fictitious admission-lock contention. Scaffold
+    // tampering also needs its own refusal, never a stale-lock removal hint.
     if (
       err instanceof CrossProcessLockError
       && err.kind !== "holder-lost"
       && err.kind !== "capability"
+      && err.kind !== "scaffold-integrity"
       && err.kind !== "poisoned"
     ) {
       throw new ExitAdmissionLockError(
