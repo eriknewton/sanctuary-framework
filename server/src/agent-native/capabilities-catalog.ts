@@ -120,7 +120,7 @@ export const ASSURANCE_MATRIX_URL =
  */
 export const SERVER_BOUNDS = {
   platforms:
-    "macOS: proven. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Windows enforcement is roadmapped; nothing enforces on Windows today.",
+    "macOS: proven. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Linux enforcement ships as the separate Castle Wall Linux 0.1.0-1 package (a GitHub pre-release), not in the npm package. Windows enforcement is roadmapped; nothing enforces on Windows today.",
   tiers:
     "Approval runs in three tiers: Tier 3 auto-allows with an audit record, Tier 2 asks a human on anomaly, and Tier 1 always waits for a human.",
   neverClaimed:

@@ -417,9 +417,9 @@ const ROWS: CoverageRow[] = [
       "federation_status",
     ],
     evidence_emitted:
-      "Auto-filled: SHR four-layer architecture description (L1 " +
-      "Cognitive Sovereignty, L2 Operational Isolation, L3 Selective " +
-      "Disclosure, L4 Verifiable Reputation) with status flags per " +
+      "Auto-filled: SHR four-layer architecture description (Cognitive " +
+      "Sovereignty, Operational Isolation, Selective Disclosure, " +
+      "Verifiable Reputation) with status flags per " +
       "layer, tool inventory showing every component interface, " +
       "sovereignty audit environment analysis, and federation peer " +
       "topology if configured.",
@@ -597,22 +597,22 @@ const ROWS: CoverageRow[] = [
     evidence_emitted:
       "Machine-verifiable inventory of Sanctuary's cybersecurity " +
       "primitives, every item reproducible by running the listed " +
-      "tools against a live instance: (1) L1 Cognitive Sovereignty " +
+      "tools against a live instance: (1) Cognitive Sovereignty " +
       "- AES-256-GCM namespace encryption with HKDF per-namespace " +
       "key derivation, Argon2id master key derivation, Ed25519 " +
       "self-custodied identity, Merkle integrity tracking; reported " +
-      "by sovereignty_audit and shr_generate under layers.l1. (2) L2 " +
+      "by sovereignty_audit and shr_generate under layers.l1. (2) " +
       "Operational Isolation - three-tier Principal Policy gate with " +
       "out-of-band approval channel, tool-call audit logging, and " +
       "denial-on-timeout semantics; reported by principal_policy_view " +
-      "and shr_generate under layers.l2. (3) L2 Outbound context " +
-      "gating - per-provider field policies classifying agent context " +
+      "and shr_generate under layers.l2. (3) Operational Isolation " +
+      "outbound context gating - per-provider field policies classifying agent context " +
       "as allow / redact / hash / summarize / deny before any outbound " +
       "call; reported by context_gate_list_policies and " +
-      "context_gate_enforcer_status. (4) L3 Selective Disclosure - " +
+      "context_gate_enforcer_status. (4) Selective Disclosure - " +
       "Pedersen commitments on Ristretto255, Schnorr proofs, and " +
       "bit-decomposition range proofs; reported by sovereignty_audit " +
-      "and shr_generate under layers.l3. (5) L4 Verifiable Reputation " +
+      "and shr_generate under layers.l3. (5) Verifiable Reputation " +
       "- Ed25519-signed attestations in EAS-compatible format with " +
       "sovereignty-gated trust tiers; reported by sovereignty_audit " +
       "and shr_generate under layers.l4. (6) Execution evidence - " +
@@ -1199,13 +1199,15 @@ const ROWS: CoverageRow[] = [
       "bridge_verify",
     ],
     evidence_emitted:
-      "Auto-filled: signed SHR + tamper-evident, checkpoint-signed " +
-      "audit chain + " +
+      "Auto-filled: signed SHR + tamper-evident, hash-chained audit " +
+      "with checkpoint signatures only where a signer is wired + " +
       "Concordia bridge attestations (where used) give machine-" +
       "readable provenance for every tool call the agent made during " +
-      "the reporting period. This enables output interpretation of " +
-      "the form 'this agent action came from these inputs at this " +
-      "time, cryptographically signed and independently verifiable.'",
+      "the reporting period. Production audit checkpoints are " +
+      "currently unsigned until **IC-05** closes. This enables output " +
+      "interpretation of the form 'this agent action came from these " +
+      "inputs at this time, cryptographically signed where a signer " +
+      "is present and independently verifiable.'",
     manual_carveout:
       "Business-facing explanation translating the cryptographic " +
       "trail into user-comprehensible narrative, performance " +
@@ -1428,12 +1430,12 @@ const ROWS: CoverageRow[] = [
     evidence_emitted:
       "Resilience against unauthorised third-party alteration is " +
       "enforced across multiple subsystems, each independently " +
-      "verifiable via an MCP tool call: (1) L1 state store - " +
+      "verifiable via an MCP tool call: (1) Cognitive Sovereignty state store - " +
       "AES-256-GCM authenticated encryption with HKDF per-namespace " +
       "keys, Merkle root per namespace, monotonic version counter " +
       "per (namespace, key), and anti-rollback checks on every read; " +
       "reported by monitor_health (state_integrity flag) and via " +
-      "version numbers returned by state_list. (2) L1 audit log - " +
+      "version numbers returned by state_list. (2) Cognitive Sovereignty audit log - " +
       "AES-256-GCM authenticated ciphertext persisted under an " +
       "HKDF-derived audit-log key, linked into a tamper-evident hash " +
       "chain (per-entry sequence plus prev_hash plus entry_hash), with " +
@@ -1443,14 +1445,14 @@ const ROWS: CoverageRow[] = [
       "MAC makes a truncation or prune of the tail detectable. Reported " +
       "by monitor_health and the audit-chain verifier; integrity " +
       "findings surface as a P1 anomaly. (See review_notes for the " +
-      "exact non-repudiation bound.) (3) L1 identity - Ed25519 " +
+      "exact non-repudiation bound.) (3) Cognitive Sovereignty identity - Ed25519 " +
       "self-custodied keypairs; signed identity operations (sign, " +
       "rotate, verify) and signed SHR generation; reported by " +
-      "shr_generate signature block. (4) L2 execution gate - every " +
+      "shr_generate signature block. (4) Operational Isolation execution gate - every " +
       "tool call routed through router.ts -> ApprovalGate.evaluate() " +
       "-> Principal Policy tier check before execution; no bypass " +
       "path; reported by principal_policy_view and the audit log " +
-      "trail of gate_* entries. (5) L2 outbound context gating - " +
+      "trail of gate_* entries. (5) Operational Isolation outbound context gating - " +
       "per-provider field policies applied before any outbound call; " +
       "reported by context_gate_enforcer_status.",
     manual_carveout: null,
@@ -1855,6 +1857,7 @@ export const COVERAGE_MATRIX_V1: CoverageMatrix = {
       "were re-verified against the current tree (server package " +
       "v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain " +
       "hardening (PR #274 and follow-ups #290, #320, #396, #461, #501). " +
+      "Checkpoint-signing remains tracked in **IC-05**. " +
       "The remaining rows carry their original 2026-04-10 verification " +
       "against v0.7.0 source. See per-row review_notes for verification " +
       "findings and any corrections applied.",

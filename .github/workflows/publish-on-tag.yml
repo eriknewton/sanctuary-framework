@@ -92,6 +92,14 @@ jobs:
             echo "::error::input version ($RELEASE_VERSION) does not match server/package.json ($package_version)"
             exit 1
           fi
+          # The MCP registry listing must name the exact version being
+          # published, in both of server.json's version fields; the same
+          # check runs in server/test/structure/mcp-registry-metadata.test.ts.
+          manifest_versions=$(node -p "const m=require('./server/server.json'); [m.version, (m.packages.find((p) => p.registryType === 'npm') || {}).version].join(' ')")
+          if [[ "$manifest_versions" != "$RELEASE_VERSION $RELEASE_VERSION" ]]; then
+            echo "::error::server/server.json versions ($manifest_versions) do not both equal the input version ($RELEASE_VERSION)"
+            exit 1
+          fi
 
       # These stdlib-only checks run before npm or pip lifecycle code can
       # mutate the checkout. The inline comparison binds the currently

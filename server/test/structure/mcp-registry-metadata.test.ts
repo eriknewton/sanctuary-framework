@@ -55,6 +55,29 @@ describe("MCP registry metadata lockstep (server.json <-> package.json)", () => 
     expect(npmEntry?.version).toBe(pkg.version);
   });
 
+  // The publish workflow (.github/workflows/publish-on-tag.yml) exports
+  // RELEASE_VERSION, the exact version the maintainer dispatched, and runs this
+  // suite against the release tag. The registry listing must name that exact
+  // version: on 2026-10-19 main's manifest named 1.8.6-rc.1, a version npm never
+  // published, and an agent reading the listing would have tried to install it.
+  // Outside a publish run the variable is unset and this check is skipped; the
+  // shape check below still runs on every commit.
+  const RELEASE_VERSION = process.env.RELEASE_VERSION;
+
+  it.runIf(Boolean(RELEASE_VERSION))("manifest carries the exact version being published", () => {
+    expect(manifest.version).toBe(RELEASE_VERSION);
+    const npmEntry = (manifest.packages as Array<Record<string, unknown>>).find(
+      (p) => p.registryType === "npm",
+    );
+    expect(npmEntry?.version).toBe(RELEASE_VERSION);
+  });
+
+  it("manifest version has the numeric shape the publish workflow accepts", () => {
+    // Must match the version-shape regex in the validate-intent job of
+    // .github/workflows/publish-on-tag.yml.
+    expect(manifest.version).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+(\.[A-Za-z0-9]+)*)?$/);
+  });
+
   it("manifest repository points at the canonical repo", () => {
     const repository = manifest.repository as Record<string, unknown>;
     expect(repository.url).toBe(

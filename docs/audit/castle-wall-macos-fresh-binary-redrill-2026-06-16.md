@@ -174,7 +174,7 @@ os_log re-binds `manifest_received=true arm_lease_received=true` every 5s throug
   captured only lifecycle events (`filter_started`/`filter_stopped`), no per-flow `egress_*`
   events, so for the boot segment specifically "lifecycle, not per-flow verdicts" still holds.
 - **Claim attaches to the drilled tree `053093963dbf`, NOT today's `origin/main`.** As of the
-  drill close, `origin/main` is **5 commits ahead** (`bb673e72`): AGENTS.md (#591) + the L1-L4
+  drill close, `origin/main` is **5 commits ahead** (`bb673e72`): AGENTS.md (#591) + the
   layer-rename PRs #592-595, which rename castle-wall symbols/dirs/import-paths and touch
   `macos-daemon.ts` + `per-rule-report.ts` (2-line renames each). Those are **not re-drilled.**
   Do not silently re-attach "survives reboot" to "current main" without re-confirming the
