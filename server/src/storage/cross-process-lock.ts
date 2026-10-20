@@ -94,9 +94,10 @@ const CUSTODY_LOCK_MAX_ENTRY_BYTES =
 const KERNEL_SOCKET_PROBE_TIMEOUT_MS = 500;
 const STALE_REAPER_TIMEOUT_MS = 2_000;
 // Three attempts = the initial attempt plus two recovery attempts SHARED across
-// all pathname and descriptor disappearance points, not one per window. Fresh
-// scaffolds are younger than the sweep's age floor, so repeated disappearance
-// exhausts this bounded allowance. Must match SCAFFOLD_ATTEMPTS in
+// all pathname and descriptor disappearance points, not one per window. A
+// scaffold this function re-creates is younger than the sweep's age floor, so a
+// routine sweep cannot remove it again; more disappearances than this budget
+// mean abnormal churn, and the call fails closed with "io". Must match SCAFFOLD_ATTEMPTS in
 // test/storage/custody-scaffold-enoent.test.ts.
 const INERT_LOCK_SCAFFOLD_MAX_ATTEMPTS = 3;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
