@@ -28,7 +28,7 @@ Every runtime gets the same capabilities:
 
 ```
 1. Add Sanctuary as an MCP server (see runtime-specific guide)
-2. Call `manifest` to verify 80+ tools are loaded
+2. Call `manifest` to verify the Sanctuary tools are loaded
 3. Call `identity_create` to get a DID
 4. Call `identity_set_primary` to designate the active identity
 5. Call `sovereignty_health_report` to check your status

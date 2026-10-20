@@ -3,8 +3,10 @@
 > Add sovereign identity, encrypted audit trails, and verifiable reputation
 > to your OpenClaw agent in under 60 seconds.
 
-Verified working on Mac Mini M4 running OpenClaw 2026.4.2 + Sanctuary v1.3.0-rc.1
-(68 tools registered, sovereignty handshakes completed, Verascore publish proven).
+Last verified in April 2026 on a Mac Mini M4 running OpenClaw 2026.4.2 with a
+Sanctuary release candidate of that month (sovereignty handshakes completed,
+Verascore publish proven). The current release is v1.8.4; install it with
+`npx -y @sanctuary-framework/mcp-server protect --openclaw`.
 The config below uses the explicit-binary npx form
 (`-p @sanctuary-framework/mcp-server sanctuary-mcp-server`), which resolves an
 executable on every published version, so it tracks the latest release instead
@@ -87,7 +89,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 ## OpenClaw-Specific Notes
 
 **Tool naming.** OpenClaw namespaces all MCP tools as `{server}__{tool}`.
-With Sanctuary v1.3.0-rc.1, you get clean names like `sanctuary__manifest`,
+With current Sanctuary releases, you get clean names like `sanctuary__manifest`,
 `sanctuary__identity_create`. Older pre-0.7 releases used a `sanctuary/`
 prefix that caused double-mangling (`sanctuary__sanctuary-manifest`).
 Always use the current release.

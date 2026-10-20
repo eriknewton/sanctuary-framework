@@ -30,6 +30,10 @@ exclude:
   # 2026-08-31 (INC-009): unpublished pending a review of whether the
   # open-security-debt board says more than a public page should.
   - audit/SECURITY_POSTURE.md
+  # Internal research note from April 2026 (layer numbering, deployment-specific
+  # scoring); unpublished 2026-10-19 by the public-freshness pass. The file stays
+  # in the repository; only the site page is removed.
+  - research/RESEARCH_ZK_UPGRADE_L3.md
 
 # Defaults
 defaults:

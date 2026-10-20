@@ -6,7 +6,7 @@
 ## Prerequisites
 
 - Anthropic Managed Agents access (research preview or GA)
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@0.7.0`
+- Sanctuary: `npm install @sanctuary-framework/mcp-server@1.8.4`
   (Node.js is pre-installed in Managed Agents containers)
 
 ## Step 1: Add Sanctuary to Your Agent Config
@@ -24,14 +24,14 @@ agent:
   mcp_servers:
     - name: sanctuary
       command: npx
-      args: ["@sanctuary-framework/mcp-server@0.7.0"]
+      args: ["@sanctuary-framework/mcp-server@1.8.4"]
 ```
 
 Deploy the agent. Sanctuary tools load automatically via MCP.
 
 ## Step 2: Verify Sanctuary Is Active
 
-Call `manifest` from your agent. You should see 80+ Sanctuary tools listed.
+Call `manifest` from your agent. You should see the Sanctuary tools listed (more than 100 in v1.8.4).
 
 ## Step 3: Bind an Identity
 
@@ -117,7 +117,7 @@ tool confirmation config.
 
 **First run is slow**
 `npx` downloads the package on first invocation (~10s). For faster cold
-starts, add `RUN npm install -g @sanctuary-framework/mcp-server@0.7.0` to
+starts, add `RUN npm install -g @sanctuary-framework/mcp-server@1.8.4` to
 your container setup.
 
 ## Next Steps

@@ -6,7 +6,7 @@ description: >
   zero-knowledge proofs, portable reputation, sovereignty health reporting, handshakes, MCP-to-MCP federation,
   protection-posture auditing, or principal dashboard approval. Bounds: these tools are the cooperative MCP
   surface (Charter); operating-system egress enforcement is a separate arming step, live on macOS,
-  proven on Linux for Ubuntu 24.04 (x86-64) only, Windows roadmapped; every claim traces to the Assurance Matrix.
+  proven on Linux for Ubuntu 24.04 (x86-64) only with a separate package (not in this npm server), Windows roadmapped; every claim traces to the Assurance Matrix.
   Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR, handshake, attestation,
   disclosure policy, zero-knowledge, federation, approval, dashboard, webhook, concordia, bridge, negotiation,
   audit, openclaw, sovereignty gap, security posture.

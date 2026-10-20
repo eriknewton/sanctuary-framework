@@ -7,13 +7,13 @@ layout: null
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmapped.">
+<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package; Windows is roadmapped.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmapped. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package; Windows is roadmapped. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -40,9 +40,31 @@ layout: null
   "codeRepository": "https://github.com/eriknewton/sanctuary-framework",
   "author": {
     "@type": "Person",
+    "@id": "https://sanctuaryprotocol.ai/#erik-newton",
     "name": "Erik Newton"
   },
-  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Apache-2.0. Installs with npx."
+  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only, for the separate Castle Wall Linux package; Windows is roadmapped. Apache-2.0. Installs with npx."
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Person",
+  "@id": "https://sanctuaryprotocol.ai/#erik-newton",
+  "name": "Erik Newton",
+  "description": "California attorney and author of Sanctuary (open source security for AI agents) and the Concordia Protocol (negotiation between agents); founder of Verascore (agent reputation); co-chair of the W3C Agentic Integrity Verification Specification (AIVS) Community Group.",
+  "url": "https://sanctuaryprotocol.ai/",
+  "sameAs": [
+    "https://github.com/eriknewton",
+    "https://x.com/newtonlaw",
+    "https://www.linkedin.com/in/erikwnewton/"
+  ],
+  "knowsAbout": [
+    "AI agent security",
+    "MCP servers",
+    "agent negotiation protocols",
+    "agent reputation"
+  ]
 }
 </script>
 
@@ -104,7 +126,7 @@ layout: null
     </p>
 
     <p class="hero__sub" style="opacity:0.66;margin-top:-0.75rem;">
-      Proven on macOS. Ubuntu 24.04 x86-64: the fresh-install per-account signed-policy claim is proven. Windows: roadmapped.
+      Proven on macOS. Ubuntu 24.04 x86-64: the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package. Windows: roadmapped.
     </p>
 
     <!-- Install block -->
