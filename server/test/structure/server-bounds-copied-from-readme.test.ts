@@ -53,6 +53,11 @@ describe("server bounds are copied from the README", () => {
     expect.soft(unbounded, "a proof sentence lacks its platform bound").toEqual([]);
     expect.soft(SERVER_BOUNDS.platforms).toContain("macOS: proven.");
     expect.soft(SERVER_BOUNDS.platforms).toContain("Linux enforcement is proven on Ubuntu 24.04 (x86-64) only;");
+    // The proven Linux path is not in the npm package this server ships in, so
+    // the bounds name its channel; an agent reading only "proven on Ubuntu"
+    // would assume the npm install enforces there.
+    expect.soft(SERVER_BOUNDS.platforms).toContain("Linux enforcement ships as the separate Castle Wall Linux");
+    expect.soft(SERVER_BOUNDS.platforms).toContain("not in the npm package.");
     // The short macOS status inherits the drill scope from the same README wall row.
     const wallRow = README.split("\n").find((line) => line.startsWith("| **the wall.**"));
     expect(wallRow).toContain("a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles.");

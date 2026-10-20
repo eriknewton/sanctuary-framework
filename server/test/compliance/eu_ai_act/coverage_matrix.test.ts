@@ -154,6 +154,33 @@ describe("EU AI Act coverage matrix v1", () => {
     });
   });
 
+  describe("public display copy", () => {
+    // The rendered matrix is served publicly at
+    // sanctuaryprotocol.ai/compliance/eu_ai_act_coverage_matrix_v1.html and is
+    // copied into every generated bundle. Its prose names the four layers, never
+    // the retired L1 to L4 numbering; the wire keys it cites (layers.l1 and the
+    // rest) are frozen contracts and are lowercase, so this pattern does not
+    // match them.
+    const RETIRED_LAYER_LABEL = /\bL[1-4]\b/;
+
+    it("no row or note uses a retired L1 to L4 layer label", () => {
+      const offenders: string[] = [];
+      for (const row of COVERAGE_MATRIX_V1.rows) {
+        for (const [field, text] of [
+          ["evidence_emitted", row.evidence_emitted],
+          ["manual_carveout", row.manual_carveout ?? ""],
+          ["review_notes", row.review_notes],
+        ] as const) {
+          if (RETIRED_LAYER_LABEL.test(text)) offenders.push(`${row.id}.${field}`);
+        }
+      }
+      COVERAGE_MATRIX_V1.notes.forEach((note, i) => {
+        if (RETIRED_LAYER_LABEL.test(note)) offenders.push(`notes[${i}]`);
+      });
+      expect(offenders).toEqual([]);
+    });
+  });
+
   describe("coverage distribution (regression lock)", () => {
     it("has exactly 46 rows (matrix v1 baseline)", () => {
       expect(COVERAGE_MATRIX_V1.rows.length).toBe(46);
