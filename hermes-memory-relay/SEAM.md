@@ -194,3 +194,47 @@ Late `probe_reply` is normal on the Node side only for an issued `(connection_id
 While one call is in flight for a connection, the relay forwards only `cancel`, `shutdown`, and peer close. A second `tools_call`, `hello`, or `tools_list` receives the fixed busy denial with at most one busy denial outstanding. Any further non-control frame poisons the connection and emits `closed`.
 
 In flight means any forwarded request awaiting its `response`: `tools_call`, `tools_list`, and `hello` all count. Public `shutdown` is forwarded to Node, then the relay closes the caller's public fd and emits `closed` once. The control queue counts events queued and not yet written to the socketpair and drains only on the write-completion hook for that control frame; idle `cancel` frames count against the same queue. Pongs count until their own client write-completion hook fires. The queue is capped at `CONTROL_QUEUE_DEPTH_PER_CONNECTION = 8`. Overflow poisons that connection only. The outbound bound per connection is one result frame, one busy denial, and `CONTROL_RESPONSE_ALLOWANCE_PER_CONNECTION = 2` pong responses.
+
+## Stdio client contract
+
+`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory search and get are available through the bridge; writes are not yet available. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; the shim code reads no environment selector for socket, identity, write flag, or boot mode. The agent account can reach the socket directly, so inherited environment is not a security boundary here.
+
+The client constants in `server/src/hermes-memory-client/protocol.ts` must match `RelayProtocolConstants` in `Sources/HermesMemoryRelayCore/Core.swift`: public payload 65536 bytes excluding the 4-byte prefix, retained socket frame 65540 bytes, 64 composite levels below the public root, two outstanding pongs, and eight queued/reserved forwarded controls. The client cannot observe `markNodeFrameWritten`, so its `CONTROL_CAP` conservatively limits controls over the connection lifetime, reserving the eighth credit for shutdown. A socket write never refunds credit.
+
+`MAX_STDIO_LINE_BYTES` must match `server/src/hermes-memory-client/protocol.ts`: 65536 payload + 35 fixed MCP envelope bytes + 128 ID bytes + 2 CRLF bytes = 65701. The maximum compact call overhead is 222 MCP bytes versus 127 relay bytes: 65536 - 127 + 222 = 65631, within the 65699 JSON ceiling. The 128-character ASCII ID rule is client-local; integer IDs remain typed. The client mints unrelated wire IDs using 128 random bits and a non-wrapping UInt64 counter.
+
+`SHIM_CALL_DEADLINE_MS` is 120000 minus the 2000 response delivery reserve = 118000, measured from shim admission. The Hermes clock starts earlier; this is not a guarantee of delivery before its deadline. Call reply stalls use the remainder of that 120000 window. Other replies use the 2000 delivery reserve. CD1a allows 5000 for connect/hello; CD1b allows 5000 in each initialization waiting/output state. Ping waits are 30000 minus 2000 = 28000 through parsing pong. Cancel settlement allows 30000 lock wait + 2000 probe = 32000 without a durable-completion guarantee. EOF and non-EOF drains allow 2000 Python process grace minus 500 scheduler/exit margin = 1500. The bridge approval constant remains 83000.
+
+MCP call results must match `CallToolResultSchema` with an actual content array; list results must match `ListToolsResultSchema` after tool-level `input_schema` becomes `inputSchema`. The exact three names are memory_insert, memory_get, memory_search, with no cursor. Payload bytes are spliced without re-encoding. Unknown call param fields are ignored; only the tool name and object arguments cross the seam. The bridge remains the argument-allowlist and effective-taint authority.
+
+| Refusing event | Client disposition |
+|---|---|
+| Denial or unknown tool | Fixed -32002, continue |
+| Occupied primary or third ping | Fixed -32003, no call queue |
+| Relay unavailable | Fixed -32004, insert outcome unknown, continue |
+| Admission deadline | Fixed -32005, outcome unknown, at most one eligible cancel |
+| Size or depth with recovered ID | -32602, continue; rejected tails retain only a bounded ID scanner |
+| Invalid framing or lifecycle | Correlate outstanding IDs and drain while stdout remains usable |
+| Malformed relay result or unsolicited pong | Fixed -32603 for the protocol fault; other admitted IDs receive unavailable, insert outcome unknown |
+| EOF or signal | No new stdout writes; eligible cancel, shutdown, bounded exit |
+| Dead stdout | Cancel where eligible, bounded exit; delivery cannot be guaranteed |
+| Native call write error | Correlated outcome unknown, no cancel and no replay; partial progress resumes at its offset and EAGAIN waits for writability |
+
+| Continuing effect | Required evidence |
+|---|---|
+| Hello | One connection, primary reserved, fixed facade identity |
+| Initialize success | Validated hello releases primary; named initialize output slot |
+| Initialized readiness | Initialize output completed; initialized notification validated |
+| List or call forwarding | READY, free primary, validated encoded size/depth and allowed method |
+| Result delivery | First settlement winner, wanted ID, validated schema and bounded immutable bytes |
+| Ping | Reserved typed FIFO entry; before hello it remains held |
+| Pong delivery | Oldest unexpired FIFO record; expired positions consume late pongs silently |
+| Cancel | Intent selected before settlement; complete wire frame before sending, once, with control credit |
+| Shutdown | Only this public connection, after eligible cancel, once |
+| Output resume | Finish the existing line before any other line; timers and relay reads continue |
+| Non-EOF drain | Settle outstanding IDs and complete buffered request lines within the total bound |
+| Wire retirement | Disarm settlement expiry; retire MCP ID independently after delivery/suppression |
+
+Retained state is one primary, one local refusal, two ping records, a dedicated initialize output slot during startup, and one terminal-only refusal slot. Each slot is retired on delivery/suppression and, where applicable, wire settlement. Input processing yields between lines. Output never queues without its record reservation. The primary may retain one encoded frame, at most 65540 bytes including its prefix, behind a completing control write; cancellation or drain discards an unwritten frame locally. Oversized input scanning retains only bounded key/ID tokens and nesting counters. Wire and stdout buffers are disposed on close.
+
+The client emits no -32000 or -32001 and only fixed errors. A process crash, SIGKILL, dead stdout, or keepalive-triggered teardown during an admitted call can still leave the SDK to synthesize a transport error. Production writes remain held. Hermes must be configured with timeout 120 and must not mark this server parallel-safe. A dead client is noticed on the next call or keepalive. Consecutive denied inserts can trip Hermes's three-error, 60-second circuit breaker and temporarily block reads. Installed uid and SDK parity evidence remains separate from fixture acceptance.
