@@ -1133,6 +1133,69 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
     let _ = booted.handle.stop();
 }
 
+fn wal_operations(wal: &mut WalWriter) -> Vec<(u64, String)> {
+    // Preserve the fixture's existing 500-row bound; reaching it must not hide later rows.
+    const SNAPSHOT_ROW_LIMIT: usize = 500;
+    let rows = wal.snapshot_after(None, SNAPSHOT_ROW_LIMIT).unwrap();
+    assert!(
+        rows.len() < SNAPSHOT_ROW_LIMIT,
+        "fixture WAL snapshot reached its cap"
+    );
+    rows.iter()
+        .map(|row| {
+            let event: serde_json::Value = serde_json::from_str(&row.event_canonical_json)
+                .unwrap_or_else(|err| panic!("invalid audit JSON at seq {}: {err}", row.seq));
+            let operation = event["operation"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing string audit operation at seq {}", row.seq));
+            (row.seq, operation.to_string())
+        })
+        .collect()
+}
+
+fn egress_row_count(operations: &[(u64, String)]) -> usize {
+    // policy.rs emits egress_approved, egress_pending, and egress_blocked;
+    // retain superseding egress evidence too, regardless of the attributed identity.
+    operations
+        .iter()
+        .filter(|(_, operation)| operation.starts_with("egress_"))
+        .count()
+}
+
+#[test]
+fn egress_row_count_detects_appended_egress_records() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut wal = WalWriter::open(&dir.path().join("filter-events.wal")).unwrap();
+    wal.append_control_critical(r#"{"operation":"ipc_policy_reload_authorized"}"#)
+        .unwrap();
+    let baseline = wal_operations(&mut wal);
+    assert_eq!(
+        egress_row_count(&baseline),
+        0, // Only a control record has been appended.
+        "rows: {baseline:?}"
+    );
+    for operation in [
+        "egress_approved",
+        "egress_pending",
+        "egress_blocked",
+        "egress_verdict_superseded",
+    ] {
+        let before = wal_operations(&mut wal);
+        // A rejected identity must remain visible to the count, even for a non-allow row.
+        let event = serde_json::json!({
+            "operation": operation,
+            "identity_id": "unadmitted/agent-x",
+        });
+        let seq = wal.append_critical(&event.to_string()).unwrap();
+        let after = wal_operations(&mut wal);
+        assert_ne!(
+            egress_row_count(&after),
+            egress_row_count(&before),
+            "unchanged-count predicate must reject appended seq {seq}, operation {operation}; rows: {after:?}"
+        );
+    }
+}
+
 #[test]
 fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
     // End-to-end: boot the daemon with one allow rule, drive a real
@@ -1188,7 +1251,51 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
     ));
     assert_eq!(callback(&packet_for_mark(admitted_mark)), NfVerdict::Accept);
     let wal = booted.handle.wal_writer().expect("wal");
-    let rows_after_admitted = wal.lock().unwrap().snapshot_after(None, 500).unwrap().len();
+    let baseline = wal_operations(&mut wal.lock().unwrap());
+    let rows_after_admitted = egress_row_count(&baseline);
+    const ADMITTED_EGRESS_ROWS: usize = 1; // One synchronous admitted callback above.
+    assert_eq!(
+        rows_after_admitted, ADMITTED_EGRESS_ROWS,
+        "the admitted callback must append one egress row; rows: {baseline:?}"
+    );
+    let baseline_seq = baseline.last().expect("admitted row").0;
+    let extra_rows = |rows: &[(u64, String)]| {
+        rows.iter()
+            .filter(|(seq, _)| *seq > baseline_seq)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // A successful reload durably appends control evidence before replying, so
+    // the old whole-WAL count fails without relying on watcher timing or sleeps.
+    const CONTROL_RELOAD_REQUEST_ID: &str = "evaluate-reload-after-baseline";
+    send_envelope(
+        &mut reload_stream,
+        &MessageEnvelope {
+            jsonrpc: "2.0".to_string(),
+            method: format!("{}.policy_reload_request", IPC_NAMESPACE),
+            params: IpcMessage::PolicyReloadRequest {
+                request_id: CONTROL_RELOAD_REQUEST_ID.to_string(),
+                manifest_path: "ignored".to_string(),
+            },
+        },
+    );
+    match recv_envelope(&mut reload_stream, &mut reload_buf).params {
+        IpcMessage::PolicyReloadResponse {
+            request_id,
+            ok: true,
+            ..
+        } if request_id == CONTROL_RELOAD_REQUEST_ID => {}
+        other => panic!("authorized unchanged-manifest reload failed: {other:?}"),
+    }
+    let after_reload = wal_operations(&mut wal.lock().unwrap());
+    let reload_rows = extra_rows(&after_reload);
+    assert!(
+        reload_rows
+            .iter()
+            .any(|(_, operation)| operation == "ipc_policy_reload_authorized"),
+        "second IPC reload must append its authorization after seq {baseline_seq}; extra rows: {reload_rows:?}"
+    );
     for mark in [
         register_agent_mark(&castle_wall_daemon::nftables::confined_agent_id(
             TEST_GATE_UID,
@@ -1202,16 +1309,20 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         register_agent_mark("agent-x"),
     ] {
         assert_eq!(callback(&packet_for_mark(mark)), NfVerdict::Drop);
+        let rows = wal_operations(&mut wal.lock().unwrap());
         assert_eq!(
-            wal.lock().unwrap().snapshot_after(None, 500).unwrap().len(),
+            egress_row_count(&rows),
             rows_after_admitted,
-            "unadmitted mark {mark} must not append an egress row"
+            "unadmitted mark {mark} must not append an egress row; extra (seq, operation): {:?}",
+            extra_rows(&rows)
         );
     }
+    let rows = wal_operations(&mut wal.lock().unwrap());
     assert_eq!(
-        wal.lock().unwrap().snapshot_after(None, 500).unwrap().len(),
+        egress_row_count(&rows),
         rows_after_admitted,
-        "unadmitted marks must not append egress rows"
+        "unadmitted marks must not append egress rows; extra (seq, operation): {:?}",
+        extra_rows(&rows)
     );
 
     let mut stream = connect_and_handshake(
