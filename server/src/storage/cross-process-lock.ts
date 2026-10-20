@@ -93,9 +93,10 @@ const CUSTODY_LOCK_MAX_ENTRY_BYTES =
   BARRIER_SCAFFOLD_DIGEST_HEX_CHARS + ".reaper".length;
 const KERNEL_SOCKET_PROBE_TIMEOUT_MS = 500;
 const STALE_REAPER_TIMEOUT_MS = 2_000;
-// Three attempts = the initial attempt plus one recovery for each pathname
-// window (validation open and final lstat). This bounds repeated disappearance,
-// not the number of competing sweepers. Must match SCAFFOLD_ATTEMPTS in
+// Three attempts = the initial attempt plus two recovery attempts SHARED across
+// all pathname and descriptor disappearance points, not one per window. Fresh
+// scaffolds are younger than the sweep's age floor, so repeated disappearance
+// exhausts this bounded allowance. Must match SCAFFOLD_ATTEMPTS in
 // test/storage/custody-scaffold-enoent.test.ts.
 const INERT_LOCK_SCAFFOLD_MAX_ATTEMPTS = 3;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
@@ -1935,13 +1936,17 @@ async function ensureInertLockScaffold(
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
       // A concurrent sweep in another process may unlink an aged scaffold
-      // between create and validate. Recreation is safe because the sweep holds
-      // both scaffold advisory locks while deleting, and validation reruns in full.
+      // between create and validate. Recreation is safe because the socket owns
+      // the lock, a fresh scaffold is younger than the sweep's age floor, and
+      // validation reruns in full.
       continue;
     }
     let repaired = false;
     try {
       const held = await handle.stat();
+      // Zero links means the held inode disappeared, not an unsafe named shape;
+      // retry full validation rather than treating unlink as degradable tampering.
+      if (held.nlink === 0) continue;
       const shape = classifyCustodyLockScaffold(held, uid);
       if (shape === "unsafe") {
         throw new CrossProcessLockError(
@@ -1956,6 +1961,9 @@ async function ensureInertLockScaffold(
         repaired = true;
       }
       const secured = await handle.stat();
+      // Zero links means disappearance even during repair; finally closes the
+      // descriptor before the shared retry budget reruns full validation.
+      if (secured.nlink === 0) continue;
       if (classifyCustodyLockScaffold(secured, uid) !== "secure") {
         throw new CrossProcessLockError(
           `custody lock scaffold mode repair did not produce a secure inode (${lockPath})`,
@@ -1972,6 +1980,9 @@ async function ensureInertLockScaffold(
         continue;
       }
       if (named.dev !== secured.dev || named.ino !== secured.ino) {
+        // Zero links proves the validated inode disappeared before replacement;
+        // a still-linked inode is substitution and must retain its refusal.
+        if ((await handle.stat()).nlink === 0) continue;
         throw new CrossProcessLockError(
           `custody lock scaffold changed during validation (${lockPath})`,
           "capability",
