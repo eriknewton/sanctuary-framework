@@ -1,3 +1,4 @@
+// fail-before-exempt: this change edits only the GENERATE_EXAMPLE=1 Markdown renderer that writes docs/compliance/eu_ai_act_coverage_matrix_v1.md (hyphens in place of em-dashes, the IC-05 checkpoint-signing sentence the committed doc already carries); it adds no assertion, so the always-on placeholder passes against the base by construction. The renamed row text it renders comes from coverage_matrix.ts and is covered by coverage_matrix.test.ts.
 /**
  * Sanctuary MCP Server — EU AI Act Example Bundle Generator
  *

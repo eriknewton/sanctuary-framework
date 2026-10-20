@@ -1,3 +1,4 @@
+// fail-before-exempt: the new assertions guard a release-time contract, not a source fix: server.json must carry the exact RELEASE_VERSION the publish workflow dispatches, and its version must have the shape that workflow accepts. They pass against the base by construction because main's server.json already matches package.json and RELEASE_VERSION is unset outside a publish run; the release witness was run locally (RELEASE_VERSION=1.8.6-rc.5 fails, 1.8.6-rc.1 passes), and the matching guard is the new server.json check in publish-on-tag.yml.
 /**
  * MCP-registry metadata lockstep guard.
  *
