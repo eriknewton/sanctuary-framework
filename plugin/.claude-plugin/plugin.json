@@ -1,7 +1,7 @@
 {
   "name": "sanctuary-framework",
   "version": "1.8.4",
-  "description": "Security for AI agents: an OS-enforced egress wall on macOS, keys only the operator holds, a hash-chained audit record. Wraps Claude Code, Cursor, Hermes, OpenClaw, Cline on tested config paths. Linux wall: Ubuntu 24.04 x86-64, separate package.",
+  "description": "Security for AI agents: an OS-enforced egress wall on macOS, operator-held keys, a hash-chained audit record. Wraps Claude Code, Cursor, Hermes, OpenClaw, Cline on tested config paths (partial). Linux wall: Ubuntu 24.04 x86-64 only, separate package.",
   "author": {
     "name": "Erik Newton",
     "homepage": "https://github.com/eriknewton/sanctuary-framework"

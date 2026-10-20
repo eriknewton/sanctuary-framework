@@ -3,8 +3,8 @@
 > Add sovereign identity, encrypted audit trails, and verifiable reputation
 > to your OpenClaw agent in under 60 seconds.
 
-Last verified in April 2026 on a Mac Mini M4 running OpenClaw 2026.4.2 with a
-Sanctuary release candidate of that month (sovereignty handshakes completed,
+Last verified in April 2026 on a Mac Mini M4 running OpenClaw 2026.4.2 with
+Sanctuary v0.7.0 (sovereignty handshakes completed,
 Verascore publish proven). The current release is v1.8.4; install it with
 `npx -y @sanctuary-framework/mcp-server protect --openclaw`.
 The config below uses the explicit-binary npx form
