@@ -93,6 +93,13 @@ const CUSTODY_LOCK_MAX_ENTRY_BYTES =
   BARRIER_SCAFFOLD_DIGEST_HEX_CHARS + ".reaper".length;
 const KERNEL_SOCKET_PROBE_TIMEOUT_MS = 500;
 const STALE_REAPER_TIMEOUT_MS = 2_000;
+// Three attempts = the initial attempt plus two recovery attempts SHARED across
+// all pathname and descriptor disappearance points, not one per window. A
+// scaffold this function re-creates is younger than the sweep's age floor, so a
+// routine sweep cannot remove it again; more disappearances than this budget
+// mean abnormal churn, and the call fails closed with "io". Must match SCAFFOLD_ATTEMPTS in
+// test/storage/custody-scaffold-enoent.test.ts.
+const INERT_LOCK_SCAFFOLD_MAX_ATTEMPTS = 3;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
 // reader socket per live unlock plus a few fixed scaffolds. A real host has a
 // handful; anything past this ceiling means crashed-reader leakage or a same-uid
@@ -121,6 +128,7 @@ const UNUSED_BARRIER_SCAFFOLD_SWEEP_PASS_TIMEOUT_MS = STALE_REAPER_TIMEOUT_MS;
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_INTERVAL_MS = STALE_REAPER_TIMEOUT_MS;
 // A peer can create its scaffold pair before it binds the socket. A scaffold
 // younger than the stale-reaper deadline is treated as possibly in-admission.
+// Must match SCAFFOLD_MIN_AGE_MS in test/storage/custody-scaffold-enoent.test.ts.
 const UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS = STALE_REAPER_TIMEOUT_MS;
 // Reaping a stale socket spawns a serialized helper process, so bound how many
 // we launch per drain pass; the rest are handled on the next pass within the
@@ -1906,64 +1914,100 @@ async function ensureInertLockScaffold(
       "capability",
     );
   }
-  let created = false;
-  try {
-    const handle = await open(lockPath, "wx", 0o600);
+  for (let attempt = 0; attempt < INERT_LOCK_SCAFFOLD_MAX_ATTEMPTS; attempt += 1) {
+    let created = false;
     try {
-      await handle.sync();
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      created = true;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+    }
+
+    let handle;
+    try {
+      handle = await open(
+        lockPath,
+        constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+      );
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+      // A concurrent sweep in another process may unlink an aged scaffold
+      // between create and validate. Recreation is safe because the socket owns
+      // the lock, a fresh scaffold is younger than the sweep's age floor, and
+      // validation reruns in full.
+      continue;
+    }
+    let repaired = false;
+    try {
+      const held = await handle.stat();
+      // Zero links means the held inode disappeared, not an unsafe named shape;
+      // retry full validation rather than treating unlink as degradable tampering.
+      if (held.nlink === 0) continue;
+      const shape = classifyCustodyLockScaffold(held, uid);
+      if (shape === "unsafe") {
+        throw new CrossProcessLockError(
+          `custody lock scaffold must be a uid-owned, single-link, zero-byte regular file with mode 0600; ` +
+            `only an exact legacy 0644 scaffold can be repaired automatically (${lockPath})`,
+          "capability",
+        );
+      }
+      if (shape === "legacy-0644") {
+        await handle.chmod(0o600);
+        await handle.sync();
+        repaired = true;
+      }
+      const secured = await handle.stat();
+      // Zero links means disappearance even during repair; finally closes the
+      // descriptor before the shared retry budget reruns full validation.
+      if (secured.nlink === 0) continue;
+      if (classifyCustodyLockScaffold(secured, uid) !== "secure") {
+        throw new CrossProcessLockError(
+          `custody lock scaffold mode repair did not produce a secure inode (${lockPath})`,
+          "capability",
+        );
+      }
+      let named;
+      try {
+        named = await lstat(lockPath);
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+        // The same sweep can remove the pathname after descriptor validation;
+        // finally closes this descriptor before full creation and validation retry.
+        continue;
+      }
+      if (named.dev !== secured.dev || named.ino !== secured.ino) {
+        // Zero links proves the validated inode disappeared before replacement;
+        // a still-linked inode is substitution and must retain its refusal.
+        if ((await handle.stat()).nlink === 0) continue;
+        throw new CrossProcessLockError(
+          `custody lock scaffold changed during validation (${lockPath})`,
+          "capability",
+        );
+      }
     } finally {
       await handle.close();
     }
-    created = true;
-  } catch (error) {
-    if (errorCode(error) !== "EEXIST") throw error;
+    if (created || repaired) {
+      const directory = await open(lockDir, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    }
+    return;
   }
-
-  const handle = await open(
-    lockPath,
-    constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+  // Disappearance is an I/O failure, never environmental capability loss that
+  // a caller could elect to degrade into an inert or read-only lease.
+  throw new CrossProcessLockError(
+    `custody lock scaffold kept disappearing during validation (${lockPath})`,
+    "io",
   );
-  let repaired = false;
-  try {
-    const held = await handle.stat();
-    const shape = classifyCustodyLockScaffold(held, uid);
-    if (shape === "unsafe") {
-      throw new CrossProcessLockError(
-        `custody lock scaffold must be a uid-owned, single-link, zero-byte regular file with mode 0600; ` +
-          `only an exact legacy 0644 scaffold can be repaired automatically (${lockPath})`,
-        "capability",
-      );
-    }
-    if (shape === "legacy-0644") {
-      await handle.chmod(0o600);
-      await handle.sync();
-      repaired = true;
-    }
-    const secured = await handle.stat();
-    if (classifyCustodyLockScaffold(secured, uid) !== "secure") {
-      throw new CrossProcessLockError(
-        `custody lock scaffold mode repair did not produce a secure inode (${lockPath})`,
-        "capability",
-      );
-    }
-    const named = await lstat(lockPath);
-    if (named.dev !== secured.dev || named.ino !== secured.ino) {
-      throw new CrossProcessLockError(
-        `custody lock scaffold changed during validation (${lockPath})`,
-        "capability",
-      );
-    }
-  } finally {
-    await handle.close();
-  }
-  if (created || repaired) {
-    const directory = await open(lockDir, "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  }
 }
 
 async function acquireKernelLock(
