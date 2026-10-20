@@ -1,3 +1,4 @@
+// fail-before-exempt: this change edits only the GENERATE_EXAMPLE=1 Markdown renderer that writes docs/compliance/eu_ai_act_coverage_matrix_v1.md (hyphens in place of em-dashes, the IC-05 checkpoint-signing sentence the committed doc already carries); it adds no assertion, so the always-on placeholder passes against the base by construction. The renamed row text it renders comes from coverage_matrix.ts and is covered by coverage_matrix.test.ts.
 /**
  * Sanctuary MCP Server — EU AI Act Example Bundle Generator
  *
@@ -427,15 +428,15 @@ description: Row-by-row mapping from Sanctuary primitives to Regulation (EU) 202
 | **Manual only** (Sanctuary has no visibility; enterprise authors in full) | ${stats.manual_only} | ${stats.manual_only_pct}% |
 | **Total** | ${stats.total_rows} | 100% |
 
-### The 5 full rows (load-bearing spine)
+### The 5 full rows (core spine)
 
-Every "full" row was individually verified against source. The audit-log rows (Article 12(1) and Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501); the remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
+Every "full" row was individually verified against source. The audit-log rows (Article 12(1) and Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501); checkpoint-signing remains tracked in **IC-05**. The remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
 
 ${m.rows
   .filter((r) => r.coverage === "full")
   .map(
     (r, i) =>
-      `${i + 1}. **${r.citation.instrument} ${r.citation.section}** — ${r.citation.title}`
+      `${i + 1}. **${r.citation.instrument} ${r.citation.section}** - ${r.citation.title}`
   )
   .join("\n")}
 
@@ -453,13 +454,13 @@ ${m.notes.map((n) => `- ${n}`).join("\n")}
     .map((row) => {
       const emitterList =
         row.evidence_emitter.length === 0
-          ? "_(none — this row is manual_only)_"
+          ? "_(none - this row is manual_only)_"
           : row.evidence_emitter.map((e) => `\`${e}\``).join(", ");
       const carveout =
         row.manual_carveout === null
-          ? "_(none — this row is fully auto-emitted)_"
+          ? "_(none - this row is fully auto-emitted)_"
           : row.manual_carveout;
-      return `### ${row.citation.instrument} ${row.citation.section} — ${row.citation.title}
+      return `### ${row.citation.instrument} ${row.citation.section} - ${row.citation.title}
 
 - **Row ID:** \`${row.id}\`
 - **Clause ID:** \`${row.citation.clause_id}\`
