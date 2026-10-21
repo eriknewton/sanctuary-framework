@@ -455,10 +455,11 @@ interface PendingRequest {
  *
  * The ONE place the projection's field selection is written, so the bridge's
  * list read and its by-id read cannot drift into describing the same hold
- * differently. Deliberately header-only: no `reason` and no `context`, because
- * a hold's context is raw tool arguments and an inbox card carries no
- * free-text member to put them in (see
- * `server/src/hub/charter-approval-bridge.ts`).
+ * differently. Header plus the gate's reason: never `context`, because a
+ * hold's context is raw tool arguments and an inbox card carries no free-text
+ * member to put them in (see `server/src/hub/charter-approval-bridge.ts`). The
+ * `reason` is the gate's operator-facing hold reason, the same string
+ * `GET /api/pending` serves from this queue (`aggregatorSources` below).
  */
 function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
   // Only the gate-stamped typed field is carried, never a `context` key: the
@@ -472,6 +473,9 @@ function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
     created_at: pending.created_at,
     ...(typeof requestingAgentId === "string" && requestingAgentId.length > 0
       ? { requesting_agent_id: requestingAgentId }
+      : {}),
+    ...(typeof pending.request.reason === "string" && pending.request.reason.length > 0
+      ? { reason: pending.request.reason }
       : {}),
   };
 }

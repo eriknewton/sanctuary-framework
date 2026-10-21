@@ -365,6 +365,11 @@ export class HubService {
         ...projectCharterApproval(record, this.deps.identityId),
         resolved: true,
         resolved_at: resolvedAt,
+        // Rule 7: `decision` carries the operator's action that THIS hub
+        // delivered and the queue accepted (resolve() returned true above);
+        // it is the console's Allowed / Denied label, not a claim about what
+        // the held call then did. The gate's decision audit row is the record.
+        decision: action,
       };
       // Remembered only after resolve() returned true: a lost race or a
       // timed-out hold never enters the decided view as an operator decision.

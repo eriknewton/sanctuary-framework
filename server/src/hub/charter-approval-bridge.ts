@@ -56,6 +56,13 @@ export interface CharterApprovalRecord {
    * argument). Absent means unattributed.
    */
   requesting_agent_id?: string;
+  /**
+   * The gate's own reason for the hold, verbatim. Must match
+   * `ApprovalRequest.reason` in server/src/principal-policy/types.ts, whose
+   * production writer is `ApprovalGate.requestApproval` (its classification
+   * and anomaly strings). Absent means the queue served none.
+   */
+  reason?: string;
 }
 
 /**
@@ -170,15 +177,35 @@ const TARGET_DEFAULTING_CATEGORIES: ReadonlySet<HubApprovalPendingItem["operatio
   new Set(["identity_rotate", "sanctuary_export_identity_bundle"]);
 
 /**
+ * Display bound on `hold_reason`, in UTF-16 code units. The gate's fixed reason
+ * templates are all under 200 characters; the rest is room for the identifier
+ * some of them quote (a namespace name or a counterparty DID), whose length the
+ * gate does not bound. 512 keeps one card, and the capped decided history that
+ * retains cards, at a known size whatever the held call named.
+ */
+export const HOLD_REASON_MAX_CHARS = 512;
+const HOLD_REASON_TRUNCATION_MARK = " (truncated)";
+
+function boundedHoldReason(reason: string): string {
+  if (reason.length <= HOLD_REASON_MAX_CHARS) return reason;
+  return (
+    reason.slice(0, HOLD_REASON_MAX_CHARS - HOLD_REASON_TRUNCATION_MARK.length) +
+    HOLD_REASON_TRUNCATION_MARK
+  );
+}
+
+/**
  * Project one live Charter hold into an inbox card.
  *
- * The card carries NO argument detail. `HubDisplayTemplateArg` is a closed
- * typed union with no free-text member precisely so a backend cannot smuggle
- * raw tool arguments into operator copy, and a Charter hold's context is raw
- * tool arguments. The card therefore says which tier is waiting, on which
- * identity, and (when the gate stamped it) which configured agent asked; it
- * names no target. `GET /api/pending` remains the surface that carries the
- * redacted argument summary.
+ * The card carries NO argument detail in its template arguments.
+ * `HubDisplayTemplateArg` is a closed typed union with no free-text member
+ * precisely so a backend cannot smuggle raw tool arguments into operator copy,
+ * and a Charter hold's context is raw tool arguments. The card therefore says
+ * which tier is waiting, which operation is held, on which identity, and (when
+ * the gate stamped it) which configured agent asked; it names no target. The
+ * gate's own reason rides beside the template as `hold_reason`, never inside
+ * it. `GET /api/pending` remains the surface that carries the redacted
+ * argument summary.
  */
 export function projectCharterApproval(
   record: CharterApprovalRecord,
@@ -201,9 +228,23 @@ export function projectCharterApproval(
   // key for <agent_id>"). A Charter card has no verified target, so its sentence
   // gets none. `identity_id` stays the hub identity because the inbox scopes by it.
   const agentId = record.requesting_agent_id;
+  // The operation name is the gate's own `operation` (the tool it classified),
+  // not an argument of the call, so the catch-all `.other` sentence and the
+  // console's Operation column can name what is held instead of "other".
   const displayArgs: HubDisplayTemplateArg[] = [
     { kind: "identity_id", value: identityId },
+    { kind: "operation", value: record.operation },
   ];
+  // Must-never #7 bounds what the AGENT learns from a denial: the gate returns
+  // it a generic reason. This card is OPERATOR copy, served only to
+  // operator-authenticated reads (a loopback-position read drops every approval
+  // item), so it carries the gate's reason verbatim and nothing beyond it: the
+  // same string the gate already sends the operator on `GET /api/pending` and
+  // writes to its decision audit row, with no policy rule or tier logic added.
+  const holdReason =
+    typeof record.reason === "string" && record.reason.length > 0
+      ? boundedHoldReason(record.reason)
+      : undefined;
   return {
     version: "1.1",
     item_id: charterApprovalItemId(record.id),
@@ -219,5 +260,6 @@ export function projectCharterApproval(
     resolved: false,
     tier,
     operation_category: category,
+    ...(holdReason ? { hold_reason: holdReason } : {}),
   };
 }

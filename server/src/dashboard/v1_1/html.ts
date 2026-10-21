@@ -1875,6 +1875,12 @@ body {
   font-size: var(--text-sm);
 }
 .approval-table td:first-child, .approval-table td:nth-child(5), .approval-table .btn { white-space: nowrap; }
+/* Beside the drawer at 1440 the queue column is about 698px (1440 less the 742px named below), and a served
+   agent id, operation name or gate reason has no space to break at, so their min-content alone pushed the
+   Decision column out of the scroll box ("Allow or", "DECID"). These cells may break anywhere and the decided
+   time may wrap; the Decision column keeps its widest nowrap button as its minimum, so every column fits. */
+.approval-table td:nth-child(2), .approval-table td:nth-child(3), .approval-table td:nth-child(4) { overflow-wrap: anywhere; }
+.approval-table td.decided-at { white-space: normal; }
 .approval-table th {
   text-align: left; color: var(--ink-3); font-family: var(--mono);
   font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;

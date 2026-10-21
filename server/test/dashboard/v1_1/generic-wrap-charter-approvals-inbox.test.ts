@@ -758,6 +758,8 @@ interface AttributedCard {
   display_template_id: string;
   display_template_args: HubDisplayTemplateArg[];
   operation_category?: string;
+  hold_reason?: string;
+  decision?: string;
 }
 
 async function inboxCards(rig: Rig): Promise<AttributedCard[]> {
@@ -803,10 +805,14 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     // The template's agent_id slot means the TARGET; the requester never fills it.
     expect(card!.display_template_args).toEqual([
       { kind: "identity_id", value: IDENTITY_ID },
+      { kind: "operation", value: "state_export" },
     ]);
+    // With no verified target the sentence is target-neutral, never a placeholder.
     expect(
       renderTemplate(card!.display_template_id, card!.display_template_args),
-    ).toBe("Export agent (unknown) state as a portable bundle.");
+    ).toBe("Export state from this fortress as a portable bundle.");
+    // The gate's own Tier 1 reason rides on the card for the operator.
+    expect(card!.hold_reason).toBe('"state_export" is a Tier 1 operation (always requires approval)');
 
     expect((await postInboxAction(rig, card!.item_id, "deny")).status).toBe(200);
     expect((await evaluation).allowed).toBe(false);
@@ -854,10 +860,15 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     expect(card!.agent_id).toBeUndefined();
     expect(card!.display_template_args).toEqual([
       { kind: "identity_id", value: IDENTITY_ID },
+      { kind: "operation", value: "state_export" },
     ]);
 
     expect((await postInboxAction(rig, card!.item_id, "deny")).status).toBe(200);
     expect((await held).decision).toBe("deny");
+    // A caller-built reason is still only the queue's reason field, carried as-is.
+    const [decided] = (await inboxCards(rig)).filter((i) => i.item_id === card!.item_id);
+    expect(decided!.decision).toBe("deny");
+    expect(decided!.hold_reason).toBe("context carries an agent id the gate never stamped");
   });
 
   it("audits a Tier 2 hold decided over the hub route and keeps the decided card listed, never as open", async () => {
@@ -873,6 +884,20 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     const [card] = (await inboxCards(rig)).filter((i) => !i.resolved);
     expect(card!.tier).toBe("tier2");
     expect(card!.agent_id).toBe(REQUESTING_AGENT_ID);
+    // The card names the held operation and carries the gate's own reason,
+    // which is what the operator reads as "Why it is held".
+    expect(card!.display_template_id).toBe("approval_pending.tier2.other");
+    expect(
+      renderTemplate(card!.display_template_id, card!.display_template_args),
+    ).toBe("Run a Tier 2 operation: state_write.");
+    expect(card!.hold_reason).toBe(
+      'First access to namespace "customer-notes" (not in session baseline)',
+    );
+    // The reason is the gate's: the same string GET /api/pending serves.
+    const { body: pendingBody } = await getJson(rig, "/api/pending");
+    expect(JSON.stringify(pendingBody)).toContain(
+      JSON.stringify(card!.hold_reason).slice(1, -1),
+    );
 
     expect((await postInboxAction(rig, card!.item_id, "approve")).status).toBe(200);
     const result = await evaluation;
@@ -895,6 +920,8 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     expect(decided[0]!.resolved).toBe(true);
     expect(typeof decided[0]!.resolved_at).toBe("string");
     expect(decided[0]!.agent_id).toBe(REQUESTING_AGENT_ID);
+    // The decided card says which decision the hub delivered.
+    expect(decided[0]!.decision).toBe("approve");
     expect(await waitForUnresolvedApprovals(rig, 1, 0)).toHaveLength(0);
     // Open projections (Overview, concierge) never see decided history.
     expect(

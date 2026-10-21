@@ -37,7 +37,19 @@ function extractClientTemplateIds(): string[] {
   return Object.keys(extractClientTemplates()).sort();
 }
 
-function extractClientArg(): (args: Array<{ kind: string; value: unknown }>, kind: string, fallback?: string) => string {
+type ClientArgHelpers = {
+  arg: (args: Array<{ kind: string; value: unknown }>, kind: string, fallback?: string) => string;
+  hasArgValue: (args: unknown, kind: string) => boolean;
+  agentOr: (args: unknown, neutral: string) => string;
+  heldOperationSentence: (args: unknown, tier: string) => string;
+};
+
+/**
+ * The client's template helpers (`arg` and the helpers declared after it, up to
+ * the TEMPLATES map), sliced from the embedded script and evaluated together so
+ * the mirrored templates call the client's own code.
+ */
+function extractClientHelpers(): ClientArgHelpers {
   const script = getClientScript();
   const marker = "function arg(args, kind, fallback) {";
   const start = script.indexOf(marker);
@@ -50,11 +62,26 @@ function extractClientArg(): (args: Array<{ kind: string; value: unknown }>, kin
     throw new Error("client arg helper close brace not found");
   }
   const fnText = script.slice(start, end + 2);
-  return new Function(`"use strict"; ${fnText}; return arg;`)() as (
-    args: Array<{ kind: string; value: unknown }>,
-    kind: string,
-    fallback?: string,
-  ) => string;
+  return new Function(
+    `"use strict"; ${fnText}; return { arg, hasArgValue, agentOr, heldOperationSentence };`,
+  )() as ClientArgHelpers;
+}
+
+/** One top-level `function <name>(...) {...}` from the embedded client script. */
+function extractClientFunction(name: string): string {
+  const script = getClientScript();
+  const start = script.indexOf(`\nfunction ${name}(`);
+  if (start === -1) throw new Error(`client function ${name} not found in embedded script`);
+  const end = script.indexOf("\n}\n", start + 1);
+  if (end === -1) throw new Error(`client function ${name} close brace not found`);
+  return script.slice(start + 1, end + 2);
+}
+
+/** The console's Operation label for a card (client approvalOperation), run from the embedded script. */
+function extractClientApprovalOperation(): (item: unknown) => string {
+  return new Function(
+    `"use strict"; ${extractClientFunction("approvalArg")}\n${extractClientFunction("approvalOperation")}\nreturn approvalOperation;`,
+  )() as (item: unknown) => string;
 }
 
 function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
@@ -72,10 +99,17 @@ function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
   // between the marker and the close brace is the literal's body.
   const objectLiteral =
     "{" + script.slice(start + marker.length, end) + "\n}";
+  const helpers = extractClientHelpers();
   const evaluated = new Function(
     "arg",
+    "hasArgValue",
+    "agentOr",
+    "heldOperationSentence",
     `"use strict"; return (${objectLiteral});`,
-  )(extractClientArg()) as Record<string, (args: unknown[]) => string>;
+  )(helpers.arg, helpers.hasArgValue, helpers.agentOr, helpers.heldOperationSentence) as Record<
+    string,
+    (args: unknown[]) => string
+  >;
   if (Object.keys(evaluated).length === 0) {
     throw new Error("client TEMPLATES map evaluated to an empty object");
   }
@@ -328,15 +362,42 @@ it("anchors the approved pending-removal sentence", () => {
 
 // A configured requester with a distinctive id, so any sentence that names it is caught.
 const CHARTER_REQUESTER = "agent:claude-code:fortress-requester-a";
-// The catalog's neutral fallback for a missing target, shared by server and client arg().
-const UNKNOWN_TARGET = "(unknown)";
+// Placeholders an audience reads as a bug; no approval card may carry one.
+const CARD_PLACEHOLDERS = ["(unknown)", "(no agent)"];
+// An operation with no category of its own, which the bridge files as "other": the demo's first write to a new
+// namespace is one.
+const UNCATEGORIZED_OPERATION = "state_write";
+// The gate's reason for that hold, as gate.ts writes it.
+const GATE_NAMESPACE_REASON = 'First access to namespace "customer-notes" (not in session baseline)';
 
-it("renders every Charter card category without naming the requester or a defaulted target, on server and client", () => {
-  // Full-set (AGENTS.md rule 5): every category the bridge can emit is projected
-  // and rendered by both catalogs, so a category added later whose sentence
-  // defaults its target cannot slip past TARGET_DEFAULTING_CATEGORIES.
+/**
+ * The exact sentence every Charter card renders, by operation, for Tier 1. A
+ * card whose catalog sentence would default its target (TARGET_DEFAULTING_CATEGORIES
+ * in server/src/hub/charter-approval-bridge.ts) and an uncategorized operation
+ * use the catch-all, which names the operation and no target. Pinned whole so a
+ * new or reworded sentence is read before it ships.
+ */
+const TIER1_CHARTER_SENTENCES: Record<string, string> = {
+  state_export: "Export state from this fortress as a portable bundle.",
+  state_import: "Import state into this fortress.",
+  state_delete: "Delete stored state from this fortress. This is irreversible.",
+  identity_rotate: "Run a Tier 1 operation: identity_rotate.",
+  reputation_export: "Export a reputation bundle from this fortress.",
+  reputation_import: "Import a reputation bundle into this fortress.",
+  sanctuary_export_identity_bundle: "Run a Tier 1 operation: sanctuary_export_identity_bundle.",
+  [UNCATEGORIZED_OPERATION]: `Run a Tier 1 operation: ${UNCATEGORIZED_OPERATION}.`,
+};
+
+it("renders every Charter card category at both tiers without a placeholder, the requester, or \"other\" as its operation, on server and client", () => {
+  // Full-set (AGENTS.md rule 5): every category the bridge can emit, plus the
+  // catch-all, is projected and rendered by both catalogs and labelled by the
+  // console's own approvalOperation, so a later category whose sentence falls
+  // back to a placeholder or a defaulted target cannot slip through.
   const clientTemplates = extractClientTemplates();
-  for (const operation of OPERATION_NAME_CATEGORIES) {
+  const clientOperation = extractClientApprovalOperation();
+  const operations = [...OPERATION_NAME_CATEGORIES, UNCATEGORIZED_OPERATION];
+  expect(Object.keys(TIER1_CHARTER_SENTENCES).sort()).toEqual([...operations].sort());
+  for (const operation of operations) {
     for (const tier of [1, 2] as const) {
       const card = projectCharterApproval(
         {
@@ -345,25 +406,44 @@ it("renders every Charter card category without naming the requester or a defaul
           tier,
           created_at: "2026-10-21T00:00:00.000Z",
           requesting_agent_id: CHARTER_REQUESTER,
+          reason: GATE_NAMESPACE_REASON,
         },
         "operator-identity",
       );
-      expect(card.agent_id, operation).toBe(CHARTER_REQUESTER);
-      expect(card.display_template_args.some((a) => a.kind === "agent_id"), operation).toBe(false);
+      const label = `${operation} tier ${tier}`;
+      expect(card.agent_id, label).toBe(CHARTER_REQUESTER);
+      expect(card.display_template_args.some((a) => a.kind === "agent_id"), label).toBe(false);
+      // The gate's reason rides on the card verbatim.
+      expect(card.hold_reason, label).toBe(GATE_NAMESPACE_REASON);
+      // The console names the held operation, never the catch-all category.
+      expect(clientOperation(card), label).toBe(operation);
       const client = clientTemplates[card.display_template_id];
       expect(client, `${card.display_template_id} has a client mirror`).toBeDefined();
+      const expected =
+        tier === 1 ? TIER1_CHARTER_SENTENCES[operation] : `Run a Tier 2 operation: ${operation}.`;
       for (const sentence of [
         renderTemplate(card.display_template_id, card.display_template_args),
         client!(card.display_template_args),
       ]) {
-        expect(sentence, operation).not.toContain(CHARTER_REQUESTER);
-        expect(sentence.startsWith("[unrecognized template"), operation).toBe(false);
-        // Either the sentence leaves the target unknown, or the card uses the
-        // tier's catch-all, whose sentence names no target.
-        const neutral =
-          sentence.includes(UNKNOWN_TARGET) || card.display_template_id.endsWith(".other");
-        expect(neutral, `${operation} tier ${tier}: ${sentence}`).toBe(true);
+        expect(sentence, label).toBe(expected);
+        expect(sentence, label).not.toContain(CHARTER_REQUESTER);
+        for (const placeholder of CARD_PLACEHOLDERS) expect(sentence, label).not.toContain(placeholder);
+        expect(sentence, label).not.toMatch(/\bother\b/);
       }
+    }
+  }
+});
+
+it("renders every approval_pending sentence without a placeholder when the card names no target, on server and client", () => {
+  // Full-set over the catalog, not only the categories the bridge emits today: a
+  // hub-enqueued card with a missing target must read as plain copy too.
+  const clientTemplates = extractClientTemplates();
+  const ids = listRegisteredTemplateIds().filter((id) => id.startsWith("approval_pending."));
+  expect(ids.length).toBeGreaterThan(0);
+  for (const id of ids) {
+    for (const sentence of [renderTemplate(id, []), clientTemplates[id]!([])]) {
+      for (const placeholder of CARD_PLACEHOLDERS) expect(sentence, id).not.toContain(placeholder);
+      expect(sentence.startsWith("["), id).toBe(false);
     }
   }
 });

@@ -45,7 +45,15 @@ export type HubDisplayTemplateArg =
   | { kind: "tier"; value: "tier1" | "tier2" | "tier3" }
   | { kind: "count"; value: number }
   | { kind: "iso8601"; value: string }
-  | { kind: "duration_ms"; value: number };
+  | { kind: "duration_ms"; value: number }
+  /**
+   * The held call's operation name (the tool the gate classified, e.g.
+   * `state_write`), never a tool argument. Written only by
+   * `projectCharterApproval` in server/src/hub/charter-approval-bridge.ts from
+   * the gate's `ApprovalRequest.operation`, so an `approval_pending.*.other`
+   * card can say which operation is held instead of the catch-all category.
+   */
+  | { kind: "operation"; value: string };
 
 /**
  * Common header on every v1.1 hub inbox item.
@@ -156,6 +164,30 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     residual_allow_count?: number;
     reload_confirmed?: boolean;
   };
+  /**
+   * The approval gate's own reason for holding this call, verbatim
+   * (`ApprovalRequest.reason`, e.g. `First access to namespace "customer-notes"
+   * (not in session baseline)`). Set only on projected Charter holds, by
+   * `projectCharterApproval` in server/src/hub/charter-approval-bridge.ts.
+   *
+   * Deliberate, bounded exception to the safe-metadata invariant above: the
+   * gate's reason can quote an identifier from the held call (a namespace
+   * name, a counterparty DID, a proxy tool name) but never a stored value. It
+   * is the same string `GET /api/pending` already serves to the operator, it is
+   * capped at HOLD_REASON_MAX_CHARS, and it reaches only operator-authenticated
+   * reads: a loopback-position read drops every approval item
+   * (`redactApprovalPendingItemsForPositionOnly`). It is OPERATOR copy; the
+   * agent whose call was held still receives only the gate's generic denial
+   * (AGENTS.md must-never #7).
+   */
+  hold_reason?: string;
+  /**
+   * The operator decision the hub delivered for a decided Charter card, set
+   * only by `HubService.resolveInboxItem` after the approval queue accepted that
+   * decision. Absent on open cards and on cards decided anywhere else; the
+   * gate's `gate_approve:*` / `gate_deny:*` audit row remains the record.
+   */
+  decision?: "approve" | "deny";
 }
 
 /**

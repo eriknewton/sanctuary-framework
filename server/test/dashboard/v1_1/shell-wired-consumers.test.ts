@@ -2188,6 +2188,42 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(h.el.main!.innerHTML).toMatch(/<tr class="sel"[^>]*data-evidence-row="1"/);
   });
 
+  it("labels gate decisions by the decider the entry records, and never an operator deny as a system failure", async () => {
+    // Shaped as ApprovalGate writes them: identity_id "system", result "failure" for every deny, and the decider in
+    // details.decided_by (absent on an invalid approval proof).
+    const gateEntry = (minute: number, operation: string, result: string, details: Record<string, unknown>) => ({
+      timestamp: `2026-10-14T16:${minute}:00.000Z`, layer: "l2", identity_id: "system", operation, result, details,
+    });
+    const h = await bootEvidence(evidencePayload({
+      entries: [
+        gateEntry(51, "gate_deny:state_export", "failure", { tier: 1, approval_proof: "invalid" }),
+        gateEntry(52, "gate_deny:memory_insert", "failure", { tier: 2, decided_by: "channel_failure" }),
+        gateEntry(53, "gate_deny:state_delete", "failure", { tier: 1, decided_by: "timeout" }),
+        gateEntry(54, "gate_approve:state_export", "success", { tier: 1, decided_by: "human" }),
+        gateEntry(55, "gate_deny:state_write", "failure", { tier: 2, decided_by: "human", reason: "First access" }),
+      ],
+      total: 5,
+    }));
+    const table = h.el.main!.innerHTML.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    const row = (operation: string) => table.split("<tr").find((r) => r.includes(`>${operation}<`))!;
+    expect(row("gate_deny:state_write")).toContain('<span class="state-chip neutral"><i aria-hidden="true"></i>Denied (operator decision)</span>');
+    expect(row("gate_deny:state_write")).toContain('<span class="row">operator</span>');
+    expect(row("gate_approve:state_export")).toContain("Approved (operator decision)");
+    expect(row("gate_approve:state_export")).toContain('<span class="row">operator</span>');
+    // A decider other than a person is named as the entry records it, and no person is credited.
+    expect(row("gate_deny:state_delete")).toContain('<span class="state-chip warn"><i aria-hidden="true"></i>Denied (timed out)</span>');
+    expect(row("gate_deny:memory_insert")).toContain('<span class="state-chip bad"><i aria-hidden="true"></i>Denied (approval channel failed)</span>');
+    expect(row("gate_deny:state_export")).toContain("Denied (decider not recorded)");
+    for (const op of ["gate_deny:state_delete", "gate_deny:memory_insert", "gate_deny:state_export"]) {
+      expect(row(op), op).toContain('<span class="row">system</span>');
+    }
+    expect(table).not.toContain("Failure");
+    // The newest entry, the operator's deny, opens in the record pane with its decider.
+    const pane = h.el.main!.innerHTML.split('<aside class="panel evidence-detail"')[1]!;
+    expect(pane).toContain("<dt>Decided by</dt><dd>operator (recorded as decided_by: human)</dd>");
+    expect(pane).toContain("Denied (operator decision)");
+  });
+
   it("distinguishes a server filter with no match from an empty log", async () => {
     const h = await bootEvidence(evidencePayload({ entries: [], total: 17 }));
     h.navigate("activity?result=failure"); await settle();
@@ -3593,6 +3629,68 @@ describe("Approvals round-one decision and evidence states", () => {
   };
   const inbox = (items: unknown[]) => () => Promise.resolve(response({ data: { items } }));
   const pageOthers = (count: number) => Array.from({ length: count }, (_, index) => ({ ...heldItem, kind: "blocked_egress", item_id: `other-${index}` }));
+
+  // A Charter hold as the hub serves it for a first write to a new namespace (projectCharterApproval).
+  const gateReason = 'First access to namespace "customer-notes" (not in session baseline)';
+  const charterHold = {
+    item_id: "charter.approval.hold-2", kind: "approval_pending", tier: "tier2", agent_id: "agent:cursor:fixture",
+    display_template_id: "approval_pending.tier2.other",
+    display_template_args: [{ kind: "identity_id", value: "operator-fixture" }, { kind: "operation", value: "state_write" }],
+    resolved: false, created_at: "2026-10-14T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "other",
+    hold_reason: gateReason,
+  };
+  const escaped = (text: string) => text.replace(/"/g, "&quot;");
+
+  it("a Charter card names its held operation and shows the gate's own reason as why it is held", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([charterHold]) });
+    await settle();
+    h.navigate("approvals");
+    const queue = h.el.main!.innerHTML.split("<aside")[0]!;
+    const row = queue.split('data-approval-row="charter.approval.hold-2"')[1]!.split("</tr>")[0]!;
+    expect(row).toContain('<td class="mono">state_write</td>');
+    expect(row).toContain(`<td>${escaped(gateReason)}</td>`);
+    const pane = drawer(h);
+    expect(pane).toContain('<div class="mono">state_write</div>');
+    expect(pane).toContain("<h4>What it wants to do</h4><p>Run a Tier 2 operation: state_write.</p>");
+    expect(pane).toContain(`<h4>Why it is held</h4><p>${escaped(gateReason)}</p>`);
+    for (const html of [row, pane]) {
+      expect(html).not.toMatch(/Held for your decision|\(no agent\)|\(unknown\)|>other</);
+    }
+  });
+
+  it("a hold reason on an item outside the Charter namespace is never shown as the gate's reason", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, item_id: "task.review.1", hold_reason: "not from the gate" }]) });
+    await settle();
+    h.navigate("approvals");
+    expect(drawer(h)).toContain("<h4>Why it is held</h4><p>Held for your decision (state_write, Tier 2).</p>");
+    expect(h.el.main!.innerHTML).not.toContain("not from the gate");
+  });
+
+  it("decided rows say whether each hold was allowed or denied, and only from the served decision", async () => {
+    vi.useFakeTimers();
+    const decided = (id: string, decision?: string) => ({
+      ...charterHold, item_id: `charter.approval.${id}`, resolved: true, resolved_at: "2026-10-14T16:50:00.000Z",
+      ...(decision ? { decision } : {}),
+    });
+    const h = boot({ "/api/hub/inbox": inbox([decided("allowed", "approve"), decided("denied", "deny"), decided("unknown")]) });
+    await settle();
+    h.navigate("approvals");
+    const queue = h.el.main!.innerHTML.split("<aside")[0]!;
+    const row = (id: string) => queue.split(`data-approval-row="charter.approval.${id}"`)[1]!.split("</tr>")[0]!;
+    expect(row("allowed")).toContain('data-approval-decision="allowed"><i aria-hidden="true"></i>ALLOWED</span>');
+    expect(row("denied")).toContain('data-approval-decision="denied"><i aria-hidden="true"></i>DENIED</span>');
+    expect(row("unknown")).toContain('data-approval-decision="decided"><i aria-hidden="true"></i>DECIDED</span>');
+    h.click({ "data-action": "approval-select", "data-item-id": "charter.approval.denied" });
+    expect(drawer(h)).toContain('<i aria-hidden="true"></i>DENIED</span>');
+    h.navigate("activity");
+    await settle();
+    const evidence = h.el.main!.innerHTML;
+    expect(evidence).toMatch(/data-decided-approval="charter\.approval\.allowed"[\s\S]*?Allowed<\/span>/);
+    expect(evidence).toMatch(/data-decided-approval="charter\.approval\.denied"[\s\S]*?Denied<\/span>/);
+    expect(evidence).toMatch(/data-decided-approval="charter\.approval\.unknown"[\s\S]*?Resolved<\/span>/);
+  });
 
   it("a full page without holds earns no empty claim on the queue, drawer or fortress", async () => {
     vi.useFakeTimers();
