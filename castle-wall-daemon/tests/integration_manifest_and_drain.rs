@@ -37,6 +37,7 @@ use castle_wall_daemon::manifest::verify::{
     AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+use castle_wall_daemon::policy::OPERATION_VERDICT_SUPERSEDED;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -1139,7 +1140,8 @@ fn wal_operations(wal: &mut WalWriter) -> Vec<(u64, String)> {
     let rows = wal.snapshot_after(None, SNAPSHOT_ROW_LIMIT).unwrap();
     assert!(
         rows.len() < SNAPSHOT_ROW_LIMIT,
-        "fixture WAL snapshot reached its cap"
+        "fixture WAL snapshot reached its cap: limit {SNAPSHOT_ROW_LIMIT}, row count {}",
+        rows.len()
     );
     rows.iter()
         .map(|row| {
@@ -1154,16 +1156,41 @@ fn wal_operations(wal: &mut WalWriter) -> Vec<(u64, String)> {
 }
 
 fn egress_row_count(operations: &[(u64, String)]) -> usize {
-    // policy.rs emits egress_approved, egress_pending, and egress_blocked;
-    // retain superseding egress evidence too, regardless of the attributed identity.
+    // Retain all egress evidence, including superseding rows, regardless of identity.
     operations
         .iter()
         .filter(|(_, operation)| operation.starts_with("egress_"))
         .count()
 }
 
+const EXPECTED_RELOAD_CONTROL_OPERATIONS: &[&str] = &[
+    // src/ipc/server.rs: handle_policy_reload authorizes before replying ok:true.
+    "ipc_policy_reload_authorized",
+    // src/runtime_providers.rs: handle_manifest_watcher_event authorizes a reload.
+    "manifest_watcher_reload_authorized",
+    // src/runtime_providers.rs: reload_manifest_from_watcher audits verification
+    // failure after releasing the reload lock. A read during write_signed_manifest
+    // can fail transiently and its audit can arrive after the baseline.
+    "manifest_verify_failed_kept_prior",
+];
+
+fn assert_only_reload_control_rows_after(operations: &[(u64, String)], baseline_seq: u64) {
+    for (seq, operation) in operations.iter().filter(|(seq, _)| *seq > baseline_seq) {
+        // Only expected reload control evidence may extend the WAL after admission.
+        assert!(
+            EXPECTED_RELOAD_CONTROL_OPERATIONS.contains(&operation.as_str()),
+            "unexpected operation {operation} at sequence {seq} after baseline sequence {baseline_seq}"
+        );
+    }
+}
+
 #[test]
 fn egress_row_count_detects_appended_egress_records() {
+    const EMPTY_EGRESS_COUNT: usize = 0; // The baseline contains only a control row.
+    const APPENDED_EGRESS_ROWS: usize = 1; // Each iteration appends one row.
+    const UNADMITTED_IDENTITY: &str = "unadmitted/agent-x";
+    // These verdict names must match `operation_for_verdict` in `src/policy.rs`.
+    const VERDICT_OPERATIONS: &[&str] = &["egress_approved", "egress_pending", "egress_blocked"];
     let dir = TempDir::new().expect("tempdir");
     let mut wal = WalWriter::open(&dir.path().join("filter-events.wal")).unwrap();
     wal.append_control_critical(r#"{"operation":"ipc_policy_reload_authorized"}"#)
@@ -1171,29 +1198,68 @@ fn egress_row_count_detects_appended_egress_records() {
     let baseline = wal_operations(&mut wal);
     assert_eq!(
         egress_row_count(&baseline),
-        0, // Only a control record has been appended.
+        EMPTY_EGRESS_COUNT,
         "rows: {baseline:?}"
     );
-    for operation in [
-        "egress_approved",
-        "egress_pending",
-        "egress_blocked",
-        "egress_verdict_superseded",
-    ] {
+    for operation in VERDICT_OPERATIONS
+        .iter()
+        .copied()
+        .chain(std::iter::once(OPERATION_VERDICT_SUPERSEDED))
+    {
         let before = wal_operations(&mut wal);
         // A rejected identity must remain visible to the count, even for a non-allow row.
         let event = serde_json::json!({
             "operation": operation,
-            "identity_id": "unadmitted/agent-x",
+            "identity_id": UNADMITTED_IDENTITY,
         });
         let seq = wal.append_critical(&event.to_string()).unwrap();
+        let appended_rows = wal.snapshot_after(None, usize::MAX).unwrap();
+        let appended = appended_rows.iter().find(|row| row.seq == seq).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_str(&appended.event_canonical_json).unwrap();
+        assert_eq!(persisted["identity_id"], UNADMITTED_IDENTITY);
         let after = wal_operations(&mut wal);
-        assert_ne!(
+        assert_eq!(
             egress_row_count(&after),
-            egress_row_count(&before),
-            "unchanged-count predicate must reject appended seq {seq}, operation {operation}; rows: {after:?}"
+            egress_row_count(&before) + APPENDED_EGRESS_ROWS,
+            "count must increase by one for appended seq {seq}, operation {operation}; rows: {after:?}"
         );
     }
+}
+
+#[test]
+fn egress_row_count_allows_only_expected_reload_control_rows_after_baseline() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut wal = WalWriter::open(&dir.path().join("filter-events.wal")).unwrap();
+    let baseline_seq = wal
+        .append_critical(
+            &serde_json::json!({"operation": OPERATION_VERDICT_SUPERSEDED}).to_string(),
+        )
+        .unwrap();
+    let baseline_count = egress_row_count(&wal_operations(&mut wal));
+    for operation in EXPECTED_RELOAD_CONTROL_OPERATIONS {
+        wal.append_control_critical(&serde_json::json!({"operation": operation}).to_string())
+            .unwrap();
+        let rows = wal_operations(&mut wal);
+        assert_only_reload_control_rows_after(&rows, baseline_seq);
+        assert_eq!(egress_row_count(&rows), baseline_count);
+    }
+}
+
+#[test]
+#[should_panic(expected = "unexpected operation unattributed_attempt at sequence")]
+fn egress_row_count_rejects_unexpected_non_egress_row_after_baseline() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut wal = WalWriter::open(&dir.path().join("filter-events.wal")).unwrap();
+    let baseline_seq = wal
+        .append_control_critical(r#"{"operation":"ipc_policy_reload_authorized"}"#)
+        .unwrap();
+    let baseline_count = egress_row_count(&wal_operations(&mut wal));
+    wal.append_critical(r#"{"operation":"unattributed_attempt"}"#)
+        .unwrap();
+    let rows = wal_operations(&mut wal);
+    assert_eq!(egress_row_count(&rows), baseline_count);
+    assert_only_reload_control_rows_after(&rows, baseline_seq);
 }
 
 #[test]
@@ -1258,7 +1324,11 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         rows_after_admitted, ADMITTED_EGRESS_ROWS,
         "the admitted callback must append one egress row; rows: {baseline:?}"
     );
-    let baseline_seq = baseline.last().expect("admitted row").0;
+    let baseline_seq = baseline
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max()
+        .expect("baseline WAL snapshot must contain the admitted egress row");
     let extra_rows = |rows: &[(u64, String)]| {
         rows.iter()
             .filter(|(seq, _)| *seq > baseline_seq)
@@ -1289,6 +1359,8 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         other => panic!("authorized unchanged-manifest reload failed: {other:?}"),
     }
     let after_reload = wal_operations(&mut wal.lock().unwrap());
+    assert_only_reload_control_rows_after(&after_reload, baseline_seq);
+    assert_eq!(egress_row_count(&after_reload), rows_after_admitted);
     let reload_rows = extra_rows(&after_reload);
     assert!(
         reload_rows
@@ -1310,6 +1382,7 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
     ] {
         assert_eq!(callback(&packet_for_mark(mark)), NfVerdict::Drop);
         let rows = wal_operations(&mut wal.lock().unwrap());
+        assert_only_reload_control_rows_after(&rows, baseline_seq);
         assert_eq!(
             egress_row_count(&rows),
             rows_after_admitted,
@@ -1318,6 +1391,7 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         );
     }
     let rows = wal_operations(&mut wal.lock().unwrap());
+    assert_only_reload_control_rows_after(&rows, baseline_seq);
     assert_eq!(
         egress_row_count(&rows),
         rows_after_admitted,

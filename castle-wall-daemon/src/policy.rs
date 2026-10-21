@@ -1384,6 +1384,8 @@ fn reject_identity_collision<'a>(
 
 /// Operation tag that maps to the existing Sanctuary `AuditEntry.operation`
 /// enum per scope-lock §8.
+// Verdict names must match `VERDICT_OPERATIONS` in
+// `tests/integration_manifest_and_drain.rs` (egress_row_count_detects_appended_egress_records).
 fn operation_for_verdict(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Allow { .. } => "egress_approved",
