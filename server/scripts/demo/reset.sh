@@ -40,6 +40,20 @@ stop_polls=40
 ready_polls=120
 poll_interval_s=0.25
 
+# The demo root is recorded and parsed one line at a time, so a temp parent
+# containing a line break would be recorded truncated: the next reset would
+# miss the live demo's pid file, or forget a crashed demo's root. Refuse first.
+# Node's tmpdir() reads TMPDIR, then TMP, then TEMP.
+for temp_var in TMPDIR TMP TEMP; do
+  temp_value=${!temp_var:-}
+  case "$temp_value" in
+    *$'\n'* | *$'\r'*)
+      echo "Refusing to start: $temp_var contains a line break, so the demo root could not be recorded. Unset it or choose a path without one." >&2
+      exit 1
+      ;;
+  esac
+done
+
 umask 077
 mkdir -p "$state_dir"
 chmod 700 "$state_dir"
@@ -68,6 +82,10 @@ if [ -f "$instance_file" ]; then
     # Ownership is the launch identity, not a name: the same pid AND the same
     # start time AND the root's own pid file. A substring of the command line
     # would also match an editor or another seeder that reused the pid.
+    # Bounded residual: ps lstart has one-second resolution, so after a crash
+    # that leaves the root and its demo.pid behind, a process of the same user
+    # that reuses the pid within the same second as the recorded launch passes
+    # all three checks. Accepted for a single-operator demo tool.
     live_lstart=$(ps -o lstart= -p "$rec_pid" 2>/dev/null | awk '{$1=$1; print}' || true)
     root_pid=""
     if [ -f "$rec_root/$pid_basename" ]; then
@@ -115,14 +133,18 @@ fi
     --port "$port" --token-file "$token_file"
 ) > "$log_file" 2>&1 < /dev/null &
 demo_pid=$!
+# Captured at once, so any later signal to this pid can prove it is still this launch.
+launch_lstart=$(ps -o lstart= -p "$demo_pid" 2>/dev/null | awk '{$1=$1; print}' || true)
 
 ready=0
+exited=0
 for _ in $(seq 1 "$ready_polls"); do
   if grep -q '^Teardown: ' "$log_file"; then
     ready=1
     break
   fi
   if ! kill -0 "$demo_pid" 2>/dev/null; then
+    exited=1
     break
   fi
   sleep "$poll_interval_s"
@@ -130,13 +152,33 @@ done
 if [ "$ready" -ne 1 ]; then
   echo "The demo did not become ready. Last lines of $log_file:" >&2
   tail -n 20 "$log_file" >&2 || true
-  kill -TERM "$demo_pid" 2>/dev/null || true
+  if [ "$exited" -eq 1 ]; then
+    # INVARIANT: a child that kill -0 already showed gone is never signalled;
+    # its pid is free and may now belong to an unrelated process.
+    echo "The demo process exited before it was ready." >&2
+  else
+    # A timed-out child is signalled only while its start time still matches
+    # the one captured at launch (same one-second residual as the stop above).
+    live_lstart=$(ps -o lstart= -p "$demo_pid" 2>/dev/null | awk '{$1=$1; print}' || true)
+    if [ -n "$launch_lstart" ] && [ "$live_lstart" = "$launch_lstart" ]; then
+      kill -TERM "$demo_pid" 2>/dev/null || true
+      echo "Stopped the demo process (pid $demo_pid) this script launched." >&2
+    else
+      echo "Refusing to stop pid $demo_pid: its start time no longer matches the demo this script launched." >&2
+      echo "If that pid is your demo, stop it with: kill -TERM $demo_pid" >&2
+    fi
+  fi
   exit 1
 fi
 
 new_root=$(sed -n 's/^Demo HOME: //p' "$log_file" | head -n 1)
 new_lstart=$(ps -o lstart= -p "$demo_pid" 2>/dev/null | awk '{$1=$1; print}' || true)
-if [ -z "$new_root" ] || [ -z "$new_lstart" ]; then
+# The recorded root must be the real one: it exists and its own pid file names this launch.
+root_pid=""
+if [ -n "$new_root" ] && [ -f "$new_root/$pid_basename" ]; then
+  root_pid=$(tr -d '[:space:]' < "$new_root/$pid_basename")
+fi
+if [ -z "$new_lstart" ] || [ "$new_lstart" != "$launch_lstart" ] || [ "$root_pid" != "$demo_pid" ]; then
   echo "The demo started but its identity could not be recorded; stop it with: kill -TERM $demo_pid" >&2
   exit 1
 fi

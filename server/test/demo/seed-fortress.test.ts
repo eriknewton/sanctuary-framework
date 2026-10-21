@@ -937,8 +937,22 @@ async function scratchDir(prefix: string): Promise<string> {
 
 interface ResetRun { code: number | null; stdout: string; stderr: string }
 
-async function runReset(env: NodeJS.ProcessEnv): Promise<ResetRun> {
-  const child = spawn("bash", ["scripts/demo/reset.sh"], { cwd: process.cwd(), env });
+// Signals a whole process group, then waits for it to empty; SIGTERM first so a seeder removes its own root.
+async function stopProcessGroup(pgid: number): Promise<void> {
+  try { process.kill(-pgid, "SIGTERM"); } catch { return; }
+  for (let attempt = 0; attempt < AUDIT_POLL_ATTEMPTS; attempt++) {
+    try { process.kill(-pgid, 0); } catch { return; }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, AUDIT_POLL_INTERVAL_MS));
+  }
+  try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ }
+}
+
+async function runReset(env: NodeJS.ProcessEnv, bashArgs: string[] = []): Promise<ResetRun> {
+  // Its own process group: the nohup'd demo inherits it, so the cleanup registered below, before
+  // anything is awaited, reaps the demo too, whether reset fails, throws, times out or succeeds.
+  const child = spawn("bash", [...bashArgs, "scripts/demo/reset.sh"], { cwd: process.cwd(), env, detached: true });
+  const pgid = child.pid!;
+  stops.push(() => stopProcessGroup(pgid));
   let stdout = "";
   let stderr = "";
   child.stdout.on("data", (chunk) => { stdout += String(chunk); });
@@ -952,7 +966,7 @@ async function runReset(env: NodeJS.ProcessEnv): Promise<ResetRun> {
       }),
       new Promise<never>((_, rejectExit) => {
         timeout = setTimeout(() => {
-          child.kill("SIGKILL");
+          void stopProcessGroup(pgid);
           rejectExit(new Error(`reset did not finish in time: ${stderr}`));
         }, RESET_TIMEOUT_MS);
       }),
@@ -1240,4 +1254,108 @@ describe("demo reset proves it launched the process before signalling it", () =>
       await cleanupOwned();
     }
   }, RESET_TIMEOUT_MS);
+});
+
+// PATH shims that stand in for the seeder, so the reset's startup arms run deterministically.
+async function startupShims(mode: "never-ready" | "never-ready-pid-reused"): Promise<{ dir: string; pidFile: string }> {
+  const dir = await scratchDir("sanctuary-demo-shim-");
+  const pidFile = join(dir, "child.pid");
+  const which = (name: string) => spawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+  const realSleep = which("sleep");
+  const realPs = which("ps");
+  // The "seeder" records its pid and stays up without ever logging readiness.
+  await writeFile(join(dir, "node"), `#!/bin/sh\necho $$ > '${pidFile}'\nexec '${realSleep}' 300\n`, { mode: 0o700 });
+  // Polls return at once, so the thirty-second ready wait elapses in well under a second.
+  await writeFile(join(dir, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  if (mode === "never-ready-pid-reused") {
+    // The first ps call (at launch) is real; later ones report another start time, as a reused pid would.
+    const count = join(dir, "ps-count");
+    await writeFile(join(dir, "ps"), `#!/bin/sh\nif [ -f '${count}' ]; then echo '${IMPOSSIBLE_LSTART}'; exit 0; fi\n: > '${count}'\nexec '${realPs}' "$@"\n`, { mode: 0o700 });
+  }
+  return { dir, pidFile };
+}
+
+async function readPid(path: string): Promise<number> {
+  return Number((await readFile(path, "utf8")).trim());
+}
+
+describe("demo reset never signals a startup child it cannot prove is its own", () => {
+  it("signals nothing when the new demo exits before it is ready", async () => {
+    const stateDir = await scratchDir("sanctuary-demo-reset-");
+    // The seeder cannot bind a held port, so it exits during startup.
+    const port = await occupyEphemeralPort();
+    const run = await runReset({
+      ...process.env,
+      HOME: await makeFakeOperatorHome(),
+      SANCTUARY_DEMO_STATE_DIR: stateDir,
+      SANCTUARY_DEMO_PORT: String(port),
+      SANCTUARY_DEMO_PASSPHRASE: PASSPHRASE,
+    }, ["-x"]);
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain("The demo process exited before it was ready.");
+    // The trace shows every command run: no signal reached the freed pid, which may now be anything.
+    expect(run.stderr).not.toMatch(/^\++ kill -TERM/m);
+    expect(await pathExists(join(stateDir, RESET_INSTANCE_FILE))).toBe(false);
+  }, RESET_TIMEOUT_MS);
+
+  it("stops a timed-out demo only while its start time still matches the launch", async () => {
+    const stateDir = await scratchDir("sanctuary-demo-reset-");
+    const shims = await startupShims("never-ready");
+    const run = await runReset({
+      ...process.env,
+      PATH: `${shims.dir}:${process.env.PATH ?? ""}`,
+      HOME: await makeFakeOperatorHome(),
+      SANCTUARY_DEMO_STATE_DIR: stateDir,
+      SANCTUARY_DEMO_PORT: String(await getFreePort()),
+    });
+    const pid = await readPid(shims.pidFile);
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain(`Stopped the demo process (pid ${pid}) this script launched.`);
+    for (let attempt = 0; attempt < AUDIT_POLL_ATTEMPTS && isAlive(pid); attempt++) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, AUDIT_POLL_INTERVAL_MS));
+    }
+    expect(isAlive(pid)).toBe(false);
+  }, RESET_TIMEOUT_MS);
+
+  it("refuses to signal a timed-out pid whose start time changed since launch", async () => {
+    const stateDir = await scratchDir("sanctuary-demo-reset-");
+    const shims = await startupShims("never-ready-pid-reused");
+    const run = await runReset({
+      ...process.env,
+      PATH: `${shims.dir}:${process.env.PATH ?? ""}`,
+      HOME: await makeFakeOperatorHome(),
+      SANCTUARY_DEMO_STATE_DIR: stateDir,
+      SANCTUARY_DEMO_PORT: String(await getFreePort()),
+    });
+    const pid = await readPid(shims.pidFile);
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain(`Refusing to stop pid ${pid}`);
+    expect(run.stderr).toContain(`kill -TERM ${pid}`);
+    // Still alive: the reset left it alone. The process-group cleanup registered by runReset reaps it.
+    expect(isAlive(pid)).toBe(true);
+  }, RESET_TIMEOUT_MS);
+});
+
+describe("demo reset refuses a temp parent it could not record", () => {
+  it.each([["TMPDIR", "\n"], ["TMP", "\r"], ["TEMP", "\n"]])(
+    "refuses to start when %s contains a line break",
+    async (name, lineBreak) => {
+      const stateDir = await scratchDir("sanctuary-demo-reset-");
+      const run = await runReset({
+        ...process.env,
+        [name]: `${tmpdir()}${lineBreak}elsewhere`,
+        HOME: await makeFakeOperatorHome(),
+        SANCTUARY_DEMO_STATE_DIR: stateDir,
+        SANCTUARY_DEMO_PORT: String(await getFreePort()),
+        SANCTUARY_DEMO_PASSPHRASE: PASSPHRASE,
+      });
+      expect(run.code).toBe(1);
+      expect(run.stderr).toContain(`Refusing to start: ${name} contains a line break`);
+      // Nothing was launched: no log was opened and no demo recorded.
+      expect(await pathExists(join(stateDir, "demo.log"))).toBe(false);
+      expect(await pathExists(join(stateDir, RESET_INSTANCE_FILE))).toBe(false);
+      expect(run.stdout).not.toContain("Demo ready.");
+    },
+    RESET_TIMEOUT_MS,
+  );
 });
