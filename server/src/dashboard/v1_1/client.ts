@@ -4620,7 +4620,7 @@ function renderOverviewFindingsPanel() {
     : shown.length
       ? '<div class="overview-list">' + shown.map(function (f) {
           const sev = severityClass(f.severity);
-          return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Anomaly detector: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
+          return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Anomaly finding") + '</div><div class="detail">Anomaly detector: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
         }).join("") + '</div>'
       : feed.state === SENTINEL_FEED.UNAVAILABLE
         ? sentinelFeedUnknownHtml()

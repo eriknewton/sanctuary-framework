@@ -422,6 +422,12 @@ describe("each findings surface names the feed it counts", () => {
     expect(overview, "the panel count says which feed it shows").toContain("showing 1 of 1 anomaly findings");
     expect(overview, "rows name the anomaly detector, not the Sentinel queue").toContain("Anomaly detector: detector-1");
     expect(overview).not.toContain("Sentinel: detector-1");
+
+    // An anomaly with nothing to title it by is still named as an anomaly, never as a Sentinel finding.
+    const bare = boot({ "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [{ severity: "high" }] } })) });
+    await settle();
+    expect(bare.el.main!.innerHTML).toContain(">Anomaly finding<");
+    expect(bare.el.main!.innerHTML).not.toContain(">Sentinel finding<");
   });
 
   it("an earned 0 open is aged by the older of its two reads, so a fresh anomaly read cannot freshen an old Sentinel zero", async () => {
