@@ -7002,68 +7002,21 @@ function decisionHeldOperation(itemId) {
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
   return item ? approvalHeldOperation(item) : null;
 }
-// A braced escape heldSubjectText writes for a code point above the four-digit range. JSON has no braced form, so
-// a run is normalized through this before JSON.parse decides whether it is one whole JSON string.
-const FEEDBACK_BRACED_ESCAPE = /^\\u\{([0-9a-f]{1,6})\}/;
-// The largest Unicode code point; a braced escape above it is not one heldSubjectText could have written.
-const LAST_UNICODE_CODE_POINT = 0x10ffff;
-// Characters that may sit just before or just after a quoted name in a console-written feedback sentence
-// (decisionSubject writes it after "for " and before " by ", a refusal reason or the sentence end).
-const FEEDBACK_RUN_BEFORE = " (";
-const FEEDBACK_RUN_AFTER = " .,:;)!?";
-// The end (exclusive) of the complete quoted run opening at start, or -1. A run counts only when JSON.parse consumes
-// all of it (after braced escapes are normalized) and it stands alone between console separators, so a quote inside
-// an unescaped name can never close one run early and open another.
-function feedbackRunEnd(raw, start) {
-  if (start > 0 && FEEDBACK_RUN_BEFORE.indexOf(raw[start - 1]) < 0) return -1;
-  let json = '"';
-  let i = start + 1;
-  while (i < raw.length) {
-    const c = raw[i];
-    if (c === '"') {
-      if (i + 1 < raw.length && FEEDBACK_RUN_AFTER.indexOf(raw[i + 1]) < 0) return -1;
-      try { return typeof JSON.parse(json + '"') === "string" ? i + 1 : -1; } catch (e) { return -1; }
-    }
-    if (c === "\\") {
-      const braced = FEEDBACK_BRACED_ESCAPE.exec(raw.slice(i));
-      if (braced) {
-        const codePoint = parseInt(braced[1], 16);
-        if (codePoint > LAST_UNICODE_CODE_POINT) return -1;
-        json += String.fromCodePoint(codePoint);
-        i += braced[0].length;
-        continue;
-      }
-      // Any other escape goes to JSON.parse as written, which rejects one JSON does not define.
-      json += raw.slice(i, i + 2);
-      i += 2;
-      continue;
-    }
-    json += c;
-    i++;
-  }
-  return -1;
-}
-// Feedback text as HTML. Invariant: a quoted name in a message (decisionSubject writes a held operation name in its
-// quoted, escaped form) is shown only as the delimited held-subject element, never as words of the message. Every
-// complete quoted run becomes that element, built from its own text with hidden characters made visible; when any
-// double quote in the message is not inside a complete run, nothing of the message is shown and the fixed console
-// sentence stands in for it, so name bytes never become prose. heldOperation is the name of the one request this
-// text is about (each batch record and each not-sent note carries its own); a run naming it renders from it.
+// Feedback text as HTML. Invariant: a feedback line shows its own text only when that text has no double quote at
+// all, or when every double quote in it belongs to an exact occurrence of heldSubjectText(name) for the name in the
+// line's own metadata (heldOperation: the single decision's, the batch record's own, or the not-sent note's), found
+// by exact string match of that known encoding; each such occurrence is shown as the delimited held-subject element.
+// Any other quote, anywhere in the line, means the text is not shown and the fixed console sentence stands in for it.
+// Allowlist, not a parser: no quoted run is ever shown as an element built from its own text, so name bytes the
+// metadata does not account for can never become prose or a misleading element.
 function renderFeedbackText(text, heldOperation, fixed) {
-  const held = typeof heldOperation === "string" && heldOperation ? heldOperation : null;
-  const heldRun = held === null ? null : heldSubjectText(held);
   const raw = String(text);
-  let html = "";
-  let last = 0;
-  for (let at = raw.indexOf('"'); at >= 0; at = raw.indexOf('"', last)) {
-    const end = feedbackRunEnd(raw, at);
-    if (end < 0) return escHtml(fixed);
-    const run = raw.slice(at, end);
-    html += escHtml(raw.slice(last, at)) + (run === heldRun ? heldSubjectHtml(held, false)
-      : '<code class="held-subject" data-held-subject="1">' + escHtml(run.replace(HELD_SUBJECT_HIDDEN_CHARS, heldSubjectEscape)) + '</code>');
-    last = end;
-  }
-  return html + escHtml(raw.slice(last));
+  if (raw.indexOf('"') < 0) return escHtml(raw);
+  const held = typeof heldOperation === "string" && heldOperation ? heldOperation : null;
+  if (held === null) return escHtml(fixed);
+  const parts = raw.split(heldSubjectText(held));
+  if (parts.length < 2 || parts.some(function (part) { return part.indexOf('"') >= 0; })) return escHtml(fixed);
+  return parts.map(escHtml).join(heldSubjectHtml(held, false));
 }
 // The fixed console sentence a feedback line falls back to when its text cannot be shown safely.
 function decisionFixedSentence(status) {

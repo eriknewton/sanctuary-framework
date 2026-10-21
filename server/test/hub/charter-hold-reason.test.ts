@@ -93,9 +93,15 @@ function gateChannelReasons(sourceText: string): { held: Set<string>; tier3Skipp
   const channelCalls: ts.CallExpression[] = [];
   const references: ts.Node[] = [];
   const reasonWrites: ts.Node[] = [];
-  const isReasonTarget = (target: ts.Expression): boolean =>
-    (ts.isPropertyAccessExpression(target) && target.name.text === "reason") ||
-    (ts.isElementAccessExpression(target) && ts.isStringLiteralLike(target.argumentExpression) && target.argumentExpression.text === "reason");
+  const isReasonTarget = (written: ts.Expression): boolean => {
+    // Parentheses do not change what is written, so `(x.reason) = ...` is the same write as `x.reason = ...`.
+    let target = written;
+    while (ts.isParenthesizedExpression(target)) target = target.expression;
+    return (
+      (ts.isPropertyAccessExpression(target) && target.name.text === "reason") ||
+      (ts.isElementAccessExpression(target) && ts.isStringLiteralLike(target.argumentExpression) && target.argumentExpression.text === "reason")
+    );
+  };
   const visit = (node: ts.Node): void => {
     if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) methods.set(node.name.text, node);
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "requestApproval") {
@@ -365,7 +371,12 @@ describe("structured hold reasons", () => {
       );
     }
     // Any assignment to a property named reason fails, whatever it assigns and however the property is named.
-    for (const write of [`classification.reason = "Rewritten later"`, `classification["reason"] += " later"`]) {
+    for (const write of [
+      `classification.reason = "Rewritten later"`,
+      `classification["reason"] += " later"`,
+      `(classification.reason) = "new reason"`,
+      `(classification["reason"]) += "new reason"`,
+    ]) {
       const rewritten = source.replace(evaluateAnchor, `${evaluateAnchor}    if (args.mutation) ${write};\n`);
       expect(() => gateChannelReasons(rewritten), write).toThrow(/reason assignment/);
     }
