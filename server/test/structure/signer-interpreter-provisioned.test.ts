@@ -24,11 +24,14 @@ const workflowsDir = join(repoRoot, ".github", "workflows");
 // interpreter" step in ci.yml, test-baseline-guard.yml and publish-on-tag.yml.
 const PROVISION_COMMAND = 'sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node';
 
-// The full suite is `npm test` or `npm run test` as a command; `npm run test:<x>`
-// targets a named subset and is not the suite.
-const SUITE_COMMAND = /(?:^|[\s;&|(])npm (?:run )?test(?=$|[\s;&|)])/;
+// The full suite is npm's `test` script however it is spelled: `npm test`, the
+// `t`/`tst` aliases, `npm run test`, `npm run-script test`, with any options
+// before it (`npm --prefix server test`). `npm run test:<x>` targets a named
+// subset and is not the suite. Over-matching only adds a job to the exact-set
+// assertion below, which then fails until the job is reviewed and listed.
+const SUITE_COMMAND = /(?:^|[\s;&|(])npm\b[^;&|#]*?\s(?:(?:run|run-script)\s+)?(?:test|tst|t)(?=$|[\s;&|)])/;
 
-type Step = { run?: unknown };
+type Step = { run?: unknown; if?: unknown };
 type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
 
 /** The executable lines of a step's run script: comment and blank lines removed. */
@@ -45,8 +48,11 @@ export function auditWorkflow(source: string): Array<{ job: string; provisioned:
     const steps = body?.steps ?? [];
     const suiteAt = steps.findIndex((s) => commandLines(s).some((l) => SUITE_COMMAND.test(l)));
     if (suiteAt < 0) continue;
-    // Provisioning counts only as an executable line in a step that runs before the suite step.
-    const provisioned = steps.slice(0, suiteAt).some((s) => commandLines(s).includes(PROVISION_COMMAND));
+    // Provisioning counts only as an unconditional step (no `if:`) that runs before the suite step and
+    // whose whole executable body is the install command, so it cannot be skipped by a step condition
+    // or wrapped in shell control flow that never reaches it.
+    const provisioned = steps.slice(0, suiteAt).some((s) => s.if === undefined
+      && commandLines(s).length === 1 && commandLines(s)[0] === PROVISION_COMMAND);
     results.push({ job, provisioned });
   }
   return results;
@@ -79,6 +85,10 @@ describe("packaged signer interpreter is provisioned before every server suite r
     ["provisioning commented out", `jobs:\n  t:\n    steps:\n      - name: Provision the root-owned workstation signer interpreter\n        run: |\n          # ${PROVISION_COMMAND}\n          echo skipped\n      - run: npm test\n`, false],
     ["step name kept, install moved after the suite", `jobs:\n  t:\n    steps:\n      - name: Provision the root-owned workstation signer interpreter\n        run: echo placeholder\n      - run: cd server && npm test\n      - run: ${PROVISION_COMMAND}\n`, false],
     ["suite inside a multi-line pipeline", `jobs:\n  t:\n    steps:\n      - run: |\n          set -o pipefail\n          npm test 2>&1 | tee out.log\n`, false],
+    ["provisioning step skipped by a step condition", `jobs:\n  t:\n    steps:\n      - if: false\n        run: ${PROVISION_COMMAND}\n      - run: npm test\n`, false],
+    ["provisioning wrapped in shell control flow", `jobs:\n  t:\n    steps:\n      - run: |\n          if false; then\n            ${PROVISION_COMMAND}\n          fi\n      - run: npm test\n`, false],
+    ["suite run with a prefix option", `jobs:\n  t:\n    steps:\n      - run: npm --prefix server test\n`, false],
+    ["suite run through run-script", `jobs:\n  t:\n    steps:\n      - run: npm run-script test\n`, false],
   ];
   for (const [label, source, expected] of fixtures) {
     it(`audit fixture: ${label}`, () => {
