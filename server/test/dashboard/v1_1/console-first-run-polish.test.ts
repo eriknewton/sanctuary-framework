@@ -410,6 +410,20 @@ describe("each findings surface names the feed it counts", () => {
     expect(quietCard).not.toContain("data-anomaly-queue-note");
   });
 
+  it("a listed anomaly beside more Sentinel queue findings: the Overview panel names the anomaly feed in its count and rows", async () => {
+    vi.useFakeTimers();
+    const anomaly = { finding_id: "anomaly-1", severity: "high", detector_id: "detector-1", summary: "Fixture anomaly.", created_at: "2026-10-21T12:00:00.000Z" };
+    const h = boot({
+      "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [anomaly] } })),
+      "/api/sentinels/findings": () => Promise.resolve(response({ data: { findings: [sentinelFinding, { ...sentinelFinding, finding_id: "finding-2" }] } })),
+    });
+    await settle();
+    const overview = h.el.main!.innerHTML;
+    expect(overview, "the panel count says which feed it shows").toContain("showing 1 of 1 anomaly findings");
+    expect(overview, "rows name the anomaly detector, not the Sentinel queue").toContain("Anomaly detector: detector-1");
+    expect(overview).not.toContain("Sentinel: detector-1");
+  });
+
   it("an earned 0 open is aged by the older of its two reads, so a fresh anomaly read cannot freshen an old Sentinel zero", async () => {
     vi.useFakeTimers();
     let sentinelReads = 0;

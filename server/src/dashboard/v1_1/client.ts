@@ -4620,7 +4620,7 @@ function renderOverviewFindingsPanel() {
     : shown.length
       ? '<div class="overview-list">' + shown.map(function (f) {
           const sev = severityClass(f.severity);
-          return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Sentinel: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
+          return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Anomaly detector: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
         }).join("") + '</div>'
       : feed.state === SENTINEL_FEED.UNAVAILABLE
         ? sentinelFeedUnknownHtml()
@@ -4628,7 +4628,7 @@ function renderOverviewFindingsPanel() {
         ? '<div class="overview-empty"><h3>' + escHtml(sentinelFindingsPhrase(feed.total)) + '</h3><p>The Sentinel queue returned ' + escHtml(sentinelFindingsCount(feed.total)) + '. Their lifecycle is not served, so this view cannot say whether ' + (feed.total === 1 ? 'it is' : 'they are') + ' open.</p><a class="btn" href="#findings">Open Findings</a></div>'
         : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. The anomaly detector and the Sentinel queue both answered empty; oldest read ' + escHtml(earnedZeroReadAge() || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
   return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
-    (unknown || (feed && feed.state === SENTINEL_FEED.UNAVAILABLE) ? "Not evaluated" : feed && feed.state === SENTINEL_FEED.LISTED ? escHtml(sentinelFindingsPhrase(feed.total)) : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
+    (unknown || (feed && feed.state === SENTINEL_FEED.UNAVAILABLE) ? "Not evaluated" : feed && feed.state === SENTINEL_FEED.LISTED ? escHtml(sentinelFindingsPhrase(feed.total)) : "showing " + shown.length + " of " + findings.length + " anomaly findings") + '</span></h3><a href="#findings">all findings</a></div>' + list +
     '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
     '<p class="muted">Fleet enforcement status comes from the Machines screen health probes; this Overview does not infer remote protection from local evidence.</p></section>';
 }
