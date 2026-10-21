@@ -13,6 +13,7 @@
  * reworded reason fails here instead of reaching the operator as unrecognised.
  */
 import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
@@ -30,6 +31,7 @@ import {
   PROXY_REASON_GATE_SOURCE,
   PROXY_REASON_PREFIX,
   classifyHoldReason,
+  cutAtCodePoint,
   projectCharterApproval,
 } from "../../src/hub/charter-approval-bridge.js";
 import { heldSubjectText } from "../../src/dashboard/v1_1/templates.js";
@@ -60,6 +62,172 @@ function capturingChannel(seen: ApprovalRequest[]): ApprovalChannel {
       seen.push(request);
       return { decision: "deny", decided_at: new Date().toISOString(), decided_by: "human" };
     },
+  };
+}
+
+function readGateSource(): string {
+  return readFileSync(new URL("../../src/principal-policy/gate.ts", import.meta.url), "utf8");
+}
+
+/**
+ * Every reason gate.ts can hand the approval channel, read with the TypeScript compiler API rather than a pattern.
+ * Reachability is decided from the call arguments: the channel is reached only through the gate's private
+ * requestApproval (checked), and the third argument of each `this.requestApproval(...)` call is resolved through
+ * the variables and private methods it forwards (`classification.reason` to classifyOperation's returned objects,
+ * `classification.anomaly.reason` through the `anomaly` it returns to detectAnomaly's). Literal text is the source
+ * text between the quotes or backticks, concatenations joined, so it compares with each template's pinned
+ * gateSource. Invariant: any reason expression, return shape or channel call this scan does not model throws, so a
+ * new shape fails the coverage test instead of being silently skipped.
+ */
+function gateChannelReasons(sourceText: string): { held: Set<string>; tier3Skipped: number } {
+  const sf = ts.createSourceFile("gate.ts", sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  function fail(node: ts.Node, what: string): never {
+    const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+    throw new Error(`gate reason scan: unmodeled ${what} at gate.ts:${line}: ${node.getText(sf)}`);
+  }
+  const methods = new Map<string, ts.MethodDeclaration>();
+  const gateCalls: ts.CallExpression[] = [];
+  const channelCalls: ts.CallExpression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) methods.set(node.name.text, node);
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "requestApproval") {
+      (node.expression.expression.kind === ts.SyntaxKind.ThisKeyword ? gateCalls : channelCalls).push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  const enclosingMethod = (node: ts.Node): ts.MethodDeclaration => {
+    for (let at: ts.Node | undefined = node.parent; at; at = at.parent) if (ts.isMethodDeclaration(at)) return at;
+    return fail(node, "call outside a method");
+  };
+  const methodName = (method: ts.MethodDeclaration): string => (ts.isIdentifier(method.name) ? method.name.text : "");
+  // The channel is reached only from requestApproval itself, so its arguments are the whole reachable set.
+  for (const call of channelCalls) {
+    if (call.expression.getText(sf) !== "this.channel.requestApproval" || methodName(enclosingMethod(call)) !== "requestApproval") {
+      fail(call, "channel call");
+    }
+  }
+
+  const isFunctionLike = (node: ts.Node) =>
+    ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node);
+  const declaredInitializer = (name: ts.Identifier, scope: ts.MethodDeclaration): ts.Expression => {
+    const found: ts.Expression[] = [];
+    const find = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name.text && node.initializer) found.push(node.initializer);
+      ts.forEachChild(node, find);
+    };
+    find(scope);
+    return found.length === 1 ? found[0]! : fail(name, "reason variable");
+  };
+  const returnedObjects = (method: ts.MethodDeclaration): ts.ObjectLiteralExpression[] => {
+    const objects: ts.ObjectLiteralExpression[] = [];
+    const find = (node: ts.Node): void => {
+      if (node !== method && isFunctionLike(node)) return;
+      if (ts.isReturnStatement(node)) {
+        const value = node.expression;
+        if (value && ts.isObjectLiteralExpression(value)) objects.push(value);
+        else if (!value || value.kind !== ts.SyntaxKind.NullKeyword) fail(node, "reason source return");
+      }
+      ts.forEachChild(node, find);
+    };
+    find(method);
+    return objects;
+  };
+  const property = (object: ts.ObjectLiteralExpression, name: string): ts.Expression | null => {
+    for (const p of object.properties) {
+      if (ts.isSpreadAssignment(p)) fail(p, "reason object spread");
+      if (p.name && ts.isIdentifier(p.name) && p.name.text === name) {
+        if (ts.isPropertyAssignment(p)) return p.initializer;
+        if (ts.isShorthandPropertyAssignment(p)) return p.name;
+        fail(p, "reason object property");
+      }
+    }
+    return null;
+  };
+  type Source = { object: ts.ObjectLiteralExpression; scope: ts.MethodDeclaration };
+  const objectsOf = (expr: ts.Expression, scope: ts.MethodDeclaration): Source[] => {
+    if (ts.isIdentifier(expr)) return objectsOf(declaredInitializer(expr, scope), scope);
+    if (ts.isCallExpression(expr) && ts.isPropertyAccessExpression(expr.expression) && expr.expression.expression.kind === ts.SyntaxKind.ThisKeyword) {
+      const method = methods.get(expr.expression.name.text);
+      if (method) return returnedObjects(method).map((object) => ({ object, scope: method }));
+    }
+    if (ts.isPropertyAccessExpression(expr)) {
+      return objectsOf(expr.expression, scope).flatMap((source) => {
+        const value = property(source.object, expr.name.text);
+        return value === null ? [] : objectsOf(value, source.scope);
+      });
+    }
+    return fail(expr, "reason source");
+  };
+  const literalText = (expr: ts.Expression): string | null => {
+    if (ts.isParenthesizedExpression(expr)) return literalText(expr.expression);
+    if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr) || ts.isTemplateExpression(expr)) return expr.getText(sf).slice(1, -1);
+    if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = literalText(expr.left);
+      const right = literalText(expr.right);
+      return left !== null && right !== null ? left + right : fail(expr, "reason concatenation");
+    }
+    return null;
+  };
+
+  const held = new Set<string>();
+  let tier3Skipped = 0;
+  const collect = (expr: ts.Expression, scope: ts.MethodDeclaration): void => {
+    const literal = literalText(expr);
+    if (literal !== null) {
+      held.add(literal);
+      return;
+    }
+    if (ts.isIdentifier(expr)) return collect(declaredInitializer(expr, scope), scope);
+    if (ts.isPropertyAccessExpression(expr) && expr.name.text === "reason") {
+      for (const source of objectsOf(expr.expression, scope)) {
+        const tier = property(source.object, "tier");
+        if (tier !== null && !ts.isNumericLiteral(tier)) fail(tier, "reason tier");
+        if (tier !== null && (tier as ts.NumericLiteral).text === "3") {
+          tier3Skipped++;
+          continue;
+        }
+        const reason = property(source.object, "reason");
+        if (reason === null) fail(source.object, "reason object without a reason");
+        collect(reason!, source.scope);
+      }
+      return;
+    }
+    fail(expr, "reason expression");
+  };
+  for (const call of gateCalls) {
+    const reason = call.arguments[2];
+    if (!reason) fail(call, "reason argument");
+    collect(reason!, enclosingMethod(call));
+  }
+  if (tier3Skipped > 0) {
+    // A Tier 3 classification never reaches the channel only because evaluate() returns an allow result for it
+    // before any call that forwards classification.reason; if that return moves, the skip above is unsound.
+    const evaluate = methods.get("evaluate");
+    let guarded = false;
+    const find = (node: ts.Node): void => {
+      if (ts.isIfStatement(node) && node.expression.getText(sf) === "classification.tier === 3" && ts.isBlock(node.thenStatement)) {
+        const last = node.thenStatement.statements.at(-1);
+        const allowed = last && ts.isReturnStatement(last) && last.expression && ts.isObjectLiteralExpression(last.expression)
+          ? property(last.expression, "allowed") : null;
+        if (allowed && allowed.kind === ts.SyntaxKind.TrueKeyword) guarded = true;
+      }
+      ts.forEachChild(node, find);
+    };
+    if (evaluate) find(evaluate);
+    if (!guarded) throw new Error("gate reason scan: unmodeled Tier 3 path: no allow return for classification.tier === 3 in evaluate()");
+  }
+  return { held, tier3Skipped };
+}
+
+/** The gate reasons no bridge template pins, and the pinned gate sources the gate no longer sends. */
+function uncoveredGateReasons(held: Set<string>): { uncovered: string[]; unsent: string[] } {
+  // The proxy wrapper is pinned whole (the classifier strips its prefix and classifies the wrapped reason); every
+  // other reason is one template's gateSource.
+  const pinned = new Set([...HOLD_REASON_TEMPLATES.map((t) => t.gateSource), PROXY_REASON_GATE_SOURCE]);
+  return {
+    uncovered: [...held].filter((r) => !pinned.has(r)).sort(),
+    unsent: [...pinned].filter((r) => !held.has(r)).sort(),
   };
 }
 
@@ -115,61 +283,45 @@ describe("structured hold reasons", () => {
     expect(Object.keys(HOLD_REASON_SENTENCES).sort()).toEqual(contract);
   });
 
-  it("covers every reason literal the gate source can send to the approval channel", () => {
-    // Computed, not listed: read every reason literal in gate.ts, keep those that can reach requestApproval, and
-    // require each to be one bridge template's pinned gateSource (the proxy wrapper is the prefix the classifier
-    // strips). A literal in a gate result (it carries `allowed:`) or a Tier 3 classification never reaches the
-    // channel. A new or reworded gate reason fails here.
-    const source = readFileSync(new URL("../../src/principal-policy/gate.ts", import.meta.url), "utf8");
-    const LITERAL = String.raw`(?:\x60(?:[^\x60\\]|\\.)*\x60|"(?:[^"\\]|\\.)*")`;
-    const literalRun = new RegExp(String.raw`${LITERAL}(?:\s*\+\s*${LITERAL})*`, "y");
-    const readRun = (at: number): string | null => {
-      literalRun.lastIndex = at;
-      const run = literalRun.exec(source);
-      if (!run) return null;
-      return [...run[0].matchAll(new RegExp(LITERAL, "g"))].map((m) => m[0].slice(1, -1)).join("");
-    };
-    const enclosingObject = (at: number): string => {
-      let depth = 0;
-      let open = at;
-      for (; open >= 0; open--) {
-        if (source[open] === "}") depth++;
-        else if (source[open] === "{") {
-          if (depth === 0) break;
-          depth--;
-        }
-      }
-      depth = 0;
-      let close = open;
-      for (; close < source.length; close++) {
-        if (source[close] === "{") depth++;
-        else if (source[close] === "}" && --depth === 0) break;
-      }
-      return source.slice(open, close + 1);
-    };
-
-    const held = new Set<string>();
-    const notHeld = new Set<string>();
-    for (const m of source.matchAll(/\breason:\s*/g)) {
-      const literal = readRun(m.index! + m[0].length);
-      if (literal === null) continue;
-      const object = enclosingObject(m.index!);
-      (/\ballowed:/.test(object) || /\btier:\s*3\b/.test(object) ? notHeld : held).add(literal);
-    }
-    const forwarded = new Set<string>();
-    for (const m of source.matchAll(/this\.requestApproval\(\s*[A-Za-z_.]+,\s*\d,\s*/g)) {
-      const literal = readRun(m.index! + m[0].length);
-      if (literal !== null) held.add(literal);
-      else forwarded.add(/^[A-Za-z_.]+/.exec(source.slice(m.index! + m[0].length))![0]);
-    }
-    // A non-literal reason passed to the channel only forwards classifyOperation's reasons, read above.
-    expect([...forwarded].sort()).toEqual(["classification.anomaly.reason", "classification.reason"]);
-    expect(notHeld.size).toBeGreaterThan(0);
-
-    expect(held.has(PROXY_REASON_GATE_SOURCE)).toBe(true);
+  it("covers every reason the gate source can send to the approval channel", () => {
+    // Computed, not listed: gateChannelReasons reads gate.ts with the compiler and resolves the reason argument of
+    // every requestApproval call. Each must be one bridge template's pinned gateSource (the proxy wrapper is the
+    // prefix the classifier strips). A new or reworded gate reason fails here.
+    const { held, tier3Skipped } = gateChannelReasons(readGateSource());
+    // classifyOperation's Tier 3 result is forwarded only past evaluate()'s Tier 3 return, which the scan checks.
+    expect(tier3Skipped).toBeGreaterThan(0);
     expect(PROXY_REASON_GATE_SOURCE.startsWith(PROXY_REASON_PREFIX)).toBe(true);
-    held.delete(PROXY_REASON_GATE_SOURCE);
-    expect([...held].sort()).toEqual(HOLD_REASON_TEMPLATES.map((t) => t.gateSource).sort());
+    expect(uncoveredGateReasons(held)).toEqual({ uncovered: [], unsent: [] });
+  });
+
+  it("the gate reason coverage fails on a new reason in any literal form and refuses a form it does not model", () => {
+    const source = readGateSource();
+    // A new reason passed straight to requestApproval, in each literal form the gate could use.
+    const evaluateAnchor = "    const classification = this.classifyOperation(toolName, args);\n";
+    expect(source.split(evaluateAnchor)).toHaveLength(2);
+    const withDirectReason = (reason: string) =>
+      source.replace(evaluateAnchor, `    if (args.mutation) return this.requestApproval(operation, 2, ${reason}, {});\n${evaluateAnchor}`);
+    const direct: Array<[string, string]> = [
+      ["'A single-quoted new reason'", "A single-quoted new reason"],
+      ['"A double-quoted new reason"', "A double-quoted new reason"],
+      ["`A template new reason for ${operation}`", "A template new reason for ${operation}"],
+      ["`A concatenated ` + 'new reason'", "A concatenated new reason"],
+    ];
+    for (const [form, text] of direct) {
+      expect(uncoveredGateReasons(gateChannelReasons(withDirectReason(form)).held).uncovered, form).toEqual([text]);
+    }
+    // A new reason the gate forwards: a detectAnomaly result reaches the channel through classification.anomaly.
+    const anomalyAnchor = "  ): { reason: string; context: Record<string, unknown>; commit?: () => void } | null {\n";
+    expect(source.split(anomalyAnchor)).toHaveLength(2);
+    const forwarded = source.replace(anomalyAnchor, `${anomalyAnchor}    if (args.mutation) return { reason: 'A forwarded new reason', context: {} };\n`);
+    expect(uncoveredGateReasons(gateChannelReasons(forwarded).held).uncovered).toEqual(["A forwarded new reason"]);
+    // A reason form the scan does not model fails loudly instead of being skipped.
+    expect(() => gateChannelReasons(withDirectReason("reasonFor(operation)"))).toThrow(/unmodeled reason/);
+    expect(() => gateChannelReasons(withDirectReason("`Prefix ` + suffix"))).toThrow(/unmodeled reason/);
+    // A channel reached other than through requestApproval fails loudly too.
+    expect(() =>
+      gateChannelReasons(source.replace(evaluateAnchor, `    if (args.mutation) await this.channel.requestApproval(request);\n${evaluateAnchor}`)),
+    ).toThrow(/channel call/);
   });
 
   it("recognises every reason the real gate writes, and keeps only the quoted identifier", async () => {
@@ -336,6 +488,33 @@ describe("structured hold reasons", () => {
       "operator-identity",
     );
     expect(short.operation_truncated).toBeUndefined();
+  });
+
+  it("cuts a capped subject and a capped operation name on a code-point boundary, never inside a surrogate pair", () => {
+    // U+1F600 is two UTF-16 units; placed at units bound-1 and bound, a plain slice would keep only its high half.
+    const astral = String.fromCodePoint(0x1f600);
+    const straddling = "n".repeat(HOLD_REASON_SUBJECT_MAX_CHARS - 1) + astral + "tail";
+    const LONE_SURROGATE = /\p{Cs}/u;
+    expect(LONE_SURROGATE.test(straddling.slice(0, HOLD_REASON_SUBJECT_MAX_CHARS))).toBe(true);
+    const reason = classifyHoldReason({
+      operation: "state_write",
+      reason: `First access to namespace "${straddling}" (not in session baseline)`,
+      context: { namespace: straddling },
+    });
+    expect(reason).toEqual({ code: "first_namespace_access", subject: "n".repeat(HOLD_REASON_SUBJECT_MAX_CHARS - 1), subject_truncated: true });
+    const operationName = "p".repeat(CARD_OPERATION_MAX_CHARS - 1) + astral + "tail";
+    const card = projectCharterApproval(
+      { id: "hold-astral", operation: operationName, tier: 2, created_at: "2026-10-21T00:00:00.000Z", hold_reason: { code: "unrecognized" } },
+      "operator-identity",
+    );
+    const operation = card.display_template_args.find((a) => a.kind === "operation")!.value as string;
+    expect(operation).toBe("p".repeat(CARD_OPERATION_MAX_CHARS - 1));
+    expect(LONE_SURROGATE.test(operation)).toBe(false);
+    expect(card.operation_truncated).toBe(true);
+    // A pair that ends exactly at the bound is kept whole.
+    const fits = "n".repeat(CARD_OPERATION_MAX_CHARS - 2) + astral + "tail";
+    expect(cutAtCodePoint(fits, CARD_OPERATION_MAX_CHARS)).toBe("n".repeat(CARD_OPERATION_MAX_CHARS - 2) + astral);
+    expect(cutAtCodePoint("short", CARD_OPERATION_MAX_CHARS)).toBe("short");
   });
 
   it("shows a guidance-shaped namespace only as escaped, delimited data under console-written words", async () => {

@@ -46,6 +46,7 @@ const CARD_RENDER_DECLARATIONS = [
   "HELD_SUBJECT_HIDDEN_CHARS",
   "LAST_FOUR_DIGIT_ESCAPE_CODE_POINT",
   "heldSubjectText",
+  "heldSubjectEscape",
   "heldSubjectHtml",
   "arg",
   "hasArgValue",

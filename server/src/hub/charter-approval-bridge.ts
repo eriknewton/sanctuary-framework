@@ -376,10 +376,29 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
 export const PROXY_REASON_PREFIX = "Proxy: ";
 export const PROXY_REASON_GATE_SOURCE = "Proxy: ${anomaly.reason}";
 
+// The UTF-16 high (leading) surrogate range: a code point above U+FFFF is one of
+// these followed by a low surrogate, so a cut just after one splits the pair.
+const HIGH_SURROGATE_FIRST = 0xd800;
+const HIGH_SURROGATE_LAST = 0xdbff;
+
+/**
+ * The first `maxUnits` UTF-16 code units of `text`, cut on a code-point
+ * boundary. Invariant: a bounded copy never ends in half of a surrogate pair,
+ * so shortening a name cannot manufacture a lone surrogate the original did not
+ * contain; when the cut would land just after a high surrogate it backs off one
+ * unit, so the copy may be one unit shorter than the bound.
+ */
+export function cutAtCodePoint(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  const last = text.charCodeAt(maxUnits - 1);
+  const splitsPair = last >= HIGH_SURROGATE_FIRST && last <= HIGH_SURROGATE_LAST;
+  return text.slice(0, splitsPair ? maxUnits - 1 : maxUnits);
+}
+
 function boundedSubject(subject: string): Pick<HubHoldReason, "subject" | "subject_truncated"> {
   return subject.length <= HOLD_REASON_SUBJECT_MAX_CHARS
     ? { subject }
-    : { subject: subject.slice(0, HOLD_REASON_SUBJECT_MAX_CHARS), subject_truncated: true };
+    : { subject: cutAtCodePoint(subject, HOLD_REASON_SUBJECT_MAX_CHARS), subject_truncated: true };
 }
 
 /**
@@ -470,7 +489,7 @@ export function projectCharterApproval(
     { kind: "identity_id", value: identityId },
     {
       kind: "operation",
-      value: operationTruncated ? record.operation.slice(0, CARD_OPERATION_MAX_CHARS) : record.operation,
+      value: operationTruncated ? cutAtCodePoint(record.operation, CARD_OPERATION_MAX_CHARS) : record.operation,
     },
   ];
   // Must-never #7 bounds what the AGENT learns from a denial: the gate returns

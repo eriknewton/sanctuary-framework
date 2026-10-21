@@ -429,12 +429,14 @@ const LAST_FOUR_DIGIT_ESCAPE_CODE_POINT = 0xffff;
 // its own quotes and backslashes are escaped, and every hidden or reordering character shown as a visible escape.
 // Must match heldSubjectText in templates.ts, which writes the same text into server-rendered sentences.
 function heldSubjectText(value) {
-  return JSON.stringify(String(value)).replace(HELD_SUBJECT_HIDDEN_CHARS, function (c) {
-    const codePoint = c.codePointAt(0);
-    return codePoint > LAST_FOUR_DIGIT_ESCAPE_CODE_POINT
-      ? "\\u{" + codePoint.toString(16) + "}"
-      : "\\u" + ("0000" + codePoint.toString(16)).slice(-4);
-  });
+  return JSON.stringify(String(value)).replace(HELD_SUBJECT_HIDDEN_CHARS, heldSubjectEscape);
+}
+// One hidden or reordering character as its visible escape: four hex digits, or the braced form above that range.
+function heldSubjectEscape(c) {
+  const codePoint = c.codePointAt(0);
+  return codePoint > LAST_FOUR_DIGIT_ESCAPE_CODE_POINT
+    ? "\\u{" + codePoint.toString(16) + "}"
+    : "\\u" + ("0000" + codePoint.toString(16)).slice(-4);
 }
 
 function heldSubjectHtml(value, truncated) {
@@ -6935,6 +6937,9 @@ function state_NOTADMITTEDDecision(fields, reason) {
     // Invariant: an unconfirmed result is replaced only by a decision that was sent; a later click that sends
     // nothing is noted on it (one slot, so repeated clicks cannot grow it) and the warning stays unclearable.
     current.notSent = "Your next " + notSent;
+    // The note names its own request, so it carries that request's held operation; rendering it with the
+    // unconfirmed result's metadata would leave this request's name outside the delimited element.
+    current.notSentHeldOperation = fields.heldOperation || null;
     announceDecision(current);
     renderFeedback();
     return;
@@ -6995,12 +7000,30 @@ function decisionHeldOperation(itemId) {
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
   return item ? approvalHeldOperation(item) : null;
 }
-// Feedback text as HTML. Invariant: the quoted form of the decision's held operation name, which decisionSubject
-// wrote into the message, is shown only as the delimited held-subject element, never as words of the message.
-function renderFeedbackText(text, result) {
-  const html = escHtml(text);
-  const held = result && typeof result.heldOperation === "string" && result.heldOperation ? result.heldOperation : null;
-  return held === null ? html : html.split(escHtml(heldSubjectText(held))).join(heldSubjectHtml(held, false));
+// A double-quoted run with backslash escapes: the shape heldSubjectText writes (JSON quoting escapes every inner
+// quote and backslash, so the run ends exactly at the name's closing quote).
+const FEEDBACK_QUOTED_SEGMENT = /"(?:[^"\\]|\\[\s\S])*"/g;
+// Feedback text as HTML. Invariant: the quoted form of a held operation name, which decisionSubject wrote into the
+// message, is shown only as the delimited held-subject element, never as words of the message. heldOperation is
+// the name of the one request this text is about (each batch record and each not-sent note carries its own).
+function renderFeedbackText(text, heldOperation) {
+  const held = typeof heldOperation === "string" && heldOperation ? heldOperation : null;
+  const raw = String(text);
+  if (held === null) return feedbackQuotedHtml(raw);
+  return raw.split(heldSubjectText(held)).map(feedbackQuotedHtml).join(heldSubjectHtml(held, false));
+}
+// Fallback for text whose operation metadata is absent or names some other request: every remaining quoted run is
+// shown as the delimited element built from its own text (hidden characters made visible), so a name the metadata
+// did not cover can never be printed as message words. Console words never contain a double quote.
+function feedbackQuotedHtml(raw) {
+  let html = "";
+  let last = 0;
+  raw.replace(FEEDBACK_QUOTED_SEGMENT, function (run, offset) {
+    html += escHtml(raw.slice(last, offset)) + '<code class="held-subject" data-held-subject="1">' + escHtml(run.replace(HELD_SUBJECT_HIDDEN_CHARS, heldSubjectEscape)) + '</code>';
+    last = offset + run.length;
+    return run;
+  });
+  return html + escHtml(raw.slice(last));
 }
 function decisionHeadline(result) {
   // A batch that was taken for some items and refused for others says so in its headline, never "taken" alone.
@@ -7120,14 +7143,17 @@ function renderDecisionResult() {
   const r = state.approvals.result;
   if (!r || r.cleared) return "";
   const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
+  // Each record renders with its own request's held operation: a batch result has no single name of its own.
   const records = r.records.length
-    ? '<ul>' + r.records.map(function (rec) { return '<li>' + renderFeedbackText(rec.message, r) + '</li>'; }).join("") + '</ul>' : "";
+    ? '<ul>' + r.records.map(function (rec) { return '<li>' + renderFeedbackText(rec.message, rec.heldOperation) + '</li>'; }).join("") + '</ul>' : "";
   // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock. An
   // unconfirmed result has no Clear at all: the operator owes the queue a check, and only the next decision
   // replaces the warning, so it cannot be dismissed unread.
-  const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS + (r.notSent ? " " + r.notSent : "") : "";
+  const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS : "";
+  // The not-sent note is about a different request than the result, so it renders with that request's metadata.
+  const notSent = r.status === "uncertain" && r.notSent ? " " + renderFeedbackText(r.notSent, r.notSentHeldOperation) : "";
   const clear = r.status === "pending" || r.status === "uncertain" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
-  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + renderFeedbackText(r.message + note + stays, r) + '</p>' + records + '</div>' + clear + '</section>';
+  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + renderFeedbackText(r.message + note + stays, r.heldOperation) + notSent + '</p>' + records + '</div>' + clear + '</section>';
 }
 function decisionFirstSentence(message) {
   const first = message.split(". ")[0];
@@ -7385,13 +7411,16 @@ async function onInboxBatchAction(action, until) {
   const fields = { kind: "batch", action: action, ids: ids, subject: ids.length + (ids.length === 1 ? " selected item" : " selected items") };
   const blocked = decisionNotAdmissible(ids);
   if (blocked) { state_NOTADMITTEDDecision(fields, blocked); return; }
+  // Each record's subject and held operation are captured at admission, like a single decision's, so a row that
+  // moves during the batch cannot rewrite its record, and each record renders with its own request's name.
+  const admitted = ids.map(function (id) { return { id: id, subject: decisionSubject(id), heldOperation: decisionHeldOperation(id) }; });
   const result = state_ADMITTEDDecision(fields);
   await runDecision(result, async function () {
     if (action === "dismiss") {
       // Each id takes the same path as an individual decision under the batch's lock, and each outcome is kept.
-      for (const id of ids) {
-        const outcome = await performInboxAction(id, "dismiss", decisionSubject(id));
-        result.records.push({ itemId: id, status: outcome.status, message: outcome.message });
+      for (const entry of admitted) {
+        const outcome = await performInboxAction(entry.id, "dismiss", entry.subject);
+        result.records.push({ itemId: entry.id, status: outcome.status, message: outcome.message, heldOperation: entry.heldOperation });
       }
       settleBatchFromRecords(result);
     } else if (action === "archive" || action === "delete" || action === "snooze") {

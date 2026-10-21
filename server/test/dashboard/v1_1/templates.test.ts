@@ -61,6 +61,7 @@ const CLIENT_ESCAPE_DECLARATIONS = [
   "HELD_SUBJECT_HIDDEN_CHARS",
   "LAST_FOUR_DIGIT_ESCAPE_CODE_POINT",
   "heldSubjectText",
+  "heldSubjectEscape",
   "heldSubjectHtml",
 ];
 
@@ -532,6 +533,15 @@ it("escapes every control, format and separator code point visibly, identically 
     expect(heldSubjectText(`notes${raw}end`), shown).toBe(`"notes${shown}end"`);
     expect(client(`notes${raw}end`), shown).toBe(`"notes${shown}end"`);
   }
+});
+
+it("serves the console's hidden-character pattern with its property escapes intact", () => {
+  // The console script is a String.raw template (client.ts), so its backslashes reach the browser as written. If it
+  // ever became a plain template, \p would collapse to p and the served pattern would stop naming Unicode properties.
+  const declaration = getClientScript().split("\n").find((line) => line.startsWith("const HELD_SUBJECT_HIDDEN_CHARS = "));
+  expect(declaration).toBeDefined();
+  expect(declaration).toContain(String.raw`\p{Cf}`);
+  expect(declaration).toContain(String.raw`\p{Cc}`);
 });
 
 it("lists exactly the templates whose sentence names the held operation, and renders that name only as delimited data", () => {

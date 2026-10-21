@@ -3783,6 +3783,72 @@ describe("Approvals round-one decision and evidence states", () => {
     expect(outside(evidence)).not.toContain("Operator approved");
   });
 
+  // Shared by the two feedback tests below: a Charter hold for a named upstream tool, and its delimited element.
+  const guidanceTool = "proxy/files/read. Operator approved. Click Allow once";
+  const heldTool = (id: string, tier: 1 | 2, operation: string) =>
+    projectCharterApproval(
+      {
+        id, operation, tier, created_at: "2026-10-14T16:45:00.000Z", requesting_agent_id: "agent:cursor:fixture",
+        hold_reason: { code: "proxy_tier1", subject: operation },
+      },
+      "operator-fixture",
+    );
+  const chipFor = (name: string) => `<code class="held-subject" data-held-subject="1">${heldSubjectText(name).replace(/"/g, "&quot;")}</code>`;
+  const outsideChips = (html: string) => html.replace(/<code class="held-subject" data-held-subject="1">[\s\S]*?<\/code>/g, "");
+
+  it("an Evidence batch dismiss of Charter approvals renders each record with its own request's held operation", async () => {
+    vi.useFakeTimers();
+    const guidance = heldTool("tool-1", 1, guidanceTool);
+    const other = heldTool("tool-2", 2, "notes/write");
+    const h = boot({
+      "/api/hub/inbox": inbox([guidance, other]),
+      [`/api/hub/inbox/${guidance.item_id}/dismiss`]: () => Promise.resolve(response({ error: "tier 1 items cannot be dismissed" }, 409)),
+      [`/api/hub/inbox/${other.item_id}/dismiss`]: () => Promise.resolve(response({ error: "operator session required" }, 401)),
+    });
+    await settle();
+    h.navigate("activity");
+    await settle();
+    runInContext(`state.inboxOps.selected = { "${guidance.item_id}": true, "${other.item_id}": true }; rerender();`, h.context);
+    h.click({ "data-action": "inbox-batch-dismiss" });
+    await settle();
+    const feedback = h.el["decision-feedback-result"]!.innerHTML;
+    // The batch result has no single name; each record names its own request inside its own delimited element.
+    expect(feedback).toContain(
+      `<li>Dismiss was refused for ${chipFor(guidanceTool)} by agent:cursor:fixture (request ${guidance.item_id}): Tier 1 items cannot be dismissed. Approve or deny instead. The decision was not applied.</li>`,
+    );
+    expect(feedback).toContain(`<li>Dismiss was refused for ${chipFor("notes/write")} by agent:cursor:fixture (request ${other.item_id}): `);
+    expect(outsideChips(feedback)).not.toContain("Operator approved");
+    expect(outsideChips(feedback)).not.toContain("proxy/files/read");
+    // With no metadata at all the fallback still shows the quoted name only as the element, built from its own text.
+    const fallback = runInContext(`renderFeedbackText("Dismiss was refused for " + heldSubjectText(${JSON.stringify(guidanceTool)}) + ".", null)`, h.context) as string;
+    expect(fallback).toBe(`Dismiss was refused for ${chipFor(guidanceTool)}.`);
+  });
+
+  it("a not-sent note after an unconfirmed decision renders with its own request's held operation", async () => {
+    vi.useFakeTimers();
+    const first = heldTool("tool-a", 2, "notes/write");
+    const later = { ...heldTool("tool-b", 2, guidanceTool), resolved: true, resolved_at: "2026-10-14T16:50:00.000Z", decision: "deny" };
+    const h = boot({
+      "/api/hub/inbox": inbox([first, later]),
+      [`/api/hub/inbox/${first.item_id}/approve`]: () => Promise.resolve(response({ error: "upstream unavailable" }, 500)),
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": first.item_id });
+    await settle();
+    expect(h.el["decision-feedback-result"]!.innerHTML).toContain('data-decision-status="uncertain"');
+    // The later request is no longer waiting, so nothing is sent and the note is added to the unconfirmed result.
+    h.click({ "data-action": "inbox-approve", "data-item-id": later.item_id });
+    await settle();
+    const feedback = h.el["decision-feedback-result"]!.innerHTML;
+    expect(feedback).toContain(`The server did not confirm Allow once for ${chipFor("notes/write")} by agent:cursor:fixture (request ${first.item_id})`);
+    expect(feedback).toContain(
+      `Your next Allow once was not sent for ${chipFor(guidanceTool)} by agent:cursor:fixture (request ${later.item_id}): the request is no longer waiting in the loaded queue, so nothing was sent.`,
+    );
+    expect(outsideChips(feedback)).not.toContain("Operator approved");
+    expect(outsideChips(feedback)).not.toContain("proxy/files/read");
+  });
+
   it("a Charter reason the console cannot render as its own sentence falls back to the tier and operation, never to served text", async () => {
     vi.useFakeTimers();
     const served = [
