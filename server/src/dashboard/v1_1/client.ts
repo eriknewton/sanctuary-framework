@@ -439,6 +439,85 @@ function promptForOperatorToken() {
   return true;
 }
 
+// ── Operator token entry for refused reads ─────────────────────────────
+// promptForOperatorToken above stays the only path for a refused mutation. A
+// refused READ shows a notice in F with a Paste operator token control that
+// opens the shell's token dialog; saving stores the token where TOKEN is read
+// at boot (sessionStorage "authToken") and reloads the page, so every read,
+// the stream session and the launch URL's read session restart from one
+// state. Must match the operator-token-* ids in html.ts.
+// 401 = the server's answer for a missing or unaccepted operator bearer; 403
+// is a refusal of a held, accepted credential and a new token cannot fix it.
+const OPERATOR_TOKEN_REFUSED_STATUS = 401;
+function operatorTokenRefused() {
+  // A source's status keeps its last failed answer until a read loads (readResponse resets it), so the notice
+  // does not flicker while a trailing read is in flight, and leaves as soon as any read of that source succeeds.
+  let refused = false;
+  sourceReads.forEach(function (read) { if (read.status === OPERATOR_TOKEN_REFUSED_STATUS) refused = true; });
+  return refused;
+}
+let lastOperatorTokenEntryHtml = null;
+function renderOperatorTokenEntry() {
+  const host = document.getElementById("operator-token-entry");
+  if (!host) return;
+  // Static text only: the token itself is never written into the page, a URL, a log or the console.
+  const html = !operatorTokenRefused() ? "" :
+    '<div class="operator-token-entry" role="group" aria-labelledby="operator-token-entry-title"><p><strong id="operator-token-entry-title">Operator token needed.</strong> ' +
+    (TOKEN ? "The server did not accept the operator token held in this tab, so these screens stay Unknown."
+      : "No operator token is held in this tab, so the server refused these reads and the screens stay Unknown.") +
+    '</p><button type="button" class="btn btn-primary" data-action="operator-token-open" aria-haspopup="dialog">Paste operator token</button></div>';
+  // Rewriting an unchanged notice would drop keyboard focus from its button on every background redraw.
+  if (lastOperatorTokenEntryHtml === html) return;
+  host.innerHTML = html;
+  lastOperatorTokenEntryHtml = html;
+}
+function operatorTokenDialogParts() {
+  return {
+    dialog: document.getElementById("operator-token-dialog"),
+    input: document.getElementById("operator-token-input"),
+    error: document.getElementById("operator-token-error")
+  };
+}
+function openOperatorTokenDialog() {
+  const parts = operatorTokenDialogParts();
+  if (!parts.dialog) return;
+  if (parts.error) parts.error.hidden = true;
+  if (parts.input) parts.input.value = "";
+  if (typeof parts.dialog.showModal === "function") { if (!parts.dialog.open) parts.dialog.showModal(); }
+  else parts.dialog.setAttribute("open", "");
+  if (parts.input && typeof parts.input.focus === "function") parts.input.focus();
+}
+function closeOperatorTokenDialog() {
+  const parts = operatorTokenDialogParts();
+  // A cancelled entry must not leave a pasted token sitting in the field.
+  if (parts.input) parts.input.value = "";
+  if (!parts.dialog) return;
+  if (typeof parts.dialog.close === "function") { if (parts.dialog.open) parts.dialog.close(); }
+  else parts.dialog.removeAttribute("open");
+}
+function submitOperatorToken() {
+  const parts = operatorTokenDialogParts();
+  const entered = parts.input ? String(parts.input.value || "").trim() : "";
+  // The field is emptied as soon as it is read, so the token is never retained in the page.
+  if (parts.input) parts.input.value = "";
+  let stored = false;
+  if (entered) {
+    try { sessionStorage.setItem("authToken", entered); stored = true; } catch (_e) { stored = false; }
+  }
+  if (!stored) {
+    if (parts.error) {
+      parts.error.textContent = entered ? "This browser did not keep the token for this tab. Check that site storage is allowed, then try again." : "Paste the operator token first.";
+      parts.error.hidden = false;
+    }
+    if (parts.input && typeof parts.input.focus === "function") parts.input.focus();
+    return;
+  }
+  TOKEN = entered;
+  closeOperatorTokenDialog();
+  // A reload re-reads every source and reopens the stream with the stored token; nothing about it enters the URL.
+  location.reload();
+}
+
 function credentialedReadUrl(url, method) {
   // The launch URL's short-lived session may authenticate same-origin reads and
   // SSE only. Decisions continue to require the explicit operator bearer.
@@ -992,6 +1071,8 @@ function setRoute(route) {
     if (agentReachPendingId && state.agentReach.agentId === agentReachPendingId && state.agentReach.state === "state_LOADING") state.agentReach = { state: "state_UNREAD", agentId: null, data: null, readAt: 0 };
     agentReachPendingId = null;
   }
+  // A new screen opens at its top; a redraw or re-entry of the screen already showing keeps the reader's place.
+  const routeChanged = state.route !== route;
   state.route = route;
   const app = document.getElementById("app");
   if (!app) return;
@@ -1014,6 +1095,13 @@ function setRoute(route) {
   if (route === "policy" || route === "approvals") void loadPolicyView();
   // Machines probes on every entry, as the Fleet Switcher does on load, and
   // keeps its check age current while it shows.
+  // After the new body is written, so the browser cannot re-clamp the old offset onto it.
+  if (routeChanged) resetMainScroll();
+}
+function resetMainScroll() {
+  // #main is the workspace scroller (html.ts); the shell itself never scrolls.
+  const main = document.getElementById("main");
+  if (main) main.scrollTop = 0;
 }
 
 // Tunability UX: fetch the plain-English rendering of the LIVE Principal
@@ -1563,6 +1651,7 @@ function renderMain() {
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
   // F is outside the route body, including stopped-updates and Talk screens.
   renderFeedback();
+  renderOperatorTokenEntry();
   // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
   // a composer that left the document while still owned was replaced by some
   // other writer, and a silent remount would discard the draft it held.
@@ -4446,12 +4535,28 @@ function severityRank(level) {
   return sev === "critical" ? 0 : sev === "high" ? 1 : sev === "medium" ? 2 : sev === "low" ? 3 : 4;
 }
 
+// The Findings screen lists the served Sentinel feed (renderFindingsScreen) with lifecycle Unknown, beside the
+// anomaly card the Overview counts as open. When the anomaly answer is empty but the feed returned findings, the
+// Overview reports the feed's count with an unknown status rather than 0 open, so the two screens never disagree.
+// Must match the Sentinel queue in renderFindingsScreen: same source, same served total.
+function sentinelFindingsWithoutLifecycle() {
+  return sourceLoaded("/api/sentinels/findings") ? state.mfp.totals.findings : 0;
+}
+function sentinelFindingsCount(count) {
+  return count + (count === 1 ? " finding" : " findings");
+}
+function sentinelFindingsPhrase(count) {
+  return sentinelFindingsCount(count) + ", status unknown";
+}
+
 function renderOverviewFindingsPanel() {
   const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
   const findings = unknown ? [] : (state.posture.anomalies || []).slice().sort(function (a, b) {
     return severityRank(a.severity) - severityRank(b.severity);
   });
   const shown = findings.slice(0, OVERVIEW_FINDING_LIMIT);
+  // An empty anomaly answer cannot read as "no findings" while the Findings screen lists Sentinel findings.
+  const returned = !unknown && !findings.length ? sentinelFindingsWithoutLifecycle() : 0;
   const list = unknown
     ? '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason("/api/anomaly/findings", "Sentinels"))) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="/api/anomaly/findings">Retry Anomaly findings</button></div>'
     : shown.length
@@ -4459,9 +4564,11 @@ function renderOverviewFindingsPanel() {
           const sev = severityClass(f.severity);
           return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Sentinel: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
         }).join("") + '</div>'
-      : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
+      : returned
+        ? '<div class="overview-empty"><h3>' + escHtml(sentinelFindingsPhrase(returned)) + '</h3><p>Sentinels returned ' + escHtml(sentinelFindingsCount(returned)) + '. Their lifecycle is not served, so this view cannot say whether ' + (returned === 1 ? 'it is' : 'they are') + ' open.</p><a class="btn" href="#findings">Open Findings</a></div>'
+        : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
   return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
-    (unknown ? "Not evaluated" : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
+    (unknown ? "Not evaluated" : returned ? escHtml(sentinelFindingsPhrase(returned)) : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
     '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
     '<p class="muted">Fleet enforcement status comes from the Machines screen health probes; this Overview does not infer remote protection from local evidence.</p></section>';
 }
@@ -4597,6 +4704,8 @@ function renderPostureScreen() {
     : "";
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
+  // An empty anomaly answer cannot show 0 open while the Findings screen lists Sentinel findings of unknown status.
+  const sentinelReturned = !anomalyUnknown && !findings.length ? sentinelFindingsWithoutLifecycle() : 0;
   const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
   const digest = home.digest || {};
   const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
@@ -4638,7 +4747,7 @@ function renderPostureScreen() {
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       // Must match renderAnomalyFindingsCard on the Findings screen: both count /api/anomaly/findings.
-      overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
+      overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : sentinelReturned ? overviewChip("unknown", sentinelFindingsCount(sentinelReturned).toUpperCase(), "status unknown") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : sentinelReturned ? 'Sentinels returned ' + escHtml(sentinelFindingsCount(sentinelReturned)) + '; lifecycle is not served · <a href="#findings">findings</a>' : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
       overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
   return [
@@ -5041,9 +5150,11 @@ function approvalPolicyUnavailableReason() {
   return "";
 }
 
+// The checkbox label leads with this phrase only when its reason does not already say it.
+const ALWAYS_ALLOW_UNAVAILABLE = "Always allow is unavailable";
 function approvalStandingState(item) {
   const op = promotableOperation(item);
-  if (!op) return { enabled: false, reason: "Always allow is unavailable for this operation." };
+  if (!op) return { enabled: false, reason: ALWAYS_ALLOW_UNAVAILABLE + " for this operation." };
   if (item.tier === "tier1") return { enabled: false, reason: "Tier 1 approvals cannot become standing rules from this drawer." };
   const unavailable = approvalPolicyUnavailableReason();
   if (unavailable) return { enabled: false, reason: unavailable };
@@ -5121,7 +5232,7 @@ function renderApprovalDrawer(item, empty) {
   const primaryLabel = checked ? "Allow always" : "Allow once";
   const checkbox = item.resolved ? "" : '<label class="approval-standing"><input type="checkbox" data-action="approval-always-allow"' +
     (checked ? " checked" : "") + (standing.enabled && !disabled ? "" : " disabled") + '><span>' +
-    (standing.enabled ? "Always allow this operation for every agent on this fortress. " : "Always allow is unavailable. ") +
+    (standing.enabled ? "Always allow this operation for every agent on this fortress. " : standing.reason.indexOf(ALWAYS_ALLOW_UNAVAILABLE) === 0 ? "" : ALWAYS_ALLOW_UNAVAILABLE + ". ") +
     '<strong class="warn">' + escHtml(standing.reason) + '</strong></span></label>';
   const tier1Confirming = state.approvals.confirmingTier1Id === item.item_id;
   const tier1Cancelled = state.approvals.cancelledTier1Id === item.item_id;
@@ -7321,6 +7432,11 @@ document.addEventListener("keydown", function (ev) {
 });
 document.addEventListener("submit", function (ev) {
   const form = ev.target;
+  // The token form is static shell markup (html.ts); its native dialog submit would close without storing.
+  if (form && typeof form.getAttribute === "function" && form.getAttribute("data-action") === "operator-token-submit") {
+    ev.preventDefault();
+    return submitOperatorToken();
+  }
   if (!(form instanceof HTMLFormElement) || form.getAttribute("data-action") !== "concierge-submit") return;
   ev.preventDefault();
   if (!talkComposing) void onConciergeSend();
@@ -7385,6 +7501,8 @@ document.addEventListener("click", function (ev) {
   const intelSubstrate = tgt.getAttribute("data-intel-substrate");
   const intelLocalModel = tgt.getAttribute("data-intel-local-model");
   const intelFrontierProvider = tgt.getAttribute("data-intel-frontier-provider");
+  if (action === "operator-token-open") return openOperatorTokenDialog();
+  if (action === "operator-token-cancel") return closeOperatorTokenDialog();
   if (action === "lockdown") return void onLockdownClick();
   // Slice 2: Talk opens the concierge as a panel beside the current screen.
   if (action === "talk-toggle") {
@@ -7823,6 +7941,15 @@ if (mq) mq.addEventListener("change", function () {
   if (sessionStorage.getItem(THEME_KEY)) return;
   applyTheme("dark");
 });
+
+// Escape closes the native token dialog without the Cancel handler; the field is emptied on every close too.
+const operatorTokenDialogEl = document.getElementById("operator-token-dialog");
+if (operatorTokenDialogEl && typeof operatorTokenDialogEl.addEventListener === "function") {
+  operatorTokenDialogEl.addEventListener("close", function () {
+    const input = document.getElementById("operator-token-input");
+    if (input) input.value = "";
+  });
+}
 
 // Boot.
 void loadPanel(panelJobs[0]);
