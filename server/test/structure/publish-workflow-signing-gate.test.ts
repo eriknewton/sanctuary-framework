@@ -158,8 +158,9 @@ describe("publish workflow trust zones", () => {
     const rawRunKeys = workflow.match(/^\s*run:\s*/gm) ?? [];
     // Exact count is deliberate: adding or removing a shell step requires this
     // security inventory to move with it, so parser coverage cannot drift.
-    expect(bodies).toHaveLength(20);
-    expect(rawRunKeys).toHaveLength(20);
+    // 21 = 20 prior steps + the root-owned signer interpreter provisioning step (no data interpolated).
+    expect(bodies).toHaveLength(21);
+    expect(rawRunKeys).toHaveLength(21);
     expect(bodies).toHaveLength(rawRunKeys.length);
     for (const body of bodies) {
       // Shell expressions are categorically forbidden. This covers direct

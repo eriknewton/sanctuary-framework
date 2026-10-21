@@ -84,6 +84,14 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
+      - name: Provision the root-owned workstation signer interpreter
+        # setup-node's tool cache is runner-writable, so its symlink cannot carry key custody.
+        # Copy the selected runtime into the fixed trusted path checked by the real signer.
+        # Must match the step of the same name in ci.yml and test-baseline-guard.yml; the
+        # release gate's `npm test` runs the packaged-signer tests, which refuse any other node.
+        # Failure mode: without it the build job fails two linux-policy-sign tests and nothing publishes.
+        run: sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node
+
       - name: Validate release metadata
         run: |
           set -euo pipefail
