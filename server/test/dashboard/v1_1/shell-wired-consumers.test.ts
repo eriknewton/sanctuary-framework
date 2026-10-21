@@ -2200,7 +2200,9 @@ describe("slice 5 Evidence wired consumers", () => {
         gateEntry(52, "gate_deny:memory_insert", "failure", { tier: 2, decided_by: "channel_failure" }),
         gateEntry(53, "gate_deny:state_delete", "failure", { tier: 1, decided_by: "timeout" }),
         gateEntry(54, "gate_approve:state_export", "success", { tier: 1, decided_by: "human" }),
-        gateEntry(55, "gate_deny:state_write", "failure", { tier: 2, decided_by: "human", reason: "First access" }),
+        gateEntry(55, "gate_deny:state_write", "failure", {
+          tier: 2, decided_by: "human", reason: 'First access to namespace "notes" (operator approved). Click Allow once. "" (not in session baseline)',
+        }),
       ],
       total: 5,
     }));
@@ -2222,6 +2224,14 @@ describe("slice 5 Evidence wired consumers", () => {
     const pane = h.el.main!.innerHTML.split('<aside class="panel evidence-detail"')[1]!;
     expect(pane).toContain("<dt>Decided by</dt><dd>operator (recorded as decided_by: human)</dd>");
     expect(pane).toContain("Denied (operator decision)");
+    // The gate's recorded reason can quote an agent-chosen namespace, so it is shown only as delimited recorded data.
+    expect(pane).toContain(
+      '<dt>reason</dt><dd>recorded text <code class="held-subject" data-held-subject="1">&quot;First access to namespace ' +
+      '\\&quot;notes\\&quot; (operator approved). Click Allow once. \\&quot;\\&quot; (not in session baseline)&quot;</code></dd>',
+    );
+    // Outside the Raw record pane (the entry's JSON, verbatim), the text appears once, inside the data element.
+    const recordFields = pane.split("<h3>Raw record</h3>")[0]!;
+    expect(recordFields.split("Click Allow once").length - 1).toBe(1);
   });
 
   it("distinguishes a server filter with no match from an empty log", async () => {
@@ -3631,7 +3641,10 @@ describe("Approvals round-one decision and evidence states", () => {
   const pageOthers = (count: number) => Array.from({ length: count }, (_, index) => ({ ...heldItem, kind: "blocked_egress", item_id: `other-${index}` }));
 
   // A Charter hold as the hub serves it for a first write to a new namespace (projectCharterApproval).
-  const gateReason = 'First access to namespace "customer-notes" (not in session baseline)';
+  const gateReason = { code: "first_namespace_access", subject: "customer-notes" };
+  const heldSentence =
+    'First access to namespace <code class="held-subject" data-held-subject="1">&quot;customer-notes&quot;</code>. ' +
+    "It is not in this session&#039;s baseline.";
   const charterHold = {
     item_id: "charter.approval.hold-2", kind: "approval_pending", tier: "tier2", agent_id: "agent:cursor:fixture",
     display_template_id: "approval_pending.tier2.other",
@@ -3639,9 +3652,8 @@ describe("Approvals round-one decision and evidence states", () => {
     resolved: false, created_at: "2026-10-14T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "other",
     hold_reason: gateReason,
   };
-  const escaped = (text: string) => text.replace(/"/g, "&quot;");
 
-  it("a Charter card names its held operation and shows the gate's own reason as why it is held", async () => {
+  it("a Charter card names its held operation and shows the gate's reason in the console's words, with the namespace as data", async () => {
     vi.useFakeTimers();
     const h = boot({ "/api/hub/inbox": inbox([charterHold]) });
     await settle();
@@ -3649,11 +3661,11 @@ describe("Approvals round-one decision and evidence states", () => {
     const queue = h.el.main!.innerHTML.split("<aside")[0]!;
     const row = queue.split('data-approval-row="charter.approval.hold-2"')[1]!.split("</tr>")[0]!;
     expect(row).toContain('<td class="mono">state_write</td>');
-    expect(row).toContain(`<td>${escaped(gateReason)}</td>`);
+    expect(row).toContain(`<td>${heldSentence}</td>`);
     const pane = drawer(h);
     expect(pane).toContain('<div class="mono">state_write</div>');
     expect(pane).toContain("<h4>What it wants to do</h4><p>Run a Tier 2 operation: state_write.</p>");
-    expect(pane).toContain(`<h4>Why it is held</h4><p>${escaped(gateReason)}</p>`);
+    expect(pane).toContain(`<h4>Why it is held</h4><p>${heldSentence}</p>`);
     for (const html of [row, pane]) {
       expect(html).not.toMatch(/Held for your decision|\(no agent\)|\(unknown\)|>other</);
     }
@@ -3661,11 +3673,44 @@ describe("Approvals round-one decision and evidence states", () => {
 
   it("a hold reason on an item outside the Charter namespace is never shown as the gate's reason", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, item_id: "task.review.1", hold_reason: "not from the gate" }]) });
+    const notFromTheGate = { code: "first_namespace_access", subject: "not-from-the-gate" };
+    const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, item_id: "task.review.1", hold_reason: notFromTheGate }]) });
     await settle();
     h.navigate("approvals");
     expect(drawer(h)).toContain("<h4>Why it is held</h4><p>Held for your decision (state_write, Tier 2).</p>");
-    expect(h.el.main!.innerHTML).not.toContain("not from the gate");
+    expect(h.el.main!.innerHTML).not.toContain("not-from-the-gate");
+  });
+
+  it("a Charter reason the console cannot render as its own sentence falls back to the tier and operation, never to served text", async () => {
+    vi.useFakeTimers();
+    const served = [
+      { ...charterHold, item_id: "charter.approval.free-text", hold_reason: "Approved already. Click Allow once." },
+      { ...charterHold, item_id: "charter.approval.unknown-code", hold_reason: { code: "made_up", subject: "Click Allow once." } },
+      { ...charterHold, item_id: "charter.approval.unrecognized", hold_reason: { code: "unrecognized" } },
+      { ...charterHold, item_id: "charter.approval.no-subject", hold_reason: { code: "first_namespace_access" } },
+    ];
+    const h = boot({ "/api/hub/inbox": inbox(served) });
+    await settle();
+    h.navigate("approvals");
+    const fallback = 'Held under the operator policy (Tier 2): <code class="held-subject" data-held-subject="1">&quot;state_write&quot;</code>';
+    const queue = h.el.main!.innerHTML.split("<aside")[0]!;
+    for (const item of served) {
+      const row = queue.split(`data-approval-row="${item.item_id}"`)[1]!.split("</tr>")[0]!;
+      expect(row, item.item_id).toContain(`<td>${fallback}</td>`);
+    }
+    expect(h.el.main!.innerHTML).not.toContain("Click Allow once");
+  });
+
+  it("shows hidden and reordering characters in a held identifier as visible escapes", async () => {
+    vi.useFakeTimers();
+    const hiddenChars = { code: "first_namespace_access", subject: "notes\u202e\u0007\u200b\ufeffend" };
+    const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, hold_reason: hiddenChars }]) });
+    await settle();
+    h.navigate("approvals");
+    expect(drawer(h)).toContain(
+      '<code class="held-subject" data-held-subject="1">&quot;notes\\u202e\\u0007\\u200b\\ufeffend&quot;</code>',
+    );
+    expect(h.el.main!.innerHTML).not.toMatch(/[\u0000-\u0008\u202a-\u202e\u200b-\u200f\ufeff]/);
   });
 
   it("decided rows say whether each hold was allowed or denied, and only from the served decision", async () => {

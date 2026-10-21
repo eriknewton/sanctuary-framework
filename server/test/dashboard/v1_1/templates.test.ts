@@ -9,12 +9,14 @@
  */
 // fail-before-exempt: slice 6a anchors the approved pending-removal sentence exactly; this inherited sentence already passes on the base, as does mirror parity.
 
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   renderTemplate,
   listRegisteredTemplateIds,
 } from "../../../src/dashboard/v1_1/templates.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { clientDeclarations } from "./client-script-extract.js";
 import { STATUS_MAPPING } from "../../../src/dashboard/v1_1/status-mapping.js";
 import type { HubDisplayTemplateArg } from "../../../src/contracts/v1.1/hub-events.js";
 import {
@@ -67,21 +69,17 @@ function extractClientHelpers(): ClientArgHelpers {
   )() as ClientArgHelpers;
 }
 
-/** One top-level `function <name>(...) {...}` from the embedded client script. */
-function extractClientFunction(name: string): string {
-  const script = getClientScript();
-  const start = script.indexOf(`\nfunction ${name}(`);
-  if (start === -1) throw new Error(`client function ${name} not found in embedded script`);
-  const end = script.indexOf("\n}\n", start + 1);
-  if (end === -1) throw new Error(`client function ${name} close brace not found`);
-  return script.slice(start + 1, end + 2);
+/** The client's own shortTime, which its activity.lifecycle mirror calls. */
+function extractClientShortTime(): (iso: string) => string {
+  return clientDeclarations<{ shortTime: (iso: string) => string }>(["shortTime"], ["shortTime"]).shortTime;
 }
 
 /** The console's Operation label for a card (client approvalOperation), run from the embedded script. */
 function extractClientApprovalOperation(): (item: unknown) => string {
-  return new Function(
-    `"use strict"; ${extractClientFunction("approvalArg")}\n${extractClientFunction("approvalOperation")}\nreturn approvalOperation;`,
-  )() as (item: unknown) => string;
+  return clientDeclarations<{ approvalOperation: (item: unknown) => string }>(
+    ["approvalArg", "approvalOperation"],
+    ["approvalOperation"],
+  ).approvalOperation;
 }
 
 function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
@@ -105,8 +103,9 @@ function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
     "hasArgValue",
     "agentOr",
     "heldOperationSentence",
+    "shortTime",
     `"use strict"; return (${objectLiteral});`,
-  )(helpers.arg, helpers.hasArgValue, helpers.agentOr, helpers.heldOperationSentence) as Record<
+  )(helpers.arg, helpers.hasArgValue, helpers.agentOr, helpers.heldOperationSentence, extractClientShortTime()) as Record<
     string,
     (args: unknown[]) => string
   >;
@@ -280,49 +279,40 @@ describe("v1.1 dashboard template registry", () => {
   });
 
   it("keeps every mirrored client template and status label in parity with the server tables", () => {
-    // Full-set equality (AGENTS.md rule 5): a parity check over one entry cannot
-    // see a drifted sibling. Every template id both registries carry renders the
-    // same text from the same args, and every status key carries the same label
-    // and glyph on both sides.
-    const args: HubDisplayTemplateArg[] = [
-      { kind: "agent_id", value: "agent-alpha" },
-      { kind: "channel_template_id", value: "channel-beta" },
-      { kind: "destination_category", value: "tool-api" },
-      { kind: "policy_id", value: "policy-delta" },
-    ];
+    // Full-set equality (AGENTS.md rule 5): the two catalogs carry the same id
+    // set, and every id renders the same text on both sides for an empty arg
+    // list and for each sample list, so no drifted sibling can hide behind a
+    // passing first entry. The client mirror has no render context and always
+    // writes the past-tense activity wording, so it is compared with the
+    // server's activity surface.
     const clientTemplates = extractClientTemplates();
-    const shared = listRegisteredTemplateIds().filter((id) => id in clientTemplates);
-    expect(shared.length).toBeGreaterThan(0);
-    // The client mirror has no render context and always writes the past-tense
-    // activity wording, so it is compared with the server's activity surface.
-    // Known drift, recorded rather than hidden: these client mirrors omit the
-    // agent or time suffix the server appends. Aligning them is a separate
-    // change; this list must shrink to empty, and a new id here fails the test.
-    const KNOWN_CLIENT_TEMPLATE_DRIFT = [
-      "activity.config",
-      "activity.lifecycle",
-      "approval_pending.tier1.exit_bundle_import",
-      "approval_pending.tier1.exit_bundle_rekey",
-      "approval_pending.tier1.sanctuary_export_identity_bundle",
+    const serverIds = listRegisteredTemplateIds();
+    expect(Object.keys(clientTemplates).sort()).toEqual(serverIds);
+    const ARG_SAMPLES: HubDisplayTemplateArg[][] = [
+      [],
+      [
+        { kind: "agent_id", value: "agent-alpha" },
+        { kind: "identity_id", value: "identity-beta" },
+        { kind: "operation", value: "state_write" },
+      ],
+      [
+        { kind: "agent_id", value: "agent-alpha" },
+        { kind: "channel_template_id", value: "channel-beta" },
+        { kind: "destination_category", value: "tool-api" },
+        { kind: "policy_id", value: "policy-delta" },
+        { kind: "iso8601", value: "2026-10-21T14:36:00.000Z" },
+        { kind: "tier", value: "tier2" },
+      ],
     ];
-    const driftedWithArgs = shared
-      .filter((id) => clientTemplates[id](args) !== renderTemplate(id, args, { surface: "activity" }))
-      .sort();
-    expect(driftedWithArgs).toEqual([...KNOWN_CLIENT_TEMPLATE_DRIFT].sort());
-
-    // Missing-argument parity has its own drift list because fallback wording
-    // is a separate contract from populated slot rendering.
-    const KNOWN_CLIENT_TEMPLATE_DRIFT_WITH_MISSING_ARGS = [
-      "activity.config",
-      "activity.lifecycle",
-      "approval_pending.tier1.exit_bundle_import",
-      "approval_pending.tier1.exit_bundle_rekey",
-      "approval_pending.tier1.sanctuary_export_identity_bundle",
-    ];
-    const driftedWithMissingArgs = shared
-      .filter((id) => clientTemplates[id]([]) !== renderTemplate(id, [], { surface: "activity" }))
-      .sort();
-    expect(driftedWithMissingArgs).toEqual([...KNOWN_CLIENT_TEMPLATE_DRIFT_WITH_MISSING_ARGS].sort());
+    const drifted: string[] = [];
+    for (const id of serverIds) {
+      for (const args of ARG_SAMPLES) {
+        const client = clientTemplates[id]!(args);
+        const server = renderTemplate(id, args, { surface: "activity" });
+        if (client !== server) drifted.push(`${id} with ${args.length} args: client "${client}" server "${server}"`);
+      }
+    }
+    expect(drifted).toEqual([]);
 
     const clientStatus = extractClientStatusMap();
     const serverStatusKeys = Object.keys(STATUS_MAPPING).sort();
@@ -367,8 +357,8 @@ const CARD_PLACEHOLDERS = ["(unknown)", "(no agent)"];
 // An operation with no category of its own, which the bridge files as "other": the demo's first write to a new
 // namespace is one.
 const UNCATEGORIZED_OPERATION = "state_write";
-// The gate's reason for that hold, as gate.ts writes it.
-const GATE_NAMESPACE_REASON = 'First access to namespace "customer-notes" (not in session baseline)';
+// Why the gate held that call, as the queue record carries it (classifyHoldReason).
+const NAMESPACE_HOLD_REASON = { code: "first_namespace_access", subject: "customer-notes" } as const;
 
 /**
  * The exact sentence every Charter card renders, by operation, for Tier 1. A
@@ -406,15 +396,15 @@ it("renders every Charter card category at both tiers without a placeholder, the
           tier,
           created_at: "2026-10-21T00:00:00.000Z",
           requesting_agent_id: CHARTER_REQUESTER,
-          reason: GATE_NAMESPACE_REASON,
+          hold_reason: NAMESPACE_HOLD_REASON,
         },
         "operator-identity",
       );
       const label = `${operation} tier ${tier}`;
       expect(card.agent_id, label).toBe(CHARTER_REQUESTER);
       expect(card.display_template_args.some((a) => a.kind === "agent_id"), label).toBe(false);
-      // The gate's reason rides on the card verbatim.
-      expect(card.hold_reason, label).toBe(GATE_NAMESPACE_REASON);
+      // Why it is held rides on the card as structured data only.
+      expect(card.hold_reason, label).toEqual(NAMESPACE_HOLD_REASON);
       // The console names the held operation, never the catch-all category.
       expect(clientOperation(card), label).toBe(operation);
       const client = clientTemplates[card.display_template_id];
@@ -434,16 +424,41 @@ it("renders every Charter card category at both tiers without a placeholder, the
   }
 });
 
-it("renders every approval_pending sentence without a placeholder when the card names no target, on server and client", () => {
-  // Full-set over the catalog, not only the categories the bridge emits today: a
-  // hub-enqueued card with a missing target must read as plain copy too.
+it("renders every approval_pending sentence identically on server and client, with no placeholder when the card names no target", () => {
+  // Full-set over the catalog, not only the categories the bridge emits today:
+  // a hub-enqueued card with a missing target must read as plain copy, and the
+  // two renderers must agree on it word for word.
   const clientTemplates = extractClientTemplates();
   const ids = listRegisteredTemplateIds().filter((id) => id.startsWith("approval_pending."));
   expect(ids.length).toBeGreaterThan(0);
+  const withTarget: HubDisplayTemplateArg[] = [
+    { kind: "agent_id", value: "agent-alpha" },
+    { kind: "identity_id", value: "identity-beta" },
+    { kind: "operation", value: "state_write" },
+  ];
   for (const id of ids) {
-    for (const sentence of [renderTemplate(id, []), clientTemplates[id]!([])]) {
-      for (const placeholder of CARD_PLACEHOLDERS) expect(sentence, id).not.toContain(placeholder);
-      expect(sentence.startsWith("["), id).toBe(false);
+    expect(clientTemplates[id], `${id} has a client mirror`).toBeDefined();
+    for (const args of [[], withTarget]) {
+      const server = renderTemplate(id, args);
+      expect(clientTemplates[id]!(args), `${id} with ${args.length} args`).toBe(server);
+      expect(server.startsWith("["), id).toBe(false);
     }
+    const empty = renderTemplate(id, []);
+    for (const placeholder of CARD_PLACEHOLDERS) expect(empty, id).not.toContain(placeholder);
   }
+});
+
+it("registers every approval_pending template id a producer emits", () => {
+  // The hub's task review card is the producer outside the Charter bridge; an
+  // emitted id with no entry renders "[unrecognized template: ...]" on a live card.
+  const hubSource = readFileSync(new URL("../../../src/hub/hub-service.ts", import.meta.url), "utf8");
+  const emitted = [...hubSource.matchAll(/\$\{HUB_INBOX_TEMPLATE_NAMESPACES\.approval_pending\}\.([a-z0-9_]+\.[a-z0-9_]+)`/g)].map(
+    (m) => `approval_pending.${m[1]}`,
+  );
+  expect(emitted).toContain("approval_pending.task.ready_for_review");
+  const registered = new Set(listRegisteredTemplateIds());
+  for (const id of emitted) expect(registered.has(id), id).toBe(true);
+  expect(renderTemplate("approval_pending.task.ready_for_review", [{ kind: "agent_id", value: "agent-alpha" }])).toBe(
+    "Agent agent-alpha marked a task ready for review. Allow completes it; Deny returns it to work.",
+  );
 });

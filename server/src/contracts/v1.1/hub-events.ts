@@ -165,22 +165,23 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     reload_confirmed?: boolean;
   };
   /**
-   * The approval gate's own reason for holding this call, verbatim
-   * (`ApprovalRequest.reason`, e.g. `First access to namespace "customer-notes"
-   * (not in session baseline)`). Set only on projected Charter holds, by
-   * `projectCharterApproval` in server/src/hub/charter-approval-bridge.ts.
+   * Why the approval gate held this call, as STRUCTURED data: a reason code the
+   * console turns into a sentence it writes itself, plus, for codes that name
+   * one, the identifier the gate quoted (a namespace, a counterparty DID, a
+   * proxied tool name). Set only on projected Charter holds, by
+   * `projectCharterApproval` in server/src/hub/charter-approval-bridge.ts from
+   * `classifyHoldReason`, which recognises the gate's reason only when it
+   * re-renders byte-for-byte from the hold's own fields.
    *
-   * Deliberate, bounded exception to the safe-metadata invariant above: the
-   * gate's reason can quote an identifier from the held call (a namespace
-   * name, a counterparty DID, a proxy tool name) but never a stored value. It
-   * is the same string `GET /api/pending` already serves to the operator, it is
-   * capped at HOLD_REASON_MAX_CHARS, and it reaches only operator-authenticated
-   * reads: a loopback-position read drops every approval item
-   * (`redactApprovalPendingItemsForPositionOnly`). It is OPERATOR copy; the
-   * agent whose call was held still receives only the gate's generic denial
+   * The gate's free-text reason never reaches a card: an identifier can be
+   * agent-chosen (a namespace may contain quotes and prose), so it travels only
+   * as `subject`, which the console shows as delimited, escaped data and never
+   * as part of a sentence. Served only to operator-authenticated reads (a
+   * loopback-position read drops every approval item). It is OPERATOR copy;
+   * the agent whose call was held still receives only the gate's generic denial
    * (AGENTS.md must-never #7).
    */
-  hold_reason?: string;
+  hold_reason?: HubHoldReason;
   /**
    * The operator decision the hub delivered for a decided Charter card, set
    * only by `HubService.resolveInboxItem` after the approval queue accepted that
@@ -188,6 +189,43 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
    * gate's `gate_approve:*` / `gate_deny:*` audit row remains the record.
    */
   decision?: "approve" | "deny";
+}
+
+/**
+ * Reason codes for a held Charter call. Each code except `unrecognized` is one
+ * reason template in server/src/principal-policy/gate.ts; must match
+ * HOLD_REASON_TEMPLATES in server/src/hub/charter-approval-bridge.ts and
+ * HOLD_REASON_SENTENCES in server/src/dashboard/v1_1/client.ts.
+ */
+export const HUB_HOLD_REASON_CODES = [
+  "tier1_policy",
+  "tier1_forced",
+  "tier1_secret_waiver",
+  "tier1_unclassified",
+  "proxy_tier1",
+  "first_session",
+  "first_namespace_access",
+  "first_counterparty",
+  "signing_rate",
+  "bulk_read",
+  "frequency_spike",
+  "unrecognized",
+] as const;
+
+export type HubHoldReasonCode = (typeof HUB_HOLD_REASON_CODES)[number];
+
+export interface HubHoldReason {
+  code: HubHoldReasonCode;
+  /** True when the gate held a proxied tool call and prefixed its reason "Proxy: ". */
+  via_proxy?: boolean;
+  /**
+   * The identifier the gate's reason quoted, for codes that name one. It can be
+   * agent-chosen, so consumers render it only as delimited data, never inside
+   * prose. Capped at HOLD_REASON_SUBJECT_MAX_CHARS in charter-approval-bridge.ts.
+   */
+  subject?: string;
+  /** True when `subject` was shortened to the cap. */
+  subject_truncated?: true;
 }
 
 /**

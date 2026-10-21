@@ -232,6 +232,15 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
       : "Tier 2 policy change requested.",
   "approval_pending.tier2.other": (a) => heldOperationSentence(a, "Tier 2"),
 
+  // ── approval_pending.task.* ──────────────────────────────────────────
+  // Emitted by HubService.enqueueTaskReviewApproval in server/src/hub/hub-service.ts, whose handler completes the
+  // task on approve and returns it to in_progress on deny. Must match "approval_pending.task.ready_for_review" in
+  // client.ts.
+  "approval_pending.task.ready_for_review": (a) =>
+    hasArgValue(a, "agent_id")
+      ? `Agent ${arg(a, "agent_id")} marked a task ready for review. Allow completes it; Deny returns it to work.`
+      : "A task is ready for review. Allow completes it; Deny returns it to work.",
+
   // ── blocked_egress.* ─────────────────────────────────────────────────
   "blocked_egress.egress_policy_deny": (a) =>
     `Egress to ${arg(a, "destination_category")} blocked by policy on agent ${arg(a, "agent_id")}.`,
@@ -305,8 +314,9 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     `Privacy event recorded for agent ${arg(a, "agent_id")}.`,
   "activity.handoff": (a) =>
     `Internal handoff event involving agent ${arg(a, "agent_id")}.`,
+  // The time clause appears only when the row carries one. Must match "activity.lifecycle" in client.ts.
   "activity.lifecycle": (a) =>
-    `Lifecycle change on agent ${arg(a, "agent_id")} at ${shortTime(arg(a, "iso8601", ""))}.`,
+    `Lifecycle change on agent ${arg(a, "agent_id")}${hasArgValue(a, "iso8601") ? ` at ${shortTime(arg(a, "iso8601"))}` : ""}.`,
   "activity.lifecycle.agent_lockdown_engaged": (a) =>
     `Network access revoked for agent ${arg(a, "agent_id")}.`,
   "activity.lifecycle.agent_lockdown_partial": (a) =>

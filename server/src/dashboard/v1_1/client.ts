@@ -415,6 +415,24 @@ function escHtml(v) {
   });
 }
 
+// Characters that can disguise or reorder displayed text: DEL and C1 controls, the soft hyphen and Arabic letter
+// mark, Mongolian vowel separator, zero-width and directional marks, line and paragraph separators, bidi
+// embeddings, overrides and isolates, word joiner and invisible operators, and the byte-order mark. C0 controls
+// are already escaped by JSON.stringify.
+const HELD_SUBJECT_HIDDEN_CHARS = /[\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+
+// An agent-chosen identifier as visible data: JSON-quoted so its own quotes and backslashes are escaped, every
+// hidden or reordering character shown as a \uXXXX escape, and the whole value inside a code element.
+function heldSubjectText(value) {
+  return JSON.stringify(String(value)).replace(HELD_SUBJECT_HIDDEN_CHARS, function (c) {
+    return "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4);
+  });
+}
+
+function heldSubjectHtml(value, truncated) {
+  return '<code class="held-subject" data-held-subject="1">' + escHtml(heldSubjectText(value)) + '</code>' + (truncated ? " (shortened)" : "");
+}
+
 function escCssAttr(v) {
   return String(v || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
@@ -910,18 +928,20 @@ const TEMPLATES = {
   "approval_pending.tier1.policy_change": (a) => "Bind " + agentOr(a, "an agent") + " to " + (hasArgValue(a,"policy_id") ? "policy " + arg(a,"policy_id") : "a policy") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind " + agentOr(a, "an agent") + " to " + (hasArgValue(a,"policy_id") ? "template " + arg(a,"policy_id") : "a template") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
-  "approval_pending.tier1.exit_bundle_import": (a) => "Import a portable bundle into this fortress.",
-  "approval_pending.tier1.exit_bundle_rekey": (a) => "Re-key encrypted state for portable export.",
+  "approval_pending.tier1.exit_bundle_import": (a) => "Import a portable bundle into this fortress. Agent: " + arg(a,"agent_id","all agents") + ".",
+  "approval_pending.tier1.exit_bundle_rekey": (a) => "Re-key encrypted state for portable export. Agent: " + arg(a,"agent_id","all agents") + ".",
   "approval_pending.tier1.state_export": (a) => hasArgValue(a,"agent_id") ? "Export agent " + arg(a,"agent_id") + " state as a portable bundle." : "Export state from this fortress as a portable bundle.",
   "approval_pending.tier1.state_import": (a) => hasArgValue(a,"agent_id") ? "Import state into agent " + arg(a,"agent_id") + "." : "Import state into this fortress.",
   "approval_pending.tier1.state_delete": (a) => hasArgValue(a,"agent_id") ? "Delete state for agent " + arg(a,"agent_id") + ". This is irreversible." : "Delete stored state from this fortress. This is irreversible.",
   "approval_pending.tier1.identity_rotate": (a) => "Rotate the identity key for " + arg(a,"agent_id","this fortress") + ".",
   "approval_pending.tier1.reputation_export": (a) => hasArgValue(a,"agent_id") ? "Export reputation bundle for " + arg(a,"agent_id") + "." : "Export a reputation bundle from this fortress.",
   "approval_pending.tier1.reputation_import": (a) => hasArgValue(a,"agent_id") ? "Import reputation bundle for " + arg(a,"agent_id") + "." : "Import a reputation bundle into this fortress.",
-  "approval_pending.tier1.sanctuary_export_identity_bundle": (a) => "Export the operator identity bundle.",
+  "approval_pending.tier1.sanctuary_export_identity_bundle": (a) => "Export the operator identity bundle for " + arg(a,"agent_id","this operator") + ".",
   "approval_pending.tier1.other": (a) => heldOperationSentence(a, "Tier 1"),
   "approval_pending.tier2.policy_change": (a) => hasArgValue(a,"agent_id") ? "Tier 2 policy change requested on agent " + arg(a,"agent_id") + "." : "Tier 2 policy change requested.",
   "approval_pending.tier2.other": (a) => heldOperationSentence(a, "Tier 2"),
+  // Must match "approval_pending.task.ready_for_review" in templates.ts.
+  "approval_pending.task.ready_for_review": (a) => hasArgValue(a,"agent_id") ? "Agent " + arg(a,"agent_id") + " marked a task ready for review. Allow completes it; Deny returns it to work." : "A task is ready for review. Allow completes it; Deny returns it to work.",
   "blocked_egress.egress_policy_deny": (a) => "Egress to " + arg(a,"destination_category") + " blocked by policy on agent " + arg(a,"agent_id") + ".",
   "blocked_egress.budget_exceeded": (a) => "Egress to " + arg(a,"destination_category") + " blocked: budget exceeded for agent " + arg(a,"agent_id") + ".",
   "blocked_egress.privacy_fail_closed": (a) => "Egress to " + arg(a,"destination_category") + " blocked: privacy filter unavailable, fail-closed default applied for agent " + arg(a,"agent_id") + ".",
@@ -951,7 +971,7 @@ const TEMPLATES = {
   "activity.egress": (a) => "Outbound traffic from agent " + arg(a,"agent_id") + " to " + arg(a,"destination_category") + ".",
   "activity.privacy": (a) => "Privacy event recorded for agent " + arg(a,"agent_id") + ".",
   "activity.handoff": (a) => "Internal handoff event involving agent " + arg(a,"agent_id") + ".",
-  "activity.lifecycle": (a) => "Lifecycle change on agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle": (a) => "Lifecycle change on agent " + arg(a,"agent_id") + (hasArgValue(a,"iso8601") ? " at " + shortTime(arg(a,"iso8601")) : "") + ".",
   "activity.lifecycle.agent_lockdown_engaged": (a) => "Network access revoked for agent " + arg(a,"agent_id") + ".",
   "activity.lifecycle.agent_lockdown_partial": (a) => "Network access was revoked on disk for agent " + arg(a,"agent_id") + ", but the live Castle Wall reload was not confirmed.",
   "activity.lifecycle.agent_lockdown_refused": (a) => "Network stop refused for agent " + arg(a,"agent_id") + ".",
@@ -961,7 +981,7 @@ const TEMPLATES = {
   "activity.lifecycle.fortress_lockdown_no_agents": () => "Fortress lockdown found no confined agents to lock.",
   "activity.agent_policy_change_engaged": (a) => "Template binding changed on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
   "activity.agent_policy_change_denied": (a) => "Template binding denied on agent " + arg(a,"agent_id") + ": " + arg(a,"channel_template_id","default none") + " to " + arg(a,"policy_id") + ".",
-  "activity.config": (a) => "Configuration change applied.",
+  "activity.config": (a) => "Configuration change applied. Agent: " + arg(a,"agent_id","(fortress)") + ".",
   "activity.other": (a) => "Audit event recorded for agent " + arg(a,"agent_id","(fortress)") + "."
 };
 
@@ -3856,8 +3876,14 @@ function evidenceDetailsList(entry) {
   if (!details) return "";
   const keys = Object.keys(details).sort();
   if (!keys.length) return "";
+  // A gate entry's recorded reason can quote an identifier the agent chose, so it is shown as delimited recorded
+  // data (heldSubjectHtml), never as a line of prose the operator could read as guidance.
+  const gateEntry = String(entry && entry.operation || "").indexOf("gate_") === 0;
   return '<dt>Details</dt><dd>showing ' + Math.min(keys.length, EVIDENCE_DETAIL_KEY_LIMIT) + ' of ' + keys.length + ' fields</dd>' + keys.slice(0, EVIDENCE_DETAIL_KEY_LIMIT).map(function (key) {
-    return '<dt>' + escHtml(cappedText(key, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dt><dd>' + escHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
+    const value = gateEntry && key === "reason" && typeof details[key] === "string"
+      ? 'recorded text ' + heldSubjectHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS), false)
+      : escHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS));
+    return '<dt>' + escHtml(cappedText(key, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dt><dd>' + value + '</dd>';
   }).join("");
 }
 
@@ -5251,15 +5277,46 @@ function approvalText(item) {
   return renderTemplate(item.display_template_id, item.display_template_args);
 }
 
-function approvalHoldReason(item) {
+// Why a Charter hold is held, written by this console from the card's structured hold_reason code. Must match
+// HUB_HOLD_REASON_CODES in server/src/contracts/v1.1/hub-events.ts. A sentence with a subject slot shows the
+// gate-quoted identifier only through heldSubjectHtml, as delimited data, never inside the sentence's own words.
+const HOLD_REASON_SENTENCES = {
+  tier1_policy: { before: "Your operator policy lists this operation as Tier 1, so it always asks for approval." },
+  tier1_forced: { before: "This operation is always Tier 1, so it always asks for approval." },
+  tier1_secret_waiver: { before: "This call names a file excluded from the secret check, so it always asks for approval." },
+  tier1_unclassified: { before: "This operation is not listed in any policy tier, so it asks for approval by default." },
+  proxy_tier1: { before: "Proxied tool ", after: " is configured as Tier 1, so it always asks for approval." },
+  first_session: { before: "This is the first session, so this operation has no established baseline yet." },
+  first_namespace_access: { before: "First access to namespace ", after: ". It is not in this session's baseline." },
+  first_counterparty: { before: "First interaction with counterparty ", after: "." },
+  signing_rate: { before: "Signing is happening faster than the policy limit." },
+  bulk_read: { before: "Many reads from namespace ", after: " in the last 60 seconds." },
+  frequency_spike: { before: "This operation is being called far more often than its average." }
+};
+
+// "Why it is held" as HTML. Must-never #7 keeps denials returned to the AGENT generic. This text is shown to the
+// OPERATOR, and every word of it is written here: a Charter card carries why the gate held the call only as a
+// structured code (classifyHoldReason in server/src/hub/charter-approval-bridge.ts), never the gate's free text,
+// so an identifier the agent chose cannot pose as guidance, and an unrecognised reason gets a fixed sentence.
+function approvalHoldReasonHtml(item) {
   const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
-  // Must-never #7 keeps denials returned to the AGENT generic. This text is shown to the OPERATOR, and a Charter
-  // card's hold_reason is the gate's own operator-facing reason, verbatim and served only on operator-authenticated
-  // reads, so the console shows it as-is and adds no policy rule or tier logic of its own.
-  if (isCharterApprovalItem(item) && typeof item.hold_reason === "string" && item.hold_reason) return item.hold_reason;
+  // A served hold_reason that is not the structured object (free text from an older or foreign producer) is never
+  // shown; it reads as unrecognised and takes the fixed sentence below.
+  const served = isCharterApprovalItem(item) && item.hold_reason !== undefined && item.hold_reason !== null ? item.hold_reason : null;
+  const reason = served === null ? null : (typeof served === "object" && !Array.isArray(served) ? served : { code: "unrecognized" });
+  if (reason) {
+    const sentence = Object.prototype.hasOwnProperty.call(HOLD_REASON_SENTENCES, reason.code) ? HOLD_REASON_SENTENCES[reason.code] : null;
+    const hasSubject = typeof reason.subject === "string" && reason.subject.length > 0;
+    // A known code renders only in the shape it was written for; a subject slot with no subject falls through.
+    if (sentence && (sentence.after === undefined) === !hasSubject) {
+      const prefix = reason.via_proxy === true ? "Through a proxied tool: " : "";
+      return escHtml(prefix + sentence.before) + (hasSubject ? heldSubjectHtml(reason.subject, reason.subject_truncated === true) + escHtml(sentence.after) : "");
+    }
+    return escHtml("Held under the operator policy (" + tier + "): ") + heldSubjectHtml(approvalOperation(item), false);
+  }
   // Hub controls and the catch-all category carry no policy-gate reason in the served item.
-  if (item.operation_category === "other" || !isCharterApprovalItem(item)) return "Held for your decision (" + approvalOperation(item) + ", " + tier + ").";
-  return approvalOperation(item) + " is a " + tier + " operation under the operator policy.";
+  if (item.operation_category === "other" || !isCharterApprovalItem(item)) return escHtml("Held for your decision (" + approvalOperation(item) + ", " + tier + ").");
+  return escHtml(approvalOperation(item) + " is a " + tier + " operation under the operator policy.");
 }
 
 // Rule 7: item.decision is the operator action the hub delivered and the approval queue accepted
@@ -5334,7 +5391,7 @@ function renderApprovalRow(item, selectedId) {
       '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
       '<td><strong>' + escHtml(agent) + '</strong></td>' +
       '<td class="mono">' + escHtml(op) + '</td>' +
-      '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+      '<td>' + approvalHoldReasonHtml(item) + '</td>' +
       '<td class="mono muted decided-at">Decided at ' + escHtml(shortTime(item.resolved_at || created)) + '</td>' +
       '<td><span class="state-chip neutral" data-approval-decision="' + escHtml(decisionLabel.toLowerCase()) + '"><i aria-hidden="true"></i>' + escHtml(decisionLabel) + '</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
     '</tr>';
@@ -5349,7 +5406,7 @@ function renderApprovalRow(item, selectedId) {
     '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
     '<td><strong>' + escHtml(agent) + '</strong></td>' +
     '<td class="mono">' + escHtml(op) + '</td>' +
-    '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+    '<td>' + approvalHoldReasonHtml(item) + '</td>' +
     '<td class="mono">' + escHtml(age) + '</td>' +
     '<td>' + decisionCell + echo + '</td>' +
   '</tr>';
@@ -5407,7 +5464,7 @@ function renderApprovalDrawer(item, empty) {
     '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? approvalDecisionLabel(item) : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
     '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
     // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
-    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + approvalHoldReasonHtml(item) + '</p></div>' +
     '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
     tier1Note +
     '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + restartButton + '</div>' + confirmRow + renderDecisionInline(item) + '<p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +

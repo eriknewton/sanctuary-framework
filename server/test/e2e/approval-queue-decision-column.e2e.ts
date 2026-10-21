@@ -1,12 +1,13 @@
 /**
  * Approvals queue at 1440 px with the drawer open: the Decision column stays
  * fully inside the queue's scroll box, so its header and every decision control
- * read whole ("Allow once", "Deny", "Review in drawer", the decided chip) rather
- * than clipped at the box edge ("Allow or", "DECID").
+ * read whole, and a decision's feedback message does not move any live decision
+ * control (the Allow, Deny and Review buttons in the queue and the drawer).
  *
  * The cards are shaped as the hub serves the demo's two Charter holds: long
- * registry agent ids and operation names with no break opportunity, and the
- * gate's own hold reason. Reads are served locally; nothing is decided.
+ * registry agent ids and operation names with no break opportunity, and a
+ * structured hold reason. Reads are served locally; the one decision posted is
+ * refused by the fixture, so nothing is decided.
  */
 import { test, expect } from "./fixtures/dashboard.js";
 
@@ -31,20 +32,25 @@ test.describe("Approvals queue Decision column at 1440 with the drawer open", ()
   test("the Decision header and every decision cell fit inside the queue", async ({ page, dashboard }) => {
     const items = [
       charterCard("40b62abdc8074e8d", "tier1", "state_export", "state_export", {
-        hold_reason: '"state_export" is a Tier 1 operation (always requires approval)',
+        hold_reason: { code: "tier1_policy" },
       }),
       charterCard("81fe29c9ce4f71ea", "tier2", "state_write", "other", {
-        hold_reason: 'First access to namespace "customer-notes" (not in session baseline)',
+        hold_reason: { code: "first_namespace_access", subject: "customer-notes" },
       }),
       charterCard("decided0decided0", "tier1", "sanctuary_export_identity_bundle", "other", {
         resolved: true, resolved_at: FIXTURE_TIME, decision: "deny",
-        hold_reason: '"sanctuary_export_identity_bundle" is a Tier 1 operation (always requires approval)',
+        hold_reason: { code: "tier1_policy" },
       }),
     ];
     await page.route("**/api/**", async (route) => {
       const path = new URL(route.request().url()).pathname;
       // Hold the event stream open without frames, so no reconnect redraw runs mid-measure.
       if (path === "/api/stream") return;
+      // Refuse the one decision this test posts, so its feedback appears and the holds stay open.
+      if (route.request().method() === "POST") {
+        await route.fulfill({ status: 409, json: { error: "Fixture refusal" } });
+        return;
+      }
       const data = path === "/api/hub/inbox" ? { data: { items } }
         : path === "/api/posture/home" ? { origin_machine: "fixture", agents: [], castle_wall: { arm_state: "unknown" }, digest: {} }
         : path === "/api/posture/evidence" ? { origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } }
@@ -102,5 +108,29 @@ test.describe("Approvals queue Decision column at 1440 with the drawer open", ()
     }
     await expect(wrap.locator('[data-action="inbox-approve"][data-item-id="charter.approval.81fe29c9ce4f71ea"]')).toHaveText("Allow once");
     await expect(wrap.locator('[data-approval-decision="denied"]')).toHaveText("DENIED");
+
+    // A decision's feedback message appears without moving any live decision control in the queue or the drawer.
+    // (The refused row's own inline echo may push a decided row's status chip below it; that chip is not a control.)
+    const decisionControls = page.locator(
+      '#approval-queue td:last-child button, aside.approval-drawer button[data-action^="inbox-"]',
+    );
+    const placed = async () => decisionControls.evaluateAll((els) => els.map((el) => {
+      const r = el.getBoundingClientRect();
+      return { text: (el.textContent || "").trim(), x: r.x, y: r.y, width: r.width, height: r.height };
+    }));
+    const before = await placed();
+    // Review in drawer, Allow once and Deny in the queue, plus the drawer's Allow once and Deny.
+    expect(before.map((c) => c.text)).toEqual(["Review in drawer", "Allow once", "Deny", "Allow once", "Deny"]);
+    await expect(page.locator('#feedback [data-decision-status="refused"]')).toHaveCount(0);
+    await wrap.locator('[data-action="inbox-approve"][data-item-id="charter.approval.81fe29c9ce4f71ea"]').click();
+    await expect(page.locator('#feedback [data-decision-status="refused"]')).toContainText("Fixture refusal");
+    await expect(wrap.locator('[data-action="inbox-approve"][data-item-id="charter.approval.81fe29c9ce4f71ea"]')).toBeEnabled();
+    const after = await placed();
+    expect(after.map((c) => c.text)).toEqual(before.map((c) => c.text));
+    after.forEach((box, i) => {
+      for (const side of ["x", "y", "width", "height"] as const) {
+        expect(Math.abs(box[side] - before[i]![side]), `${box.text} ${side} after feedback`).toBeLessThanOrEqual(EDGE_EPSILON_PX);
+      }
+    });
   });
 });
