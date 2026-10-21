@@ -178,8 +178,14 @@ root_pid=""
 if [ -n "$new_root" ] && [ -f "$new_root/$pid_basename" ]; then
   root_pid=$(tr -d '[:space:]' < "$new_root/$pid_basename")
 fi
-if [ -z "$new_lstart" ] || [ "$new_lstart" != "$launch_lstart" ] || [ "$root_pid" != "$demo_pid" ]; then
-  echo "The demo started but its identity could not be recorded; stop it with: kill -TERM $demo_pid" >&2
+if [ -z "$new_lstart" ] || [ "$new_lstart" != "$launch_lstart" ]; then
+  echo "The demo reported ready, but pid $demo_pid no longer has the start time captured at launch, so it was not recorded." >&2
+  echo "If that pid is your demo, stop it with: kill -TERM $demo_pid" >&2
+  exit 1
+fi
+if [ "$root_pid" != "$demo_pid" ]; then
+  echo "The demo reported ready, but its demo root's $pid_basename does not name pid $demo_pid, so it was not recorded." >&2
+  echo "If that pid is your demo, stop it with: kill -TERM $demo_pid" >&2
   exit 1
 fi
 printf '%s\n%s\n%s\n' "$demo_pid" "$new_lstart" "$new_root" > "$instance_file"

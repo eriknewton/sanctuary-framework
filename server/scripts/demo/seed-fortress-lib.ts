@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, constants as fsConstants, mkdtempSync, rmSync } from "node:fs";
-import { chmod, mkdir, open, rm, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, open, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { establishMaster } from "../../src/core/master-custody.js";
@@ -62,6 +62,8 @@ const DEMO_AUTH_TOKEN_MIN_CHARS = Math.ceil(
 const DEMO_AUTH_TOKEN_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${DEMO_AUTH_TOKEN_MIN_CHARS},}$`);
 // 1 KiB is far above one token plus a newline, so a larger file is the wrong path, and it is never read whole.
 const DEMO_TOKEN_FILE_MAX_BYTES = 1024;
+// 8 random bytes (16 hex characters) make a token temp name unique next to the pid.
+const DEMO_TOKEN_TEMP_RANDOM_BYTES = 8;
 // Group and other permission bits; a reused token file must have none of them set.
 const GROUP_OTHER_MODE_BITS = 0o077;
 // The demo keeps two holds open for one hour; the README states this auto-deny bound.
@@ -268,26 +270,57 @@ export function mintDemoAuthToken(): string {
 }
 
 /**
- * Reuse the demo token stored at `path`, or mint one and store it there.
+ * Reuse the demo token stored at `path`, or mint one and publish it there.
  *
  * A reused file must be a regular file (not a symlink) owned by this user with
  * no group or other permission bits, and must hold one base64url token at least
- * as long as a minted one; anything else is refused without echoing its
- * contents. A missing file is created with mode 0600, and only an empty file
- * that passes the same checks is ever written, so this never overwrites a token
- * or a file it did not validate.
+ * as long as a minted one; anything else, including an empty file, is refused
+ * without echoing its contents. This never writes into an existing file: a new
+ * token is published whole, so it never overwrites a token or a file it did not
+ * create, and concurrent first runs all end up with the one token that won.
  */
 export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: string; reused: boolean }> {
+  const token = mintDemoAuthToken();
+  // Atomic publish: the token is written in full to a private temp file in the
+  // same directory, then hard-linked to `path`. link() never replaces or follows
+  // an existing entry (a file, symlink, dangling symlink or FIFO all give EEXIST),
+  // so exactly one concurrent first run publishes, and a reader can never see a
+  // partial token because the name appears only after the write completed.
+  const tempPath = join(dirname(path), `${basename(path)}.${process.pid}.${randomBytes(DEMO_TOKEN_TEMP_RANDOM_BYTES).toString("hex")}.tmp`);
+  let published = false;
+  try {
+    const temp = await open(
+      tempPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      OPERATOR_TOKEN_FILE_MODE,
+    );
+    try {
+      // The umask may have narrowed the create mode; the published file is exactly owner read/write.
+      await temp.chmod(OPERATOR_TOKEN_FILE_MODE);
+      await temp.writeFile(`${token}\n`);
+    } finally {
+      await temp.close();
+    }
+    await link(tempPath, path).then(
+      () => { published = true; },
+      (error: NodeJS.ErrnoException) => { if (error.code !== "EEXIST") throw error; },
+    );
+  } finally {
+    await unlink(tempPath).catch(() => undefined);
+  }
+  if (published) return { token, reused: false };
+  return readExistingDemoToken(path);
+}
+
+async function readExistingDemoToken(path: string): Promise<{ token: string; reused: boolean }> {
   // One open, and every decision after it is made on that descriptor, never on
-  // the path, so the file validated is the file read or written (no
-  // check-then-use window). O_CREAT makes a missing file with mode 0600;
+  // the path, so the file validated is the file read (no check-then-use window).
   // O_NOFOLLOW refuses a symlink at the final component with ELOOP, so nothing
-  // is created or read through one; O_NONBLOCK keeps a FIFO planted at the path
-  // from blocking the open (the regular-file check then refuses it).
+  // is read through one; O_NONBLOCK keeps a FIFO planted at the path from
+  // blocking the open (the regular-file check then refuses it).
   const handle = await open(
     path,
-    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
-    OPERATOR_TOKEN_FILE_MODE,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
   ).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ELOOP") throw new Error(`refusing demo token file that is not a regular file: ${path}`);
     throw error;
@@ -306,13 +339,6 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
     if (existing.size > DEMO_TOKEN_FILE_MAX_BYTES) {
       throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
     }
-    if (existing.size === 0) {
-      // Just created, or an empty owner-only file that already passed the checks
-      // above: nothing is lost by writing the minted token through this descriptor.
-      const token = mintDemoAuthToken();
-      await handle.writeFile(`${token}\n`);
-      return { token, reused: false };
-    }
     // Bounded read through the validated descriptor: one byte past the cap is
     // requested, so a file that grew after the size check is refused, never read whole.
     const buffer = Buffer.alloc(DEMO_TOKEN_FILE_MAX_BYTES + 1);
@@ -320,11 +346,11 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
     if (bytesRead > DEMO_TOKEN_FILE_MAX_BYTES) {
       throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
     }
-    const token = buffer.subarray(0, bytesRead).toString("utf8").trim();
-    if (!DEMO_AUTH_TOKEN_PATTERN.test(token)) {
+    const stored = buffer.subarray(0, bytesRead).toString("utf8").trim();
+    if (!DEMO_AUTH_TOKEN_PATTERN.test(stored)) {
       throw new Error(`refusing demo token file that does not hold a demo token: ${path}`);
     }
-    return { token, reused: true };
+    return { token: stored, reused: true };
   } finally {
     await handle.close();
   }

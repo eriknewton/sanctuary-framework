@@ -865,6 +865,8 @@ const AUDIT_POLL_INTERVAL_MS = 50;
 const RESET_TIMEOUT_MS = 60_000;
 // Two resets plus teardown within one test.
 const RESET_TEST_TIMEOUT_MS = 3 * RESET_TIMEOUT_MS;
+// Enough simultaneous first runs that an unserialized create would hand out different tokens.
+const CONCURRENT_FIRST_RUNS = 8;
 // Group and other read bits, which a reused token file must not carry.
 const GROUP_OTHER_READABLE_MODE = 0o644;
 // 22 = base64url length of 16 random bytes with no padding, the minted demo token.
@@ -944,7 +946,13 @@ async function stopProcessGroup(pgid: number): Promise<void> {
     try { process.kill(-pgid, 0); } catch { return; }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, AUDIT_POLL_INTERVAL_MS));
   }
-  try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ }
+  try { process.kill(-pgid, "SIGKILL"); } catch { return; }
+  // A SIGKILL is only a request: the group is reaped when the bounded wait sees it gone, or the cleanup fails.
+  for (let attempt = 0; attempt < AUDIT_POLL_ATTEMPTS; attempt++) {
+    try { process.kill(-pgid, 0); } catch { return; }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, AUDIT_POLL_INTERVAL_MS));
+  }
+  throw new Error(`process group ${pgid} survived SIGKILL`);
 }
 
 async function runReset(env: NodeJS.ProcessEnv, bashArgs: string[] = []): Promise<ResetRun> {
@@ -1065,6 +1073,26 @@ describe("stable demo token file", () => {
     expect(file.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
     expect(file.text.trim()).toBe(first.token);
     expect(await loadOrCreateDemoTokenFile(path)).toEqual({ token: first.token, reused: true });
+  });
+
+  it("gives every concurrent first run the one published token and leaves no temp files", async () => {
+    const dir = await scratchDir("sanctuary-demo-token-");
+    const path = join(dir, "operator-token");
+    const runs = await Promise.all(Array.from({ length: CONCURRENT_FIRST_RUNS }, () => loadOrCreateDemoTokenFile(path)));
+    const tokens = new Set(runs.map((run) => run.token));
+    expect(tokens.size).toBe(1);
+    expect(runs.filter((run) => !run.reused)).toHaveLength(1);
+    const file = await readModeAndText(path);
+    expect(file.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
+    expect(file.text.trim()).toBe(runs[0]!.token);
+    expect(await readdir(dir)).toEqual(["operator-token"]);
+  });
+
+  it("refuses an existing empty token file rather than writing into it", async () => {
+    const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
+    await writeFile(path, "", { mode: OPERATOR_TOKEN_FILE_MODE });
+    await expect(loadOrCreateDemoTokenFile(path)).rejects.toThrow(/does not hold a demo token/);
+    expect(await readFile(path, "utf8")).toBe("");
   });
 
   it("refuses a token file readable by group or others", async () => {
