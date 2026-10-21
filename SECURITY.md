@@ -55,7 +55,7 @@ reporting an issue you cannot reproduce on it.
 | Version | Supported |
 |---|---|
 | `1.8.x` (npm `latest`, currently `1.8.4`) | :white_check_mark: |
-| `1.8.6-rc.*` (npm `next`, currently `1.8.6-rc.5`) | :warning: pre-release; a fix lands in the next `1.8.x` release, and no rc is patched in place |
+| `1.9.0-rc.*` (npm `next`, currently `1.9.0-rc.1`) | :warning: pre-release; a fix lands in the next `1.9.x` release, and no rc is patched in place |
 | `< 1.8` | :x: |
 
 The npm `latest` dist-tag is the authoritative pointer to the currently

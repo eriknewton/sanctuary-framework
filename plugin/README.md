@@ -56,7 +56,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Tools provided
 
-111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`), spanning the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge and system tools. The five named mechanisms of the Castle Architecture are Castle Wall, Sentinels, Charter, Heralds, and Mantle; this plugin exposes Charter. See the skill documentation for the featured workflows.
+111 registered MCP tools (measured 2026-10-13 from `server/test/fixtures/tools-list-wire-golden.json`), spanning the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge and system tools. The five named mechanisms of the Castle Architecture are Castle Wall, Sentinels, Charter, Heralds, and Mantle; this plugin exposes Charter. See the skill documentation for the featured workflows.
 
 ## License
 

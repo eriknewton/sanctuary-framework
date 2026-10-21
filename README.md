@@ -110,7 +110,7 @@ socket as cross-host exclusion.
 4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) and opens in your browser with a one-click auth token.
 5. Every MCP tool call Sanctuary executes or forwards is policy-gated first and logged. Sensitive-content redaction and query-layer anonymity layer on top per the Assurance Matrix: fingerprintable-header stripping is on by default, and an opt-in, consent-gated PII rewrite scrubs query content before it leaves the machine, with the rewrite's internal classifier pinned to local processing so a privacy feature can never become an egress channel. Dangerous operations require your approval.
 
-Useful flags: `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal. `--unwrap` restores the original harness config. `--passphrase-stdin` (from 1.8.6, unreleased; an unknown-flag refusal on the v1.8.4 tag and on the 1.8.6 pre-releases) reads the fortress passphrase from piped stdin. Two other verbs have non-interactive forms: `sanctuary init --no-confirm` skips the recovery-key confirmation that otherwise refuses to run without a terminal, and `sanctuary export-passphrase --yes` skips its `Continue? [y/N]` prompt. An installing agent never runs `export-passphrase`; see the agent section below.
+Useful flags: `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal. `--unwrap` restores the original harness config. `--passphrase-stdin` (from 1.9.0, including the 1.9.0-rc.1 preview; an unknown-flag refusal on the v1.8.4 tag and on the 1.8.6 pre-releases) reads the fortress passphrase from piped stdin. Two other verbs have non-interactive forms: `sanctuary init --no-confirm` skips the recovery-key confirmation that otherwise refuses to run without a terminal, and `sanctuary export-passphrase --yes` skips its `Continue? [y/N]` prompt. An installing agent never runs `export-passphrase`; see the agent section below.
 
 **Back up your passphrase:**
 
@@ -136,20 +136,23 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 npm install -g @sanctuary-framework/mcp-server
 ```
 
-The current opt-in preview is **v1.8.6-rc.5** on npm's `next` channel. Default
-installs still resolve to v1.8.4, and RC5 does not widen any capability claim.
+The current opt-in preview is **v1.9.0-rc.1** on npm's `next` channel. Default
+installs still resolve to v1.8.4, and rc.1 states no capability beyond the
+bounded rows of the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
 ```bash
-npm install -g @sanctuary-framework/mcp-server@1.8.6-rc.5
+npm install -g @sanctuary-framework/mcp-server@1.9.0-rc.1
 # or run the guided installer without a global install
-npx -y @sanctuary-framework/mcp-server@1.8.6-rc.5 protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server@1.9.0-rc.1 protect --claude-code --no-open --no-dashboard
 ```
 
-The [v1.8.6-rc.5 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.8.6-rc.5)
-carries the signed and notarized macOS app. Its
-`Sanctuary-CastleWall.app.zip` SHA-256 is
-`bd19890ad40d8c15b0c44201d537d6d7c9d6c82437db6a4611f8d841837409aa`.
-See the [RC5 release notes](docs/releases/v1.8.6.md) for the bounded fix set.
+No signed macOS app is attached for this preview yet. Castle Wall `enable`
+requires an app built from the same commit as the CLI, so macOS wall testing of
+rc.1 waits for `Sanctuary-CastleWall.app.zip` on the
+[v1.9.0-rc.1 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.9.0-rc.1),
+whose SHA-256 will be recorded here once verified. The v1.8.4 app above pairs
+only with the v1.8.4 CLI.
+See the [1.9.0 release notes](docs/releases/v1.9.0.md) for what changed since 1.8.4.
 
 ### Verify before you trust
 
@@ -306,7 +309,7 @@ machine; `operator_actions` then lists what the operator still does in
 private, such as moving a staged recovery file into a password manager.
 `observations.*` is the evidence the status was derived from, and `notes` is
 prose for the operator (v1.8.4 puts one reminder string there on every
-response: rerun the planner after each action). Three observations arrive from 1.8.6-rc.5 (npm `next`) and are absent
+response: rerun the planner after each action). Three observations arrive from the 1.9.0-rc.1 preview (npm `next`) and are absent
 on v1.8.4: `tier1_approval`, `staged_recovery_file`, and `vault_provision`.
 
 The operator, not the agent, performs three things: Apple consent, bounded
@@ -514,7 +517,7 @@ For AI coding agents handling install failures. Every case below is keyed to a f
 **`custody_mutation: "unavailable"` on Windows:**
 - Expected. Windows can open an already-enveloped fortress for authenticated custody read with an available credential, but custody creation, migration, rekey, reset, and `restore-attest` remain unavailable until a crash-recoverable cross-process lock is implemented; install readiness stays fail-closed.
 
-**`tier1_approval: "unavailable"` (from 1.8.6-rc.5):**
+**`tier1_approval: "unavailable"` (from 1.9.0-rc.1):**
 - The memory profile is mechanically installed but no human-resolvable Tier 1 channel is configured. The planner names the policy or config edit that selects the local dashboard and an operator-held bearer; that edit is a human action. Never weaken the Tier 1 classification to get past it.
 
 **`doctor --json` reports `FAIL` checks:**
