@@ -1,3 +1,4 @@
+import { CrossProcessLockError } from "../storage/cross-process-lock.js";
 import {
   execFile as nodeExecFile,
   execSync as nodeExecSync,
@@ -2677,11 +2678,20 @@ export async function runDaemon(
     derived = { key: custodyResult.masterKey };
     daemonMasterWriteBarrier = custodyResult.masterWriteBarrier;
   } catch (error) {
-    write(
-      err,
-      `Refusing to start: ${error instanceof Error ? error.message : String(error)}\n` +
-        "(nothing provisioned to bring up, or the credential does not unlock this fortress).\n",
-    );
+    // Structural refusal must direct the operator to the lock, not to provisioning or credentials.
+    if (error instanceof CrossProcessLockError && error.kind === "scaffold-integrity") {
+      write(
+        err,
+        "The custody lock structure is malformed or substituted. The daemon refused to start without its rotation barrier. " +
+          "Check the custody lock directory owner and contents.\n",
+      );
+    } else {
+      write(
+        err,
+        `Refusing to start: ${error instanceof Error ? error.message : String(error)}\n` +
+          "(nothing provisioned to bring up, or the credential does not unlock this fortress).\n",
+      );
+    }
     return 1;
   }
   if (derived === undefined) return 1;

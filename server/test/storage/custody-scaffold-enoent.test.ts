@@ -332,7 +332,7 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")(
 
       for (const point of ["first stat", "second stat"] as const) {
         for (const shape of ["hardlink", "mode", "contents"] as const) {
-          it(`refuses ${suffix} ${shape} at ${point} with capability`, async () => {
+          it(`refuses ${suffix} ${shape} at ${point} with scaffold-integrity`, async () => {
             let visits = 0;
             intercept(suffix, point, async (path) => {
               visits += 1;
@@ -345,7 +345,7 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")(
                 await fs.writeFile(path, "not inert");
               }
             });
-            await expect(acquire()).rejects.toMatchObject({ kind: "capability" });
+            await expect(acquire()).rejects.toMatchObject({ kind: "scaffold-integrity" });
             expect(visits).toBe(1);
             await assertNoAdmission();
           });
@@ -385,7 +385,7 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")(
         const outcome = acquire();
         await expect(outcome).rejects.toThrow();
         if (replacement === "identity" || replacement === "hardlink") {
-          await expect(outcome).rejects.toMatchObject({ kind: "capability" });
+          await expect(outcome).rejects.toMatchObject({ kind: "scaffold-integrity" });
         }
         expect(visits).toBe(2); // The replacement is examined on the recovery attempt.
         expect(target).not.toBe("");
