@@ -146,8 +146,10 @@ export interface ApprovalRequest {
    */
   args_binding?: string;
   /**
-   * The hub agent id of the agent whose tool call raised this hold, in the
-   * registry form `agent:<SANCTUARY_AGENT_ID>`. Set only by `ApprovalGate`
+   * The hub agent id of the agent this server process is configured for, in
+   * the registry form `agent:<SANCTUARY_AGENT_ID>`: the requester of the held
+   * call, never its target (the target is what the call's own arguments name).
+   * Set only by `ApprovalGate`
    * from its server-set `currentAgentId` supplier (the wrap-time
    * `SANCTUARY_AGENT_ID` of this MCP server process, the same source the
    * router uses for `callerIdentity`), never from tool arguments or request

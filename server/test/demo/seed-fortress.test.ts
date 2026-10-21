@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
@@ -870,7 +871,44 @@ const GROUP_OTHER_READABLE_MODE = 0o644;
 const MINTED_TOKEN_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 // Must match the state file names in server/scripts/demo/reset.sh.
 const RESET_TOKEN_FILE = "operator-token";
-const RESET_ROOT_FILE = "demo-root";
+// Three lines: pid, ps lstart, demo root.
+const RESET_INSTANCE_FILE = "demo-instance";
+// A start time no live process can have, for the pid-reuse record.
+const IMPOSSIBLE_LSTART = "Thu Jan  1 00:00:00 1970";
+
+async function recordedRoot(stateDir: string): Promise<string> {
+  const [, , root] = (await readFile(join(stateDir, RESET_INSTANCE_FILE), "utf8")).split("\n");
+  expect(root).toBeTruthy();
+  return root!;
+}
+
+function liveStartTime(pid: number): string {
+  const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+  return out.stdout.trim().split(/\s+/).join(" ");
+}
+
+// A live process whose command line contains "seed-fortress" but which this test, not reset.sh, launched.
+function spawnImpostor(): number {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "seed-fortress"], { stdio: "ignore" });
+  const pid = child.pid!;
+  stops.push(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+      child.kill("SIGKILL");
+      await exited;
+    }
+  });
+  return pid;
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 interface InboxCard {
   item_id: string;
@@ -1024,13 +1062,30 @@ describe("stable demo token file", () => {
     expect(error?.message).not.toContain(token);
   });
 
-  it("refuses a symlinked token file", async () => {
+  it("refuses a symlink at the token path, even to a valid token, without echoing it", async () => {
     const dir = await scratchDir("sanctuary-demo-token-");
     const target = join(dir, "real-token");
-    await loadOrCreateDemoTokenFile(target);
+    const { token } = await loadOrCreateDemoTokenFile(target);
+    const link = join(dir, "operator-token");
+    await symlink(target, link);
+    const error = await loadOrCreateDemoTokenFile(link).then(() => undefined, (err: Error) => err);
+    expect(error?.message).toMatch(/not a regular file/);
+    expect(error?.message).not.toContain(token);
+  });
+
+  it("refuses a dangling symlink at the token path and creates nothing through it", async () => {
+    const dir = await scratchDir("sanctuary-demo-token-");
+    const target = join(dir, "would-be-created");
     const link = join(dir, "operator-token");
     await symlink(target, link);
     await expect(loadOrCreateDemoTokenFile(link)).rejects.toThrow(/not a regular file/);
+    expect(await pathExists(target)).toBe(false);
+  });
+
+  it("refuses a FIFO at the token path without blocking", async () => {
+    const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
+    expect(spawnSync("mkfifo", ["-m", "600", path]).status).toBe(0);
+    await expect(loadOrCreateDemoTokenFile(path)).rejects.toThrow(/not a regular file/);
   });
 
   it.each([
@@ -1092,7 +1147,7 @@ describe("one-command demo reset", () => {
     try {
       const first = await runReset(env);
       expect(first.code, first.stderr).toBe(0);
-      const firstRoot = (await readFile(join(stateDir, RESET_ROOT_FILE), "utf8")).trim();
+      const firstRoot = await recordedRoot(stateDir);
       roots.add(firstRoot);
       stops.push(stopRecordedDemo(firstRoot));
       const tokenFile = await readModeAndText(join(stateDir, RESET_TOKEN_FILE));
@@ -1104,7 +1159,7 @@ describe("one-command demo reset", () => {
 
       const second = await runReset(env);
       expect(second.code, second.stderr).toBe(0);
-      const secondRoot = (await readFile(join(stateDir, RESET_ROOT_FILE), "utf8")).trim();
+      const secondRoot = await recordedRoot(stateDir);
       roots.add(secondRoot);
       stops.push(stopRecordedDemo(secondRoot));
       expect(secondRoot).not.toBe(firstRoot);
@@ -1122,4 +1177,67 @@ describe("one-command demo reset", () => {
       await cleanupOwned();
     }
   }, RESET_TEST_TIMEOUT_MS);
+});
+
+describe("demo reset proves it launched the process before signalling it", () => {
+  it.each(["a start time that differs", "a demo root that names a different pid"])(
+    "refuses a recorded pid now held by another seed-fortress process with %s",
+    async (variant) => {
+      const stateDir = await scratchDir("sanctuary-demo-reset-");
+      const root = await scratchDir("sanctuary-demo-reset-root-");
+      const impostor = spawnImpostor();
+      const lstart = variant === "a start time that differs" ? IMPOSSIBLE_LSTART : liveStartTime(impostor);
+      // The root's own pid file names the impostor only in the start-time variant.
+      const rootPid = variant === "a start time that differs" ? impostor : impostor + 1;
+      await writeFile(join(root, DEMO_PID_FILE_BASENAME), `${rootPid}\n`, { mode: OPERATOR_TOKEN_FILE_MODE });
+      const instancePath = join(stateDir, RESET_INSTANCE_FILE);
+      await writeFile(instancePath, `${impostor}\n${lstart}\n${root}\n`, { mode: OPERATOR_TOKEN_FILE_MODE });
+      try {
+        const run = await runReset({
+          ...process.env,
+          HOME: await makeFakeOperatorHome(),
+          SANCTUARY_DEMO_STATE_DIR: stateDir,
+          SANCTUARY_DEMO_PORT: String(await getFreePort()),
+          SANCTUARY_DEMO_PASSPHRASE: PASSPHRASE,
+        });
+        expect(run.code).toBe(1);
+        expect(run.stderr).toContain(`Refusing to stop pid ${impostor}`);
+        expect(run.stderr).toContain(`kill -TERM ${impostor}`);
+        expect(run.stdout).not.toContain("Demo ready.");
+        expect(isAlive(impostor)).toBe(true);
+        // The record is kept so nothing is forgotten about the refused process.
+        expect(await pathExists(instancePath)).toBe(true);
+      } finally {
+        await cleanupOwned();
+      }
+    },
+    RESET_TIMEOUT_MS,
+  );
+
+  it("keeps its record when the previous demo root cannot be removed", async () => {
+    const stateDir = await scratchDir("sanctuary-demo-reset-");
+    // Not a seeder-named root under the temp parent, so the guarded teardown refuses it.
+    const root = await scratchDir("sanctuary-demo-reset-root-");
+    const exited = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+    const deadPid = Number(exited.stdout);
+    expect(isAlive(deadPid)).toBe(false);
+    const instancePath = join(stateDir, RESET_INSTANCE_FILE);
+    await writeFile(instancePath, `${deadPid}\n${IMPOSSIBLE_LSTART}\n${root}\n`, { mode: OPERATOR_TOKEN_FILE_MODE });
+    try {
+      const run = await runReset({
+        ...process.env,
+        HOME: await makeFakeOperatorHome(),
+        SANCTUARY_DEMO_STATE_DIR: stateDir,
+        SANCTUARY_DEMO_PORT: String(await getFreePort()),
+        SANCTUARY_DEMO_PASSPHRASE: PASSPHRASE,
+      });
+      expect(run.code).toBe(1);
+      expect(run.stderr).toContain(`Could not remove the previous demo root ${root}`);
+      expect(await pathExists(root)).toBe(true);
+      expect(await pathExists(instancePath)).toBe(true);
+      expect(run.stdout).not.toContain("Demo ready.");
+    } finally {
+      await cleanupOwned();
+    }
+  }, RESET_TIMEOUT_MS);
 });

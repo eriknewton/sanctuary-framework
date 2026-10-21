@@ -191,7 +191,9 @@ export class ApprovalGate {
   }
 
   /**
-   * The requesting agent's hub id for a hold, or undefined.
+   * The hub id of the agent this server process is configured for, used as
+   * the requester of a hold, or undefined. It names who asked, never the
+   * operation's target.
    *
    * Rule-7 provenance: the value comes from the server-set `currentAgentId`
    * supplier and never from tool arguments, so an agent cannot name a different

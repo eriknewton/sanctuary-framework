@@ -277,30 +277,41 @@ export function mintDemoAuthToken(): string {
  * overwrites a file it did not validate.
  */
 export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: string; reused: boolean }> {
-  // Every check runs on the opened descriptor, never on the path, so the file
-  // validated is the file read (no check-then-use window); O_NOFOLLOW refuses a
-  // symlink at the final component with ELOOP.
-  const reading = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined;
-    if (error.code === "ELOOP") throw new Error(`refusing demo token file that is not a regular file: ${path}`);
+  // Create first, exclusively: O_CREAT|O_EXCL is one atomic step that either
+  // makes a new file (mode 0600, never through a symlink) or fails with EEXIST.
+  // There is no prior existence check, so nothing is decided on a stale view of
+  // the path, and an existing file is never overwritten.
+  const created = await open(
+    path,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    OPERATOR_TOKEN_FILE_MODE,
+  ).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "EEXIST") return undefined;
     throw error;
   });
-  if (reading === undefined) {
+  if (created !== undefined) {
     const token = mintDemoAuthToken();
-    // O_EXCL: a file that appeared after the read attempt is never overwritten.
-    const handle = await open(
-      path,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-      OPERATOR_TOKEN_FILE_MODE,
-    );
     try {
-      await handle.chmod(OPERATOR_TOKEN_FILE_MODE);
-      await handle.writeFile(`${token}\n`);
+      await created.chmod(OPERATOR_TOKEN_FILE_MODE);
+      await created.writeFile(`${token}\n`);
     } finally {
-      await handle.close();
+      await created.close();
     }
     return { token, reused: false };
   }
+  // Something already exists at the path (a file, or a symlink, which EEXIST
+  // also reports). Every check below runs on the opened descriptor, never on
+  // the path, so the file validated is the file read; O_NOFOLLOW refuses a
+  // symlink at the final component with ELOOP, and O_NONBLOCK keeps a FIFO
+  // planted at the path from blocking the open (the regular-file check then
+  // refuses it).
+  const reading = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  ).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ELOOP") throw new Error(`refusing demo token file that is not a regular file: ${path}`);
+    throw error;
+  });
   try {
     const existing = await reading.stat();
     if (!existing.isFile()) {
@@ -315,7 +326,14 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
     if (existing.size > DEMO_TOKEN_FILE_MAX_BYTES) {
       throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
     }
-    const token = (await reading.readFile("utf8")).trim();
+    // Bounded read through the validated descriptor: one byte past the cap is
+    // requested, so a file that grew after the size check is refused, never read whole.
+    const buffer = Buffer.alloc(DEMO_TOKEN_FILE_MAX_BYTES + 1);
+    const { bytesRead } = await reading.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > DEMO_TOKEN_FILE_MAX_BYTES) {
+      throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
+    }
+    const token = buffer.subarray(0, bytesRead).toString("utf8").trim();
     if (!DEMO_AUTH_TOKEN_PATTERN.test(token)) {
       throw new Error(`refusing demo token file that does not hold a demo token: ${path}`);
     }
@@ -351,7 +369,7 @@ export function parseDemoPort(raw: string | undefined): number {
 export function seededItemsForDemo(): SeededDemoItem[] {
   return [
     {
-      item: "four protected-agent registry entries",
+      item: "four registry agents",
       producedBy: "buildLocalAgentRecord plus upsertPersistedLocalAgent, matching a wrap without a confinement outcome",
       readPath: "GET /api/hub/agents",
       status: "seeded",

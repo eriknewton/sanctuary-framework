@@ -17,7 +17,7 @@ The two held approvals are raised through the real approval gate, as the named a
 - a Tier 1 `state_export` from the first seeded agent (`state_export` is always Tier 1 under the default policy);
 - a Tier 2 `state_write` to a namespace the session has not seen, from the second seeded agent (a first write to a new namespace is a Tier 2 anomaly under the default policy).
 
-Each card names the agent that asked, using the same server-set agent id a wrapped harness carries. Deciding a hold from the console releases it the way production does, and the gate writes its own decision entry to the audit log: operation `gate_approve:<operation>` or `gate_deny:<operation>`. That entry is on the layer the console labels Sentinels, which is where production records gate decisions, so to find it on the Evidence screen search for `gate_approve` rather than filtering to Charter. The fixture writes no decision entry of its own. Its only Charter-layer entry is the `demo_approvals_seeded` marker. A decided hold also appears under the Approvals screen's Decided filter for the life of the demo process.
+Each card's Agent column shows the requester: the agent the asking server process is configured for, from the same server-set agent id a wrapped harness carries. The card's sentence names the operation but no target, because the card does not carry the call's arguments. Deciding a hold from the console releases it the way production does, and the gate writes its own decision entry to the audit log: operation `gate_approve:<operation>` or `gate_deny:<operation>`. That entry is on the layer the console labels Sentinels, which is where production records gate decisions, so to find it on the Evidence screen search for `gate_approve` rather than filtering to Charter. The fixture writes no decision entry of its own. Its only Charter-layer entry is the `demo_approvals_seeded` marker. A decided hold also appears under the Approvals screen's Decided filter for the life of the demo process.
 
 The holds auto-deny after one hour, and stopping the demo auto-denies any hold still open; the gate records both as denials, as it would in production. Reset the demo shortly before presenting (see below).
 
@@ -37,13 +37,15 @@ npm run demo:reset
 
 This stops the demo that the previous `demo:reset` started, then starts a fresh one on port 3517 with `--token-file ~/.sanctuary-demo/operator-token`, and prints the dashboard URL, the token file path, the log path and the stop command. The token is the same after every reset, so reload the open tab instead of pasting the token again. A full reset takes about three seconds.
 
-- `SANCTUARY_DEMO_PORT`, `SANCTUARY_DEMO_STATE_DIR` and `SANCTUARY_DEMO_PASSPHRASE` override the port, the state directory (token, log and last demo root), and the throwaway fortress passphrase. Your own `SANCTUARY_PASSPHRASE` is not used.
-- The reset only stops the demo it recorded, and only after checking that pid is still the demo seeder. Failure mode: a demo started by hand on the same port is not stopped, so the new demo fails to bind and the reset prints the log tail with an address-in-use error; stop the hand-started demo and rerun.
+- `SANCTUARY_DEMO_PORT`, `SANCTUARY_DEMO_STATE_DIR` and `SANCTUARY_DEMO_PASSPHRASE` override the port, the state directory (token, log, and the record of the last demo), and the throwaway fortress passphrase. Your own `SANCTUARY_PASSPHRASE` is not used.
+- When it starts a demo, the reset records that process's pid, its start time and its demo root in `demo-instance` in the state directory. On the next run it signals that pid only if all three still match: the pid is alive, its start time is unchanged, and the demo root's own `demo.pid` names it. If any of them differs, it signals nothing, prints the `kill -TERM <pid>` command to run yourself if that process is your demo, and exits 1. Remove `demo-instance` after checking, then rerun.
+- Failure mode: a demo started by hand on the same port is not stopped, so the new demo fails to bind and the reset prints the log tail with an address-in-use error; stop the hand-started demo and rerun.
+- Failure mode: if a crashed demo left its root behind and the guarded teardown cannot remove it, the reset keeps its record, prints the root's path and exits 1; remove that root and rerun.
 - Failure mode: if the previous demo does not exit within ten seconds, the reset stops with a message and starts nothing; stop that pid by hand and rerun.
 
 | Seeded item | Product path used | Read path | Status |
 | --- | --- | --- | --- |
-| four protected-agent registry entries | `buildLocalAgentRecord` plus `upsertPersistedLocalAgent`, matching a wrap without a confinement outcome | `GET /api/hub/agents` | Seeded |
+| four registry agents | `buildLocalAgentRecord` plus `upsertPersistedLocalAgent`, matching a wrap without a confinement outcome | `GET /api/hub/agents` | Seeded |
 | two pending approvals | `ApprovalGate.evaluate` for `state_export` (Tier 1) and `state_write` to a new namespace (Tier 2), each raised as a seeded agent | `GET /api/hub/inbox` | Seeded |
 | one Sentinel finding | `SentinelDispatcher.reportFinding` | `GET /api/sentinels/findings` | Seeded |
 | blocked egress event | No kernel-enforcer verdict is minted by this fixture | `GET /api/audit-log` | Not available on this fixture |

@@ -790,7 +790,7 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     await rig.stop();
   });
 
-  it("carries the gate-stamped requesting agent into the card's agent_id and its agent_id template arg", async () => {
+  it("shows the gate-stamped requester as the card's agent and never as a template argument", async () => {
     const evaluation = gateForWrappedAgent(rig).evaluate("state_export", {
       namespace: "project-notes",
     });
@@ -800,14 +800,37 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     expect(card!.agent_id).toBe(REQUESTING_AGENT_ID);
     expect(card!.display_template_id).toBe("approval_pending.tier1.state_export");
     expect(card!.operation_category).toBe("state_export");
+    // The template's agent_id slot means the TARGET; the requester never fills it.
     expect(card!.display_template_args).toEqual([
       { kind: "identity_id", value: IDENTITY_ID },
-      { kind: "agent_id", value: REQUESTING_AGENT_ID },
     ]);
-    // The server-side catalog renders the requester, not the "(no agent)" fallback.
     expect(
       renderTemplate(card!.display_template_id, card!.display_template_args),
-    ).toBe(`Export agent ${REQUESTING_AGENT_ID} state as a portable bundle.`);
+    ).toBe("Export agent (unknown) state as a portable bundle.");
+
+    expect((await postInboxAction(rig, card!.item_id, "deny")).status).toBe(200);
+    expect((await evaluation).allowed).toBe(false);
+  });
+
+  it("never names the requesting agent as the target when agent A asks to rotate identity B", async () => {
+    const targetIdentity = "identity-b-0123";
+    const evaluation = gateForWrappedAgent(rig).evaluate("identity_rotate", {
+      identity_id: targetIdentity,
+    });
+
+    expect(await waitForUnresolvedApprovals(rig, 1)).toHaveLength(1);
+    const [card] = (await inboxCards(rig)).filter((i) => !i.resolved);
+    // A is the requester, shown as the card's agent.
+    expect(card!.agent_id).toBe(REQUESTING_AGENT_ID);
+    expect(card!.operation_category).toBe("identity_rotate");
+    // The rotate sentence defaults its target to "this fortress", so the card uses
+    // the tier's catch-all sentence, which names no target at all.
+    expect(card!.display_template_id).toBe("approval_pending.tier1.other");
+    expect(card!.display_template_args.some((a) => a.kind === "agent_id")).toBe(false);
+    const sentence = renderTemplate(card!.display_template_id, card!.display_template_args);
+    expect(sentence).not.toContain(REQUESTING_AGENT_ID);
+    expect(sentence).not.toContain(WRAPPED_AGENT_ID);
+    expect(sentence).not.toContain("this fortress");
 
     expect((await postInboxAction(rig, card!.item_id, "deny")).status).toBe(200);
     expect((await evaluation).allowed).toBe(false);
