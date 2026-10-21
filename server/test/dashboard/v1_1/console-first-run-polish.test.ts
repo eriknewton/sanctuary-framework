@@ -382,6 +382,55 @@ describe("an unread Sentinel feed is never a zero", () => {
   });
 });
 
+describe("each findings surface names the feed it counts", () => {
+  const sentinelFinding = { finding_id: "finding-1", summary: "Fixture sentinel flagged a burst.", severity: "warn", sentinel_id: "sentinel-1", agent_id: null, observed_at: "2026-10-21T12:00:00.000Z" };
+  const READ_GAP_MS = 3 * 60 * 1000;
+
+  it("an empty anomaly answer beside one listed Sentinel finding: the tile names the queue, the anomaly card names its detector and points at the queue", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/sentinels/findings": () => Promise.resolve(response({ data: { findings: [sentinelFinding] } })) });
+    await settle();
+    const overview = h.el.main!.innerHTML;
+    expect(overview).toContain("Sentinel queue returned 1 finding; lifecycle is not served");
+    expect(overview).toContain("The Sentinel queue returned 1 finding.");
+    h.navigate("findings");
+    const findings = h.el.main!.innerHTML;
+    const card = findings.split("data-anomaly-findings")[1] || "";
+    expect(card, "the anomaly card says whose zero it is").toContain("0 open in the anomaly detector");
+    expect(card, "no unlabeled zero").not.toMatch(/>0 open(?! in the anomaly detector)/);
+    expect(card, "and that the queue above lists a finding it does not count").toContain(
+      "This card counts only the anomaly detector. The Sentinel queue above lists 1 finding whose status is not served.");
+
+    // With the queue loaded empty, the card carries no queue note and still names its detector.
+    const quiet = boot();
+    await settle();
+    quiet.navigate("findings");
+    const quietCard = quiet.el.main!.innerHTML.split("data-anomaly-findings")[1] || "";
+    expect(quietCard).toContain("0 open in the anomaly detector");
+    expect(quietCard).not.toContain("data-anomaly-queue-note");
+  });
+
+  it("an earned 0 open is aged by the older of its two reads, so a fresh anomaly read cannot freshen an old Sentinel zero", async () => {
+    vi.useFakeTimers();
+    let sentinelReads = 0;
+    const h = boot({ "/api/sentinels/findings": () => { sentinelReads++; return Promise.resolve(response({ data: { findings: [] } })); } });
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("No open Sentinel findings");
+    const sentinelReadsAtBoot = sentinelReads;
+    await vi.advanceTimersByTimeAsync(READ_GAP_MS);
+    h.read('void queueStreamRefresh(["/api/anomaly/findings"])');
+    await settle();
+    expect(sentinelReads, "only the anomaly detector was reread").toBe(sentinelReadsAtBoot);
+    const gap = h.read("durationLabelFromMs(" + READ_GAP_MS + ")") as string;
+    const fresh = h.read('sourceReadAge("/api/anomaly/findings")') as string;
+    expect(fresh, "the anomaly read is fresh").not.toBe(gap + " ago");
+    const overview = h.el.main!.innerHTML;
+    expect(overview).toContain("The anomaly detector and the Sentinel queue both answered empty; oldest read " + gap + " ago.");
+    expect(overview).toContain("anomaly detector and Sentinel queue answered empty; oldest read " + gap + " ago");
+    expect(overview).not.toContain("oldest read " + fresh);
+  });
+});
+
 describe("screen scroll on route change", () => {
   it("a new hash route opens at the top of main; a redraw or same-screen filter change keeps the place", async () => {
     vi.useFakeTimers();

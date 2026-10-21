@@ -67,6 +67,9 @@ const OPERATOR_TOKEN_NOTICE_BASIS_PX = 320;
 // the dialog's explanation reads as short lines at any font size; on a narrower screen it keeps a --space-4 gutter
 // on each side (the 2 is the two sides).
 const OPERATOR_TOKEN_DIALOG_MEASURE_CH = 60;
+// 600 = semibold, the weight the console's labels and headings already use (.card h3, .layer-card h4, the top-bar
+// buttons), so the token field's label reads as a label beside them.
+const OPERATOR_TOKEN_LABEL_WEIGHT = 600;
 
 const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
 ${PAPER_INK_ROOT_TOKENS_CSS}
@@ -476,7 +479,7 @@ body {
 .operator-token-dialog::backdrop { background: ${MODAL_SCRIM}; }
 .operator-token-dialog h2 { margin: 0 0 var(--space-2); font-size: var(--text-lg); }
 .operator-token-dialog p { margin: 0 0 var(--space-2); color: var(--ink-2); }
-.operator-token-dialog label { display: block; margin-bottom: var(--space-1); font-weight: 600; }
+.operator-token-dialog label { display: block; margin-bottom: var(--space-1); font-weight: ${OPERATOR_TOKEN_LABEL_WEIGHT}; }
 /* --ink-3 is the control boundary every input wears (see .btn). */
 .operator-token-dialog input { width: 100%; padding: var(--space-1) var(--space-2); border: 1px solid var(--ink-3); border-radius: var(--rad); font: inherit; color: var(--ink); background: var(--surface-2); }
 .operator-token-error { color: var(--rust); margin-top: var(--space-2); }

@@ -4586,6 +4586,17 @@ function sentinelFeedState() {
   const total = state.mfp.totals.findings;
   return { state: total > 0 ? SENTINEL_FEED.LISTED : SENTINEL_FEED.EMPTY, total: total };
 }
+const ANOMALY_FEED_PATH = "/api/anomaly/findings";
+function earnedZeroReadAge() {
+  // "0 open" is earned only by both answers (the anomaly detector empty and the Sentinel queue loaded empty), so its
+  // age is the OLDER of the two reads: a fresh anomaly read cannot make an older Sentinel zero look fresh.
+  let oldest = null;
+  [ANOMALY_FEED_PATH, SENTINEL_FEED_PATH].forEach(function (path) {
+    const read = sourceRead(path);
+    if (read && read.lastReadAt && (oldest === null || read.lastReadAt < oldest)) oldest = read.lastReadAt;
+  });
+  return oldest === null ? null : durationLabelFromMs(Date.now() - oldest) + " ago";
+}
 function sentinelFeedUnknownHtml() {
   return '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason(SENTINEL_FEED_PATH, "Sentinel findings"))) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="' + SENTINEL_FEED_PATH + '">Retry Sentinel findings</button></div>';
 }
@@ -4614,8 +4625,8 @@ function renderOverviewFindingsPanel() {
       : feed.state === SENTINEL_FEED.UNAVAILABLE
         ? sentinelFeedUnknownHtml()
       : feed.state === SENTINEL_FEED.LISTED
-        ? '<div class="overview-empty"><h3>' + escHtml(sentinelFindingsPhrase(feed.total)) + '</h3><p>Sentinels returned ' + escHtml(sentinelFindingsCount(feed.total)) + '. Their lifecycle is not served, so this view cannot say whether ' + (feed.total === 1 ? 'it is' : 'they are') + ' open.</p><a class="btn" href="#findings">Open Findings</a></div>'
-        : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
+        ? '<div class="overview-empty"><h3>' + escHtml(sentinelFindingsPhrase(feed.total)) + '</h3><p>The Sentinel queue returned ' + escHtml(sentinelFindingsCount(feed.total)) + '. Their lifecycle is not served, so this view cannot say whether ' + (feed.total === 1 ? 'it is' : 'they are') + ' open.</p><a class="btn" href="#findings">Open Findings</a></div>'
+        : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. The anomaly detector and the Sentinel queue both answered empty; oldest read ' + escHtml(earnedZeroReadAge() || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
   return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
     (unknown || (feed && feed.state === SENTINEL_FEED.UNAVAILABLE) ? "Not evaluated" : feed && feed.state === SENTINEL_FEED.LISTED ? escHtml(sentinelFindingsPhrase(feed.total)) : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
     '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
@@ -4797,10 +4808,15 @@ function renderPostureScreen() {
       renderOverviewProtection(home) +
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
-      // Must match renderAnomalyFindingsCard on the Findings screen: both count /api/anomaly/findings.
+      // Two feeds, each named where it is counted. Open findings come from the anomaly detector (/api/anomaly/findings,
+      // the same count as renderAnomalyFindingsCard on the Findings screen). When that answer is empty, the tile reports
+      // the Sentinel queue instead (sentinelFeedState over /api/sentinels/findings, the same source and total as the
+      // Findings screen's Sentinel queue), and its evidence line says which feed it is reading.
       overviewTile("Open Sentinel findings",
         anomalyUnknown || feedUnavailable ? overviewChip("unknown", "Not evaluated") : feedListed ? overviewChip("unknown", sentinelFindingsCount(feed.total).toUpperCase(), "status unknown") : escHtml(findings.length),
-        anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : feedUnavailable ? escHtml(overviewSourceReason(SENTINEL_FEED_PATH, "Sentinel findings")) + ' · <a href="#findings">findings</a>' : feedListed ? 'Sentinels returned ' + escHtml(sentinelFindingsCount(feed.total)) + '; lifecycle is not served · <a href="#findings">findings</a>' : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
+        anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : feedUnavailable ? escHtml(overviewSourceReason(SENTINEL_FEED_PATH, "Sentinel findings")) + ' · <a href="#findings">findings</a>' : feedListed ? 'Sentinel queue returned ' + escHtml(sentinelFindingsCount(feed.total)) + '; lifecycle is not served · <a href="#findings">findings</a>'
+          : feed ? "anomaly detector and Sentinel queue answered empty; oldest read " + escHtml(earnedZeroReadAge() || "now") + ' · <a href="#findings">findings</a>'
+          : "anomaly detector answered " + escHtml(loadedSourceReadAge(ANOMALY_FEED_PATH) || "now") + ' · <a href="#findings">findings</a>', "#findings") +
       overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
   return [
@@ -5560,16 +5576,22 @@ function renderFindingsScreen() {
       mfpPager(page, "findings", path) + '<div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Severity</th><th>Finding</th><th>Lifecycle</th><th>Sentinel</th><th>Age</th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
     '</section>' + (selected ? renderFindingDrawer(selected) : '') + '</div>' + renderAnomalyFindingsCard() + renderMfpFoldedSections() + '</section>';
 }
-// Must match the Overview's "Open Sentinel findings" tile (renderPostureScreen), which counts this source and links here.
+// Counts only the anomaly detector (/api/anomaly/findings), the feed the Overview's "Open Sentinel findings" tile
+// (renderPostureScreen) counts first. Its count is labeled with that feed, and when the Sentinel queue above lists
+// findings the card says so, so its "0 open" can never read as a contradiction of the queue or of the tile.
 function renderAnomalyFindingsCard() {
   const findings = state.posture.anomalies || [];
-  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
-  const age = sourceReadAge("/api/anomaly/findings");
+  const unknown = !sourceLoaded(ANOMALY_FEED_PATH) || state.posture.anomaliesUnknown !== false;
+  const age = sourceReadAge(ANOMALY_FEED_PATH);
   const countLine = unknown
     ? '<span class="count-age">Unknown: the detector has not answered</span>'
-    : '<span class="count-age">' + escHtml(findings.length) + ' open' + (age ? ' · detector read ' + escHtml(age) : '') + '</span>';
-  return '<section class="card" data-anomaly-findings><h3>Anomaly findings ' + countLine + '</h3>' +
-    renderPostureAnomalies(findings, unknown) + renderSourceRead("/api/anomaly/findings") + '</section>';
+    : '<span class="count-age">' + escHtml(findings.length) + ' open in the anomaly detector' + (age ? ' · detector read ' + escHtml(age) : '') + '</span>';
+  const queue = sentinelFeedState();
+  const queueNote = queue.state === SENTINEL_FEED.LISTED
+    ? '<p class="muted" data-anomaly-queue-note>This card counts only the anomaly detector. The Sentinel queue above lists ' + escHtml(sentinelFindingsCount(queue.total)) + ' whose status is not served.</p>'
+    : '';
+  return '<section class="card" data-anomaly-findings><h3>Anomaly findings ' + countLine + '</h3>' + queueNote +
+    renderPostureAnomalies(findings, unknown) + renderSourceRead(ANOMALY_FEED_PATH) + '</section>';
 }
 
 function renderServerFleetRoster() {
