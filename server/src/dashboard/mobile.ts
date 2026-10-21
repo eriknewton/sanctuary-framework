@@ -92,6 +92,26 @@ const SHIELD_ICON_SVG =
       "</svg>",
   );
 
+/**
+ * The manifest's colors are read from the token values, never hand-copied,
+ * so the install splash and the status bar match the page the companion
+ * paints. The companion sets no data-theme, so it renders the light block of
+ * PAPER_INK_ROOT_TOKENS_CSS: background_color is that block's --paper and
+ * theme_color its --ink. Must match the light :root block's --paper and
+ * --ink declarations in design-tokens.ts, which pins this read on its side.
+ * A token that is renamed or stops being a six-digit hex fails this module's
+ * load (and its test), instead of shipping a stale color to an installed app.
+ */
+function lightTokenHex(name: string): string {
+  const darkAt = PAPER_INK_ROOT_TOKENS_CSS.indexOf('[data-theme="dark"]');
+  const light = darkAt >= 0 ? PAPER_INK_ROOT_TOKENS_CSS.slice(0, darkAt) : PAPER_INK_ROOT_TOKENS_CSS;
+  const match = light.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{6})\\s*;`));
+  if (!match) throw new Error(`design token --${name} has no six-digit hex value in the light block`);
+  return match[1]!.toLowerCase();
+}
+export const MOBILE_COMPANION_BACKGROUND_COLOR = lightTokenHex("paper");
+export const MOBILE_COMPANION_THEME_COLOR = lightTokenHex("ink");
+
 export const MOBILE_COMPANION_WEBMANIFEST: string = JSON.stringify(
   {
     name: "Sanctuary Companion",
@@ -101,8 +121,8 @@ export const MOBILE_COMPANION_WEBMANIFEST: string = JSON.stringify(
     scope: "/m/",
     display: "standalone",
     orientation: "portrait",
-    background_color: "#f7f5f0",
-    theme_color: "#1a1a17",
+    background_color: MOBILE_COMPANION_BACKGROUND_COLOR,
+    theme_color: MOBILE_COMPANION_THEME_COLOR,
     icons: [
       { src: SHIELD_ICON_SVG, sizes: "any", type: "image/svg+xml", purpose: "any" },
       { src: SHIELD_ICON_SVG, sizes: "any", type: "image/svg+xml", purpose: "maskable" },
@@ -325,7 +345,7 @@ export function renderMobileCompanionHTML(): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#1a1a17">
+<meta name="theme-color" content="${MOBILE_COMPANION_THEME_COLOR}">
 <meta name="color-scheme" content="light dark">
 <title>Sanctuary Companion</title>
 <link rel="manifest" href="/m/manifest.webmanifest">

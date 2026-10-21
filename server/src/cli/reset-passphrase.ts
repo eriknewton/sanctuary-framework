@@ -2005,7 +2005,8 @@ Reset history: ${markerRecorded ? join(ctx.storagePath, ".reset-history.log") : 
           "Refusing: another custody operation is in progress for this fortress. " +
             "Nothing was changed; retry after the active operation finishes.\n",
         );
-      } else if (error.kind === "capability") {
+      } else if (error.kind === "capability" || error.kind === "scaffold-integrity") {
+        // Scaffold tampering refuses admission; do not misreport it as journaled holder loss.
         ctx.err.write(`Refusing: ${error.message}\n`);
       } else {
         // Holder loss can occur after a journaled mutation. Never claim that

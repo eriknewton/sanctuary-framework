@@ -33,15 +33,20 @@ import {
 } from "../../../src/intelligence/templates.js";
 
 describe("Intelligence panel — sidebar nav + route plumbing", () => {
-  it("includes Intelligence in the sidebar nav between Policy and Privacy", () => {
+  it("reaches Intelligence as the Local models tab of Settings, after Policies in the rail", () => {
+    // Retargeted (slice 2 shell): Intelligence folded out of the rail into
+    // the Settings tabs; the #intelligence route still renders on its own.
     const html = renderDashboardV11Html({});
-    expect(html).toContain('data-route="intelligence"');
     const policyIdx = html.indexOf('data-route="policy"');
-    const intelIdx = html.indexOf('data-route="intelligence"');
-    const privacyIdx = html.indexOf('data-route="privacy"');
+    const settingsIdx = html.indexOf('data-route="settings"');
     expect(policyIdx).toBeGreaterThan(0);
-    expect(intelIdx).toBeGreaterThan(policyIdx);
-    expect(privacyIdx).toBeGreaterThan(intelIdx);
+    expect(settingsIdx).toBeGreaterThan(policyIdx);
+    const client = getClientScript();
+    const privacyTab = client.indexOf('{ id: "privacy", label: "Privacy" }');
+    const intelTab = client.indexOf('{ id: "intelligence", label: "Local models" }');
+    expect(privacyTab).toBeGreaterThan(0);
+    expect(intelTab).toBeGreaterThan(privacyTab);
+    expect(client).toContain('"intelligence": "settings"');
   });
 
   it("client-script renderMain dispatches the intelligence route to renderIntelligenceCenter", () => {

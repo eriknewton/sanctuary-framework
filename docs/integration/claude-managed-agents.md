@@ -6,7 +6,7 @@
 ## Prerequisites
 
 - Anthropic Managed Agents access (research preview or GA)
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@0.7.0`
+- Sanctuary: `npm install @sanctuary-framework/mcp-server@1.8.4`
   (Node.js is pre-installed in Managed Agents containers)
 
 ## Step 1: Add Sanctuary to Your Agent Config
@@ -24,14 +24,14 @@ agent:
   mcp_servers:
     - name: sanctuary
       command: npx
-      args: ["@sanctuary-framework/mcp-server@0.7.0"]
+      args: ["@sanctuary-framework/mcp-server@1.8.4"]
 ```
 
 Deploy the agent. Sanctuary tools load automatically via MCP.
 
 ## Step 2: Verify Sanctuary Is Active
 
-Call `manifest` from your agent. You should see 80+ Sanctuary tools listed.
+Call `manifest` from your agent. You should see the Sanctuary tools listed (more than 100 in v1.8.4).
 
 ## Step 3: Bind an Identity
 
@@ -55,6 +55,8 @@ See the [verification checklist](./_verification-checklist.md) for expected resu
 ```
 Call: reputation_publish
 ```
+
+From 1.9.0 this call always waits for operator approval (Tier 1), because the signed report leaves the machine. Releases before 1.9.0 publish without asking under the default policy.
 
 Visit `https://verascore.ai/agent/{did}` to see the live profile.
 
@@ -86,8 +88,12 @@ not across sessions. For durable identity across sessions:
 **Multi-agent.** If using `callable_agents`, each thread agent can independently
 run Sanctuary: one identity per thread agent, or a shared identity via seed.
 
-**SIEM export.** Use `audit_export_siem` to push CEF/OCSF-formatted audit
-events to your SIEM (Datadog, Splunk, Chronicle) from inside the container.
+**SIEM export.** Use `audit_export_siem` to export CEF, OCSF, ECS, or raw Cortex
+events for XDM modeling from inside the container. Field names under
+`integrations/siem/`, and the Cortex mapping file's raw-to-home pairs, are
+checked against formatter tables by repo tests; null XDM homes keep those values
+as raw dataset fields. Run a tenant
+drill before treating either mapping as installed evidence.
 
 ## Troubleshooting
 
@@ -111,7 +117,7 @@ tool confirmation config.
 
 **First run is slow**
 `npx` downloads the package on first invocation (~10s). For faster cold
-starts, add `RUN npm install -g @sanctuary-framework/mcp-server@0.7.0` to
+starts, add `RUN npm install -g @sanctuary-framework/mcp-server@1.8.4` to
 your container setup.
 
 ## Next Steps

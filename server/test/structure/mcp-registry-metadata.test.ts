@@ -1,3 +1,4 @@
+// fail-before-exempt: the new assertions guard a release-time contract, not a source fix: server.json must carry the exact RELEASE_VERSION the publish workflow dispatches, and its version must have the shape that workflow accepts. They pass against the base by construction because main's server.json already matches package.json and RELEASE_VERSION is unset outside a publish run; the release witness was run locally (RELEASE_VERSION=1.8.6-rc.5 fails, 1.8.6-rc.1 passes), and the matching guard is the new server.json check in publish-on-tag.yml.
 /**
  * MCP-registry metadata lockstep guard.
  *
@@ -53,6 +54,29 @@ describe("MCP registry metadata lockstep (server.json <-> package.json)", () => 
     expect(npmEntry, "manifest must list the npm package").toBeTruthy();
     expect(npmEntry?.identifier).toBe(pkg.name);
     expect(npmEntry?.version).toBe(pkg.version);
+  });
+
+  // The publish workflow (.github/workflows/publish-on-tag.yml) exports
+  // RELEASE_VERSION, the exact version the maintainer dispatched, and runs this
+  // suite against the release tag. The registry listing must name that exact
+  // version: on 2026-10-19 main's manifest named 1.8.6-rc.1, a version npm never
+  // published, and an agent reading the listing would have tried to install it.
+  // Outside a publish run the variable is unset and this check is skipped; the
+  // shape check below still runs on every commit.
+  const RELEASE_VERSION = process.env.RELEASE_VERSION;
+
+  it.runIf(Boolean(RELEASE_VERSION))("manifest carries the exact version being published", () => {
+    expect(manifest.version).toBe(RELEASE_VERSION);
+    const npmEntry = (manifest.packages as Array<Record<string, unknown>>).find(
+      (p) => p.registryType === "npm",
+    );
+    expect(npmEntry?.version).toBe(RELEASE_VERSION);
+  });
+
+  it("manifest version has the numeric shape the publish workflow accepts", () => {
+    // Must match the version-shape regex in the validate-intent job of
+    // .github/workflows/publish-on-tag.yml.
+    expect(manifest.version).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+(\.[A-Za-z0-9]+)*)?$/);
   });
 
   it("manifest repository points at the canonical repo", () => {

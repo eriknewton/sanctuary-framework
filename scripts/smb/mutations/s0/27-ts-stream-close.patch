@@ -1,0 +1,6 @@
+# witness: frame_refusal_closes_without_reply
+--- a/server/src/smb/frame.ts
++++ b/server/src/smb/frame.ts
+@@ -39 +39 @@
+-      stream.destroy(); reject(new Error('SMB frame refused'));
++      reject(new Error('SMB frame refused'));

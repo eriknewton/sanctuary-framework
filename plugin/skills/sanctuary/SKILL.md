@@ -5,8 +5,8 @@ description: >
   audit record. Use when the agent needs encrypted state storage, self-custodied identity, selective disclosure,
   zero-knowledge proofs, portable reputation, sovereignty health reporting, handshakes, MCP-to-MCP federation,
   protection-posture auditing, or principal dashboard approval. Bounds: these tools are the cooperative MCP
-  surface (Charter); operating-system egress enforcement is a separate arming step, live on a patched macOS host,
-  proven on Linux for Ubuntu 24.04 (x86-64) only, Windows roadmapped; every claim traces to the Assurance Matrix.
+  surface (Charter); operating-system egress enforcement is a separate arming step, live on macOS,
+  proven on Linux for Ubuntu 24.04 (x86-64) only with a separate package (not in this npm server), Windows roadmapped; every claim traces to the Assurance Matrix.
   Triggers: sovereignty, encrypted state, identity, reputation, privacy, SHR, handshake, attestation,
   disclosure policy, zero-knowledge, federation, approval, dashboard, webhook, concordia, bridge, negotiation,
   audit, openclaw, sovereignty gap, security posture.
@@ -14,7 +14,7 @@ description: >
 
 # Sanctuary Framework
 
-Sanctuary gives your agent protection it can prove: encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, posture auditing, and a verifiable security posture. The tools in this skill are the Charter layer, the cooperative MCP surface. The Castle Wall (kernel-level egress enforcement) is armed separately and is live on a patched macOS host; on Linux it is proven for Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Every capability claim traces to a row in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
+Sanctuary gives your agent protection it can prove: encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, posture auditing, and a verifiable security posture. The tools in this skill are the Charter layer, the cooperative MCP surface. The Castle Wall (kernel-level egress enforcement) is armed separately and is live on macOS; on Linux it is proven for Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Every capability claim traces to a row in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
 
 ## Install, verify, uninstall
 
@@ -160,6 +160,7 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 | `sanctuary/reputation_query_weighted` | Query reputation with posture-tier weighting |
 | `sanctuary/reputation_export` | Export reputation as portable bundle (Tier 1) |
 | `sanctuary/reputation_import` | Import reputation bundle (verify signatures; Tier 1) |
+| `sanctuary/reputation_publish` | Publish a signed sovereignty report to Verascore (the report leaves this machine; always Tier 1 from 1.9.0, auto-allowed by default before 1.9.0) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
 | `sanctuary/bootstrap_provide_guarantee` | Principal guarantee certificate (Tier 1) |
 
@@ -203,7 +204,7 @@ Within Charter, the tools are grouped in four capability surfaces:
 - **Selective Disclosure:** Commitment-based proofs, zero-knowledge proofs (Pedersen/Ristretto255/Schnorr), disclosure policies
 - **Verifiable Reputation:** Signed attestations (posture-weighted), portable reputation, trust bootstrapping, handshakes, MCP-to-MCP federation
 
-Beneath the cooperative surface, on a patched macOS host the Castle Wall enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, so the perimeter holds even when an agent is prompt-injected or disobedient; that proof is one host and one OS version, not an audited per-rule, per-flow trail. On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. See the [repository README](https://github.com/eriknewton/sanctuary-framework#readme) for the current per-platform enforcement status and its proven bounds.
+Beneath the cooperative surface, on macOS, the Castle Wall enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, so the perimeter holds even when an agent is prompt-injected or disobedient; that proof is one host and one OS version, not an audited per-rule, per-flow trail. On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. See the [repository README](https://github.com/eriknewton/sanctuary-framework#readme) for the current per-platform enforcement status and its proven bounds.
 
 User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 

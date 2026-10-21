@@ -1,0 +1,761 @@
+{
+  "$comment": "THE SMB constants source; must match loaders constants.ts and castle-wall-daemon/src/smb/constants.rs (include_str!(../../../server/src/smb/constants.json)). Numeric times are seconds except QUERY_REPLY_MAX in milliseconds. Built, acceptance pending; NO CLAIM.",
+  "constants": {
+    "KIB": {
+      "value": 1024,
+      "source": "binary kibibyte: 2^10 bytes"
+    },
+    "FRAME_HEADER": {
+      "value": 4,
+      "source": "u32 network length: 32 bits / 8 bits per byte"
+    },
+    "PIPE_DEFAULT_CAPACITY": {
+      "value": 65536,
+      "source": "pipe(7), default capacity assumption; short writes still refuse"
+    },
+    "BASE64_INPUT": {
+      "value": 3,
+      "source": "RFC 4648 section 4: three octets encode as four characters"
+    },
+    "BASE64_OUTPUT": {
+      "value": 4,
+      "source": "RFC 4648 section 4: three octets encode as four characters"
+    },
+    "SECONDS_PER_MINUTE": {
+      "value": 60,
+      "source": "time unit conversion"
+    },
+    "MINUTES_PER_HOUR": {
+      "value": 60,
+      "source": "time unit conversion"
+    },
+    "HOURS_PER_DAY": {
+      "value": 24,
+      "source": "time unit conversion"
+    },
+    "UNLOCK_HOURS": {
+      "value": 12,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "SESSION_IDLE_MINUTES": {
+      "value": 5,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "SESSION_ABSOLUTE_HOURS": {
+      "value": 8,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "DEST_DAYS": {
+      "value": 90,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "REQ_MIB": {
+      "value": 1,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "RESP_MIB": {
+      "value": 8,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "TASK_STORE_MIB": {
+      "value": 64,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "WORKSPACE_MIB": {
+      "value": 64,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "WORKSPACE_INODES": {
+      "value": 4096,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "TASK_ERR_MAX": {
+      "value": 65536,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "FRAME_MAX_SMALL": {
+      "value": 4096,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "PASSPHRASE_MAX": {
+      "value": 1024,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "MAX_VAULT_VALUE_BYTES": {
+      "value": 4096,
+      "source": "must match MAX_SURROGATE_VALUE_BYTES in server/src/credential-surrogate/constants.ts; equality witness in test/smb/contracts.test.ts"
+    },
+    "QUERY_ENVELOPE_MAX": {
+      "value": 1024,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "GATE_B_ENVELOPE_MAX": {
+      "value": 4096,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "WALL_PROBE": {
+      "value": 1,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "AGENT_STOP": {
+      "value": 10,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "STOP_VERIFY": {
+      "value": 15,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "STATUS_POLL": {
+      "value": 5,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "VERB_STATUS_MARGIN": {
+      "value": 5,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "RELOCK_MUTEX_DEADLINE": {
+      "value": 1,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "QUERY_REPLY_MAX": {
+      "value": 2000,
+      "source": "must match SURROGATE_QUERY_TIMEOUT_MS in server/src/credential-surrogate/constants.ts; milliseconds; equality witness in test/smb/contracts.test.ts"
+    },
+    "EXIT_RELOCK_STALLED": {
+      "value": 70,
+      "source": "brief section 5: EX_SOFTWARE from sysexits.h"
+    },
+    "EXIT_REFUSED": {
+      "value": 1,
+      "source": "brief appendix A2: EXIT_REFUSED"
+    },
+    "EXIT_USAGE": {
+      "value": 64,
+      "source": "brief appendix A2: EXIT_USAGE"
+    },
+    "DEST_SKEW": {
+      "value": 300,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "B_START_RETRY": {
+      "value": 1,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "TMPFS_MAGIC": {
+      "value": 16914836,
+      "source": "include/uapi/linux/magic.h: TMPFS_MAGIC 0x01021994"
+    },
+    "P_GATE": {
+      "value": 850,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "P_WEB": {
+      "value": 3501,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "WALL_PROBE_PORT": {
+      "value": 852,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "PORT_FLOOR": {
+      "value": 1024,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "ID_BITS": {
+      "value": 128,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "ID_BYTES": {
+      "expression": {
+        "op": "div",
+        "args": [
+          "ID_BITS",
+          "BITS_PER_BYTE"
+        ]
+      },
+      "source": "brief section 4 item 2: bits divided by bits per byte"
+    },
+    "HEX_PER_BYTE": {
+      "value": 2,
+      "source": "two four-bit hexadecimal digits encode one eight-bit byte"
+    },
+    "ENROLLMENT_CODE_CHARS": {
+      "value": 26,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "ENROLLMENT_TTL": {
+      "value": 60,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "ENROLLMENT_ATTEMPTS": {
+      "value": 5,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "SIGNIN_NONCE_TTL": {
+      "value": 60,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "SIGNIN_NONCE_CAP": {
+      "value": 16,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "DECISION_NONCE_TTL": {
+      "value": 60,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "MUTATION_NONCE_TTL": {
+      "value": 60,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "MUTATION_NONCE_CAP": {
+      "value": 1,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "VAULT_VERSION": {
+      "value": 1,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "VAULT_SALT_BYTES": {
+      "value": 16,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "VAULT_KEY_BYTES": {
+      "value": 32,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "VAULT_NONCE_BYTES": {
+      "value": 24,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "VAULT_TAG_BYTES": {
+      "value": 16,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "ARGON2_T": {
+      "value": 3,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "ARGON2_P": {
+      "value": 4,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "ARGON2_M_KIB": {
+      "value": 65536,
+      "source": "brief section 5 vault format, D5; Argon2 parameters from RFC 9106 section 4 second option"
+    },
+    "JSON_MAX_DEPTH": {
+      "value": 64,
+      "source": "chosen policy: bounded parser or retained state work; maximum zero-based container depth (root is zero), must match strict_json.rs and parse-strict.ts"
+    },
+    "GATE_B_PENDING_MAX": {
+      "value": 64,
+      "source": "chosen policy: bounded parser or retained state work"
+    },
+    "CLASS_MAX_BYTES": {
+      "value": 64,
+      "source": "brief section 5 (R3 table and added constants)"
+    },
+    "STRING_MAX_BYTES": {
+      "value": 4096,
+      "source": "chosen policy: bounded parser or retained state work"
+    },
+    "ARRAY_MAX_ITEMS": {
+      "value": 4096,
+      "source": "chosen policy: bounded parser or retained state work"
+    },
+    "MIB": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "KIB",
+          "KIB"
+        ]
+      },
+      "source": "binary megabyte"
+    },
+    "SECONDS_PER_HOUR": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "SECONDS_PER_MINUTE",
+          "MINUTES_PER_HOUR"
+        ]
+      },
+      "source": "time conversion"
+    },
+    "SECONDS_PER_DAY": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "SECONDS_PER_HOUR",
+          "HOURS_PER_DAY"
+        ]
+      },
+      "source": "time conversion"
+    },
+    "TASK_IN_MAX": {
+      "expression": {
+        "op": "sub",
+        "args": [
+          "PIPE_DEFAULT_CAPACITY",
+          "FRAME_HEADER"
+        ]
+      },
+      "source": "D9: one complete frame per default pipe"
+    },
+    "TASK_OUT_FRAME_MAX": {
+      "expression": {
+        "op": "ref",
+        "args": [
+          "TASK_IN_MAX"
+        ]
+      },
+      "source": "one out frame fits the same pipe"
+    },
+    "WALL_STATUS_DEADLINE": {
+      "expression": {
+        "op": "ref",
+        "args": [
+          "WALL_PROBE"
+        ]
+      },
+      "source": "same freshness bound"
+    },
+    "VERB_STATUS_DEADLINE": {
+      "expression": {
+        "op": "add",
+        "args": [
+          "AGENT_STOP",
+          "STOP_VERIFY",
+          "VERB_STATUS_MARGIN"
+        ]
+      },
+      "source": "longest ordinary lock holder plus chosen margin"
+    },
+    "ID_HEX_CHARS": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "ID_BYTES",
+          "HEX_PER_BYTE"
+        ]
+      },
+      "source": "two hex digits per raw byte"
+    },
+    "FRAME_QUERY_BASE64": {
+      "expression": {
+        "op": "base64",
+        "args": [
+          "MAX_VAULT_VALUE_BYTES",
+          "BASE64_INPUT",
+          "BASE64_OUTPUT"
+        ]
+      },
+      "source": "ceil(bytes / 3) * 4"
+    },
+    "FRAME_MAX_QUERY": {
+      "expression": {
+        "op": "add",
+        "args": [
+          "FRAME_QUERY_BASE64",
+          "QUERY_ENVELOPE_MAX"
+        ]
+      },
+      "source": "value plus envelope"
+    },
+    "FRAME_GATE_B_BASE64": {
+      "expression": {
+        "op": "base64",
+        "args": [
+          "REQ_MAX",
+          "BASE64_INPUT",
+          "BASE64_OUTPUT"
+        ]
+      },
+      "source": "ceil(bytes / 3) * 4"
+    },
+    "FRAME_MAX_GATE_B": {
+      "expression": {
+        "op": "add",
+        "args": [
+          "FRAME_GATE_B_BASE64",
+          "GATE_B_ENVELOPE_MAX"
+        ]
+      },
+      "source": "frozen bytes plus envelope"
+    },
+    "UNLOCK_TTL": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "UNLOCK_HOURS",
+          "SECONDS_PER_HOUR"
+        ]
+      },
+      "source": "two clocks, first expiry or realtime reversal relocks"
+    },
+    "SESSION_IDLE": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "SESSION_IDLE_MINUTES",
+          "SECONDS_PER_MINUTE"
+        ]
+      },
+      "source": "idle limit"
+    },
+    "SESSION_ABSOLUTE": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "SESSION_ABSOLUTE_HOURS",
+          "SECONDS_PER_HOUR"
+        ]
+      },
+      "source": "absolute limit"
+    },
+    "DEST_MAX_LIFETIME": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "DEST_DAYS",
+          "SECONDS_PER_DAY"
+        ]
+      },
+      "source": "chosen ninety-day maximum"
+    },
+    "REQ_MAX": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "REQ_MIB",
+          "MIB"
+        ]
+      },
+      "source": "configured MiB times bytes per MiB"
+    },
+    "RESP_MAX": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "RESP_MIB",
+          "MIB"
+        ]
+      },
+      "source": "configured MiB times bytes per MiB"
+    },
+    "TASK_STORE_BYTES": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "TASK_STORE_MIB",
+          "MIB"
+        ]
+      },
+      "source": "configured MiB times bytes per MiB"
+    },
+    "WORKSPACE_BYTES": {
+      "expression": {
+        "op": "mul",
+        "args": [
+          "WORKSPACE_MIB",
+          "MIB"
+        ]
+      },
+      "source": "configured MiB times bytes per MiB"
+    },
+    "PLACEHOLDER_PREFIX": {
+      "value": "sanctuary_surrogate_",
+      "source": "must match SURROGATE_PLACEHOLDER_PREFIX in server/src/credential-surrogate/placeholder.ts; equality witness in test/smb/contracts.test.ts"
+    },
+    "GATE_ADDR": {
+      "value": "127.0.0.1",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "WEB_ADDR": {
+      "value": "service.json: provisioned private-network address",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "ORIGIN": {
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "https://<private-name>:${P_WEB}"
+    },
+    "MACHINE_ID_PATH": {
+      "value": "/etc/sanctuary/service/machine.json",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "R": {
+      "value": "/run/sanctuary-peer/activation.json",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "PREPARED": {
+      "value": "/run/sanctuary-peer/prepared.json",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "START_TICKET": {
+      "value": "/run/sanctuary-peer/start-ticket",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "UNCONFIRMED": {
+      "value": "/run/sanctuary-peer/stop-unconfirmed",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "FIFO_DIR": {
+      "value": "/run/sanctuary-task/current",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "FIFO_PARENT": {
+      "value": "/run/sanctuary-task",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "AGENT_UNIT": {
+      "value": "sanctuary-agent@<A>.service",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "AGENT_LEAF": {
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "/sys/fs/cgroup/system.slice/${AGENT_UNIT}"
+    },
+    "WORKSPACE": {
+      "value": "/var/lib/sanctuary-agent-workspace",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "ACTIVATE_SOCKET": {
+      "value": "/run/sanctuary-activate/activate.sock",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "FILTER_SOCKET": {
+      "value": "/run/sanctuary-wall/filter.sock",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "GATE_SOCKET": {
+      "value": "/run/sanctuary-peer/gate.sock",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "QUERY_SOCKET": {
+      "value": "/run/sanctuary-custody/query.sock",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "UNLOCK_SOCKET": {
+      "value": "/run/sanctuary-custody/unlock.sock",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "GATE_B_SOCKET": {
+      "value": "/run/sanctuary-gate/gate-b.sock",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "DESTINATIONS_PATH": {
+      "value": "/etc/sanctuary/egress/<F>/destinations.json",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "PIN_COPY_PATH": {
+      "value": "/etc/sanctuary/egress/<F>/pinned.pub",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "OWNER_ENROLL_REQUEST": {
+      "value": "/run/sanctuary-owner-enroll/request.json",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "VAULT_PATH": {
+      "value": "/var/lib/sanctuary-custody/<F>/vault.enc",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "VAULT_MAGIC": {
+      "value": "SNCV",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "VAULT_KDF": {
+      "value": "Argon2id",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "VAULT_AEAD": {
+      "value": "XChaCha20-Poly1305",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "HOLD_TIMEOUT": {
+      "value": "service.json: timeout always denies",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "WALL_DIGEST": {
+      "value": "SHA-256 of nft list table inet sanctuary_wall output, pinned in install manifest",
+      "source": "brief section 5 / decisions D1-D9"
+    },
+    "K": {
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "${ID_BITS} random bits, lowercase hex"
+    },
+    "MACHINE_ID": {
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "${ID_BITS} random bits minted at provision"
+    },
+    "WALL_TABLE": {
+      "source": "brief section 5 / decisions D1-D9",
+      "template": "table inet sanctuary_wall {\n  chain out { type filter hook output priority filter; policy accept;\n    meta skuid <A> jump agent }\n  chain agent {\n    meta nfproto ipv4 ip daddr ${GATE_ADDR} tcp dport ${P_GATE} accept\n    drop\n  }\n}\n"
+    },
+    "AGENT_HIDDEN": {
+      "source": "R3 amended D1 D3 D4",
+      "template": [
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/run/user",
+        "-/var/crash",
+        "/var/lib/sanctuary",
+        "/var/lib/sanctuary-service",
+        "/var/lib/sanctuary-gate",
+        "/var/lib/sanctuary-custody",
+        "/etc/sanctuary/egress",
+        "/etc/sanctuary/custody",
+        "/etc/sanctuary/service",
+        "/etc/sanctuary/castle-wall.env",
+        "/etc/sanctuary/install-recovery.json",
+        "/run/sanctuary",
+        "/run/sanctuary-linux",
+        "/run/sanctuary-peer",
+        "/run/sanctuary-custody",
+        "/run/sanctuary-service",
+        "/run/sanctuary-service-locks",
+        "/run/sanctuary-activate",
+        "${FIFO_PARENT}",
+        "/dev/mqueue",
+        "/run/sanctuary-wall",
+        "/run/sanctuary-gate",
+        "/run/sanctuary-owner-enroll"
+      ]
+    },
+    "AGENT_READ_SET": {
+      "value": [
+        "/opt/sanctuary/**",
+        "/usr/local/libexec/sanctuary/**",
+        "/usr/sbin/sanctuary-linux",
+        "/etc/systemd/system/sanctuary-*",
+        "/etc/sanctuary/agent/**",
+        "/etc/sanctuary/hermes/**",
+        "/etc/sanctuary/install-manifest.json"
+      ],
+      "source": "R3"
+    },
+    "AGENT_WRITE_SET": {
+      "source": "F-T13",
+      "template": [
+        "${WORKSPACE}"
+      ]
+    },
+    "H_HIDDEN": {
+      "value": [
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/dev/mqueue"
+      ],
+      "source": "R3: no PrivateTmp or ReadWritePaths"
+    },
+    "IO_URING_DENY": {
+      "value": {
+        "SystemCallFilter": "~io_uring_setup io_uring_enter io_uring_register",
+        "SystemCallArchitectures": "native"
+      },
+      "source": "R3"
+    },
+    "SESSION_COOKIE": {
+      "value": {
+        "prefix": "__Host-",
+        "Secure": true,
+        "HttpOnly": true,
+        "SameSite": "Strict"
+      },
+      "source": "R3: memory only, restart ends sessions"
+    },
+    "AGENT_UNIT_PROPERTIES": {
+      "source": "R3/R4 amended; no Install section",
+      "template": {
+        "TimeoutStopSec": "${AGENT_STOP}",
+        "KillMode": "control-group",
+        "UMask": "0077",
+        "RestrictAddressFamilies": "AF_INET",
+        "MemorySwapMax": "0",
+        "StandardError": "null",
+        "BindsTo": "sanctuary-wall.service",
+        "TemporaryFileSystem": "${WORKSPACE}:size=${WORKSPACE_MIB}M,nr_inodes=${WORKSPACE_INODES},mode=0700,uid=%i,gid=%i,nosuid,nodev,noexec",
+        "OpenFile": [
+          "${FIFO_DIR}/in:task-in",
+          "${FIFO_DIR}/out:task-out",
+          "${FIFO_DIR}/err:task-err"
+        ]
+      }
+    },
+    "FILE_MODES": {
+      "value": {
+        "MACHINE_ID": "0644",
+        "R": "0600",
+        "PREPARED": "0600",
+        "START_TICKET": "0600",
+        "UNCONFIRMED": "0600",
+        "FIFO_DIR": "0750",
+        "FIFO": "0660",
+        "FIFO_PARENT": "0755",
+        "OWNER_ENROLL_REQUEST": "0640",
+        "VAULT_PATH": "0640",
+        "DESTINATIONS_PATH": "0640",
+        "PIN_COPY_PATH": "0640"
+      },
+      "source": "R3 and D4 D5 D7; root owns all"
+    },
+    "EFFECT_STATES": {
+      "value": [
+        "reserved",
+        "committed",
+        "possible",
+        "unknown"
+      ],
+      "source": "one slot per task, full record budget reserved before admission"
+    },
+    "UNCONFIRMED_WRITE_RULE": {
+      "value": "stop writes only when ACTIVATION_GONE does not hold within STOP_VERIFY",
+      "source": "BR-T7"
+    },
+    "NONCE_KEYS": {
+      "value": {
+        "decision": [
+          "Q",
+          "credential id",
+          "value"
+        ],
+        "mutation": [
+          "actor credential id",
+          "target P",
+          "canonical route"
+        ]
+      },
+      "source": "R3 amended F-T19; single use"
+    },
+    "BITS_PER_BYTE": {
+      "value": 8,
+      "source": "octet definition"
+    },
+    "FIFO_RESULT_ENVELOPE_BYTES": {
+      "value": 31,
+      "source": "UTF-8 length of JCS({data_b64: \"\", type: \"result\"}); must match wire.json fifo_result"
+    },
+    "FIFO_RESULT_AVAILABLE_BYTES": {
+      "expression": {
+        "op": "sub",
+        "args": [
+          "TASK_OUT_FRAME_MAX",
+          "FIFO_RESULT_ENVELOPE_BYTES"
+        ]
+      },
+      "source": "brief section 4 item 6: payload budget less the result envelope"
+    },
+    "FIFO_RESULT_ENCODED_MAX": {
+      "expression": {
+        "op": "floor_multiple",
+        "args": [
+          "FIFO_RESULT_AVAILABLE_BYTES",
+          "BASE64_OUTPUT"
+        ]
+      },
+      "source": "RFC 4648: largest complete four-character base64 group that fits the frame"
+    }
+  }
+}

@@ -1,0 +1,232 @@
+{
+  "$comment": "R2-F7. Must match the ENC tuple consumer in later S6a. R11 field order amended by D8: class type 0x03 immediately after A. Type 0x01 raw ids, 0x02 u64 epochs, 0x03 UTF-8, 0x00 absent. Each length is a u32 big-endian byte count.",
+  "vectors": [
+    {
+      "domain": "ENC_SIGNIN",
+      "tag": "sanctuary-signin-v1",
+      "tag_hex": "73616e6374756172792d7369676e696e2d7631",
+      "fields": [
+        {
+          "name": "MACHINE_ID",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "nonce",
+          "type": "0x01",
+          "value": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "length_be": "00000020",
+          "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "name": "cred",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        }
+      ],
+      "encoded_hex": "73616e6374756172792d7369676e696e2d76310100000010abababababababababababababababab0100000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0100000010abababababababababababababababab"
+    },
+    {
+      "domain": "ENC_DECIDE",
+      "tag": "sanctuary-decide-v1",
+      "tag_hex": "73616e6374756172792d6465636964652d7631",
+      "fields": [
+        {
+          "name": "MACHINE_ID",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "boot",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "Q",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "digest",
+          "type": "0x01",
+          "value": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "length_be": "00000020",
+          "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "name": "A",
+          "type": "0x01",
+          "value": "00000000000003e9",
+          "length_be": "00000008",
+          "bytes": "00000000000003e9"
+        },
+        {
+          "name": "class",
+          "type": "0x03",
+          "value": "api.write",
+          "length_be": "00000009",
+          "bytes": "6170692e7772697465"
+        },
+        {
+          "name": "I",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "C",
+          "type": "0x01",
+          "value": "0000000000000001",
+          "length_be": "00000008",
+          "bytes": "0000000000000001"
+        },
+        {
+          "name": "person",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "cred",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "person_epoch",
+          "type": "0x02",
+          "value": "0000000000000001",
+          "length_be": "00000008",
+          "bytes": "0000000000000001"
+        },
+        {
+          "name": "value",
+          "type": "0x03",
+          "value": "approve",
+          "length_be": "00000007",
+          "bytes": "617070726f7665"
+        },
+        {
+          "name": "n",
+          "type": "0x01",
+          "value": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "length_be": "00000020",
+          "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "encoded_hex": "73616e6374756172792d6465636964652d76310100000010abababababababababababababababab0100000010abababababababababababababababab0100000010abababababababababababababababab0100000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd010000000800000000000003e903000000096170692e77726974650100000010abababababababababababababababab010000000800000000000000010100000010abababababababababababababababab0100000010abababababababababababababababab020000000800000000000000010300000007617070726f76650100000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    },
+    {
+      "domain": "ENC_MUTATE",
+      "tag": "sanctuary-mutate-v1",
+      "tag_hex": "73616e6374756172792d6d75746174652d7631",
+      "fields": [
+        {
+          "name": "MACHINE_ID",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "boot",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "method",
+          "type": "0x03",
+          "value": "POST",
+          "length_be": "00000004",
+          "bytes": "504f5354"
+        },
+        {
+          "name": "route",
+          "type": "0x03",
+          "value": "/people/{P}",
+          "length_be": "0000000b",
+          "bytes": "2f70656f706c652f7b507d"
+        },
+        {
+          "name": "target",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "target_epoch",
+          "type": "0x02",
+          "value": "0000000000000001",
+          "length_be": "00000008",
+          "bytes": "0000000000000001"
+        },
+        {
+          "name": "grant_id",
+          "type": "0x00",
+          "value": "",
+          "length_be": "00000000",
+          "bytes": ""
+        },
+        {
+          "name": "grant_epoch",
+          "type": "0x00",
+          "value": "",
+          "length_be": "00000000",
+          "bytes": ""
+        },
+        {
+          "name": "body_hash",
+          "type": "0x01",
+          "value": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "length_be": "00000020",
+          "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "name": "actor",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "cred",
+          "type": "0x01",
+          "value": "abababababababababababababababab",
+          "length_be": "00000010",
+          "bytes": "abababababababababababababababab"
+        },
+        {
+          "name": "actor_epoch",
+          "type": "0x02",
+          "value": "0000000000000001",
+          "length_be": "00000008",
+          "bytes": "0000000000000001"
+        },
+        {
+          "name": "n",
+          "type": "0x01",
+          "value": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "length_be": "00000020",
+          "bytes": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "encoded_hex": "73616e6374756172792d6d75746174652d76310100000010abababababababababababababababab0100000010abababababababababababababababab0300000004504f5354030000000b2f70656f706c652f7b507d0100000010abababababababababababababababab02000000080000000000000001000000000000000000000100000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0100000010abababababababababababababababab0100000010abababababababababababababababab020000000800000000000000010100000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    }
+  ]
+}

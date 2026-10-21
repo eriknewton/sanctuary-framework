@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a scopes the existing Overview copy assertion to renderPostureScreen because agent detail now names enforcement.
 /**
  * Sanctuary v1.1 Dashboard — Shell HTML tests.
  *
@@ -14,25 +15,199 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { createContext, runInContext } from "node:vm";
 import {
   renderDashboardV11Html,
   getClientScript,
 } from "../../../src/dashboard/v1_1/index.js";
+import { THEME_BOOTSTRAP_SCRIPT } from "../../../src/dashboard/design-tokens.js";
 
 describe("v1.1 dashboard shell HTML", () => {
   it("renders the sidebar nav and excludes out-of-scope routes", () => {
     const html = renderDashboardV11Html({});
-    expect(html).toContain('data-route="dashboard"');
-    expect(html).toContain('data-route="agents"');
-    expect(html).toContain('data-route="policy"');
-    expect(html).toContain('data-route="privacy"');
-    expect(html).toContain('data-route="coordination"');
-    expect(html).toContain('data-route="health"');
-    expect(html).toContain('data-route="exit-drill"');
+    // Slice 2 rail: the eight destinations plus Configure (order is pinned in
+    // shell-route-walk.test.ts).
+    for (const id of ["posture", "approvals", "agents", "enforcement", "findings", "activity", "policy", "integrations", "settings"]) {
+      expect(html).toContain(`data-route="${id}"`);
+    }
+    // Retargeted (slice 2 shell): Talk, Privacy, Coordination, Health and
+    // Exit drill left the rail; each folded id resolves through the client's
+    // rail-parent table and still renders on its own hash.
+    const client = getClientScript();
+    expect(client).toContain('"dashboard": null');
+    expect(client).toContain('"privacy": "settings"');
+    expect(client).toContain('"coordination": "integrations"');
+    expect(client).toContain('"health": "settings"');
+    expect(client).toContain('"exit-drill": "activity"');
     // Out-of-scope at v1.1 ship: federation, composition, full recovery.
     expect(html).not.toContain('data-route="federation"');
     expect(html).not.toContain('data-route="composition"');
     expect(html).not.toContain('data-route="recovery"');
+    expect(client).not.toContain('case "federation"');
+    expect(client).not.toContain('case "composition"');
+    expect(client).not.toContain('case "recovery"');
+  });
+
+  it("locked status paints the violet locked hue, never the fault red", () => {
+    const html = renderDashboardV11Html({ embedClient: false });
+    // Locked down is an operator decision, not a failure: the pill, the
+    // top-bar seal and the ambient seal all read --locked with its tint and
+    // line, and none of them reads the --rust fault hue.
+    const rule = (selector: string) => {
+      const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const m = html.match(new RegExp(`(?:^|\\n)${esc} \\{([^}]*)\\}`));
+      expect(m, selector).toBeTruthy();
+      return m![1]!;
+    };
+    const pill = rule(".pill.tone-locked");
+    expect(pill).toContain("var(--locked-bg)");
+    expect(pill).toContain("color: var(--locked)");
+    expect(pill).toContain("var(--locked-line)");
+    expect(pill).not.toContain("--rust");
+    const seal = rule(".posture-seal.tone-locked");
+    expect(seal).toContain("var(--locked-bg)");
+    expect(seal).toContain("color: var(--locked)");
+    expect(seal).toContain("var(--locked-line)");
+    expect(seal).not.toContain("--rust");
+    const ambient = rule(".ambient-seal.tone-locked .as-glyph");
+    expect(ambient).toContain("color: var(--locked)");
+    expect(ambient).not.toContain("--rust");
+    // No combined selector smuggles the locked tone back onto the fault red
+    // (comments stripped first: the token block's prose names these selectors).
+    const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(css).not.toMatch(/tone-locked[^{]*\{[^}]*--rust/);
+  });
+
+  it("a bare link in the main column reads the accent, never the user-agent blue", () => {
+    // Dark is the default theme, and the user-agent link blue on the dark
+    // paper is about 2:1, under the 4.5:1 text floor. One rule colors every
+    // non-button anchor in the main column, visited and hover included.
+    const html = renderDashboardV11Html({ embedClient: false });
+    const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
+    // :where() keeps the rule at zero specificity, so a link a component
+    // already colors keeps its own rule (a capture audit found the Settings
+    // tabs recolored by a plain-specificity version).
+    const m = css.match(/(?:^|\n):where\(\.main a:not\(\.btn\), \.main a:not\(\.btn\):visited, \.main a:not\(\.btn\):hover\) \{([^}]*)\}/);
+    expect(m, ":where(.main a:not(.btn)) rule").toBeTruthy();
+    expect(m![1]).toContain("color: var(--accent)");
+  });
+
+  it("the stylesheet's braces balance: no unmatched closer, depth zero at the end", () => {
+    // CSS error recovery folds a stray closing brace into the next rule's
+    // prelude and silently drops that rule, so a balanced stylesheet is a
+    // rendering invariant, not a lint. Comments and quoted strings are skipped.
+    const html = renderDashboardV11Html({ embedClient: false });
+    const css = html.slice(html.indexOf("<style>") + "<style>".length, html.indexOf("</style>"));
+    let depth = 0;
+    let unmatched = 0;
+    for (let i = 0; i < css.length; i++) {
+      const c = css[i];
+      if (c === "/" && css[i + 1] === "*") { const end = css.indexOf("*/", i + 2); i = end < 0 ? css.length : end + 1; continue; }
+      if (c === '"' || c === "'") { let j = i + 1; while (j < css.length && css[j] !== c) j += css[j] === "\\" ? 2 : 1; i = j; continue; }
+      if (c === "{") depth++;
+      else if (c === "}") { if (depth === 0) unmatched++; else depth--; }
+    }
+    expect(unmatched, "unmatched closing braces").toBe(0);
+    expect(depth, "unclosed blocks at the end").toBe(0);
+  });
+
+  it("the engaged Lock down state keeps the bad text and a bad-hue border with no fill", () => {
+    // Lock down is the one danger-styled control, and it never paints a red
+    // fill, engaged included: an engaged lockdown is a decision on record,
+    // not an alarm.
+    // Retargeted (slice 2b): the edge moved from --rust-line to --rust,
+    // because a control edge must clear 3:1 against its fill and --rust-line
+    // measures under 2.1:1 on every fill (shell-contrast.test.ts).
+    const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
+    const m = css.match(/(?:^|\n)\.btn\.btn-lockdown\.tier1-engaged(?:, [^{]+)? \{([^}]*)\}/);
+    expect(m, ".btn.btn-lockdown.tier1-engaged rule").toBeTruthy();
+    expect(m![1]).toContain("background: transparent");
+    expect(m![1]).toContain("color: var(--rust)");
+    expect(m![1]).toContain("border-color: var(--rust)");
+    expect(m![1]).not.toContain("--rust-bg");
+  });
+
+  it("no Lock down state paints the rust fill: idle, hover, focus and engaged keep text and line only", () => {
+    const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
+    const rules = [...css.matchAll(/(?:^|\n)([^{}\n]*btn-lockdown[^{}\n]*) \{([^}]*)\}/g)];
+    expect(rules.length).toBeGreaterThan(0);
+    expect(rules.map((m) => m[1])).toEqual(expect.arrayContaining([expect.stringContaining(":hover")]));
+    for (const m of rules) {
+      expect(m[2], m[1]).not.toContain("--rust-bg");
+      const bg = m[2]!.match(/background:\s*([^;]+)/);
+      if (bg) expect(bg[1]!.trim(), m[1]).toBe("transparent");
+    }
+  });
+
+  it("a folded section carries its own styled head, and the hosted page's eyebrow and h1 do not repeat", () => {
+    const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
+    const rule = (selector: string) => {
+      const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const m = css.match(new RegExp(`(?:^|\\n)${esc} \\{([^}]*)\\}`));
+      expect(m, selector).toBeTruthy();
+      return m![1]!;
+    };
+    // The fold's eyebrow reads as an eyebrow (mono, uppercase), and its title
+    // is a section heading, not body text.
+    expect(rule(".folded-section > .folded-head .eyebrow")).toContain("text-transform: uppercase");
+    expect(rule(".folded-section > .folded-head h2")).toContain("font-family: var(--display)");
+    // The hosted page's own eyebrow and h1 are hidden inside a fold (the
+    // fold's head carries them), wherever the hosted renderer puts them.
+    const hide = rule(".folded-section > .page-head .eyebrow, .folded-section > .page-head h1, .folded-section > .policy-center > .eyebrow, .folded-section > .policy-center > h1, .folded-section > h1");
+    expect(hide).toContain("display: none");
+    // Both folds name their hosted page in the fold head.
+    const client = getClientScript();
+    expect(client).toContain('renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot"');
+    expect(client).toContain('renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger"');
+  });
+
+  it("the theme bootstrap yields dark with empty storage, and an explicit light choice wins", () => {
+    const run = (storage: { getItem: (k: string) => string | null }) => {
+      const attrs: Record<string, string> = {};
+      const context = createContext({
+        sessionStorage: storage,
+        document: { documentElement: { setAttribute: (k: string, v: string) => { attrs[k] = v; } } },
+      });
+      runInContext(THEME_BOOTSTRAP_SCRIPT, context);
+      return attrs["data-theme"];
+    };
+    expect(run({ getItem: () => null })).toBe("dark");
+    expect(run({ getItem: () => "dark" })).toBe("dark");
+    expect(run({ getItem: () => "light" })).toBeUndefined();
+    expect(run({ getItem: () => { throw new Error("storage blocked"); } })).toBe("dark");
+    // The shell runs the same bootstrap in its head, before first paint.
+    const html = renderDashboardV11Html({ embedClient: false });
+    expect(html.indexOf(THEME_BOOTSTRAP_SCRIPT)).toBeGreaterThan(0);
+    expect(html.indexOf(THEME_BOOTSTRAP_SCRIPT)).toBeLessThan(html.indexOf("<style>"));
+  });
+
+  it("the client's theme fallback is dark with no explicit choice and light only when chosen", () => {
+    const boot = (choice: string | null) => {
+      const calls: string[] = [];
+      const context = createContext({
+        document: {
+          getElementById: () => null, addEventListener() {}, querySelectorAll: () => [],
+          documentElement: {
+            setAttribute: (k: string, v: string) => calls.push(`set ${k}=${v}`),
+            removeAttribute: (k: string) => calls.push(`remove ${k}`),
+          },
+        },
+        // An OS that prefers light must not pull the no-choice state to light.
+        window: { addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }) },
+        location: { hash: "", search: "", origin: "http://fixture" },
+        sessionStorage: { getItem: (k: string) => (k === "sanctuary-v11-theme" ? choice : null) },
+        URLSearchParams, URL, AbortController, Date, Element: class {},
+        setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
+        EventSource: class { addEventListener() {} close() {} },
+        fetch: () => new Promise<never>(() => {}),
+      });
+      runInContext(getClientScript(), context);
+      return calls;
+    };
+    expect(boot(null)).toContain("set data-theme=dark");
+    expect(boot("dark")).toContain("set data-theme=dark");
+    expect(boot("light")).toContain("remove data-theme");
+    expect(boot("light")).not.toContain("set data-theme=dark");
   });
 
   it("embeds dashboard config as a JSON script tag without serializing the bearer", () => {
@@ -42,11 +217,18 @@ describe("v1.1 dashboard shell HTML", () => {
       fortressId: "fortress-001",
     });
     expect(html).not.toContain("session-token-xyz");
-    expect(html).not.toContain("localStorage");
     // Sovereignty preference is in-memory; sidebar collapse goes to
     // sessionStorage only. Confirm via the embedded client script.
+    // Retargeted (slice 2b): the Machines screen reads the Fleet Switcher's
+    // saved machine list, so the client now carries exactly one
+    // localStorage access, a read of that one key. Nothing is ever written
+    // to localStorage, so no token or state is persisted there.
     const client = getClientScript();
-    expect(client).not.toContain("localStorage");
+    expect(html.match(/localStorage/g) ?? []).toHaveLength(1);
+    expect(client.match(/localStorage/g) ?? []).toHaveLength(1);
+    expect(client).toContain("localStorage.getItem(FLEET_STORAGE_KEY)");
+    expect(client).toContain('const FLEET_STORAGE_KEY = "sanctuary_fleet_machines";');
+    expect(client).not.toMatch(/localStorage\.(setItem|removeItem|clear)|localStorage\[/);
     expect(client).toContain("sessionStorage");
     expect(client).toContain('sessionStorage.getItem("authToken")');
   });
@@ -74,9 +256,10 @@ describe("v1.1 dashboard shell HTML", () => {
   it("exposes a Posture entry in the sidebar (folded-in posture detail)", () => {
     const html = renderDashboardV11Html({});
     expect(html).toContain('data-route="posture"');
-    // It sits in the Verify group alongside Activity / Attestation / Health.
+    // It leads the rail, with Evidence (activity) beside it.
     expect(html).toContain('data-route="activity"');
-    expect(html).toContain('data-route="attestation"');
+    // Retargeted (slice 2 shell): Attestation is a Settings tab, not a rail item.
+    expect(getClientScript()).toContain('{ id: "attestation", label: "Attestation" }');
   });
 
   it("renders the folded Posture screen reusing the existing posture data endpoints", () => {
@@ -90,19 +273,21 @@ describe("v1.1 dashboard shell HTML", () => {
     // The per-agent drill-down and the Evidence view stay reachable.
     expect(client).toContain("/posture/agent/");
     expect(client).toContain("/posture/evidence");
-    // The six named metric cards from the posture board are folded in.
-    expect(client).toContain("Protection requested");
-    expect(client).toContain("Enforcement confirmed");
+    // The source-backed Overview tiles that remain after slice 3 subtraction are folded in.
+    expect(client).not.toContain("Protected agents");
+    // Agent detail names scoped enforcement evidence; this prohibition belongs to the Overview alone.
+    expect(client.match(/function renderPostureScreen\(\)[\s\S]*?\n\}\n/)![0]).not.toContain("Enforcement confirmed");
     expect(client).toContain("Castle Wall");
     expect(client).toContain("Approvals waiting");
-    expect(client).toContain("Open anomalies");
+    expect(client).toContain("Open Sentinel findings");
     expect(client).toContain("Audit chain");
-    // Today's story + the plain-summary toggle are folded in (apostrophe is
-    // emitted as the &#39; entity so the raw client string is plain).
-    expect(client).toContain("Today&#39;s story");
-    expect(client).toContain("posture-story-plain");
-    // Anomaly findings list is folded in.
-    expect(client).toContain("Anomaly findings");
+    // The decision queue, findings list, and agents table are folded in without adding a duplicate API surface.
+    expect(client).toContain("Needs your decision");
+    expect(client).not.toContain("Egress enforcement");
+    // Retargeted (slice 3 round 2): pins the Overview findings panel renderer, not a generic label.
+    expect(client).toContain("function renderOverviewFindingsPanel");
+    // Retargeted (slice 3 round 2): pins the Overview agents table renderer, not a generic label.
+    expect(client).toContain("function renderOverviewAgentsTable");
   });
 
   it("the seal click-to-expand routes into the full Posture detail", () => {
@@ -167,15 +352,26 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(pillsMatch![0]).toContain('data-pill="deployment"');
   });
 
-  it("renders a clickable link to /fleet as the Machines nav item (C1 Finding 4; S2 reorder)", () => {
+  it("the Machines nav item opens the fleet inside the shell, and /fleet stays linked (C1 Finding 4; S2 reorder)", () => {
     const html = renderDashboardV11Html({});
     // S2: the Fleet Switcher moved from a top-bar link to the "Machines" item
     // in the sidebar nav spine. The /fleet route stays reachable, unremoved.
-    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
-    const navMatch = html.match(/<nav id="sidebar-nav">[\s\S]*?<\/nav>/);
+    // Retargeted (slice 2 shell): the nav now carries aria-label="Primary".
+    // Retargeted (slice 2b): Machines is a shell screen (hash route
+    // "machines") over the Fleet Switcher's reads, so the rail item and the
+    // scope menu's fleet link open it; the /fleet page stays served and the
+    // Machines screen links to it for adding and removing machines.
+    const navMatch = html.match(/<nav id="sidebar-nav"[^>]*>[\s\S]*?<\/nav>/);
     expect(navMatch).toBeTruthy();
-    expect(navMatch![0]).toContain('href="/fleet"');
-    expect(navMatch![0]).toContain("Machines");
+    expect(navMatch![0]).toMatch(/<a href="#machines" data-route="machines"[^>]*>[\s\S]*?Machines/);
+    expect(html).toContain('<a class="scope-fleet" href="#machines" data-action="set-route" data-route="machines"');
+    expect(html).toContain("Fleet: machines saved in this browser");
+    const client = getClientScript();
+    const screen = client.match(/function renderMachinesScreen\(\)[\s\S]*?\n\}\n/);
+    expect(screen, "renderMachinesScreen").toBeTruthy();
+    expect(screen![0]).toContain('<a href="/fleet">Fleet Switcher</a>');
+    expect(screen![0]).toContain("<h1>Machines saved in this browser.</h1>");
+    expect(screen![0]).not.toContain("Every machine" + " you run.");
   });
 
   it("falls back to the package binary version when sanctuaryVersion is unset", () => {
@@ -228,6 +424,51 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(client).toContain("Per-agent rules");
     expect(client).toContain("template-picker-open");
     expect(client).toContain('body: { template_id: templateId }');
+  });
+});
+
+describe("v1.1 dashboard top bar at narrow widths", () => {
+  const html = renderDashboardV11Html({ embedClient: false });
+  // Comments stripped: the stylesheet's prose names these selectors.
+  const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
+  const block = (query: string) => {
+    const start = css.indexOf(`@media (${query}) {`);
+    expect(start, query).toBeGreaterThan(-1);
+    let depth = 0;
+    for (let i = css.indexOf("{", start); i < css.length; i++) {
+      if (css[i] === "{") depth++;
+      if (css[i] === "}" && --depth === 0) return css.slice(start, i + 1);
+    }
+    throw new Error("unbalanced " + query);
+  };
+
+  it("the scope trigger clips its own content, so its caret never draws over the search box", () => {
+    const scope = css.match(/\n\.scope \{([^}]*)\}/);
+    expect(scope).toBeTruthy();
+    expect(scope![1]).toContain("overflow: hidden");
+  });
+
+  it("the narrow rail is wide enough for Approvals beside a four-digit waiting pill", () => {
+    const step = block("max-width: 1100px");
+    expect(step).toContain(".app, .app.route-full { grid-template-columns: 220px 1fr;");
+  });
+
+  it("the per-agent rules table fits the narrowed main column instead of hiding a column", () => {
+    expect(css).toMatch(/\n\.rules-table \{[^}]*min-width: 760px/);
+    expect(block("max-width: 1100px")).toContain(".rules-table { min-width: 680px; }");
+  });
+
+  it("the second step starts at the measured 1240px and sheds the avatar before the scope's text floors give", () => {
+    expect(css).not.toContain("@media (max-width: 1180px)");
+    const step = block("max-width: 1240px");
+    expect(step).toContain(".topbar .avatar { display: none; }");
+    // The agent label is the last give; the machine name keeps its 6ch floor
+    // so a short name is never shaved into an ellipsis.
+    expect(step).toContain(".scope .sw-agent { min-width: 0; }");
+    expect(step).not.toMatch(/\.machine-name \{[^}]*min-width: 0/);
+    expect(css).toMatch(/\n\.scope \.machine-name \{[^}]*min-width: 6ch/);
+    expect(step).toContain(".search-wrap { min-width: 104px; }");
+    expect(step).toContain(".brand .brand-word { display: none; }");
   });
 });
 

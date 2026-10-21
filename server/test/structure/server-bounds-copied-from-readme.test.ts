@@ -15,6 +15,17 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { SERVER_BOUNDS } from "../../src/agent-native/capabilities-catalog.js";
 
+// Historical blog posts are intentionally outside the current public-copy contract.
+const PUBLIC_SURFACES = [
+  "docs/index.html", "README.md", "docs/llms-full.txt", "server/README.md",
+  "docs/llms.txt", "ROADMAP.md", "server/src/agent-native/capabilities-catalog.ts",
+  "plugin/skills/sanctuary/SKILL.md", "plugin/README.md",
+  "plugin/.claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+  "server/package.json", "server/server.json", "docs/agent-guided-install.md",
+  "SANCTUARY_ARCHITECTURE.md",
+];
+const RETIRED_QUALIFIER = /\bpatched\s+(?:host|mac(?:os)?)\b/i;
+
 const README = readFileSync(fileURLToPath(new URL("../../../README.md", import.meta.url)), "utf8").toLowerCase();
 
 /** Split on a sentence end followed by whitespace; the README is read the same way. */
@@ -23,17 +34,37 @@ function sentences(text: string): string[] {
 }
 
 describe("server bounds are copied from the README", () => {
-  it("every platform and never-claimed sentence is a README substring, and every proof sentence carries the patched-host bound", () => {
+  it("every copied sentence retains its platform bound and public surfaces omit the retired qualifier", () => {
     const copied = { platforms: SERVER_BOUNDS.platforms, neverClaimed: SERVER_BOUNDS.neverClaimed };
     const missing: string[] = [];
     const unbounded: string[] = [];
     for (const [key, text] of Object.entries(copied)) {
       for (const sentence of sentences(text)) {
         if (!README.includes(sentence.toLowerCase())) missing.push(`${key}: ${sentence}`);
-        if (/\bproven\b/i.test(sentence) && !/on a patched host/.test(sentence)) unbounded.push(`${key}: ${sentence}`);
+        if (key === "platforms" && /\bproven\b/i.test(sentence)) {
+          // A proof stays attached to its platform; Linux never generalizes beyond the drilled OS and architecture.
+          const macOS = sentence === "macOS: proven.";
+          const linux = sentence === "Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven.";
+          if (!macOS && !linux) unbounded.push(`${key}: ${sentence}`);
+        }
       }
     }
-    expect(missing, "a bounds sentence is not README text; change the README first").toEqual([]);
-    expect(unbounded, "a proof sentence lacks the patched-host bound").toEqual([]);
+    expect.soft(missing, "a bounds sentence is not README text; change the README first").toEqual([]);
+    expect.soft(unbounded, "a proof sentence lacks its platform bound").toEqual([]);
+    expect.soft(SERVER_BOUNDS.platforms).toContain("macOS: proven.");
+    expect.soft(SERVER_BOUNDS.platforms).toContain("Linux enforcement is proven on Ubuntu 24.04 (x86-64) only;");
+    // The proven Linux path is not in the npm package this server ships in, so
+    // the bounds name its channel; an agent reading only "proven on Ubuntu"
+    // would assume the npm install enforces there.
+    expect.soft(SERVER_BOUNDS.platforms).toContain("Linux enforcement ships as the separate Castle Wall Linux");
+    expect.soft(SERVER_BOUNDS.platforms).toContain("not in the npm package.");
+    // The short macOS status inherits the drill scope from the same README wall row.
+    const wallRow = README.split("\n").find((line) => line.startsWith("| **the wall.**"));
+    expect(wallRow).toContain("a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles.");
+    expect(wallRow).toContain("not an audited per-rule, per-flow trail.");
+    const qualified = PUBLIC_SURFACES.filter((path) => RETIRED_QUALIFIER.test(
+      readFileSync(fileURLToPath(new URL(`../../../${path}`, import.meta.url)), "utf8"),
+    ));
+    expect(qualified, "a public surface reintroduced the retired qualifier").toEqual([]);
   });
 });

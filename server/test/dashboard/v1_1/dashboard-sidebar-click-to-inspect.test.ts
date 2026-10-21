@@ -21,6 +21,7 @@
  * These are server-side rendered-script / CSS-shape assertions; the
  * full route round-trip is exercised by inspect-routes coverage.
  */
+// fail-before-exempt: this change edits click-target comment prose only here; the agent-row control labels are asserted in shell-wired-consumers.test.ts.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -85,7 +86,7 @@ describe("v1.1 dashboard sidebar click-to-inspect (fortress-column agent rows)",
   it("lifecycle action buttons still carry their own data-action so the head click does not swallow them", () => {
     const script = getClientScript();
     // The dispatcher walks up to the closest data-action ancestor.
-    // Lifecycle buttons (Pause / Resume / Restart / Lockdown / Unwrap)
+    // Lifecycle buttons (Pause / Resume / Restart / Lock down / Remove protection)
     // are emitted with their own data-action="agent-<sub>" so a click
     // on a button finds that action first and does NOT bubble up to
     // agent-row-inspect-open on the head. Pin the agent-<sub> pattern

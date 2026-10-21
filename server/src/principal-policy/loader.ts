@@ -245,6 +245,30 @@ export const NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS = [
   "state_disclose_unattributed",
 ] as const;
 
+/**
+ * Verascore publish (`reputation_publish`) sends a signed sovereignty report off
+ * this machine to a third-party service, so it ALWAYS waits for the operator:
+ * data leaves the machine only with explicit, confirmed operator intent
+ * (AGENTS.md MUST-NEVER #1). Force-pinned from 1.9.0.
+ *
+ * WHY A `tier3_always_allow` LISTING IS NOT HONORED HERE, unlike an ordinary
+ * default. Until 1.9.0 the shipped default listed `reputation_publish` under
+ * Tier 3, and the first-boot writer (`writeDefaultPrincipalPolicyFile`) wrote
+ * that default into every fortress's `principal-policy.yaml`. So a Tier 3
+ * listing on disk is what Sanctuary wrote at setup, not evidence that the
+ * operator chose unattended publishing; honoring it would keep auto-publish on
+ * every existing install. The policy still LOADS (no boot failure, no rewrite
+ * of the operator's file): `enforceForcedTiers` moves the operation to Tier 1
+ * and prunes it from Tier 3 at load, and `gate.ts`'s runtime mirror classifies
+ * it Tier 1 even for a policy object that never passed through the loader.
+ * The tool name and schema are unchanged. Must match the "Tier 1" sentence in
+ * the `reputation_publish` description (src/reputation/tools.ts) and
+ * test/principal-policy/reputation-publish-approval-tier.test.ts.
+ */
+export const NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS = [
+  "reputation_publish",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -264,6 +288,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -573,6 +598,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "governor_reset", // Clears all runtime governance state - always requires approval
     "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes - always requires approval
     "sanctuary_export_identity_bundle", // Exports portable identity - always requires approval
+    // Verascore publish: data leaves the machine only with explicit operator
+    // intent (AGENTS.md MUST-NEVER #1). ALSO force-pinned via
+    // NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS, which is what makes it
+    // non-relaxable; this entry keeps a generated policy file honest.
+    "reputation_publish",
     "exit_bundle_export", // Complete portability bundle export. Always requires approval.
     "exit_bundle_import", // External durable-record import. Always requires approval.
     "exit_bundle_import_activate", // Activates imported material. Always requires approval.
@@ -712,7 +742,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sovereignty_profile_get",
     "sovereignty_profile_generate_prompt", // Agent needs its own config to generate system prompt
     "governor_status",
-    "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
+    // reputation_publish is Tier 1 (see tier1_always_approve above): it sends
+    // data off the machine, so it is never auto-allowed by default.
     "identity_set_primary", // One-time set, persists via _meta storage - safe at Tier 3
     "memory_attest", // Read-only audit attestation - records that a memory op happened
     // Rung 1 hands-free restart read (must match the tier pin on

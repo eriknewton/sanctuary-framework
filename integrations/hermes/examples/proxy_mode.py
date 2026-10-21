@@ -294,6 +294,7 @@ and audit log showing the enforcement chain in action.""",
 
 5. Publish to Verascore using sanctuary/reputation_publish:
    - target_url: "https://verascore.ai/api/publish"
+   - From Sanctuary 1.9.0 the operator approves this before anything is sent
 
 6. Store the governance report in sanctuary/state_write
    with key 'proxy_governance_report'.

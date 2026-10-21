@@ -1,0 +1,11 @@
+# witness: enc_vectors_carry_class_after_a
+--- a/server/test/smb/vectors/enc.json
++++ b/server/test/smb/vectors/enc.json
+@@ -74,7 +73,0 @@
+-          "name": "class",
+-          "type": "0x03",
+-          "value": "api.write",
+-          "length_be": "00000009",
+-          "bytes": "6170692e7772697465"
+-        },
+-        {

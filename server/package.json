@@ -2,7 +2,7 @@
   "name": "@sanctuary-framework/mcp-server",
   "version": "1.9.0-rc.1",
   "mcpName": "ai.sanctuaryprotocol/sanctuary",
-  "description": "Open source wall under your AI agent: egress enforced by the OS on a patched macOS host, keys the operator holds, a hash-chained audit record. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host. Wraps Claude Code, Cursor, Hermes, OpenClaw and Cline on tested config paths (Assurance Matrix: partial).",
+  "description": "Security for AI agents: an OS-enforced egress wall on macOS, operator-held keys, a hash-chained audit record. Wraps Claude Code, Cursor, Hermes, OpenClaw, Cline on tested config paths (partial). Linux wall: Ubuntu 24.04 x86-64 only, separate package.",
   "homepage": "https://sanctuaryprotocol.ai",
   "bugs": {
     "url": "https://github.com/eriknewton/sanctuary-framework/issues"
@@ -110,9 +110,6 @@
     "it-pipe": "3.0.1",
     "libp2p": "2.10.0",
     "lmdb": "3.5.6",
-    "pg": "8.23.0",
-    "pgvector": "0.3.0",
-    "uint8arraylist": "3.0.2",
     "uint8arrays": "6.1.1",
     "viem": "2.56.9"
   },
@@ -122,7 +119,6 @@
     "@stryker-mutator/core": "10.0.0",
     "@stryker-mutator/vitest-runner": "10.0.0",
     "@types/node": "26.6.2",
-    "@types/pg": "8.23.1",
     "@vitest/coverage-v8": "4.1.11",
     "ajv": "8.20.0",
     "eslint": "10.11.0",

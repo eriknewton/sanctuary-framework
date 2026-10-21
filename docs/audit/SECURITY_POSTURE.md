@@ -2,7 +2,7 @@
 
 Canonical, at-a-glance statement of where the repository stands on release provenance, supply chain, branch protection, and code scanning, plus the open security-debt board. This is the page an external reviewer should read first. Update it whenever any row below changes.
 
-Last updated: 2026-10-06.
+Last updated: 2026-10-21.
 
 This posture reflects the remediation of the independent 2026-06-16 hygiene and security audit (which graded the repository B / 8.1 after the first remediation wave) and the 2026-06-17 follow-up wave that closed the remaining clean-win findings and documented the residue. The remaining open items below are either upstream-blocked, dev-and-build-only (never shipped), drill-gated, or deliberate maintainer-posture choices. Each is disclosed here rather than silently dismissed.
 
@@ -11,9 +11,9 @@ This posture reflects the remediation of the independent 2026-06-16 hygiene and 
 | Field | Value |
 |---|---|
 | npm `latest` | `@sanctuary-framework/mcp-server@1.8.4` |
-| npm `next` | `@sanctuary-framework/mcp-server@1.8.6-rc.5` |
-| Git tag | `v1.8.4` for stable; `v1.8.6-rc.5` for the current prerelease |
-| GitHub release | `v1.8.4` for stable; `v1.8.6-rc.5` for the current prerelease; `castle-wall-linux-0.1.0-1` for the bounded Ubuntu 24.04 x86-64 Linux Castle Wall pre-release |
+| npm `next` | `@sanctuary-framework/mcp-server@1.9.0-rc.1` |
+| Git tag | `v1.8.4` for stable; `v1.9.0-rc.1` for the current prerelease |
+| GitHub release | `v1.8.4` for stable; `v1.9.0-rc.1` for the current prerelease; `castle-wall-linux-0.1.0-1` for the bounded Ubuntu 24.04 x86-64 Linux Castle Wall pre-release |
 | Supported versions | Current stable and current prerelease, with older supported lines governed by [`SECURITY.md`](../../SECURITY.md). |
 | Publish flow | npm Trusted Publishing (OIDC), manual `workflow_dispatch`. No static npm token. |
 

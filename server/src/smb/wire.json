@@ -1,0 +1,766 @@
+{
+  "$comment": "THE SMB wire source; must match loaders wire.ts and castle-wall-daemon/src/smb/wire.rs. All fields required; no unknown fields. Decimal integers are strings, including D7 version/port under section 4 item 2. unconfirmed is an empty presence-marker object; identity and err_ino remain in r_record and prepared. String bounds use UTF-8 bytes.",
+  "schemas": {
+    "decimal": {
+      "type": "decimal",
+      "max": "18446744073709551615"
+    },
+    "request_id": {
+      "type": "decimal",
+      "min": "1",
+      "max": "18446744073709551615"
+    },
+    "hex128": {
+      "type": "string",
+      "min": "ID_HEX_CHARS",
+      "max": "ID_HEX_CHARS",
+      "chars": "0123456789abcdef"
+    },
+    "I": {
+      "ref": "hex128"
+    },
+    "boot_id": {
+      "ref": "hex128"
+    },
+    "K": {
+      "ref": "hex128"
+    },
+    "MACHINE_ID": {
+      "ref": "hex128"
+    },
+    "class": {
+      "type": "string",
+      "min": 1,
+      "max": "CLASS_MAX_BYTES",
+      "chars": "abcdefghijklmnopqrstuvwxyz0123456789_.-"
+    },
+    "digest": {
+      "type": "string",
+      "min": 64,
+      "max": 64,
+      "chars": "0123456789abcdef"
+    },
+    "T": {
+      "ref": "hex128"
+    },
+    "P": {
+      "ref": "hex128"
+    },
+    "Q": {
+      "ref": "hex128"
+    },
+    "person": {
+      "ref": "hex128"
+    },
+    "T_view": {
+      "ref": "hex128"
+    },
+    "text": {
+      "type": "string",
+      "min": 1,
+      "max": "STRING_MAX_BYTES"
+    },
+    "placeholder": {
+      "type": "string",
+      "min": 1,
+      "max": "STRING_MAX_BYTES",
+      "prefix": "PLACEHOLDER_PREFIX",
+      "suffix": "hex128"
+    },
+    "activation_state": {
+      "enum": [
+        "LIVE",
+        "STARTING",
+        "STOP_UNCONFIRMED",
+        "STOPPING",
+        "PREPARED",
+        "NONE",
+        "RESIDUE"
+      ]
+    },
+    "json": {
+      "type": "json"
+    },
+    "integer": {
+      "type": "integer"
+    },
+    "request_envelope": {
+      "type": "object",
+      "fields": {
+        "kind": "text",
+        "id": "request_id"
+      }
+    },
+    "reply_envelope": {
+      "type": "object",
+      "fields": {
+        "id": "request_id",
+        "ok": {
+          "const": true
+        }
+      }
+    },
+    "error_envelope": {
+      "type": "object",
+      "fields": {
+        "id": "request_id",
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "enum": [
+            "refused",
+            "malformed",
+            "unavailable"
+          ]
+        }
+      }
+    },
+    "r_record": {
+      "type": "object",
+      "fields": {
+        "boot_id": "boot_id",
+        "I": "I",
+        "C": "decimal",
+        "unit_name": "text",
+        "K": "K",
+        "in_ino": "decimal",
+        "out_ino": "decimal",
+        "err_ino": "decimal",
+        "state": {
+          "enum": [
+            "live",
+            "stopping"
+          ]
+        }
+      }
+    },
+    "prepared": {
+      "type": "object",
+      "fields": {
+        "K": "K",
+        "in_ino": "decimal",
+        "out_ino": "decimal",
+        "err_ino": "decimal"
+      }
+    },
+    "start_ticket": {
+      "type": "object",
+      "fields": {
+        "K": "K"
+      }
+    },
+    "unconfirmed": {
+      "type": "object",
+      "fields": {}
+    },
+    "wall_status": {
+      "type": "object",
+      "fields": {
+        "instance_id": "hex128",
+        "digest": "digest"
+      }
+    },
+    "decision": {
+      "type": "object",
+      "fields": {
+        "Q": "Q",
+        "digest": "digest",
+        "I": "I",
+        "C": "decimal",
+        "cookie": "decimal",
+        "value": {
+          "enum": [
+            "approve",
+            "deny"
+          ]
+        }
+      }
+    },
+    "owner_enroll_request": {
+      "type": "object",
+      "fields": {
+        "version": {
+          "const": "1"
+        },
+        "person": "person",
+        "role": {
+          "const": "owner"
+        },
+        "code_hash": "digest",
+        "expires": "decimal"
+      }
+    },
+    "vault_entry": {
+      "type": "object",
+      "fields": {
+        "placeholder": "placeholder",
+        "agent_uid": "decimal",
+        "host": "text",
+        "header": "text",
+        "value_b64": {
+          "type": "base64",
+          "max": "MAX_VAULT_VALUE_BYTES"
+        }
+      }
+    },
+    "vault_plaintext": {
+      "type": "object",
+      "fields": {
+        "version": {
+          "const": "1"
+        },
+        "entries": {
+          "type": "array",
+          "items": "vault_entry",
+          "max": "ARRAY_MAX_ITEMS"
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "fields": {
+        "method": {
+          "const": "POST"
+        },
+        "path": "text",
+        "class": "class"
+      }
+    },
+    "destination_host": {
+      "type": "object",
+      "fields": {
+        "host": "text",
+        "port": {
+          "const": "443"
+        },
+        "header": "text",
+        "placeholder": "placeholder",
+        "routes": {
+          "type": "array",
+          "items": "route",
+          "max": "ARRAY_MAX_ITEMS"
+        }
+      }
+    },
+    "destinations_body": {
+      "type": "object",
+      "fields": {
+        "version": {
+          "const": "1"
+        },
+        "fortress_id": "text",
+        "generation": "decimal",
+        "issued_at": "decimal",
+        "expires_at": "decimal",
+        "hosts": {
+          "type": "array",
+          "items": "destination_host",
+          "max": "ARRAY_MAX_ITEMS"
+        }
+      }
+    },
+    "manifest_signature": {
+      "type": "object",
+      "fields": {
+        "signature_scheme": {
+          "const": "ed25519-v1"
+        },
+        "signing_key_id": "text",
+        "signature_b64url": {
+          "type": "base64url",
+          "max": 64
+        }
+      }
+    },
+    "destinations_file": {
+      "type": "object",
+      "fields": {
+        "body": "destinations_body",
+        "signature": "manifest_signature"
+      }
+    },
+    "fifo_in": {
+      "type": "object",
+      "fields": {
+        "T_view": "T_view",
+        "body": "json"
+      }
+    },
+    "fifo_result": {
+      "type": "object",
+      "fields": {
+        "type": {
+          "const": "result"
+        },
+        "data_b64": {
+          "type": "base64",
+          "max": "TASK_OUT_FRAME_MAX",
+          "encoded_max": "FIFO_RESULT_ENCODED_MAX"
+        }
+      }
+    },
+    "fifo_end": {
+      "type": "object",
+      "fields": {
+        "type": {
+          "const": "end"
+        },
+        "outcome": {
+          "enum": [
+            "done",
+            "failed"
+          ]
+        }
+      }
+    },
+    "fifo_refused": {
+      "type": "object",
+      "fields": {
+        "type": {
+          "const": "refused"
+        },
+        "check": {
+          "enum": [
+            "workspace",
+            "hidden_path",
+            "proc_view"
+          ]
+        }
+      }
+    },
+    "fifo_out": {
+      "oneOf": [
+        "fifo_result",
+        "fifo_end",
+        "fifo_refused"
+      ]
+    },
+    "activate.prepare.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "prepare"
+        }
+      }
+    },
+    "activate.prepare.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "K": "K",
+        "in_ino": "decimal",
+        "out_ino": "decimal",
+        "err_ino": "decimal"
+      }
+    },
+    "activate.start.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "start"
+        },
+        "K": "K"
+      }
+    },
+    "activate.start.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "I": "I",
+        "C": "decimal"
+      }
+    },
+    "activate.stop.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "stop"
+        }
+      }
+    },
+    "activate.stop.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "state": "activation_state"
+      }
+    },
+    "activate.status.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "status"
+        }
+      }
+    },
+    "activate.status.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "state": "activation_state",
+        "R": {
+          "oneOf": [
+            "r_record",
+            {
+              "const": null
+            }
+          ]
+        },
+        "unit_state": "text"
+      }
+    },
+    "filter.status.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "status"
+        }
+      }
+    },
+    "filter.status.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "instance_id": "hex128",
+        "digest": "digest"
+      }
+    },
+    "gate.admit.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "admit"
+        }
+      }
+    },
+    "gate.admit.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "conn_id": "decimal",
+        "inst": "decimal",
+        "uid": "decimal",
+        "I": "I",
+        "C": "decimal",
+        "client_cookie": "decimal",
+        "accepted_cookie": "decimal"
+      }
+    },
+    "gate.recheck.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "recheck"
+        },
+        "conn_id": "decimal",
+        "inst": "decimal"
+      }
+    },
+    "gate.recheck.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {}
+    },
+    "query.query.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "query"
+        },
+        "placeholder": "placeholder",
+        "agent_uid": "decimal",
+        "host": "text",
+        "header": "text"
+      }
+    },
+    "query.query.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "gen": "decimal",
+        "value_b64": {
+          "type": "base64",
+          "max": "MAX_VAULT_VALUE_BYTES"
+        }
+      }
+    },
+    "unlock.unlock.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "unlock"
+        },
+        "passphrase_b64": {
+          "type": "base64",
+          "max": "PASSPHRASE_MAX"
+        }
+      }
+    },
+    "unlock.unlock.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {}
+    },
+    "unlock.lock.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "lock"
+        }
+      }
+    },
+    "unlock.lock.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {}
+    },
+    "unlock.status.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "status"
+        }
+      }
+    },
+    "unlock.status.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "state": {
+          "enum": [
+            "LOCKED",
+            "UNLOCKED"
+          ]
+        }
+      }
+    },
+    "gate-b.scope.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "scope"
+        },
+        "I": "I",
+        "C": "decimal"
+      }
+    },
+    "gate-b.scope.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "T": "T",
+        "P": "P",
+        "W0": "wall_status"
+      }
+    },
+    "gate-b.hold.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "hold"
+        },
+        "I": "I",
+        "C": "decimal",
+        "cookie": "decimal",
+        "class": "class",
+        "frozen_b64": {
+          "type": "base64",
+          "max": "REQ_MAX"
+        }
+      }
+    },
+    "gate-b.hold.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "Q": "Q",
+        "T": "T",
+        "P": "P"
+      }
+    },
+    "gate-b.await.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "await"
+        },
+        "Q": "Q"
+      }
+    },
+    "gate-b.await.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {
+        "decision": "decision"
+      }
+    },
+    "gate-b.confirm.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "confirm"
+        },
+        "Q": "Q",
+        "digest": "digest",
+        "I": "I",
+        "C": "decimal",
+        "cookie": "decimal"
+      }
+    },
+    "gate-b.confirm.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {}
+    },
+    "gate-b.event.request": {
+      "type": "object",
+      "extends": "request_envelope",
+      "fields": {
+        "kind": {
+          "const": "event"
+        },
+        "event": {
+          "const": "refusal"
+        },
+        "I": "I",
+        "C": "decimal",
+        "stage": {
+          "enum": [
+            "C6",
+            "C8.3",
+            "C9"
+          ]
+        }
+      }
+    },
+    "gate-b.event.reply": {
+      "type": "object",
+      "extends": "reply_envelope",
+      "fields": {}
+    }
+  },
+  "edges": {
+    "activate": {
+      "path": "ACTIVATE_SOCKET",
+      "frame_max": "FRAME_MAX_SMALL",
+      "pending_max": 1,
+      "requests": {
+        "prepare": {
+          "request": "activate.prepare.request",
+          "reply": "activate.prepare.reply"
+        },
+        "start": {
+          "request": "activate.start.request",
+          "reply": "activate.start.reply"
+        },
+        "stop": {
+          "request": "activate.stop.request",
+          "reply": "activate.stop.reply"
+        },
+        "status": {
+          "request": "activate.status.request",
+          "reply": "activate.status.reply"
+        }
+      }
+    },
+    "filter": {
+      "path": "FILTER_SOCKET",
+      "frame_max": "FRAME_MAX_SMALL",
+      "pending_max": 1,
+      "requests": {
+        "status": {
+          "request": "filter.status.request",
+          "reply": "filter.status.reply"
+        }
+      }
+    },
+    "gate": {
+      "path": "GATE_SOCKET",
+      "frame_max": "FRAME_MAX_SMALL",
+      "pending_max": 1,
+      "requests": {
+        "admit": {
+          "request": "gate.admit.request",
+          "reply": "gate.admit.reply"
+        },
+        "recheck": {
+          "request": "gate.recheck.request",
+          "reply": "gate.recheck.reply"
+        }
+      }
+    },
+    "query": {
+      "path": "QUERY_SOCKET",
+      "frame_max": "FRAME_MAX_QUERY",
+      "pending_max": 1,
+      "requests": {
+        "query": {
+          "request": "query.query.request",
+          "reply": "query.query.reply"
+        }
+      }
+    },
+    "unlock": {
+      "path": "UNLOCK_SOCKET",
+      "frame_max": "FRAME_MAX_SMALL",
+      "pending_max": 1,
+      "requests": {
+        "unlock": {
+          "request": "unlock.unlock.request",
+          "reply": "unlock.unlock.reply"
+        },
+        "lock": {
+          "request": "unlock.lock.request",
+          "reply": "unlock.lock.reply"
+        },
+        "status": {
+          "request": "unlock.status.request",
+          "reply": "unlock.status.reply"
+        }
+      }
+    },
+    "gate-b": {
+      "path": "GATE_B_SOCKET",
+      "frame_max": "FRAME_MAX_GATE_B",
+      "pending_max": "GATE_B_PENDING_MAX",
+      "requests": {
+        "scope": {
+          "request": "gate-b.scope.request",
+          "reply": "gate-b.scope.reply"
+        },
+        "hold": {
+          "request": "gate-b.hold.request",
+          "reply": "gate-b.hold.reply"
+        },
+        "await": {
+          "request": "gate-b.await.request",
+          "reply": "gate-b.await.reply"
+        },
+        "confirm": {
+          "request": "gate-b.confirm.request",
+          "reply": "gate-b.confirm.reply"
+        },
+        "event": {
+          "request": "gate-b.event.request",
+          "reply": "gate-b.event.reply"
+        }
+      }
+    }
+  }
+}

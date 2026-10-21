@@ -96,6 +96,18 @@ jobs:
           restore-keys: |
             castle-wall-${{ runner.os }}-cargo-
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Scan SMB release artifacts for test hooks
+        env:
+          SMB_RELEASE_HOOK_SCAN: "1"
+        run: |
+          # Missing build or bundle tools must fail the requested scan, never skip it.
+          npm ci --prefix server --ignore-scripts
+          bash scripts/smb/release-hook-scan.sh
+
       - name: Verify nft binary available
         run: |
           which nft

@@ -50,16 +50,16 @@ afterEach(async () => {
 });
 
 describe("SEC-036/037/039: reputation_publish security", () => {
-  // Phase D: reputation_publish was moved to Tier 3 (auto-allow with audit).
-  // Publishing SHR data to Verascore is a routine, low-sensitivity surface —
-  // the SSRF allowlist + Ed25519 signature + identity-owned keys provide
-  // the security properties without requiring human approval each call.
-  it("reputation_publish is classified as Tier 3 (auto-allow with audit)", () => {
-    expect(DEFAULT_POLICY.tier3_always_allow).toContain("reputation_publish");
+  // reputation_publish sends a signed report off the machine, so the default
+  // policy holds it for operator approval (Tier 1). Must match the
+  // reputation_publish entry in DEFAULT_POLICY.tier1_always_approve
+  // (src/principal-policy/loader.ts).
+  it("reputation_publish is classified as Tier 1 (operator approval)", () => {
+    expect(DEFAULT_POLICY.tier1_always_approve).toContain("reputation_publish");
   });
 
-  it("reputation_publish is NOT in Tier 1", () => {
-    expect(DEFAULT_POLICY.tier1_always_approve).not.toContain("reputation_publish");
+  it("reputation_publish is NOT in Tier 3", () => {
+    expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("reputation_publish");
   });
 
   // SEC-039 hardening: dashboard_open must not be agent-reachable.

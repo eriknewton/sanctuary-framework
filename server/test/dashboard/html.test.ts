@@ -4,9 +4,14 @@
  * filters all render from a given snapshot.
  */
 
+// fail-before-exempt: this change strengthens the existing shield-mark pin to run the client update path for each light; server/src/dashboard/html.ts is unchanged here, so the test passes on the base by design.
 import { describe, it, expect } from "vitest";
+import { runInNewContext } from "node:vm";
 import { renderDashboardHTML, HERO_COPY } from "../../src/dashboard/html.js";
 import type { ProtectionSnapshot } from "../../src/dashboard/aggregator.js";
+import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../../src/dashboard/design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../../src/dashboard/design-fonts.js";
+import { cssRules, inlineStyle, ownStyleProblems } from "./console-style-helpers.js";
 
 function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSnapshot {
   const base: ProtectionSnapshot = {
@@ -20,7 +25,7 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
     },
     layers: {
       l1: {
-        label: "L1 Cognitive",
+        label: "Cognitive",
         state: "full",
         headline: "State encrypted at rest",
         encryption: "AES-256-GCM",
@@ -28,16 +33,16 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
         memory_attest_ready: true,
       },
       l2: {
-        label: "L2 Operational",
+        label: "Operational",
         state: "degraded",
-        headline: "Process isolation — no TEE on this host",
+        headline: "Process isolation: no TEE on this host",
         isolation_type: "process-level",
         tee_available: false,
-        tee_status: "Not available — normal on local dev",
+        tee_status: "Not available, normal on local dev",
         sandbox_status: "Principal Policy gate active",
       },
       l3: {
-        label: "L3 Disclosure",
+        label: "Selective Disclosure",
         state: "full",
         headline: "Selective disclosure ready",
         did_active: true,
@@ -45,7 +50,7 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
         proofs_today: 1,
       },
       l4: {
-        label: "L4 Reputation",
+        label: "Verifiable Reputation",
         state: "full",
         headline: "Verascore attached",
         score: 82,
@@ -99,10 +104,10 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
 describe("renderDashboardHTML", () => {
   it("renders all four layer cards with their labels", () => {
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
-    expect(html).toContain("L1 Cognitive");
-    expect(html).toContain("L2 Operational");
-    expect(html).toContain("L3 Disclosure");
-    expect(html).toContain("L4 Reputation");
+    expect(html).toContain("Cognitive");
+    expect(html).toContain("Operational");
+    expect(html).toContain("Selective Disclosure");
+    expect(html).toContain("Verifiable Reputation");
   });
 
   it("applies the correct shield color class for green status", () => {
@@ -117,6 +122,8 @@ describe("renderDashboardHTML", () => {
       }),
     });
     expect(html).toMatch(/class="shield yellow"/);
+    expect(html).toContain('id="shield-status-mark" d="M100 78 L122 120 L78 120 Z"');
+    expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
   });
 
   it("applies the correct shield color class for red status", () => {
@@ -126,6 +133,67 @@ describe("renderDashboardHTML", () => {
       }),
     });
     expect(html).toMatch(/class="shield red"/);
+    expect(html).toContain('id="shield-status-mark" d="M84 84 L116 116 M116 84 L84 116"');
+    expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
+  });
+
+  it("the client shield update path uses the same mark paths as the server render", () => {
+    const lights = ["green", "yellow", "red"] as const;
+    const serverMarks = new Map(lights.map((light) => {
+      const html = renderDashboardHTML({ snapshot: makeSnapshot({ overall: { status: "healthy", light, headline: "x" } }) });
+      return [light, html.match(/id="shield-status-mark" d="([^"]+)"/)![1]!] as const;
+    }));
+    const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+    expect(html).toContain("must match shieldStatusMark in server/src/dashboard/html.ts");
+    const clientFns = html.match(/function shieldStatusMarkForLight\(light\) \{[\s\S]*?\n  \}\n\n  function renderShield\(light, headline\) \{[\s\S]*?\n  \}\n\n  function renderActivity[\s\S]*?\n  function currentAuditFilter/)![0]!.replace(/\n  function currentAuditFilter$/, "");
+    for (const light of lights) {
+      const result = runInNewContext(`
+        const dWrites = [];
+        const classCalls = [];
+        const classes = new Set(["green", "yellow", "red"]);
+        const ids = {
+          shield: {
+            classList: {
+              remove: function (...names) { classCalls.push(["remove", names]); names.forEach((name) => classes.delete(name)); },
+              add: function (...names) { classCalls.push(["add", names]); names.forEach((name) => classes.add(name)); },
+            },
+          },
+          "shield-status-mark": {
+            setAttribute: function (key, value) { if (key === "d") dWrites.push(value); },
+          },
+          "hero-copy": { textContent: "" },
+          "hero-sub": { textContent: "" },
+          "mode-pill": { textContent: "" },
+          "agent-name": { textContent: "" },
+          "agent-did": { textContent: "" },
+        };
+        const document = {
+          getElementById: function (id) { return ids[id] || { textContent: "", innerHTML: "" }; },
+          querySelector: function () { return null; },
+        };
+        let snapshot;
+        function wireApprovalButtons() {}
+        function currentAuditFilter() { return "all"; }
+        function heroCopyForLight() { return "copy"; }
+        // clientFns contains the real renderActivity, renderApprovals, renderPrivacy, and renderAudit declarations; renderAll runs those here.
+        ${clientFns}
+        renderAll({
+          overall: { light: __light, headline: "headline" },
+          mode: "fixture",
+          server_version: "test",
+          agent: { display_name: "agent", did_fingerprint: "did" },
+          activity: [],
+          pending_approvals: [],
+          privacy: {},
+          audit: [],
+        });
+        ({ dWrites, classCalls, classes: Array.from(classes).sort() });
+      `, { __light: light }) as { dWrites: string[]; classCalls: [string, string[]][]; classes: string[] };
+      expect(result.classCalls.filter(([kind]) => kind === "remove"), light).toEqual([["remove", ["green", "yellow", "red"]]]);
+      expect(result.classCalls.filter(([kind]) => kind === "add"), light).toEqual([["add", [light]]]);
+      expect(result.classes, light).toEqual([light]);
+      expect(result.dWrites, light).toEqual([serverMarks.get(light)]);
+    }
   });
 
   it("renders the hero copy from the exported HERO_COPY constant", () => {
@@ -157,10 +225,10 @@ describe("renderDashboardHTML", () => {
 
   it("echoes the aggregator headline in the hero sub-text", () => {
     const snap = makeSnapshot({
-      overall: { status: "healthy", light: "green", headline: "L1·L3·L4 full — L2 degraded" },
+      overall: { status: "healthy", light: "green", headline: "Castle Wall enforcing, Operational layer degraded (no TEE on this host)" },
     });
     const html = renderDashboardHTML({ snapshot: snap });
-    expect(html).toContain("L1·L3·L4 full");
+    expect(html).toContain("Castle Wall enforcing, Operational layer degraded (no TEE on this host)");
   });
 
   it("shows the agent display name and DID fingerprint", () => {
@@ -188,7 +256,7 @@ describe("renderDashboardHTML", () => {
       layers: {
         ...makeSnapshot().layers,
         l4: {
-          label: "L4 Reputation",
+          label: "Verifiable Reputation",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -211,7 +279,7 @@ describe("renderDashboardHTML", () => {
       layers: {
         ...makeSnapshot().layers,
         l4: {
-          label: "L4 Reputation",
+          label: "Verifiable Reputation",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -234,7 +302,7 @@ describe("renderDashboardHTML", () => {
       layers: {
         ...makeSnapshot().layers,
         l4: {
-          label: "L4 Reputation",
+          label: "Verifiable Reputation",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -313,7 +381,7 @@ describe("renderDashboardHTML", () => {
         layers: {
           ...base.layers,
           l4: {
-            label: "L4 Reputation",
+            label: "Verifiable Reputation",
             state: "degraded" as const,
             headline: "Attached, but evidence is degraded",
             score: 82,
@@ -354,9 +422,9 @@ describe("renderDashboardHTML", () => {
       };
     }
 
-    it("renders the L4 score and evidence counts when evidence is present", () => {
+    it("renders the Verifiable Reputation score and evidence counts when evidence is present", () => {
       const html = renderDashboardHTML({ snapshot: snapshotWithEvidence() });
-      expect(html).toContain("L4 score");
+      expect(html).toContain("Verifiable Reputation score");
       expect(html).toContain("55 / 100");
       expect(html).toContain("Attestations");
       expect(html).toContain(">7<");
@@ -386,7 +454,7 @@ describe("renderDashboardHTML", () => {
       // stylesheet so consumers can theme them — we check the rendered
       // DOM instead.)
       expect(html).not.toContain(`<div class="l4-evidence">`);
-      expect(html).not.toMatch(/<dt>L4 score<\/dt>/);
+      expect(html).not.toMatch(/<dt>Verifiable Reputation score<\/dt>/);
     });
 
     it("escapes HTML in evidence-derived fields", () => {
@@ -404,5 +472,45 @@ describe("renderDashboardHTML", () => {
       expect(html).not.toContain("<img src=x");
       expect(html).toContain("&lt;script&gt;");
     });
+  });
+});
+
+// Slice 2b: the pre-v1.1 dashboard reads the console design system (the
+// server tokens and the bundled faces) instead of a system font stack and a
+// palette of its own, and its states read in monochrome.
+describe("renderDashboardHTML reads the console design system", () => {
+  const shared = { fonts: CONSOLE_FONT_FACE_CSS, tokens: PAPER_INK_ROOT_TOKENS_CSS };
+
+  it("carries the token block, the bundled faces and the theme bootstrap, and no palette or font of its own", () => {
+    for (const light of ["green", "yellow", "red"] as const) {
+      const html = renderDashboardHTML({ snapshot: makeSnapshot({ overall: { status: "healthy", light, headline: "x" } }) });
+      expect(ownStyleProblems(html, shared), light).toEqual([]);
+      expect(html, light).toContain(`<script>${THEME_BOOTSTRAP_SCRIPT}</script>`);
+      expect(html, light).toMatch(/font-family: var\(--sans\)/);
+      expect(html, light).toMatch(/var\(--mono\)/);
+    }
+  });
+
+  it("its title has no em-dash", () => {
+    const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+    expect(html).toContain("<title>Sanctuary: Sovereignty Dashboard</title>");
+  });
+
+  it("each layer and upstream-server state wears its own dot shape, so a state never rides on hue alone", () => {
+    const rules = cssRules(inlineStyle(renderDashboardHTML({ snapshot: makeSnapshot() })));
+    const decls = (sel: string) => new Map(rules.filter((r) => r.selector === sel).flatMap((r) => r.decls));
+    const shape = (base: string, state: string | null) => {
+      const d = decls(base);
+      if (state) for (const [k, v] of decls(state)) d.set(k, v);
+      return ["clip-path", "border-radius", "height", "border", "background"].map((k) => k + ":" + (d.get(k) ?? "")).join(" ");
+    };
+    const layer = [null, ".layer-full .layer-dot", ".layer-degraded .layer-dot", ".layer-compromised .layer-dot"].map((s) => shape(".layer-dot", s));
+    expect(new Set(layer.map((x) => x.replace(/background:var\(--[a-z-]+\)/, ""))).size).toBe(layer.length);
+    const server = [null, ".server-row.state-connected .server-dot", ".server-row.state-connecting .server-dot",
+      ".server-row.state-disconnected .server-dot, .server-row.state-error .server-dot"].map((s) => shape(".server-dot", s));
+    expect(new Set(server.map((x) => x.replace(/background:var\(--[a-z-]+\)/, ""))).size).toBe(server.length);
+    // The base state (no evidence of a state) is the hollow dotted slate ring.
+    expect(decls(".layer-dot").get("border")).toMatch(/dotted var\(--slate\)/);
+    expect(decls(".server-dot").get("border")).toMatch(/dotted var\(--slate\)/);
   });
 });

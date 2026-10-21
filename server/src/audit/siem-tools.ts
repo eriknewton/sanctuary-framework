@@ -1,47 +1,62 @@
 /**
- * Sanctuary MCP Server — SIEM Export Tool
+ * Sanctuary MCP Server - SIEM Export Tool
  *
  * Registers the audit_export_siem MCP tool that exports audit log entries
- * in standard SIEM formats (CEF and OCSF).
+ * in standard SIEM formats (CEF, OCSF, ECS, and raw XDM events).
  *
  * Tier 1: Operator approval required. SIEM forwarding is an operator function;
- * the export bulk-decrypts audit events across all principals, each carrying its
- * policy tier and approve/deny decision, so auto-allowing it would hand the agent
- * a policy-inference oracle (no-read invariant, CLAUDE.md #7). The operator IS
- * allowed to see this structure, so the rich SIEM fields are preserved — only the
- * gate changed (Tier 3 → Tier 1; CISO MED-1).
+ * even with the approval gate, this agent-callable tool returns the export body
+ * to the caller. It therefore formats only the caller-scoped, redacted audit view
+ * instead of raw audit details that could reveal policy tiers, rule ids, agent
+ * DIDs, sessions, or free-text policy reasons.
  */
 
 import type { ToolDefinition } from "../router.js";
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { SessionBinding } from "../agent-native/safety-base.js";
-import { formatAsCEF, formatAsOCSF, agentDecision } from "./siem-formatter.js";
+import {
+  formatAsCEF,
+  formatAsECS,
+  formatAsOCSF,
+  formatAsXDM,
+  agentDecision,
+} from "./siem-formatter.js";
 import { redactAuditEntryForAgent } from "../operational/agent-audit-redaction.js";
+
+export type SIEMExportFormat = "cef" | "ocsf" | "ecs" | "xdm";
+
+// The schema and validator share this list; runtime mutation must not change accepted formats.
+export const SIEM_EXPORT_FORMATS = Object.freeze(["cef", "ocsf", "ecs", "xdm"] as const);
+
+function isSIEMExportFormat(value: string): value is SIEMExportFormat {
+  return (SIEM_EXPORT_FORMATS as readonly string[]).includes(value);
+}
 
 export function createSIEMTools(
   auditLog: AuditLog,
   // OWN-IDENTITY FILTER (CISO MED-3): `audit_export_siem` is agent-callable, so
-  // it must export only the CALLER's own entries (system/gate entries — which
-  // carry operator-only context — are never returned). Optional so existing
-  // callers that pre-date the filter still construct; when absent, the tool
-  // fails closed (exports nothing) rather than degrading open.
+  // it must export only the CALLER's own entries. System-owned gate entries that
+  // carry operator-only context are never returned; the caller's own
+  // approval-proof rows remain in scope. Optional so existing callers that
+  // pre-date the filter still construct; when absent, the tool fails closed
+  // (exports nothing) rather than degrading open.
   currentSessionBinding?: () => SessionBinding | undefined
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
     {
       name: "audit_export_siem",
       description:
-        "Export the caller's own redacted audit view in CEF or OCSF (for SIEMs such as Splunk or " +
-        "Datadog). Raw policy tier, rule ids, system/gate entries, and approve-vs-auto distinctions " +
+        "Export the caller's own redacted audit view in CEF, OCSF, ECS, or raw Cortex events for XDM modeling and SIEM ingestion. " +
+        "Raw policy tier, rule ids, system-owned gate entries, and approve-vs-auto distinctions " +
         "are not included; Tier 1 approval still required (bulk audit export).",
       inputSchema: {
         type: "object",
         properties: {
           format: {
             type: "string",
-            enum: ["cef", "ocsf"],
+            enum: SIEM_EXPORT_FORMATS,
             description:
-              'Output format: "cef" (Common Event Format, newline-delimited) or "ocsf" (Open Cybersecurity Schema Framework, JSON array)',
+              'Output format: "cef" (Common Event Format, newline-delimited), "ocsf" (Open Cybersecurity Schema Framework, JSON array), "ecs" (Elastic Common Schema, JSON array), or "xdm" (raw Cortex XDR events with sanctuary_* keys for an XDM dataset, JSON array)',
           },
           since: {
             type: "string",
@@ -90,19 +105,20 @@ export function createSIEMTools(
       },
       handler: async (args) => {
         // Parse and validate inputs
-        const format = String(args.format || "").toLowerCase();
-        if (format !== "cef" && format !== "ocsf") {
+        const requestedFormat = String(args.format || "").toLowerCase();
+        if (!isSIEMExportFormat(requestedFormat)) {
           return {
             content: [
               {
                 type: "text" as const,
                 text: JSON.stringify({
-                  error: "Invalid format. Must be 'cef' or 'ocsf'.",
+                  error: "Invalid format. Must be 'cef', 'ocsf', 'ecs', or 'xdm'.",
                 }),
               },
             ],
           };
         }
+        const format: SIEMExportFormat = requestedFormat;
 
         // Parse time range (default to 24 hours ago if since not specified)
         let since: string | undefined;
@@ -198,7 +214,7 @@ export function createSIEMTools(
 
         // Query audit log scoped to the caller's identity BEFORE the limit
         // (AuditLog.query applies identity_id before its slice), so the
-        // over-fetch window is entirely the caller's OWN entries — a caller with
+        // over-fetch window is entirely the caller's OWN entries; a caller with
         // many other-identity entries ahead of theirs is no longer undercounted
         // (CISO LOW, 2026-06-16). `result.total` is the caller's own in-window
         // population; the remaining tool/decision/result/until filters + the
@@ -225,7 +241,7 @@ export function createSIEMTools(
 
         if (filterDecision) {
           // Filter on the AGENT-SAFE coarse decision (2-valued allow/deny),
-          // derived from the entry `result` alone — never the raw operator
+          // derived from the entry `result` alone, never the raw operator
           // `gate_decision` detail NOR the fine-grained `decision` value (both
           // would re-introduce a policy read; `decision` was removed from the
           // agent corpus, CISO HIGH 2026-06-16). The schema enum keeps
@@ -266,11 +282,21 @@ export function createSIEMTools(
             formatAsCEF(redactAuditEntryForAgent(entry))
           );
           output = cefLines.join("\n");
-        } else {
+        } else if (format === "ocsf") {
           const ocsfObjects = filtered.map((entry: AuditEntry) =>
             formatAsOCSF(redactAuditEntryForAgent(entry))
           );
           output = JSON.stringify(ocsfObjects, null, 2);
+        } else if (format === "ecs") {
+          const ecsObjects = filtered.map((entry: AuditEntry) =>
+            formatAsECS(redactAuditEntryForAgent(entry))
+          );
+          output = JSON.stringify(ecsObjects, null, 2);
+        } else {
+          const xdmObjects = filtered.map((entry: AuditEntry) =>
+            formatAsXDM(redactAuditEntryForAgent(entry))
+          );
+          output = JSON.stringify(xdmObjects, null, 2);
         }
 
         return {
@@ -294,7 +320,7 @@ export function createSIEMTools(
                 note:
                   format === "cef"
                     ? `${filtered.length} CEF events (newline-delimited). Each line is a complete CEF event.`
-                    : `${filtered.length} OCSF objects in JSON array format.`,
+                    : `${filtered.length} ${format.toUpperCase()} objects in JSON array format.`,
               }),
             },
             {

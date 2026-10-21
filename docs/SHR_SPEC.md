@@ -84,7 +84,7 @@ Verification: `Ed25519_Verify(signed_by, canonical_bytes(body), signature)` must
 
 Default validity period is 1 hour. Implementations MAY use shorter or longer periods depending on context. Short-lived SHRs (5-15 minutes) are appropriate for high-security handshakes. Longer-lived SHRs (24 hours) may be used for stable, persistent agent deployments.
 
-### 3.2 Layer 1: Cognitive Sovereignty
+### 3.2 Cognitive Sovereignty
 
 Describes the agent's persistent state protection.
 
@@ -103,14 +103,14 @@ Describes the agent's persistent state protection.
 
 | Field | Description |
 |-------|-------------|
-| `status` | "active" = all L1 properties functional; "degraded" = partial; "inactive" = no L1 |
+| `status` | "active" = all Cognitive Sovereignty properties functional; "degraded" = partial; "inactive" = no Cognitive Sovereignty |
 | `encryption` | Cipher used for state-at-rest. Reference implementation: "AES-256-GCM" |
 | `key_custody` | Who holds the master key. "self" = agent/principal; "delegated" = trusted third party; "platform" = hosting platform |
 | `integrity` | Mechanism for tamper detection. Reference implementation: "HMAC-SHA256" with Merkle proofs |
 | `identity_type` | Identity mechanism. Reference implementation: "Ed25519" (self-custodied keypair) |
 | `state_portable` | Whether the agent's encrypted state can be exported and imported to another instance |
 
-### 3.3 Layer 2: Operational Isolation
+### 3.3 Operational Isolation
 
 Describes the agent's computational privacy.
 
@@ -130,7 +130,7 @@ Describes the agent's computational privacy.
 | `isolation_type` | Mechanism type. Values: "tee" (Intel TDX, ARM CCA, etc.), "local-process", "container", "vm", "none" |
 | `attestation_available` | Whether hardware attestation (remote attestation from TEE) is available. False for process-level isolation. |
 
-### 3.4 Layer 3: Selective Disclosure
+### 3.4 Selective Disclosure
 
 Describes the agent's ability to prove claims without full revelation.
 
@@ -150,9 +150,9 @@ Describes the agent's ability to prove claims without full revelation.
 | `proof_system` | System in use. Values: "schnorr-pedersen" (Schnorr + Pedersen + range proofs, genuine ZK), "groth16", "plonk", "none". Legacy value "commitment-only" is accepted as an alias for "schnorr-pedersen". |
 | `selective_disclosure` | Whether the agent can produce zero-knowledge proofs of specific claims |
 
-Note: The reference implementation uses "schnorr-pedersen": Pedersen commitments on Ristretto255, Schnorr proofs of knowledge, and bit-decomposition range proofs. These are genuine zero-knowledge proofs with selective disclosure capability. L3 status is "active" with this proof system. SNARK-based systems (Groth16, PLONK) are specified for future implementation but are not required for full L3 status.
+Note: The reference implementation uses "schnorr-pedersen": Pedersen commitments on Ristretto255, Schnorr proofs of knowledge, and bit-decomposition range proofs. These are genuine zero-knowledge proofs with selective disclosure capability. Selective Disclosure status is "active" with this proof system. SNARK-based systems (Groth16, PLONK) are specified for future implementation but are not required for full Selective Disclosure status.
 
-### 3.5 Layer 4: Verifiable Reputation
+### 3.5 Verifiable Reputation
 
 Describes the agent's reputation portability and verification capability.
 
@@ -251,8 +251,8 @@ Based on the reported layers, a consumer assigns one of three sovereignty levels
 | Level | Criteria |
 |-------|----------|
 | **full** | All four layers report status "active" |
-| **degraded** | L1 is "active" but one or more of L2-L4 are "degraded" or "inactive" |
-| **minimal** | L1 is "inactive" or "degraded", or critical degradations are present |
+| **degraded** | Cognitive Sovereignty is "active" but one or more of the other three layers are "degraded" or "inactive" |
+| **minimal** | Cognitive Sovereignty is "inactive" or "degraded", or critical degradations are present |
 
 ### 4.2 Verification Result
 
@@ -340,7 +340,7 @@ SHRs integrate with the reputation system through sovereignty-gated tiers: the m
 | Tier | Requirement | Attestation Weight |
 |------|-------------|-------------------|
 | `verified-sovereign` | Sovereignty handshake complete, all layers active | 1.0 (full weight) |
-| `verified-degraded` | Sovereignty handshake complete, L1 active, others degraded | 0.8 |
+| `verified-degraded` | Sovereignty handshake complete, Cognitive Sovereignty active, others degraded | 0.8 |
 | `self-attested` | SHR presented but no handshake completed | 0.5 |
 | `unverified` | No SHR, no handshake | 0.2 |
 
@@ -357,9 +357,9 @@ The SHR maps to specific EU AI Act requirements:
 | AI Act Requirement | SHR Coverage |
 |-------------------|--------------|
 | **Article 9: Risk Management** | SHR degradations array documents known risks. Sovereignty audit tool provides gap analysis. |
-| **Article 10: Data Governance** | L1 (Cognitive Sovereignty) documents encryption, key custody, and integrity verification for all persistent data. |
-| **Article 14: Human Oversight** | L2 (Operational Isolation) documents the Principal Policy gate and approval tiers. Tier 1 operations require human approval. |
-| **Article 15: Accuracy, Robustness, Security** | L1 documents encryption and tamper detection. L2 documents isolation. L3 documents selective disclosure. Full SHR provides security posture evidence. |
+| **Article 10: Data Governance** | Cognitive Sovereignty documents encryption, key custody, and integrity verification for all persistent data. |
+| **Article 14: Human Oversight** | Operational Isolation documents the Principal Policy gate and approval tiers. Tier 1 operations require human approval. |
+| **Article 15: Accuracy, Robustness, Security** | Cognitive Sovereignty documents encryption and tamper detection. Operational Isolation documents isolation. Selective Disclosure documents selective disclosure. Full SHR provides security posture evidence. |
 | **Article 22: Audit Trail** | SHR generation and verification are logged to the encrypted audit trail. All tool calls pass through the approval gate with audit logging. |
 | **Article 42: Conformity Assessment** | SHR provides a standardized, machine-readable format for documenting and verifying compliance posture. |
 | **Article 50: Transparency** | SHR is designed to be presented to counterparties and regulators as a transparency artifact. |
@@ -374,15 +374,15 @@ In February 2026, NIST's Center for AI Standards and Innovation (CAISI) launched
 
 | NIST Security Dimension | SHR Coverage |
 |------------------------|--------------|
-| **Identification** | L1 (Cognitive Sovereignty) reports Ed25519 self-custodied agent identity. The `signed_by` field in the SHR envelope is the agent's public key. Identity is cryptographic, not platform-dependent. |
+| **Identification** | Cognitive Sovereignty reports Ed25519 self-custodied agent identity. The `signed_by` field in the SHR envelope is the agent's public key. Identity is cryptographic, not platform-dependent. |
 | **Authentication** | SHR signature verification (Ed25519 over canonical JSON) provides authentication. A verifier confirms the SHR was generated by the claimed identity. The sovereignty handshake (Section 5) extends this to mutual authentication. |
-| **Authorization** | L2 (Operational Isolation) reports the Principal Policy gate, approval tiers, and behavioral anomaly detection. The SHR documents what authorization controls are in place and at what tier. |
-| **Auditing / Non-Repudiation** | L2 reports encrypted audit trail status. L4 (Verifiable Reputation) provides signed attestations of past actions. SHR generation itself is logged. Content hashes from context gating (L2) provide verifiable records of data flows. |
-| **Prompt Injection Mitigation** | L2 context gating controls what enters and leaves the sovereignty boundary. L3 (Selective Disclosure) prevents over-revelation that could enable prompt injection via leaked context. The Principal Policy's behavioral anomaly detection flags unexpected actions that may result from injection. |
+| **Authorization** | Operational Isolation reports the Principal Policy gate, approval tiers, and behavioral anomaly detection. The SHR documents what authorization controls are in place and at what tier. |
+| **Auditing / Non-Repudiation** | Operational Isolation reports encrypted audit trail status. Verifiable Reputation provides signed attestations of past actions. SHR generation itself is logged. Content hashes from context gating (Operational Isolation) provide verifiable records of data flows. |
+| **Prompt Injection Mitigation** | Operational Isolation context gating controls what enters and leaves the sovereignty boundary. Selective Disclosure prevents over-revelation that could enable prompt injection via leaked context. The Principal Policy's behavioral anomaly detection flags unexpected actions that may result from injection. |
 
 NIST explicitly references the Model Context Protocol (MCP) as a candidate integration point for agent security controls. Sanctuary operates as an MCP server, making it directly compatible with NIST's protocol-level recommendations.
 
-The NIST initiative's emphasis on treating AI agents as identifiable entities within enterprise identity systems, rather than anonymous automation under shared credentials, aligns directly with Sanctuary's L1 identity model. An agent running Sanctuary holds its own Ed25519 keypair, generates and signs its own SHR, and can participate in sovereignty handshakes with counterparties. The identity is not delegated from a platform; it is self-custodied.
+The NIST initiative's emphasis on treating AI agents as identifiable entities within enterprise identity systems, rather than anonymous automation under shared credentials, aligns directly with Sanctuary's Cognitive Sovereignty identity model. An agent running Sanctuary holds its own Ed25519 keypair, generates and signs its own SHR, and can participate in sovereignty handshakes with counterparties. The identity is not delegated from a platform; it is self-custodied.
 
 An enterprise deploying Sanctuary can demonstrate alignment with both the EU AI Act (Section 8) and the NIST AI Agent Standards Initiative from a single agent infrastructure.
 

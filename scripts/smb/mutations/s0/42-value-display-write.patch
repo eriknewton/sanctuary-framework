@@ -1,0 +1,5 @@
+# witness: structural_seams
+--- a/castle-wall-daemon/src/smb/mod.rs
++++ b/castle-wall-daemon/src/smb/mod.rs
+@@ -10,0 +11 @@
++pub fn alternate_wire(value: &serde_json::Value) -> String { use std::fmt::Write; let mut out = String::new(); write!(&mut out, "{value}").unwrap(); out }

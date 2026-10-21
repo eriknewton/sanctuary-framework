@@ -3461,6 +3461,8 @@ export function generateFleetSwitcherHTML(options: {
       box-shadow: var(--shadow);
       padding: 16px;
       display: flex;
+      /* Let the fixed status words and action group wrap while identity keeps its intrinsic text width. */
+      flex-wrap: wrap;
       align-items: center;
       gap: 12px;
     }
@@ -3474,14 +3476,17 @@ export function generateFleetSwitcherHTML(options: {
     .machine-card .status-dot.online { background: var(--sage); }
     .machine-card .status-dot.offline { background: var(--rust); }
     .machine-card .status-dot.checking { background: var(--ochre); }
+    /* Unknown is hollow because a probe without an explicit boolean health answer earns neither the pass nor the failure color. */
+    .machine-card .status-dot.unknown { background: transparent; border: 1px solid var(--ink-3); } /* One CSS pixel outlines the hollow dot. */
     .machine-card .status-label {
       font-family: var(--mono);
       font-size: var(--text-xs);
       color: var(--ink-3);
       flex-shrink: 0;
-      min-width: 56px;
+      /* 11ch = "Not healthy" and "Not checked", the longest status words, in this monospace face, so names align when status and identity share one row. */
+      min-width: 11ch;
     }
-    .machine-card .info { flex: 1; min-width: 0; }
+    .machine-card .info { flex: 1 1 auto; min-width: 0; }
     .machine-card .name {
       font-weight: 600;
       font-size: 15px;
@@ -3555,7 +3560,7 @@ export function generateFleetSwitcherHTML(options: {
       <label for="machine-url">Dashboard URL</label>
       <input id="machine-url" type="text" placeholder="e.g. https://100.64.0.5:3501" />
     </div>
-    <button onclick="addMachine()">Add Machine</button>
+    <button id="add-machine" type="button">Add Machine</button>
   </div>
   <div id="form-hint" class="form-hint"></div>
 
@@ -3564,16 +3569,45 @@ export function generateFleetSwitcherHTML(options: {
 
   <script>
     const STORAGE_KEY = 'sanctuary_fleet_machines';
+    // Must match FLEET_STORAGE_KEY in server/src/dashboard/v1_1/client.ts,
+    // because the Machines screen reads the saved list this page writes.
     const CURRENT_ENDPOINT = ${JSON.stringify(currentEndpoint)};
 
-    function loadMachines() {
+    function loadStoredMachines() {
       try {
-        return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-      } catch { return []; }
+        const stored = localStorage.getItem(STORAGE_KEY);
+        return stored === null ? [] : JSON.parse(stored);
+      } catch {
+        // An unreadable saved value is preserved until an explicit Add replaces it.
+        return null;
+      }
     }
 
     function saveMachines(machines) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(machines));
+    }
+
+    function isSavedMachine(value) {
+      return value !== null
+        && typeof value === 'object'
+        && typeof value.name === 'string'
+        && typeof value.url === 'string';
+    }
+
+    function loadMachines() {
+      const stored = loadStoredMachines();
+      return Array.isArray(stored) ? stored.filter(isSavedMachine) : [];
+    }
+
+    function acceptedDashboardUrl(value) {
+      try {
+        // Explicit authority forms resolve to the same machine with or without a page base.
+        if (!/^https?:[/][/]/i.test(value)) return null;
+        const parsed = new URL(value);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? value : null;
+      } catch {
+        return null;
+      }
     }
 
     function showFormHint(message) {
@@ -3610,35 +3644,66 @@ export function generateFleetSwitcherHTML(options: {
       // duplicated here because embedded dashboard JS cannot import a server module.
       { let end = url.length; while (end > 0 && url[end - 1] === '/') end -= 1; url = url.slice(0, end); }
 
+      if (!acceptedDashboardUrl(url)) {
+        urlEl.classList.add('invalid');
+        showFormHint('Enter an http or https address.');
+        return;
+      }
+
       const machines = loadMachines();
       // Prevent duplicates by URL
       if (machines.some(m => m.url === url)) {
         alert('A machine with this URL already exists.');
         return;
       }
-      machines.push({ name, url, added: new Date().toISOString() });
-      saveMachines(machines);
+      const stored = loadStoredMachines();
+      const nextMachines = Array.isArray(stored) ? stored : [];
+      nextMachines.push({ name, url, added: new Date().toISOString() });
+      saveMachines(nextMachines);
       nameEl.value = '';
       urlEl.value = '';
       render();
     }
 
     function removeMachine(url) {
-      const machines = loadMachines().filter(m => m.url !== url);
+      const stored = loadStoredMachines();
+      const machines = Array.isArray(stored)
+        ? stored.filter(m => !(isSavedMachine(m) && m.url === url))
+        : [];
       saveMachines(machines);
       render();
     }
 
     async function checkHealth(url) {
+      // These words must match FLEET_PROBE_VIEW in server/src/dashboard/v1_1/client.ts,
+      // so both views describe the same probe evidence with the same words.
+      const PROBE_VIEW = {
+        state_ONLINE: { word: 'Online', cls: 'online' },
+        state_NOT_HEALTHY: { word: 'Not healthy', cls: 'offline' },
+        state_UNKNOWN: { word: 'Unknown', cls: 'unknown' }
+      };
+      let timeout;
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000);
+        // 3000 ms = FLEET_PROBE_DEADLINE_SECONDS (3) times 1000 ms per second; must match
+        // FLEET_PROBE_DEADLINE_MS in server/src/dashboard/v1_1/client.ts so both views give a machine the same time to answer.
+        timeout = setTimeout(() => controller.abort(), 3000);
         const resp = await fetch(url + '/api/health', { signal: controller.signal });
-        clearTimeout(timeout);
+        // Only a non-redirecting successful response is evidence from this machine's health endpoint.
+        if (!resp.ok || resp.redirected) return PROBE_VIEW.state_UNKNOWN;
         const data = await resp.json();
-        return data.ok === true ? 'online' : 'offline';
+        // Only an explicit boolean true earns the healthy label and pass color.
+        if (data && data.ok === true) return PROBE_VIEW.state_ONLINE;
+        // Only an explicit boolean false earns the unhealthy label and failure color.
+        if (data && data.ok === false) return PROBE_VIEW.state_NOT_HEALTHY;
+        // An unrecognized body supplies no health verdict.
+        return PROBE_VIEW.state_UNKNOWN;
       } catch {
-        return 'offline';
+        // A failed, aborted or unreadable probe is not evidence that the machine is unhealthy.
+        return PROBE_VIEW.state_UNKNOWN;
+      } finally {
+        // The deadline also covers the body read, so a machine that answers headers and then stalls settles to Unknown.
+        clearTimeout(timeout);
       }
     }
 
@@ -3651,56 +3716,95 @@ export function generateFleetSwitcherHTML(options: {
         return;
       }
 
-      list.innerHTML = machines.map(m => {
+      list.replaceChildren();
+      const healthTargets = [];
+
+      machines.forEach((m) => {
         const isCurrent = m.url === CURRENT_ENDPOINT || m.url === location.origin;
-        const key = btoa(m.url).replace(/=/g,'');
-        return \`
-          <div class="machine-card \${isCurrent ? 'current' : ''}" data-url="\${m.url}">
-            <div class="status-dot checking" id="dot-\${key}"></div>
-            <div class="status-label" id="label-\${key}">Checking</div>
-            <div class="info">
-              <div class="name">\${escapeHtml(m.name)}\${isCurrent ? ' <span class="current-badge">CURRENT</span>' : ''}</div>
-              <div class="url">\${escapeHtml(m.url)}</div>
-            </div>
-            <div class="actions">
-              <a href="\${m.url}" class="btn-open">Open Console</a>
-              <button class="btn-remove" onclick="removeMachine('\${escapeHtml(m.url)}')">Remove</button>
-            </div>
-          </div>
-        \`;
-      }).join('');
+        const acceptedUrl = acceptedDashboardUrl(m.url);
+        const card = document.createElement('div');
+        card.className = 'machine-card' + (isCurrent ? ' current' : '');
+        card.dataset.url = m.url;
 
-      // Check health for each machine
-      machines.forEach(async (m) => {
-        const key = btoa(m.url).replace(/=/g,'');
-        const dot = document.getElementById('dot-' + key);
-        const label = document.getElementById('label-' + key);
-        if (!dot) return;
-        const status = await checkHealth(m.url);
-        dot.className = 'status-dot ' + status;
-        if (label) label.textContent = status === 'online' ? 'Online' : 'Offline';
+        const dot = document.createElement('div');
+        dot.className = acceptedUrl ? 'status-dot checking' : 'status-dot';
+        card.appendChild(dot);
+
+        const label = document.createElement('div');
+        label.className = 'status-label';
+        label.textContent = acceptedUrl ? 'Checking' : 'Not checked';
+        card.appendChild(label);
+
+        const info = document.createElement('div');
+        info.className = 'info';
+
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = m.name;
+        if (isCurrent) {
+          name.appendChild(document.createTextNode(' '));
+          const badge = document.createElement('span');
+          badge.className = 'current-badge';
+          badge.textContent = 'CURRENT';
+          name.appendChild(badge);
+        }
+        info.appendChild(name);
+
+        const url = document.createElement('div');
+        url.className = 'url';
+        url.textContent = m.url;
+        info.appendChild(url);
+        card.appendChild(info);
+
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        if (acceptedUrl) {
+          const open = document.createElement('a');
+          open.className = 'btn-open';
+          open.setAttribute('href', acceptedUrl);
+          open.textContent = 'Open Console';
+          actions.appendChild(open);
+        }
+
+        const remove = document.createElement('button');
+        remove.className = 'btn-remove';
+        remove.type = 'button';
+        remove.textContent = 'Remove';
+        remove.addEventListener('click', () => removeMachine(m.url));
+        actions.appendChild(remove);
+        card.appendChild(actions);
+        list.appendChild(card);
+
+        if (acceptedUrl) healthTargets.push({ url: acceptedUrl, dot, label });
       });
-    }
 
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
+      // Check health for each accepted machine address.
+      healthTargets.forEach(async (target) => {
+        const { url, dot, label } = target;
+        const status = await checkHealth(url);
+        // The named state supplies both color and word so they describe the same evidence.
+        dot.className = 'status-dot ' + status.cls;
+        if (label) label.textContent = status.word;
+      });
     }
 
     // Auto-add current machine if not in list
     (function autoAddCurrent() {
-      const machines = loadMachines();
+      const stored = loadStoredMachines();
+      if (!Array.isArray(stored)) return;
+      const machines = stored.filter(isSavedMachine);
       const origin = location.origin;
       if (!machines.some(m => m.url === origin)) {
         const hostname = location.hostname;
         const name = hostname === '127.0.0.1' || hostname === 'localhost'
           ? 'This machine (local)'
           : hostname;
-        machines.push({ name, url: origin, added: new Date().toISOString() });
-        saveMachines(machines);
+        stored.push({ name, url: origin, added: new Date().toISOString() });
+        saveMachines(stored);
       }
     })();
+
+    document.getElementById('add-machine').addEventListener('click', addMachine);
 
     // Clear the validation hint once the operator starts correcting the fields.
     ['machine-name', 'machine-url'].forEach((id) => {

@@ -10,7 +10,7 @@
  * static CLIENT_SCRIPT string into a sandboxed Function so it can be called
  * against synthetic state objects without a real browser.
  */
-// fail-before-exempt: adapts the fake location object with the origin field the bounded-load client now reads; asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the read-state fix lives in boot-hydration, dashboard-honesty and client-time-parity tests.
+// fail-before-exempt: adapts the onInboxAction sandbox to the retained decision result the client now settles on every decision (state.approvals.lock and result, the decision-announcement live region, the inbox source read, the admission check against the loaded queue) and to the acknowledgement shape the server returns (resolved: true); asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the decision paths lives in approval-decision-result.test.ts.
 import { describe, expect, it } from "vitest";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
@@ -85,12 +85,18 @@ function makeInboxActionSandbox(): {
   const wrapper = `
     return async function invoke(stateObj, itemId, action, apiReturn) {
       var state = stateObj;
+      state.approvals = { inFlightItemId: null };
+      var resetApprovalConsent = function() {};
       var api = async function() { return apiReturn; };
       var toast = function() {};
       var fetchAll = async function() {};
       var rerender = function() {};
       var renderTopbar = function() {};
       var onAgentInspectOpen = async function() {};
+      var document = { getElementById: function() { return null; } };
+      var sourceLoaded = function() { return false; };
+      var decisionNotAdmissible = function() { return ""; };
+      var HUB = "/api/hub";
       ${fnText}
       await onInboxAction(itemId, action);
     };
@@ -122,7 +128,7 @@ describe("v1.1 dashboard exit drill onInboxAction (A7 regression)", () => {
   }
 
   function resolvedApi(pl: object, itemId = "item-exit-1"): object {
-    return { data: { item: { item_id: itemId, agent_id: null, resolution_payload: pl } } };
+    return { data: { item: { item_id: itemId, agent_id: null, resolved: true, resolution_payload: pl } } };
   }
 
   // A7 regression: this test fails on the buggy tree because payload is

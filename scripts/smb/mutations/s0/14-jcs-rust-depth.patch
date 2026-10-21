@@ -1,0 +1,6 @@
+# witness: codec_bounds_agree
+--- a/castle-wall-daemon/src/smb/jcs.rs
++++ b/castle-wall-daemon/src/smb/jcs.rs
+@@ -76 +76 @@
+-    if (value.is_array() || value.is_object()) && depth > super::constants::bound("JSON_MAX_DEPTH")?
++    if (value.is_array() || value.is_object()) && depth > super::constants::bound("JSON_MAX_DEPTH")? + 1

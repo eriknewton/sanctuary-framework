@@ -1,0 +1,5 @@
+# witness: default_features_exclude_hooks
+--- a/castle-wall-daemon/Cargo.toml
++++ b/castle-wall-daemon/Cargo.toml
+@@ -66,0 +67 @@
++default = ["smb-test-hooks"]

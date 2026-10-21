@@ -10,7 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install already carrying another form keeps running under its installed policy, where that rule matches nothing, and units already enabled still start at boot; `start` and `enable` refuse until the policy is re-signed with the `uid-<uid>` form and reinstalled.
 
-## [1.9.0-rc.1] - 2026-10-13
+### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
+
+- `@sanctuary-framework/quickstart` 0.2.0: publishing is opt-in. In a terminal it shows the destination and the exact request body and asks `[y/N]` (default No); `--publish` publishes without asking, `--no-publish` never publishes, and a run without a terminal does not publish unless `--publish` is given. The local identity exists before the publish decision in every case. A saved identity in `~/.sanctuary/quickstart-identity.json` is reused and never rewritten; `--new-identity` mints a fresh one after copying the old file to a backup.
+
+## [1.9.0-rc.1] - 2026-10-21
 
 Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 until 1.9.0 ships. This release carries the unpublished 1.8.5 changes and the 1.8.6 pre-release fixes (their own sections below) and everything merged to `main` since 1.8.4. No claim here goes beyond the bounded rows of the [Assurance Matrix](ASSURANCE_MATRIX.md), and changes with no matrix row are behavior changes, not new capability claims; the one row whose status changed since 1.8.4 is the Linux row, and only for the separately published Linux package (see Linux).
 
@@ -20,9 +24,11 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 - `sanctuary_help` answers an installing agent's evaluation questions ("should I install this", "what does this protect", "what are the bounds", "which platforms", "how do I verify", "how do I uninstall") by naming the read-only posture tool that answers each one, or `sanctuary doctor --json` and `sanctuary uninstall` where no tool does. The server's instructions now carry a short bounds paragraph copied from the README, and every tool whose default tier is Tier 1 says so in its description. No tool name or input schema changed.
 - `sanctuary-linux-policy-sign`, a new command in the package, signs Linux Castle Wall policies on an operator workstation. See the Linux section.
 - `docs/assurance-matrix.json` and `docs/.well-known/product-facts.json`: machine-readable copies of the Assurance Matrix and the README's install facts, generated from those files and checked in CI so neither says more than its source.
+- `audit_export_siem` accepts two more formats, `ecs` (Elastic Common Schema) and `xdm` (raw Cortex XDR events with `sanctuary_*` keys for an XDM dataset), built from the same redacted, caller-scoped audit view as the existing `cef` and `ocsf` output, which is unchanged. Field-mapping references for both are in the repository under `integrations/siem/`; no ingest pipeline or detection rule ships with them.
 
 ### Changed
 
+- Privacy default: from 1.9.0, `reputation_publish` (publishing a signed sovereignty report to Verascore) always requires operator approval, including on installs whose `~/.sanctuary/principal-policy.yaml` lists it under `tier3_always_allow`. Sanctuary itself wrote that line at first setup, so it is not treated as an operator choice. No migration step is needed: the policy file loads unchanged and the approval applies on the next start. The tool's name, schema and signing behavior are unchanged.
 - The install planner (`sanctuary install --json`) reports whether a usable Tier 1 approval path exists (`tier1_approval`), where the staged recovery file is (`staged_recovery_file`), and whether the vault is provisioned (`vault_provision`). Memory installs require a usable Tier 1 approval channel before they report completion; dashboard approval requires an explicit operator bearer.
 - Default `init` provisions only the fortress-local vault and leaves the machine-wide Castle Wall trust anchor alone; that anchor changes only through an explicit, confirmed `sanctuary castle-wall re-pin`. `doctor`, `status`, the dashboard and the MCP health and attestation tools report whether a vault has completed that step, and an unreadable record reads as not walled. `--no-pin` and `SANCTUARY_INIT_NO_PIN` are still accepted and do nothing.
 - On macOS, the installer uses the command line bundled in the verified signed app for memory and full profiles, and refuses an app whose runtime is inconsistent.
@@ -49,6 +55,7 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 - The rotation-in-progress refusal names only commands that exist.
 - Signed provenance fields in the vault are verified before content classification and are not classified as content.
 - Storage worker start-up tolerates a bounded load.
+- When another Sanctuary process for the same user removes an unused custody-lock scaffold while this one is setting one up, setup retries a bounded number of times instead of failing with a raw file-not-found error.
 
 ### Security
 
@@ -59,6 +66,16 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 - Exit-bundle artifacts and memory-archive bundle files are read through one bounded reader that checks the declared size and a per-file cap before a full read, and refuses symlinks and other non-regular files.
 - The Castle Wall daemon bounds the flow and approval work it holds when storage stalls or approvals back up, and the dashboard's read routes end at a deadline with one request in flight per route.
 - The harness log directory is checked through a no-follow handle before its ownership or mode is changed.
+
+### Dashboard
+
+The dashboard is now a console. These are behavior changes with no Assurance Matrix row. On the new screens, a value the server does not serve reads Unknown or Not evaluated with its reason, never zero, and served values show their age.
+
+- **Layout.** Dark by default, keeping a stored light choice. A top bar carries the machine and agent scope, search over what the page has loaded, the count of approvals waiting, Lock down, and Talk as a side panel. A rail reaches Overview, Approvals, Agents, Machines, Enforcement, Findings, Evidence and Policies, with Integrations and Settings under Configure. The older dashboard and posture pages use the same colors and bundled typefaces. Agent controls read Lock down and Remove protection.
+- **Overview.** Tiles for the Castle Wall arm state, approvals waiting, open Sentinel findings, the audit chain check, and how many detected agents have protection requested. Blocked and allowed outbound connection counts appear only beside a current, passing audit chain check, over a window the server shows it read in full; otherwise they read Not evaluated with the reason. With no agents yet, a first-run path names the detected harnesses that have no protection.
+- **Approvals.** One queue of held Tier 1 and Tier 2 operations, filtered by state, agent, tier and category, with a drawer that says what the request does, why it is held and where the decision is recorded. A Tier 1 approval takes two steps, Allow once and then Confirm. Allow always is offered for Tier 2 only when the policy engine answers, and adds a standing rule after the operator confirms. Every decision, single or batch, ends in one result kept until cleared: taken only when the server confirms the request resolved, refused with the server's reason, or unconfirmed. While a decision is being sent, decision controls on every screen are paused.
+- **Agents, Machines, Findings, Policies and Evidence.** Agents is an inventory with a detail page for each agent, including its configured reach; an agent counts as protected only with current per-agent enforcement evidence. Machines and the Fleet Switcher check each machine saved in the browser and say Online, Not healthy, or Unknown when it gives no clear answer within 3 seconds, which is never shown as down. Findings and Policies page through served data. Evidence reads the audit log with layer, agent, event, result and start-date filters, and states the server's own chain verification verdict.
+- **Talk.** A background refresh no longer overwrites a draft. Moving between the side panel and the full page keeps the draft and any send in progress. A reader scrolled up in the history keeps their place when a reply arrives. A display error after a message is posted is reported as a display problem, not a failed send.
 
 ### Linux
 

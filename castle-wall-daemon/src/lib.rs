@@ -17,6 +17,7 @@
 //! Source: Castle_Wall_Phase1_Scope_Lock_2026-05-03.md (sections 1, 4, 5,
 //! 6, 7, 8). Parent ADR: Castle_Architecture_ADR_2026-04-30.md.
 
+pub(crate) mod admitted_identity;
 #[cfg(target_os = "linux")]
 pub mod agent_launch;
 pub mod agent_start;
@@ -50,12 +51,15 @@ pub mod nftables;
 pub mod ownership_journal;
 pub mod policy;
 pub mod protected_agent;
+pub mod protection_subject;
 pub mod runtime_health;
 pub mod runtime_lock;
 pub mod runtime_providers;
 pub mod safety_net_uid;
 #[cfg(test)]
 pub(crate) mod source_scan;
+// One SMB contract surface keeps every later consumer on the same validators.
+pub mod smb;
 pub mod systemd_notify;
 pub mod thread_component;
 
@@ -63,7 +67,7 @@ pub use config::DaemonConfig;
 pub use daemon::{
     boot, DaemonError, DaemonExitReport, DaemonHandle, DaemonRuntimeState, SupervisionOutcome,
 };
-pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome};
+pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome, OutcomeEvidence};
 pub use enforcement::{
     derive_daemon_state, enforcement_status, AcquiredComponent, ComponentKind, ComponentProvider,
     EnforcementError, EnforcementRuntime, EnforcementStartError, EnforcementStatus, NotReadyReason,
@@ -75,6 +79,7 @@ pub use policy::{
     build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot,
     PolicySnapshotError, Verdict,
 };
+pub use protection_subject::ProtectionSubject;
 pub use runtime_providers::{
     disarm_castle_runtime, linux_production_plan, DisarmOutcome, LinuxRuntimeConfig,
 };

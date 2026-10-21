@@ -26,6 +26,8 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "file-grant",
   "fleet",
   "generate",
+  "hermes-memory-client",
+  "hermes-memory-bridge",
   "identity",
   "import-exit-bundle",
   "inbox",

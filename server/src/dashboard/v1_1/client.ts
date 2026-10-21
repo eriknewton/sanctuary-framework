@@ -12,7 +12,10 @@
  * - State is module-local. NEVER persisted to localStorage. The sidebar
  *   collapse flag and operator-entered bearer token use sessionStorage only.
  *
- * NO localStorage anywhere. NO operator-typed direct chat command at v1.1
+ * NO localStorage writes. The one localStorage access is a read of the
+ * Fleet Switcher's saved machine list (FLEET_STORAGE_KEY) for the Machines
+ * screen; the Fleet Switcher page owns and writes that list. NO
+ * operator-typed direct chat command at v1.1
  * (free text routes to the concierge as a UI-side suggestion engine).
  * NO verifier in-process (exit drill steps 4 + 5 display CLI commands;
  * they do NOT call the verifier from the dashboard process).
@@ -24,7 +27,10 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
+import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
+import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
+import { ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE } from "./templates.js";
 
 /**
  * Returns the inline client script body. The HTML shell wraps this in
@@ -56,6 +62,15 @@ export const DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR =
 export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE = "standalone";
 export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE =
   "Not available in this dashboard mode.";
+
+// Must cover AuditChainVerdictStatus in operational/audit-log.ts; the browser
+// receives this typed map verbatim, and the wired test compares the whole union.
+const EVIDENCE_CHAIN_VERDICTS = {
+  verified: { kind: "good", word: "CHAIN VERIFIED", summary: "Routine entries and any readable sealed region verified clean." },
+  verified_suffix_only: { kind: "warn", word: "RECENT ENTRIES VERIFIED", summary: "Recent entries are verified. The sealed older region could not be verified at this privilege." },
+  findings: { kind: "bad", word: "INTEGRITY FINDINGS", summary: "The server reported integrity findings." },
+  key_unavailable: { kind: "unknown", word: "NOT VERIFIED", summary: "The audit key is not available, so the chain was not verified." },
+} satisfies Record<AuditChainVerdictStatus, { kind: string; word: string; summary: string }>;
 
 const CLIENT_SCRIPT = String.raw`
 "use strict";
@@ -119,6 +134,8 @@ const URL_SESSION = (function () {
 // window, the smaller window wins. Missing, malformed, or non-positive
 // freshness windows are unknown, never silently widened to this maximum.
 const SEAL_FRESHNESS_MAX_MS = 10 * 60 * 1000;
+// Must match windowEnd in buildAuditDigest (principal-policy/posture.ts): the verdict and window end share a build.
+const AUDIT_CHAIN_VERIFIED_MAX_AGE_MS = SEAL_FRESHNESS_MAX_MS;
 const sealFreshnessTimers = new Map();
 let homeFreshnessTimer = null;
 // One five-second interaction budget bounds a read, including its JSON body.
@@ -153,17 +170,24 @@ const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE
 // Protection additionally requires fresh evidence. Fixed sources never evict.
 const sourceReads = new Map([
   INBOX_PREFS, HUB + "/agents", HUB + "/inbox", HUB + "/activity",
+  "/api/posture/evidence",
   HUB + "/policies", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
   HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config",
   HUB + "/chat/concierge/history", POLICY + "/current", AUTO_TRIGGER + "/rules",
   AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
   "/api/honeypot/tool-traps", "/api/honeypot/credential-traps",
-  "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings"
+  "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings", "/api/fleet/roster", "/api/sentinels/findings"
 ].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0, lastReadAt: 0 }]; }));
 const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute after repeated failures.
 function readKey(url) {
   const parsed = new URL(url, location.origin);
   parsed.searchParams.delete("_t"); parsed.searchParams.delete("session");
+  // Filter changes share one bounded read slot; queuePanel invalidates the old revision.
+  if (parsed.pathname === "/api/posture/evidence") {
+    ["agent", "since", "operation_type", "layer", "result", "limit"].forEach(function (key) {
+      parsed.searchParams.delete(key);
+    });
+  }
   return parsed.origin + parsed.pathname + parsed.search;
 }
 function sourceRead(path) { return sourceReads.get(readKey(path)); }
@@ -198,6 +222,7 @@ function isDashboardModeNotServedResponse(status, body) {
     body.unavailable === true &&
     body.message === DASHBOARD_MODE_NOT_SERVED_MESSAGE;
 }
+function mfpOptionalText(value) { return value == null || typeof value === "string"; }
 function validateReadBody(key, body) {
   const data = body && body.data;
   const arrayFields = [
@@ -206,14 +231,27 @@ function validateReadBody(key, body) {
     [HUB + "/activity?category=handoff", "entries"], [HUB + "/policies", "policies"],
     [HUB + "/chat/concierge/history", "messages"], [AUTO_TRIGGER + "/rules", "rules"],
     [AUTO_TRIGGER + "/recommendations", "recommendations"], ["/api/anomaly/findings", "findings"],
-    ["/api/honeypot/tool-traps", "traps"], ["/api/honeypot/credential-traps", "traps"]
+    ["/api/honeypot/tool-traps", "traps"], ["/api/honeypot/credential-traps", "traps"], ["/api/sentinels/findings", "findings"]
   ];
+  if (key === readKey("/api/fleet/roster") && (!body || typeof body.available !== "boolean" || !Array.isArray(body.nodes) || !body.nodes.every(function (node) {
+    return node && typeof node.node_id === "string" && mfpOptionalText(node.label) && mfpOptionalText(node.trust_state) &&
+      // The roster's evaluator reports this node's trust; a mistyped flag cannot establish evaluability.
+      (node.trust_evaluable === undefined || typeof node.trust_evaluable === "boolean") &&
+      mfpOptionalText(node.reach) && mfpOptionalText(node.last_sync_received_at) &&
+      (node.policy == null || (typeof node.policy === "object" && mfpOptionalText(node.policy.drift_state)));
+  }))) return false;
+  if (key === readKey("/api/sentinels/findings") && (!data || !Array.isArray(data.findings) || !data.findings.every(function (finding) {
+    return finding && typeof finding.finding_id === "string" && mfpOptionalText(finding.summary) && mfpOptionalText(finding.severity) &&
+      mfpOptionalText(finding.sentinel_id) && mfpOptionalText(finding.agent_id) && mfpOptionalText(finding.observed_at) &&
+      (finding.evidence_audit_ids == null || (Array.isArray(finding.evidence_audit_ids) && finding.evidence_audit_ids.every(function (id) { return typeof id === "string"; })));
+  }))) return false;
   const array = arrayFields.find(function (entry) { return readKey(entry[0]) === key; });
   if (array && !(array[1] === "items" && isPendingApprovalsRedactedMarker(data)) && (!data || !Array.isArray(data[array[1]]))) return false;
   if ([HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config", POLICY + "/current"].some(function (path) { return readKey(path) === key; }) && (!data || typeof data !== "object" || Array.isArray(data))) return false;
   if (key === readKey(HUB + "/recognition/did-web") && typeof data.configured !== "boolean") return false;
   if (key === readKey(HUB + "/intelligence/status") && !Array.isArray(data.surfaces)) return false;
   if (key === readKey("/api/posture/home") && (!body.castle_wall || !Array.isArray(body.agents) || !body.digest)) return false;
+  if (key === readKey("/api/posture/evidence") && (!Array.isArray(body.entries) || !Array.isArray(body.integrity_findings))) return false;
   if (key === readKey("/api/sovereignty") && (!body.live_enforcement || typeof body.live_enforcement !== "object")) return false;
   return true;
 }
@@ -224,7 +262,11 @@ const state = {
   // Overview board ("How safe you are right now"), not the concierge. Talk
   // stays fully reachable at the frozen "dashboard" route via the Assist nav.
   route: "posture",
+  mfp: { roster: null, findings: [], totals: { roster: 0, findings: 0, policy: 0 }, findingId: null, folds: { "auto-trigger": false, honeypot: false }, pages: { roster: 0, findings: 0, policy: 0, bindings: 0, rules: 0, recommendations: 0, toolTraps: 0, credentialTraps: 0 } },
   agents: [],
+  agentInventory: { status: "", harness: "", sort: "name", page: 0 },
+  agentTab: "overview",
+  agentReach: { state: "state_UNREAD", agentId: null, data: null, readAt: 0 },
   inbox: [],
   inboxRedacted: false,
   inboxRedactedCount: 0,
@@ -233,7 +275,24 @@ const state = {
     filters: { search: "", source: "", severity: "", agent: "", from: "", to: "" },
     snoozeDialog: null
   },
+  approvals: {
+    selectedId: null,
+    alwaysAllow: false,
+    confirmingTier1Id: null,
+    cancelledTier1Id: null,
+    inFlightItemId: null,
+    // One retained decision result for every inbox decision, and the lock that is its in-flight form.
+    // Both are owned by the decision-result section below (state_ADMITTEDDecision through state_RELEASEDDecision).
+    lock: null,
+    result: null,
+    filters: { state: "all", agent: "", tier: "both", category: "" }
+  },
   activity: [],
+  evidence: {
+    view: null,
+    filters: { query: "", layer: "", agent: "", event: "", result: "", from: "" },
+    selectedIndex: 0
+  },
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
   // Tunability UX: plain-English view of the LIVE Principal Policy, fetched
@@ -251,18 +310,25 @@ const state = {
   // (the concierge reads fortress state), so the scope label is shown but
   // the concierge thread is not re-queried per agent in wave 1.
   agentScope: { selectedAgentId: null, switcherOpen: false },
+  // Slice 2 shell (2026-10-13): Talk opens the concierge as a panel beside
+  // the current screen; the top-bar search filters only what this page has
+  // already loaded (no endpoint); the time range is a client-side window
+  // over the Evidence list, "all" until the operator narrows it.
+  talk: { open: false },
+  search: { query: "", open: false },
+  timeRange: "all",
   // Wave 1: HONEST posture from the evidence-gated /api/sovereignty verdict
   // (#828). castleWallArmState drives the seal color; NEVER green-on-presence.
   // null until first load; load failure leaves it null and the seal reads
   // "Unknown / Attention", never a fabricated "Protected".
   //
   // home / homeError (2026-06-30 one-surface fold): the full posture-home
-  // payload from GET /api/posture/home (metric cards, today's story, anomaly
+  // payload from GET /api/posture/home (today's story, anomaly
   // findings, per-agent rows). Reuses the EXISTING posture data endpoint - the
   // Posture screen folded into this single surface renders from this, and links
   // out to the per-agent drill-down (/posture/agent/:id) and the evidence view
-  // (/posture/evidence). storyPlain toggles the plain-language story summary.
-  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null, storyPlain: false },
+  // (/posture/evidence).
+  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
   },
@@ -365,6 +431,7 @@ function shortTime(iso) {
 }
 
 function promptForOperatorToken() {
+  if (!window.prompt) return false;
   const entered = window.prompt("Operator token required for this action.");
   if (!entered || !entered.trim()) return false;
   TOKEN = entered.trim();
@@ -386,11 +453,26 @@ function credentialedReadUrl(url, method) {
   } catch (_e) { return url; }
 }
 
+// These three snapshot readers carry a per-source generation through transport and projection.
+function beginMfpRead(path) {
+  const source = sourceRead(path);
+  source.generation = (source.generation || 0) + 1;
+  return source.generation;
+}
+function currentMfpRead(path, generation) { return sourceRead(path).generation === generation; }
+// For the three snapshot readers (fetchMfpRead and readPolicyView), every site that bumps the read's revision also sets
+// its state (queuePanel to LOADING and queues the trailing read; a restart to UNREAD; a stop to FAILED), so this refusal
+// means "not mine to publish", never a failed read. Other panels reach loadPanel's catch and still fail on it.
+function supersededByRefresh() {
+  const error = new Error("A newer refresh is pending.");
+  error.supersededByRefresh = true;
+  return error;
+}
 // A rejected race cannot publish late bytes, even if a transport ignores abort.
 // Only GETs use this helper; a mutation timeout must not imply it was undone.
-function readResponse(url, init, deadlineMs) {
+function readResponse(url, init, deadlineMs, generation) {
   const key = readKey(url);
-  if (pendingReads.has(key)) return pendingReads.get(key);
+  if (generation === undefined && pendingReads.has(key)) return pendingReads.get(key);
   const source = sourceReads.get(key);
   const revision = source && source.revision;
   if (source && source.state === "state_FAILED" && Date.now() < source.nextReadAt) {
@@ -409,7 +491,9 @@ function readResponse(url, init, deadlineMs) {
     if (deadlineMs !== undefined && deadlineMs <= 0) throw new Error("Read timed out. The latest result is unavailable.");
     const res = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
     let body = null;
-    try { body = await res.json(); } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
+    try {
+      body = key === readKey("/api/fleet/roster") || key === readKey("/api/sentinels/findings") || key === readKey(POLICY + "/current") ? await readMfpBody(res) : await res.json();
+    } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
     if (!res.ok) {
       if (isDashboardModeNotServedResponse(res.status, body)) {
         const error = new Error(DASHBOARD_MODE_NOT_SERVED_MESSAGE);
@@ -429,11 +513,18 @@ function readResponse(url, init, deadlineMs) {
     return { ok: res.ok, status: res.status, json: async function () { return body; } };
   })();
   const result = Promise.race([read, expired]).then(function (res) {
+    // Only the newest read may publish loaded state; an older success carries no current evidence.
+    if (generation !== undefined && !currentMfpRead(url, generation)) throw new Error("A newer read replaced this response.");
     // A response admitted before an event or decision cannot publish over its trailing read.
-    if (source && source.revision !== revision) throw new Error("A newer refresh is pending.");
+    if (source && source.revision !== revision) throw supersededByRefresh();
     if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
     return res;
   }, function (error) {
+    // An older failure cannot revoke evidence already supplied by a newer generation.
+    if (generation !== undefined && !currentMfpRead(url, generation)) throw error;
+    // A snapshot read whose revision moved failed after a trailing read or a stop took over its state, so the failure
+    // is not this source's result: the reader keeps its snapshot, as it does when a superseded read succeeds.
+    if (generation !== undefined && source && source.revision !== revision) throw supersededByRefresh();
     if (error && error.dashboardModeNotServed) markSourceNotServed(url);
     else failSource(url, error);
     if (source && source.state !== "state_NOT_SERVED") source.status = error.status;
@@ -441,7 +532,7 @@ function readResponse(url, init, deadlineMs) {
     throw error;
   }).finally(function () {
     clearTimeout(timer);
-    pendingReads.delete(key);
+    if (pendingReads.get(key) === result) pendingReads.delete(key);
   });
   pendingReads.set(key, result);
   return result;
@@ -455,9 +546,11 @@ function dashboardResponse(url, init, deadlineAt) {
 
 function readLabel(path) {
   const labels = [
+    ["/api/fleet/roster", "Fleet roster"], ["/api/sentinels/findings", "Sentinel findings"],
     [INBOX_PREFS, "Saved inbox filters"], ["/api/posture/home", "Protection status"],
     ["/api/sovereignty", "Protection evidence"], ["/api/anomaly", "Anomaly findings"],
     [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
+    ["/api/posture/evidence", "Chain verification"],
     [HUB + "/activity?category=privacy", "Privacy"], [HUB + "/activity?category=handoff", "Coordination"],
     [HUB + "/activity", "Activity"], [HUB + "/policies", "Agent policies"],
     [HUB + "/intelligence/status", "Intelligence status"], [HUB + "/intelligence/config", "Intelligence configuration"], [HUB + "/intelligence", "Intelligence"], [HUB + "/recognition", "Recognition"],
@@ -519,10 +612,11 @@ async function api(path, opts, deadlineAt) {
   init.cache = "no-store";
   init.headers["Cache-Control"] = "no-cache";
   init.headers["Pragma"] = "no-cache";
-  let url = HUB + path;
+  // The audit download uses the same bearer and read handling as hub calls.
+  let url = path === "/api/audit-log" ? path : HUB + path;
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") {
-    url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+    url += (url.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
   url = credentialedReadUrl(url, method);
   let res = await dashboardResponse(url, init, deadlineAt);
@@ -590,7 +684,7 @@ async function autoTriggerApi(path, opts, deadlineAt) {
 // the operator token once, exactly like api(). There is no loopback
 // shortcut and no second, weaker path: the server runs authMiddleware
 // then requireOperatorCredential on every sensitive policy route.
-async function policyApi(path, opts) {
+async function policyApi(path, opts, generation) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
   if (init.body && typeof init.body !== "string") {
@@ -604,7 +698,7 @@ async function policyApi(path, opts) {
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   url = credentialedReadUrl(url, method);
-  let res = await dashboardResponse(url, init);
+  let res = await (generation === undefined ? dashboardResponse(url, init) : readResponse(url, init, undefined, generation));
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
     res = await fetch(url, init);
@@ -641,8 +735,12 @@ function toast(message, kind) {
   const el = document.createElement("div");
   el.className = "toast" + (kind === "error" ? " error" : "");
   el.textContent = message;
-  host.appendChild(el);
-  setTimeout(function () { el.remove(); }, 4000);
+  // Newest first keeps F at its origin so expiry cannot hide the retained headline.
+  host.insertBefore(el, host.firstChild);
+  const feedback = document.getElementById("feedback");
+  if (feedback) feedback.scrollTop = 0;
+  const toastLifetimeMs = 4 * 1000; // Four seconds, preserving the existing toast lifetime.
+  setTimeout(function () { el.remove(); }, toastLifetimeMs);
 }
 
 // ── Template registry (mirror of server templates.ts) ──────────────────
@@ -652,6 +750,16 @@ function arg(args, kind, fallback) {
     if (args[i].kind === kind) return String(args[i].value);
   }
   return fallback;
+}
+
+// True when the first arg of the kind, the one arg() renders, carries a nonempty string. Must match hasArgValue in
+// templates.ts.
+function hasArgValue(args, kind) {
+  if (!Array.isArray(args)) return false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] && args[i].kind === kind) return typeof args[i].value === "string" && args[i].value.length > 0;
+  }
+  return false;
 }
 
 // Cross-file contract: every key here must have a matching key in the
@@ -665,7 +773,8 @@ const TEMPLATES = {
   "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   // Must match "approval_pending.tier1.fortress_exit_bundle_export" in templates.ts.
   "approval_pending.tier1.fortress_exit_bundle_export": () => "Export the entire fortress as a portable exit bundle.",
-  "approval_pending.tier1.unwrap": (a) => "Unwrap request for agent " + arg(a,"agent_id") + ". This build refuses unsupported unwraps before approval is queued.",
+  // Must match "approval_pending.tier1.unwrap" in templates.ts.
+  "approval_pending.tier1.unwrap": (a) => "Request to remove protection from agent " + arg(a,"agent_id") + ". This build refuses unsupported removals before approval is queued.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
@@ -724,19 +833,36 @@ const TEMPLATES = {
   "activity.other": (a) => "Audit event recorded for agent " + arg(a,"agent_id","(fortress)") + "."
 };
 
+// Must match ACTIVITY_TEMPLATE_NAMESPACES in templates.ts, sourced from hub/constants.ts.
+const ACTIVITY_TEMPLATE_NAMESPACES = ${JSON.stringify(Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES))};
+// Must match ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE in templates.ts, injected from it when the script is built.
+const ACTIVITY_FALLBACK_TEMPLATES = ${JSON.stringify(ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE)};
+
 function renderTemplate(id, args) {
-  const fn = TEMPLATES[id];
+  let fn = TEMPLATES[id];
+  if (!fn && typeof id === "string") {
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category. An operation renders its
+    // category's sentence only where that sentence is true of every operation the hub files there.
+    const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => id.startsWith(prefix + "."));
+    const fallback = namespace ? ACTIVITY_FALLBACK_TEMPLATES[namespace] : undefined;
+    // A row without a verified agent never renders a sentence that would name the fortress as its subject: the hub
+    // serves agent_id only for a re-verified producer signature, so the row keeps the diagnostic fallback instead.
+    if (fallback && (fallback.requiredArg === null || hasArgValue(args, fallback.requiredArg))) fn = TEMPLATES[fallback.template];
+  }
   if (!fn) return "[unrecognized template: " + id + "]";
   try { return fn(args || []); } catch (e) { return "[template render failed: " + id + "]"; }
 }
 
 // ── Status mapping ─────────────────────────────────────────────────────
+// Table-level pin: must match STATUS_MAPPING in status-mapping.ts. Enforced
+// by the status parity guard in test/dashboard/v1_1/templates.test.ts.
 const STATUS_MAP = {
   active: { label: "Protected", glyph: "online" },
   paused: { label: "Paused", glyph: "idle" },
   restarting: { label: "Restarting", glyph: "idle" },
   locked_down: { label: "Locked down", glyph: "offline" },
-  unwrapping: { label: "Unwrapping", glyph: "idle" },
+  // Must match STATUS_MAPPING.unwrapping in status-mapping.ts.
+  unwrapping: { label: "Removing protection", glyph: "idle" },
   error: { label: "Error", glyph: "away" },
   unknown: { label: "Unknown", glyph: "unknown" }
 };
@@ -802,7 +928,7 @@ function inboxActions(item) {
 }
 
 const INBOX_ACTION_LABEL = {
-  approve: "Approve",
+  approve: "Allow once",
   deny: "Deny",
   dismiss: "Dismiss",
   review_receipt: "Review receipt",
@@ -812,24 +938,82 @@ const INBOX_ACTION_LABEL = {
 };
 
 // ── Render: app-level ─────────────────────────────────────────────────
+// Slice 2 rail (2026-10-13): which rail item a hash route lights. The rail
+// carries ten destinations; the older routes fold into them as tabs,
+// sections or actions, and every older hash still renders its own screen
+// when navigated directly. Talk ("dashboard") lights no rail item: it is a
+// top-bar button. Must match RAIL_PRIMARY and RAIL_CONFIGURE in
+// server/src/dashboard/v1_1/html.ts: every value here is a rail id there.
+const ROUTE_RAIL_PARENT = {
+  "posture": "posture",
+  "approvals": "approvals",
+  "agents": "agents",
+  "agent-detail": "agents",
+  "machines": "machines",
+  "enforcement": "enforcement",
+  "findings": "findings",
+  "honeypot": "findings",
+  "activity": "activity",
+  "exit-drill": "activity",
+  "policy": "policy",
+  "auto-trigger": "policy",
+  "integrations": "integrations",
+  "coordination": "integrations",
+  "settings": "settings",
+  "health": "settings",
+  "privacy": "settings",
+  "intelligence": "settings",
+  "attestation": "settings",
+  "dashboard": null
+};
+// Settings tabs: each is a plain hash link to the older route id, so the tab
+// IS the route and a deep link to #privacy still lands on Privacy.
+const SETTINGS_TABS = [
+  { id: "health", label: "Health" },
+  { id: "privacy", label: "Privacy" },
+  { id: "intelligence", label: "Local models" },
+  { id: "attestation", label: "Attestation" }
+];
+// Time-range windows, in milliseconds, for the Evidence list. Only the
+// Evidence screen has a client-side window today; every other screen shows
+// current state, so the control is disabled there with a title saying so.
+const MS_PER_HOUR = 60 * 60 * 1000;
+const TIME_RANGE_MS = { "24h": 24 * MS_PER_HOUR, "7d": 7 * 24 * MS_PER_HOUR, "30d": 30 * 24 * MS_PER_HOUR };
+const TIME_RANGE_LABEL = { "all": "all time", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" };
+const TIME_RANGE_ROUTES = ["activity"];
+// Every route but Talk's full page is route-full: the fortress column (the
+// queue and ambient posture beside the concierge) shows only there. The
+// route-walk test asserts this for every hash id but "dashboard".
+const ROUTE_FULL = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "machines", "enforcement", "findings", "integrations", "settings", "attestation"];
 function setRoute(route) {
+  // A queued reach read belongs to the open detail route, never to a remembered selection; a cleared subject was
+  // never read, so its loading placeholder returns to unread rather than claiming a read in progress.
+  if (route !== "agent-detail") {
+    if (agentReachPendingId && state.agentReach.agentId === agentReachPendingId && state.agentReach.state === "state_LOADING") state.agentReach = { state: "state_UNREAD", agentId: null, data: null, readAt: 0 };
+    agentReachPendingId = null;
+  }
   state.route = route;
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
-  if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
+  if (ROUTE_FULL.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
+  const railRoute = Object.prototype.hasOwnProperty.call(ROUTE_RAIL_PARENT, route) ? ROUTE_RAIL_PARENT[route] : null;
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
-    if (a.getAttribute("data-route") === route) a.classList.add("active");
-    else a.classList.remove("active");
+    if (railRoute && a.getAttribute("data-route") === railRoute) { a.classList.add("active"); a.setAttribute("aria-current", "page"); }
+    else { a.classList.remove("active"); a.removeAttribute("aria-current"); }
   });
-  renderMain();
+  state.search.open = false;
+  if (route === "machines") { void probeFleetMachines(); scheduleFleetAgeTick(); }
+  else renderMain();
   renderFortress();
+  renderShellChrome();
   // Tunability UX: entering the Policy surface loads the LIVE plain-English
   // policy from the operator-bearer-gated GET /api/policy/current. Fired
   // fire-and-forget; loadPolicyView rerenders when the view arrives.
-  if (route === "policy") void loadPolicyView();
+  if (route === "policy" || route === "approvals") void loadPolicyView();
+  // Machines probes on every entry, as the Fleet Switcher does on load, and
+  // keeps its check age current while it shows.
 }
 
 // Tunability UX: fetch the plain-English rendering of the LIVE Principal
@@ -842,12 +1026,28 @@ async function loadPolicyView(afterMutation) {
   return loadPanel(policyPanelJob);
 }
 async function readPolicyView() {
+  const path = POLICY + "/current";
+  const generation = beginMfpRead(path);
   state.policyView.loading = true;
   state.policyView.loadError = null;
   try {
-    const r = await policyApi("/current", { method: "GET" });
-    state.policyView.view = (r && r.data && r.data.view) || null;
+    const r = await policyApi("/current", { method: "GET" }, generation);
+    // Only the newest generation may commit a policy projection or its total.
+    if (!currentMfpRead(path, generation)) return;
+    const view = r && r.data && r.data.view;
+    if (!view || !Array.isArray(view.lines) || !view.lines.every(function (line) { return line && typeof line.section === "string" && typeof line.text === "string" && line.text.length <= MFP_EVIDENCE_CHAR_LIMIT; })) throw new Error("Policy rule list unavailable.");
+    state.mfp.totals.policy = view.lines.length;
+    // Only a bounded projection is retained; every refresh replaces the previous policy snapshot.
+    state.policyView.view = { policy_version: view.policy_version, lines: view.lines.slice(0, MFP_RECORD_LIMIT).map(function (line) {
+      return { section: line.section, text: line.text };
+    }) };
   } catch (e) {
+    // A superseded failure must leave the newer policy and its loaded state intact.
+    if (!currentMfpRead(path, generation)) return;
+    // The refresh that superseded this read owns the next policy and already set the read state.
+    if (e && e.supersededByRefresh === true) return;
+    if (sourceRead(path).state !== "state_FAILED" && !sourceNotServed(path)) failSource(path, e);
+    state.mfp.totals.policy = 0;
     state.policyView.view = null;
     state.policyView.loadError =
       e.status === 401 || e.status === 403
@@ -856,8 +1056,10 @@ async function readPolicyView() {
           ? "Policy engine is not configured on this fortress."
           : (e.message || "Could not load policy.");
   } finally {
-    state.policyView.loading = false;
-    if (state.route === "policy") rerender();
+    if (currentMfpRead(path, generation)) {
+      state.policyView.loading = false;
+      if (state.route === "policy" || state.route === "approvals") rerender();
+    }
   }
 }
 
@@ -927,25 +1129,29 @@ function renderTopbar() {
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
     renderTopbarAttestationBadge(state.topbarPills.attestation)
   ].join("");
-  // Lockdown button reflects the approved handler's reported outcome.
+  // Lock down button reflects the approved handler's reported outcome.
   const btn = document.getElementById("btn-lockdown");
   if (!btn) return;
   const t1 = state.tier1.lockdown;
   btn.classList.remove("tier1-pending", "tier1-partial", "tier1-engaged");
   btn.disabled = false;
   if (t1.state === "pending") {
+    // Must match TIER1_BUTTON_COPY.lockdown.pending in status-mapping.ts.
     btn.textContent = "Awaiting approval";
     btn.classList.add("tier1-pending");
     btn.disabled = true;
   } else if (t1.state === "partial") {
-    btn.textContent = "Lockdown partial";
+    // Must match TIER1_BUTTON_COPY.lockdown.partial in status-mapping.ts.
+    btn.textContent = "Partly locked down";
     btn.classList.add("tier1-partial");
   } else if (t1.state === "engaged") {
-    btn.textContent = "Lockdown ON";
+    // Must match TIER1_BUTTON_COPY.lockdown.engaged in status-mapping.ts.
+    btn.textContent = "Locked down";
     btn.classList.add("tier1-engaged");
     btn.disabled = true;
   } else {
-    btn.textContent = "Lockdown";
+    // Must match TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts.
+    btn.textContent = "Lock down";
   }
   renderAgentSwitcher();
   renderPostureSeal();
@@ -965,11 +1171,15 @@ function agentScopeGlyph(agentId) {
   return (cleaned.slice(0, 2) || "··").toUpperCase();
 }
 function renderAgentSwitcher() {
+  // Slice 2: the agent switcher folded into the top bar's scope control. The
+  // trigger shows the machine and its id (server-rendered) plus the agent
+  // scope; the menu's static head carries the full id and its copy control,
+  // and the agent options are written into #agent-switcher-options.
   const labelEl = document.getElementById("agent-switcher-label");
-  const glyphEl = document.getElementById("agent-switcher-glyph");
   const menuEl = document.getElementById("agent-switcher-menu");
+  const optionsEl = document.getElementById("agent-switcher-options") || menuEl;
   const trigger = document.getElementById("agent-switcher-trigger");
-  if (!labelEl || !glyphEl || !menuEl) return;
+  if (!labelEl || !menuEl) return;
   const selected = state.agentScope.selectedAgentId;
   const selectedAgent = selected
     ? state.agents.find(function (a) { return a.agent_id === selected; })
@@ -978,18 +1188,18 @@ function renderAgentSwitcher() {
   if (selected && !selectedAgent) state.agentScope.selectedAgentId = null;
   const curLabel = state.agentScope.selectedAgentId || "All agents";
   labelEl.textContent = curLabel;
-  glyphEl.textContent = agentScopeGlyph(state.agentScope.selectedAgentId);
   const open = !!state.agentScope.switcherOpen;
   menuEl.hidden = !open;
   if (trigger) trigger.setAttribute("aria-expanded", open ? "true" : "false");
   if (!open) return;
-  if (!sourceLoaded(HUB + "/agents")) { menuEl.innerHTML = renderSourceRead(HUB + "/agents"); return; }
+  if (!sourceLoaded(HUB + "/agents")) { optionsEl.innerHTML = renderSourceRead(HUB + "/agents"); return; }
   const allSelected = !state.agentScope.selectedAgentId;
   const rows = ['<button type="button" class="agent-switcher-opt' + (allSelected ? ' selected' : '') +
     '" data-action="agent-scope-select" data-agent-id="">' +
     '<span class="opt-glyph">··</span>' +
     '<span class="opt-name">All agents</span>' +
-    '<span class="opt-state">' + state.agents.length + ' wrapped</span>' +
+    // A roster count, never "protected": enforcement evidence is per agent.
+    '<span class="opt-state">' + (state.agents.length === 1 ? "1 agent" : state.agents.length + " agents") + '</span>' +
     '</button>'];
   state.agents.forEach(function (a) {
     const map = agentDisplayStatus(a);
@@ -1001,7 +1211,7 @@ function renderAgentSwitcher() {
       '<span class="opt-state">' + escHtml(map.label || "") + '</span>' +
       '</button>');
   });
-  menuEl.innerHTML = rows.join("");
+  optionsEl.innerHTML = rows.join("");
 }
 
 // Wave 1 (2026-06-30): the posture seal. Honest verdict drives its color and
@@ -1013,14 +1223,18 @@ function renderPostureSeal() {
   const freshnessEl = document.getElementById("posture-seal-freshness");
   const popEl = document.getElementById("posture-seal-pop");
   if (!sealEl || !wordEl || !popEl) return;
-  sealEl.classList.remove("tone-protected", "tone-attention", "tone-locked");
+  sealEl.classList.remove("tone-protected", "tone-attention", "tone-locked", "tone-unknown");
   if (seal.tone === "protected") sealEl.classList.add("tone-protected");
   else if (seal.tone === "locked") sealEl.classList.add("tone-locked");
   else if (seal.tone === "attention") sealEl.classList.add("tone-attention");
-  // "unknown" tone keeps the neutral default styling.
+  // Unknown wears its own full-weight slate and an empty dotted ring, never
+  // the neutral "Checking" chrome and never the pass hue.
+  else sealEl.classList.add("tone-unknown");
   wordEl.textContent = seal.word;
   if (freshnessEl) {
     freshnessEl.textContent = seal.freshness.inline;
+    // The freshness may ellipsize on a narrow bar; the full text stays here.
+    freshnessEl.setAttribute("title", seal.freshness.inline);
     freshnessEl.classList.remove("fresh", "not-fresh");
     freshnessEl.classList.add(seal.freshness.current ? "fresh" : "not-fresh");
   }
@@ -1035,7 +1249,10 @@ function renderPostureSeal() {
     sub = "Protected means Castle Wall enforcement was observed within the freshness window and the Charter still gates risky actions. It does not mean every past action is fully verified here.";
   } else if (seal.tone === "locked") {
     head = "This fortress is locked down.";
-    sub = "Lockdown holds wrapped agents. Protected is only shown when Castle Wall enforcement has current evidence.";
+    // Must match the Lock down button title in html.ts and the
+    // approval_pending.tier1.fortress_lockdown template: network access is
+    // revoked for confined agents, and agents keep running and local access.
+    sub = "Lockdown revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
     sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Retry the protection evidence read.";
@@ -1044,7 +1261,7 @@ function renderPostureSeal() {
     sub = "Current enforcement is Unknown. Retry the protection evidence read.";
   }
   const lines = postureLayerLines().map(function (l) {
-    const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
+    const dotCls = layerDotClass(l);
     return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
       '<span class="pp-k">' + escHtml(l.k) + '</span>' +
       '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
@@ -1067,136 +1284,308 @@ function renderPostureSeal() {
 // generated reply via the standard macOS selection mechanism.
 const __renderCache = { route: null, html: null };
 
-// ── Render: main area ──────────────────────────────────────────────────
-function renderMain() {
-  const main = document.getElementById("main");
-  if (!main) return;
-  // F8 fix: capture focused-input identity + caret position so an SSE-
-  // triggered rerender during typing does not clobber the operator's
-  // typing experience. innerHTML replacement creates new DOM nodes; we
-  // re-find the equivalent input by data-action + optional data-agent-id
-  // and restore focus + selection range.
+// Talk owns one live composer for the lifetime of its current host. Background
+// reads hydrate only named presentation parts; they never replace the form.
+// Minimal VM DOMs and old engines retain the former whole-string path; the
+// mounted owner runs only where every primitive it calls exists. The owner
+// path reads Node.isConnected (hydrateTalkHost's disconnect check), calls
+// Element.replaceChildren (non-append history rewrite) and parses through
+// template.content; an engine missing any one of them would throw mid-hydrate,
+// so the check names all three and such an engine takes the legacy path.
+const talkDomOwnerSupported = typeof document.createElement === "function" &&
+  !!document.createElement("template").content &&
+  typeof Node !== "undefined" && !!Node.prototype && "isConnected" in Node.prototype &&
+  typeof Element !== "undefined" && !!Element.prototype &&
+  typeof Element.prototype.replaceChildren === "function";
+let talkOwner = null;
+let talkFollowIntent = null;
+let talkComposing = false;
+let talkViewportState = null;
+let talkUserScrollEpoch = 0;
+// "At the bottom" tolerance: 4 CSS px absorbs the sub-pixel remainder of
+// scrollTop + clientHeight against scrollHeight under zoom and fractional
+// device pixel ratios, where an exact equality never holds at the true bottom.
+// Must match BOTTOM_SLACK_PX in server/test/e2e/talk-follow-ownership.e2e.ts.
+const TALK_BOTTOM_SLACK_PX = 4;
+// Motion threshold for the scroll-epoch watcher: half a CSS px, below which a
+// scroll event is layout jitter from fractional scrollTop, not a reader moving.
+const TALK_SCROLL_MOTION_PX = 0.5;
+function captureTalkViewport(history) {
+  if (!history) return null;
+  // A history with no layout box (hidden panel, detached node, unlaid VM fake)
+  // reports 0 for scrollTop, clientHeight and scrollHeight, and 0 + 0 >= 0 - 4
+  // reads as "following". That reading says nothing about where the reader was,
+  // so capture refuses: callers keep the last real snapshot instead of saving a
+  // meaningless one, whatever order a teardown hides and captures in.
+  if (history.isConnected === false || !(history.clientHeight > 0)) return null;
+  return {
+    top: history.scrollTop,
+    following: history.scrollTop + history.clientHeight >= history.scrollHeight - TALK_BOTTOM_SLACK_PX
+  };
+}
+// The only writer of talkViewportState from a live history: a refused capture
+// leaves the saved snapshot untouched rather than clearing it.
+function saveTalkViewport(history) {
+  const snapshot = captureTalkViewport(history);
+  if (snapshot) talkViewportState = snapshot;
+  return snapshot;
+}
+function restoreTalkViewport(history, snapshot, forceFollow) {
+  if (!history) return;
+  if (forceFollow || !snapshot || snapshot.following) history.scrollTop = history.scrollHeight;
+  else history.scrollTop = snapshot.top;
+}
+// A send's follow request survives until the reader actually scrolls. Both the
+// mounted owner and the legacy whole-string path read this one predicate, so
+// there is a single follow policy rather than one per render path.
+function talkFollowRequested() {
+  return !!talkFollowIntent && talkFollowIntent.scrollEpoch === talkUserScrollEpoch;
+}
+// Watches one history element for reader scrolls. Only a trusted scroll whose
+// scrollTop actually moved bumps the epoch: a programmatic restore is followed
+// by watch.lastTop = scrollTop, and a no-motion wheel at either end fires no
+// movement, so neither revokes a send's follow request.
+function watchTalkScroll(history) {
+  const watch = { lastTop: history.scrollTop };
+  watch.onScroll = function (event) {
+    const moved = Math.abs(history.scrollTop - watch.lastTop) > TALK_SCROLL_MOTION_PX;
+    watch.lastTop = history.scrollTop;
+    if (event.isTrusted && moved) talkUserScrollEpoch++;
+  };
+  history.addEventListener("scroll", watch.onScroll);
+  return watch;
+}
+function disposeTalkOwner() {
+  if (!talkOwner) return;
+  saveTalkViewport(talkOwner.history);
+  talkOwner.history.removeEventListener("scroll", talkOwner.watch.onScroll);
+  talkOwner.host.innerHTML = "";
+  talkOwner = null;
+  talkComposing = false;
+}
+function attachTalkOwner(host) {
+  if (talkOwner && talkOwner.host !== host) disposeTalkOwner();
+  const history = host.querySelector("#concierge-history");
+  const input = host.querySelector('input[data-action="concierge-input"]');
+  if (!history || !input || !host.querySelector("[data-talk-read-status]") ||
+      !host.querySelector("[data-talk-error]")) throw new Error("Talk mount anchors missing");
+  const owner = { host: host, history: history, input: input, watch: watchTalkScroll(history) };
+  talkOwner = owner;
+  restoreTalkViewport(history, talkViewportState, talkFollowRequested());
+  owner.watch.lastTop = history.scrollTop;
+}
+// Legacy whole-string path, after a write: restore the viewport and watch the
+// new history element. A landed reply (pendingScroll) follows only while the
+// send's follow request is unrevoked, the same epoch rule the mounted owner
+// applies, so a reader who scrolled during the in-flight send stays put.
+// The replaced history element took its old watcher with it; no removal needed.
+function restoreLegacyTalkHistory(history, viewport) {
+  if (history) {
+    restoreTalkViewport(history, viewport || talkViewportState,
+      state.chat.concierge.pendingScroll && talkFollowRequested());
+    saveTalkViewport(history);
+    if (typeof history.addEventListener === "function") watchTalkScroll(history);
+  }
+  state.chat.concierge.pendingScroll = false;
+}
+function hydrateTalkHost(host) {
+  const owner = talkOwner;
+  // Fail loud, recover by navigation only: a disconnected owner means some
+  // other writer replaced the mounted composer, so the draft and viewport this
+  // owner holds no longer match the screen. Silently remounting would hide
+  // that second writer and could drop an operator's typed draft; throwing
+  // stops this render, and the next route or panel change disposes the stale
+  // owner and mounts a fresh one from state.
+  if (!owner || owner.host !== host || !owner.input.isConnected || !owner.history.isConnected) {
+    throw new Error("Talk mount disconnected during background refresh");
+  }
+  const template = document.createElement("template");
+  template.innerHTML = renderDashboardConcierge();
+  const fresh = template.content.querySelector(".concierge-wrap");
+  if (!fresh) throw new Error("Talk render shell missing");
+  // Read-status and badge changes resize history even when its messages are unchanged.
+  // Capture before any presentation write so shrinking the viewport cannot erase follow intent.
+  const history = owner.history;
+  const viewport = captureTalkViewport(history);
+  const requestedFollow = talkFollowRequested();
+  ["[data-talk-read-status]", ".concierge-meta", "[data-talk-error]"].forEach(function (selector) {
+    const livePart = host.querySelector(selector);
+    const freshPart = fresh.querySelector(selector);
+    if (!livePart || !freshPart) throw new Error("Talk presentation anchor missing: " + selector);
+    if (livePart.innerHTML === freshPart.innerHTML) return;
+    // Rewriting a part replaces its controls (the read status carries Retry),
+    // so a keyboard user focused inside it would drop to the page body. Focus
+    // is captured from the part being rewritten and restored into it, on
+    // whichever host (full-page Talk or the panel) this owner is mounted in.
+    const focus = livePart.contains(document.activeElement) ? captureInputFocus(livePart) : null;
+    livePart.innerHTML = freshPart.innerHTML;
+    restoreInputFocus(livePart, focus);
+  });
+  const freshHistory = fresh.querySelector("#concierge-history");
+  if (!freshHistory) throw new Error("Talk history anchor missing");
+  const changed = history.innerHTML !== freshHistory.innerHTML;
+  // Only real message admission starts a thread; an empty-to-empty refresh must preserve the suggestion reader's offset.
+  const firstMessages = changed && !history.querySelector(".concierge-msg") && !!freshHistory.querySelector(".concierge-msg");
+  if (changed) {
+    // Compare and copy text separators as well as message elements. Cloning
+    // only .children drops the renderer's newline nodes, making a later
+    // unchanged refresh look different and replace selected reply text.
+    const oldNodes = Array.from(history.childNodes);
+    const newNodes = Array.from(freshHistory.childNodes);
+    const appendOnly = oldNodes.length > 0 && newNodes.length > oldNodes.length &&
+      oldNodes.every(function (node, index) { return node.isEqualNode(newNodes[index]); });
+    if (appendOnly) {
+      newNodes.slice(oldNodes.length).forEach(function (node) { history.appendChild(node.cloneNode(true)); });
+    } else {
+      history.replaceChildren(...newNodes.map(function (node) { return node.cloneNode(true); }));
+    }
+  }
+  const sending = state.chat.concierge.sending;
+  owner.input.disabled = sending;
+  host.querySelectorAll(".concierge-suggest").forEach(function (button) { button.disabled = sending; });
+  const send = host.querySelector('[data-action="concierge-send"]');
+  if (!send) throw new Error("Talk send control missing");
+  send.disabled = sending;
+  const label = sending ? "Sending..." : "Send";
+  if (send.textContent !== label) send.textContent = label;
+  // Preserve the reader across the complete hydration, including chrome-only refreshes.
+  restoreTalkViewport(history, viewport || talkViewportState, firstMessages || (changed && requestedFollow));
+  // Rebase only our own motion so a reader scroll awaiting its event still revokes the send's follow request.
+  if (!viewport || history.scrollTop !== viewport.top) owner.watch.lastTop = history.scrollTop;
+  state.chat.concierge.pendingScroll = false;
+}
+
+
+// F8 fix: capture focused-input identity + caret position so an SSE-
+// triggered rerender during typing does not clobber the operator's typing
+// experience. innerHTML replacement creates new DOM nodes; we re-find the
+// equivalent input or route control by data-action, href and optional
+// data-agent-id and restore focus. Shared by #main and the Talk panel, the
+// two containers whose inputs a rerender rewrites.
+function captureInputFocus(container) {
   const active = document.activeElement;
-  let focus = null;
-  if (
-    active && (!main.contains || main.contains(active)) &&
-    active.tagName === "INPUT" &&
-    ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 &&
-    typeof active.getAttribute === "function" &&
-    active.getAttribute("data-action")
-  ) {
-    focus = {
+  if (!active || (container.contains && !container.contains(active)) || typeof active.getAttribute !== "function") return null;
+  if (active.tagName === "INPUT" && ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 && active.getAttribute("data-action")) {
+    return {
+      kind: "input",
       action: active.getAttribute("data-action"),
       agentId: active.getAttribute("data-agent-id"),
+      itemId: active.getAttribute("data-item-id"),
       selectionStart: active.selectionStart,
       selectionEnd: active.selectionEnd
     };
   }
-  // Finding DDD (v1.2.0-rc.5): capture whether the operator is
-  // following the conversation BEFORE the DOM is replaced. With the
-  // rc.5 bounded-card layout, .concierge-history is the inner scroll
-  // container (max-height on the card + min-height: 0 + overflow-y:
-  // auto on history). The composer sits OUTSIDE the history's scroll
-  // region, so it stays visible regardless of where the operator has
-  // scrolled. "Following" now means the latest message is visible
-  // inside the history container's viewport. The check compares the
-  // last message's bounding rect to the history element's bounding
-  // rect (both are border-box rects in viewport space, so the
-  // intersection test is direct). The rc.5 restore continues to use
-  // scrollIntoView, which scrolls whichever ancestor is the actual
-  // scroll container, now .concierge-history.
-  let conciergeWasFollowing = false;
-  if (state.route === "dashboard") {
-    const histEl = document.getElementById("concierge-history");
-    if (histEl) {
-      const lastMsg = histEl.querySelector(".concierge-msg:last-child");
-      if (lastMsg) {
-        const histRect = histEl.getBoundingClientRect();
-        const lastRect = lastMsg.getBoundingClientRect();
-        // Following = the last message overlaps the history container's
-        // visible region. If the operator scrolled up past the latest
-        // message, the message is below histRect.bottom (clipped); if
-        // far above the visible region, it's above histRect.top.
-        conciergeWasFollowing =
-          lastRect.top < histRect.bottom && lastRect.bottom > histRect.top;
-      } else {
-        // Empty thread. Treat as following so a fresh exchange lands
-        // in view.
-        conciergeWasFollowing = true;
-      }
-    }
+  if ((active.tagName === "BUTTON" || active.tagName === "A") && (active.getAttribute("data-action") || active.getAttribute("href"))) {
+    return {
+      kind: "control",
+      action: active.getAttribute("data-action"),
+      href: active.getAttribute("href"),
+      agentId: active.getAttribute("data-agent-id"),
+      itemId: active.getAttribute("data-item-id")
+    };
   }
+  return null;
+}
+function restoreInputFocus(container, focus) {
+  if (!focus || !container.querySelector) return;
+  // Decision controls disappear and reappear on different queue rows as the
+  // inbox changes. Restoring them by selector can move focus to the wrong
+  // decision, so only stable route controls and text inputs are restored.
+  if (focus.kind === "control" && focus.itemId) return;
+  let sel;
+  if (focus.kind === "input") sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
+  else if (focus.action) sel = '[data-action="' + escCssAttr(focus.action) + '"]';
+  else if (focus.href) sel = 'a[href="' + escCssAttr(focus.href) + '"]';
+  else return;
+  if (focus.agentId) sel += '[data-agent-id="' + escCssAttr(focus.agentId) + '"]';
+  if (focus.itemId) sel += '[data-item-id="' + escCssAttr(focus.itemId) + '"]';
+  let matches;
+  try {
+    matches = container.querySelectorAll ? container.querySelectorAll(sel) : [];
+  } catch (e) { return; }
+  // A stable control is restored only when the selector names one element.
+  // Ambiguous matches can move focus to a sibling control with the same action.
+  if (!matches || matches.length !== 1) return;
+  const el = matches[0];
+  if (el && typeof el.focus === "function") {
+    try {
+      el.focus();
+      if (
+        focus.kind === "input" &&
+        typeof el.setSelectionRange === "function" &&
+        focus.selectionStart != null &&
+        focus.selectionEnd != null
+      ) {
+        el.setSelectionRange(focus.selectionStart, focus.selectionEnd);
+      }
+    } catch (e) { /* ignore browsers that disallow programmatic focus */ }
+  }
+}
+
+// ── Render: main area ──────────────────────────────────────────────────
+function renderMain() {
+  const main = document.getElementById("main");
+  if (!main) return;
+  const talkMain = talkDomOwnerSupported && state.route === "dashboard" && !liveUpdatesStopped;
+  const focus = talkMain ? null : captureInputFocus(main);
+  // Legacy capture reads the one live history wherever it is mounted (Talk's
+  // element ids exist once in the document). A panel-to-full-page move runs
+  // renderMain before renderTalkPanel closes the panel, so this is the only
+  // point that sees the panel reader's current position rather than the
+  // panel's previous write.
+  const legacyViewport = !talkDomOwnerSupported ? saveTalkViewport(document.getElementById("concierge-history")) : null;
   let nextHtml;
   switch (state.route) {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
     case "activity": nextHtml = renderActivityScreen(); break;
     case "posture": nextHtml = renderPostureScreen(); break;
+    case "approvals": nextHtml = renderApprovalsScreen(); break;
     case "agents": nextHtml = renderAgentsList(); break;
     case "agent-detail": nextHtml = renderAgentDetail(); break;
-    case "policy": nextHtml = renderPolicyCenter(); break;
+    case "machines": nextHtml = renderMachinesScreen(); break;
+    case "enforcement": nextHtml = renderEnforcementScreen(); break;
+    case "findings": nextHtml = renderFindingsScreen(); break;
+    // Policies hosts the auto-trigger ladder as a section; #auto-trigger
+    // still renders the ladder on its own.
+    case "policy": nextHtml = renderPolicyCenter() + renderMfpFoldedSections(); break;
     case "auto-trigger": nextHtml = renderAutoTriggerPage(); break;
-    case "intelligence": nextHtml = renderIntelligenceCenter() + renderSourceRead(HUB + "/intelligence/status") + renderSourceRead(HUB + "/intelligence/config"); break;
-    case "attestation": nextHtml = renderAttestation(); break;
+    case "integrations": nextHtml = renderIntegrationsScreen(); break;
+    case "settings": nextHtml = settingsTabStrip("health") + renderHealthPage(); break;
+    case "intelligence": nextHtml = settingsTabStrip("intelligence") + renderIntelligenceCenter() + renderSourceRead(HUB + "/intelligence/status") + renderSourceRead(HUB + "/intelligence/config"); break;
+    case "attestation": nextHtml = settingsTabStrip("attestation") + renderAttestation(); break;
     case "honeypot": nextHtml = renderHoneypotPage(); break;
-    case "privacy": nextHtml = renderPrivacyPage(); break;
+    case "privacy": nextHtml = settingsTabStrip("privacy") + renderPrivacyPage(); break;
     case "coordination": nextHtml = renderCoordinationPage(); break;
-    case "health": nextHtml = renderHealthPage(); break;
+    case "health": nextHtml = settingsTabStrip("health") + renderHealthPage(); break;
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
-  // Stopped live updates invalidate every live view, including previously loaded clears.
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
-  // Skip the innerHTML write when the rendered output is byte-identical
-  // to the last write on the same route. Preserves the existing DOM
-  // tree, focus, and any active text selection during no-op poll
-  // cycles. The route-change branch always writes (cache miss).
+  // F is outside the route body, including stopped-updates and Talk screens.
+  renderFeedback();
+  // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
+  // a composer that left the document while still owned was replaced by some
+  // other writer, and a silent remount would discard the draft it held.
+  if (talkMain && talkOwner && talkOwner.host === main && !talkOwner.input.isConnected) {
+    throw new Error("Talk composer disconnected during background refresh");
+  }
+  const mountedTalk = talkMain && talkOwner && talkOwner.host === main && talkOwner.input.isConnected;
   let didWrite = false;
-  if (__renderCache.route === state.route && __renderCache.html === nextHtml) {
-    // No-op: DOM already reflects current state.
-  } else {
+  if (mountedTalk) {
+    hydrateTalkHost(main);
+  } else if (__renderCache.route !== state.route || __renderCache.html !== nextHtml || talkMain) {
+    if (talkOwner && (talkOwner.host === main || talkMain)) disposeTalkOwner();
     main.innerHTML = nextHtml;
-    __renderCache.route = state.route;
-    __renderCache.html = nextHtml;
     didWrite = true;
+    __renderCache.route = state.route;
+    __renderCache.html = talkMain ? null : nextHtml;
+    if (talkMain) attachTalkOwner(main);
   }
-  // Finding DDD (v1.2.0-rc.4): bring the latest concierge message into
-  // the viewport when (a) the operator just sent a message
-  // (pendingScroll flag set in onConciergeSend), or (b) the operator
-  // was following the conversation before this render. If the operator
-  // scrolled up to read history, leave their position alone.
-  // scrollIntoView is layout-agnostic; it scrolls whichever ancestor is
-  // the actual scroll container (window in the current layout, or the
-  // history element if a future layout puts a fixed height on it).
-  if (state.route === "dashboard" && didWrite) {
-    const histEl = document.getElementById("concierge-history");
-    if (histEl) {
-      const pending = state.chat.concierge.pendingScroll;
-      if (pending || conciergeWasFollowing) {
-        const lastMsg = histEl.querySelector(".concierge-msg:last-child");
-        if (lastMsg && typeof lastMsg.scrollIntoView === "function") {
-          lastMsg.scrollIntoView({ block: "end", behavior: "auto" });
-        }
-      }
-      state.chat.concierge.pendingScroll = false;
-    }
+  if (state.route === "machines") hydrateMachinesScreen();
+  if (state.route === "dashboard" && !talkDomOwnerSupported && didWrite) {
+    restoreLegacyTalkHistory(main.querySelector("#concierge-history"), legacyViewport);
   }
-  if (focus) {
-    let sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
-    if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
-    const el = main.querySelector(sel);
-    if (el && typeof el.focus === "function") {
-      try {
-        el.focus();
-        if (
-          typeof el.setSelectionRange === "function" &&
-          focus.selectionStart != null &&
-          focus.selectionEnd != null
-        ) {
-          el.setSelectionRange(focus.selectionStart, focus.selectionEnd);
-        }
-      } catch (e) { /* ignore browsers that disallow programmatic focus */ }
-    }
-  }
+  restoreInputFocus(main, focus);
 }
 
 // ── Render: dashboard concierge ────────────────────────────────────────
@@ -1288,8 +1677,9 @@ function renderDashboardConcierge() {
         '<h1>Talk to your fortress.</h1>',
         '<p class="sub">A direct line to Sanctuary, routed through the substrate you chose. Nothing leaves without your hand on it.</p>',
       '</div></div>',
-      activeChatsPanel, renderSourceRead(HUB + "/chat/concierge/history"),
+      activeChatsPanel,
       '<div class="card concierge-card">',
+        '<div data-talk-read-status>' + renderSourceRead(HUB + "/chat/concierge/history") + '</div>',
         '<div class="concierge-header">',
           '<div class="concierge-persona">',
             '<div class="glyph-ring"></div>',
@@ -1297,7 +1687,7 @@ function renderDashboardConcierge() {
           '</div>',
           '<div class="concierge-meta">' + badge + '</div>',
         '</div>',
-        errorBanner,
+        '<div data-talk-error>' + errorBanner + '</div>',
         '<div class="concierge-history" id="concierge-history">' + messagesHtml + '</div>',
         '<form class="concierge-composer" data-action="concierge-submit">',
           '<div class="input-wrap">',
@@ -1325,11 +1715,21 @@ function agentInitials(agentId) {
   const cleaned = tail.replace(/[^a-zA-Z0-9]/g, "");
   return (cleaned.slice(0, 2) || "??").toUpperCase();
 }
+// The state dot beside an agent's state word, one shape per state so it
+// reads in monochrome: active is the pass circle, locked down the hollow
+// locked square, an error the fault square, Unknown the hollow unknown ring,
+// and known transitional states (paused, restarting, unwrapping) the warn triangle.
+// An agent with no current evidence is Unknown, never painted as working.
 function agentStateClass(status) {
   if (status === "active") return "live";
-  if (status === "locked_down" || status === "error") return "off";
-  return "idle";
+  if (status === "locked_down") return "locked";
+  if (status === "error") return "off";
+  if (!status || status === "unknown") return "unknown";
+  if (status === "paused" || status === "restarting" || status === "unwrapping") return "idle";
+  return "unknown";
 }
+// The inspect pane's state pill wears the same state as the dot inside it.
+const AGENT_STATE_PILL_TONE = { live: "tone-verified", locked: "tone-locked", off: "tone-unverified", unknown: "tone-unknown", idle: "tone-degraded" };
 // Per-agent attestation badge (Q1 layer 2). Square chip beside each
 // agent: a bounded glyph beside a bounded entity. Color and fill pattern
 // carry meaning together so the badge reads even monochrome. The "locked"
@@ -1490,12 +1890,14 @@ function renderHoneypotPage() {
   if (!sourceLoaded("/api/honeypot/tool-traps") || !sourceLoaded("/api/honeypot/credential-traps")) return unavailablePanel("Honeypots", ["/api/honeypot/tool-traps", "/api/honeypot/credential-traps"]);
   const toolTraps = state.honeypot.toolTraps || [];
   const credentialTraps = state.honeypot.credentialTraps || [];
-  const toolRows = toolTraps.length ? toolTraps.map(function (trap) {
+  const toolPage = mfpPage(toolTraps, "toolTraps", MFP_ALL_SERVED);
+  const credentialPage = mfpPage(credentialTraps, "credentialTraps", MFP_ALL_SERVED);
+  const toolRows = toolTraps.length ? toolPage.rows.map(function (trap) {
     const activations = trap.activations || [];
     const latest = activations.length ? activations[activations.length - 1] : null;
     const followups = latest && latest.follow_up_tool_calls ? latest.follow_up_tool_calls : [];
     const followupText = followups.length
-      ? followups.map(function (f) { return escHtml(f.tool_name) + " at " + escHtml(shortTime(f.called_at)); }).join(", ")
+      ? followups.slice(0, MFP_PAGE_SIZE).map(function (f) { return escHtml(f.tool_name) + " at " + escHtml(shortTime(f.called_at)); }).join(", ")
       : "No follow-up calls in the 5 minute window.";
     const latestText = latest
       ? escHtml(latest.caller_identity) + " invoked " + escHtml(trap.fake_tool_name) + " at " + escHtml(shortTime(latest.invoked_at)) + "; received the operator-configured fake response; followed up with " + followups.length + " calls."
@@ -1515,7 +1917,7 @@ function renderHoneypotPage() {
       (latest ? '<pre class="terminal-block">' + escHtml(JSON.stringify(latest.invocation_args || {}, null, 2)) + '</pre>' : '') +
     '</section>';
   }).join("") : '<section class="card"><h3>No tool-call traps deployed.</h3><p class="muted">Compile and deploy a tool_call honeypot to see catalog injections and invocations here.</p></section>';
-  const credentialRows = credentialTraps.length ? credentialTraps.map(function (trap) {
+  const credentialRows = credentialTraps.length ? credentialPage.rows.map(function (trap) {
     const accesses = trap.accesses || [];
     const attempts = trap.use_attempts || [];
     const latestAccess = accesses.length ? accesses[accesses.length - 1] : null;
@@ -1554,7 +1956,8 @@ function renderHoneypotPage() {
     '<p class="eyebrow">Honeypots</p>' +
     '<h1>Honeypot traps.</h1>' +
     '<p class="sub">Fake tools and fake credentials. Reads, invocations, and attempted credential use create sentinel findings without revealing the trap.</p>' +
-  '</div></div>' + error + createCta + credentialRows + toolRows;
+  // Successful empty reads already have an empty state, so only populated lists need a record pager.
+  '</div></div>' + error + createCta + (credentialTraps.length ? mfpPager(credentialPage, "credentialTraps", "/api/honeypot/credential-traps") : "") + credentialRows + (toolTraps.length ? mfpPager(toolPage, "toolTraps", "/api/honeypot/tool-traps") : "") + toolRows;
 }
 
 function relTimeFromIso(iso) {
@@ -1584,101 +1987,287 @@ function durationLabelFromMs(ms) {
   return day + "d";
 }
 
+// Inventory pages hold one screenful; detail lists hold twenty rows to keep review bounded.
+const AGENTS_PAGE_SIZE = 25;
+const AGENT_DETAIL_LIST_LIMIT = 20;
+const AGENT_STATE_FILTERS = [["", "All states"], ["active", "Protected"], ["unknown", "Unknown"], ["paused", "Paused"], ["locked_down", "Locked down"], ["error", "Error"], ["ownerless", "Ownerless"]];
+const AGENT_TABS = ["overview", "approvals", "activity", "policy", "identity", "memory", "evidence"];
+function agentEmpty(title, reason, href, action) {
+  return '<div class="overview-empty"><h3>' + escHtml(title) + '</h3><p>' + escHtml(reason) + '</p><a class="btn" href="' + escHtml(href) + '">' + escHtml(action) + '</a></div>';
+}
 function renderAgentsList() {
-  if (!sourceLoaded(HUB + "/agents")) return unavailablePanel("Agents", [HUB + "/agents"]);
-  if (!state.agents.length) return '<h1>Agents</h1>' +
-    '<div class="agents-empty">' +
-      '<div class="icon-frame"><div class="core"></div></div>' +
-      '<h2>No protected agents yet.</h2>' +
-      '<p>Protect an agent to give it a portable identity, a charter, and approval gates. Run <code>sanctuary protect</code> in any project where your agent lives.</p>' +
-      '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary protect</span></div>' +
-    '</div>';
-  const count = state.agents.length;
-  const subCopy = count + ' agent' + (count === 1 ? '' : 's') + '. Click one to inspect its activity, policy, and pending approvals.';
-  const rows = state.agents.map(function (a) {
-    const map = agentDisplayStatus(a);
-    const dotCls = agentStateClass(agentEvidenceStatus(a));
-    const initials = agentInitials(a.agent_id);
-    const role = escHtml(a.harness) + (a.model_provider && a.model_provider.model_id ? ' · ' + escHtml(a.model_provider.model_id) : '');
-    const isSelected = state.selectedAgentId === a.agent_id;
-    return '<div class="agent-row' + (isSelected ? ' selected' : '') + '" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open inspect panel for ' + escHtml(a.agent_id) + '">' +
-      '<div class="agent-identity">' +
-        '<div class="agent-glyph">' + escHtml(initials) + '</div>' +
-        '<div class="agent-name">' +
-          '<strong>' + escHtml(a.agent_id) + '</strong>' +
-          '<small>' + role + '</small>' +
-        '</div>' +
-      '</div>' +
-      '<span class="agent-state">' +
-        '<span class="state-dot ' + dotCls + '"></span>' +
-        escHtml(map.label) +
-      '</span>' +
-      renderAgentAttestationBadge(agentEvidenceStatus(a)) +
-      '<span class="agent-last">' + escHtml(relTimeFromIso(a.last_activity_at)) + '</span>' +
-      '</div>';
-  }).join("\n");
-  return '<div class="agents-wrap">' +
-    '<div class="page-head">' +
-      '<div>' +
-        '<p class="eyebrow">Agents</p>' +
-        '<h1>Agents.</h1>' +
-        '<p class="sub">' + escHtml(subCopy) + '</p>' +
-      '</div>' +
-    '</div>' +
-    '<div class="agents-layout">' +
-      '<div class="agents-list">' +
-        '<div class="agents-list-head">' +
-          '<span>Agent</span><span>State</span><span>Attestation</span><span>Last seen</span>' +
-        '</div>' +
-        rows +
-      '</div>' +
-    '</div>' +
-  '</div>';
+  const loaded = sourceLoaded(HUB + "/agents");
+  if (loaded && !state.agents.length) return '<h1>Agents</h1><section data-agents-first-run>' + agentEmpty("No protected agents yet", "Run sanctuary protect in your agent's project. The roster returned no registered agents.", "#posture", "Open Overview") + '</section>';
+  const total = loaded ? state.agents.length : null;
+  const age = loadedSourceReadAge(HUB + "/agents");
+  const home = sourceLoaded("/api/posture/home") && state.posture.home;
+  const detected = loaded && home && unprotectedHarnesses(home);
+  const protectedCount = loaded && home ? state.agents.filter(function (a) { return agentEvidenceStatus(a) === "active"; }).length : null;
+  const denominator = detected ? total + detected.length : null;
+  const count = function (n, d) { return n === null || d === null ? overviewChip("unknown", "UNKNOWN") : escHtml(n + " of " + d); };
+  const rosterAge = "roster read " + (age || "Unknown");
+  const tiles = overviewTile("Total", count(total, denominator), escHtml("Loaded registered of detected in this read · " + rosterAge + "; detection read " + (loadedSourceReadAge("/api/posture/home") || "Unknown")), "#agents") +
+    overviewTile("Protected of detected", count(protectedCount, denominator), escHtml("Current per-agent enforcement evidence required · posture read " + (loadedSourceReadAge("/api/posture/home") || "Unknown")), "#agents?state=active") +
+    overviewTile("Ownerless", count(loaded ? state.agents.filter(function (a) { return !a.identity_id; }).length : null, total), escHtml("Of loaded registered agents; detected-only ownership Unknown · " + rosterAge), "#agents?state=ownerless") +
+    overviewTile("At risk", overviewChip("unknown", "Not evaluated"), escHtml("Risk evaluation not served for " + (total === null ? "Unknown" : total) + " registered agents · " + rosterAge), "#agents");
+  if (!loaded) return '<h1>Agents</h1><div class="agents-tiles">' + tiles + '</div>' + renderOverviewAgentsTable();
+  const filters = state.agentInventory;
+  const rows = state.agents.filter(function (a) {
+    return (!filters.harness || a.harness === filters.harness) && (!filters.status || (filters.status === "ownerless" ? !a.identity_id : agentEvidenceStatus(a) === filters.status));
+  }).sort(function (a, b) {
+    if (filters.sort === "activity") return String(b.last_activity_at || "").localeCompare(String(a.last_activity_at || ""));
+    const order = String(a.agent_id).localeCompare(String(b.agent_id));
+    return filters.sort === "name-desc" ? -order : order;
+  });
+  filters.page = Math.min(filters.page, Math.max(0, Math.ceil(rows.length / AGENTS_PAGE_SIZE) - 1));
+  const select = function (label, action, values, selected) {
+    return '<label>' + label + '<select data-action="' + action + '">' + values.map(function (v) { return '<option value="' + escHtml(v[0]) + '"' + (v[0] === selected ? ' selected' : '') + '>' + escHtml(v[1]) + '</option>'; }).join("") + '</select></label>';
+  };
+  const harnesses = Array.from(new Set(state.agents.map(function (a) { return a.harness; }))).sort();
+  const controls = select("State", "agents-state", AGENT_STATE_FILTERS, filters.status) +
+    select("Harness", "agents-harness", [["", "All harnesses"]].concat(harnesses.map(function (h) { return [h, h]; })), filters.harness) +
+    select("Sort", "agents-sort", [["name", "Agent A to Z"], ["name-desc", "Agent Z to A"], ["activity", "Last activity"]], filters.sort);
+  const page = '<div class="agent-pagination"><span>Page ' + (filters.page + 1) + ' of ' + Math.max(1, Math.ceil(rows.length / AGENTS_PAGE_SIZE)) + ' · ' + escHtml(rosterAge) + '</span>' +
+    '<button class="btn" data-action="agents-page" data-page="' + (filters.page - 1) + '"' + (filters.page === 0 ? ' disabled' : '') + '>Previous</button>' +
+    '<button class="btn" data-action="agents-page" data-page="' + (filters.page + 1) + '"' + ((filters.page + 1) * AGENTS_PAGE_SIZE >= rows.length ? ' disabled' : '') + '>Next</button></div>';
+  return '<h1>Agents</h1><div class="agents-tiles">' + tiles + '</div><div class="agent-filters">' + controls + '</div>' +
+    renderOverviewAgentsTable(rows, AGENTS_PAGE_SIZE, filters.page * AGENTS_PAGE_SIZE) + page +
+    '<p class="muted">Inventory covers the served roster. Detection uses harness configuration presence; counts are not a process census.</p>';
 }
 
+function agentPolicySummary(agent) {
+  return sourceLoaded(HUB + "/policies") && state.policies.find(function (p) { return p.policy_id === agent.policy_id; });
+}
+function renderAgentStanding(agent) {
+  // A served negative policy flag is evidence of intent, not an unanswered policy read.
+  const evidence = sourceLoaded("/api/posture/home") && postureEvidenceByAgent(state.posture.home || {})[agent.agent_id];
+  const row = function (k, v) { return '<dt>' + k + '</dt><dd>' + v + '</dd>'; };
+  return '<section class="card" aria-label="Standing"><h3>Standing</h3><dl class="kv">' +
+    row("Status", '<span class="glyph ' + agentDisplayStatus(agent).glyph + '"></span> ' + escHtml(agentDisplayStatus(agent).label)) +
+    row("Protection requested", escHtml(evidence && typeof evidence.policy_protected === "boolean" ? (evidence.policy_protected ? "Yes" : "No") + " · roster intent; posture read " + loadedSourceReadAge("/api/posture/home") : "Unknown · no agent policy evidence served")) +
+    row("Enforcement confirmed", agentEnforcementChip(agent) + '<span class="muted"> Per-agent posture · ' + escHtml(evidence && evidence.last_enforcement_evidence_at ? relTimeFromIso(evidence.last_enforcement_evidence_at) : "evidence age Unknown") + '</span>') +
+    row("Account isolation", "Unknown · account-isolation evidence not served") +
+    row("Memory", "Unknown · agent memory inventory not served") +
+    row("Budget today", escHtml(agentBudgetText(agent) + " · budget evidence " + (agent.budget_summary && agent.budget_summary.last_refreshed_at ? relTimeFromIso(agent.budget_summary.last_refreshed_at) : "Unknown"))) +
+    row("Reputation", "Unknown · agent reputation evidence not served") +
+    row("Last anomaly", "Unknown · agent-scoped anomaly evidence not served") + '</dl></section>';
+}
+function renderAgentIdentity(agent) {
+  // Only these public metadata fields are rendered; extra response fields never enumerate key material.
+  return '<section class="card" aria-label="Identity"><h3>Identity</h3><dl class="kv"><dt>Owner</dt><dd>' + escHtml(agent.identity_id || "Unknown") + '</dd>' +
+    '<dt>DID</dt><dd>Unknown · agent DID not served</dd><dt>Fingerprint</dt><dd>Unknown · agent fingerprint not served</dd>' +
+    '<dt>Rotation</dt><dd>Unknown · agent key history not served</dd><dt>Custody</dt><dd>Unknown · custody evidence not served</dd>' +
+    '<dt>Evidence age</dt><dd>Roster read ' + escHtml(loadedSourceReadAge(HUB + "/agents") || "Unknown") + '</dd></dl></section>';
+}
+// One unresolved transport slot survives a UI timeout; a transport ignoring abort cannot accumulate reads.
+const AGENT_REACH_MAX_IN_FLIGHT = 1;
+const AGENT_REACH_DESTINATION_LIMIT = 256; // A detail snapshot, with the full policy available at its existing link.
+const AGENT_REACH_FIELD_LIMIT = 2048; // Accommodates URL-sized destinations without retaining arbitrary strings.
+const AGENT_REACH_BODY_LIMIT = 2 * 1024 * 1024; // Two MiB covers 256 pairs of URL-sized fields plus JSON framing.
+const AGENT_REACH_MAX_AGE_MS = 60 * 1000; // Configured reach must be reread after one minute; it is not live enforcement evidence.
+let agentReachController = null;
+let agentReachRevision = 0;
+let agentReachInFlight = 0;
+let agentReachExpiry = null;
+// One pending slot: the newest subject asked for while a read holds admission, never a queue.
+let agentReachPendingId = null;
+async function readAgentReachBody(response) {
+  if (!response.ok || !response.body) throw new Error("Reach unavailable");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      // Refuse the whole read before decoding or retaining a body beyond the per-request budget.
+      if (bytes > AGENT_REACH_BODY_LIMIT) throw new Error("Reach unavailable");
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } finally { void reader.cancel().catch(function () {}); reader.releaseLock(); }
+}
+async function loadAgentReach(agentId) {
+  if (agentReachInFlight >= AGENT_REACH_MAX_IN_FLIGHT) {
+    if (state.agentReach.agentId !== agentId) {
+      ++agentReachRevision;
+      agentReachController.abort();
+      // This subject has not been read yet, so it waits as loading and never reads as a failed read.
+      agentReachPendingId = agentId;
+      state.agentReach = { state: "state_LOADING", agentId: agentId, data: null, readAt: 0 };
+      rerender();
+    }
+    return;
+  }
+  const revision = ++agentReachRevision;
+  const controller = new AbortController();
+  agentReachController = controller;
+  agentReachInFlight++;
+  clearTimeout(agentReachExpiry);
+  state.agentReach = { state: "state_LOADING", agentId: agentId, data: null, readAt: 0 };
+  rerender();
+  const headers = {};
+  if (TOKEN) headers.Authorization = "Bearer " + TOKEN;
+  let deadline;
+  const expired = new Promise(function (_, reject) {
+    deadline = setTimeout(function () { controller.abort(); reject(new Error("Reach unavailable")); }, DASHBOARD_READ_DEADLINE_MS);
+  });
+  // Release admission only when transport AND body reading settle, never when the UI deadline wins.
+  const transport = (async function () {
+    try {
+      const response = await fetch(credentialedReadUrl("/api/posture/reach/" + encodeURIComponent(agentId), "GET"), { headers: headers, cache: "no-store", signal: controller.signal });
+      if (controller.signal.aborted) { if (response.body) void response.body.cancel().catch(function () {}); throw new Error("Reach unavailable"); }
+      return await readAgentReachBody(response);
+    } finally {
+      agentReachInFlight--;
+      const next = agentReachPendingId;
+      agentReachPendingId = null;
+      // setRoute clears this slot whenever the detail route closes, so a subject still pending here belongs to an open
+      // or opening detail page: an open from another route queues the read before its hashchange lands.
+      if (next && next === state.selectedAgentId) void loadAgentReach(next);
+    }
+  })();
+  try {
+    const data = await Promise.race([transport, expired]);
+    // Only this requested subject's current read may populate reach; late or cancelled reads never publish.
+    if (revision !== agentReachRevision || controller.signal.aborted) return;
+    if (!data || data.agent_id !== agentId || !Array.isArray(data.destinations) || data.destinations.length > AGENT_REACH_DESTINATION_LIMIT || !data.destinations.every(function (d) { return d && typeof d.destination === "string" && d.destination.length <= AGENT_REACH_FIELD_LIMIT && typeof d.rule_id === "string" && d.rule_id.length <= AGENT_REACH_FIELD_LIMIT && ["allow", "prompt", "deny"].includes(d.disposition) && ["castle_wall", "policy"].includes(d.enforcing_layer); })) throw new Error("Reach unavailable");
+    // Retain only the bounded public projection; unknown response fields are not a cache or a secret inventory.
+    const projection = { enforcement_confirmed: data.enforcement_confirmed === true, has_wall_policy: data.has_wall_policy === true,
+      destinations: data.destinations.map(function (d) { return { destination: d.destination, rule_id: d.rule_id, disposition: d.disposition, enforcing_layer: d.enforcing_layer }; }) };
+    state.agentReach = { state: "state_LOADED", agentId: agentId, data: projection, readAt: Date.now() };
+    agentReachExpiry = setTimeout(function () {
+      if (revision !== agentReachRevision) return;
+      state.agentReach = { state: "state_EXPIRED", agentId: agentId, data: null, readAt: state.agentReach.readAt };
+      rerender();
+    }, AGENT_REACH_MAX_AGE_MS);
+  } catch (e) {
+    if (revision !== agentReachRevision) return;
+    state.agentReach = { state: "state_FAILED", agentId: agentId, data: null, readAt: Date.now() };
+  } finally {
+    clearTimeout(deadline);
+    if (revision === agentReachRevision) rerender();
+  }
+}
+// Every way of opening an agent row must reset the tab and start its read before navigation and inspection.
+function openAgentRowInspect(agentId) {
+  state.selectedAgentId = agentId;
+  state.agentTab = "overview";
+  void loadAgentReach(agentId);
+  if (location.hash !== "#agent-detail") location.hash = "agent-detail";
+  else setRoute("agent-detail");
+  void onAgentInspectOpen(agentId);
+}
+
+function renderAgentReach(agent) {
+  const policy = agentPolicySummary(agent);
+  const read = state.agentReach;
+  const now = Date.now();
+  // Only a numeric read time can be aged; any other value counts as no time, so no comparison or Date below can throw.
+  const readMs = typeof read.readAt === "number" ? read.readAt : NaN;
+  // A different subject has no read here, regardless of the stored read's state.
+  let reachState = read.agentId !== agent.agent_id ? "state_UNREAD" : read.state;
+  if (reachState === "state_LOADED" && read.data) {
+    // A stopped stream cannot establish current reach even when its last read is recent.
+    if (liveUpdatesStopped) reachState = "state_STOPPED";
+    // A read time that is not a finite number cannot be aged, so it cannot establish freshness either.
+    else if (!Number.isFinite(readMs)) reachState = "state_UNDATED";
+    // A future read cannot establish freshness against this device's clock.
+    else if (now < readMs) reachState = "state_FUTURE";
+    // Configured reach expires at the same one-minute boundary used by the loader.
+    else if (now - readMs >= AGENT_REACH_MAX_AGE_MS) reachState = "state_EXPIRED";
+  }
+  // A read time outside the Date range has no ISO form, so its age reads Unknown instead of throwing while the card renders.
+  const readTime = new Date(readMs);
+  const readAge = Number.isFinite(readTime.getTime()) ? relTimeFromIso(readTime.toISOString()) : "time Unknown";
+  // Only a current, matching loaded read may expose destinations; malformed clocks remain withheld.
+  const reach = reachState === "state_LOADED" && !liveUpdatesStopped && now >= readMs && now - readMs < AGENT_REACH_MAX_AGE_MS ? read.data : null;
+  const intro = '<p>' + escHtml(policy ? policy.display_label : "Policy summary Unknown") + ' · ' + escHtml(agent.policy_id || "policy Unknown") + ' · version Unknown · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies") || "Unknown") + '</p>';
+  const lanes = [["allow", "May reach"], ["prompt", "Asks you first"], ["deny", "Never"]].map(function (lane) {
+    const entries = reach ? reach.destinations.filter(function (d) { return d.disposition === lane[0]; }) : [];
+    return '<div class="agent-reach-lane"><h4>' + lane[1] + '</h4><div>' + (reach ? entries.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (d) {
+      return '<div class="mono">' + escHtml(d.destination) + ' <span class="muted">' + (d.enforcing_layer === "castle_wall" ? "Castle Wall" : "Charter") + ' · ' + escHtml(d.rule_id) + '</span></div>';
+    }).join("") + '<p class="muted">showing ' + Math.min(entries.length, AGENT_DETAIL_LIST_LIMIT) + ' of ' + entries.length + ' configured destinations</p>' : '<span class="state-chip unknown"><i aria-hidden="true"></i>UNKNOWN</span>') + '</div></div>';
+  }).join("");
+  // A configured rule and a fresh read do not prove enforcement; both the scoped reach and posture must confirm it.
+  const confirmed = reach && reach.enforcement_confirmed === true && agentEvidenceStatus(agent) === "active";
+  // Each read state describes its own evidence; absence never borrows a failure or loading claim.
+  const descriptions = {
+    state_UNREAD: "Reach not read yet.",
+    state_LOADING: "Reading this agent's reach.",
+    state_EXPIRED: "Reach read expired after one minute without interaction.",
+    state_STOPPED: "Live updates stopped. Retry to resume.",
+    state_FUTURE: "Reach read time is ahead of this device's clock, so it is not current.",
+    state_UNDATED: "Reach read time is unknown, so it is not current.",
+    state_FAILED: "Reach read failed · " + readAge,
+    state_LOADED: "The reach source answered without a record for this agent."
+  };
+  // Withheld loaded evidence must not leave lanes visible as though they describe current reach.
+  const visibleLanes = ["state_STOPPED", "state_UNDATED", "state_FUTURE", "state_EXPIRED"].includes(reachState) ? "" : lanes;
+  const description = reach ? (confirmed ? "Enforcement confirmed" : "Configured; enforcement not confirmed") + (reach.has_wall_policy ? "" : ". No Castle Wall ruleset applies") : descriptions[reachState];
+  return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + '</p>' + visibleLanes +
+    '<p class="muted">' + (reach ? reach.destinations.filter(function (d) { return d.disposition === "allow"; }).length + ' allowed destinations; ' : '') + 'requested hosts Unknown · MCP servers Unknown · tools Unknown · reach read ' + escHtml(reach ? readAge : "Unknown") + '</p>' +
+    '<a class="btn" href="/posture/agent/' + escHtml(encodeURIComponent(agent.agent_id)) + '">All configured reach</a> ' +
+    '<button class="btn" data-action="agent-reach-refresh" data-agent-id="' + escHtml(agent.agent_id) + '">Refresh reach</button></section>';
+}
+function agentApprovalRows(items) {
+  return items.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (item) {
+    // Only an explicit Tier 2 hold is safe inline; unknown tiers must take the Approvals review path.
+    const controls = item.tier === "tier2"
+      ? '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Deny</button><button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Allow once</button>' + renderDecisionInline(item)
+      : '<a class="btn" href="#approvals">Review in Approvals</a>';
+    return '<div class="approval-row"><div class="what">' + overviewChip("warn", "WAITING") + ' <span>' + (item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : "Tier Unknown") + '</span> ' +
+      escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '<span class="muted"> · ' + escHtml(item.created_at ? relTimeFromIso(item.created_at) : "age Unknown") + '</span></div><div class="actions">' + controls + '</div></div>';
+  }).join("");
+}
+function renderAgentApprovals(agent) {
+  const items = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted ? state.inbox.filter(function (i) { return i.agent_id === agent.agent_id && i.kind === "approval_pending" && !i.resolved; }) : null;
+  return '<section class="card"><h3>This agent\'s approvals</h3>' + (items ? (items.length ? agentApprovalRows(items) : agentEmpty("No waiting approvals", "The loaded queue has no waiting items for this agent.", "#approvals", "Open Approvals")) +
+    '<p class="muted">showing ' + Math.min(items.length, AGENT_DETAIL_LIST_LIMIT) + ' of ' + items.length + ' · queue read ' + escHtml(loadedSourceReadAge(HUB + "/inbox")) + ' · <a href="#approvals">All approvals</a></p>' : agentEmpty("Approvals Unknown", "Agent-scoped approval details are unavailable.", "#approvals", "Review in Approvals")) + '</section>';
+}
+function renderAgentTimeline(agent, evidenceTab) {
+  const entries = sourceLoaded(HUB + "/activity") ? state.activity.filter(function (e) { return e.agent_id === agent.agent_id; }).sort(function (a, b) { return String(b.emitted_at).localeCompare(String(a.emitted_at)); }) : null;
+  const href = '#activity?agent=' + encodeURIComponent(agent.agent_id);
+  const rows = entries && entries.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (e) {
+    // The approval category also holds requests and denied or resolved decisions, so only a denial names an outcome.
+    const verdict = e.category === "denial" ? ["bad", "DENIED"] : ["neutral", "RECORDED"];
+    // Must match categorizeOperation in hub/activity-feed.ts: categories classify operation names, not their audit layer.
+    // Even egress admits dynamic operation names from multiple producers, so no category alone proves a layer.
+    const layer = "Layer not served";
+    return '<div class="agent-event"><time>' + escHtml(relTimeFromIso(e.emitted_at)) + '</time>' + overviewChip(verdict[0], verdict[1]) +
+      '<a href="' + escHtml(href) + '" title="Evidence entry ' + escHtml(e.entry_id) + '">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) + '<small>Entry ' + escHtml(e.entry_id) + '</small></a><span class="muted">' + layer + '</span>' +
+      (e.attestation ? '<div class="att">' + renderActionAttestationBadge(e.attestation.state, e.attestation.fragment) + '</div>' : '') + '</div>';
+  }).join("");
+  return '<section class="card"><h3>' + (evidenceTab ? 'Agent evidence' : 'Recent activity') + '</h3>' + (entries ? (entries.length ? rows : agentEmpty("No agent activity in this read", "The loaded feed has no entries for this agent.", href, "Open Evidence")) +
+    '<p class="muted">showing ' + Math.min(entries.length, AGENT_DETAIL_LIST_LIMIT) + ' of ' + entries.length + ' loaded entries · feed read ' + escHtml(loadedSourceReadAge(HUB + "/activity")) + ' · <a href="' + escHtml(href) + '">All activity</a></p>' : agentEmpty("Activity Unknown", "The activity source has not answered.", href, "Open Evidence")) + '</section>';
+}
 function renderAgentDetail() {
   if (!sourceLoaded(HUB + "/agents")) return unavailablePanel("Agent", [HUB + "/agents"]);
   const a = state.agents.find(function (x) { return x.agent_id === state.selectedAgentId; });
-  if (!a) return '<h1>Agent</h1><p class="muted">Agent not found. <a href="#agents">Back to list</a>.</p>';
-  const map = agentDisplayStatus(a);
-  const events = state.activity.filter(function (e) { return e.agent_id === a.agent_id; }).slice(0, 50);
-  const timeline = !sourceLoaded(HUB + "/activity") ? renderSourceRead(HUB + "/activity") : events.length
-    ? events.map(function (e) {
-        const t = renderTemplate(e.display_template_id, e.display_template_args);
-        const badgeHtml = e.attestation
-          ? ' ' + renderActionAttestationBadge(e.attestation.state, e.attestation.fragment)
-          : '';
-        return '<div class="row"><span class="muted">' + escHtml(shortTime(e.emitted_at)) + '</span><span>' + escHtml(t) + badgeHtml + '</span></div>';
-      }).join("\n")
-    : '<p class="muted">No activity yet.</p>';
-  // WP-V1.2 reshape click-to-inspect surface. Clicking "Open inspect
-  // panel" hits POST /api/hub/agents/:id/inspect/open synchronously and
-  // renders recent activity + pending approvals + policy summary. The
-  // chat surface was removed in the reshape; the panel is read-only and
-  // re-fetches on each click (no streaming updates).
-  const inspectPanel = renderAgentInspectPanel(a);
-  // Inspect panel is the primary action surface; render it immediately
-  // under the H1 above the Identity card so recent activity + pending
-  // approvals are visible above the fold. Identity + Timeline drop to
-  // reference position.
-  return '<h1>' + escHtml(a.agent_id) + '</h1>' +
-    inspectPanel +
-    '<div class="card"><h3>Identity</h3>' +
-      '<dl class="kv">' +
-      '<dt>Harness</dt><dd class="mono">' + escHtml(a.harness) + '</dd>' +
-      '<dt>Model</dt><dd class="mono">' + escHtml(a.model_provider.vendor) + " / " + escHtml(a.model_provider.model_id) + '</dd>' +
-      '<dt>Policy</dt><dd class="mono">' + escHtml(a.policy_id) + '</dd>' +
-      '<dt>Template</dt><dd class="mono">' + escHtml(a.channel_template_id || "no_template") + '</dd>' +
-      '<dt>Status</dt><dd><span class="glyph ' + map.glyph + '"></span> ' + escHtml(map.label) + '</dd>' +
-      '</dl>' +
-    '</div>' +
-    '<div class="card"><h3>Timeline</h3>' + timeline + '</div>';
+  if (!a) return agentEmpty("Agent not found", "This agent is not in the loaded roster.", "#agents", "Back to Agents");
+  const tab = AGENT_TABS.includes(state.agentTab) ? state.agentTab : "overview";
+  const tabs = '<nav class="agent-tabs" aria-label="Agent sections">' + AGENT_TABS.map(function (id) { return '<button class="btn" data-action="agent-tab" data-tab="' + id + '" aria-pressed="' + (id === tab) + '">' + sentenceCase(id) + '</button>'; }).join("") + '</nav>';
+  let body;
+  switch (tab) {
+    case "approvals": body = renderAgentApprovals(a); break;
+    case "activity": body = renderAgentTimeline(a, false); break;
+    case "policy": body = renderAgentReach(a); break;
+    case "identity": body = renderAgentIdentity(a); break;
+    case "memory": body = agentEmpty("Memory inventory unavailable", "The server does not serve a per-agent memory inventory. This is not a confirmation of empty memory.", "#activity", "Open Evidence"); break;
+    case "evidence": body = renderAgentTimeline(a, true); break;
+    default: body = '<div class="agent-entity-grid"><div>' + renderAgentStanding(a) + renderAgentReach(a) + renderAgentIdentity(a) + '</div><div>' + renderAgentTimeline(a, false) + renderAgentApprovals(a) + renderAgentInspectPanel(a) + '</div></div>';
+  }
+  return '<div class="agent-entity"><nav aria-label="Breadcrumb"><a href="#agents">Agents</a> / ' + escHtml(a.agent_id) + '</nav><header class="agent-entity-header"><h1>' + escHtml(a.agent_id) + ' ' + agentStateChip(a) + ' ' + agentEnforcementChip(a) + '</h1>' +
+    '<p class="muted">' + escHtml(a.harness || "Harness Unknown") + ' · ' + escHtml(a.model_provider ? a.model_provider.vendor + " / " + a.model_provider.model_id : "Model Unknown") + ' · Policy template: ' + escHtml(a.channel_template_id || "Unknown") + ' · protection requested ' + escHtml(a.wrapped_at ? relTimeFromIso(a.wrapped_at) : "Unknown") + '</p>' +
+    '<div class="agent-entity-actions">' + renderAgentControlButtons(a, true) + '<a class="btn" href="#policy">' + escHtml(agentControlLabel("edit_policy")) + '</a><button class="btn" disabled title="Per-agent identity rotation is not served by this dashboard.">' + escHtml(agentControlLabel("identity_rotate")) + ' <span>Tier 1</span></button></div></header>' + tabs + '<div data-agent-tab="' + tab + '">' + body + '</div></div>';
 }
 
 // Inspect panel for the Agents view (WP-V1.2 reshape). Clicking the
 // inspect affordance opens the panel synchronously via POST
 // /api/hub/agents/:id/inspect/open. The panel is read-only:
-// recent activity, pending Tier 1 approvals, policy summary. States:
+// recent activity, pending approvals, policy summary. States:
 //   1. No panel data yet: show "Open inspect panel" CTA.
 //   1b. Optimistic-open in flight: render an interim "Opening..." pane.
 //   2. Panel loaded: render activity feed + pending approvals + policy
@@ -1691,7 +2280,7 @@ function renderAgentInspectPanel(agent) {
     ? '<div class="banner banner-warn">' + escHtml(ip.error) + '</div>'
     : "";
 
-  // State 2: panel loaded.
+  // state_LOADED: the inspect response is available.
   // Sprint Piece 2 PR 4 polish: outer wrapper combines .card with
   // .inspect-pane (sticky right rail, internal scroll, sectioned body).
   // The .card class is preserved so the rendered surface keeps its
@@ -1700,7 +2289,7 @@ function renderAgentInspectPanel(agent) {
   if (panel) {
     const dotCls = agentStateClass(agentEvidenceStatus(agent));
     const stateMap = agentDisplayStatus(agent);
-    const activity = (panel.recent_activity || []).slice(0, 20);
+    const activity = (panel.recent_activity || []).slice(0, AGENT_DETAIL_LIST_LIMIT);
     const activityHtml = activity.length
       ? '<div class="timeline">' +
         activity.map(function (e) {
@@ -1708,7 +2297,9 @@ function renderAgentInspectPanel(agent) {
           const badgeHtml = e.attestation
             ? renderActionAttestationBadge(e.attestation.state, e.attestation.fragment)
             : '';
-          return '<div class="timeline-item ok">' +
+          // An activity row carries no verdict, so its mark is the neutral
+          // dash; the pass circle is kept for an observed success.
+          return '<div class="timeline-item">' +
             '<div class="ts">' + escHtml(shortTime(e.emitted_at)) + '</div>' +
             '<div class="what">' + escHtml(t) + '</div>' +
             (badgeHtml ? '<div class="att">' + badgeHtml + '</div>' : '') +
@@ -1717,22 +2308,9 @@ function renderAgentInspectPanel(agent) {
         '</div>'
       : '<p class="muted">No recent activity for this agent.</p>';
 
-    const approvals = panel.pending_approvals || [];
-    const approvalsHtml = approvals.length
-      ? approvals.map(function (item) {
-          const promptText = renderTemplate(item.display_template_id, item.display_template_args);
-          return '<div class="approval-row">' +
-            '<div class="what">' +
-              '<span class="pill tone-degraded">' + escHtml(item.tier || "tier1") + '</span>' +
-              escHtml(promptText) +
-            '</div>' +
-            '<div class="actions">' +
-              '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>' +
-              '<button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Approve once</button>' +
-            '</div>' +
-            '</div>';
-        }).join("")
-      : '<p class="muted">No pending approvals routed through this agent.</p>';
+    const approvals = (panel.pending_approvals || []).filter(function (item) { return !item.resolved; });
+    const approvalsHtml = (approvals.length ? agentApprovalRows(approvals) : '<p class="muted">No pending approvals routed through this agent.</p>') +
+      '<p class="muted">showing ' + Math.min(approvals.length, AGENT_DETAIL_LIST_LIMIT) + ' of ' + approvals.length + ' · panel read ' + escHtml(relTimeFromIso(panel.opened_at)) + ' · <a href="#approvals">All approvals</a></p>';
 
     const policySection = panel.policy_summary
       ? '<div class="policy-line"><span class="k">Policy</span><span class="v">' + escHtml(panel.policy_summary.display_label || panel.policy_summary.policy_id) + '</span></div>' +
@@ -1754,7 +2332,7 @@ function renderAgentInspectPanel(agent) {
           '<span style="margin-left:auto;">' + renderAgentAttestationBadge(agentEvidenceStatus(agent)) + '</span>' +
         '</div>' +
         '<div class="meta">' +
-          '<span class="pill ' + (dotCls === "live" ? "tone-verified" : "tone-degraded") + '"><span class="state-dot ' + dotCls + '" style="margin-right:4px;"></span>' + escHtml(stateMap.label) + '</span>' +
+          '<span class="pill ' + (AGENT_STATE_PILL_TONE[dotCls] || "tone-unknown") + '"><span class="state-dot ' + dotCls + '" style="margin-right:4px;"></span>' + escHtml(stateMap.label) + '</span>' +
           '<span class="pill">opened ' + escHtml(shortTime(panel.opened_at)) + '</span>' +
           '<button class="btn btn-quiet" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '" title="Refresh inspect panel">Refresh</button>' +
         '</div>' +
@@ -1767,7 +2345,7 @@ function renderAgentInspectPanel(agent) {
         '</div>' +
         '<div class="inspect-section">' +
           '<h4>Recent activity</h4>' +
-          activityHtml +
+          activityHtml + '<p class="muted">showing ' + activity.length + ' of ' + (panel.recent_activity || []).length + ' · <a href="#activity">All activity</a></p>' +
         '</div>' +
         '<div class="inspect-section">' +
           '<h4>Policy summary</h4>' +
@@ -1778,7 +2356,7 @@ function renderAgentInspectPanel(agent) {
           '<div class="policy-line"><span class="k">Agent id</span><span class="v">' + escHtml(agent.agent_id) + '</span></div>' +
           '<div class="policy-line"><span class="k">Harness</span><span class="v">' + escHtml(agent.harness) + '</span></div>' +
           modelLine +
-          '<div class="policy-line"><span class="k">Wrapped since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
+          '<div class="policy-line"><span class="k">Protection requested</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
         '</div>' +
         '<p class="muted" style="margin-top:10px;font-size:12px;">' +
           '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
@@ -1788,7 +2366,7 @@ function renderAgentInspectPanel(agent) {
     '</div>';
   }
 
-  // State 1b: optimistic-open in flight.
+  // state_LOADING: the inspect response is pending.
   if (opening) {
     return '<div class="card">' +
       '<h3>Inspect</h3>' +
@@ -1797,12 +2375,12 @@ function renderAgentInspectPanel(agent) {
     '</div>';
   }
 
-  // State 1: no panel data: CTA.
+  // state_UNREAD: request an inspect response.
   return '<div class="card">' +
     '<h3>Inspect</h3>' +
     errorBanner +
     '<p>Open the inspect panel to see this agent\'s recent activity, ' +
-      'pending Tier 1 approvals, and policy summary at a glance. ' +
+      'pending approvals, and policy summary at a glance. ' +
       'Read-only; the panel re-fetches on each open.</p>' +
     '<button class="btn btn-primary" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '">Open inspect panel</button>' +
   '</div>';
@@ -1872,7 +2450,7 @@ function renderHealthPage() {
     '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
       '<dl class="kv">' +
-      '<dt>Wrapped agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
+      '<dt>Protection requested</dt><dd>' + escHtml(totalAgents) + '</dd>' +
       '<dt>Locked down</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? lockedDown : "Unknown") + '</dd>' +
       '<dt>Errored</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? errored : "Unknown") + '</dd>' +
       '<dt>Denials in feed</dt><dd>' + escHtml(sourceLoaded(HUB + "/activity") ? recentDenials : "Unknown") + '</dd>' +
@@ -2392,39 +2970,66 @@ async function onConciergeSend() {
   if (c.sending) return;
   const message = (c.composer || "").trim();
   if (message.length === 0) return;
+  talkFollowIntent = { scrollEpoch: talkUserScrollEpoch };
   c.sending = true;
   c.error = null;
-  rerender();
+  // True once the POST has settled successfully. The catch below reads it to
+  // tell a failed send (nothing reached the service; the draft stays for a
+  // retry) from a failed redraw over a sent message (the draft must not come
+  // back, because another Send would post the same message twice).
+  let posted = false;
   try {
+    // Inside the try: c.sending is now true, and only the finally below resets
+    // it. A render that throws here (a fail-loud Talk mount check) must still
+    // reach that finally, or every later send returns early forever. A throw
+    // here happens before the POST, so the request is never sent twice.
+    rerender();
     const res = await api("/chat/concierge", {
       method: "POST",
       body: { message: message }
     });
+    // INVARIANT: the sent state commits here, at POST settlement and before
+    // any redraw. The service has persisted the message, so the draft clears
+    // now; a redraw that throws after this line is a display problem over a
+    // sent message, never a failed send, and must not leave the draft in the
+    // composer where a retry would post it a second time.
+    posted = true;
+    c.composer = "";
+    // The operator's successful send is an explicit draft clear, unlike a
+    // background hydration. A route or panel change can remount Talk while
+    // this request is in flight. The shared composer is still disabled until
+    // settlement, so clear the currently mounted input regardless of
+    // scroll-follow intent.
+    if (talkOwner) talkOwner.input.value = "";
     const data = res.data || {};
     // Refetch history so both operator submit + concierge response
     // render in chronological order. The service persisted both
     // messages before the response returned; the history endpoint is
     // the single source of truth for the visible thread.
     await refreshPanel(HUB + "/chat/concierge/history");
-    // Update the badge directly from the response so it reflects what
-    // served THIS query even before the next render.
+    // Update the badge from the response AFTER the history refresh: the
+    // history loader (fetchConciergeHistory) writes a generic per-substrate
+    // label from the last reply, and the response carries the more specific
+    // display_label for THIS reply, which must be the one left standing.
     if (data.served_by) {
       state.chat.concierge.badge = {
         substrate: data.served_by,
         displayLabel: data.display_label || substrateBadgeLabel(data.served_by)
       };
     }
-    c.composer = "";
-    // Finding DDD (v1.2.0-rc.3): the operator just submitted a message
-    // and a concierge reply just landed. Force scroll to bottom on the
-    // next render so the new exchange is in view, even if the operator
-    // had drifted up by a poll-cycle's worth of layout shift.
-    c.pendingScroll = true;
+    if (!talkDomOwnerSupported) c.pendingScroll = true;
   } catch (e) {
-    c.error = e.message || "Concierge call failed.";
+    // After the POST settled, the only thing that can throw is the redraw of
+    // a message the service already holds: report it as a display problem in
+    // plain words, with no stack, and never as a failed send.
+    c.error = posted
+      ? "Your message was sent, but the screen could not refresh. Reload the page to see the reply."
+      : (e.message || "Concierge call failed.");
   } finally {
     c.sending = false;
-    rerender();
+    // The settling render still reads the follow request (it lands the reply);
+    // the request ends with this send even if that render throws.
+    try { rerender(); } finally { talkFollowIntent = null; }
   }
 }
 
@@ -2476,31 +3081,32 @@ const POLICY_SECTION_TITLES = {
 };
 const POLICY_SECTION_ORDER = ["approval", "auto_allow", "anomaly", "channel"];
 function renderPolicyPlainEnglishPanel() {
-  const pv = state.policyView;
-  let body;
-  if (pv.loadError) {
-    body = '<p class="muted">' + escHtml(pv.loadError) + '</p>';
-  } else if (!pv.view) {
-    body = '<p class="muted">' + (pv.loading ? "Loading your policy." : "Your policy will appear here.") + '</p>';
-  } else {
-    const lines = pv.view.lines || [];
-    const sections = POLICY_SECTION_ORDER.map(function (sec) {
-      const secLines = lines.filter(function (l) { return l.section === sec; });
-      if (!secLines.length) return "";
-      return '<div class="policy-plain-section">' +
-        '<h3>' + escHtml(POLICY_SECTION_TITLES[sec] || sec) + '</h3>' +
-        '<ul class="policy-plain-list">' +
-        secLines.map(function (l) { return '<li>' + escHtml(l.text) + '</li>'; }).join("") +
-        '</ul>' +
-      '</div>';
-    }).join("");
-    body = sections || '<p class="muted">No rules configured yet.</p>';
-  }
-  return '<section class="policy-panel policy-plain-english">' +
-    '<h2>Your policy in plain English</h2>' +
-    '<p class="muted">This is what your fine-grained policy does right now. It is read-only here; tune it by approving from the queue or editing a rule.</p>' +
-    (sourceLoaded(POLICY + "/current") || state.policyView.loadError ? body : "") + renderSourceRead(POLICY + "/current") +
-  '</section>';
+  const path = POLICY + "/current";
+  const view = sourceLoaded(path) && state.policyView.view;
+  if (!view || !Array.isArray(view.lines)) return '<section class="policy-panel"><h2>Policy Unknown</h2>' + overviewChip("unknown", "UNKNOWN") +
+    '<p>' + escHtml(state.policyView.loadError || "The current policy did not answer with a rule list.") + '</p>' + (sourceLoaded(path) ? '<button class="btn" data-action="retry-panel" data-read="/api/policy/current">Retry</button>' : renderSourceRead(path)) + '</section>';
+  const page = mfpPage(view.lines, "policy");
+  page.total = state.mfp.totals.policy;
+  const sections = POLICY_SECTION_ORDER.map(function (section) {
+    const lines = page.rows.filter(function (line) { return line.section === section; });
+    if (!lines.length) return "";
+    return '<section><h3>' + escHtml(POLICY_SECTION_TITLES[section]) + '</h3><ul>' +
+      lines.map(function (line) { return '<li>' + escHtml(line.text) + '</li>'; }).join("") + '</ul></section>';
+  }).join("");
+  const unknownGroup = function (title, reason) { return '<section><h3>' + title + '</h3>' + overviewChip("unknown", "UNKNOWN") + '<p>' + reason + '</p></section>'; };
+  const rows = page.rows.map(function (line, index) {
+    return '<tr><td class="mono">' + (page.start + index + 1) + '</td><td>' + escHtml(POLICY_SECTION_TITLES[line.section] || "Unknown") + '</td><td>' + escHtml(line.text) + '</td></tr>';
+  }).join("");
+  return '<section class="policy-panel" data-mfp-policy><div class="card-head-row"><h2>Principal policy</h2>' +
+    overviewChip(typeof view.policy_version === "number" ? "neutral" : "unknown", typeof view.policy_version === "number" ? "Version " + view.policy_version : "Version Unknown") + '</div>' +
+    '<p>Signature: ' + overviewChip("unknown", "UNKNOWN") + ' Signature state is not served by this policy view.</p>' +
+    '<p class="muted">Read-only policy lines. Groups and table show the same page of the current policy; row numbers are display positions.</p>' +
+    (view.lines.length ? mfpPager(page, "policy", path) : "") +
+    (view.lines.length ? '<div class="mfp-policy-grid"><div class="mfp-policy-groups">' +
+      unknownGroup("What agents may reach", "Destination and tool reach rules are not served by this policy view.") + sections +
+      unknownGroup("What is never allowed", "A deny list is not served by this policy view.") +
+      '</div><section><h3>Rule table</h3><div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Row</th><th>Group</th><th>Rule</th></tr></thead><tbody>' + rows + '</tbody></table></div></section></div>' :
+      mfpEmpty("No policy lines returned", "The current policy returned 0 of 0 lines; this is not a claim that every action is allowed.", path)) + '</section>';
 }
 
 function renderPolicyCenter() {
@@ -2514,8 +3120,9 @@ function renderPolicyCenter() {
       '<p>' + escHtml(t.description) + '</p>' +
     '</article>';
   }).join("\n");
+  const bindingPage = mfpPage(state.agents, "bindings");
   const rows = state.agents.length
-    ? state.agents.map(function (a) {
+    ? bindingPage.rows.map(function (a) {
         const binding = a.channel_template_id || "default none";
         const budget = a.budget_summary && a.budget_summary.daily
           ? "$" + escHtml(a.budget_summary.daily.cap) + "/day"
@@ -2538,12 +3145,17 @@ function renderPolicyCenter() {
       }).join("\n")
     : '<tr><td colspan="7" class="muted">No protected agents yet.</td></tr>';
   return '<section class="policy-center">' +
-    '<p class="eyebrow">POLICY CENTER</p>' +
-    '<h1>One screen for every rule</h1>' +
-    '<p class="policy-subtitle">Templates, per-agent rules, egress allowlists, retention, budgets, and privacy-minimization settings. Edits write a signed receipt; agents pick up changes within one tool-call cycle.</p>' +
+    '<p class="eyebrow">Configure</p>' +
+    '<h1>Policies</h1>' +
+    // Traced to the edit path: a template change is queued as a Tier 1
+    // approval; approving it records the new template and policy binding
+    // on the agent's record, and approving or denying it appends an audit
+    // log entry. The copy claims nothing past that.
+    '<p class="policy-subtitle">Principal policy lines and agent template bindings. A template change waits for your approval; approving it records the new template on the agent, and your decision either way is written to your audit log.</p>' +
     renderPolicyPlainEnglishPanel() +
     '<section class="policy-panel"><h2>Channel templates · ' + CHANNEL_TEMPLATES.length + ' shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
-    '<section class="policy-panel"><h2>Per-agent rules</h2>' +
+    // A pager describes served rows; unread sources keep their status and loaded empty agents keep their empty state.
+    '<section class="policy-panel"><h2>Per-agent rules</h2><p class="muted">Agent template bindings and daily budgets. Other rule fields are not served here.</p>' + (sourceLoaded(HUB + "/agents") && state.agents.length ? mfpPager(bindingPage, "bindings", HUB + "/agents") : "") +
       '<div class="rules-scroll"><table class="rules-table">' +
       '<thead><tr><th>AGENT</th><th>TEMPLATE</th><th>ALLOW / BLOCK</th><th>BUDGET</th><th>RETENTION</th><th>MINIMIZE</th><th>APPROVALS</th></tr></thead>' +
       '<tbody>' + (sourceLoaded(HUB + "/agents") ? rows : '<tr><td colspan="7">' + renderSourceRead(HUB + "/agents") + '</td></tr>') + '</tbody></table></div>' +
@@ -2554,11 +3166,13 @@ function renderPolicyCenter() {
 function renderAutoTriggerPage() {
   const rules = state.autoTrigger.rules || [];
   const recs = state.autoTrigger.recommendations || [];
+  const rulePage = mfpPage(rules, "rules", MFP_ALL_SERVED);
+  const recommendationPage = mfpPage(recs, "recommendations", MFP_ALL_SERVED);
   const summary = !sourceLoaded(AUTO_TRIGGER + "/rules") ? renderSourceRead(AUTO_TRIGGER + "/rules") : rules.length
-    ? '<div class="auto-trigger-rule-list">' + rules.map(renderAutoTriggerRuleRow).join("") + '</div>'
+    ? mfpPager(rulePage, "rules", AUTO_TRIGGER + "/rules") + '<div class="auto-trigger-rule-list">' + rulePage.rows.map(renderAutoTriggerRuleRow).join("") + '</div>'
     : '<p class="muted">No auto-trigger ladders configured. Ladders appear here after a sentinel, anomaly detector, or honeypot records its first finding. Use <code>sanctuary auto-trigger promote</code> to create one.</p>';
   const body = !sourceLoaded(AUTO_TRIGGER + "/recommendations") ? renderSourceRead(AUTO_TRIGGER + "/recommendations") : recs.length
-    ? '<div class="recommendation-list">' + recs.map(function (r) {
+    ? mfpPager(recommendationPage, "recommendations", AUTO_TRIGGER + "/recommendations") + '<div class="recommendation-list">' + recommendationPage.rows.map(function (r) {
         const hs = r.history_summary || {};
         const approval = Math.round(((hs.operator_approval_rate || 0) * 100));
         const cancel = hs.operator_cancel_rate == null ? null : Math.round(hs.operator_cancel_rate * 100);
@@ -2631,11 +3245,26 @@ function renderAutoTriggerRuleRow(rule) {
 
 function renderAutoTriggerTrend(history) {
   if (!history.length) return '<span class="muted">No 30-day trend yet.</span>';
-  return history.slice(-30).map(function (h) {
-    const cls = h.outcome === "auto_proceeded" || h.outcome === "operator_approved" ? "good" :
-      h.outcome === "operator_canceled" || h.outcome === "operator_revoked" ? "warn" : "pending";
+  const counts = { good: 0, warn: 0, pending: 0 };
+  const bars = history.slice(-30).map(function (h) {
+    const cls = trendOutcomeClass(h.outcome);
+    counts[cls]++;
     return '<span class="trend-bar ' + cls + '" title="' + escHtml(h.outcome + " at " + shortTime(h.observed_at)) + '"></span>';
   }).join("");
+  // Each outcome has its own bar shape (a tall filled bar went ahead, a
+  // short filled bar was stopped, an outline is anything else), and the
+  // legend names each shape with its count, so the strip reads without color.
+  return '<span class="trend-bars">' + bars + '</span>' +
+    '<span class="trend-legend">' +
+      '<span><i class="trend-bar good" aria-hidden="true"></i>' + counts.good + ' went ahead</span>' +
+      '<span><i class="trend-bar warn" aria-hidden="true"></i>' + counts.warn + ' stopped</span>' +
+      '<span><i class="trend-bar pending" aria-hidden="true"></i>' + counts.pending + ' other</span>' +
+    '</span>';
+}
+function trendOutcomeClass(outcome) {
+  if (outcome === "auto_proceeded" || outcome === "operator_approved") return "good";
+  if (outcome === "operator_canceled" || outcome === "operator_revoked") return "warn";
+  return "pending";
 }
 
 function renderTemplatePicker(agent) {
@@ -2672,7 +3301,7 @@ function renderExitDrill() {
   const step1Body = exportDone
     ? 'Bundle approved and packaging.'
     : exportPending
-    ? '<span class="muted">Awaiting approval. See inbox in the right pane.</span>'
+    ? '<span class="muted">Awaiting approval. It waits in <a href="#approvals">Approvals</a>.</span>'
     : '<button class="btn btn-primary" data-action="exit-export-start">Snapshot now</button>';
   const step2Body = exportDone ? 'Re-key complete.' : '<span class="muted">Re-keying state for portable export.</span>';
   // A7: always render state_entry_count (including 0) so "Bundle ready" cannot
@@ -2790,11 +3419,15 @@ function inboxAgentOptions() {
   }).join("");
 }
 
-function filterInbox(items) {
+function filterInbox(items, ignoreTimeRange) {
   const f = state.inboxOps.filters;
   const q = f.search.trim().toLowerCase();
   const fromMs = f.from ? Date.parse(f.from + "T00:00:00.000Z") : null;
   const toMs = f.to ? Date.parse(f.to + "T23:59:59.999Z") : null;
+  // The top-bar time range narrows the same list; like the date filters, an
+  // item whose time does not parse is kept rather than silently dropped.
+  const windowMs = ignoreTimeRange ? undefined : TIME_RANGE_MS[state.timeRange];
+  const sinceMs = typeof windowMs === "number" ? Date.now() - windowMs : null;
   return items.filter(function (i) {
     const args = i.display_template_args || {};
     const agent = i.agent_id || args.agent_id || "";
@@ -2807,6 +3440,7 @@ function filterInbox(items) {
     if (f.agent && agent !== f.agent) return false;
     if (fromMs !== null && Number.isFinite(when) && when < fromMs) return false;
     if (toMs !== null && Number.isFinite(when) && when > toMs) return false;
+    if (sinceMs !== null && Number.isFinite(when) && when < sinceMs) return false;
     if (q && text.indexOf(q) < 0) return false;
     return true;
   });
@@ -2827,9 +3461,13 @@ function filterInbox(items) {
 // hub/api-router.ts (#823). See test/dashboard/v1_1/queue-approve-token-gate.test.ts.
 function pendingApprovalItems() {
   // Pending Tier-1 approvals, scoped to the selected agent when one is
-  // chosen. These are the only items the rail queue shows; everything else
-  // (privacy events, budget warnings, blocked egress) lives on Activity.
-  const scope = state.agentScope.selectedAgentId;
+  // chosen. These are the only items the queue shows; everything else
+  // (privacy events, budget warnings, blocked egress) lives on Evidence.
+  return heldApprovalItems(state.agentScope.selectedAgentId);
+}
+// Every held operation, optionally narrowed to one agent. Called with null
+// it is the fortress-wide denominator the waiting count is stated against.
+function heldApprovalItems(scope) {
   return state.inbox.filter(function (i) {
     if (i.resolved) return false;
     if (i.kind !== "approval_pending") return false;
@@ -2837,6 +3475,50 @@ function pendingApprovalItems() {
     if (scope && (i.agent_id || "") !== scope) return false;
     return true;
   });
+}
+
+const AGENT_CONTROL_LABELS = {
+  pause: "Pause",
+  resume: "Resume",
+  restart: "Restart",
+  // Must match TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts; both renderers use this map.
+  lockdown: "Lock down",
+  // Must match TIER1_BUTTON_COPY.unwrap.idle in status-mapping.ts; both renderers use this map.
+  unwrap: "Remove protection",
+  edit_policy: "Edit policy",
+  identity_rotate: "Rotate identity"
+};
+
+function agentControlLabel(action) {
+  return AGENT_CONTROL_LABELS[action] || "This control";
+}
+
+function renderAgentControlButtons(a, scoped) {
+  // Must match projectAgentCapabilities in hub/hub-service.ts: a flag includes stored permission AND controller support.
+  const c = a.capabilities || {};
+  const menuItems = [
+    { action: "pause", enabled: !!c.can_pause },
+    { action: "resume", enabled: !!c.can_resume },
+    { action: "restart", enabled: !!c.can_restart },
+    // "Lock down" is the top bar's verb; "Remove protection" is the
+    // operator's word for the frozen "unwrap" action id, which stays
+    // the wire name in data-action only.
+    { action: "lockdown", enabled: !!c.can_lockdown, tier1: true },
+    { action: "unwrap", enabled: !!c.can_unwrap, tier1: true }
+  ];
+  const disabledTipByAction = {
+    pause: "Sanctuary does not control this agent's process, so pause is not available.",
+    resume: "Sanctuary does not control this agent's process, so resume is not available.",
+    restart: "Sanctuary does not control this agent's process, so restart is not available.",
+    lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
+    unwrap: "Removing protection from the dashboard is not available yet; an unsupported request is refused before any approval is queued."
+  };
+  return menuItems.map(function (mi) {
+    const tip = mi.enabled
+      ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
+      : disabledTipByAction[mi.action];
+    return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(agentControlLabel(mi.action) + (scoped && mi.action === "lockdown" ? " this agent" : "")) + '</button>';
+  }).join("");
 }
 
 // Wave 1: the fortress-column agents card and Recognition Layer health card
@@ -2850,27 +3532,7 @@ function renderFortressAgentsCard() {
   return state.agents.length
     ? state.agents.slice(0, 8).map(function (a) {
         const map = agentDisplayStatus(a);
-        const c = a.capabilities || {};
-        const menuItems = [
-          { action: "pause", label: "Pause", enabled: !!c.can_pause },
-          { action: "resume", label: "Resume", enabled: !!c.can_resume },
-          { action: "restart", label: "Restart", enabled: !!c.can_restart },
-          { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
-          { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
-        ];
-        const disabledTipByAction = {
-          pause: "Sanctuary does not control this agent's process, so pause is not available.",
-          resume: "Sanctuary does not control this agent's process, so resume is not available.",
-          restart: "Sanctuary does not control this agent's process, so restart is not available.",
-          lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
-          unwrap: "Dashboard unwrap is not implemented yet; unsupported unwraps are refused before approval is queued."
-        };
-        const buttons = menuItems.map(function (mi) {
-          const tip = mi.enabled
-            ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
-            : disabledTipByAction[mi.action];
-          return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
-        }).join("");
+        const buttons = renderAgentControlButtons(a, false);
         // Click-to-inspect: the head sub-row is the click target. A click
         // navigates to agent-detail and opens the read-only inspect panel
         // synchronously via the WP-V1.2 reshape route. Lifecycle buttons in
@@ -2918,32 +3580,6 @@ function renderRecognitionHealthCard() {
     '<div style="margin-top:8px;">' + history + '</div>';
 }
 
-function renderApprovalTile(i) {
-  const text = renderTemplate(i.display_template_id, i.display_template_args);
-  const agentId = i.agent_id || (i.display_template_args && i.display_template_args.agent_id) || "this fortress";
-  // Tunability UX: "always allow this" promotes the one-time approval into
-  // a durable standing rule so each interruption teaches the wall instead of
-  // nagging the operator into disabling it. The promote issues the SAME
-  // operator-bearer-gated api() request path as approve/deny and lands on the
-  // REAL english-policy activator (compile -> activate), which runs the
-  // conflict-detector and the #805 downgrade gate server-side. It is offered
-  // ONLY for operations that name a promotable category; policy_change and
-  // other non-operation approvals are not promotable and omit the button.
-  const promotable = promotableOperation(i);
-  const promoteBtn = promotable
-    ? '<button class="btn btn-sm at-promote" data-action="inbox-promote" data-item-id="' + escHtml(i.item_id) + '" title="Turn this into a standing rule so agents can do it without asking you again.">Always allow</button>'
-    : '';
-  return '<div class="approval-tile" data-approval-tile="' + escHtml(i.item_id) + '">' +
-    '<div class="at-what">' + escHtml(text) + '</div>' +
-    '<div class="at-agent"><span class="ad"></span>' + escHtml(agentId) + '</div>' +
-    '<div class="at-actions">' +
-      '<button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '">Approve</button>' +
-      '<button class="btn btn-sm at-deny" data-action="inbox-deny" data-item-id="' + escHtml(i.item_id) + '">Deny</button>' +
-      promoteBtn +
-    '</div>' +
-  '</div>';
-}
-
 // The operation an approval names, when it maps to a promotable standing
 // rule. Returns null for approvals with no concrete operation to promote
 // (e.g. policy_change, lockdown, unwrap). Kept in sync with the server
@@ -2970,17 +3606,213 @@ function promotableOperation(i) {
   return op;
 }
 
+const EVIDENCE_LAYER_NAMES = {
+  // Must match validLayers in server/src/principal-policy/posture-routes.ts.
+  l1: "Castle Wall",
+  l2: "Sentinels",
+  l3: "Charter",
+  l4: "Heralds"
+};
+const EVIDENCE_LAYER_ORDER = ["l1", "l2", "l3", "l4"];
+const EVIDENCE_ROUTE_DEFAULT_LIMIT = 50; // Must match buildEvidence default in principal-policy/posture-routes.ts.
+const EVIDENCE_CHAIN_VERDICTS = ${JSON.stringify(EVIDENCE_CHAIN_VERDICTS)};
+// 50 is the route default limit in buildEvidence, so the first page and the
+// server window have the same bound unless the route changes.
+const EVIDENCE_PAGE_SIZE = EVIDENCE_ROUTE_DEFAULT_LIMIT;
+const EVIDENCE_DETAIL_VALUE_MAX_CHARS = 240; // 240 = four 60-char lines in the drawer key-value column.
+const EVIDENCE_RAW_RECORD_MAX_CHARS = 6000; // 6000 = about 100 60-char lines, enough for inspection without unbounded DOM growth.
+// The decided approvals list shows at most one audit page of rows, so the screen's two lists share one row budget.
+const EVIDENCE_DECIDED_APPROVAL_LIMIT = EVIDENCE_PAGE_SIZE;
+const EVIDENCE_DETAIL_KEY_LIMIT = EVIDENCE_PAGE_SIZE; // One record gets at most the same row budget as one audit page.
+const EVIDENCE_SINCE_ROUND_MS = 60 * 1000; // One minute: the time range start sent with the read is rounded to it.
+const EVIDENCE_FINDING_DISPLAY_LIMIT = 5; // Five findings fit in the strip before the table leaves the first viewport.
+// Must match the limit default in handleAuditLog in server/src/principal-policy/dashboard.ts: the audit
+// log read serves the most recent entries up to this limit, so the export says it is that bound.
+const EVIDENCE_JSON_EXPORT_LIMIT = 50;
+
+function evidenceLayerName(layer) {
+  return EVIDENCE_LAYER_NAMES[layer] || "Unknown";
+}
+
+function evidenceTimestamp(entry) {
+  return entry && entry.timestamp || "";
+}
+
+// Invariant: the Evidence read serves AuditEntry only, so every cell reads a
+// served AuditEntry field or says the value is missing.
+function evidenceAgent(entry) {
+  return entry && entry.identity_id || "agent not named";
+}
+
+function evidenceEvent(entry) {
+  return entry && entry.operation || "operation not named";
+}
+
+function evidenceResult(entry) {
+  const raw = String(entry && entry.result || "").toLowerCase();
+  if (raw === "success" || raw === "failure") return raw;
+  return "";
+}
+
+function cappedText(value, maxChars) {
+  var raw;
+  if (value === null) raw = "null";
+  else if (value === undefined) raw = "missing";
+  else if (typeof value === "string") raw = value;
+  else {
+    try { raw = JSON.stringify(value); } catch (_e) { raw = String(value); }
+  }
+  if (raw.length <= maxChars) return raw;
+  return raw.slice(0, maxChars) + "... truncated at " + maxChars + " chars";
+}
+
+function evidenceDetailsList(entry) {
+  const details = entry && entry.details && typeof entry.details === "object" && !Array.isArray(entry.details) ? entry.details : null;
+  if (!details) return "";
+  const keys = Object.keys(details).sort();
+  if (!keys.length) return "";
+  return '<dt>Details</dt><dd>showing ' + Math.min(keys.length, EVIDENCE_DETAIL_KEY_LIMIT) + ' of ' + keys.length + ' fields</dd>' + keys.slice(0, EVIDENCE_DETAIL_KEY_LIMIT).map(function (key) {
+    return '<dt>' + escHtml(cappedText(key, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dt><dd>' + escHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
+  }).join("");
+}
+
+function evidenceContributorsList(entry) {
+  const contributors = entry && Array.isArray(entry.contributors) ? entry.contributors : [];
+  if (!contributors.length) return "";
+  return '<dt>contributors</dt><dd>' + escHtml(cappedText(contributors, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
+}
+
+function evidenceEntryText(entry) {
+  const details = entry && entry.details && typeof entry.details === "object" ? entry.details : {};
+  return [
+    evidenceEvent(entry),
+    evidenceAgent(entry),
+    evidenceResult(entry),
+    evidenceLayerName(entry && entry.layer),
+    JSON.stringify(details)
+  ].filter(Boolean).join(" ");
+}
+
+function evidenceMatchesQuery(entry, query) {
+  const trimmed = String(query || "").trim().toLowerCase();
+  if (!trimmed) return true;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const haystack = evidenceEntryText(entry).toLowerCase();
+  return words.every(function (word) {
+    const split = word.indexOf(":");
+    if (split > 0) {
+      const field = word.slice(0, split);
+      const value = word.slice(split + 1);
+      if (field === "agent") return String(evidenceAgent(entry)).toLowerCase().indexOf(value) >= 0;
+      if (field === "layer") return evidenceLayerName(entry.layer).toLowerCase().indexOf(value) >= 0 || String(entry.layer || "").toLowerCase() === value;
+      if (field === "result") return evidenceResult(entry).toLowerCase().indexOf(value) >= 0;
+      if (field === "event" || field === "operation" || field === "text") return haystack.indexOf(value) >= 0;
+    }
+    return haystack.indexOf(word) >= 0;
+  });
+}
+
+function applyEvidenceHashFilters(hash) {
+  const route = String(hash || "").split("?")[0];
+  if (route !== "activity") return;
+  const qs = String(hash || "").split("?")[1] || "";
+  const params = new URLSearchParams(qs);
+  const filters = state.evidence.filters;
+  filters.query = params.get("q") || "";
+  const layer = params.get("layer") || "";
+  filters.layer = EVIDENCE_LAYER_NAMES[layer] ? layer : "";
+  filters.agent = params.get("agent") || "";
+  filters.event = params.get("event") || "";
+  const result = params.get("result") || "";
+  filters.result = result === "success" || result === "failure" ? result : "";
+  filters.from = evidenceFromDate(params.get("from") || "");
+}
+
+// The From filter is a calendar date in the operator's own time zone (what a date input holds), so
+// anything that is not a real YYYY-MM-DD date is dropped instead of sent as a window that matches nothing.
+function evidenceFromDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!m) return "";
+  const local = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return local.getFullYear() === Number(m[1]) && local.getMonth() === Number(m[2]) - 1 && local.getDate() === Number(m[3]) ? value : "";
+}
+
+// The start of the Evidence read's window: the later of the From date's local midnight and the start of
+// the top-bar time range. The time range start is rounded down to the minute, so reads within one minute
+// ask for the same window and a repeated read compares equal.
+function evidenceSinceIso() {
+  const from = evidenceFromDate(state.evidence.filters.from);
+  const fromMs = from ? new Date(Number(from.slice(0, 4)), Number(from.slice(5, 7)) - 1, Number(from.slice(8, 10))).getTime() : null;
+  const windowMs = TIME_RANGE_MS[state.timeRange];
+  const rangeMs = typeof windowMs === "number" ? Math.floor((Date.now() - windowMs) / EVIDENCE_SINCE_ROUND_MS) * EVIDENCE_SINCE_ROUND_MS : null;
+  const since = fromMs === null ? rangeMs : rangeMs === null ? fromMs : Math.max(fromMs, rangeMs);
+  return since === null ? "" : new Date(since).toISOString();
+}
+
+function evidenceHashFromFilters() {
+  const params = new URLSearchParams();
+  const filters = state.evidence.filters;
+  if (filters.query) params.set("q", filters.query);
+  if (filters.layer) params.set("layer", filters.layer);
+  if (filters.agent) params.set("agent", filters.agent);
+  if (filters.event) params.set("event", filters.event);
+  if (filters.result) params.set("result", filters.result);
+  if (filters.from) params.set("from", filters.from);
+  const qs = params.toString();
+  return "#activity" + (qs ? "?" + qs : "");
+}
+
+function setEvidenceFilter(name, value) {
+  if (!Object.prototype.hasOwnProperty.call(state.evidence.filters, name)) return;
+  const previousUrl = evidenceReadUrl();
+  state.evidence.filters[name] = value;
+  state.evidence.selectedIndex = 0;
+  const nextHash = evidenceHashFromFilters();
+  if (location.hash !== nextHash) location.hash = nextHash;
+  else rerender();
+  if (evidenceReadUrl() !== previousUrl) queueEvidenceRead();
+}
+
+function evidenceReadUrl() {
+  const params = new URLSearchParams();
+  const filters = state.evidence.filters;
+  if (filters.agent) params.set("agent", filters.agent);
+  const since = evidenceSinceIso();
+  if (since) params.set("since", since);
+  if (filters.event) params.set("operation_type", filters.event);
+  if (filters.layer) params.set("layer", filters.layer);
+  if (filters.result) params.set("result", filters.result);
+  params.set("limit", String(EVIDENCE_PAGE_SIZE));
+  const qs = params.toString();
+  return "/api/posture/evidence" + (qs ? "?" + qs : "");
+}
+
+function queueEvidenceRead() {
+  const job = panelJobs.find(function (candidate) {
+    return candidate.paths.indexOf("/api/posture/evidence") >= 0;
+  });
+  if (job) { void queuePanel(job); rerender(); }
+}
+
+function filteredEvidenceEntries(entries) {
+  const filters = state.evidence.filters;
+  return (entries || []).filter(function (entry) {
+    return evidenceMatchesQuery(entry, filters.query);
+  });
+}
+
+function renderEvidenceStatusChip(kind, word) {
+  return '<span class="state-chip ' + escHtml(kind) + '"><i aria-hidden="true"></i>' + escHtml(word) + '</span>';
+}
+
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
-  const pending = pendingApprovalItems();
-  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
-  const countCls = queueCount ? "count" : "count zero";
-  const queueBody = !sourceLoaded(HUB + "/inbox") ? renderSourceRead(HUB + "/inbox") : state.inboxRedacted
-    ? '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>'
-    : pending.length
-    ? '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>'
-    : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+  const evidence = approvalQueueEvidence();
+  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : evidence.count;
+  // The muted zero badge is the same claim as the green check, so it needs the same earned evidence.
+  const countCls = evidence.earned ? "count zero" : "count";
+  const approvalSummary = evidence.summary;
 
   // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
   // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
@@ -3009,7 +3841,7 @@ function renderFortress() {
   fortress.innerHTML = [
       '<div class="rail-section">',
       '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + queueCount + '</span></div>',
-      queueBody,
+      approvalSummary,
     '</div>',
     '<div class="rail-section">',
       '<div class="rail-section-label">Right now</div>',
@@ -3020,7 +3852,7 @@ function renderFortress() {
         '</div>',
         '<div class="ambient-line"><span class="lead">What is protecting you</span>' + escHtml(protectingLine) + '</div>',
         '<div class="ambient-stats">',
-          '<div class="ambient-stat"><span class="n">' + wrapped + '</span><span class="l">Wrapped</span></div>',
+          '<div class="ambient-stat" title="Agents placed under Sanctuary protection; enforcement evidence is stated per agent"><span class="n">' + wrapped + '</span><span class="l">Protection requested</span></div>',
           '<div class="ambient-stat"><span class="n">' + queueCount + '</span><span class="l">Waiting</span></div>',
           '<div class="ambient-stat"><span class="n">' + federationState + '</span><span class="l">Federation</span></div>',
         '</div>',
@@ -3029,6 +3861,129 @@ function renderFortress() {
     '</div>'
   ].join("");
   restoreRetryFocus(active, fortress);
+}
+
+function renderEvidenceIntegrity(view) {
+  const read = sourceRead("/api/posture/evidence");
+  if (!sourceLoaded("/api/posture/evidence") || !view) {
+    const reason = read && read.error ? read.error : "server verification has not answered";
+    return '<section class="evidence-integrity unknown"><div class="ei-badge">' + renderEvidenceStatusChip("unknown", "UNKNOWN") +
+      '</div><div class="ei-facts"><strong>Chain verification Unknown</strong><span>' + escHtml(reason) + '</span></div></section>';
+  }
+  const findings = Array.isArray(view.integrity_findings) ? view.integrity_findings : [];
+  const total = typeof view.total === "number" ? view.total : "Unknown";
+  const sealed = renderSealedRegion(view.sealed_region);
+  const status = view.chain_verdict;
+  const known = Object.prototype.hasOwnProperty.call(EVIDENCE_CHAIN_VERDICTS, status);
+  // Only the served whole-chain verdict with no findings earns CHAIN VERIFIED.
+  // Continuing paths: verified -> clean; suffix -> qualified; any served finding -> bad, whatever the
+  // served verdict, so no reassuring word sits above a finding; key unavailable or an unrecognized
+  // verdict -> no verification claim.
+  const verdict = known ? EVIDENCE_CHAIN_VERDICTS[findings.length ? "findings" : status] : {
+    kind: "unknown", word: "UNKNOWN", summary: "The audit chain status was not recognized or was not served."
+  };
+  const chipKind = verdict.kind;
+  const chipWord = verdict.word;
+  const summary = verdict.summary;
+  const shownFindings = findings.slice(0, EVIDENCE_FINDING_DISPLAY_LIMIT).map(function (finding) {
+    return '<span>' + escHtml(cappedText(finding.kind || "finding", EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + ': ' +
+      escHtml(cappedText(finding.message || "message not served", EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</span>';
+  }).join("");
+  const findingCount = findings.length
+    ? '<span>showing ' + escHtml(Math.min(findings.length, EVIDENCE_FINDING_DISPLAY_LIMIT)) + ' of ' + escHtml(findings.length) + ' findings</span>'
+    : '<span><b>0</b> integrity findings reported for the whole chain</span>';
+  return '<section class="evidence-integrity ' + escHtml(chipKind) + '"><div class="ei-badge">' + renderEvidenceStatusChip(chipKind, chipWord) + '</div>' +
+    '<div class="ei-facts"><strong>' + escHtml(summary) + '</strong><span><b>' + escHtml(total) + '</b> entries in the served window before page limit and result filter</span>' +
+    findingCount + '<span>sealed region: ' + escHtml(sealed) + '</span><span>age of this read: ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span>' +
+    shownFindings + '</div></section>';
+}
+
+// Must match SealedRegionVerdict in server/src/operational/audit-log.ts: every served status has its own
+// words here, and a status this list does not name reads Unknown, never a verification.
+function renderSealedRegion(sealed) {
+  if (!sealed || typeof sealed !== "object") return "Unknown";
+  if (sealed.status === "not_present") return "no sealed legacy region present";
+  if (sealed.status === "empty") return "sealed legacy region is empty";
+  if (sealed.status === "verified") return "sealed region verified, entries verified " + String(sealed.entries_verified || 0);
+  if (sealed.status === "unreadable") return "sealed older region unreadable at this privilege: " + cappedText(sealed.note || "reason not served", EVIDENCE_DETAIL_VALUE_MAX_CHARS);
+  if (sealed.status === "incomplete") return "sealed region incomplete, highest present " + String(sealed.highest_present || 0) + " of expected tip " + String(sealed.expected_tip || 0);
+  if (sealed.status === "hash_mismatch") return "sealed region hash mismatch at sequence " + String(sealed.sequence || "unknown");
+  return "Unknown";
+}
+
+function renderEvidenceQueryBar() {
+  const f = state.evidence.filters;
+  const layerOptions = ['<option value="">Any</option>'].concat(EVIDENCE_LAYER_ORDER.map(function (token) {
+    return '<option value="' + token + '"' + (f.layer === token ? ' selected' : '') + '>' + escHtml(evidenceLayerName(token)) + '</option>';
+  })).join("");
+  const resultOptions = ["", "success", "failure"].map(function (value) {
+    const label = value ? sentenceCase(value) : "Any";
+    return '<option value="' + escHtml(value) + '"' + (f.result === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+  }).join("");
+  const chips = [
+    "Layer: " + (f.layer ? evidenceLayerName(f.layer) : "Any"),
+    "Agent: " + (f.agent || "Any"),
+    "Event: " + (f.event || "Any"),
+    "Result: " + (f.result ? sentenceCase(f.result) : "Any"),
+    "From: " + (f.from || "Any"),
+    "Time range: " + TIME_RANGE_LABEL[state.timeRange]
+  ].map(function (chip) { return '<span class="evidence-chip">' + escHtml(chip) + '</span>'; }).join("");
+  return '<section class="card evidence-query"><div class="filter-bar" role="group" aria-label="Filter evidence entries">' +
+    '<label class="field evidence-query-field"><span class="field-label">Query</span><input class="input" data-action="evidence-filter-query" placeholder="agent: layer: result: event: or text" value="' + escHtml(f.query) + '"></label>' +
+    '<label class="field"><span class="field-label">Layer</span><select class="input" data-action="evidence-filter-layer">' + layerOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">Agent</span><input class="input" data-action="evidence-filter-agent" value="' + escHtml(f.agent) + '"></label>' +
+    '<label class="field"><span class="field-label">Event</span><input class="input" data-action="evidence-filter-event" value="' + escHtml(f.event) + '"></label>' +
+    '<label class="field"><span class="field-label">Result</span><select class="input" data-action="evidence-filter-result">' + resultOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">From</span><input class="input" data-action="evidence-filter-from" type="date" value="' + escHtml(f.from) + '"></label>' +
+    '</div><div class="evidence-chips">' + chips + '<span class="evidence-chip">Query searches only the entries loaded on this page</span></div></section>';
+}
+
+function renderEvidenceRow(entry, index) {
+  const selected = state.evidence.selectedIndex === index;
+  const result = evidenceResult(entry);
+  const resultKind = result === "success" ? "neutral" : result === "failure" ? "bad" : "unknown";
+  return '<tr' + (selected ? ' class="sel"' : '') + ' data-evidence-row="' + escHtml(index) + '">' +
+    '<td class="mono">' + escHtml(shortTime(evidenceTimestamp(entry)) || "timestamp missing") + '</td>' +
+    '<td><span class="lay">' + escHtml(evidenceLayerName(entry.layer)) + '</span></td>' +
+    '<td><span class="row">' + escHtml(evidenceAgent(entry)) + '</span></td>' +
+    '<td><button class="btn" data-action="evidence-select" data-evidence-index="' + index + '" aria-pressed="' + selected + '">' + escHtml(evidenceEvent(entry)) + '</button></td>' +
+    '<td>' + renderEvidenceStatusChip(resultKind, result ? sentenceCase(result) : "Missing") + '</td>' +
+  '</tr>';
+}
+
+function renderEvidenceDrawer(entry) {
+  if (!entry) {
+    return '<aside class="panel evidence-detail"><div class="overview-empty"><h3>No record selected</h3><p>Select an entry to inspect the served audit record.</p></div></aside>';
+  }
+  const result = evidenceResult(entry);
+  const details = evidenceDetailsList(entry);
+  const contributors = evidenceContributorsList(entry);
+  const raw = cappedText(entry, EVIDENCE_RAW_RECORD_MAX_CHARS);
+  return '<aside class="panel evidence-detail" aria-label="Selected entry">' +
+    '<div class="hd"><div class="t">' + escHtml(evidenceEvent(entry)) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
+    '<div class="sec"><h3>What happened</h3><dl class="kv">' +
+      '<dt>Operation</dt><dd>' + escHtml(evidenceEvent(entry)) + '</dd>' +
+      '<dt>Agent</dt><dd>' + escHtml(evidenceAgent(entry)) + '</dd>' +
+      '<dt>Layer</dt><dd>' + escHtml(evidenceLayerName(entry.layer)) + '</dd>' +
+      '<dt>Result</dt><dd>' + renderEvidenceStatusChip(result === "success" ? "neutral" : result === "failure" ? "bad" : "unknown", result ? sentenceCase(result) : "Missing") + '</dd>' +
+      '<dt>Time</dt><dd>' + escHtml(evidenceTimestamp(entry) || "timestamp missing") + '</dd>' +
+      details + contributors +
+    '</dl></div>' +
+    '<div class="sec"><h3>Seal</h3><div class="chain">' +
+      '<p class="muted">Per-entry seal data is not served by this read. Chain integrity is the strip above.</p>' +
+    '</div></div>' +
+    '<div class="sec"><h3>Raw record</h3><pre class="json">' + escHtml(raw) + '</pre></div>' +
+  '</aside>';
+}
+
+function renderEvidenceExports() {
+  return '<section class="card evidence-export"><h3>Export</h3><div class="toolbar">' +
+    '<button class="btn" data-action="evidence-export-json">JSON: latest ' + EVIDENCE_JSON_EXPORT_LIMIT + ' audit entries</button>' +
+    '<button class="btn" disabled title="CEF export is available from the audit_export_siem tool, not from this dashboard yet.">CEF unavailable from this dashboard</button>' +
+    '<button class="btn" disabled title="Compliance bundle export is Tier 1 through compliance_generate_eu_ai_act_bundle, not from this dashboard yet.">Compliance bundle unavailable from this dashboard</button>' +
+    '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
+    '<a class="btn" href="#exit-drill">Exit drill</a>' +
+  '</div></section>';
 }
 
 // Wave 1 (2026-06-30): the Activity screen. The heavy six-field inbox
@@ -3042,43 +3997,133 @@ function renderFortress() {
 // token-gated paths (onInboxAction -> api()). No behavior change; only the
 // home of the panel moved.
 function renderActivityScreen() {
+  const view = state.evidence.view;
+  // Must match AuditLog.query in server/src/operational/audit-log.ts, which serves the most recent
+  // entries oldest first (filtered.slice(-limit)); the table lists that page newest first.
+  const entries = sourceLoaded("/api/posture/evidence") && view && Array.isArray(view.entries) ? view.entries.slice().reverse() : [];
+  const filtered = filteredEvidenceEntries(entries);
+  const shown = filtered.slice(0, EVIDENCE_PAGE_SIZE);
+  if (!shown[state.evidence.selectedIndex]) state.evidence.selectedIndex = 0;
+  const selected = shown[state.evidence.selectedIndex] || null;
+  const total = view && typeof view.total === "number" ? view.total : "Unknown";
+  // buildEvidence applies the page limit before the result filter and serves total before both, so a
+  // result filter narrows only the most recent page, and the count says so.
+  const resultScopeLine = state.evidence.filters.result
+    ? '<p class="muted" data-evidence-result-scope="1">The result filter checks the ' + EVIDENCE_PAGE_SIZE + ' most recent entries in the window; ' + escHtml(total) + ' counts entries of every result.</p>'
+    : "";
+  const searchedLine = state.evidence.filters.query
+    ? "searching the " + entries.length + " entries loaded"
+    : "search is local to the " + entries.length + " entries loaded";
+  const timeRangeActive = state.timeRange !== "all";
+  const serverFiltersActive = Object.keys(state.evidence.filters).some(function (key) { return key !== "query" && !!state.evidence.filters[key]; });
+  const searchActive = !!state.evidence.filters.query;
+  // Name only filters actually applied; a range-only view cannot be cleared by navigating to its existing hash.
+  const activeFilterNames = (timeRangeActive ? ["time range"] : []).concat(serverFiltersActive ? ["server filters"] : [], searchActive ? ["page-local search"] : []);
+  const noMatchNote = entries.length + " entries were loaded" + (timeRangeActive ? " for " + TIME_RANGE_LABEL[state.timeRange] : "") + ". " +
+    (activeFilterNames.length ? "Active filters: " + activeFilterNames.join(", ") + ". " : "") + "No matches on this page." +
+    (timeRangeActive ? (serverFiltersActive || searchActive ? " Clear filters keeps the time range; change it in the top bar." : " Change the time range in the top bar.") : "");
+  const clearFiltersLink = serverFiltersActive || searchActive ? '<a class="btn" href="#activity">Clear filters</a>' : "";
+  const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
+    // AuditLog.query applies range/agent/layer/operation before total and paging; only buildEvidence's result
+    // post-filter can explain an empty served page with a positive total. Page-local search runs after that read.
+    ? !entries.length && total > 0 && !state.evidence.filters.result
+      ? '<div class="overview-empty"><h3>No entries on this page</h3><p>' + escHtml("The server counts " + total + (total === 1 ? " entry" : " entries") + " in this view, but this read shows none.") + '</p><button class="btn" data-action="retry-panel" data-read="/api/posture/evidence">Retry</button></div>'
+      : entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
+      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p>' + clearFiltersLink + '</div>'
+      : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
+    : "";
+  const table = sourceLoaded("/api/posture/evidence")
+    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(total) + '</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + ' · ' + escHtml(searchedLine) + '</span></div>' + resultScopeLine +
+      (shown.length ? '<div class="overview-table-scroll"><table class="overview-table evidence-table"><thead><tr><th>Time</th><th>Layer</th><th>Agent</th><th>Event</th><th>Result</th></tr></thead><tbody>' + shown.map(renderEvidenceRow).join("") + '</tbody></table></div>' : empty) + '</section>'
+    : '<section class="panel evidence-entries" aria-label="Entries"><div class="overview-empty"><h3>Entries Unknown</h3><p>The server verification read has not loaded entries.</p></div></section>';
+  const operations = renderEvidenceOperationsSection();
+  return [
+    '<section class="evidence-page">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Evidence</p>',
+        '<h1>Evidence</h1>',
+        // The subtitle names the source and makes no completeness or tamper claim: not every decision is
+        // recorded here (inbox decisions stay in the inbox), and integrity is the strip's to state.
+        '<p class="sub">The audit log this fortress keeps. Integrity is shown only from the server verification read.</p>',
+      '</div></div>',
+      renderEvidenceIntegrity(view),
+      renderEvidenceQueryBar(),
+      renderSourceRead("/api/posture/evidence"),
+      '<div class="evidence-layout">' + table + renderEvidenceDrawer(selected) + '</div>',
+      renderEvidenceExports(),
+      operations,
+    '</section>'
+  ].join("");
+}
+
+function renderEvidenceDecidedApprovals() {
+  if (!sourceLoaded(HUB + "/inbox")) return "";
+  if (state.inboxRedacted) return '<section class="card"><h3>Decided approvals</h3><p>Approvals are hidden, not empty. Paste the operator token to review them.</p></section>';
+  const decided = state.inbox.filter(function (item) { return item.kind === "approval_pending" && item.resolved; });
+  const shown = filterInbox(decided).slice(0, EVIDENCE_DECIDED_APPROVAL_LIMIT);
+  // Resolution is a served historical fact, never permission to decide the item again.
+  return '<section class="card"><h3>Decided approvals</h3><p class="muted">showing ' + shown.length + ' of ' + decided.length +
+    ' loaded decisions · inbox read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</p>' +
+    (shown.length ? shown.map(function (item) {
+      return '<div class="row" data-decided-approval="' + escHtml(item.item_id) + '"><div class="grow">' +
+        escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '</div>' +
+        renderEvidenceStatusChip("neutral", "Resolved") + '<span class="mono">' + escHtml(item.resolved_at || "resolution time not served") + '</span></div>';
+    }).join("") : '<p class="muted">No decided approvals in this loaded view.</p>') + '</section>';
+}
+
+function renderEvidenceOperationsSection() {
   const visibleInbox = filterInbox(state.inbox.filter(function (i) { return !i.resolved; }));
   const selectedIds = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
   const batchToolbar = selectedIds.length
     ? '<div class="toolbar" style="margin-bottom:8px;">' +
         '<span class="pill">' + selectedIds.length + ' selected</span>' +
-        '<button class="btn" data-action="inbox-batch-archive">Archive</button>' +
-        '<button class="btn" data-action="inbox-batch-dismiss">Dismiss</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze-open">Snooze</button>' +
-        '<button class="btn btn-danger" data-action="inbox-batch-delete">Delete</button>' +
+        '<button class="btn" data-action="inbox-batch-archive"' + approvalDecisionDisabled() + '>Archive</button>' +
+        '<button class="btn" data-action="inbox-batch-dismiss"' + approvalDecisionDisabled() + '>Dismiss</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-open"' + approvalDecisionDisabled() + '>Snooze</button>' +
+        '<button class="btn btn-danger" data-action="inbox-batch-delete"' + approvalDecisionDisabled() + '>Delete</button>' +
       '</div>'
     : "";
   const snoozeDialog = state.inboxOps.snoozeDialog
     ? '<div class="modal-backdrop"><div class="modal"><h3>Snooze</h3><div class="toolbar">' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="3600000">1h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="14400000">4h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="86400000">1d</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="604800000">1w</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>1h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (4 * MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>4h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (24 * MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>1d</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (7 * 24 * MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>1w</button>' +
         '<input class="input" data-action="inbox-snooze-custom" type="datetime-local">' +
-        '<button class="btn" data-action="inbox-batch-snooze-custom">Custom</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-custom"' + approvalDecisionDisabled() + '>Custom</button>' +
         '<button class="btn" data-action="inbox-batch-snooze-close">Cancel</button>' +
       '</div></div></div>'
     : "";
+  // Each filter is a labelled field in a wrapping grid: the label sits above
+  // its control in the label style, so no label runs into its neighbour.
+  const filterField = function (label, control) {
+    return '<label class="field"><span class="field-label">' + label + '</span>' + control + '</label>';
+  };
   const filterPanel =
-    '<div class="toolbar" style="align-items:flex-end;flex-wrap:wrap;margin-bottom:8px;">' +
-      '<label>Search<br><input class="input" data-action="inbox-filter-search" value="' + escHtml(state.inboxOps.filters.search) + '"></label>' +
-      '<label>Source<br><select class="input" data-action="inbox-filter-source"><option value="">Any</option>' + inboxOption("blocked_egress") + inboxOption("privacy_event") + inboxOption("budget_warning") + inboxOption("recovery_prompt") + inboxOption("agent_error") + inboxOption("approval") + inboxOption("sentinel_finding") + '</select></label>' +
-      '<label>Severity<br><select class="input" data-action="inbox-filter-severity"><option value="">Any</option>' + inboxOption("info", "severity") + inboxOption("warn", "severity") + inboxOption("alert", "severity") + inboxOption("critical", "severity") + '</select></label>' +
-      '<label>Agent<br><select class="input" data-action="inbox-filter-agent"><option value="">Any</option>' + inboxAgentOptions() + '</select></label>' +
-      '<label>From<br><input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '"></label>' +
-      '<label>To<br><input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '"></label>' +
+    '<div class="filter-bar" role="group" aria-label="Filter the inbox">' +
+      filterField("Search", '<input class="input" data-action="inbox-filter-search" value="' + escHtml(state.inboxOps.filters.search) + '">') +
+      filterField("Source", '<select class="input" data-action="inbox-filter-source"><option value="">Any</option>' + inboxOption("blocked_egress") + inboxOption("privacy_event") + inboxOption("budget_warning") + inboxOption("recovery_prompt") + inboxOption("agent_error") + inboxOption("approval") + inboxOption("sentinel_finding") + '</select>') +
+      filterField("Severity", '<select class="input" data-action="inbox-filter-severity"><option value="">Any</option>' + inboxOption("info", "severity") + inboxOption("warn", "severity") + inboxOption("alert", "severity") + inboxOption("critical", "severity") + '</select>') +
+      filterField("Agent", '<select class="input" data-action="inbox-filter-agent"><option value="">Any</option>' + inboxAgentOptions() + '</select>') +
+      filterField("From", '<input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '">') +
+      filterField("To", '<input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '">') +
     '</div>';
   const redactedNotice = state.inboxRedacted
     ? '<div class="banner-warn" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '. Paste the operator token to review and decide them.</div>'
     : '';
   var inboxRows;
-  if (!visibleInbox.length) {
+  const openItems = state.inbox.filter(function (i) { return !i.resolved; });
+  if (!visibleInbox.length && !openItems.length) {
     inboxRows = redactedNotice || '<p class="muted">Nothing pending.</p>';
+  } else if (!visibleInbox.length) {
+    // Open items exist but the view shows none: say where they went, so an
+    // empty window never reads as an empty inbox.
+    const anyTime = filterInbox(openItems, true).length;
+    const hiddenByFilters = openItems.length - anyTime;
+    const parts = [];
+    if (anyTime) parts.push(anyTime + (anyTime === 1 ? " older item is" : " older items are") + " outside " + TIME_RANGE_LABEL[state.timeRange]);
+    if (hiddenByFilters) parts.push(hiddenByFilters + (hiddenByFilters === 1 ? " item is" : " items are") + " hidden by your filters");
+    inboxRows = redactedNotice + '<p class="muted">No open items in this view: ' + escHtml(parts.join("; ")) + '.</p>';
   } else {
     var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
     var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
@@ -3086,19 +4131,26 @@ function renderActivityScreen() {
     function renderInboxRow(i) {
       var text = renderTemplate(i.display_template_id, i.display_template_args);
       var actions = inboxActions(i);
-      var buttons = actions.map(function (act) {
-        return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
-      }).join("");
+      // Invariant: as on the Overview, a held approval is decided inline only at Tier 2; every other
+      // served tier links to Approvals, where a Tier 1 decision takes the drawer's two steps.
+      var reviewInApprovals = i.kind === "approval_pending" && i.tier !== "tier2";
+      var buttons = reviewInApprovals
+        ? '<a class="btn" href="#approvals" data-evidence-review="' + escHtml(i.item_id) + '">Review in Approvals</a>'
+        : actions.map(function (act) {
+          // A decision control shares the one decision lock; a receipt link is not a decision.
+          const decides = act === "approve" || act === "deny" || act === "dismiss";
+          return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '"' + (decides ? approvalDecisionDisabled() : "") + '>' + INBOX_ACTION_LABEL[act] + '</button>';
+        }).join("");
       var tierBadge = i.kind === "approval_pending"
         ? '<span class="pill">' + escHtml(i.tier) + '</span>'
         : '<span class="pill">' + escHtml(i.kind) + '</span>';
       return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
         (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
-        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
+        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + batchSelectionDisabled() + '>' +
         '<div class="grow">' + escHtml(text) + '</div>' +
         tierBadge +
-        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
-        '<div style="display:flex;gap:4px;">' + buttons + '</div>' +
+        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '"' + (decisionInFlight() ? approvalDecisionDisabled() : ' title="Snooze"') + '>...</button>' +
+        '<div style="display:flex;gap:4px;">' + buttons + '</div>' + renderDecisionInline(i) +
         '</div>';
     }
     var sections = [];
@@ -3108,39 +4160,31 @@ function renderActivityScreen() {
     inboxRows = redactedNotice + sections.join("\n");
   }
   const total = sourceLoaded(HUB + "/inbox") ? state.inbox.filter(function (i) { return !i.resolved; }).length : "Unknown";
+  // The count states what the filters and the time range left showing, out of
+  // every open item, so a narrowed list never reads as the whole inbox.
+  const inboxCount = sourceLoaded(HUB + "/inbox") ? visibleInbox.length + " of " + total : "Unknown";
   if (!sourceLoaded(HUB + "/inbox")) inboxRows = renderSourceRead(HUB + "/inbox");
   return [
-    '<section class="concierge-wrap">',
-      '<div class="page-head"><div>',
-        '<p class="eyebrow">Activity</p>',
-        '<h1>Everything across your fortress.</h1>',
-        '<p class="sub">Approvals, blocked actions, privacy events, and budget warnings, with filters to find one. Approve or deny right here. Anything waiting on you also shows in the rail.</p>',
-      '</div></div>',
+    '<section class="evidence-ops">',
       '<section class="card">',
         '<h3>This fortress</h3>',
         (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
         '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
         '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
       '</section>',
-      '<section class="card"><h3>Inbox (' + total + ')</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
+      '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + renderDecisionBatchInline() + inboxRows + snoozeDialog + '</section>',
+      renderEvidenceDecidedApprovals(),
       '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
       '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
     '</section>'
   ].join("");
 }
 
-// ── Posture screen (one-surface fold, 2026-06-30) ───────────────────────
-// The full posture detail folded into the single default surface. Reuses the
-// EXISTING /api/posture/* data (state.posture.home, fetched by fetchPostureHome)
-// and renders the same evidence the standalone posture board showed: the six
-// metric cards (Protection Requested, Enforcement Confirmed, Castle Wall,
-// Approvals Waiting, Open Anomalies, Audit Chain), Today's Story with the
-// plain-summary toggle, the Anomaly Findings list, and the per-agent rows that
-// link out to the per-agent drill-down (/posture/agent/:id) and the Evidence
-// view (/posture/evidence). HONESTY: Castle Wall reads green only on an "armed"
-// arm-state; each agent reads green only on confirmed live enforcement; the
-// audit chain reads VERIFIED only when chain_verified is true. Named layers
-// only (no L-numbers); no em-dashes in user-visible copy.
+// ── Posture screen (Overview, 2026-10-14) ────────────────────────────────
+// The default surface is the security-console Overview. It reuses served
+// posture, roster, inbox and Sentinel data, then renders honest tiles, the
+// decision queue, findings, and the agents table. Named layers only (no
+// L-numbers); no em-dashes in user-visible copy.
 function evidenceCurrent(evidence) {
   // Protection requires one unambiguous, valid instant; invalid or offset-less evidence fails closed.
   const timestamp = evidence && parseEvidenceTimestamp(evidence.last_enforcement_evidence_at);
@@ -3152,14 +4196,13 @@ function agentEvidenceStatus(agent) {
   if (agent.status !== "active") return agent.status;
   // Only this agent's loaded posture evidence can vouch for protection; roster or machine timestamps cannot.
   const home = sourceLoaded("/api/posture/home") && state.posture.home;
-  const evidence = home && (home.agents || []).find(function (row) { return row.agent_id === agent.agent_id; });
-  return evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence) ? "active" : "unknown";
+  return home && agentEnforcementConfirmedNow(agent, home) ? "active" : "unknown";
 }
 function agentDisplayStatus(agent) {
   return STATUS_MAP[agentEvidenceStatus(agent)] || STATUS_MAP.unknown;
 }
 function postureWallLabel(armState) {
-  if (!sourceLoaded("/api/posture/home") || (armState === "armed" && !evidenceCurrent(state.posture.home && state.posture.home.castle_wall))) return { cls: "pill", text: "Unknown" };
+  if (!sourceLoaded("/api/posture/home") || (armState === "armed" && !evidenceCurrent(state.posture.home && state.posture.home.castle_wall))) return { cls: "pill tone-unknown", text: "Unknown" };
   if (armState === "armed") return { cls: "pill tone-verified", text: "Enforcing" };
   // S5-P distinct non-green: coarse wall enforcing, fine-grained exclusive-egress
   // stack not live. Never the verified/green tone.
@@ -3167,87 +4210,303 @@ function postureWallLabel(armState) {
   if (armState === "degraded") return { cls: "pill tone-degraded", text: "Degraded" };
   if (armState === "not_installed") return { cls: "pill", text: "Not installed" };
   if (armState === "locked_down") return { cls: "pill tone-locked", text: "Locked down" };
-  return { cls: "pill", text: "Unknown" };
+  return { cls: "pill tone-unknown", text: "Unknown" };
 }
-// S3 evidence spine tile. The opts argument and every field in it are optional:
-// the honest render of a missing denominator or a missing timestamp is to OMIT
-// it, never to substitute a placeholder that reads like data.
-//   opts.of            a denominator, rendered only when it is a finite number,
-//                      so a null/NaN total renders a bare count rather than
-//                      "of 0" or "of -".
-//   opts.fresh         an ISO timestamp, rendered through relTimeFromIso. When
-//                      it is absent we render opts.freshNone in the slate
-//                      unknown tone, so "not checked" can never be mistaken
-//                      for "checked recently".
-//   opts.ev            { href, text } link to the evidence behind the number.
-function postureMetricCard(value, label, opts) {
-  const o = opts || {};
-  const ofText = (typeof o.of === "number" && isFinite(o.of))
-    ? '<span class="pm-of">of ' + escHtml(o.of) + '</span>'
-    : "";
-  const freshText = o.fresh ? relTimeFromIso(o.fresh) : "";
-  let freshHtml = "";
-  if (freshText) {
-    freshHtml = '<span class="pm-fresh" title="' + escHtml(o.fresh) + '">checked ' + escHtml(freshText) + '</span>';
-  } else if (o.freshNone) {
-    freshHtml = '<span class="pm-fresh none">' + escHtml(o.freshNone) + '</span>';
+// Slice 3 Overview caps. Each rendered list prints "showing M of N" beside
+// the panel title so the cap bounds client work without hiding the backlog.
+const OVERVIEW_DECISION_LIMIT = 4;
+const OVERVIEW_FINDING_LIMIT = 3;
+const OVERVIEW_AGENT_LIMIT = 8;
+const OVERVIEW_DESTINATION_LIMIT = 3; // Compact Overview preview, with the full served list on Enforcement.
+// Must match BLOCKED_DESTINATION_SERVED_LIMIT in principal-policy/posture.ts.
+const OUTBOUND_DESTINATION_LIMIT = 10;
+
+function overviewSourceReason(path, noun) {
+  const read = sourceRead(path);
+  if (sourceNotServed(path)) return noun + " is not served on this host";
+  if (!read || read.state === "state_UNREAD" || read.state === "state_LOADING") return noun + " has not answered yet";
+  if (read.state === "state_FAILED") return noun + " did not answer" + (read.error ? ": " + stripTrailingPeriod(read.error) : "");
+  return noun + " is not evaluated";
+}
+function sentenceCase(text) {
+  const value = String(text || "");
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
+}
+function stripTrailingPeriod(text) {
+  return String(text || "").replace(/[.]+$/, "");
+}
+function loadedSourceReadAge(path) {
+  return sourceLoaded(path) ? sourceReadAge(path) : null;
+}
+
+function overviewChip(kind, word, detail) {
+  return '<span class="state-chip ' + escHtml(kind) + ' overview-chip"><span class="overview-chip-head"><i aria-hidden="true"></i>' +
+    escHtml(word) + '</span>' + (detail ? '<span class="overview-chip-detail">' + escHtml(detail) + '</span>' : '') + '</span>';
+}
+
+function overviewTile(label, valueHtml, evidenceHtml, href) {
+  return '<div class="overview-tile">' +
+    '<a class="ot-label" href="' + escHtml(href || "#activity") + '">' + escHtml(label) + '</a>' +
+    '<span class="ot-value">' + valueHtml + '</span>' +
+    '<span class="ot-evidence">' + (typeof evidenceHtml === "string" ? evidenceHtml : (evidenceHtml && evidenceHtml.text) || "") + '</span>' +
+  '</div>';
+}
+
+function servedCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function renderOverviewProtection(home) {
+  const loaded = sourceLoaded("/api/posture/home") && home;
+  const requested = loaded ? home.protection_requested_count : null;
+  const detected = loaded ? home.protection_detected_count : null;
+  const known = servedCount(requested) && servedCount(detected) && requested <= detected;
+  const reason = !loaded ? overviewSourceReason("/api/posture/home", "posture")
+    : !servedCount(requested) || !servedCount(detected) ? "protection counts not served"
+    : "requested count exceeds detected count";
+  // Policy intent is never an enforcement claim, including a fully requested roster.
+  return overviewTile("Protection requested", known ? escHtml(requested + " of " + detected) : overviewChip("unknown", "UNKNOWN"),
+    known ? "registered agents plus unprotected harnesses · posture read " + escHtml(loadedSourceReadAge("/api/posture/home") || "Unknown") : escHtml(reason), "#agents");
+}
+
+function auditChainEvidence(digest) {
+  return { last_enforcement_evidence_at: digest && digest.window_end, freshness_window_ms: AUDIT_CHAIN_VERIFIED_MAX_AGE_MS };
+}
+
+function auditChainCheckCurrent(digest) {
+  // The chip and counts share both the accepted verdict and its evidence clock.
+  return !!digest && ((digest.chain_verdict === "verified" && digest.chain_verified === true) ||
+    digest.chain_verdict === "verified_suffix_only") && evidenceCurrent(auditChainEvidence(digest));
+}
+
+function windowCoverageReason(d) {
+  // Must match AuditDigest.window_incomplete_reason in principal-policy/posture.ts.
+  if (typeof d.window_complete !== "boolean") return "window completeness not served";
+  if (d.window_complete) return null;
+  switch (d.window_incomplete_reason) {
+    case "read_limit": return "window larger than one read";
+    case "sealed_region": return "sealed audit region coverage not established";
+    // This reason establishes missing coverage, not whether pruning, a legacy prefix, or an append caused it.
+    case "retention": return "the check could not reach the oldest audit entry, so this window is not fully covered";
+    default: return "window coverage not established";
   }
-  const evHtml = o.ev
-    ? '<a class="pm-ev" href="' + escHtml(o.ev.href) + '">' + escHtml(o.ev.text) + ' &rarr;</a>'
-    : "";
-  const foot = (freshHtml || evHtml)
-    ? '<span class="pm-foot">' + freshHtml + evHtml + '</span>'
-    : "";
-  return '<div class="posture-metric"><span class="pm-v">' + value + ofText + '</span><span class="pm-l">' + escHtml(label) + '</span>' + foot + '</div>';
 }
-function renderPostureStory(d) {
-  // F2 BLOCKER-1: three-state from the shared verdict. Never "verified clean"
-  // over a tampered sealed entry; a neutral "sealed history not re-verifiable at
-  // this privilege" for verified_suffix_only.
-  if (state.posture.storyPlain) {
-    const chainText = d.chain_verified
-      ? "The audit log verified clean: no tampering."
-      : d.chain_verdict === "verified_suffix_only"
-        ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
-        : "The audit log is unverified: " + escHtml(d.integrity_finding_count) + " integrity finding(s).";
-    return '<p>Today your agents ran <strong>' + escHtml(d.total_operations) +
-      '</strong> operations in the last 24h. Sanctuary blocked <strong>' + escHtml(d.kernel_blocks) +
-      '</strong> outbound connections and allowed <strong>' + escHtml(d.kernel_allows) +
-      '</strong>. You denied <strong>' + escHtml(d.approvals_denied) +
-      '</strong> approvals and granted <strong>' + escHtml(d.approvals_granted) +
-      '</strong>. ' + chainText + '</p>';
+
+function renderOutboundConnections(d, overview) {
+  d = d || {};
+  // Counts require both a covered window and the same current verified/suffix check as the chip.
+  // Continuing paths also require dated reads and safe served counts; all refusals name their missing evidence.
+  // Must match the fail-honest returns in buildAuditDigest (principal-policy/posture.ts).
+  // Counts and the chip must name the same missing evidence; a mismatched verdict is not a stale verification.
+  const reason = (d.chain_verdict !== "verified" && d.chain_verdict !== "verified_suffix_only") || (d.chain_verdict === "verified" && d.chain_verified !== true) ? "chain not verified"
+    : windowCoverageReason(d) ? windowCoverageReason(d)
+    : !Number.isFinite(parseEvidenceTimestamp(d.window_start)) || !Number.isFinite(parseEvidenceTimestamp(d.window_end)) ? "window not stated"
+    : !auditChainCheckCurrent(d) ? "audit check not current"
+    : !servedCount(d.kernel_blocks) || !servedCount(d.kernel_allows) ? "count not served" : null;
+  const notEvaluated = function (why) {
+    const age = why === "audit check not current" ? '<span class="outbound-reason muted">last verified ' + escHtml(relTimeFromIso(d.window_end)) + '</span>' : '';
+    return overviewChip("unknown", "Not evaluated") + '<span class="outbound-reason muted">' + escHtml(why) + '</span>' + age;
+  };
+  // Continuing paths: Blocked needs the common gate; Allowed additionally needs exactly zero overrides.
+  const allowedReason = reason || (!servedCount(d.kernel_allow_overrides) ? "override count not served"
+    : d.kernel_allow_overrides === 1 ? "1 allowed verdict was overridden after it was recorded"
+    : d.kernel_allow_overrides > 0 ? d.kernel_allow_overrides + " allowed verdicts were overridden after they were recorded" : null);
+  const counts = '<div class="outbound-counts"><div>Blocked ' + (reason ? notEvaluated(reason) : '<strong>' + escHtml(d.kernel_blocks) + '</strong>') + '</div><div>Allowed ' +
+    (allowedReason ? notEvaluated(allowedReason) : '<strong>' + escHtml(d.kernel_allows) + '</strong>') + '</div></div>';
+  const windowLabel = Number.isFinite(parseEvidenceTimestamp(d.window_start)) && Number.isFinite(parseEvidenceTimestamp(d.window_end))
+    ? '<p class="muted">window ' + escHtml(shortTime(d.window_start)) + ' to ' + escHtml(shortTime(d.window_end)) + '</p>' : '';
+  let destinations;
+  if (reason) destinations = '<p>' + notEvaluated(reason) + '</p>';
+  else if (!Array.isArray(d.blocked_destinations)) destinations = '<p>' + notEvaluated("Blocked destinations are not served") + '</p>';
+  else {
+    const rows = d.blocked_destinations;
+    // Validation compares served values only; displayed counts are never reconstructed from rows.
+    const validRows = rows.length <= OUTBOUND_DESTINATION_LIMIT && rows.every(function (row) {
+      return row && (row.destination === null || typeof row.destination === "string") && servedCount(row.blocks) && row.blocks > 0 &&
+        (row.last_blocked_at === null || Number.isFinite(parseEvidenceTimestamp(row.last_blocked_at)));
+    });
+    const sum = validRows ? rows.reduce(function (n, row) { return n + row.blocks; }, 0) : NaN;
+    const disagree = !validRows || !servedCount(sum) || sum > d.kernel_blocks ||
+      !servedCount(d.blocked_destination_count) || d.blocked_destination_count < rows.length ||
+      d.blocked_destination_count > d.kernel_blocks ||
+      (d.kernel_blocks > 0 && (rows.length === 0 || d.blocked_destination_count === 0)) ||
+      (d.blocked_destination_count === rows.length && sum < d.kernel_blocks);
+    // Destinations continue only through the count gate plus row-shape and consistency checks.
+    if (disagree) destinations = '<p>' + notEvaluated("served destination values disagree") + '</p>';
+    else if (d.kernel_blocks === 0) destinations = '<p>No blocked connections in this window</p>';
+    else {
+      const shown = rows.slice(0, overview ? OVERVIEW_DESTINATION_LIMIT : OUTBOUND_DESTINATION_LIMIT);
+      destinations = '<div class="card-head-row"><h4>Blocked destinations <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(d.blocked_destination_count) + '</span></h4>' +
+        (overview ? '<a href="#enforcement">all outbound connections</a>' : '') + '</div>' +
+        '<div class="overview-table-scroll"><table class="overview-table outbound-table"><thead><tr><th>Destination</th><th>Blocks</th><th>Last blocked</th></tr></thead><tbody>' +
+        shown.map(function (row) { return '<tr><td>' + escHtml(row.destination === null ? "destination not recorded" : row.destination) + '</td><td>' + escHtml(row.blocks) + '</td><td>' + escHtml(row.last_blocked_at === null ? "Unknown" : shortTime(row.last_blocked_at)) + '</td></tr>'; }).join("") + '</tbody></table></div>';
+    }
   }
-  const chainLine = d.chain_verified
-    ? '<span class="pill tone-verified">Audit chain verified</span> no tampering.'
-    : d.chain_verdict === "verified_suffix_only"
-      ? '<span class="pill tone-degraded">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
-      : '<span class="pill tone-locked">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>';
-  // S3 denominators: each count states the whole it came out of, so a "4" reads
-  // as 4-of-2,113 rather than an unanchored number. Both totals are computed
-  // from fields already on the digest; nothing new is fetched.
-  const connTotal = (d.kernel_blocks || 0) + (d.kernel_allows || 0);
-  const decidedTotal = (d.approvals_denied || 0) + (d.approvals_granted || 0);
-  const lines = [
-    '<strong>' + escHtml(d.total_operations) + '</strong> operations in the last 24h' +
-      (d.failures ? ', ' + escHtml(d.failures) + ' of them failed.' : '.'),
-    '<strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(connTotal) +
-      ' observed outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.',
-    '<strong>' + escHtml(d.approvals_denied) + '</strong> of ' + escHtml(decidedTotal) +
-      ' decided approvals denied by you, ' + escHtml(d.approvals_granted) + ' granted.',
-    chainLine
-  ];
-  return lines.map(function (l) { return '<div class="story-line">' + l + '</div>'; }).join("");
+  // Enforcement always keeps the window's age and evidence destination, including withheld and empty reads.
+  const foot = overview ? '' : '<div class="evidence pm-foot"><span class="pm-fresh">' +
+    (Number.isFinite(parseEvidenceTimestamp(d.window_end)) ? 'window closed ' + escHtml(relTimeFromIso(d.window_end)) : 'window not stated') +
+    '</span><a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>';
+  return '<section class="card outbound-card"><h3>Outbound connections</h3>' + counts + windowLabel + destinations + foot + '</section>';
 }
-// S3 evidence spine for Today's story: how recently the counted window closed,
-// beside the link to the evidence behind the counts. A digest with no
-// window_end says so rather than letting stale counts read as live.
-function postureStoryFoot(d) {
-  const freshText = d && d.window_end ? relTimeFromIso(d.window_end) : "";
-  const fresh = freshText
-    ? '<span class="pm-fresh" title="' + escHtml(d.window_end) + '">window closed ' + escHtml(freshText) + '</span>'
-    : '<span class="pm-fresh none">window not stated</span>';
-  return '<div class="evidence pm-foot">' + fresh +
-    '<a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>';
+
+function postureEvidenceByAgent(home) {
+  const map = Object.create(null);
+  (home && home.agents || []).forEach(function (row) { if (row && row.agent_id) map[row.agent_id] = row; });
+  return map;
+}
+
+function unprotectedHarnesses(home) {
+  return home && home.unwrapped && Array.isArray(home.unwrapped.unwrapped) ? home.unwrapped.unwrapped : null;
+}
+
+function isRosterStateProtectable(agent) {
+  return agent && agent.status !== "locked_down" && agent.status !== "error" && agent.status !== "paused";
+}
+
+function agentEnforcementConfirmedNow(agent, home) {
+  const evidence = postureEvidenceByAgent(home)[agent && agent.agent_id];
+  // Invariant: confirmed means this protected agent has current active enforcement evidence and is not in a continuing roster state that suspends or invalidates it.
+  return !!(isRosterStateProtectable(agent) && evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence));
+}
+
+function oldestAge(items) {
+  const times = items.map(function (i) { return parseEvidenceTimestamp(i.created_at || ""); }).filter(Number.isFinite);
+  if (!times.length) return "oldest age Unknown";
+  return "oldest " + durationLabelFromMs(Date.now() - Math.min.apply(null, times)) + " ago";
+}
+
+function overviewFirstRun(home) {
+  const unwrapped = unprotectedHarnesses(home);
+  const detectedHarnesses = Array.isArray(unwrapped) ? unwrapped : [];
+  const reason = !Array.isArray(unwrapped)
+    ? "Unprotected-harness list was not served"
+    : detectedHarnesses.length
+    ? String(detectedHarnesses.length) + " agent harness" + (detectedHarnesses.length === 1 ? "" : "es") + " detected, none protected"
+    : "No harness was detected";
+  return '<section class="overview-empty" data-overview-first-run="1">' +
+    '<h2>No agents protected yet</h2>' +
+    '<p>' + escHtml(sentenceCase(reason) + ". Evidence read " + (loadedSourceReadAge("/api/posture/home") || "is current only after the first check") + ".") + '</p>' +
+    (detectedHarnesses.length ? '<p class="muted">' + escHtml(detectedHarnesses.map(function (u) { return u.harness || "unknown harness"; }).join(", ")) + '</p>' : '') +
+    '<a class="btn btn-primary" href="#agents">Protect an agent</a>' +
+  '</section>';
+}
+
+function overviewDecisionRow(item) {
+  const text = renderTemplate(item.display_template_id, item.display_template_args);
+  const agentId = item.agent_id || "";
+  const createdAt = parseEvidenceTimestamp(item.created_at || "");
+  const wait = Number.isFinite(createdAt) ? durationLabelFromMs(Date.now() - createdAt) + " ago" : "Unknown";
+  const tier = item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : (item.tier ? "Tier " + String(item.tier) : "Tier unknown");
+  // Invariant: inline decisions are a positive Tier 2 affordance only; every other served tier stays on the full Approvals path.
+  const actions = item.tier === "tier2"
+    ? '<div class="actions"><button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Allow once</button>' +
+      '<button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Deny</button></div>' + renderDecisionInline(item)
+    : '<a class="btn btn-sm" href="#approvals" data-overview-review="' + escHtml(item.item_id) + '">Review in Approvals</a>';
+  const agentCell = agentId
+    ? '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(agentId) + '">' + escHtml(agentId) + '</a>'
+    : '<span>agent not named</span>';
+  return '<tr><td class="overview-tier"><span class="mono">' + escHtml(tier) + '</span></td><td>' + agentCell + '</td>' +
+    '<td class="mono">' + escHtml(item.operation_category || "approval") + '</td><td>' + escHtml(text) + '</td><td class="mono">' + escHtml(wait) + '</td><td>' + actions + '</td></tr>';
+}
+
+function renderOverviewDecisionQueue() {
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Not evaluated</span></h3></div>' +
+      '<div class="overview-empty"><h3>Approvals Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason(HUB + "/inbox", "approval queue"))) + '.</p><button class="btn" data-action="retry-panel" data-read="' + HUB + "/inbox" + '">Retry</button></div></section>';
+  }
+  if (state.inboxRedacted) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Unknown</span></h3></div>' +
+      '<div class="overview-empty"><h3>Approvals hidden</h3><p>Approval queue is hidden until you paste the operator token. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p><a class="btn" href="#approvals">Open Approvals</a></div></section>';
+  }
+  const all = heldApprovalItems(null).slice().sort(function (a, b) {
+    return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
+  });
+  const shown = all.slice(0, OVERVIEW_DECISION_LIMIT);
+  const evidence = approvalQueueEvidence();
+  if (!all.length) {
+    // The same evidence bound as Approvals prevents a full or unrecognized page from claiming an empty queue.
+    if (!evidence.earned) return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</span></h3></div>' + evidence.emptyHtml + evidence.warning + '<a class="btn" href="#approvals">Open Approvals</a></section>';
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">0 of 0 · queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</span></h3></div>' +
+      '<div class="overview-empty"><h3>No approvals waiting</h3><p>0 of 0 held operations are open. Queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '.</p><a class="btn" href="#activity">Open Evidence</a></div></section>';
+  }
+  // The card's recognized total covers only the served page, so a full page cannot present it as exact.
+  return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(all.length) + (evidence.full ? '+' : '') + ' · ' + escHtml(oldestAge(all)) + '</span></h3>' +
+    '<a href="#approvals">all approvals</a></div><div class="overview-table-scroll"><table class="overview-table overview-table-decisions"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting</th><th></th></tr></thead><tbody>' +
+    // Recognized rows do not account for unknown tiers, so the card must retain their separate warning.
+    shown.map(overviewDecisionRow).join("") + '</tbody></table></div>' + evidence.warning + '</section>';
+}
+
+function severityClass(level) {
+  const v = String(level || "info").toLowerCase();
+  if (v === "critical" || v === "high" || v === "medium" || v === "low") return v;
+  return "info";
+}
+function severityRank(level) {
+  const sev = severityClass(level);
+  return sev === "critical" ? 0 : sev === "high" ? 1 : sev === "medium" ? 2 : sev === "low" ? 3 : 4;
+}
+
+function renderOverviewFindingsPanel() {
+  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
+  const findings = unknown ? [] : (state.posture.anomalies || []).slice().sort(function (a, b) {
+    return severityRank(a.severity) - severityRank(b.severity);
+  });
+  const shown = findings.slice(0, OVERVIEW_FINDING_LIMIT);
+  const list = unknown
+    ? '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason("/api/anomaly/findings", "Sentinels"))) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="/api/anomaly/findings">Retry Anomaly findings</button></div>'
+    : shown.length
+      ? '<div class="overview-list">' + shown.map(function (f) {
+          const sev = severityClass(f.severity);
+          return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Sentinel: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
+        }).join("") + '</div>'
+      : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
+  return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
+    (unknown ? "Not evaluated" : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
+    '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
+    '<p class="muted">Fleet enforcement status comes from the Machines screen health probes; this Overview does not infer remote protection from local evidence.</p></section>';
+}
+
+function agentBudgetText(agent) {
+  const daily = agent && agent.budget_summary && agent.budget_summary.daily;
+  if (!daily) return "Unknown";
+  return String(daily.used) + " of " + String(daily.cap) + " " + String(daily.unit || "");
+}
+
+function agentStateChip(agent) {
+  const status = agentEvidenceStatus(agent);
+  const evidence = postureEvidenceByAgent(state.posture.home || {})[agent && agent.agent_id];
+  const evidenceAge = evidence && evidence.last_enforcement_evidence_at ? relTimeFromIso(evidence.last_enforcement_evidence_at) : "";
+  if (status === "active") return overviewChip("good", "RUNNING", evidenceAge);
+  const tone = { paused: "neutral", restarting: "neutral", unwrapping: "neutral", locked_down: "locked", error: "bad" }[status] || "unknown";
+  return overviewChip(tone, agentDisplayStatus(agent).label.toUpperCase());
+}
+
+function agentEnforcementChip(agent) {
+  const evidence = postureEvidenceByAgent(state.posture.home || {})[agent && agent.agent_id];
+  const evidenceAge = evidence && evidence.last_enforcement_evidence_at ? relTimeFromIso(evidence.last_enforcement_evidence_at) : "";
+  return agentEvidenceStatus(agent) === "active"
+    ? overviewChip("good", "CONFIRMED", evidenceAge)
+    : overviewChip("unknown", "UNKNOWN");
+}
+
+function renderOverviewAgentsTable(agents, limit, offset) {
+  const roster = agents || state.agents;
+  const pageLimit = limit || OVERVIEW_AGENT_LIMIT;
+  if (!sourceLoaded(HUB + "/agents")) {
+    return '<section class="card"><div class="card-head-row"><h3>Agents <span class="count-age">Not evaluated</span></h3></div><div class="overview-empty"><h3>Agent roster Unknown</h3><p>' + escHtml(overviewSourceReason(HUB + "/agents", "agent roster")) + '.</p><button class="btn" data-action="retry-panel" data-read="' + HUB + "/agents" + '">Retry</button></div></section>';
+  }
+  const shown = roster.slice(offset || 0, (offset || 0) + pageLimit);
+  const rows = shown.map(function (a) {
+    const owner = a.identity_id || "Unknown";
+    const template = a.channel_template_id || "Unknown";
+    const policyAge = loadedSourceReadAge(HUB + "/policies");
+    return '<tr><td><a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) + '</a></td>' +
+      '<td>' + escHtml(owner) + '</td><td>' + escHtml(a.harness || "Unknown") + '</td><td>' + escHtml(template) + '</td>' +
+      '<td class="mono">Unknown hosts · Unknown MCP · Unknown tools<br><span class="muted">' + escHtml((a.policy_id || "policy Unknown") + (policyAge ? " · policy read " + policyAge : "")) + '</span></td>' +
+      '<td>' + agentEnforcementChip(a) + '</td><td>' + agentStateChip(a) + '</td><td>' + escHtml(agentBudgetText(a)) + '</td><td class="mono muted">' + escHtml(a.last_activity_at ? relTimeFromIso(a.last_activity_at) : "no activity reported") + '</td></tr>';
+  }).join("");
+  return '<section class="card"><div class="card-head-row"><h3>Agents <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(roster.length) + ' · <a href="#agents">all agents</a></span></h3><span class="count-age">Reach (allowed of requested)' + (loadedSourceReadAge(HUB + "/policies") ? ' · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies")) : '') + '</span></div>' +
+    '<div class="overview-table-scroll"><table class="overview-table overview-table-agents"><thead><tr><th>Agent</th><th>Owner</th><th>Harness</th><th>Policy template</th><th>Reach (allowed of requested)</th><th>Enforcement</th><th>State</th><th>Budget today</th><th>Last activity</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
 }
 function renderPostureAnomalies(findings, unknown) {
   if (unknown) {
@@ -3309,112 +4568,1371 @@ function renderPostureScreen() {
   const home = state.posture.home;
   const head =
     '<div class="page-head"><div>' +
-      '<p class="eyebrow">Posture</p>' +
-      '<h1>How safe you are right now.</h1>' +
-      '<p class="sub">The full posture detail, on this one surface. Castle Wall reads protected only on a fresh enforcement check. Every number traces to your signed audit trail.</p>' +
+      '<p class="eyebrow">Overview</p>' +
+      '<h1>Overview</h1>' +
+      '<p class="sub">What needs attention now. Unknown means a source has not answered or has not proven the value.</p>' +
     '</div></div>';
   if (!sourceLoaded("/api/posture/home") || !home) {
     const why = state.posture.homeError
-      ? 'Protection status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
-      : 'Protection status unavailable. Current data is Unknown.';
+      ? 'Protection status unavailable. Overview unavailable. This dashboard could not read the latest posture check. ' + escHtml(state.posture.homeError)
+      : 'Protection status unavailable. Overview unavailable. Current posture is Unknown.';
+    return '<section class="overview-page">' + head + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' +
+      '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
+      '</section>';
+  }
+  const machineLine = home.origin_machine
+    ? '<p class="muted overview-machine">Machine <span class="mono">' + escHtml(home.origin_machine) + '</span></p>'
+    : '';
+  if (sourceLoaded(HUB + "/agents") && state.agents.length === 0 && (home.agents || []).length === 0) {
+    const below = [];
+    // An empty agent roster cannot establish that a full or unrecognized inbox page has no holds.
+    if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && !approvalQueueEvidence().earned) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
+    if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
+    return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' + below.join("") + '</section>';
+  }
+  const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
+  const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
+  const vaultNotice = vaultProvision === "not_yet_walled"
+    ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    : "";
+  const findings = home.anomaly_findings || [];
+  const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
+  const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
+  const digest = home.digest || {};
+  const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
+  const wallChip = wall.text === "Enforcing"
+    ? overviewChip("good", "ENFORCING", wallAge)
+    : wall.text === "Coarse-only" || wall.text === "Degraded"
+      ? overviewChip("warn", wall.text.toUpperCase(), wallAge || "evidence not current")
+      : wall.text === "Locked down"
+        ? overviewChip("locked", "LOCKED DOWN", wallAge)
+        : wall.text === "Not installed"
+          ? overviewChip("warn", "NOT INSTALLED", wallAge || "not installed")
+          : overviewChip("unknown", "UNKNOWN", wallAge || "no evidence");
+  const pendingKnown = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
+  const pending = pendingKnown ? heldApprovalItems(null) : [];
+  const pendingEvidence = approvalQueueEvidence();
+  // Only earned evidence permits an unqualified zero; full pages and unknown tiers retain their bounds below.
+  const pendingValue = pendingEvidence.earned ? "0" : pending.length + (pendingEvidence.full ? "+" : "");
+  const pendingNote = (pendingEvidence.full ? "from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items · " : "") +
+    (pendingEvidence.unknown ? pendingEvidence.unknownLine + " · " : "");
+  const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
+  // VERIFIED requires current evidence from this digest build; stale and future checks never remain green.
+  const checkCurrent = auditChainCheckCurrent(digest);
+  const chainVerified = digest.chain_verified === true && digest.chain_verdict === "verified" && checkCurrent;
+  // The verdict covers the whole chain, so only a positive safe window count can supply a findings detail.
+  const findingDetail = Number.isSafeInteger(digest.integrity_finding_count) && digest.integrity_finding_count > 0
+    ? digest.integrity_finding_count + (digest.integrity_finding_count === 1 ? " finding" : " findings") : "chain not verified";
+  const chainChip = chainVerified
+    ? overviewChip("good", "VERIFIED", relTimeFromIso(digest.window_end))
+    : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent
+      ? overviewChip("unknown", "UNKNOWN", "last verified " + (Number.isFinite(chainWindowEnd) ? relTimeFromIso(digest.window_end) : "Unknown"))
+    : digest.chain_verdict === "findings"
+      ? overviewChip("bad", "FAILED", findingDetail)
+      : digest.chain_verdict === "verified_suffix_only" && checkCurrent
+      ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
+      : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
+  const metricCards =
+    '<div class="overview-tiles" aria-label="At a glance">' +
+      renderOverviewProtection(home) +
+      overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
+      overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
+      // Must match renderAnomalyFindingsCard on the Findings screen: both count /api/anomaly/findings.
+      overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
+      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
+    '</div>';
+  return [
+    '<section class="overview-page">',
+      head,
+      machineLine,
+      metricCards,
+      vaultNotice,
+      renderOverviewDecisionQueue(),
+      renderOverviewFindingsPanel(),
+      renderOutboundConnections(digest, true),
+      renderOverviewAgentsTable(),
+      '<p class="muted">Overview values come directly from served posture, approval, Sentinel and roster reads. Unknown remains explicit when a source has not answered.</p>',
+    '</section>'
+  ].join("");
+}
+
+// ── Slice 2 shell: folded destinations (2026-10-13) ─────────────────────
+// The rail's new screens are compositions of renderers this client already
+// had; none reads a new endpoint, and every number keeps its denominator and
+// the age of the read behind it. The older routes they host keep rendering
+// on their own hashes.
+
+// A folded section: an older screen hosted inside a rail destination, with a
+// link to the same content on its own route (the frozen hash id). The fold's
+// head carries the hosted page's eyebrow and title, and the stylesheet hides
+// the hosted page's own eyebrow and h1 inside a fold, so no heading repeats.
+// titleSuffixHtml is trusted markup from the caller (a status pill the hosted
+// h1 carried), never data.
+function renderFoldedSection(eyebrow, title, routeId, html, titleSuffixHtml) {
+  return '<section class="folded-section" data-folded-route="' + escHtml(routeId) + '">' +
+    '<div class="folded-head"><div><p class="eyebrow">' + escHtml(eyebrow) + '</p>' +
+    '<h2>' + escHtml(title) + (titleSuffixHtml ? ' ' + titleSuffixHtml : '') + '</h2></div>' +
+    '<a href="#' + escHtml(routeId) + '">Open on its own page</a></div>' +
+    html + '</section>';
+}
+
+// Settings tab strip. Each tab is a hash link to the older route id, so the
+// active tab is simply the current route.
+function settingsTabStrip(activeId) {
+  return '<div class="screen-tabs"><p class="eyebrow">Settings</p><nav aria-label="Settings">' +
+    SETTINGS_TABS.map(function (t) {
+      const active = t.id === activeId;
+      return '<a href="#' + t.id + '"' + (active ? ' class="active" aria-current="page"' : '') + '>' + escHtml(t.label) + '</a>';
+    }).join("") + '</nav></div>';
+}
+
+// The age of a source's last read, as "Ns ago", or null before any read.
+// Read start is the bound: the data on screen is at least this old.
+function sourceReadAge(path) {
+  const read = sourceRead(path);
+  if (!read || !read.lastReadAt) return null;
+  return durationLabelFromMs(Date.now() - read.lastReadAt) + " ago";
+}
+
+// The waiting count, its denominator, and the age of the queue read behind
+// it, as one sentence for titles and accessible names. Unknown until the
+// queue read is LOADED (never a zero the client has not observed). The
+// numerator honors the agent scope; the denominator is every held operation
+// on this fortress. A redacted queue reports the server's pending count,
+// which no agent scope can narrow.
+function approvalWaitingSummary() {
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return { known: false, n: null, of: null, sentence: "Held operations waiting on you: Unknown until the approval queue loads." };
+  }
+  const age = sourceReadAge(HUB + "/inbox") || "at an unknown time";
+  if (state.inboxRedacted) {
+    const hidden = state.inboxRedactedCount;
+    // A served redacted count cannot establish emptiness because hidden rows and tiers cannot be checked.
+    return { known: true, n: hidden, of: hidden, earned: false, unrecognized: 0, sentence: hidden + " of " + heldOperationsPhrase(hidden, "waits", "wait") + " on you, hidden until you paste the operator token · queue read " + age + "." };
+  }
+  const evidence = approvalQueueEvidence();
+  const n = evidence.waiting;
+  const of = evidence.total;
+  const scope = state.agentScope.selectedAgentId;
+  // A full page establishes observed counts only, so the sentence binds them to the served inbox page.
+  const countLine = n + " of " + (evidence.full
+    ? heldOperationsPhrase(of) + " in the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items " + (of === 1 ? "waits" : "wait")
+    : heldOperationsPhrase(of, "waits", "wait")) + " on you";
+  // Unknown tiers cannot disappear into a recognized zero, even when the current agent scope hides them.
+  // The wording comes from approvalQueueEvidence so the queue warning, tile, seal row and this sentence say it the same way.
+  const unknownClause = evidence.unknown ? "; " + evidence.unknownLine : "";
+  return { known: true, n: n, of: of, full: evidence.full, earned: evidence.earned, unrecognized: evidence.unknown, sentence: countLine + (scope ? " (scoped to " + scope + ")" : "") + unknownClause + " · queue read " + age + "." + (evidence.full ? evidence.pageEdge : "") };
+}
+
+function renderApprovalCounts() {
+  const w = approvalWaitingSummary();
+  const suffix = w.full ? "+" : "";
+  const text = w.known ? w.n + suffix + " of " + w.of + suffix : "Unknown";
+  // The pill's digits count recognized holds only, so a hold they count, inside or outside the agent scope, looks hot.
+  const counted = w.known && w.of > 0;
+  // An unearned zero cannot look calm because unseen or unrecognized holds may still need a decision.
+  const unknown = !w.known || (!w.earned && !counted);
+  const railCount = document.getElementById("rail-approvals-count");
+  if (railCount) {
+    railCount.className = "count" + (unknown ? " unknown" : counted ? " hot" : "");
+    railCount.textContent = text;
+    const link = railCount.parentElement;
+    if (link && typeof link.setAttribute === "function") {
+      link.setAttribute("title", w.sentence);
+      link.setAttribute("aria-label", "Approvals: " + w.sentence);
+    }
+  }
+  const notify = document.getElementById("btn-notifications");
+  if (notify) {
+    notify.setAttribute("title", w.sentence);
+    notify.setAttribute("aria-label", "Approvals: " + w.sentence);
+    // The badge goes only when nothing waits fortress-wide: a zero scoped to
+    // one agent while other agents' holds wait is not an all-clear, so the
+    // badge stays and reads "0 of N". Full pages and unknown tiers also cannot
+    // earn an empty claim; the title states the count bounds and age.
+    if (w.known && w.earned) notify.classList.remove("waiting");
+    else notify.classList.add("waiting");
+  }
+  const badge = document.getElementById("notify-count");
+  if (badge) {
+    // Hiding the badge is an empty-queue claim and requires the same evidence as the calm summary.
+    badge.hidden = w.known && w.earned;
+    // The badge signals any observed hold, including a tier this console cannot decide, so only a zero with
+    // nothing observed takes the unknown look.
+    badge.className = "wait" + (unknown && !(w.known && w.unrecognized > 0) ? " unknown" : "");
+    badge.innerHTML = '<i aria-hidden="true"></i>' + escHtml(text);
+  }
+}
+
+// Route-dependent top-bar state: the waiting count, the time range (live
+// only where a screen has a client-side window), the Talk button and panel,
+// and the search results. Called on every route change and rerender.
+function renderShellChrome() {
+  renderApprovalCounts();
+  const range = document.getElementById("time-range");
+  if (range) {
+    const applies = TIME_RANGE_ROUTES.indexOf(state.route) >= 0;
+    range.disabled = !applies;
+    range.value = state.timeRange;
+    range.setAttribute("title", applies
+      ? "Time range for the Evidence list: " + TIME_RANGE_LABEL[state.timeRange] + "."
+      : "This screen shows current state and has no time window. The time range applies to the Evidence list.");
+  }
+  const talkBtn = document.getElementById("btn-talk");
+  if (talkBtn) {
+    const talkShown = state.route === "dashboard" || !!state.talk.open;
+    if (talkShown) talkBtn.classList.add("active"); else talkBtn.classList.remove("active");
+    talkBtn.setAttribute("aria-expanded", state.talk.open && state.route !== "dashboard" ? "true" : "false");
+  }
+  renderTalkPanel();
+  renderSearchResults();
+}
+
+// Talk as a panel: the full-page concierge renderer, mounted in the right-hand
+// panel. On Talk's own full-page route the panel stays shut, so the
+// concierge's element ids exist once in the document.
+let talkPanelLegacyCache = null;
+function renderTalkPanel() {
+  const panel = document.getElementById("talk-panel");
+  const body = document.getElementById("talk-panel-body");
+  if (!panel || !body) return;
+  const open = !!state.talk.open && state.route !== "dashboard";
+  if (!open) {
+    // Capture before hide: a hidden panel's history has no layout box, so any
+    // viewport read after panel.hidden = true is zero geometry. The reader's
+    // position is saved first, and only then is the panel shut.
+    if (!talkDomOwnerSupported) {
+      if (talkPanelLegacyCache !== null) {
+        saveTalkViewport(body.querySelector("#concierge-history"));
+        body.innerHTML = "";
+        talkPanelLegacyCache = null;
+      }
+    } else if (talkOwner && talkOwner.host === body) disposeTalkOwner();
+    else if (body.firstChild) body.innerHTML = "";
+    panel.hidden = true;
+    return;
+  }
+  // Shown before any mount or restore: a scrollTop written into a hidden
+  // panel's history is discarded, so the panel must have layout first.
+  panel.hidden = false;
+  if (!talkDomOwnerSupported) {
+    const html = renderDashboardConcierge();
+    if (html !== talkPanelLegacyCache) {
+      const viewport = saveTalkViewport(body.querySelector("#concierge-history"));
+      const focus = captureInputFocus(body);
+      body.innerHTML = html;
+      talkPanelLegacyCache = html;
+      restoreInputFocus(body, focus);
+      restoreLegacyTalkHistory(body.querySelector("#concierge-history"), viewport);
+    }
+    return;
+  }
+  if (talkOwner && talkOwner.host === body) {
+    hydrateTalkHost(body);
+    return;
+  }
+  if (talkOwner) disposeTalkOwner();
+  body.innerHTML = renderDashboardConcierge();
+  attachTalkOwner(body);
+}
+
+// Top-bar search over what this page already holds: agents, waiting
+// approvals and recent evidence rows. No endpoint; a group whose read has not
+// loaded says so instead of reporting no match.
+const SEARCH_HITS_PER_GROUP = 6;
+function searchGroups(needle) {
+  const match = function (text) { return String(text || "").toLowerCase().indexOf(needle) >= 0; };
+  return [
+    {
+      label: "Agents",
+      loaded: sourceLoaded(HUB + "/agents"),
+      total: state.agents.length,
+      hits: state.agents.filter(function (a) { return match(a.agent_id) || match(a.harness); }).map(function (a) {
+        return '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) +
+          '<span class="sr-meta">' + escHtml(agentDisplayStatus(a).label || "") + '</span></a>';
+      })
+    },
+    {
+      label: "Waiting approvals",
+      loaded: sourceLoaded(HUB + "/inbox") && !state.inboxRedacted,
+      // Loaded but redacted: the server withheld the items, so a match can be
+      // neither shown nor ruled out until the operator token is pasted.
+      hidden: sourceLoaded(HUB + "/inbox") && !!state.inboxRedacted,
+      total: heldApprovalItems(null).length,
+      hits: heldApprovalItems(null).filter(function (i) {
+        return match(renderTemplate(i.display_template_id, i.display_template_args)) || match(i.agent_id);
+      }).map(function (i) {
+        return '<a href="#approvals">' + escHtml(renderTemplate(i.display_template_id, i.display_template_args)) +
+          '<span class="sr-meta">' + escHtml(i.tier || "") + '</span></a>';
+      })
+    },
+    {
+      label: "Recent evidence",
+      loaded: sourceLoaded(HUB + "/activity"),
+      total: state.activity.length,
+      hits: state.activity.filter(function (e) {
+        return match(renderTemplate(e.display_template_id, e.display_template_args)) || match(e.agent_id) || match(e.category);
+      }).map(function (e) {
+        return '<a href="#activity">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) +
+          '<span class="sr-meta">' + escHtml(shortTime(e.emitted_at)) + '</span></a>';
+      })
+    }
+  ];
+}
+function renderSearchResults() {
+  const panel = document.getElementById("search-results");
+  const input = document.getElementById("global-search");
+  if (!panel) return;
+  const needle = String(state.search.query || "").trim().toLowerCase();
+  const open = !!state.search.open && needle.length > 0;
+  panel.hidden = !open;
+  if (input && typeof input.setAttribute === "function") input.setAttribute("aria-expanded", open ? "true" : "false");
+  if (!open) return;
+  const groups = searchGroups(needle);
+  const scope = groups.map(function (g) {
+    return g.loaded ? g.total + " " + g.label.toLowerCase() : g.label.toLowerCase() + (g.hidden ? " hidden" : " not loaded");
+  }).join(", ");
+  let any = false;
+  // A "no match" line is a negative result, so it is earned only when at
+  // least one group actually loaded and none matched; with nothing loaded
+  // the honest answer is that nothing searchable has loaded yet.
+  const anyLoaded = groups.some(function (g) { return g.loaded; });
+  const body = groups.map(function (g) {
+    if (g.hidden) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: hidden until you paste the operator token, so a match cannot be ruled out.</div>';
+    if (!g.loaded) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: not loaded yet, so a match cannot be ruled out.</div>';
+    if (!g.hits.length) return "";
+    any = true;
+    const shown = g.hits.slice(0, SEARCH_HITS_PER_GROUP);
+    return '<div class="sr-group">' + escHtml(g.label) + ' (' + shown.length + ' of ' + g.hits.length + ' matches)</div>' + shown.join("");
+  }).join("");
+  panel.innerHTML = '<div class="sr-scope">Searching what this page has loaded: ' + escHtml(scope) + '.</div>' +
+    body + (any ? "" : anyLoaded
+      ? '<div class="sr-empty" data-search-no-match="1">No match in what this page has loaded.</div>'
+      : '<div class="sr-empty" data-search-nothing-loaded="1">Nothing searchable has loaded yet, so no result is known.</div>');
+}
+
+// One page bounds the Approvals queue and its evidence claims.
+const APPROVAL_QUEUE_ITEM_CAP = 100; // 100 matches HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts, the one page this client reads.
+// Must match CHARTER_APPROVAL_ITEM_ID_PREFIX in server/src/hub/charter-approval-bridge.ts.
+const CHARTER_APPROVAL_ITEM_ID_PREFIX = "charter.approval.";
+
+// All three approval surfaces share the same evidence bounds so none can earn a false calm zero.
+function approvalQueueEvidence() {
+  const ready = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
+  const full = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP;
+  // A decided item is no longer held, so only waiting items with an unrecognized tier are counted.
+  const unknown = state.inbox.filter(function (i) {
+    return i.kind === "approval_pending" && !i.resolved && i.tier !== "tier1" && i.tier !== "tier2";
+  }).length;
+  const unknownLine = unknown === 1 ? "1 held item carries a tier this console does not recognize" : unknown + " held items carry a tier this console does not recognize";
+  const warning = ready && unknown
+    ? '<p class="muted">' + unknownLine + (unknown === 1
+      ? '. It is not shown here and cannot be decided from this screen.'
+      : '. They are not shown here and cannot be decided from this screen.') + '</p>' : "";
+  const waiting = pendingApprovalItems().length;
+  const outside = heldApprovalItems(null).length - waiting;
+  let title = "Nothing selected";
+  let line = "";
+  // A partial or redacted read cannot establish an empty queue.
+  const earned = ready && !full && !unknown && !waiting && !outside;
+  const pageEdge = " The inbox has at least " + APPROVAL_QUEUE_ITEM_CAP + " items and this read shows only the first " + APPROVAL_QUEUE_ITEM_CAP + ", so a held operation may be waiting past them.";
+  if (!ready) line = state.inboxRedacted ? "Approvals are hidden, not empty. Pending count: " + state.inboxRedactedCount + "." : "Approval data is Unknown until the queue read loads.";
+  // Observed recognized holds cannot exclude unknown tiers or holds beyond this page in the selected scope.
+  else if (outside && !waiting) line = "No recognized held operation for " + (state.agentScope.selectedAgentId || "this agent") + " is waiting in this read. " + (full ? "At least " : "") + heldOperationsPhrase(outside, "waits", "wait") + " outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
+  else if (full && !waiting) {
+    // The inbox serves no total, so a full page cannot rule out a held operation beyond its edge.
+    line = state.inbox.some(function (i) { return i.kind === "approval_pending"; }) ? "No recognized held operation is waiting in this page." : "None of the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items is a held operation.";
+    line += pageEdge;
+  } else if (unknown && !waiting) {
+    // Unrecognized holds are not shown, so the empty state says what is known instead of rendering blank.
+    line = "No recognized held operation is waiting.";
+  } else if (earned) {
+    title = "No approvals waiting";
+    line = "0 of 0 held operations are waiting on you.";
+  }
+  const emptyHtml = '<div class="queue-empty"' + (outside && !waiting ? ' data-scoped-empty="1"' : '') + '>' +
+    (earned ? '<span class="qe-check"></span>Nothing waiting on you.' : escHtml(line)) + '</div>';
+  let summary = emptyHtml;
+  if (ready && waiting) {
+    // Full-page counts describe only a lower bound, never the fortress total.
+    const count = full ? "At least " + heldOperationsPhrase(waiting) + " waiting (from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items)." : heldOperationsPhrase(waiting) + " waiting.";
+    summary = '<div class="queue-empty"><span class="qe-warn"></span>' + escHtml(count) + ' <a href="#approvals">Open Approvals</a>.</div>';
+  }
+  if (!sourceLoaded(HUB + "/inbox")) summary = renderSourceRead(HUB + "/inbox");
+  else if (state.inboxRedacted) summary = '<div class="queue-empty" data-pending-approvals-redacted="1">' + escHtml(line) + '</div>';
+  // Only recognized holds belong in scoped counts; unknown tiers retain their separate warning and cannot earn calm.
+  const total = waiting + outside;
+  const suffix = full ? "+" : "";
+  // A full page bounds both counts even when every observed hold belongs to the selected scope.
+  const count = waiting + suffix + (outside || full ? " of " + total + suffix : "");
+  return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning, count: count, earned: earned, waiting: waiting, outside: outside, total: total, full: full, pageEdge: pageEdge, unknown: unknown, unknownLine: unknownLine };
+}
+
+// "1 held operation" or "N held operations", with the verb that agrees when one is given.
+function heldOperationsPhrase(n, singularVerb, pluralVerb) {
+  const phrase = n === 1 ? "1 held operation" : n + " held operations";
+  return singularVerb ? phrase + " " + (n === 1 ? singularVerb : pluralVerb) : phrase;
+}
+
+function resetApprovalConsent() {
+  // Consent belongs to the selected request and never transfers to a replacement or a changed view.
+  state.approvals.alwaysAllow = false;
+  state.approvals.confirmingTier1Id = null;
+  state.approvals.cancelledTier1Id = null;
+}
+
+function approvalItemsForScreen() {
+  const scope = state.agentScope.selectedAgentId;
+  return state.inbox.filter(function (i) {
+    if (i.kind !== "approval_pending") return false;
+    if (i.tier !== "tier1" && i.tier !== "tier2") return false;
+    if (scope && (i.agent_id || "") !== scope) return false;
+    return true;
+  });
+}
+
+function approvalArg(item, names, fallback) {
+  const args = item && item.display_template_args;
+  if (!Array.isArray(args)) return fallback || "";
+  for (let i = 0; i < args.length; i++) {
+    if (names.indexOf(args[i].kind) >= 0) return String(args[i].value);
+  }
+  return fallback || "";
+}
+
+function approvalAgentId(item) {
+  return item.agent_id || approvalArg(item, ["agent_id"], "this fortress");
+}
+
+function approvalOperation(item) {
+  return item.operation_category || String(item.display_template_id || "").split(".").pop() || "approval";
+}
+
+function approvalText(item) {
+  return renderTemplate(item.display_template_id, item.display_template_args);
+}
+
+function approvalHoldReason(item) {
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  // Hub controls and the catch-all category carry no policy-gate reason in the served item.
+  if (item.operation_category === "other" || !isCharterApprovalItem(item)) return "Held for your decision (" + approvalOperation(item) + ", " + tier + ").";
+  return approvalOperation(item) + " is a " + tier + " operation under the operator policy.";
+}
+
+function isCharterApprovalItem(item) {
+  return !!(item && typeof item.item_id === "string" && item.item_id.indexOf(CHARTER_APPROVAL_ITEM_ID_PREFIX) === 0);
+}
+
+function approvalRecordLine(item) {
+  return isCharterApprovalItem(item) ? "recorded in your audit log" : "marked decided in this inbox";
+}
+
+function approvalOutcomeLine(item) {
+  return isCharterApprovalItem(item) ? "outcome in your audit log" : "outcome not reported by the inbox";
+}
+
+function approvalPolicyUnavailableReason() {
+  if (state.policyView.loadError) return state.policyView.loadError;
+  const read = sourceRead(POLICY + "/current");
+  if (read && read.state === "state_FAILED") return read.error || "Policy engine is not configured on this fortress.";
+  if (read && read.state === "state_NOT_SERVED") return read.error || DASHBOARD_MODE_NOT_SERVED_MESSAGE;
+  if (state.policyView.loading || (read && read.state === "state_LOADING")) return "Checking the policy-change path.";
+  if (!sourceLoaded(POLICY + "/current")) return "Checking the policy-change path.";
+  return "";
+}
+
+function approvalStandingState(item) {
+  const op = promotableOperation(item);
+  if (!op) return { enabled: false, reason: "Always allow is unavailable for this operation." };
+  if (item.tier === "tier1") return { enabled: false, reason: "Tier 1 approvals cannot become standing rules from this drawer." };
+  const unavailable = approvalPolicyUnavailableReason();
+  if (unavailable) return { enabled: false, reason: unavailable };
+  // The standing rule is activated into the fortress policy through the policy engine; this console has no
+  // control that removes one, so the note states that bound instead of promising a revocation path.
+  return { enabled: true, reason: "Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
+}
+
+function batchSelectionLocked() { return decisionInFlight() && state.approvals.lock.kind === "batch"; }
+function batchSelectionDisabled() {
+  // The selection checkboxes pause only while a batch holds the lock; an item decision leaves them live.
+  return batchSelectionLocked() ? ' disabled title="' + DECISION_BUSY_REASON + '"' : "";
+}
+function approvalDecisionDisabled() {
+  // Invariant: every decision control on every screen reads the one decision lock, so while a decision is in
+  // flight no second request can be clicked anywhere, and each paused control says why.
+  if (!decisionInFlight()) return "";
+  return ' disabled title="' + (state.approvals.lock.status === "pending" ? DECISION_BUSY_REASON : DECISION_REREAD_BUSY_REASON) + '"';
+}
+
+function renderApprovalRow(item, selectedId) {
+  const selected = item.item_id === selectedId;
+  const agent = approvalAgentId(item);
+  const op = approvalOperation(item);
+  const created = item.created_at || "";
+  const age = created ? relTimeFromIso(created) : "age unknown";
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  if (item.resolved) {
+    // The inbox serves no operator decision outcome, so the screen never
+    // infers allow or deny from agent-control result fields.
+    const outcomeLine = approvalOutcomeLine(item);
+    return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
+      '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
+      '<td><strong>' + escHtml(agent) + '</strong></td>' +
+      '<td class="mono">' + escHtml(op) + '</td>' +
+      '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+      '<td class="mono muted">Decided at ' + escHtml(shortTime(item.resolved_at || created)) + '</td>' +
+      '<td><span class="state-chip neutral"><i aria-hidden="true"></i>DECIDED</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
+    '</tr>';
+  }
+  const disabled = approvalDecisionDisabled();
+  const decisionCell = item.tier === "tier1"
+    ? '<button class="btn btn-sm" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">Review in drawer</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>'
+    : '<button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>';
+  // The queue row echoes its own decision as the drawer does, since the drawer may be showing another request.
+  const echo = item.tier === "tier1" ? "" : renderDecisionInline(item);
+  return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
+    '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
+    '<td><strong>' + escHtml(agent) + '</strong></td>' +
+    '<td class="mono">' + escHtml(op) + '</td>' +
+    '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+    '<td class="mono">' + escHtml(age) + '</td>' +
+    '<td>' + decisionCell + echo + '</td>' +
+  '</tr>';
+}
+
+function renderApprovalDrawer(item, empty) {
+  if (!item) {
+    const e = empty || {};
+    const evidence = approvalQueueEvidence();
+    // Filters can hide loaded holds but cannot establish that no holds exist.
+    const title = e.filteredOut ? "Nothing selected" : evidence.title;
+    const line = e.filteredOut
+      ? "No held operation matches these filters. " + heldOperationsPhrase(e.waiting, "in this scope is", "in this scope are") + " waiting on you."
+      : evidence.line;
+    return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>' + escHtml(title) + '</h3><p>' + escHtml(line) + ' Queue checked ' + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + '.</p>' + evidence.warning + '<a class="btn" href="#activity">Open Evidence</a></div></aside>';
+  }
+  const agent = approvalAgentId(item);
+  const op = approvalOperation(item);
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  const standing = approvalStandingState(item);
+  const checked = state.approvals.alwaysAllow && standing.enabled && !item.resolved;
+  const disabled = approvalDecisionDisabled();
+  const primaryAction = checked ? "inbox-promote" : "inbox-approve";
+  const primaryLabel = checked ? "Allow always" : "Allow once";
+  const checkbox = item.resolved ? "" : '<label class="approval-standing"><input type="checkbox" data-action="approval-always-allow"' +
+    (checked ? " checked" : "") + (standing.enabled && !disabled ? "" : " disabled") + '><span>' +
+    (standing.enabled ? "Always allow this operation for every agent on this fortress. " : "Always allow is unavailable. ") +
+    '<strong class="warn">' + escHtml(standing.reason) + '</strong></span></label>';
+  const tier1Confirming = state.approvals.confirmingTier1Id === item.item_id;
+  const tier1Cancelled = state.approvals.cancelledTier1Id === item.item_id;
+  const startButton = '<button class="btn btn-primary approval-tier1-step" data-action="approval-start-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button>';
+  const cancelButton = '<button class="btn approval-tier1-step" data-action="approval-cancel-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Cancel</button>';
+  const primaryButton = item.resolved ? "" : item.tier === "tier1"
+    ? (tier1Confirming || tier1Cancelled ? cancelButton : startButton)
+    : '<button class="btn btn-primary" data-approval-primary="' + escHtml(item.item_id) + '" data-action="' + primaryAction + '" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>' + primaryLabel + '</button>';
+  const denyButton = item.resolved ? "" : '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button>';
+  // Confirm occupies a separate row so the second click in the first-step slot can only cancel.
+  const confirmRow = !item.resolved && tier1Confirming
+    ? '<div class="approval-confirm-row"><button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Confirm ' + escHtml(op) + '</button></div>' : "";
+  // Keep Cancel in its original slot and focused after disarming; a new Allow step uses a separate slot.
+  const restartButton = !item.resolved && tier1Cancelled ? startButton : "";
+  const standingEffect = checked
+    ? "Later matching operations stop asking only if the policy engine accepts both steps."
+    : "The next matching operation asks again.";
+  // A Tier 1 Allow once only arms the request; the card says so, matching the note below it.
+  const allowCopy = checked
+    ? "Allows this request once, then requests a standing rule for every agent on this fortress. " + standingEffect
+    : item.tier === "tier1" && !item.resolved
+      ? "Allow once arms this request, and Confirm " + op + " sends the approval; the decision is " + approvalRecordLine(item) + "."
+      : "Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".";
+  const tier1Note = item.tier === "tier1" && !item.resolved
+    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + escHtml(op) + '. Only Confirm sends the approval.</div>'
+    : "";
+  return '<aside class="card approval-drawer" aria-label="Selected approval">' +
+    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? "DECIDED" : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
+    // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
+    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
+    tier1Note +
+    '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + restartButton + '</div>' + confirmRow + renderDecisionInline(item) + '<p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
+  '</aside>';
+}
+
+function approvalFilterOptions(items, field, current) {
+  const seen = Object.create(null);
+  items.forEach(function (item) {
+    const value = field === "agent" ? approvalAgentId(item) : approvalOperation(item);
+    if (value) seen[value] = true;
+  });
+  // A stale filter remains visible and selected, so choosing All can actually clear it.
+  const stale = current && !seen[current]
+    ? '<option value="' + escHtml(current) + '" selected>' + escHtml(current) + ' (none loaded)</option>' : "";
+  return stale + Object.keys(seen).sort().map(function (value) {
+    return '<option value="' + escHtml(value) + '"' + (current === value ? " selected" : "") + '>' + escHtml(value) + '</option>';
+  }).join("");
+}
+
+function filterApprovalItems(items) {
+  const f = state.approvals.filters || {};
+  return items.filter(function (item) {
+    if (f.state === "waiting" && item.resolved) return false;
+    if (f.state === "decided" && !item.resolved) return false;
+    if (f.agent && approvalAgentId(item) !== f.agent) return false;
+    if (f.tier === "tier1" && item.tier !== "tier1") return false;
+    if (f.tier === "tier2" && item.tier !== "tier2") return false;
+    if (f.category && approvalOperation(item) !== f.category) return false;
+    return true;
+  });
+}
+
+function renderApprovalsScreen() {
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approval data is Unknown until the queue read loads.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
+  }
+  if (state.inboxRedacted) {
+    return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
+  }
+  const all = approvalItemsForScreen();
+  const filtered = filterApprovalItems(all);
+  // Waiting operations get the bounded decision slots before decided history can consume them.
+  const capped = filtered.filter(function (i) { return !i.resolved; }).concat(filtered.filter(function (i) { return !!i.resolved; })).slice(0, APPROVAL_QUEUE_ITEM_CAP);
+  const allWaitingCount = all.filter(function (i) { return !i.resolved; }).length;
+  const waiting = capped.filter(function (i) { return !i.resolved; }).sort(function (a, b) {
+    return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
+  });
+  const decided = capped.filter(function (i) { return !!i.resolved; });
+  const selectedId = capped.some(function (i) { return i.item_id === state.approvals.selectedId; })
+    ? state.approvals.selectedId
+    : (waiting[0] || capped[0] || {}).item_id || null;
+  if (state.approvals.selectedId !== selectedId) resetApprovalConsent();
+  state.approvals.selectedId = selectedId;
+  const selected = capped.find(function (i) { return i.item_id === selectedId; }) || null;
+  const oldest = waiting.length && waiting[0].created_at ? relTimeFromIso(waiting[0].created_at) : "none waiting";
+  const rows = [
+    waiting.length ? '<tr class="sect"><td colspan="6">Waiting on you · ' + waiting.length + ' of ' + allWaitingCount + ' · oldest wait ' + escHtml(oldest) + '</td></tr>' : "",
+    waiting.map(function (i) { return renderApprovalRow(i, selectedId); }).join(""),
+    decided.length ? '<tr class="sect"><td colspan="6">Decided · showing ' + decided.length + ' of ' + filtered.filter(function (i) { return !!i.resolved; }).length + '</td></tr>' : "",
+    decided.map(function (i) { return renderApprovalRow(i, selectedId); }).join("")
+  ].join("");
+  const evidence = approvalQueueEvidence();
+  const noFilterMatch = all.length > 0 && filtered.length === 0;
+  // One inbox read returns at most APPROVAL_QUEUE_ITEM_CAP items of every kind and serves no total,
+  // so a full page means held operations past it may exist; the counts above cover the loaded page only.
+  const pageFullNotice = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP
+    ? '<p class="muted" data-inbox-page-full="1">The inbox read returned a full page of ' + APPROVAL_QUEUE_ITEM_CAP + ' items; held operations beyond it are not shown here.</p>'
+    : "";
+  // Decided history cannot hide holds waiting elsewhere when the selected scope has no waiting operations.
+  const outsideNotice = evidence.outside && !evidence.waiting ? evidence.emptyHtml : "";
+  const body = capped.length ? outsideNotice + '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
+    noFilterMatch ? '<div class="queue-empty">No held operation matches these filters.</div>' :
+    evidence.emptyHtml;
+  const f = state.approvals.filters;
+  const filterBar = '<div class="approval-filters" role="group" aria-label="Filter approvals">' +
+      '<label class="filter-field">State<select class="input" data-action="approval-filter-state"><option value="all"' + (f.state === "all" ? " selected" : "") + '>All</option><option value="waiting"' + (f.state === "waiting" ? " selected" : "") + '>Waiting</option><option value="decided"' + (f.state === "decided" ? " selected" : "") + '>Decided</option></select></label>' +
+      '<label class="filter-field">Agent<select class="input" data-action="approval-filter-agent"><option value="">All</option>' + approvalFilterOptions(all, "agent", f.agent) + '</select></label>' +
+      '<label class="filter-field">Tier<select class="input" data-action="approval-filter-tier"><option value="both"' + (f.tier === "both" ? " selected" : "") + '>Tier 1 and Tier 2</option><option value="tier1"' + (f.tier === "tier1" ? " selected" : "") + '>Tier 1</option><option value="tier2"' + (f.tier === "tier2" ? " selected" : "") + '>Tier 2</option></select></label>' +
+      '<label class="filter-field">Category<select class="input" data-action="approval-filter-category"><option value="">All</option>' + approvalFilterOptions(all, "category", f.category) + '</select></label>' +
+      '<span class="count-age">showing ' + capped.length + ' of ' + all.length + ' · cap ' + APPROVAL_QUEUE_ITEM_CAP + '</span>' +
+    '</div>';
+  return [
+    '<section class="concierge-wrap approvals-wide">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Approvals</p>',
+        '<h1>Held operations waiting on you.</h1>',
+        '<p class="sub">A decision on a Charter hold is recorded in your audit log; a decision on any other held item is marked decided in this inbox.</p>',
+      '</div></div>',
+      filterBar,
+      '<p class="muted">Left rail agent scope applies first; these controls then narrow that scoped queue.</p>',
+      pageFullNotice,
+      evidence.warning,
+      '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected, { filteredOut: noFilterMatch, waiting: allWaitingCount, total: all.length }) + '</div>',
+    '</section>'
+  ].join("");
+}
+
+function renderEnforcementScreen() {
+  const home = state.posture.home;
+  const head =
+    '<div class="page-head"><div>' +
+      '<p class="eyebrow">Enforcement</p>' +
+      '<h1>What is enforced on this machine.</h1>' +
+      '<p class="sub">Castle Wall reads enforcing only on a fresh enforcement check. Outbound counts come from the kernel for the stated window.</p>' +
+    '</div></div>';
+  if (!sourceLoaded("/api/posture/home") || !home) {
+    const why = state.posture.homeError
+      ? 'Enforcement status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
+      : 'Enforcement status unavailable. Current data is Unknown.';
     return '<section class="concierge-wrap">' + head +
       '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
       '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
-  // ADDITIVE vault-level line. The wall label above is the MACHINE arm-state and
-  // is unchanged; a Mac armed by an earlier install renders it protected while
-  // this vault is on no wall, so the vault's own claim gets its own sentence
-  // rather than being folded into that label. NOTE: this whole browser script
-  // lives inside a TypeScript template literal, so a backtick here would
-  // terminate it; comments in this file use plain words, never code quotes.
-  const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
-  const vaultNotice =
-    vaultProvision === "not_yet_walled"
-      ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
-      : "";
-  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
-  const findings = home.anomaly_findings || [];
-  const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
-  // F2 BLOCKER-1: three-state audit-chain pill from the shared verdict.
-  const chainPill = home.digest && home.digest.chain_verified
-    ? '<span class="pill tone-verified">Verified</span>'
-    : (home.digest && home.digest.chain_verdict === "verified_suffix_only")
-      ? '<span class="pill tone-degraded">Suffix-only</span>'
-      : '<span class="pill tone-locked">Unverified</span>';
-  // S3 evidence spine. Every tile carries, where the payload already supports
-  // it, a denominator, a freshness stamp, and a link to its evidence. Nothing
-  // here fetches new data: detectedTotal, the wall's evidence timestamp, and the
-  // digest window all come from the /api/posture/home payload already in state.
-  // Tiles the payload cannot honestly qualify (approvals, anomalies) get an
-  // evidence link only, with no invented denominator or age.
-  const detectedTotal =
-    ((home.agents && home.agents.length) || 0) +
-    ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
   const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
-  const digest = home.digest || {};
-  const metricCards =
-    '<div class="posture-metrics">' +
-      postureMetricCard(escHtml(home.protection_requested_count), "Protection requested", {
-        of: detectedTotal,
-        // Hash route, matching the SPA's own nav ids, so this stays in-app.
-        ev: { href: "#agents", text: "agents" },
-      }) +
-      postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed", {
-        of: home.protection_requested_count,
-        ev: { href: "/posture/evidence", text: "evidence" },
-      }) +
-      postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall", {
-        // The wall's freshness is the age of its last ENFORCEMENT evidence, not
-        // of this render. No evidence says so outright: absence must read as
-        // absence, never as a recent check that happened to pass.
-        fresh: wallEvidenceAt,
-        freshNone: "no enforcement evidence yet",
-      }) +
-      vaultNotice + renderSourceRead(HUB + "/inbox") +
-      postureMetricCard(!sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : escHtml(pending), "Approvals waiting") +
-      postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
-      postureMetricCard(chainPill, "Audit chain", {
-        // The digest window is the period this verdict covers; its end states
-        // how current the verdict is.
-        fresh: digest.window_end,
-        freshNone: "no verify on record",
-        ev: { href: "/api/audit-log", text: "audit log" },
-      }) +
-    '</div>';
-  const storyToggle =
-    '<label class="story-toggle"><input type="checkbox" data-action="posture-story-plain"' +
-    (state.posture.storyPlain ? ' checked' : '') + '> Plain summary</label>';
+  const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
+  const wallAgeHtml = wallAge
+    ? '<span class="pm-fresh" title="' + escHtml(wallEvidenceAt) + '">last enforcement evidence ' + escHtml(wallAge) + '</span>'
+    : '<span class="pm-fresh none">no enforcement evidence yet</span>';
+  const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
+  const vaultNotice = vaultProvision === "not_yet_walled"
+    ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    : "";
+  const layers = postureLayerLines().map(function (l) {
+    const dotCls = layerDotClass(l);
+    return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
+      '<span class="pp-k">' + escHtml(l.k) + '</span>' +
+      '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
+  }).join("");
   return [
     '<section class="concierge-wrap">',
       head,
       '<section class="card">',
-        '<h3>At a glance</h3>',
-        metricCards,
-        '<p class="muted">Machine: ' + escHtml(home.origin_machine || "(local)") + '</p>',
+        '<div class="card-head-row"><h3>Castle Wall</h3><span class="' + wall.cls + '">' + escHtml(wall.text) + '</span></div>',
+        '<div class="evidence pm-foot">' + wallAgeHtml + '<a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>',
+        vaultNotice,
+        '<div class="enforcement-layers">' + layers + '</div>',
+        renderSourceRead("/api/sovereignty"),
       '</section>',
+      renderOutboundConnections(home.digest, false),
       '<section class="card">',
-        '<div class="card-head-row"><h3>Today&#39;s story</h3>' + storyToggle + '</div>',
-        renderPostureStory(home.digest || {}),
-        postureStoryFoot(home.digest || {}),
-      '</section>',
-      '<section class="card">',
-        '<h3>Anomaly findings</h3>',
-        renderPostureAnomalies(findings, anomalyUnknown), renderSourceRead("/api/anomaly/findings"),
-      '</section>',
-      '<section class="card">',
-        '<h3>Per-agent posture (' + (home.agents || []).length + ')</h3>',
+        '<h3>Per-agent enforcement (' + (home.agents || []).length + ')</h3>',
         renderPostureAgentRows(home),
       '</section>',
     '</section>'
   ].join("");
 }
 
+// 25 rows per page keeps the console scannable; 20 pages bound sorting and retained snapshots.
+const MFP_PAGE_SIZE = 25;
+const MFP_RECORD_LIMIT = MFP_PAGE_SIZE * 20;
+// Evidence text is a preview capped at 16 KiB, with the original read available separately.
+const MFP_EVIDENCE_CHAR_LIMIT = 16 * 1024;
+// Control lists page over all served items so the preview cap cannot hide an operator action.
+const MFP_ALL_SERVED = "all-served";
+function mfpPage(items, key, scope) {
+  const count = scope === MFP_ALL_SERVED ? items.length : Math.min(items.length, MFP_RECORD_LIMIT);
+  const last = Math.max(0, Math.ceil(count / MFP_PAGE_SIZE) - 1);
+  const page = Math.min(last, Math.max(0, state.mfp.pages[key] || 0));
+  state.mfp.pages[key] = page;
+  const start = page * MFP_PAGE_SIZE;
+  return { rows: items.slice(start, start + MFP_PAGE_SIZE), total: items.length, allServed: scope === MFP_ALL_SERVED, start: start, page: page, last: last };
+}
+// Read URLs carry the launch session only inside fetch calls; a rendered link would place it in the page and in the
+// browser history, so these lists name their count and read age without linking to the raw read.
+function mfpPager(page, key, path) {
+  return '<div class="mfp-pager"><span>Showing ' + page.rows.length + ' of ' + page.total + ' returned records · read ' + escHtml(sourceReadAge(path) || "Unknown") + '</span>' +
+    (!page.allServed && page.total > MFP_RECORD_LIMIT ? '<span>Only the first ' + MFP_RECORD_LIMIT + ' returned records are browsable here.</span>' : '') +
+    (page.last ? '<button class="btn" data-action="mfp-page" data-list="' + key + '" data-step="-1"' + (page.page === 0 ? ' disabled' : '') + '>Previous</button>' +
+      '<span>Page ' + (page.page + 1) + ' of ' + (page.last + 1) + '</span><button class="btn" data-action="mfp-page" data-list="' + key + '" data-step="1"' + (page.page === page.last ? ' disabled' : '') + '>Next</button>' : '') + '</div>';
+}
+function mfpEmpty(title, reason, path) {
+  return '<div class="overview-empty">' + overviewChip("neutral", "EMPTY") + '<h3>' + title + '</h3><p>' + reason + ' Read ' + escHtml(sourceReadAge(path) || "Unknown") + '.</p>' +
+    '<button class="btn" data-action="retry-panel" data-read="' + escHtml(path) + '">Refresh</button></div>';
+}
+function renderMfpFoldedSections() {
+  return '<details class="mfp-fold" data-mfp-fold="auto-trigger"' + (state.mfp.folds["auto-trigger"] ? ' open' : '') + '><summary>Auto-trigger</summary>' + renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger", renderAutoTriggerPage()) + '</details>' +
+    '<details class="mfp-fold" data-mfp-fold="honeypot"' + (state.mfp.folds.honeypot ? ' open' : '') + '><summary>Honeypots</summary>' + renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot", renderHoneypotPage()) + '</details>';
+}
+// Only Sentinel wire values carry severity: alert maps to High, warn to Medium and info to Info; any other value reads
+// Unknown.
+function mfpSeverity(value) {
+  // Sentinel wire values alone carry severity evidence; display-scale words are not server verdicts.
+  return value === "alert" ? "high" : value === "warn" ? "medium" : value === "info" ? "info" : null;
+}
+function mfpSeverityMark(value) {
+  return mfpDisplaySeverityMark(mfpSeverity(value));
+}
+// The legend names the display scale independently of the server's narrower severity vocabulary.
+function mfpDisplaySeverityMark(level) {
+  return level ? '<span class="mfp-severity ' + level + '"><b aria-hidden="true"></b>' + escHtml(sentenceCase(level)) + '</span>' : overviewChip("unknown", "UNKNOWN");
+}
+// Keep expanded configuration sections open across polling renders; only these two fixed keys persist.
+document.addEventListener("toggle", function (event) {
+  const target = event.target;
+  if (!target || !target.getAttribute) return;
+  const key = target.getAttribute("data-mfp-fold");
+  if (Object.prototype.hasOwnProperty.call(state.mfp.folds, key)) state.mfp.folds[key] = target.open === true;
+}, true);
+function mfpFindingAgent(finding) {
+  // Missing agent evidence cannot establish fortress-wide scope in either the queue or the drawer.
+  return finding.agent_id || "Unknown · agent not served";
+}
+function renderFindingDrawer(finding) {
+  const details = JSON.stringify(finding.details || {}, null, 2);
+  const evidence = Array.isArray(finding.evidence_audit_ids) ? finding.evidence_audit_ids : [];
+  return '<aside class="mfp-drawer" aria-label="Finding evidence"><div class="card-head-row"><h2>Finding evidence</h2><button class="btn" data-action="mfp-finding-close">Close</button></div>' +
+    mfpSeverityMark(finding.severity) + ' ' + overviewChip("unknown", "LIFECYCLE UNKNOWN") +
+    '<h3>' + escHtml(finding.summary || "Finding") + '</h3><p class="mono">' + escHtml(finding.finding_id) + '</p>' +
+    '<dl><dt>Sentinel</dt><dd>' + escHtml(finding.sentinel_id || "Unknown") + '</dd><dt>Agent</dt><dd>' + escHtml(mfpFindingAgent(finding)) +
+    '</dd><dt>Observed</dt><dd>' + escHtml(finding.observed_at || "Unknown") + ' · ' + escHtml(finding.observed_at ? relTimeFromIso(finding.observed_at) : "Unknown") + '</dd></dl>' +
+    '<h3>Evidence and baseline</h3><p class="muted">Detector-supplied data. Shown as recorded, not as instructions.</p><pre>' + escHtml(details.slice(0, MFP_EVIDENCE_CHAR_LIMIT)) + '</pre>' +
+    (details.length > MFP_EVIDENCE_CHAR_LIMIT ? '<p>Evidence preview truncated at ' + MFP_EVIDENCE_CHAR_LIMIT + ' characters of ' + details.length + '.</p>' : '') +
+    '<h3>Audit references</h3><p>Showing ' + Math.min(evidence.length, MFP_PAGE_SIZE) + ' of ' + evidence.length + ' recorded references.</p><ul>' +
+    evidence.slice(0, MFP_PAGE_SIZE).map(function (id) { return '<li class="mono">' + escHtml(id) + '</li>'; }).join("") + '</ul><a href="#activity">Open Evidence</a></aside>';
+}
+function renderFindingsScreen() {
+  const path = "/api/sentinels/findings";
+  const loaded = sourceLoaded(path);
+  // No lifecycle field exists in the shipped finding schema: absence never becomes an invented Open state.
+  const findings = loaded ? state.mfp.findings.slice(0, MFP_RECORD_LIMIT).sort(function (a, b) {
+    // Unknown follows all five display levels, rather than inheriting severityClass's Info default.
+    const unknownRank = 5; // Five display levels precede Unknown.
+    const rank = function (value) { const level = mfpSeverity(value); return level ? severityRank(level) : unknownRank; };
+    return rank(a.severity) - rank(b.severity);
+  }) : [];
+  const page = mfpPage(findings, "findings");
+  page.total = loaded ? state.mfp.totals.findings : 0;
+  const selected = loaded && findings.find(function (f) { return f.finding_id === state.mfp.findingId; });
+  const rows = page.rows.map(function (finding) {
+    return '<tr' + (finding.finding_id === state.mfp.findingId ? ' class="selected"' : '') + '><td>' + mfpSeverityMark(finding.severity) + '</td><td><button class="link-btn" data-action="mfp-finding" data-finding-id="' + escHtml(finding.finding_id) + '">' +
+      escHtml(finding.summary || "Finding") + '</button><div class="muted">' + escHtml(mfpFindingAgent(finding)) + '</div></td><td>' + overviewChip("unknown", "UNKNOWN") + '</td><td class="mono">' + escHtml(finding.sentinel_id || "Unknown") + '</td><td class="mono">' + escHtml(finding.observed_at ? relTimeFromIso(finding.observed_at) : "Unknown") + '</td></tr>';
+  }).join("");
+  return '<section class="mfp-screen" data-mfp-findings><div class="page-head"><div><p class="eyebrow">This fortress</p><h1>Findings</h1><p class="sub">Sentinel observations, ranked by severity. Read-only. Lifecycle is not served; this view cannot resolve or dismiss findings.</p></div></div>' +
+    '<div class="mfp-legend" aria-label="Severity scale">' + ["critical", "high", "medium", "low", "info"].map(mfpDisplaySeverityMark).join("") + '</div>' +
+    '<p class="muted">Server alert maps to High, warn to Medium, and info to Info. Critical and Low are display levels not emitted by this source. The source returns a limited history, not an open-finding count.</p>' +
+    '<div class="mfp-queue-grid' + (selected ? ' has-selection' : '') + '"><section class="card"><h2>Sentinel queue</h2>' +
+    (!loaded ? '<h3>Sentinel findings Unknown</h3>' + overviewChip("unknown", "UNKNOWN") + renderSourceRead(path) :
+      !findings.length ? mfpEmpty("No findings returned", "The source returned 0 of 0 findings. This does not establish detector coverage.", path) :
+      mfpPager(page, "findings", path) + '<div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Severity</th><th>Finding</th><th>Lifecycle</th><th>Sentinel</th><th>Age</th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
+    '</section>' + (selected ? renderFindingDrawer(selected) : '') + '</div>' + renderAnomalyFindingsCard() + renderMfpFoldedSections() + '</section>';
+}
+// Must match the Overview's "Open Sentinel findings" tile (renderPostureScreen), which counts this source and links here.
+function renderAnomalyFindingsCard() {
+  const findings = state.posture.anomalies || [];
+  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
+  const age = sourceReadAge("/api/anomaly/findings");
+  const countLine = unknown
+    ? '<span class="count-age">Unknown: the detector has not answered</span>'
+    : '<span class="count-age">' + escHtml(findings.length) + ' open' + (age ? ' · detector read ' + escHtml(age) : '') + '</span>';
+  return '<section class="card" data-anomaly-findings><h3>Anomaly findings ' + countLine + '</h3>' +
+    renderPostureAnomalies(findings, unknown) + renderSourceRead("/api/anomaly/findings") + '</section>';
+}
+
+function renderServerFleetRoster() {
+  const path = "/api/fleet/roster";
+  const roster = sourceLoaded(path) && state.mfp.roster;
+  if (!roster) return '<section class="card" data-mfp-roster><h2>Fleet roster Unknown</h2>' + overviewChip("unknown", "UNKNOWN") + renderSourceRead(path) + '</section>';
+  if (!roster.available) return '<section class="card" data-mfp-roster><h2>Fleet not configured</h2><p>The server reports no provisioned federation roster. Read ' + escHtml(sourceReadAge(path)) + '.</p><a class="btn" href="/fleet">Open Fleet Switcher</a></section>';
+  const page = mfpPage(roster.nodes, "roster");
+  page.total = state.mfp.totals.roster;
+  const status = function (value, labels, warnings) {
+    if (!Object.prototype.hasOwnProperty.call(labels, value)) return overviewChip("unknown", "UNKNOWN");
+    // These are recorded federation verdicts, not fresh enforcement claims; never infer trust from reach.
+    return overviewChip(value === "revoked" || value === "untrusted" ? "bad" : warnings.indexOf(value) >= 0 ? "warn" : "neutral", labels[value]);
+  };
+  const rows = page.rows.map(function (node) {
+    // The server evaluator's false flag means this node's trust is unprovable, never proven safe.
+    const trust = node.trust_evaluable === false
+      ? overviewChip("warn", "NOT EVALUATED") + '<div>Trust could not be evaluated; treated as untrusted</div>'
+      : status(node.trust_state, { admitted: "ADMITTED", revoked: "REVOKED", untrusted: "UNTRUSTED" }, ["revoked", "untrusted"]);
+    return '<tr><td><strong>' + escHtml(node.label || node.node_id || "Unknown") + '</strong><div class="mono">' + escHtml(node.node_id || "Unknown") + '</div></td>' +
+      '<td>' + trust + '</td>' +
+      '<td>' + status(node.reach, { recent: "RECENT SYNC", stale: "STALE SYNC", never: "NEVER SYNCED" }, ["stale"]) + '</td>' +
+      '<td>' + status(node.policy && node.policy.drift_state, { in_sync: "IN SYNC", drifted: "DRIFTED" }, ["drifted"]) + '</td>' +
+      '<td>' + overviewChip("unknown", "UNKNOWN") + '</td><td class="mono">Roster read ' + escHtml(sourceReadAge(path) || "Unknown") +
+      '<div>Last sync: ' + escHtml(node.last_sync_received_at ? relTimeFromIso(node.last_sync_received_at) : "Unknown") + '</div></td></tr>';
+  }).join("");
+  return '<section class="card" data-mfp-roster><h2>Fleet roster</h2><p>Trust, reach and policy drift are server verdicts at the roster read. Enrollment status is not served. Enrollment actions are not available in this read-only roster.</p>' +
+    (!roster.nodes.length ? mfpEmpty("No machines in the roster", "The server returned 0 of 0 machines in the federation roster.", path) :
+      mfpPager(page, "roster", path) + '<div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Machine</th><th>Trust</th><th>Reach</th><th>Drift</th><th>Enrollment</th><th>Last check</th></tr></thead><tbody>' + rows + '</tbody></table></div>') + '</section>';
+}
+
+function renderIntegrationsScreen() {
+  return '<div class="screen-tabs"><p class="eyebrow">Integrations</p><nav aria-label="Integrations">' +
+    '<a href="#coordination" class="active" aria-current="page">Coordination</a></nav></div>' +
+    renderCoordinationPage();
+}
+
+// ── Machines (slice 2b) ────────────────────────────────────────────────
+// The fleet the Fleet Switcher page (/fleet) shows, inside the shell, from
+// the same two reads: the machine list the operator saved in this browser,
+// and each machine's unauthenticated GET /api/health liveness probe. This
+// screen only reads: adding and removing machines stays on /fleet, which
+// owns and writes the list. fleetMachines below is this client's one read
+// of persistent browser storage, and nothing here ever writes it.
+// Must match STORAGE_KEY in generateFleetSwitcherHTML
+// (server/src/principal-policy/dashboard-html.ts).
+const FLEET_STORAGE_KEY = "sanctuary_fleet_machines";
+// Must match the Fleet Switcher's health-probe abort (3000 ms in
+// generateFleetSwitcherHTML), so both views give a machine the same time to
+// answer before they stop waiting.
+const FLEET_PROBE_DEADLINE_SECONDS = 3;
+const FLEET_PROBE_DEADLINE_MS = FLEET_PROBE_DEADLINE_SECONDS * DASHBOARD_MILLISECONDS_PER_SECOND;
+// 25 probes = the visible current machine plus two dozen saved peers, which
+// bounds one Check-again wave while leaving enough rows for a real small fleet.
+const FLEET_PROBED_MACHINE_LIMIT = 25;
+// The check age is rewritten once a second while the screen shows, so the
+// age on screen is never more than one second younger than the probe round.
+const FLEET_AGE_TICK_MS = DASHBOARD_MILLISECONDS_PER_SECOND;
+// Named probe states. Only state_ONLINE counts toward the online numerator.
+// state_UNKNOWN is no answer at all (a timeout, a refused or blocked
+// connection, an answer that is not the health JSON): it is never counted
+// as online and never as down, because no answer is evidence of neither.
+const FLEET_PROBE = {
+  CHECKING: "state_CHECKING",
+  ONLINE: "state_ONLINE",
+  NOT_HEALTHY: "state_NOT_HEALTHY",
+  UNKNOWN: "state_UNKNOWN",
+  UNPROBED: "state_UNPROBED"
+};
+// The Fleet Switcher's probe words in generateFleetSwitcherHTML in
+// server/src/principal-policy/dashboard-html.ts must match this table's words
+// for the same outcomes, so switching views does not change what the evidence means.
+const FLEET_PROBE_VIEW = {
+  state_CHECKING: { word: "Checking", cls: "checking" },
+  state_ONLINE: { word: "Online", cls: "good" },
+  state_NOT_HEALTHY: { word: "Not healthy", cls: "bad" },
+  state_UNKNOWN: { word: "Unknown", cls: "unknown" },
+  state_UNPROBED: { word: "Unchecked", cls: "unknown" }
+};
+const FLEET_ROW_UPDATE_REASON = "Unknown: this row could not be updated; use Check again.";
+const FLEET_ROW_DRAW_FAILED = "One machine could not be shown; use Check again.";
+const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {}, rowUpdateFailed: {} };
+
+// Only an http or https address becomes a link or a probe target: the list
+// is operator-typed text in browser storage, and a javascript: or data:
+// address must never reach an href or a fetch.
+function fleetHttpUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    return u.protocol === "http:" || u.protocol === "https:" ? u : null;
+  } catch (e) { return null; }
+}
+
+// The saved list, plus this machine when the list does not carry it (the
+// Fleet Switcher adds it on load; this read-only screen shows it without
+// writing). An unreadable or malformed list reads as empty, never as a
+// failure that hides this machine.
+function fleetMachines() {
+  let saved = [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FLEET_STORAGE_KEY) || "[]");
+    if (Array.isArray(parsed)) saved = parsed;
+  } catch (e) { saved = []; }
+  const here = location.origin;
+  const seen = {};
+  const list = [];
+  saved.forEach(function (m) {
+    if (!m || typeof m.url !== "string" || !m.url) return;
+    const web = fleetHttpUrl(m.url);
+    const key = web ? web.origin : "raw:" + m.url;
+    if (seen[key]) return;
+    seen[key] = true;
+    list.push({
+      name: typeof m.name === "string" && m.name ? m.name : m.url,
+      url: m.url,
+      origin: web ? web.origin : null,
+      probeUrl: web ? web.origin + "/api/health" : null,
+      current: web ? web.origin === here : m.url === here,
+      capped: false
+    });
+  });
+  const currentIndex = list.findIndex(function (m) { return m.current; });
+  if (currentIndex > 0) {
+    // The local console is probed before the cap is applied; otherwise a
+    // saved list could make this page skip the machine serving it.
+    list.unshift(list.splice(currentIndex, 1)[0]);
+  }
+  // The machine serving this console is always in the list, under the name
+  // the scope trigger shows for it, so the denominator never omits it.
+  if (currentIndex < 0) {
+    const selfUrl = fleetHttpUrl(here);
+    list.unshift({ name: config.tenantName || "This machine", url: here, origin: selfUrl ? selfUrl.origin : null, probeUrl: selfUrl ? selfUrl.origin + "/api/health" : null, current: true, capped: false });
+  }
+  let probeSlots = 0;
+  list.forEach(function (m) {
+    if (!m.origin) return;
+    probeSlots++;
+    // The cap is enforced on web addresses only: non-web entries are never
+    // probe candidates, so they cannot consume probe slots.
+    m.capped = probeSlots > FLEET_PROBED_MACHINE_LIMIT;
+  });
+  return list;
+}
+
+// One liveness probe. It never carries the operator bearer or a cookie: a
+// machine in a browser-stored list must never receive this machine's
+// credential, and /api/health needs none.
+async function probeFleetMachine(machine, signal) {
+  if (!machine.origin || machine.capped) return machine.capped ? FLEET_PROBE.UNPROBED : FLEET_PROBE.UNKNOWN;
+  try {
+    const resp = await fetch(machine.probeUrl, { signal: signal, credentials: "omit", cache: "no-store", redirect: "manual" });
+    // A health result is trusted only when the named web origin answered a
+    // non-redirecting 2xx response. Error pages and redirects are not a
+    // machine-health answer, even if their body happens to contain ok.
+    if (!resp || !resp.ok || resp.redirected || resp.type === "opaqueredirect") return FLEET_PROBE.UNKNOWN;
+    const body = await resp.json();
+    return body && body.ok === true ? FLEET_PROBE.ONLINE : body && body.ok === false ? FLEET_PROBE.NOT_HEALTHY : FLEET_PROBE.UNKNOWN;
+  } catch (e) {
+    return FLEET_PROBE.UNKNOWN;
+  }
+}
+
+function scheduleFleetPaint(url) {
+  if (state.route !== "machines") return;
+  if (url) fleet.paintRows[url] = true;
+  if (fleet.paintScheduled) return;
+  fleet.paintScheduled = true;
+  Promise.resolve().then(function () {
+    fleet.paintScheduled = false;
+    if (state.route === "machines") paintMachinesScreen();
+  });
+}
+
+// A probe round. A result from an older round never overwrites a newer
+// one, so a slow answer cannot repaint a machine after "Check again".
+async function probeFleetMachines() {
+  const round = ++fleet.round;
+  const machines = fleetMachines();
+  if (fleet.controller) fleet.controller.abort();
+  const controller = new AbortController();
+  fleet.controller = controller;
+  const timer = setTimeout(function () { controller.abort(); }, FLEET_PROBE_DEADLINE_MS);
+  fleet.roundStartedAt = Date.now();
+  fleet.roundDone = false;
+  fleet.machines = machines;
+  fleet.probes = {};
+  fleet.paintRows = {};
+  fleet.rowUpdateFailed = {};
+  machines.forEach(function (m) {
+    fleet.probes[m.url] = !m.origin ? FLEET_PROBE.UNKNOWN : m.capped ? FLEET_PROBE.UNPROBED : FLEET_PROBE.CHECKING;
+  });
+  if (state.route === "machines") renderMain();
+  await Promise.all(machines.filter(function (m) { return m.origin && !m.capped; }).map(async function (m) {
+    const result = await probeFleetMachine(m, controller.signal);
+    if (round !== fleet.round) return;
+    fleet.probes[m.url] = result;
+    scheduleFleetPaint(m.url);
+  }));
+  clearTimeout(timer);
+  if (round !== fleet.round) return;
+  fleet.roundDone = true;
+  if (fleet.controller === controller) fleet.controller = null;
+  scheduleFleetPaint(null);
+}
+
+// The fleet count with its denominator and its check age. The age is the
+// round's start, so the answers on screen are at least this old. Unknown
+// and not-healthy machines are named beside the count, never folded into it.
+function fleetSummary(machines) {
+  const total = machines.length;
+  const noun = total === 1 ? " machine" : " machines";
+  if (!fleet.roundStartedAt) return { text: "Not checked yet: 0 of " + total + noun + " checked", age: "" };
+  let online = 0, unknown = 0, notHealthy = 0, checking = 0, unprobed = 0, probeable = 0;
+  machines.forEach(function (m) {
+    if (m.origin && !m.capped) probeable++;
+    const s = fleet.probes[m.url] || FLEET_PROBE.UNKNOWN;
+    if (s === FLEET_PROBE.ONLINE) online++;
+    else if (s === FLEET_PROBE.NOT_HEALTHY) notHealthy++;
+    else if (s === FLEET_PROBE.CHECKING) checking++;
+    else if (s === FLEET_PROBE.UNPROBED) unprobed++;
+    else unknown++;
+  });
+  const parts = [online + " of " + total + noun + " online"];
+  if (unprobed) {
+    const cappedWebTotal = probeable + unprobed;
+    const cappedNoun = cappedWebTotal === 1 ? " machine" : " machines";
+    // The cap denominator counts web addresses only; non-web rows keep their
+    // own Unknown reason and must not be folded into the unchecked remainder.
+    parts.push((checking ? "checking " : "checked ") + probeable + " of " + cappedWebTotal + cappedNoun + " with a web address; the rest are listed unchecked");
+  }
+  if (checking && !unprobed) parts.push(checking + " checking");
+  if (notHealthy) parts.push(notHealthy + " not healthy");
+  if (unknown) parts.push(unknown + " Unknown");
+  return { text: parts.join(" · "), age: "checked " + durationLabelFromMs(Date.now() - fleet.roundStartedAt) + " ago" };
+}
+
+function scheduleFleetAgeTick() {
+  if (fleet.ageTimer) return;
+  fleet.ageTimer = setTimeout(function () {
+    fleet.ageTimer = null;
+    if (state.route !== "machines") return;
+    const el = document.getElementById("machines-age");
+    if (el && fleet.roundStartedAt) el.textContent = "checked " + durationLabelFromMs(Date.now() - fleet.roundStartedAt) + " ago";
+    scheduleFleetAgeTick();
+  }, FLEET_AGE_TICK_MS);
+}
+
+function renderMachinesScreen() {
+  return [
+    '<section class="concierge-wrap">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Machines</p>',
+        '<h1>Machines</h1>',
+        '<p class="sub">The authenticated federation roster is separate from machines saved in this browser. Saved machines are checked at their host health check. Online means the host answered; it is not a statement about that machine\'s protection. Add or remove machines on the <a href="/fleet">Fleet Switcher</a>.</p>',
+      '</div></div>',
+      renderServerFleetRoster(),
+      '<section class="card browser-machines" aria-label="Saved in this browser">',
+        '<div class="card-head-row"><div><h1>Machines saved in this browser.</h1><span class="count-age" id="machines-summary"></span></div>',
+        '<button type="button" class="btn" data-action="machines-recheck">Check again</button></div>',
+        '<div class="machine-list" id="machines-list"></div>',
+      '</section>',
+    '</section>'
+  ].join("");
+}
+
+function appendText(parent, text) {
+  parent.appendChild(document.createTextNode(String(text)));
+}
+
+function makeTextElement(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  appendText(el, text);
+  return el;
+}
+
+function machineStatus(machine) {
+  return fleet.roundStartedAt ? (fleet.probes[machine.url] || FLEET_PROBE.UNKNOWN) : FLEET_PROBE.UNKNOWN;
+}
+
+function machineStatusReason(machine, status) {
+  return !machine.origin
+    ? "Unknown: this saved address is not a web address, so it was not linked or checked."
+    : status === FLEET_PROBE.UNPROBED
+      ? "Unchecked: this row is past the " + FLEET_PROBED_MACHINE_LIMIT + "-machine probe cap, so it was listed but not checked."
+      : status === FLEET_PROBE.UNKNOWN
+        ? "Unknown: no answer to the health check within " + FLEET_PROBE_DEADLINE_SECONDS + " seconds, or an answer that was not the health check. This is not proof the machine is down."
+        : status === FLEET_PROBE.NOT_HEALTHY ? "The machine answered its health check with ok false."
+        : status === FLEET_PROBE.ONLINE ? "The machine answered its health check with ok true. This says only that the host answered." : "The health check is in flight.";
+}
+
+function updateMachinesSummary(summaryEl, machines) {
+  const summary = fleetSummary(machines);
+  summaryEl.replaceChildren(document.createTextNode(summary.text));
+  if (summary.age) {
+    appendText(summaryEl, " · ");
+    const age = makeTextElement("span", "", summary.age);
+    age.setAttribute("id", "machines-age");
+    summaryEl.appendChild(age);
+  }
+}
+
+function makeMachineRow(machine, index) {
+  const status = machineStatus(machine);
+  const view = FLEET_PROBE_VIEW[status] || FLEET_PROBE_VIEW.state_UNKNOWN;
+  const row = document.createElement("div");
+  row.className = "machine-row";
+  row.setAttribute("data-machine-index", String(index));
+  row.setAttribute("data-machine-url", machine.url);
+  const chip = document.createElement("span");
+  chip.className = "state-chip " + view.cls;
+  chip.setAttribute("title", machineStatusReason(machine, status));
+  const mark = document.createElement("i");
+  mark.setAttribute("aria-hidden", "true");
+  chip.appendChild(mark);
+  appendText(chip, view.word);
+  row.appendChild(chip);
+  const id = document.createElement("div");
+  id.className = "machine-id";
+  const name = makeTextElement("strong", "", machine.name);
+  const address = makeTextElement("small", "mono", machine.url);
+  id.appendChild(name);
+  id.appendChild(address);
+  if (machine.origin) id.appendChild(makeTextElement("small", "mono", "host health check"));
+  row.appendChild(id);
+  if (machine.current) {
+    row.appendChild(makeTextElement("span", "machine-here", "This machine"));
+  } else if (machine.origin) {
+    const open = makeTextElement("a", "btn", "Open console");
+    const parsed = fleetHttpUrl(machine.url);
+    // The link uses the same parsed web address as the probe, so a loosely
+    // written address cannot resolve as a path on this console.
+    if (parsed) open.setAttribute("href", parsed.href);
+    open.setAttribute("rel", "noopener");
+    row.appendChild(open);
+  } else {
+    row.appendChild(makeTextElement("span", "muted", "Not a web address"));
+  }
+  return row;
+}
+
+function makeMachineUpdateFallbackRow(machine, index) {
+  const row = document.createElement("div");
+  row.className = "machine-row";
+  row.setAttribute("data-machine-index", String(index));
+  row.setAttribute("data-machine-url", machine.url);
+  const chip = document.createElement("span");
+  chip.className = "state-chip unknown";
+  chip.setAttribute("title", FLEET_ROW_UPDATE_REASON);
+  const mark = document.createElement("i");
+  mark.setAttribute("aria-hidden", "true");
+  chip.appendChild(mark);
+  appendText(chip, "Unknown");
+  row.appendChild(chip);
+  const id = document.createElement("div");
+  id.className = "machine-id";
+  id.appendChild(makeTextElement("strong", "", machine.name || machine.url));
+  row.appendChild(id);
+  return row;
+}
+
+function guardedMachineRow(machine, index) {
+  try { return makeMachineRow(machine, index); }
+  catch (e) {
+    fleet.rowUpdateFailed[machine.url] = true;
+    try { return makeMachineUpdateFallbackRow(machine, index); }
+    catch (fallbackError) {
+      // A row whose fallback also fails still takes its place in the list as
+      // fixed text that reads no machine field, so the list never silently
+      // shows fewer machines than the summary counts; if even that fails, an
+      // empty node keeps the other rows and the focus restore running.
+      try {
+        const placeholder = document.createElement("div");
+        placeholder.className = "machine-row";
+        placeholder.appendChild(makeTextElement("span", "muted", FLEET_ROW_DRAW_FAILED));
+        return placeholder;
+      } catch (placeholderError) {
+        return document.createTextNode("");
+      }
+    }
+  }
+}
+
+function replaceMachineWithFallback(oldRow) {
+  try {
+    const chip = oldRow && oldRow.querySelector(".state-chip");
+    if (!chip) return;
+    // Reuse the chip and its mark so a repeated row-construction failure cannot
+    // leave Checking behind or discard the operator's focused link.
+    chip.className = "state-chip unknown";
+    chip.title = FLEET_ROW_UPDATE_REASON;
+    if (chip.lastChild) chip.lastChild.textContent = "Unknown";
+  } catch (e) { /* A failed in-place mark leaves the existing row; other rows and focus restore still run. */ }
+}
+
+function rebuildMachinesList(listEl, machines) {
+  const frag = document.createDocumentFragment();
+  machines.forEach(function (m, index) {
+    frag.appendChild(guardedMachineRow(m, index));
+  });
+  listEl.replaceChildren(frag);
+}
+
+function paintMachinesScreen() {
+  const summaryEl = document.getElementById("machines-summary");
+  const listEl = document.getElementById("machines-list");
+  if (!summaryEl || !listEl) return;
+  const machines = fleet.roundStartedAt && fleet.machines ? fleet.machines : fleetMachines();
+  updateMachinesSummary(summaryEl, machines);
+  const pending = fleet.paintRows || {};
+  fleet.paintRows = {};
+  const focus = captureInputFocus(listEl);
+  try {
+    let rebuilt = false;
+    Object.keys(pending).forEach(function (url) {
+      let oldRow = null;
+      let index = -1;
+      try {
+        index = machines.findIndex(function (m) { return m.url === url; });
+        if (index < 0 || !listEl.querySelector) return;
+        // Row lookup is by the generated numeric index; saved machine addresses
+        // can contain control characters that are not safe selector text.
+        oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
+        if (!oldRow) {
+          try { oldRow = listEl.querySelector('[data-machine-url="' + escCssAttr(machines[index].url) + '"]'); }
+          catch (e) { oldRow = null; }
+          if (oldRow) {
+            fleet.rowUpdateFailed[url] = true;
+            replaceMachineWithFallback(oldRow);
+            return;
+          }
+        }
+        if (!oldRow) {
+          if (!rebuilt) {
+            rebuilt = true;
+            rebuildMachinesList(listEl, machines);
+          }
+          return;
+        }
+        if (fleet.rowUpdateFailed[url]) {
+          replaceMachineWithFallback(oldRow);
+          return;
+        }
+        if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
+      } catch (e) {
+        // A finished probe must never leave an old Checking chip behind; that
+        // would claim work is still in flight after the answer arrived.
+        if (index >= 0) fleet.rowUpdateFailed[url] = true;
+        if (oldRow && index >= 0) replaceMachineWithFallback(oldRow);
+        else if (!rebuilt) {
+          rebuilt = true;
+          rebuildMachinesList(listEl, machines);
+        }
+      }
+    });
+  } finally {
+    // restoreInputFocus enforces the exactly-one-match rule, so a replaced
+    // row can regain focus without moving the operator to a sibling control.
+    restoreInputFocus(listEl, focus);
+  }
+}
+
+function hydrateMachinesScreen() {
+  const summaryEl = document.getElementById("machines-summary");
+  const listEl = document.getElementById("machines-list");
+  if (!summaryEl || !listEl) return;
+  const machines = fleet.roundStartedAt && fleet.machines ? fleet.machines : fleetMachines();
+  updateMachinesSummary(summaryEl, machines);
+  const frag = document.createDocumentFragment();
+  machines.forEach(function (m, index) {
+    frag.appendChild(guardedMachineRow(m, index));
+  });
+  listEl.replaceChildren(frag);
+}
+
 // ── Hub API actions ────────────────────────────────────────────────────
 // Each independent panel publishes as soon as it settles. One slow route must
 // never hold Posture, or another panel, behind it. Retries select one panel.
+// Two MiB covers 500 public records at roughly 4 KiB each; larger reads fail Unknown.
+const MFP_BODY_BYTE_LIMIT = 2 * 1024 * 1024;
+async function readMfpBody(response) {
+  if (!response.body || !response.body.getReader) throw new Error("Dashboard read body unavailable");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      // Untrusted roster, finding and policy text cannot grow the retained response beyond the fixed budget.
+      if (bytes > MFP_BODY_BYTE_LIMIT) throw new Error("Dashboard read body too large");
+      text += decoder.decode(part.value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } finally { void reader.cancel().catch(function () {}); reader.releaseLock(); }
+}
+async function fetchMfpRead(path, key) {
+  const generation = beginMfpRead(path);
+  const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
+  try {
+    const res = await readResponse(credentialedReadUrl(path + "?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" }, undefined, generation);
+    const body = await res.json();
+    // Only the newest generation may commit rows and totals; older completions have no current authority.
+    if (!currentMfpRead(path, generation)) return;
+    // Snapshots replace prior state; the byte cap bounds text and the record cap bounds sorting and DOM work.
+    const rows = key === "roster" ? body.nodes : body.data.findings;
+    state.mfp.totals[key] = rows.length;
+    state.mfp[key] = key === "roster" ? { available: body.available, nodes: rows.slice(0, MFP_RECORD_LIMIT) } : rows.slice(0, MFP_RECORD_LIMIT);
+  } catch (error) {
+    // A superseded failure cannot clear the current snapshot or change its loaded state.
+    if (!currentMfpRead(path, generation)) return;
+    // The refresh that superseded this read owns the next snapshot and its selection, and already set the read state.
+    if (error && error.supersededByRefresh === true) return;
+    if (sourceRead(path).state !== "state_FAILED" && !sourceNotServed(path)) failSource(path, error);
+    state.mfp.totals[key] = 0;
+    state.mfp[key] = key === "roster" ? null : [];
+    // Selection belongs to the failed snapshot; a later success must not reopen its drawer.
+    if (key === "findings") state.mfp.findingId = null;
+  }
+}
+
 const panelJobs = [
   { paths: [INBOX_PREFS], load: loadInboxPrefs },
+  { paths: ["/api/fleet/roster"], load: function () { return fetchMfpRead("/api/fleet/roster", "roster"); } },
+  { paths: ["/api/sentinels/findings"], load: function () { return fetchMfpRead("/api/sentinels/findings", "findings"); } },
   { paths: [HUB + "/agents"], load: async function () {
     const ar = await api("/agents");
     state.agents = ar.data.agents || [];
@@ -3422,6 +5940,15 @@ const panelJobs = [
   } },
   { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
   { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
+  { paths: ["/api/posture/evidence"], load: async function (deadlineAt) {
+    const url = evidenceReadUrl();
+    const sep = url.indexOf("?") >= 0 ? "&" : "?";
+    const res = await readResponse(credentialedReadUrl(url + sep + "_t=" + Date.now(), "GET"), {
+      headers: Object.assign({ "Cache-Control": "no-cache", "Pragma": "no-cache" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+      cache: "no-store"
+    }, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()));
+    state.evidence.view = await res.json();
+  } },
   { paths: [HUB + "/policies"], load: async function () { const r = await api("/policies"); state.policies = r.data.policies || []; } },
   { paths: [HUB + "/activity?category=privacy"], load: async function () { const r = await api("/activity?category=privacy"); state.privacyEvents = r.data.entries || []; } },
   { paths: [HUB + "/activity?category=handoff"], load: async function () { const r = await api("/activity?category=handoff"); state.handoffEvents = r.data.entries || []; } },
@@ -3582,7 +6109,7 @@ async function fetchSovereignty() {
 function postureHomeExpiryAt(home) {
   if (!home) return null;
   // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
-  const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
+  const expiries = [home.castle_wall, home.digest && (home.digest.chain_verified === true || home.digest.chain_verdict === "verified_suffix_only") ? auditChainEvidence(home.digest) : null].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
     return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + SEAL_FRESHNESS_BOUNDARY_OFFSET_MS;
   });
   return expiries.length ? Math.min.apply(null, expiries) : null;
@@ -3837,6 +6364,15 @@ function deriveSeal() {
 // Plain-English line for the named layer in the posture popover. Uses the
 // retired-L-number rule: named layers only, never "L1".."L4". Values are
 // honest: the wall line reflects the real arm-state, not config presence.
+// The dot beside a layer line. A line whose word is Unknown wears the unknown
+// dot (slate, hollow) whatever its other flags say: the pass dot is earned by
+// observed evidence, never by the absence of a warning. Shared by the seal
+// popover and the Enforcement screen so the two cannot disagree.
+function layerDotClass(l) {
+  if (l.unknown || /^unknown$/i.test(String(l.v).trim())) return "pp-dot unknown";
+  if (l.off) return "pp-dot off";
+  return l.warn ? "pp-dot warn" : "pp-dot";
+}
 function postureLayerLines() {
   const d = state.posture.data;
   const seal = deriveSeal();
@@ -3851,16 +6387,25 @@ function postureLayerLines() {
   else if (seal.arm) wallV = "not enforcing";
   else wallV = "unknown";
   const wallWarn = !(seal.arm === "armed" && seal.freshness.current);
-  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
-  const wrapped = sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown";
+  const pending = heldApprovalItems(null).length;
+  const approvalsEvidence = approvalQueueEvidence();
+  // Only a complete, readable queue without recognized or unknown holds can earn a clear Charter row.
+  const approvalsValue = !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : approvalsEvidence.earned ? "clear" :
+    pending + (approvalsEvidence.full ? "+" : "") + " waiting" + (approvalsEvidence.unknown ? "; " + approvalsEvidence.unknownLine : "");
   return [
     { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
-    { k: "Sentinels watching agents", v: wrapped === "Unknown" ? "Unknown" : wrapped + " wrapped", warn: wrapped === "Unknown", off: wrapped === 0 },
-    { k: "Charter approvals", v: !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : pending ? pending + " waiting" : "clear", warn: pending > 0 },
-    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") }
+    // No read this page makes carries a Sentinel report, and a roster of
+    // protected agents is not evidence that a Sentinel is watching them, so
+    // this line is Unknown until a Sentinel report is part of a read.
+    { k: "Sentinels watching agents", v: "Unknown", unknown: true },
+    // Every value short of earned clear keeps the warning; unknown values retain the shared Unknown dot.
+    { k: "Charter approvals", v: approvalsValue, warn: approvalsValue !== "clear" },
+    // A Heralds layer that is configured but not active is not signing: it
+    // reads "configured" with the warn dot, never the pass dot.
+    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 || d.layers.l4.status !== "active" }
   ];
 }
 
@@ -3959,99 +6504,387 @@ async function onLockdownClick() {
 }
 
 async function onAgentControl(agentId, action) {
+  const label = agentControlLabel(action);
   try {
     const r = await api("/agents/" + encodeURIComponent(agentId) + "/" + action, { method: "POST", body: {} });
     if (r.data && r.data.status === "approval_pending") {
       toast("Approval pending. See inbox.", "info");
     } else {
-      toast(action + " applied to " + agentId, "info");
+      toast('"' + label + '" applied to ' + agentId, "info");
     }
     await fetchAll(true);
     rerender();
   } catch (e) {
     if (e.status === 422) {
-      toast("Sanctuary cannot apply " + action + " for this agent: " + e.message, "error");
+      toast('Sanctuary cannot apply "' + label + '" for this agent.', "error");
     } else {
-      toast(action + " failed: " + e.message, "error");
+      toast('"' + label + '" failed. Try again.', "error");
     }
   }
 }
 
+function decisionNotAdmissible(ids) {
+  // Invariant: a decision is sent only against a loaded inbox read in which every admitted id is still held; a
+  // stale selection, a resolved row or a queue that could not be re-read sends nothing and says why.
+  if (!sourceLoaded(HUB + "/inbox")) return "the queue has not been read since it last changed, so nothing was sent. Re-read the queue first.";
+  const gone = ids.filter(function (id) { const item = state.inbox.find(function (i) { return i.item_id === id; }); return !item || item.resolved; });
+  if (gone.length === 0) return "";
+  return (ids.length === 1 ? "the request is no longer waiting in the loaded queue"
+    : gone.length + " of the " + ids.length + " selected items " + (gone.length === 1 ? "is" : "are") + " no longer waiting in the loaded queue") + ", so nothing was sent.";
+}
+function state_NOTADMITTEDDecision(fields, reason) {
+  // Nothing was sent, so no lock is taken; the retained result still tells the operator what did not happen.
+  if (decisionInFlight()) return;
+  const notSent = decisionVerb(fields.action) + " was not sent for " + fields.subject + ": " + reason;
+  const current = state.approvals.result;
+  if (current && current.status === "uncertain") {
+    // Invariant: an unconfirmed result is replaced only by a decision that was sent; a later click that sends
+    // nothing is noted on it (one slot, so repeated clicks cannot grow it) and the warning stays unclearable.
+    current.notSent = "Your next " + notSent;
+    announceDecision(current);
+    renderFeedback();
+    return;
+  }
+  state.approvals.result = Object.assign({ status: "not_sent", rule: null, refresh: "loaded", records: [] }, fields, { message: notSent });
+  announceDecision(state.approvals.result);
+  rerender();
+}
 async function onInboxAction(itemId, action) {
+  // Invariant: a second decision is never admitted while one holds the lock, so a stale or repeated click
+  // sends nothing and the retained result keeps naming the first request only.
+  if (decisionInFlight()) return false;
+  const fields = { kind: "item", action: action, itemId: itemId, ids: [itemId], subject: decisionSubject(itemId) };
+  const blocked = decisionNotAdmissible([itemId]);
+  if (blocked) { state_NOTADMITTEDDecision(fields, blocked); return false; }
+  const result = state_ADMITTEDDecision(fields);
+  let acknowledged = false;
+  await runDecision(result, async function () {
+    const outcome = await performInboxAction(itemId, action, result.subject);
+    settleDecision(result, outcome.status, outcome.message);
+    acknowledged = outcome.status === "acknowledged";
+  });
+  return acknowledged;
+}
+
+// ── Decision result: one retained outcome for every inbox decision ─────
+// Every per-item and batch decision is admitted into state.approvals.result and settles there; the screens
+// with decision controls render from it, and nothing else reports a decision. Named states, in order:
+// state_ADMITTEDDecision, then settleDecision (acknowledged, refused or uncertain), then
+// refreshAfterDecision, then state_RELEASEDDecision. The lock (state.approvals.lock) is the admitted result
+// and is held through the refresh, so no new decision is taken against a list the last one has not re-read.
+// Must match the reason and note text asserted in test/dashboard/v1_1/approval-decision-result.test.ts.
+const DECISION_BUSY_REASON = "Another decision is being sent.";
+const DECISION_REREAD_NOTE = "The queue could not be re-read after this decision, so this list may be out of date.";
+const DECISION_UNCERTAIN_ADVICE = "The decision may or may not have been applied. Check the queue before deciding again.";
+const DECISION_VERB = { approve: "Allow once", deny: "Deny", dismiss: "Dismiss", archive: "Archive", delete: "Delete", snooze: "Snooze" };
+const DECISION_DONE = { approve: "Allowed once", deny: "Denied", dismiss: "Dismissed", archive: "Archived", delete: "Deleted", snooze: "Snoozed" };
+const DECISION_REREAD_BUSY_REASON = "The queue is being re-read after a decision.";
+// not_sent is client-side only: nothing reached the server, so it is neither a refusal (a 4xx) nor unconfirmed.
+const DECISION_HEADLINE = { pending: "Sending your decision", acknowledged: "Decision taken", refused: "Decision refused", uncertain: "Decision unconfirmed", not_sent: "Decision not sent" };
+const DECISION_UNCERTAIN_STAYS = "This result stays on screen until your next decision replaces it.";
+
+function decisionInFlight() { return !!state.approvals.lock; }
+function decisionVerb(action) { return DECISION_VERB[action] || action; }
+function decisionDone(action) { return DECISION_DONE[action] || "Done"; }
+function decisionSubject(itemId) {
+  // Captured at admission: after the refresh the item may have left the served projection.
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  // The category is an internal token (state_export); the operator reads it as words (state export).
+  return (item ? approvalOperation(item).replace(/_/g, " ") + " by " + approvalAgentId(item) + " " : "") + "(request " + itemId + ")";
+}
+function decisionHeadline(result) {
+  // A batch that was taken for some items and refused for others says so in its headline, never "taken" alone.
+  if (result.status === "acknowledged" && result.records.some(function (rec) { return rec.status !== "acknowledged"; })) return "Decision partly taken";
+  return DECISION_HEADLINE[result.status];
+}
+function endSentence(text) {
+  const t = String(text || "").trim();
+  return t ? (/[.!?]$/.test(t) ? t : t + ".") : "";
+}
+function announceDecision(result) {
+  // The shell live region outlives every #main repaint, so an announcement is never lost to innerHTML replacement.
+  const region = document.getElementById("decision-announcement");
+  // The re-read note is part of the announcement, so a screen reader hears that the list may be stale.
+  if (region) region.textContent = decisionHeadline(result) + ". " + result.message + (result.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : "") + (result.notSent ? " " + result.notSent : "");
+}
+function state_ADMITTEDDecision(fields) {
+  // Invariant: the lock and the retained result are set together, so the paused controls and the status text
+  // can never disagree about whether a decision is in flight.
+  const result = Object.assign({ status: "pending", rule: null, refresh: "pending", records: [] }, fields);
+  result.message = "Sending " + decisionVerb(result.action) + " for " + result.subject + ". Other decision controls are paused until the server answers.";
+  state.approvals.lock = result;
+  state.approvals.result = result;
+  state.approvals.inFlightItemId = result.kind === "item" ? result.itemId : null;
+  announceDecision(result);
+  rerender();
+  return result;
+}
+function settleDecision(result, status, message) {
+  // Invariant: only the result holding the lock settles, and only once; a late or foreign settlement is
+  // dropped, so the retained outcome always belongs to the admitted request.
+  if (state.approvals.lock !== result || result.status !== "pending") return;
+  result.status = status;
+  result.message = message;
+  announceDecision(result);
+  rerender();
+}
+function extendDecision(result, text, rule) {
+  if (state.approvals.lock !== result) return;
+  result.message += " " + text;
+  if (rule) result.rule = rule;
+  announceDecision(result);
+  rerender();
+}
+async function refreshAfterDecision(result) {
+  // Invariant: the refresh never changes the status. A false return, an inbox read that did not load, or a
+  // thrown repaint all become the plain-English re-read note, so an acknowledged decision cannot read as
+  // refused and a stale list cannot read as current.
+  let loaded = false;
+  try { loaded = !!(await fetchAll(true)) && sourceLoaded(HUB + "/inbox"); }
+  catch (e) { loaded = false; }
+  if (state.approvals.lock !== result) return;
+  result.refresh = loaded ? "loaded" : "unavailable";
+  if (!loaded) announceDecision(result);
+}
+function state_RELEASEDDecision(result) {
+  if (state.approvals.lock !== result) return;
+  state.approvals.lock = null;
+  state.approvals.inFlightItemId = null;
+  // Consent belongs to the selected request; a decision on another row leaves it in place.
+  if (result.ids.indexOf(state.approvals.selectedId) >= 0) resetApprovalConsent();
+  rerender();
+}
+async function runDecision(result, send) {
+  try {
+    try { await send(); }
+    catch (e) { settleDecision(result, "uncertain", "The server's answer could not be read (" + ((e && e.message) || "no detail") + "). " + DECISION_UNCERTAIN_ADVICE); }
+    await refreshAfterDecision(result);
+  } finally { state_RELEASEDDecision(result); }
+}
+function decisionRefusedByServer(error) {
+  // Invariant: only a 4xx answer proves the server refused; no answer, a 5xx or an unreadable body leaves the
+  // decision uncertain, never refused and never acknowledged.
+  const status = error && error.status;
+  return typeof status === "number" && status >= 400 && status < 500;
+}
+function decisionOutcomeFromError(action, subject, error, item) {
+  const http = error && typeof error.status === "number" ? " (HTTP " + error.status + ")" : "";
+  const reason = (error && error.message) || "no answer from the server";
+  if (decisionRefusedByServer(error)) {
+    // A Tier 1 dismiss returns 409 (binding addendum 1.2) and the operator needs the next step, not the code; any
+    // other 409 (for example a request another surface already resolved) keeps the server's own reason.
+    const tier1Dismiss = error.status === 409 && action === "dismiss" && !!item && item.tier === "tier1";
+    const detail = tier1Dismiss ? "Tier 1 items cannot be dismissed. Approve or deny instead." : endSentence(reason + http);
+    // A refusal proves only that this decision was not applied; the queue below shows the request's current state.
+    return { status: "refused", message: decisionVerb(action) + " was refused for " + subject + ": " + detail + " The decision was not applied." };
+  }
+  return { status: "uncertain", message: "The server did not confirm " + decisionVerb(action) + " for " + subject + " (" + reason + http + "). " + DECISION_UNCERTAIN_ADVICE };
+}
+function decisionAcknowledges(body, itemId) {
+  // Invariant: an acknowledgement is only a 2xx body that names the admitted item as resolved; a 2xx that says
+  // anything else is uncertain, so the screen never shows a decision the server did not confirm.
+  const item = body && body.data && body.data.item;
+  return !!(item && item.item_id === itemId && item.resolved === true);
+}
+function decisionRecordLine(item, action) {
+  if (!item || (action !== "approve" && action !== "deny")) return "";
+  return isCharterApprovalItem(item) ? " Recorded in your audit log." : " Marked decided in this inbox.";
+}
+// The host id must match decision-feedback-result in html.ts. Clear uses this
+// patch directly so it does not replace route nodes or restore input focus.
+let lastFeedbackHtml = null;
+function renderFeedback() {
+  const host = document.getElementById("decision-feedback-result");
+  if (!host) return;
+  const html = renderDecisionResult();
+  // Compare emitted strings: DOM serialization changes quote entities and would replace focused Clear.
+  if (lastFeedbackHtml !== html) {
+    host.innerHTML = html;
+    lastFeedbackHtml = html;
+    // A changed result starts at F's origin so stale scrolling cannot hide its headline.
+    const feedback = document.getElementById("feedback");
+    if (feedback) feedback.scrollTop = 0;
+  }
+}
+function renderDecisionResult() {
+  const r = state.approvals.result;
+  if (!r || r.cleared) return "";
+  const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
+  const records = r.records.length
+    ? '<ul>' + r.records.map(function (rec) { return '<li>' + escHtml(rec.message) + '</li>'; }).join("") + '</ul>' : "";
+  // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock. An
+  // unconfirmed result has no Clear at all: the operator owes the queue a check, and only the next decision
+  // replaces the warning, so it cannot be dismissed unread.
+  const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS + (r.notSent ? " " + r.notSent : "") : "";
+  const clear = r.status === "pending" || r.status === "uncertain" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
+  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + escHtml(r.message + note + stays) + '</p>' + records + '</div>' + clear + '</section>';
+}
+function decisionFirstSentence(message) {
+  const first = message.split(". ")[0];
+  return first.slice(-1) === "." ? first : first + ".";
+}
+function renderDecisionBatchInline() {
+  // The Evidence inbox repeats the last batch status beside its toolbar; full text stays in F.
+  const r = state.approvals.result;
+  if (!r || r.kind !== "batch") return "";
+  // A partly taken batch keeps its whole short message here, so the refusal is not dropped with the second sentence.
+  const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
+    : r.status === "acknowledged" ? (decisionHeadline(r) === DECISION_HEADLINE.acknowledged ? decisionFirstSentence(r.message) : r.message)
+    : r.status === "refused" ? "Refused."
+    : r.status === "not_sent" ? "Not sent."
+    : "Unconfirmed.";
+  return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
+}
+function renderDecisionInline(item) {
+  // The drawer and rows repeat the status for the decided request; full text stays in F.
+  const r = state.approvals.result;
+  if (!r || r.kind !== "item" || r.itemId !== item.item_id || item.resolved) return "";
+  const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
+    : r.status === "acknowledged" ? decisionDone(r.action) + "."
+    : r.status === "refused" ? "Refused."
+    : r.status === "not_sent" ? "Not sent."
+    : "Unconfirmed.";
+  return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
+}
+
+// Below the stacking breakpoint the drawer sits under the whole queue, so selecting a row moves focus to
+// the drawer's heading, which brings it into view. The target is a heading, not a decision control, so a
+// stray key press after the click cannot decide.
+function focusApprovalDrawer() {
+  const main = document.getElementById("main");
+  const head = main && main.querySelector('[data-approval-drawer-focus="1"]');
+  if (head && typeof head.focus === "function") head.focus();
+}
+function focusTier1Cancel() {
+  const main = document.getElementById("main");
+  const cancel = main && main.querySelector('[data-action="approval-cancel-tier1-allow"]');
+  if (cancel) cancel.focus();
+}
+function state_ARMEDTier1(itemId) {
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  // Arming binds consent to the current unresolved Tier 1 request, never a stale or in-flight row.
+  if (!item || item.resolved || item.tier !== "tier1" || state.approvals.selectedId !== itemId || decisionInFlight()) return;
+  state.approvals.confirmingTier1Id = itemId;
+  state.approvals.cancelledTier1Id = null;
+  rerender();
+  focusTier1Cancel();
+}
+function state_CANCELLEDTier1(itemId) {
+  // An in-flight approval cannot be cancelled by a local control after submission.
+  if (decisionInFlight()) return;
+  // Cancellation disarms the request before repainting, so no subsequent Confirm can submit it.
+  state.approvals.confirmingTier1Id = null;
+  state.approvals.cancelledTier1Id = itemId;
+  rerender();
+  focusTier1Cancel();
+}
+async function state_APPROVINGAlwaysAllow(itemId) {
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  // Only an explicitly checked, available standing option on this waiting item can begin promotion.
+  if (!item || item.resolved || state.approvals.selectedId !== itemId || !state.approvals.alwaysAllow || !approvalStandingState(item).enabled || decisionInFlight()) return;
+  const op = promotableOperation(item);
+  const fields = { kind: "item", action: "approve", itemId: itemId, ids: [itemId], subject: decisionSubject(itemId), rule: "pending" };
+  const blocked = decisionNotAdmissible([itemId]);
+  if (blocked) { state_NOTADMITTEDDecision(fields, blocked); return; }
+  const result = state_ADMITTEDDecision(fields);
+  await runDecision(result, async function () {
+    const outcome = await performInboxAction(itemId, "approve", result.subject);
+    settleDecision(result, outcome.status, outcome.message);
+    // Invariant: a refused or unconfirmed approval never grants a standing rule; only an acknowledged approval reaches compile.
+    if (outcome.status !== "acknowledged") { extendDecision(result, "No standing rule was requested.", "refused"); return; }
+    await state_PROMOTINGAlwaysAllow(result, itemId, op);
+  });
+}
+async function state_PROMOTINGAlwaysAllow(result, itemId, op) {
+  try {
+    await onInboxPromote(itemId, op);
+    extendDecision(result, "Standing rule added: agents may " + op.replace(/_/g, " ") + " without asking.", "added");
+  } catch (e) {
+    // The approval already succeeded, so a policy failure reports that partial outcome in words, never as a refused decision.
+    extendDecision(result, e && e.ruleUncertain
+      ? "The standing rule may not have been added: " + endSentence(e.message) + " Check the policy before relying on it."
+      : "The standing rule was not added: " + endSentence((e && e.message) || "no detail"), e && e.ruleUncertain ? "uncertain" : "refused");
+  }
+}
+
+async function performInboxAction(itemId, action, subject) {
   // WP-V1.2 reshape: direct-agent chat surface removed; the
   // pending-approval bookkeeping that previously synced with chat
   // session state is gone. Inbox approve/deny now is a clean inbox-only
   // resolve with the lockdown / exit-drill side effects preserved.
   // After approve, the inspect panel for the bound agent (if any) is
   // re-fetched via the route, not through state mutation.
+  // Returns the settled outcome { status, message } for the caller's retained result; it never reports on its own.
   const item0 = state.inbox.find(function (x) { return x.item_id === itemId; });
   const boundAgentId = (item0 && item0.agent_id) || null;
+  // The subject was captured at admission, so a row that moves during the request cannot rewrite the sentence.
+  subject = subject || decisionSubject(itemId);
+  let r;
   try {
-    const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
-    const item = (r.data && r.data.item) || null;
-    // payload is resolved here, before the lockdown and exit-drill branches, so both can
-    // read it. Declaring it inside the lockdown if-block puts it out of scope for the
-    // exit-drill branch and causes ReferenceError when the lockdown branch did not execute.
-    const payload = item ? (item.resolution_payload || {}) : {};
-    if (item && state.tier1.lockdown.inboxItemId === itemId) {
-      if (action === "approve" && payload.outcome === "engaged") {
-        state.tier1.lockdown.state = "engaged";
-      } else if (action === "approve" && payload.outcome === "partial") {
-        state.tier1.lockdown.state = "partial";
-        toast("Lockdown partially applied. At least one confined agent did not confirm a live stop.", "info");
-      } else {
-        state.tier1.lockdown.state = "idle";
-        if (action === "approve" && payload.outcome) {
-          toast("Lockdown outcome: " + payload.outcome + ".", "error");
-        }
-      }
-      renderTopbar();
-    }
-    if (state.exitDrill.inboxItemId === itemId && action === "approve") {
-      // A7: read the real export values from resolution_payload rather than
-      // a placeholder, so the dashboard renders the honest state_entry_count
-      // and warnings. payload is in scope from the outer block above.
-      // state_entry_count accepts only nonneg integers; fractional or negative
-      // values are stored as null so the renderer omits the field rather than
-      // displaying a nonsensical count.
-      // warnings accepts only string entries; non-string entries are filtered
-      // out before they reach escHtml so a future coercion change cannot widen
-      // the injection surface.
-      const rawCount = payload.state_entry_count;
-      const secCount = (typeof rawCount === "number" && Number.isInteger(rawCount) && rawCount >= 0) ? rawCount : null;
-      const rawWarnings = payload.warnings;
-      const secWarnings = Array.isArray(rawWarnings)
-        ? rawWarnings.filter(function(w) { return typeof w === "string"; })
-        : undefined;
-      state.exitDrill.bundleResult = {
-        bundle_dir: payload.bundle_dir || "(see activity feed)",
-        manifest_hash: payload.manifest_hash || "",
-        artifact_count: typeof payload.artifact_count === "number" ? payload.artifact_count : 0,
-        state_entry_count: secCount,
-        warnings: (secWarnings && secWarnings.length > 0) ? secWarnings : undefined,
-      };
-    }
-    await fetchAll(true);
-    // After approve on an agent-bound inbox item, refresh the inspect
-    // panel for that agent if the operator is currently viewing it, so
-    // the panel reflects the resolved approval.
-    if (
-      action === "approve" &&
-      boundAgentId &&
-      state.selectedAgentId === boundAgentId &&
-      state.chat.inspect.panelByAgentId[boundAgentId]
-    ) {
-      void onAgentInspectOpen(boundAgentId);
-    }
-    rerender();
+    r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
   } catch (e) {
-    // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
-    if (e.status === 409) {
-      toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
-    } else {
-      toast("Inbox action failed: " + e.message, "error");
-    }
+    return decisionOutcomeFromError(action, subject, e, item0);
   }
+  if (!decisionAcknowledges(r, itemId)) {
+    return { status: "uncertain", message: "The server answered but did not confirm " + decisionVerb(action) + " for " + subject + ". " + DECISION_UNCERTAIN_ADVICE };
+  }
+  const item = r.data.item;
+  // payload is resolved here, before the lockdown and exit-drill branches, so both can
+  // read it. Declaring it inside the lockdown if-block puts it out of scope for the
+  // exit-drill branch and causes ReferenceError when the lockdown branch did not execute.
+  const payload = item.resolution_payload || {};
+  let effect = "";
+  if (item && state.tier1.lockdown.inboxItemId === itemId) {
+    if (action === "approve" && payload.outcome === "engaged") {
+      state.tier1.lockdown.state = "engaged";
+      effect = " Lockdown engaged.";
+    } else if (action === "approve" && payload.outcome === "partial") {
+      state.tier1.lockdown.state = "partial";
+      effect = " Lockdown partially applied. At least one confined agent did not confirm a live stop.";
+    } else {
+      state.tier1.lockdown.state = "idle";
+      if (action === "approve" && payload.outcome) {
+        effect = " Lockdown outcome: " + payload.outcome + ".";
+      }
+    }
+    renderTopbar();
+  }
+  if (state.exitDrill.inboxItemId === itemId && action === "approve") {
+    // A7: read the real export values from resolution_payload rather than
+    // a placeholder, so the dashboard renders the honest state_entry_count
+    // and warnings. payload is in scope from the outer block above.
+    // state_entry_count accepts only nonneg integers; fractional or negative
+    // values are stored as null so the renderer omits the field rather than
+    // displaying a nonsensical count.
+    // warnings accepts only string entries; non-string entries are filtered
+    // out before they reach escHtml so a future coercion change cannot widen
+    // the injection surface.
+    const rawCount = payload.state_entry_count;
+    const secCount = (typeof rawCount === "number" && Number.isInteger(rawCount) && rawCount >= 0) ? rawCount : null;
+    const rawWarnings = payload.warnings;
+    const secWarnings = Array.isArray(rawWarnings)
+      ? rawWarnings.filter(function(w) { return typeof w === "string"; })
+      : undefined;
+    state.exitDrill.bundleResult = {
+      bundle_dir: payload.bundle_dir || "(see activity feed)",
+      manifest_hash: payload.manifest_hash || "",
+      artifact_count: typeof payload.artifact_count === "number" ? payload.artifact_count : 0,
+      state_entry_count: secCount,
+      warnings: (secWarnings && secWarnings.length > 0) ? secWarnings : undefined,
+    };
+  }
+  // After approve on an agent-bound inbox item, refresh the inspect
+  // panel for that agent if the operator is currently viewing it, so
+  // the panel reflects the resolved approval.
+  if (
+    action === "approve" &&
+    boundAgentId &&
+    state.selectedAgentId === boundAgentId &&
+    state.chat.inspect.panelByAgentId[boundAgentId]
+  ) {
+    void onAgentInspectOpen(boundAgentId);
+  }
+  return { status: "acknowledged", message: decisionDone(action) + ": " + subject + "." + decisionRecordLine(item0, action) + effect };
 }
 
 // Tunability UX: promote a pending approval into a durable standing rule.
@@ -4072,40 +6905,17 @@ async function onInboxAction(itemId, action) {
 // agent on loopback cannot promote by network position alone. This never
 // creates an agent-readable policy path (AGENTS.md hard rule 7): the agent
 // sees only the generic gate denial, never the promoted rule.
-async function onInboxPromote(itemId) {
-  const item = state.inbox.find(function (x) { return x.item_id === itemId; });
-  if (!item) return;
-  const op = promotableOperation(item);
-  if (!op) {
-    toast("This approval cannot be turned into a standing rule.", "error");
-    return;
-  }
-  try {
-    // Step 1: compile the standing rule from plain English. The compiler
-    // recognizes "auto-allow <op>" deterministically (high confidence), so
-    // no substrate call is needed and the draft is inspectable.
-    const compiled = await policyApi("/compile", {
-      method: "POST",
-      body: { english_text: "auto-allow " + op }
-    });
-    const draft = compiled && compiled.data && compiled.data.draft;
-    if (!draft || !draft.draft_id) {
-      toast("Could not prepare a rule for " + op + ".", "error");
-      return;
-    }
-    // Step 2: activate the draft through the REAL activator. The server
-    // enforces conflict detection + the #805 downgrade gate; we surface its
-    // decision honestly rather than pretending success.
-    await activateStandingRule(draft.draft_id, op, false);
-  } catch (e) {
-    if (e.status === 401 || e.status === 403) {
-      toast("Operator token required to change policy.", "error");
-    } else if (e.status === 503) {
-      toast("Policy engine is not configured on this fortress.", "error");
-    } else {
-      toast("Could not add standing rule: " + e.message, "error");
-    }
-  }
+async function onInboxPromote(itemId, approvedOperation) {
+  // The approved operation is captured before refetch because resolved Charter holds leave the projection.
+  const op = approvedOperation;
+  const compiled = await policyApi("/compile", {
+    method: "POST",
+    body: { english_text: "auto-allow " + op }
+  });
+  const draft = compiled && compiled.data && compiled.data.draft;
+  // Missing draft evidence cannot authorize an activation.
+  if (!draft || !draft.draft_id) throw new Error("Could not prepare a rule for " + op.replace(/_/g, " ") + ".");
+  await activateStandingRule(draft.draft_id, op, false);
 }
 
 // Activate a compiled standing-rule draft. On a #805 posture-downgrade
@@ -4113,21 +6923,26 @@ async function onInboxPromote(itemId) {
 // we retry with the audited override. The gate is never bypassed silently:
 // a refused promote either stops or goes through the operator-confirmed,
 // server-audited (policy_force_downgrade_used) path.
+// Resolves when the rule is activated and throws otherwise; the caller's retained result carries the outcome.
 async function activateStandingRule(draftId, op, force) {
   const path = "/drafts/" + encodeURIComponent(draftId) + "/activate" +
     (force ? "?override_downgrade=true" : "");
   try {
     const activated = await policyApi(path, { method: "POST", body: {} });
-    const status = activated && activated.data && activated.data.status;
+    const status = activated && activated.data && typeof activated.data.status === "string" ? activated.data.status : null;
     if (status === "activated") {
-      toast(force
-        ? "Standing rule added (you confirmed it relaxes protection)."
-        : "Standing rule added: agents may " + op + " without asking.");
       if (state.route === "policy") await loadPolicyView(true);
-      await fetchAll(true);
-      rerender();
+    } else if (status === null) {
+      // Invariant: a 2xx whose body carries no readable status may already have changed the policy, so it is
+      // unconfirmed, never a refusal; only an explicit non-activated status is a refusal.
+      const unreadable = new Error("the activation answer could not be read.");
+      unreadable.ruleUncertain = true;
+      throw unreadable;
     } else {
-      toast("Rule not activated (" + (status || "refused") + ").", "error");
+      // Only an explicit activated result establishes that the standing rule was added.
+      const notActivated = new Error("Rule not activated (" + status + ").");
+      notActivated.ruleRefused = true;
+      throw notActivated;
     }
   } catch (e) {
     if (e.status === 409 && !force) {
@@ -4137,40 +6952,97 @@ async function activateStandingRule(draftId, op, force) {
         "This rule would relax your protection so agents can " + op +
         " without asking you. This is recorded in your audit log. Add it anyway?");
       if (ok) return activateStandingRule(draftId, op, true);
-      toast("Kept your protection: no standing rule added.");
-      return;
+      throw new Error("you chose to keep your protection.");
     }
+    let error = e;
     if (e.status === 401 || e.status === 403) {
-      toast("Operator token required to change policy.", "error");
+      error = new Error("Operator token required to change policy.");
     } else if (e.status === 503) {
-      toast("Policy engine is not configured on this fortress.", "error");
-    } else {
-      toast("Could not add standing rule: " + e.message, "error");
+      error = new Error("Policy engine is not configured on this fortress.");
     }
+    // Invariant: a 4xx, a non-activated status, an unconfigured engine or the operator's own cancel is a definite
+    // refusal; only an activate call with no readable answer may have taken effect, so only that is uncertain.
+    error.ruleUncertain = e.ruleUncertain === true || !(e.ruleRefused || decisionRefusedByServer(e) || e.status === 503);
+    throw error;
   }
 }
 
 async function onInboxBatchAction(action, until) {
+  // The batch shares the one decision lock, so it never overlaps an individual decision or another batch.
+  if (decisionInFlight()) return;
   const ids = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
   if (ids.length === 0) return;
-  try {
-    if (action === "archive" || action === "delete" || action === "snooze") {
-      await fetch("/api/inbox/unified/batch", {
-        method: "POST",
-        headers: Object.assign({ "Content-Type": "application/json" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
-        body: JSON.stringify({ action: action, entry_ids: ids, until: until })
-      });
-    }
+  const fields = { kind: "batch", action: action, ids: ids, subject: ids.length + (ids.length === 1 ? " selected item" : " selected items") };
+  const blocked = decisionNotAdmissible(ids);
+  if (blocked) { state_NOTADMITTEDDecision(fields, blocked); return; }
+  const result = state_ADMITTEDDecision(fields);
+  await runDecision(result, async function () {
     if (action === "dismiss") {
-      for (const id of ids) await onInboxAction(id, "dismiss");
+      // Each id takes the same path as an individual decision under the batch's lock, and each outcome is kept.
+      for (const id of ids) {
+        const outcome = await performInboxAction(id, "dismiss", decisionSubject(id));
+        result.records.push({ itemId: id, status: outcome.status, message: outcome.message });
+      }
+      settleBatchFromRecords(result);
+    } else if (action === "archive" || action === "delete" || action === "snooze") {
+      settleUnifiedBatch(result, ids, await submitUnifiedBatch(action, ids, until));
+    } else {
+      settleDecision(result, "refused", "Unsupported batch action " + action + "; nothing was sent.");
     }
-    state.inboxOps.selected = {};
-    state.inboxOps.snoozeDialog = null;
-    await fetchAll(true);
-    rerender();
-  } catch (e) {
-    toast("Inbox batch action failed.", "error");
+    // Invariant: the selection clears only on an acknowledgement, so a refused or unconfirmed batch leaves the
+    // operator's choice in place for a retry instead of looking done.
+    if (result.status === "acknowledged") {
+      state.inboxOps.selected = {};
+      state.inboxOps.snoozeDialog = null;
+    }
+  });
+}
+function settleBatchFromRecords(result) {
+  const counts = { acknowledged: 0, refused: 0, uncertain: 0 };
+  result.records.forEach(function (rec) { counts[rec.status]++; });
+  const total = result.records.length;
+  // One unconfirmed item makes the batch unconfirmed; a batch with no acknowledgement is refused.
+  const status = counts.uncertain ? "uncertain" : counts.acknowledged ? "acknowledged" : "refused";
+  const message = decisionDone(result.action) + " " + counts.acknowledged + " of " + total + (total === 1 ? " item." : " items.") +
+    (counts.refused ? " " + counts.refused + (counts.refused === 1 ? " was refused." : " were refused.") : "") +
+    (counts.uncertain ? " " + counts.uncertain + (counts.uncertain === 1 ? " is unconfirmed. " : " are unconfirmed. ") + DECISION_UNCERTAIN_ADVICE : "");
+  settleDecision(result, status, message);
+}
+async function submitUnifiedBatch(action, ids, until) {
+  // The unified inbox keeps its own route and bearer handling; only the answer is now read before anything is reported.
+  const res = await fetch("/api/inbox/unified/batch", {
+    method: "POST",
+    headers: Object.assign({ "Content-Type": "application/json" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+    body: JSON.stringify({ action: action, entry_ids: ids, until: until })
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  return { ok: res.ok, status: res.status, body: body };
+}
+function settleUnifiedBatch(result, ids, answer) {
+  const body = answer.body;
+  if (!answer.ok) {
+    const error = new Error(body && (body.error || body.detail) ? (body.error || body.detail) : "HTTP " + answer.status);
+    error.status = answer.status;
+    const outcome = decisionOutcomeFromError(result.action, result.subject, error);
+    settleDecision(result, outcome.status, outcome.message);
+    return;
   }
+  const summary = body && body.ok === true && body.data && body.data.result;
+  // Invariant: a batch is acknowledged only by a summary whose counts account for every id sent (must match
+  // BatchActionResult in principal-policy/unified-inbox-bridge.ts); anything else is uncertain.
+  const consistent = !!summary && summary.requested === ids.length && Number.isInteger(summary.affected) && summary.affected >= 0 &&
+    Array.isArray(summary.missing) && summary.affected + summary.missing.length === summary.requested &&
+    // Every missing entry must be one of the ids this batch sent, once; a foreign, duplicated or non-string entry
+    // means the summary describes some other batch, so it confirms nothing about this one.
+    summary.missing.every(function (id, index) { return typeof id === "string" && ids.indexOf(id) >= 0 && summary.missing.indexOf(id) === index; });
+  if (!consistent) {
+    settleDecision(result, "uncertain", "The server answered but did not confirm " + decisionVerb(result.action) + " for " + result.subject + ". " + DECISION_UNCERTAIN_ADVICE);
+    return;
+  }
+  const missing = summary.missing.length;
+  settleDecision(result, "acknowledged", decisionDone(result.action) + " " + summary.affected + " of " + ids.length + (ids.length === 1 ? " item." : " items.") +
+    (missing ? " " + missing + (missing === 1 ? " was not found: " : " were not found: ") + summary.missing.map(String).join(", ") + "." : ""));
 }
 
 async function onExitExportStart() {
@@ -4185,6 +7057,41 @@ async function onExitExportStart() {
       toast("Export start failed: " + e.message, "error");
     }
   }
+}
+
+async function onEvidenceJsonExport() {
+  try {
+    // api() sends the exact /api/audit-log path unprefixed, so the read relies on the route's default limit.
+    const body = await api("/api/audit-log", { method: "GET" });
+    // Must match handleAuditLog in server/src/principal-policy/dashboard.ts: with an audit log it serves the
+    // query result object ({ entries, total, integrity_findings }), and without one, or when the query fails,
+    // an empty array. An empty answer of either shape is reported as no entries, never as a downloaded log.
+    const entries = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray(body.entries) ? body.entries : null;
+    if (!entries) throw new Error("the audit log read did not return entries");
+    if (!entries.length) {
+      toast("No audit entries were returned, so nothing was exported. The audit log read returns none both for an empty log and for a log it could not read.", "info");
+      return;
+    }
+    // The file is the served answer unchanged, so the export carries the read's own total and findings with its entries.
+    downloadJsonFile(body, "sanctuary-audit-log.json");
+    toast("Downloaded the latest " + entries.length + (entries.length === 1 ? " audit entry" : " audit entries") + " as JSON (at most " + EVIDENCE_JSON_EXPORT_LIMIT + ").", "info");
+  } catch (e) {
+    toast("Audit log JSON export failed: " + (e && e.message ? e.message : "unknown"), "error");
+  }
+}
+
+function downloadJsonFile(body, filename) {
+  if (typeof Blob === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) throw new Error("File downloads are not available in this browser.");
+  const blob = new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  a.style.display = "none";
+  if (document.body && document.body.appendChild) document.body.appendChild(a);
+  if (typeof a.click === "function") a.click();
+  if (a.parentElement && a.parentElement.removeChild) a.parentElement.removeChild(a);
+  if (URL.revokeObjectURL) URL.revokeObjectURL(href);
 }
 
 async function onDidWebCompromisedRotation() {
@@ -4255,7 +7162,7 @@ function connectStream() {
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
           void refreshAutoTriggerPanels();
         }
-        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot", "/api/anomaly/findings"];
+        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot", "/api/anomaly/findings", "/api/sentinels/findings"];
         void queueStreamRefresh(paths);
       } catch (err) { /* ignore */ }
     });
@@ -4303,6 +7210,9 @@ function stopLiveUpdates() {
   liveUpdatesStopped = true;
   clearSealFreshnessTimer();
   sourceReads.forEach(function (read) { read.revision++; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
+  // Every read is now failed, so no findings snapshot is current: the selection closes, as a failed findings read
+  // closes it, and a restart cannot reopen it.
+  state.mfp.findingId = null;
   rerender();
 }
 
@@ -4336,20 +7246,84 @@ function rerender() {
   renderTopbar();
   renderMain();
   renderFortress();
+  renderShellChrome();
 }
 
 // ── Wire-up: events ────────────────────────────────────────────────────
 function bindHashRoute() {
   function fromHash() {
     const h = (location.hash || "#posture").slice(1);
+    const previousUrl = evidenceReadUrl();
+    applyEvidenceHashFilters(h);
+    if (evidenceReadUrl() !== previousUrl) { state.evidence.selectedIndex = 0; queueEvidenceRead(); }
+    if (h.split("?")[0] === "agents") {
+      const requestedState = new URLSearchParams(h.split("?")[1] || "").get("state") || "";
+      // The select and filter share one allowed set so an unknown hash cannot silently hide rows.
+      state.agentInventory.status = AGENT_STATE_FILTERS.some(function (option) { return option[0] === requestedState; }) ? requestedState : "";
+      state.agentInventory.page = 0;
+    }
     setRoute(h.split("?")[0] || "posture");
   }
   window.addEventListener("hashchange", fromHash);
   fromHash();
 }
 
+// Slice 2 keyboard: Ctrl-K (Cmd-K on a Mac) focuses the top-bar search;
+// Escape closes, in order, the search results, an open top-bar popover, and
+// the Talk panel.
+document.addEventListener("keydown", function (ev) {
+  // With no focused control, native page keys must target the workspace scroller.
+  if (document.activeElement === document.body && !ev.ctrlKey && !ev.metaKey && !ev.altKey &&
+      ["PageDown", "PageUp", "Home", "End", "ArrowDown", "ArrowUp", " "].includes(ev.key)) {
+    const main = document.getElementById("main");
+    if (main && typeof main.focus === "function") main.focus({ preventScroll: true });
+  }
+  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && String(ev.key || "").toLowerCase() === "k") {
+    const input = document.getElementById("global-search");
+    if (input && typeof input.focus === "function") {
+      ev.preventDefault();
+      input.focus();
+      if (typeof input.select === "function") input.select();
+      if (state.search.query) { state.search.open = true; renderSearchResults(); }
+    }
+    return;
+  }
+  if (ev.key !== "Escape") return;
+  if (state.search.open) { state.search.open = false; renderSearchResults(); return; }
+  if (state.agentScope.switcherOpen || state.posture.sealOpen) {
+    state.agentScope.switcherOpen = false;
+    state.posture.sealOpen = false;
+    renderTopbar();
+    return;
+  }
+  if (state.talk.open) {
+    state.talk.open = false;
+    renderShellChrome();
+    const talkBtn = document.getElementById("btn-talk");
+    if (talkBtn && typeof talkBtn.focus === "function") talkBtn.focus();
+  }
+});
+
 document.addEventListener("visibilitychange", function () {
   if (document.visibilityState === "visible") rerender();
+});
+
+document.addEventListener("compositionstart", function (ev) {
+  if (ev.target instanceof HTMLInputElement && ev.target.getAttribute("data-action") === "concierge-input") talkComposing = true;
+});
+document.addEventListener("compositionend", function (ev) {
+  if (ev.target instanceof HTMLInputElement && ev.target.getAttribute("data-action") === "concierge-input") talkComposing = false;
+});
+document.addEventListener("keydown", function (ev) {
+  if (ev.key !== "Enter") return;
+  if (!(ev.target instanceof HTMLInputElement) || ev.target.getAttribute("data-action") !== "concierge-input") return;
+  if (ev.isComposing || talkComposing || ev.keyCode === 229) ev.preventDefault();
+});
+document.addEventListener("submit", function (ev) {
+  const form = ev.target;
+  if (!(form instanceof HTMLFormElement) || form.getAttribute("data-action") !== "concierge-submit") return;
+  ev.preventDefault();
+  if (!talkComposing) void onConciergeSend();
 });
 
 document.addEventListener("click", function (ev) {
@@ -4376,10 +7350,33 @@ document.addEventListener("click", function (ev) {
       renderTopbar();
     }
   }
+  // Slice 2: the search results close on any click outside the search box,
+  // and on any click on a result. A result that links to the route already
+  // showing (an approval hit from #approvals, an evidence hit from
+  // #activity) assigns an unchanged hash, so no hashchange fires; the close
+  // here is explicit for that reason, not left to the route change.
+  if (state.search.open && (!rawTgt.closest("[data-search]") || rawTgt.closest("#search-results a"))) {
+    state.search.open = false;
+    renderSearchResults();
+  }
   if (!tgt) return;
   const action = tgt.getAttribute("data-action");
   if (action === "retry-panel") return void retryPanel(tgt.getAttribute("data-read"));
   if (!action) return;
+  if (action === "mfp-page") {
+    const key = tgt.getAttribute("data-list");
+    if (Object.prototype.hasOwnProperty.call(state.mfp.pages, key)) {
+      const step = tgt.getAttribute("data-step") === "-1" ? -1 : 1;
+      // mfpPage clamps against this list's served length when it renders, including control lists beyond 500.
+      state.mfp.pages[key] = Math.max(0, state.mfp.pages[key] + step);
+      rerender();
+    }
+    return;
+  }
+  if (action === "mfp-finding" || action === "mfp-finding-close") {
+    state.mfp.findingId = action === "mfp-finding" ? tgt.getAttribute("data-finding-id") : null;
+    rerender(); return;
+  }
   const itemId = tgt.getAttribute("data-item-id");
   const agentId = tgt.getAttribute("data-agent-id");
   const ruleId = tgt.getAttribute("data-rule-id");
@@ -4389,6 +7386,21 @@ document.addEventListener("click", function (ev) {
   const intelLocalModel = tgt.getAttribute("data-intel-local-model");
   const intelFrontierProvider = tgt.getAttribute("data-intel-frontier-provider");
   if (action === "lockdown") return void onLockdownClick();
+  // Slice 2: Talk opens the concierge as a panel beside the current screen.
+  if (action === "talk-toggle") {
+    if (state.route === "dashboard") return;
+    state.talk.open = !state.talk.open;
+    return renderShellChrome();
+  }
+  if (action === "talk-close") {
+    state.talk.open = false;
+    renderShellChrome();
+    const talkBtn = document.getElementById("btn-talk");
+    if (talkBtn && typeof talkBtn.focus === "function") talkBtn.focus();
+    return;
+  }
+  // The full-page link keeps its href navigation; the panel closes with it.
+  if (action === "talk-open-full") { state.talk.open = false; return; }
   if (action === "theme-toggle") {
     const isDark = document.documentElement.getAttribute("data-theme") === "dark";
     const next = isDark ? "light" : "dark";
@@ -4432,13 +7444,17 @@ document.addEventListener("click", function (ev) {
   if (action === "agent-scope-select") {
     const id = tgt.getAttribute("data-agent-id") || "";
     state.agentScope.selectedAgentId = id || null;
+    state.approvals.filters.agent = "";
+    resetApprovalConsent();
     state.agentScope.switcherOpen = false;
-    // Scope the queue + ambient posture to the chosen agent; re-render the
-    // rail and the topbar. The conversation spine stays fortress-wide in
-    // wave 1 (the concierge reads fortress state); per-agent conversation
-    // scoping is a wave-2 follow-up.
-    renderTopbar();
-    renderFortress();
+    // Scope the queue + ambient posture to the chosen agent and repaint
+    // everything that shows them: since slice 2 the queue renders on the
+    // Approvals screen (main) and its scoped count on the rail pill and the
+    // bell (shell chrome), so repainting only the top bar and the fortress
+    // column left a stale, unscoped count. The conversation spine stays
+    // fortress-wide in wave 1 (the concierge reads fortress state);
+    // per-agent conversation scoping is a wave-2 follow-up.
+    rerender();
     return;
   }
   if (action === "posture-seal-toggle") {
@@ -4456,11 +7472,6 @@ document.addEventListener("click", function (ev) {
     location.hash = "#posture";
     renderTopbar();
     return;
-  }
-  // Today's Story plain-summary toggle on the Posture screen.
-  if (action === "posture-story-plain") {
-    state.posture.storyPlain = !state.posture.storyPlain;
-    return rerender();
   }
   if (action === "intel-reload") { return void refreshPanel(HUB + "/intelligence"); }
   if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);
@@ -4511,29 +7522,54 @@ document.addEventListener("click", function (ev) {
     const found = CONCIERGE_SUGGESTIONS.find(function (s) { return s.id === sid; });
     if (found) {
       state.chat.concierge.composer = found.query;
+      if (talkOwner && talkOwner.input.isConnected) talkOwner.input.value = found.query;
       return void onConciergeSend();
     }
     return;
   }
+  if (action === "agent-tab") {
+    const tab = tgt.getAttribute("data-tab");
+    if (AGENT_TABS.includes(tab)) state.agentTab = tab;
+    return rerender();
+  }
+  if (action === "agents-page") {
+    const page = Number(tgt.getAttribute("data-page"));
+    if (Number.isSafeInteger(page) && page >= 0) state.agentInventory.page = page;
+    return rerender();
+  }
+  if (action === "agent-reach-refresh" && agentId) return void loadAgentReach(agentId);
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
   if (action === "exit-export-start") return void onExitExportStart();
+  if (action === "evidence-select") {
+    const index = Number(tgt.getAttribute("data-evidence-index"));
+    if (Number.isInteger(index) && index >= 0 && index < EVIDENCE_PAGE_SIZE) state.evidence.selectedIndex = index;
+    return rerender();
+  }
+  if (action === "evidence-export-json") return void onEvidenceJsonExport();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
-  if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
+  if (action === "open-agent" && agentId) {
+    if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+    state.selectedAgentId = agentId;
+    state.agentTab = "overview";
+    void loadAgentReach(agentId);
+    // Close the search results here: a hit opened from #agent-detail assigns
+    // the hash it already has, so no hashchange fires to close them or to
+    // render the newly selected agent; setRoute does both explicitly.
+    state.search.open = false;
+    renderSearchResults();
+    if (location.hash !== "#agent-detail") location.hash = "agent-detail";
+    else setRoute("agent-detail");
+    return;
+  }
   // Click-to-inspect from the fortress-column agent rows (PR #100
   // sidebar wire-up): navigate to the agent-detail view AND fire the
   // synchronous /inspect/open route so the panel renders already-loaded.
   // Same component as the Agents-view CTA; the optimistic "Opening..."
   // pane (openingAgentId) renders during the round-trip.
   if (action === "agent-row-inspect-open" && agentId) {
-    state.selectedAgentId = agentId;
-    if (location.hash !== "#agent-detail") {
-      location.hash = "agent-detail";
-    } else {
-      setRoute("agent-detail");
-    }
-    void onAgentInspectOpen(agentId);
+    openAgentRowInspect(agentId);
     return;
   }
   // Keyboard activation for the role="button" agent-row-head: Enter and
@@ -4562,13 +7598,57 @@ document.addEventListener("click", function (ev) {
     return rerender();
   }
   if (action === "template-bind" && agentId) return void onTemplateBind(agentId);
-  if (action === "set-route" && route) { location.hash = route; return; }
+  if (action === "set-route" && route) {
+    state.agentScope.switcherOpen = false;
+    const nextHash = "#" + route;
+    // Hashchange is the route owner; direct setRoute runs only when the hash
+    // is already there, so a click starts one probe wave.
+    if (location.hash !== nextHash) location.hash = nextHash;
+    else setRoute(route);
+    renderTopbar();
+    return;
+  }
+  if (action === "machines-recheck") { void probeFleetMachines(); return; }
   if (action === "show-details" && itemId) {
     const i = state.inbox.find(function (x) { return x.item_id === itemId; });
     if (i) toast("Template: " + i.display_template_id);
     return;
   }
+  if (action === "approval-select" && itemId) {
+    state.approvals.selectedId = itemId;
+    resetApprovalConsent();
+    rerender();
+    return focusApprovalDrawer();
+  }
+  if (action === "decision-result-clear") {
+    // F hides a result only through its own control, never while its decision holds the lock, and an
+    // unconfirmed result has no such control: a stray click on a stale button must not clear it either.
+    if (decisionInFlight() || (state.approvals.result && state.approvals.result.status === "uncertain")) return;
+    const clearHadFocus = document.activeElement === tgt;
+    // Clear hides only F; keep status echoes stable on background redraws until the next decision.
+    if (state.approvals.result) state.approvals.result.cleared = true;
+    renderFeedback();
+    // Removing focused Clear must retain the keyboard user's place without moving decision controls.
+    if (clearHadFocus) document.getElementById("feedback").focus({ preventScroll: true });
+    return;
+  }
+  if (action === "approval-always-allow") {
+    // An in-flight decision retains its consent state until settlement.
+    if (decisionInFlight()) return;
+    state.approvals.alwaysAllow = !!tgt.checked;
+    state.approvals.confirmingTier1Id = null;
+    return rerender();
+  }
+  if (action === "approval-start-tier1-allow" && itemId) return state_ARMEDTier1(itemId);
+  if (action === "approval-cancel-tier1-allow" && itemId) return state_CANCELLEDTier1(itemId);
+  if (action === "approval-confirm-tier1-allow" && itemId) {
+    // Only an armed confirmation for the selected request may submit a Tier 1 approval.
+    if (state.approvals.confirmingTier1Id !== itemId || state.approvals.selectedId !== itemId) return;
+    return void onInboxAction(itemId, "approve");
+  }
   if (action === "inbox-select" && itemId) {
+    // A batch in flight owns its selection until it settles; a tick under that lock would rewrite what a refusal keeps.
+    if (batchSelectionLocked()) return;
     state.inboxOps.selected[itemId] = tgt.checked;
     return rerender();
   }
@@ -4580,6 +7660,9 @@ document.addEventListener("click", function (ev) {
     return rerender();
   }
   if (action === "inbox-snooze-menu" && itemId) {
+    // Invariant: the row menu replaces the selection, so under the lock it is refused like every other decision
+    // control; otherwise a refused batch would report against a selection the operator no longer sees.
+    if (decisionInFlight()) return;
     state.inboxOps.selected = {};
     state.inboxOps.selected[itemId] = true;
     state.inboxOps.snoozeDialog = true;
@@ -4596,14 +7679,13 @@ document.addEventListener("click", function (ev) {
   if (action === "inbox-batch-snooze-custom") {
     const input = document.querySelector('[data-action="inbox-snooze-custom"]');
     const raw = input && input.value ? input.value : "";
-    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + 3600000).toISOString());
+    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + MS_PER_HOUR).toISOString());
   }
   // Tunability UX: promote-to-standing-rule. Intercepted BEFORE the generic
-  // inbox-* -> onInboxAction slice below, because promote is NOT an
-  // /inbox/:id/<action> hub mutation; it runs the compile -> activate flow
-  // on the real english-policy activator via policyApi().
+  // inbox-* dispatcher: approve the request first, then compile and activate
+  // the standing rule through the existing operator-gated policyApi path.
   if (action === "inbox-promote" && itemId) {
-    return void onInboxPromote(itemId);
+    return void state_APPROVINGAlwaysAllow(itemId);
   }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
@@ -4631,13 +7713,7 @@ document.addEventListener("keydown", function (ev) {
   const agentId = rawTgt.getAttribute("data-agent-id");
   if (!agentId) return;
   ev.preventDefault();
-  state.selectedAgentId = agentId;
-  if (location.hash !== "#agent-detail") {
-    location.hash = "agent-detail";
-  } else {
-    setRoute("agent-detail");
-  }
-  void onAgentInspectOpen(agentId);
+  openAgentRowInspect(agentId);
 });
 
 // Intelligence picker: capture password / text input updates without
@@ -4655,6 +7731,11 @@ document.addEventListener("input", function (ev) {
     // Mirror composer text into state without rerender so keystrokes
     // do not clobber the input element's value or caret position.
     state.chat.concierge.composer = tgt.value;
+  } else if (action === "global-search") {
+    // Search results re-render alone, so typing never rewrites the input.
+    state.search.query = tgt.value;
+    state.search.open = true;
+    renderSearchResults();
   } else if (action === "inbox-filter-search") {
     state.inboxOps.filters.search = tgt.value;
     saveInboxPrefs();
@@ -4667,6 +7748,14 @@ document.addEventListener("input", function (ev) {
     state.inboxOps.filters.to = tgt.value;
     saveInboxPrefs();
     rerender();
+  } else if (action === "evidence-filter-query") {
+    setEvidenceFilter("query", tgt.value);
+  } else if (action === "evidence-filter-agent") {
+    setEvidenceFilter("agent", tgt.value);
+  } else if (action === "evidence-filter-event") {
+    setEvidenceFilter("event", tgt.value);
+  } else if (action === "evidence-filter-from") {
+    setEvidenceFilter("from", evidenceFromDate(tgt.value));
   }
 });
 
@@ -4674,11 +7763,37 @@ document.addEventListener("change", function (ev) {
   const tgt = ev.target;
   if (!(tgt instanceof Element) || tgt.tagName !== "SELECT") return;
   const action = tgt.getAttribute("data-action");
+  if (["agents-state", "agents-harness", "agents-sort"].includes(action)) {
+    const field = { "agents-state": "status", "agents-harness": "harness", "agents-sort": "sort" }[action];
+    state.agentInventory[field] = tgt.value;
+    state.agentInventory.page = 0;
+    return rerender();
+  }
+  if (action === "time-range") {
+    // Not saved with the inbox preferences. It narrows the loaded inbox list on the client, and it is
+    // sent with the Evidence entries read as that read's window start, so the table, its counts and the
+    // integrity strip's entry total cover the range the control shows.
+    const previousUrl = evidenceReadUrl();
+    state.timeRange = Object.prototype.hasOwnProperty.call(TIME_RANGE_LABEL, tgt.value) ? tgt.value : "all";
+    rerender();
+    if (evidenceReadUrl() !== previousUrl) { state.evidence.selectedIndex = 0; queueEvidenceRead(); }
+    return;
+  }
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
+  else if (action === "evidence-filter-layer") return setEvidenceFilter("layer", tgt.value);
+  else if (action === "evidence-filter-result") return setEvidenceFilter("result", tgt.value);
+  else if (action === "approval-filter-state") state.approvals.filters.state = tgt.value === "waiting" || tgt.value === "decided" ? tgt.value : "all";
+  else if (action === "approval-filter-agent") state.approvals.filters.agent = tgt.value;
+  else if (action === "approval-filter-tier") state.approvals.filters.tier = tgt.value === "tier1" || tgt.value === "tier2" ? tgt.value : "both";
+  else if (action === "approval-filter-category") state.approvals.filters.category = tgt.value;
   else return;
-  saveInboxPrefs();
+  if (action.indexOf("inbox-filter-") === 0) saveInboxPrefs();
+  if (action.indexOf("approval-filter-") === 0) {
+    state.approvals.selectedId = null;
+    resetApprovalConsent();
+  }
   rerender();
 });
 
@@ -4687,12 +7802,12 @@ document.addEventListener("change", function (ev) {
 // then the dashboard view renders a static welcome card with no form
 // inputs that could be confused for a working command surface.
 
-// Theme: explicit operator preference (sessionStorage) overrides system
-// pref. The toggle button in the topbar dispatches data-action
-// "theme-toggle" which writes the chosen theme and updates the
-// [data-theme] attribute. When no explicit choice exists, fall back to
-// system preference and track changes so dark-mode-at-sunset behavior
-// keeps working on macOS / Windows.
+// Theme: the ratified console is DARK BY DEFAULT (2026-10-13). An explicit
+// operator choice (sessionStorage, written by the top-bar toggle) wins; with
+// no explicit choice the page is dark whatever the OS reports. Must match
+// THEME_BOOTSTRAP_SCRIPT in server/src/dashboard/design-tokens.ts, which
+// applies the same rule in the head before first paint: same key, and "no
+// explicit choice" resolves to dark in both.
 const THEME_KEY = "sanctuary-v11-theme";
 function applyTheme(theme) {
   if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
@@ -4700,17 +7815,13 @@ function applyTheme(theme) {
 }
 const explicitTheme = sessionStorage.getItem(THEME_KEY);
 const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
-if (explicitTheme === "dark" || explicitTheme === "light") {
-  applyTheme(explicitTheme);
-} else if (mq && mq.matches) {
-  applyTheme("dark");
-}
-if (mq) mq.addEventListener("change", function (e) {
-  // Only honor system pref changes when the operator has not made an
-  // explicit choice. Once they toggle, the choice sticks for the
-  // session.
+applyTheme(explicitTheme === "light" ? "light" : "dark");
+if (mq) mq.addEventListener("change", function () {
+  // An OS appearance change applies only when the operator has made no
+  // explicit choice, and the no-choice state is dark: it no longer follows
+  // the OS to light.
   if (sessionStorage.getItem(THEME_KEY)) return;
-  applyTheme(e.matches ? "dark" : "light");
+  applyTheme("dark");
 });
 
 // Boot.

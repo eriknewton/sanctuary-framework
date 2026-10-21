@@ -1,0 +1,55 @@
+{
+  "$comment": "Depth counts container edges from root zero. Must match JSON_MAX_DEPTH, strict_json.rs, parse-strict.ts and both JCS encoders.",
+  "depth": [
+    {
+      "name": "array.max",
+      "shape": "array",
+      "offset": 0,
+      "valid": true
+    },
+    {
+      "name": "array.over",
+      "shape": "array",
+      "offset": 1,
+      "valid": false
+    },
+    {
+      "name": "object.max",
+      "shape": "object",
+      "offset": 0,
+      "valid": true
+    },
+    {
+      "name": "object.over",
+      "shape": "object",
+      "offset": 1,
+      "valid": false
+    }
+  ],
+  "numbers": [
+    {
+      "literal": "9007199254740991",
+      "valid": true
+    },
+    {
+      "literal": "9007199254740992",
+      "valid": false
+    },
+    {
+      "literal": "9007199254740993",
+      "valid": false
+    }
+  ],
+  "fifo": [
+    {
+      "name": "largest.complete.base64",
+      "extra_decoded_bytes": 0,
+      "valid": true
+    },
+    {
+      "name": "next.base64.group",
+      "extra_decoded_bytes": 1,
+      "valid": false
+    }
+  ]
+}

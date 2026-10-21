@@ -38,6 +38,7 @@
  * without a live HTTP server or a running daemon.
  */
 
+import { parseIsoInstantWithOffset } from "../core/index.js";
 import {
   auditChainVerdictClaimsClean,
   auditChainVerdictUntampered,
@@ -95,6 +96,10 @@ export {
   type ExclusiveEgressPosture,
   type ExclusiveEgressMode,
 } from "../egress-gate/posture.js";
+
+import type { CastleWallEventType } from "../castle-wall/audit/events.js";
+import { parseCastleWallSignedCanonicalBody } from "../castle-wall/audit-attribution.js";
+import { destinationHostOf, destinationIpOf, destinationPortOf, CONTROL_CHARS } from "../castle-wall/export/map.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -1027,6 +1032,18 @@ export interface AuditDigest {
   origin_machine: string;
   window_start: string;
   window_end: string;
+  /** True only for an uncut query with no nonempty sealed region whose verified view
+   * still holds the chain from its first entry, so retention removed nothing. */
+  window_complete: boolean;
+  /** Why coverage was not established; null only when window_complete is true.
+   * Must match windowCoverageReason in dashboard/v1_1/client.ts. */
+  window_incomplete_reason: "read_limit" | "sealed_region" | "retention" | "coverage_unknown" | null;
+  /** Later in-window verdict records that prevent an unqualified Allowed count. */
+  kernel_allow_overrides: number;
+  /** Counted blocks grouped by destination, capped after sorting by frequency. */
+  blocked_destinations: Array<{ destination: string | null; blocks: number; last_blocked_at: string | null }>;
+  /** Distinct destinations before the served-row cap, including the null bucket. */
+  blocked_destination_count: number;
   total_operations: number;
   /** Operations whose recorded result was a failure (denials, blocks, errors). */
   failures: number;
@@ -1092,6 +1109,82 @@ export interface BuildAuditDigestInput {
  * `details.decision` field (`approved` / `denied`); kernel block/allow counts
  * from the Castle Wall verdict operations.
  */
+// Bound per-request query, aggregation memory and work for caller-influenced audit history.
+const DIGEST_QUERY_ENTRY_LIMIT = 50_000;
+// Must match OUTBOUND_DESTINATION_LIMIT in dashboard/v1_1/client.ts.
+const BLOCKED_DESTINATION_SERVED_LIMIT = 10; // Ten rows fit the Enforcement detail card.
+const DESTINATION_HOST_MAX_CHARS = 253; // DNS name maximum.
+const DESTINATION_LABEL_MAX_CHARS = DESTINATION_HOST_MAX_CHARS + 1 + 5; // Host, colon, 5 port digits = 259.
+const DESTINATION_PORT_MAX = 65535; // Maximum unsigned 16-bit port.
+// C1 extends the shared C0/DEL replacement through the Latin-1 control range.
+const DESTINATION_C1_CONTROLS = /[\u0080-\u009f]/g;
+// Unicode direction marks, embeddings/overrides and isolates can reorder visible host text.
+const DESTINATION_BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+// Zero-width spaces/joiners, word joiner and BOM can hide destination differences.
+const DESTINATION_ZERO_WIDTH = /[\u200b-\u200d\u2060\ufeff]/g;
+const ALLOW_OVERRIDE_OPERATION = "egress_verdict_superseded" satisfies CastleWallEventType;
+
+function blockedDestinationLabel(details: Record<string, unknown> | undefined): string | null {
+  const host = destinationHostOf(details);
+  const ip = destinationIpOf(details);
+  const clean = (value: string | null) => (value ?? "").replace(CONTROL_CHARS, " ")
+    .replace(DESTINATION_C1_CONTROLS, " ").replace(DESTINATION_BIDI_CONTROLS, " ")
+    .replace(DESTINATION_ZERO_WIDTH, " ").trim();
+  const cleanHost = clean(host);
+  const address = cleanHost || clean(ip);
+  // Invisible-only hosts must not hide a recorded IP or create a blank destination bucket.
+  if (!address) return null;
+  // Brackets count toward the same address budget, including malformed untrusted IP text.
+  const label = !cleanHost && address.includes(":")
+    ? "[" + address.slice(0, DESTINATION_HOST_MAX_CHARS - 2) + "]"
+    : address.slice(0, DESTINATION_HOST_MAX_CHARS);
+  const port = destinationPortOf(details);
+  return (label + (port !== null && port >= 0 && port <= DESTINATION_PORT_MAX ? ":" + port : "")).slice(0, DESTINATION_LABEL_MAX_CHARS);
+}
+
+/**
+ * Settle retention from the eager in-memory view and three cheap public reads (the rotation floor, and the chain head
+ * before and after the view); never re-reads the chain from disk.
+ */
+async function routineWindowCoverage(
+  auditLog: AuditLog, windowStart: string, readRetained: (limit: number) => ReturnType<AuditLog["query"]>,
+): Promise<AuditDigest["window_incomplete_reason"]> {
+  try {
+    const floor = await auditLog.authenticatedRotationFloor();
+    if (floor.status === "invalid") return "coverage_unknown";
+    // An unparseable window cannot support a coverage claim; parsing is a fail-closed gate, not a retention time bound.
+    if (parseIsoInstantWithOffset(windowStart) === undefined) return "coverage_unknown";
+    const head = await auditLog.getChainHead();
+    // The posture surface runs the digest inside runEagerReads, so this read serves references into the verified
+    // in-memory view; a full on-disk re-read per board paint or stream push is the load this surface must not pay. The
+    // read budget is raised to the retention cap so a log retained in full is read in full.
+    const retained = await readRetained(Math.max(DIGEST_QUERY_ENTRY_LIMIT, auditLog.getRetentionConfig().maxEntries));
+    // The view's oldest sequence is derived from the first head and the count, so a head that moved while the view was
+    // read cannot support a complete window, and coverage is unknown. Must match "withholds coverage for an append
+    // between the chain head and eager view reads" and
+    // "withholds coverage when a reloaded view races an append" in test/principal-policy/overview-digest.test.ts.
+    if ((await auditLog.getChainHead()).sequence !== head.sequence) return "coverage_unknown";
+    // The floor entry is found by position, so every entry in the view must be in hand; an empty log has none to prove from.
+    if (retained.entries.length === 0 || retained.entries.length !== retained.total) return "coverage_unknown";
+    // A verified chain is contiguous, so the view's oldest sequence follows from the head and the count. The view may
+    // still hold a prefix that retention pruned on disk, until its next reload; a view that holds less than the disk
+    // (a trimmed in-memory window) leaves the floor entry outside it and reads as unknown.
+    const viewOldestSequence = head.sequence - retained.total + 1;
+    const firstSequence = 1; // Audit chains number their first entry at one.
+    if (floor.status === "absent") return viewOldestSequence === firstSequence ? null : "coverage_unknown";
+    const floorEntry = retained.entries[floor.base_sequence - viewOldestSequence];
+    if (!floorEntry) return "coverage_unknown";
+    // Entry timestamps are caller-supplied and need not rise with sequence, so no retained entry's time bounds what
+    // retention removed before it. Coverage holds only while the view still reaches the chain's first entry; otherwise
+    // the reason is retention until the audit module serves an authenticated time bound for the pruned prefix.
+    // Must match "covers a pruned prefix still held in the eager view but reports retention outside it" in
+    // test/principal-policy/overview-digest.test.ts: the full view supplies the counts.
+    return viewOldestSequence === firstSequence ? null : "retention";
+  } catch {
+    return "coverage_unknown";
+  }
+}
+
 const APPROVAL_RESOLVED_OPERATION = "cross_harness_approval_resolved";
 export async function buildAuditDigest(
   input: BuildAuditDigestInput,
@@ -1099,6 +1192,9 @@ export async function buildAuditDigest(
   const now = input.now ?? Date.now();
   const windowMs = input.windowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const windowStart = new Date(now - windowMs).toISOString();
+  // window_end is this build's instant and the verdict is read in this build;
+  // must match AUDIT_CHAIN_VERIFIED_MAX_AGE_MS in dashboard/v1_1/client.ts.
+  // AuditLog's DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS is the eager re-verify backstop.
   const windowEnd = new Date(now).toISOString();
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
   const subjectFortressId =
@@ -1113,6 +1209,12 @@ export async function buildAuditDigest(
       origin_machine: input.originMachine,
       window_start: windowStart,
       window_end: windowEnd,
+      // Must match the positive gate in renderOutboundConnections in dashboard/v1_1/client.ts.
+      window_complete: false,
+      window_incomplete_reason: "coverage_unknown",
+      kernel_allow_overrides: 0,
+      blocked_destinations: [],
+      blocked_destination_count: 0,
       total_operations: 0,
       failures: 0,
       kernel_blocks: 0,
@@ -1126,6 +1228,7 @@ export async function buildAuditDigest(
     };
   }
 
+  let windowIncompleteReason: AuditDigest["window_incomplete_reason"];
   let entries;
   let integrityFindings;
   // BLOCKER-1 (round 3): fold the sealed-region verdict into the digest's
@@ -1138,11 +1241,19 @@ export async function buildAuditDigest(
   try {
     const result = await input.auditLog.query({
       since: windowStart,
-      limit: 50_000,
+      limit: DIGEST_QUERY_ENTRY_LIMIT,
     });
     entries = result.entries;
     integrityFindings = result.integrity_findings;
     chainVerdict = await input.auditLog.getAuditChainVerdict();
+    // Coverage needs an uncut query, no sealed entries per getAuditChainVerdict,
+    // and authenticatedRotationFloor's entry located in the eager view by getChainHead and the retained count.
+    // Sealed-region time bounds remain an audit-module follow-up; no nonempty status qualifies.
+    windowIncompleteReason = chainVerdict.sealed_region.status !== "not_present" && chainVerdict.sealed_region.status !== "empty" ? "sealed_region"
+      : result.entries.length !== result.total ? "read_limit"
+      // The view read stays in this builder, the caller-wrapped site the eager-read chokepoint registers; the helper
+      // only decides when it runs (after the head read).
+      : await routineWindowCoverage(input.auditLog, windowStart, (limit) => input.auditLog.query({ limit }));
   } catch {
     // A tainted/unreadable read is reported as an unverified chain with zero
     // counts — never as a clean day.
@@ -1150,6 +1261,12 @@ export async function buildAuditDigest(
       origin_machine: input.originMachine,
       window_start: windowStart,
       window_end: windowEnd,
+      // Must match the positive gate in renderOutboundConnections in dashboard/v1_1/client.ts.
+      window_complete: false,
+      window_incomplete_reason: "coverage_unknown",
+      kernel_allow_overrides: 0,
+      blocked_destinations: [],
+      blocked_destination_count: 0,
       total_operations: 0,
       failures: 0,
       kernel_blocks: 0,
@@ -1167,6 +1284,9 @@ export async function buildAuditDigest(
   let failures = 0;
   let kernelBlocks = 0;
   let kernelAllows = 0;
+  let kernelAllowOverrides = 0;
+  // At most DIGEST_QUERY_ENTRY_LIMIT buckets per request, discarded after the read.
+  const destinations = new Map<string | null, AuditDigest["blocked_destinations"][number]>();
   let approvalsGranted = 0;
   let approvalsDenied = 0;
   const perAgent = new Map<string, number>();
@@ -1197,6 +1317,9 @@ export async function buildAuditDigest(
       isRecord(entry.details) &&
       entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
         CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
+    // Provenance alone can only suppress Allowed, never increase an enforcement claim.
+    if (hasCastleWallProvenance && entry.operation === ALLOW_OVERRIDE_OPERATION &&
+        Number.isFinite(ts) && ts > now - windowMs && ts <= windowEndMs) kernelAllowOverrides += 1;
     const isCastleWallEnforcementEvidence =
       hasCastleWallProvenance &&
       CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(entry.operation);
@@ -1251,9 +1374,21 @@ export async function buildAuditDigest(
           !isDuplicate;
       }
     }
-    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked")
+    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked") {
       kernelBlocks += 1;
-    else if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_allowed")
+      // Every counted block enters exactly one row and only counted blocks enter;
+      // the sum before the cap equals kernel_blocks under the same evidence gate.
+      // A producer-verified destination describes this signed flow, never stored top-level metadata.
+      const signed = signedAttribution?.basis === "producer_signed_verified";
+      const bodyDetails = signed ? parseCastleWallSignedCanonicalBody(entry.details ?? {})?.details : entry.details;
+      const destination = blockedDestinationLabel(isRecord(bodyDetails) ? bodyDetails : undefined);
+      const capturedAt = signed ? signedAttribution?.signedCapturedAtMs ?? null : ts;
+      const last = capturedAt !== null && Number.isFinite(capturedAt) ? new Date(capturedAt).toISOString() : null;
+      const row = destinations.get(destination) ?? { destination, blocks: 0, last_blocked_at: null };
+      row.blocks += 1;
+      if (last !== null && (row.last_blocked_at === null || last > row.last_blocked_at)) row.last_blocked_at = last;
+      destinations.set(destination, row);
+    } else if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_allowed")
       kernelAllows += 1;
     else if (entry.operation === APPROVAL_RESOLVED_OPERATION) {
       // Split by the recorded decision; fall back to the entry result
@@ -1308,6 +1443,22 @@ export async function buildAuditDigest(
     origin_machine: input.originMachine,
     window_start: windowStart,
     window_end: windowEnd,
+    window_complete: windowIncompleteReason === null,
+    window_incomplete_reason: windowIncompleteReason,
+    kernel_allow_overrides: kernelAllowOverrides,
+    blocked_destination_count: destinations.size,
+    blocked_destinations: [...destinations.values()].sort((a, b) => {
+      if (a.blocks !== b.blocks) return b.blocks - a.blocks;
+      if (a.last_blocked_at !== b.last_blocked_at) {
+        if (a.last_blocked_at === null) return 1;
+        if (b.last_blocked_at === null) return -1;
+        return a.last_blocked_at > b.last_blocked_at ? -1 : 1;
+      }
+      if (a.destination === b.destination) return 0;
+      if (a.destination === null) return 1;
+      if (b.destination === null) return -1;
+      return a.destination < b.destination ? -1 : 1;
+    }).slice(0, BLOCKED_DESTINATION_SERVED_LIMIT),
     total_operations: totalOperations,
     failures,
     kernel_blocks: kernelBlocks,

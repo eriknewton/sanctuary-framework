@@ -1,0 +1,6 @@
+# witness: frame_vectors_agree
+--- a/castle-wall-daemon/src/smb/frame.rs
++++ b/castle-wall-daemon/src/smb/frame.rs
+@@ -17 +17 @@
+-    let mut result = length.to_be_bytes().to_vec();
++    let mut result = length.to_le_bytes().to_vec();
