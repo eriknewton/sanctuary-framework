@@ -289,11 +289,18 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
   const tempPath = join(dirname(path), `${basename(path)}.${process.pid}.${randomBytes(DEMO_TOKEN_TEMP_RANDOM_BYTES).toString("hex")}.tmp`);
   let published = false;
   try {
+    // A directory this user cannot write (EACCES, EROFS) cannot take a new token,
+    // but may still hold a valid one: skip publishing and let the validated read
+    // decide, which refuses with its own error when nothing usable is there.
     const temp = await open(
       tempPath,
       fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
       OPERATOR_TOKEN_FILE_MODE,
-    );
+    ).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "EACCES" || error.code === "EROFS") return undefined;
+      throw error;
+    });
+    if (temp === undefined) return readExistingDemoToken(path);
     try {
       // The umask may have narrowed the create mode; the published file is exactly owner read/write.
       await temp.chmod(OPERATOR_TOKEN_FILE_MODE);

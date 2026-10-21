@@ -1095,6 +1095,21 @@ describe("stable demo token file", () => {
     expect(await readFile(path, "utf8")).toBe("");
   });
 
+  it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
+    "reuses a valid token in a directory this user cannot write",
+    async () => {
+      const dir = await scratchDir("sanctuary-demo-token-");
+      const path = join(dir, "operator-token");
+      const { token } = await loadOrCreateDemoTokenFile(path);
+      await chmod(dir, 0o500); // 0o500 = owner read and search, no write: a temp file cannot be created here
+      try {
+        await expect(loadOrCreateDemoTokenFile(path)).resolves.toEqual({ token, reused: true });
+      } finally {
+        await chmod(dir, 0o700); // owner read, write and search again, so scratch cleanup can remove it
+      }
+    },
+  );
+
   it("refuses a token file readable by group or others", async () => {
     const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
     const { token } = await loadOrCreateDemoTokenFile(path);
