@@ -813,6 +813,8 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     expect((await evaluation).allowed).toBe(false);
   });
 
+  // fail-before-exempt: a guard that also holds on the base, where no card is attributed at all; its witness is a
+  // planted change that projects `context.agent_id` into the card, which turns it red.
   it("never names a requester from a hold's caller-built context", async () => {
     // A caller that raises a hold directly can put anything in `context`; only
     // the gate's typed requesting_agent_id may name the requester on a card.
