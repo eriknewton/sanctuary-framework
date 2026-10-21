@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, constants as fsConstants, mkdtempSync, rmSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -277,42 +277,52 @@ export function mintDemoAuthToken(): string {
  * overwrites a file it did not validate.
  */
 export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: string; reused: boolean }> {
-  const existing = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+  // Every check runs on the opened descriptor, never on the path, so the file
+  // validated is the file read (no check-then-use window); O_NOFOLLOW refuses a
+  // symlink at the final component with ELOOP.
+  const reading = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
+    if (error.code === "ELOOP") throw new Error(`refusing demo token file that is not a regular file: ${path}`);
     throw error;
   });
-  if (existing === undefined) {
+  if (reading === undefined) {
     const token = mintDemoAuthToken();
+    // O_EXCL: a file that appeared after the read attempt is never overwritten.
     const handle = await open(
       path,
       fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
       OPERATOR_TOKEN_FILE_MODE,
     );
     try {
-      await handle.writeFile(`${token}\n`);
       await handle.chmod(OPERATOR_TOKEN_FILE_MODE);
+      await handle.writeFile(`${token}\n`);
     } finally {
       await handle.close();
     }
     return { token, reused: false };
   }
-  if (!existing.isFile()) {
-    throw new Error(`refusing demo token file that is not a regular file: ${path}`);
+  try {
+    const existing = await reading.stat();
+    if (!existing.isFile()) {
+      throw new Error(`refusing demo token file that is not a regular file: ${path}`);
+    }
+    if (typeof process.getuid === "function" && existing.uid !== process.getuid()) {
+      throw new Error(`refusing demo token file owned by another user: ${path}`);
+    }
+    if ((existing.mode & GROUP_OTHER_MODE_BITS) !== 0) {
+      throw new Error(`refusing demo token file readable by group or others (chmod 600 it): ${path}`);
+    }
+    if (existing.size > DEMO_TOKEN_FILE_MAX_BYTES) {
+      throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
+    }
+    const token = (await reading.readFile("utf8")).trim();
+    if (!DEMO_AUTH_TOKEN_PATTERN.test(token)) {
+      throw new Error(`refusing demo token file that does not hold a demo token: ${path}`);
+    }
+    return { token, reused: true };
+  } finally {
+    await reading.close();
   }
-  if (typeof process.getuid === "function" && existing.uid !== process.getuid()) {
-    throw new Error(`refusing demo token file owned by another user: ${path}`);
-  }
-  if ((existing.mode & GROUP_OTHER_MODE_BITS) !== 0) {
-    throw new Error(`refusing demo token file readable by group or others (chmod 600 it): ${path}`);
-  }
-  if (existing.size > DEMO_TOKEN_FILE_MAX_BYTES) {
-    throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
-  }
-  const token = (await readFile(path, "utf8")).trim();
-  if (!DEMO_AUTH_TOKEN_PATTERN.test(token)) {
-    throw new Error(`refusing demo token file that does not hold a demo token: ${path}`);
-  }
-  return { token, reused: true };
 }
 
 function assertValidPort(port: number): void {
