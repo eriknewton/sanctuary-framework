@@ -6981,6 +6981,8 @@ const DECISION_REREAD_BUSY_REASON = "The queue is being re-read after a decision
 // not_sent is client-side only: nothing reached the server, so it is neither a refusal (a 4xx) nor unconfirmed.
 const DECISION_HEADLINE = { pending: "Sending your decision", acknowledged: "Decision taken", refused: "Decision refused", uncertain: "Decision unconfirmed", not_sent: "Decision not sent" };
 const DECISION_UNCERTAIN_STAYS = "This result stays on screen until your next decision replaces it.";
+// The fixed sentence a not-sent note falls back to when its text cannot be shown safely.
+const DECISION_NOT_SENT_FIXED = "Your next decision was not sent.";
 
 function decisionInFlight() { return !!state.approvals.lock; }
 function decisionVerb(action) { return DECISION_VERB[action] || action; }
@@ -7000,30 +7002,72 @@ function decisionHeldOperation(itemId) {
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
   return item ? approvalHeldOperation(item) : null;
 }
-// A double-quoted run with backslash escapes: the shape heldSubjectText writes (JSON quoting escapes every inner
-// quote and backslash, so the run ends exactly at the name's closing quote).
-const FEEDBACK_QUOTED_SEGMENT = /"(?:[^"\\]|\\[\s\S])*"/g;
-// Feedback text as HTML. Invariant: the quoted form of a held operation name, which decisionSubject wrote into the
-// message, is shown only as the delimited held-subject element, never as words of the message. heldOperation is
-// the name of the one request this text is about (each batch record and each not-sent note carries its own).
-function renderFeedbackText(text, heldOperation) {
-  const held = typeof heldOperation === "string" && heldOperation ? heldOperation : null;
-  const raw = String(text);
-  if (held === null) return feedbackQuotedHtml(raw);
-  return raw.split(heldSubjectText(held)).map(feedbackQuotedHtml).join(heldSubjectHtml(held, false));
+// A braced escape heldSubjectText writes for a code point above the four-digit range. JSON has no braced form, so
+// a run is normalized through this before JSON.parse decides whether it is one whole JSON string.
+const FEEDBACK_BRACED_ESCAPE = /^\\u\{([0-9a-f]{1,6})\}/;
+// The largest Unicode code point; a braced escape above it is not one heldSubjectText could have written.
+const LAST_UNICODE_CODE_POINT = 0x10ffff;
+// Characters that may sit just before or just after a quoted name in a console-written feedback sentence
+// (decisionSubject writes it after "for " and before " by ", a refusal reason or the sentence end).
+const FEEDBACK_RUN_BEFORE = " (";
+const FEEDBACK_RUN_AFTER = " .,:;)!?";
+// The end (exclusive) of the complete quoted run opening at start, or -1. A run counts only when JSON.parse consumes
+// all of it (after braced escapes are normalized) and it stands alone between console separators, so a quote inside
+// an unescaped name can never close one run early and open another.
+function feedbackRunEnd(raw, start) {
+  if (start > 0 && FEEDBACK_RUN_BEFORE.indexOf(raw[start - 1]) < 0) return -1;
+  let json = '"';
+  let i = start + 1;
+  while (i < raw.length) {
+    const c = raw[i];
+    if (c === '"') {
+      if (i + 1 < raw.length && FEEDBACK_RUN_AFTER.indexOf(raw[i + 1]) < 0) return -1;
+      try { return typeof JSON.parse(json + '"') === "string" ? i + 1 : -1; } catch (e) { return -1; }
+    }
+    if (c === "\\") {
+      const braced = FEEDBACK_BRACED_ESCAPE.exec(raw.slice(i));
+      if (braced) {
+        const codePoint = parseInt(braced[1], 16);
+        if (codePoint > LAST_UNICODE_CODE_POINT) return -1;
+        json += String.fromCodePoint(codePoint);
+        i += braced[0].length;
+        continue;
+      }
+      // Any other escape goes to JSON.parse as written, which rejects one JSON does not define.
+      json += raw.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    json += c;
+    i++;
+  }
+  return -1;
 }
-// Fallback for text whose operation metadata is absent or names some other request: every remaining quoted run is
-// shown as the delimited element built from its own text (hidden characters made visible), so a name the metadata
-// did not cover can never be printed as message words. Console words never contain a double quote.
-function feedbackQuotedHtml(raw) {
+// Feedback text as HTML. Invariant: a quoted name in a message (decisionSubject writes a held operation name in its
+// quoted, escaped form) is shown only as the delimited held-subject element, never as words of the message. Every
+// complete quoted run becomes that element, built from its own text with hidden characters made visible; when any
+// double quote in the message is not inside a complete run, nothing of the message is shown and the fixed console
+// sentence stands in for it, so name bytes never become prose. heldOperation is the name of the one request this
+// text is about (each batch record and each not-sent note carries its own); a run naming it renders from it.
+function renderFeedbackText(text, heldOperation, fixed) {
+  const held = typeof heldOperation === "string" && heldOperation ? heldOperation : null;
+  const heldRun = held === null ? null : heldSubjectText(held);
+  const raw = String(text);
   let html = "";
   let last = 0;
-  raw.replace(FEEDBACK_QUOTED_SEGMENT, function (run, offset) {
-    html += escHtml(raw.slice(last, offset)) + '<code class="held-subject" data-held-subject="1">' + escHtml(run.replace(HELD_SUBJECT_HIDDEN_CHARS, heldSubjectEscape)) + '</code>';
-    last = offset + run.length;
-    return run;
-  });
+  for (let at = raw.indexOf('"'); at >= 0; at = raw.indexOf('"', last)) {
+    const end = feedbackRunEnd(raw, at);
+    if (end < 0) return escHtml(fixed);
+    const run = raw.slice(at, end);
+    html += escHtml(raw.slice(last, at)) + (run === heldRun ? heldSubjectHtml(held, false)
+      : '<code class="held-subject" data-held-subject="1">' + escHtml(run.replace(HELD_SUBJECT_HIDDEN_CHARS, heldSubjectEscape)) + '</code>');
+    last = end;
+  }
   return html + escHtml(raw.slice(last));
+}
+// The fixed console sentence a feedback line falls back to when its text cannot be shown safely.
+function decisionFixedSentence(status) {
+  return (DECISION_HEADLINE[status] || "Decision result") + ".";
 }
 function decisionHeadline(result) {
   // A batch that was taken for some items and refused for others says so in its headline, never "taken" alone.
@@ -7145,15 +7189,15 @@ function renderDecisionResult() {
   const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
   // Each record renders with its own request's held operation: a batch result has no single name of its own.
   const records = r.records.length
-    ? '<ul>' + r.records.map(function (rec) { return '<li>' + renderFeedbackText(rec.message, rec.heldOperation) + '</li>'; }).join("") + '</ul>' : "";
+    ? '<ul>' + r.records.map(function (rec) { return '<li>' + renderFeedbackText(rec.message, rec.heldOperation, decisionFixedSentence(rec.status)) + '</li>'; }).join("") + '</ul>' : "";
   // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock. An
   // unconfirmed result has no Clear at all: the operator owes the queue a check, and only the next decision
   // replaces the warning, so it cannot be dismissed unread.
   const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS : "";
   // The not-sent note is about a different request than the result, so it renders with that request's metadata.
-  const notSent = r.status === "uncertain" && r.notSent ? " " + renderFeedbackText(r.notSent, r.notSentHeldOperation) : "";
+  const notSent = r.status === "uncertain" && r.notSent ? " " + renderFeedbackText(r.notSent, r.notSentHeldOperation, DECISION_NOT_SENT_FIXED) : "";
   const clear = r.status === "pending" || r.status === "uncertain" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
-  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + renderFeedbackText(r.message + note + stays, r.heldOperation) + notSent + '</p>' + records + '</div>' + clear + '</section>';
+  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + renderFeedbackText(r.message, r.heldOperation, decisionHeadline(r) + ".") + escHtml(note + stays) + notSent + '</p>' + records + '</div>' + clear + '</section>';
 }
 function decisionFirstSentence(message) {
   const first = message.split(". ")[0];

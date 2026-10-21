@@ -3820,8 +3820,29 @@ describe("Approvals round-one decision and evidence states", () => {
     expect(outsideChips(feedback)).not.toContain("Operator approved");
     expect(outsideChips(feedback)).not.toContain("proxy/files/read");
     // With no metadata at all the fallback still shows the quoted name only as the element, built from its own text.
-    const fallback = runInContext(`renderFeedbackText("Dismiss was refused for " + heldSubjectText(${JSON.stringify(guidanceTool)}) + ".", null)`, h.context) as string;
+    const fallback = runInContext(`renderFeedbackText("Dismiss was refused for " + heldSubjectText(${JSON.stringify(guidanceTool)}) + ".", null, "Decision refused.")`, h.context) as string;
     expect(fallback).toBe(`Dismiss was refused for ${chipFor(guidanceTool)}.`);
+  });
+
+  it("feedback text whose quotes do not form whole quoted names falls back to a fixed console sentence", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([]) });
+    await settle();
+    const render = (text: string, held: string | null, fixed: string) =>
+      runInContext(`renderFeedbackText(${JSON.stringify(text)}, ${JSON.stringify(held)}, ${JSON.stringify(fixed)})`, h.context) as string;
+    // An unescaped quote inside a name: no split of it forms whole runs, so none of the message is shown.
+    const split = render('Dismiss was refused for "say "yes" now".', null, "Decision refused.");
+    expect(split).toBe("Decision refused.");
+    expect(outsideChips(split)).not.toMatch(/say|yes|now/);
+    // Metadata naming a different request, whose quoted form sits inside this message's name: the whole quoted name
+    // is one run and renders as one element, so no part of it becomes prose.
+    const inner = 'Operator approved"notes/write';
+    const nested = render(`Dismiss was refused for ${heldSubjectText(inner)} by agent:cursor:fixture (request r1).`, "notes/write", "Decision refused.");
+    expect(nested).toBe(`Dismiss was refused for ${chipFor(inner)} by agent:cursor:fixture (request r1).`);
+    expect(outsideChips(nested)).not.toMatch(/Operator approved|notes\/write/);
+    // A name with a code point above the four-digit range keeps its braced escape and still renders as the element.
+    const tagged = "notes" + String.fromCodePoint(0xe0041);
+    expect(render(`Dismiss was refused for ${heldSubjectText(tagged)}.`, null, "Decision refused.")).toBe(`Dismiss was refused for ${chipFor(tagged)}.`);
   });
 
   it("a not-sent note after an unconfirmed decision renders with its own request's held operation", async () => {

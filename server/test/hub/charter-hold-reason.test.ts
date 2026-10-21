@@ -70,14 +70,17 @@ function readGateSource(): string {
 }
 
 /**
- * Every reason gate.ts can hand the approval channel, read with the TypeScript compiler API rather than a pattern.
- * Reachability is decided from the call arguments: the channel is reached only through the gate's private
- * requestApproval (checked), and the third argument of each `this.requestApproval(...)` call is resolved through
- * the variables and private methods it forwards (`classification.reason` to classifyOperation's returned objects,
- * `classification.anomaly.reason` through the `anomaly` it returns to detectAnomaly's). Literal text is the source
- * text between the quotes or backticks, concatenations joined, so it compares with each template's pinned
- * gateSource. Invariant: any reason expression, return shape or channel call this scan does not model throws, so a
- * new shape fails the coverage test instead of being silently skipped.
+ * The reasons gate.ts hands the approval channel through the forms this scan models, read with the TypeScript
+ * compiler API. Bound: this is a tripwire over the modeled forms, NOT a reachability proof. It resolves the third
+ * argument of each `this.requestApproval(...)` call through the variables and private methods it forwards
+ * (`classification.reason` to classifyOperation's returned objects, `classification.anomaly.reason` through the
+ * `anomaly` it returns to detectAnomaly's), comparing literal source text (concatenations joined) with each
+ * template's pinned gateSource. It fails closed on what it can see it does not model: an unmodeled reason
+ * expression, return shape or channel call; a reason source that resolves to nothing; any reference to
+ * requestApproval other than the modeled call; and any assignment to a property named reason. It does not analyze
+ * control flow: that a Tier 3 classification never reaches the channel rests on a checked shape (evaluate()'s allow
+ * return for Tier 3), not a proof. The guarantee is at run time: a reason the bridge does not recognise is
+ * `unrecognized`, the console renders a fixed sentence for it, and the gate's free text never reaches a card.
  */
 function gateChannelReasons(sourceText: string): { held: Set<string>; tier3Skipped: number } {
   const sf = ts.createSourceFile("gate.ts", sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -88,14 +91,39 @@ function gateChannelReasons(sourceText: string): { held: Set<string>; tier3Skipp
   const methods = new Map<string, ts.MethodDeclaration>();
   const gateCalls: ts.CallExpression[] = [];
   const channelCalls: ts.CallExpression[] = [];
+  const references: ts.Node[] = [];
+  const reasonWrites: ts.Node[] = [];
+  const isReasonTarget = (target: ts.Expression): boolean =>
+    (ts.isPropertyAccessExpression(target) && target.name.text === "reason") ||
+    (ts.isElementAccessExpression(target) && ts.isStringLiteralLike(target.argumentExpression) && target.argumentExpression.text === "reason");
   const visit = (node: ts.Node): void => {
     if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) methods.set(node.name.text, node);
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "requestApproval") {
       (node.expression.expression.kind === ts.SyntaxKind.ThisKeyword ? gateCalls : channelCalls).push(node);
     }
+    if ((ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && node.text === "requestApproval") references.push(node);
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      isReasonTarget(node.left)
+    ) {
+      reasonWrites.push(node);
+    }
     ts.forEachChild(node, visit);
   };
   visit(sf);
+  // A reason written after the object is built is invisible to the resolution below, so any such write fails.
+  for (const write of reasonWrites) fail(write, "reason assignment");
+  // The only modeled references: the private method's own name, and the callee of a call (`this.requestApproval(...)`
+  // or the channel call checked below). An alias, element access, destructuring or the method passed as a value fails.
+  for (const reference of references) {
+    const parent = reference.parent;
+    const declaresMethod = ts.isMethodDeclaration(parent) && parent.name === reference;
+    const callee =
+      ts.isPropertyAccessExpression(parent) && parent.name === reference && ts.isCallExpression(parent.parent) && parent.parent.expression === parent;
+    if (!declaresMethod && !callee) fail(reference, "requestApproval reference");
+  }
   const enclosingMethod = (node: ts.Node): ts.MethodDeclaration => {
     for (let at: ts.Node | undefined = node.parent; at; at = at.parent) if (ts.isMethodDeclaration(at)) return at;
     return fail(node, "call outside a method");
@@ -180,7 +208,10 @@ function gateChannelReasons(sourceText: string): { held: Set<string>; tier3Skipp
     }
     if (ts.isIdentifier(expr)) return collect(declaredInitializer(expr, scope), scope);
     if (ts.isPropertyAccessExpression(expr) && expr.name.text === "reason") {
-      for (const source of objectsOf(expr.expression, scope)) {
+      const sources = objectsOf(expr.expression, scope);
+      // An empty resolution would add nothing and pass, so a source that names no returned object fails.
+      if (sources.length === 0) fail(expr, "reason source did not resolve");
+      for (const source of sources) {
         const tier = property(source.object, "tier");
         if (tier !== null && !ts.isNumericLiteral(tier)) fail(tier, "reason tier");
         if (tier !== null && (tier as ts.NumericLiteral).text === "3") {
@@ -318,6 +349,26 @@ describe("structured hold reasons", () => {
     // A reason form the scan does not model fails loudly instead of being skipped.
     expect(() => gateChannelReasons(withDirectReason("reasonFor(operation)"))).toThrow(/unmodeled reason/);
     expect(() => gateChannelReasons(withDirectReason("`Prefix ` + suffix"))).toThrow(/unmodeled reason/);
+    // A reason source that resolves to no returned object fails instead of adding nothing.
+    expect(() => gateChannelReasons(withDirectReason("classification.missing.reason"))).toThrow(/reason source did not resolve/);
+    // Any reference to requestApproval other than the modeled call fails: element access, an alias, destructuring,
+    // the method passed as a value, and a bound copy.
+    for (const reference of [
+      `this["requestApproval"](operation, 2, "x", {})`,
+      "const ask = this.requestApproval",
+      "const { requestApproval } = this",
+      "void [this.requestApproval]",
+      "this.requestApproval.bind(this)",
+    ]) {
+      expect(() => gateChannelReasons(source.replace(evaluateAnchor, `    if (args.mutation) ${reference};\n${evaluateAnchor}`)), reference).toThrow(
+        /requestApproval reference/,
+      );
+    }
+    // Any assignment to a property named reason fails, whatever it assigns and however the property is named.
+    for (const write of [`classification.reason = "Rewritten later"`, `classification["reason"] += " later"`]) {
+      const rewritten = source.replace(evaluateAnchor, `${evaluateAnchor}    if (args.mutation) ${write};\n`);
+      expect(() => gateChannelReasons(rewritten), write).toThrow(/reason assignment/);
+    }
     // A channel reached other than through requestApproval fails loudly too.
     expect(() =>
       gateChannelReasons(source.replace(evaluateAnchor, `    if (args.mutation) await this.channel.requestApproval(request);\n${evaluateAnchor}`)),
