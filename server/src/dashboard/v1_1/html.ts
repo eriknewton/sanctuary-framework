@@ -56,6 +56,18 @@ const OVERVIEW_FULL_ROW_MIN_PX = OVERVIEW_TILE_COUNT * OVERVIEW_TILE_MIN_PX + (O
 const OVERVIEW_COMPACT_COLUMNS = 3;
 const OVERVIEW_COMPACT_ROW_MIN_PX = OVERVIEW_COMPACT_COLUMNS * OVERVIEW_TILE_MIN_PX + (OVERVIEW_COMPACT_COLUMNS - 1) * OVERVIEW_TILE_GAP_PX;
 
+// The console's one modal scrim: 40% black over the page, shared by .intel-modal-backdrop and the operator-token
+// dialog's ::backdrop so the two modals dim the page alike.
+const MODAL_SCRIM = "rgba(0,0,0,0.4)";
+// The token notice sentence keeps a line of its own below this basis and shares the line with its button above it.
+// 320px = the narrowest phone viewport the console supports (an iPhone SE width), so on a phone the sentence wraps
+// above the button and on any wider screen they sit side by side.
+const OPERATOR_TOKEN_NOTICE_BASIS_PX = 320;
+// The token dialog is sized in characters: 60ch is the conventional upper bound of a comfortable reading line, so
+// the dialog's explanation reads as short lines at any font size; on a narrower screen it keeps a --space-4 gutter
+// on each side (the 2 is the two sides).
+const OPERATOR_TOKEN_DIALOG_MEASURE_CH = 60;
+
 const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
 ${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
@@ -453,20 +465,20 @@ body {
 .feedback:not(:has(#toast-host > *, #decision-feedback-result > *, #operator-token-entry > *)) {
   border-color: transparent; background: transparent;
 }
-/* 320px is a phone width: below it the sentence wraps above the button, above it they share a line. */
+/* The notice basis and dialog measure are derived beside their constants above STYLES. */
 .operator-token-entry { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
-.operator-token-entry p { margin: 0; flex: 1 1 320px; }
+.operator-token-entry p { margin: 0; flex: 1 1 ${OPERATOR_TOKEN_NOTICE_BASIS_PX}px; }
 .operator-token-dialog {
-  width: min(440px, calc(100vw - 2 * var(--space-4))); padding: var(--space-4);
+  width: min(${OPERATOR_TOKEN_DIALOG_MEASURE_CH}ch, calc(100vw - 2 * var(--space-4))); padding: var(--space-4);
   background: var(--surface); color: var(--ink); border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
 }
-/* Same scrim as .intel-modal-backdrop, the console's other modal. */
-.operator-token-dialog::backdrop { background: rgba(0,0,0,0.4); }
+/* MODAL_SCRIM, shared with .intel-modal-backdrop. */
+.operator-token-dialog::backdrop { background: ${MODAL_SCRIM}; }
 .operator-token-dialog h2 { margin: 0 0 var(--space-2); font-size: var(--text-lg); }
 .operator-token-dialog p { margin: 0 0 var(--space-2); color: var(--ink-2); }
-.operator-token-dialog label { display: block; margin-bottom: 4px; font-weight: 600; }
+.operator-token-dialog label { display: block; margin-bottom: var(--space-1); font-weight: 600; }
 /* --ink-3 is the control boundary every input wears (see .btn). */
-.operator-token-dialog input { width: 100%; padding: 6px 8px; border: 1px solid var(--ink-3); border-radius: var(--rad); font: inherit; color: var(--ink); background: var(--surface-2); }
+.operator-token-dialog input { width: 100%; padding: var(--space-1) var(--space-2); border: 1px solid var(--ink-3); border-radius: var(--rad); font: inherit; color: var(--ink); background: var(--surface-2); }
 .operator-token-error { color: var(--rust); margin-top: var(--space-2); }
 .operator-token-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-3); }
 .toast {
@@ -586,7 +598,7 @@ body {
 .intel-hardware dt { color: var(--ink-3); font-family: var(--mono); }
 .intel-hardware dd { margin: 0; }
 .intel-modal-backdrop {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 1100;
+  position: fixed; inset: 0; background: ${MODAL_SCRIM}; z-index: 1100;
   display: flex; align-items: flex-start; justify-content: center;
   padding: 40px 16px; overflow-y: auto;
 }

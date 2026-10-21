@@ -92,3 +92,120 @@ test("a route change opens the new screen at the top of main", async ({ page, da
   await expect(main).toContainText("Evidence");
   expect(await main.evaluate((el) => el.scrollTop)).toBe(0);
 });
+
+// Desktop and a narrow phone width (390 px, a current iPhone viewport) at which the drawer stacks below the queue.
+const GEOMETRY_VIEWPORTS = { desktop: { width: 1440, height: 900 }, narrow: { width: 390, height: 844 } } as const;
+const GEOMETRY_TIME = "2026-10-21T12:00:00.000Z";
+const geometryHeld = (id: string, tier = "tier2") => ({
+  item_id: id, kind: "approval_pending", tier, agent_id: "fixture-agent",
+  display_template_id: `approval_pending.${tier}.other`, display_template_args: [{ kind: "agent_id", value: "fixture-agent" }],
+  resolved: false, created_at: GEOMETRY_TIME, identity_id: "operator-e2e", operation_category: "state_export",
+});
+
+/**
+ * Boot Approvals with decision controls on screen, then make one read the Approvals screen does not draw (the fleet
+ * roster) answer 401 or succeed on demand, so the token notice appears and clears while the controls stay live.
+ */
+async function prepareTokenGeometry(page: Page, url: string) {
+  const gate = { refuseRoster: false };
+  await page.clock.install({ time: new Date(GEOMETRY_TIME) });
+  await page.clock.pauseAt(new Date(GEOMETRY_TIME));
+  // Expose only the shipping per-panel retry, the entry point a Retry button uses.
+  await page.route(url + "/", async (route) => {
+    const response = await route.fetch();
+    const html = (await response.text()).replace("void loadPanel(panelJobs[0]);",
+      "window.tokenDriver = { refresh: function (path) { return retryPanel(path); } }; void loadPanel(panelJobs[0]);");
+    await route.fulfill({ response, body: html });
+  });
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/stream") return;
+    if (path === "/api/fleet/roster") {
+      await route.fulfill(gate.refuseRoster ? { status: 401, json: { error: "unauthorized" } } : { json: { available: false, nodes: [] } });
+      return;
+    }
+    const data = path === "/api/hub/inbox" ? { data: { items: [geometryHeld("seed"), geometryHeld("later"), geometryHeld("armed", "tier1")] } }
+      : path === "/api/posture/home" ? { origin_machine: "fixture", agents: [], castle_wall: { arm_state: "unknown" }, digest: {} }
+      : path === "/api/posture/evidence" ? { origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } }
+      : path === "/api/policy/current" ? { data: { view: { lines: [] } } }
+      : { data: { configured: false, agents: [], items: [], entries: [], findings: [], messages: [], policies: [], rules: [], recommendations: [] } };
+    await route.fulfill({ json: data });
+  });
+  await page.goto(url + "/#approvals");
+  await page.locator('[data-action="approval-select"][data-item-id="later"]').first().click();
+  const approve = page.locator('.approval-drawer [data-action="inbox-approve"]');
+  await expect(approve).toBeEnabled();
+  await approve.scrollIntoViewIfNeeded();
+  await page.evaluate("document.fonts.ready");
+  await page.clock.runFor(SETTLE_FRAMES_MS);
+  return gate;
+}
+
+/** Every decision control's rectangle, identity and eligibility, plus the workspace and feedback scroll offsets. */
+function decisionGeometry(page: Page) {
+  return page.evaluate<{ controls: Array<[string, string, boolean, number[]]>; mainScroll: number; feedbackBox: number[] }>(`(() => {
+    const box = el => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; };
+    const controls = [...document.querySelectorAll('#main [data-action^="inbox-"], #main [data-action^="approval-"]')]
+      .map(el => [el.getAttribute('data-action'), el.getAttribute('data-item-id') || '', el.disabled === true, box(el)]);
+    return { controls, mainScroll: document.getElementById('main').scrollTop, feedbackBox: box(document.getElementById('feedback')) };
+  })()`);
+}
+
+for (const [name, viewport] of Object.entries(GEOMETRY_VIEWPORTS)) {
+  test(`${name}: the token notice and dialog never move a decision control or the screen's scroll`, async ({ page, dashboard }) => {
+    await page.setViewportSize(viewport);
+    const gate = await prepareTokenGeometry(page, dashboard.url);
+    const baseline = await decisionGeometry(page);
+    expect(baseline.controls.length, "decision controls are on screen").toBeGreaterThan(0);
+    // At the narrow width the drawer sits below the queue, so a held scroll offset is part of what must not move.
+    if (name === "narrow") expect(baseline.mainScroll, "the screen is scrolled to the drawer").toBeGreaterThan(0);
+    const unchanged = async (step: string) => {
+      await page.clock.runFor(SETTLE_FRAMES_MS);
+      expect(await decisionGeometry(page), step).toEqual(baseline);
+    };
+
+    gate.refuseRoster = true;
+    await page.evaluate("tokenDriver.refresh('/api/fleet/roster')");
+    const open = page.getByRole("button", { name: "Paste operator token" });
+    await expect(open).toBeVisible();
+    await unchanged("notice appears");
+
+    await open.click();
+    await expect(page.getByRole("dialog", { name: "Paste operator token" })).toBeVisible();
+    await unchanged("dialog open");
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#operator-token-dialog")).not.toHaveAttribute("open", "");
+    await unchanged("dialog closed with Escape");
+    await open.click();
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.locator("#operator-token-dialog")).not.toHaveAttribute("open", "");
+    await unchanged("dialog closed with Cancel");
+
+    gate.refuseRoster = false;
+    await page.evaluate("tokenDriver.refresh('/api/fleet/roster')");
+    await expect(open).toHaveCount(0);
+    await unchanged("notice clears");
+  });
+}
+
+test("a malformed paste is refused in the dialog, and a held token the browser cannot send still offers a replacement", async ({ page, dashboard }) => {
+  // An em-dash typo: outside Latin-1, so the browser cannot put it in an Authorization header.
+  const malformed = "operator-token\u2014typo";
+  await gateReadsOnToken(page);
+  await page.goto(dashboard.url + "/#posture");
+  await page.getByRole("button", { name: "Paste operator token" }).click();
+  const dialog = page.getByRole("dialog", { name: "Paste operator token" });
+  await dialog.getByRole("textbox", { name: "Operator token" }).fill(malformed);
+  await dialog.getByRole("button", { name: "Use token" }).click();
+  await expect(page.locator("#operator-token-error")).toContainText("That is not an operator token");
+  await expect(dialog).toBeVisible();
+  expect(await page.evaluate<string | null>("sessionStorage.getItem('authToken')")).toBeNull();
+
+  // A token already held in that shape (from before the check existed) makes the real fetch throw; it still reads as refused.
+  await page.evaluate(`sessionStorage.setItem('authToken', ${JSON.stringify(malformed)})`);
+  await page.reload();
+  await expect(page.locator("#feedback #operator-token-entry")).toContainText("contains characters that cannot be sent");
+  // The panel reason comes from the read path's own conversion of the browser's header TypeError.
+  await expect(page.locator("#main")).toContainText("the operator token held in this tab cannot be sent");
+  await expect(page.getByRole("button", { name: "Paste operator token" })).toBeVisible();
+});

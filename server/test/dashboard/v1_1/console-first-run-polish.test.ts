@@ -94,7 +94,7 @@ const SHELL_IDS = [
 ];
 
 type Override = (init?: RequestInit, url?: string) => unknown;
-function boot(overrides: Record<string, Override> = {}, storage: Map<string, string> = new Map()) {
+function boot(overrides: Record<string, Override> = {}, storage: Map<string, string> = new Map(), opts: { browserHeaders?: boolean } = {}) {
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
@@ -140,10 +140,14 @@ function boot(overrides: Record<string, Override> = {}, storage: Map<string, str
       setItem: (key: string, value: string) => { storage.set(key, String(value)); },
     },
     console: { log: record, info: record, warn: record, error: record, debug: record },
-    URLSearchParams, URL, AbortController, TextDecoder, Date, Element: FakeElement, HTMLInputElement: FakeInput, HTMLFormElement: FakeForm, Blob,
+    URLSearchParams, URL, AbortController, TextDecoder, Date, Element: FakeElement, HTMLInputElement: FakeInput, HTMLFormElement: FakeForm, Blob, Headers,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
     fetch: (url: string, init?: RequestInit) => {
+      // A browser builds the request headers before anything is sent, and rejects a value outside Latin-1 there.
+      if (opts.browserHeaders && init && init.headers) {
+        try { new Headers(init.headers); } catch (error) { return Promise.reject(error); }
+      }
       const path = url.replace(/([?&])_t=[^&]*&?/, "$1").replace(/[?&]$/, "");
       requests.push({ url, init });
       const bare = path.split("?")[0]!;
@@ -163,7 +167,12 @@ function boot(overrides: Record<string, Override> = {}, storage: Map<string, str
   const read = (expression: string) => runInContext(expression, context);
   return { el, context, location, navigate, click, submit, read, requests, storage, consoleCalls, prompts, reloads: () => reloads };
 }
-async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
+// Boot's longest read chain (fetch, body, panel publish, rerender, trailing read) settles in a few dozen microtask
+// turns; 100 is that bound with margin, the same finite drain settle() uses in approval-decision-result.test.ts.
+const MICROTASK_DRAIN_TURNS = 100;
+async function settle() { for (let i = 0; i < MICROTASK_DRAIN_TURNS; i++) await Promise.resolve(); }
+// Must match DASHBOARD_READ_DEADLINE_MS in client.ts: a read still pending at this age fails Unknown.
+const READ_DEADLINE_MS = 5 * 1000;
 afterEach(() => { vi.useRealTimers(); });
 
 // Every read the console makes is refused unless it carries the stored bearer, as a fortress that requires the
@@ -239,6 +248,43 @@ describe("operator token entry for refused reads", () => {
     expect(h.el["operator-token-dialog"]!.open).toBe(true);
   });
 
+  it("a malformed paste is refused before storage: the held token stays, the dialog stays open and says why", async () => {
+    vi.useFakeTimers();
+    const held = "held-token-from-the-token-file";
+    const h = boot({ "*": tokenGate(held) }, new Map([["authToken", held]]));
+    await settle();
+    h.click({ "data-action": "operator-token-open" });
+    // An em-dash typo (outside Latin-1) and an inner space are both outside the token shape.
+    for (const pasted of ["operator-token\u2014typo", "two words"]) {
+      h.el["operator-token-input"]!.value = pasted;
+      expect(h.submit(h.el["operator-token-form"]!)).toBe(true);
+      expect(h.storage.get("authToken"), pasted).toBe(held);
+      expect(h.reloads(), pasted).toBe(0);
+      expect(h.el["operator-token-dialog"]!.open, pasted).toBe(true);
+      expect(h.el["operator-token-error"]!.hidden, pasted).toBe(false);
+      expect(h.el["operator-token-error"]!.textContent, pasted).toContain("That is not an operator token");
+      expect(h.el["operator-token-error"]!.textContent, pasted).not.toContain(pasted);
+      expect(h.el["operator-token-input"]!.value, pasted).toBe("");
+    }
+    // The dialog stays usable: a well-formed token after the refusal is stored and reloads.
+    h.el["operator-token-input"]!.value = PASTED_TOKEN;
+    h.submit(h.el["operator-token-form"]!);
+    expect(h.storage.get("authToken")).toBe(PASTED_TOKEN);
+    expect(h.reloads()).toBe(1);
+  });
+
+  it("a held token whose header cannot be built reads as refused, so the replacement notice still appears", async () => {
+    vi.useFakeTimers();
+    // A token stored before shape checking existed (or set through the mutation prompt) with an em-dash typo.
+    const h = boot({}, new Map([["authToken", "operator-token\u2014typo"]]), { browserHeaders: true });
+    await settle();
+    const notice = h.el["operator-token-entry"]!.innerHTML;
+    expect(notice).toContain(">Paste operator token</button>");
+    expect(notice).toContain("contains characters that cannot be sent");
+    expect(h.el.main!.innerHTML).toContain("the operator token held in this tab cannot be sent");
+    expect(h.read('sourceRead("/api/posture/home").tokenUnsendable')).toBe(true);
+  });
+
   it("a held token the server does not accept is named as refused, and the notice offers a replacement", async () => {
     vi.useFakeTimers();
     const h = boot({ "*": tokenGate(PASTED_TOKEN) }, new Map([["authToken", "stale-token-from-an-earlier-reset"]]));
@@ -272,6 +318,67 @@ describe("Overview findings agree with the Findings screen", () => {
     await settle();
     expect(quiet.el.main!.innerHTML).toMatch(/Open Sentinel findings<\/a><span class="ot-value">0</);
     expect(quiet.el.main!.innerHTML).toContain("No open Sentinel findings");
+  });
+});
+
+describe("an unread Sentinel feed is never a zero", () => {
+  const sentinelFinding = { finding_id: "finding-1", summary: "Fixture sentinel flagged a burst.", severity: "warn", sentinel_id: "sentinel-1", agent_id: null, observed_at: "2026-10-21T12:00:00.000Z" };
+  const never = () => new Promise<never>(() => {});
+  const zeroTile = /Open Sentinel findings<\/a><span class="ot-value">0</;
+  const unknownTile = /Open Sentinel findings<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"><span class="overview-chip-head"><i aria-hidden="true"><\/i>Not evaluated</;
+  function expectUnknown(html: string, when: string) {
+    expect(html, when).not.toMatch(zeroTile);
+    expect(html, when).toMatch(unknownTile);
+    expect(html, when).not.toContain("No open Sentinel findings");
+    expect(html, when).not.toContain("0 of 0 open findings");
+    expect(html, when).toContain("Sentinel findings Unknown");
+    expect(html, when).toContain('data-read="/api/sentinels/findings">Retry Sentinel findings</button>');
+  }
+
+  it("a feed that has not answered beside an empty anomaly answer reads Not evaluated, before and after its deadline", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/sentinels/findings": never });
+    await settle();
+    expectUnknown(h.el.main!.innerHTML, "pending at boot");
+    await vi.advanceTimersByTimeAsync(READ_DEADLINE_MS);
+    expectUnknown(h.el.main!.innerHTML, "timed out");
+  });
+
+  it("a pending refresh after one listed finding never flips the Overview to 0 of 0", async () => {
+    vi.useFakeTimers();
+    let mode: "listed" | "pending" = "listed";
+    const h = boot({ "/api/sentinels/findings": () => mode === "listed" ? Promise.resolve(response({ data: { findings: [sentinelFinding] } })) : never() });
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("<h3>1 finding, status unknown</h3>");
+    mode = "pending";
+    h.read('void queueStreamRefresh(["/api/sentinels/findings"])');
+    // The refresh is in flight: no settle, so this is the window the redraw paints while the read is pending.
+    expectUnknown(h.el.main!.innerHTML, "refresh in flight");
+    await settle();
+    expectUnknown(h.el.main!.innerHTML, "refresh still pending");
+    await vi.advanceTimersByTimeAsync(READ_DEADLINE_MS);
+    expectUnknown(h.el.main!.innerHTML, "refresh timed out");
+  });
+
+  it("a failed refresh after one listed finding reads Unknown, and a later empty answer reads 0 open", async () => {
+    vi.useFakeTimers();
+    let mode: "listed" | "failed" | "empty" = "listed";
+    const h = boot({ "/api/sentinels/findings": () => mode === "listed" ? Promise.resolve(response({ data: { findings: [sentinelFinding] } }))
+      : mode === "failed" ? Promise.resolve(response({ error: "unavailable" }, 503)) : Promise.resolve(response({ data: { findings: [] } })) });
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("1 FINDING");
+    mode = "failed";
+    h.read('void queueStreamRefresh(["/api/sentinels/findings"])');
+    expectUnknown(h.el.main!.innerHTML, "refresh in flight");
+    await settle();
+    expectUnknown(h.el.main!.innerHTML, "refresh answered 503");
+    expect(h.el.main!.innerHTML).toContain("Sentinel findings did not answer: Read failed (HTTP 503)");
+    // Only a feed that loads empty earns the zero.
+    mode = "empty";
+    h.read('void retryPanel("/api/sentinels/findings")');
+    await settle();
+    expect(h.el.main!.innerHTML).toMatch(zeroTile);
+    expect(h.el.main!.innerHTML).toContain("No open Sentinel findings");
   });
 });
 

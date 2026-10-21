@@ -449,12 +449,39 @@ function promptForOperatorToken() {
 // 401 = the server's answer for a missing or unaccepted operator bearer; 403
 // is a refusal of a held, accepted credential and a new token cannot fix it.
 const OPERATOR_TOKEN_REFUSED_STATUS = 401;
+// Every token the server mints is hex (randomBytes(...).toString("hex")) or base64url, and an operator-set
+// SANCTUARY_DASHBOARD_AUTH_TOKEN travels in the same "Bearer <token>" header, so a usable token is one or more
+// visible ASCII characters, 0x21 "!" through 0x7E "~": no space, no control character, nothing outside Latin-1. A
+// value outside that set either cannot be put in a header at all (fetch throws before any request leaves) or is
+// altered in transit, so it is refused at entry rather than stored.
+const OPERATOR_TOKEN_SHAPE = /^[\x21-\x7E]+$/;
+function operatorTokenSendable(token) { return typeof token === "string" && OPERATOR_TOKEN_SHAPE.test(token); }
 function operatorTokenRefused() {
   // A source's status keeps its last failed answer until a read loads (readResponse resets it), so the notice
   // does not flicker while a trailing read is in flight, and leaves as soon as any read of that source succeeds.
-  let refused = false;
-  sourceReads.forEach(function (read) { if (read.status === OPERATOR_TOKEN_REFUSED_STATUS) refused = true; });
+  // A held token that could not be sent at all counts as refused too: no 401 can arrive for a request that never
+  // left, and without this the notice would vanish exactly when a replacement is needed.
+  let refused = !!TOKEN && !operatorTokenSendable(TOKEN);
+  sourceReads.forEach(function (read) { if (read.status === OPERATOR_TOKEN_REFUSED_STATUS || read.tokenUnsendable === true) refused = true; });
   return refused;
+}
+// A bearer request whose header could not be built never reached the server; it reads as a refusal of the held
+// token, never as an ordinary network failure, so the replacement notice stays available.
+function unsendableTokenError() {
+  const error = new Error("Operator access required: the operator token held in this tab cannot be sent.");
+  error.operatorTokenUnsendable = true;
+  return error;
+}
+const BEARER_PREFIX = "Bearer ";
+function requestCarriesBearer(init) {
+  const headers = init && init.headers;
+  return !!headers && typeof headers === "object" && typeof headers.Authorization === "string" && headers.Authorization.indexOf(BEARER_PREFIX) === 0;
+}
+function headerRejected(init) {
+  // Browsers report both an invalid header and an unreachable server as TypeError; rebuilding the headers on their
+  // own tells the two apart, and with no Headers constructor the failure stays an ordinary read failure.
+  if (typeof Headers !== "function") return false;
+  try { new Headers(init.headers); return false; } catch (_e) { return true; }
 }
 let lastOperatorTokenEntryHtml = null;
 function renderOperatorTokenEntry() {
@@ -463,7 +490,8 @@ function renderOperatorTokenEntry() {
   // Static text only: the token itself is never written into the page, a URL, a log or the console.
   const html = !operatorTokenRefused() ? "" :
     '<div class="operator-token-entry" role="group" aria-labelledby="operator-token-entry-title"><p><strong id="operator-token-entry-title">Operator token needed.</strong> ' +
-    (TOKEN ? "The server did not accept the operator token held in this tab, so these screens stay Unknown."
+    (TOKEN && !operatorTokenSendable(TOKEN) ? "The operator token held in this tab contains characters that cannot be sent, so these screens stay Unknown."
+      : TOKEN ? "The server did not accept the operator token held in this tab, so these screens stay Unknown."
       : "No operator token is held in this tab, so the server refused these reads and the screens stay Unknown.") +
     '</p><button type="button" class="btn btn-primary" data-action="operator-token-open" aria-haspopup="dialog">Paste operator token</button></div>';
   // Rewriting an unchanged notice would drop keyboard focus from its button on every background redraw.
@@ -500,13 +528,17 @@ function submitOperatorToken() {
   const entered = parts.input ? String(parts.input.value || "").trim() : "";
   // The field is emptied as soon as it is read, so the token is never retained in the page.
   if (parts.input) parts.input.value = "";
+  // Shape is checked before storage, so a malformed paste never replaces the token already held for this tab.
+  const problem = !entered ? "Paste the operator token first."
+    : !operatorTokenSendable(entered) ? "That is not an operator token: a token is letters, digits and punctuation with no spaces. Copy it again from the token file and paste it here."
+    : "";
   let stored = false;
-  if (entered) {
+  if (!problem) {
     try { sessionStorage.setItem("authToken", entered); stored = true; } catch (_e) { stored = false; }
   }
   if (!stored) {
     if (parts.error) {
-      parts.error.textContent = entered ? "This browser did not keep the token for this tab. Check that site storage is allowed, then try again." : "Paste the operator token first.";
+      parts.error.textContent = problem || "This browser did not keep the token for this tab. Check that site storage is allowed, then try again.";
       parts.error.hidden = false;
     }
     if (parts.input && typeof parts.input.focus === "function") parts.input.focus();
@@ -568,7 +600,13 @@ function readResponse(url, init, deadlineMs, generation) {
   });
   const read = (async function () {
     if (deadlineMs !== undefined && deadlineMs <= 0) throw new Error("Read timed out. The latest result is unavailable.");
-    const res = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    let res;
+    try { res = await fetch(url, Object.assign({}, init, { signal: controller.signal })); }
+    catch (error) {
+      // fetch rejects with a TypeError when a header value is invalid; with a bearer attached that is the token.
+      if (requestCarriesBearer(init) && error && error.name === "TypeError" && !controller.signal.aborted && headerRejected(init)) throw unsendableTokenError();
+      throw error;
+    }
     let body = null;
     try {
       body = key === readKey("/api/fleet/roster") || key === readKey("/api/sentinels/findings") || key === readKey(POLICY + "/current") ? await readMfpBody(res) : await res.json();
@@ -596,7 +634,7 @@ function readResponse(url, init, deadlineMs, generation) {
     if (generation !== undefined && !currentMfpRead(url, generation)) throw new Error("A newer read replaced this response.");
     // A response admitted before an event or decision cannot publish over its trailing read.
     if (source && source.revision !== revision) throw supersededByRefresh();
-    if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
+    if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; source.tokenUnsendable = false; }
     return res;
   }, function (error) {
     // An older failure cannot revoke evidence already supplied by a newer generation.
@@ -606,7 +644,7 @@ function readResponse(url, init, deadlineMs, generation) {
     if (generation !== undefined && source && source.revision !== revision) throw supersededByRefresh();
     if (error && error.dashboardModeNotServed) markSourceNotServed(url);
     else failSource(url, error);
-    if (source && source.state !== "state_NOT_SERVED") source.status = error.status;
+    if (source && source.state !== "state_NOT_SERVED") { source.status = error.status; source.tokenUnsendable = !!(error && error.operatorTokenUnsendable); }
     rerender();
     throw error;
   }).finally(function () {
@@ -4536,11 +4574,20 @@ function severityRank(level) {
 }
 
 // The Findings screen lists the served Sentinel feed (renderFindingsScreen) with lifecycle Unknown, beside the
-// anomaly card the Overview counts as open. When the anomaly answer is empty but the feed returned findings, the
-// Overview reports the feed's count with an unknown status rather than 0 open, so the two screens never disagree.
-// Must match the Sentinel queue in renderFindingsScreen: same source, same served total.
-function sentinelFindingsWithoutLifecycle() {
-  return sourceLoaded("/api/sentinels/findings") ? state.mfp.totals.findings : 0;
+// anomaly card the Overview counts as open. When the anomaly answer is empty, the Overview may say "0 open" only
+// once the feed itself has loaded empty; a listed feed reads as its count with an unknown status, and a feed that is
+// pending, failed or not served reads as Unknown, so the two screens never disagree and an unread feed never
+// becomes a reassuring zero. Must match the Sentinel queue in renderFindingsScreen: same source, same served total.
+const SENTINEL_FEED_PATH = "/api/sentinels/findings";
+const SENTINEL_FEED = { UNAVAILABLE: "state_UNAVAILABLE", EMPTY: "state_EMPTY", LISTED: "state_LISTED" };
+function sentinelFeedState() {
+  // Availability is decided before the count: an unloaded source has no count, never a count of zero.
+  if (!sourceLoaded(SENTINEL_FEED_PATH)) return { state: SENTINEL_FEED.UNAVAILABLE, total: null };
+  const total = state.mfp.totals.findings;
+  return { state: total > 0 ? SENTINEL_FEED.LISTED : SENTINEL_FEED.EMPTY, total: total };
+}
+function sentinelFeedUnknownHtml() {
+  return '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason(SENTINEL_FEED_PATH, "Sentinel findings"))) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="' + SENTINEL_FEED_PATH + '">Retry Sentinel findings</button></div>';
 }
 function sentinelFindingsCount(count) {
   return count + (count === 1 ? " finding" : " findings");
@@ -4555,8 +4602,8 @@ function renderOverviewFindingsPanel() {
     return severityRank(a.severity) - severityRank(b.severity);
   });
   const shown = findings.slice(0, OVERVIEW_FINDING_LIMIT);
-  // An empty anomaly answer cannot read as "no findings" while the Findings screen lists Sentinel findings.
-  const returned = !unknown && !findings.length ? sentinelFindingsWithoutLifecycle() : 0;
+  // An empty anomaly answer is "no open findings" only beside a Sentinel feed that loaded empty.
+  const feed = !unknown && !findings.length ? sentinelFeedState() : null;
   const list = unknown
     ? '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason("/api/anomaly/findings", "Sentinels"))) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="/api/anomaly/findings">Retry Anomaly findings</button></div>'
     : shown.length
@@ -4564,11 +4611,13 @@ function renderOverviewFindingsPanel() {
           const sev = severityClass(f.severity);
           return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Sentinel: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
         }).join("") + '</div>'
-      : returned
-        ? '<div class="overview-empty"><h3>' + escHtml(sentinelFindingsPhrase(returned)) + '</h3><p>Sentinels returned ' + escHtml(sentinelFindingsCount(returned)) + '. Their lifecycle is not served, so this view cannot say whether ' + (returned === 1 ? 'it is' : 'they are') + ' open.</p><a class="btn" href="#findings">Open Findings</a></div>'
+      : feed.state === SENTINEL_FEED.UNAVAILABLE
+        ? sentinelFeedUnknownHtml()
+      : feed.state === SENTINEL_FEED.LISTED
+        ? '<div class="overview-empty"><h3>' + escHtml(sentinelFindingsPhrase(feed.total)) + '</h3><p>Sentinels returned ' + escHtml(sentinelFindingsCount(feed.total)) + '. Their lifecycle is not served, so this view cannot say whether ' + (feed.total === 1 ? 'it is' : 'they are') + ' open.</p><a class="btn" href="#findings">Open Findings</a></div>'
         : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
   return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
-    (unknown ? "Not evaluated" : returned ? escHtml(sentinelFindingsPhrase(returned)) : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
+    (unknown || (feed && feed.state === SENTINEL_FEED.UNAVAILABLE) ? "Not evaluated" : feed && feed.state === SENTINEL_FEED.LISTED ? escHtml(sentinelFindingsPhrase(feed.total)) : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
     '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
     '<p class="muted">Fleet enforcement status comes from the Machines screen health probes; this Overview does not infer remote protection from local evidence.</p></section>';
 }
@@ -4704,8 +4753,10 @@ function renderPostureScreen() {
     : "";
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
-  // An empty anomaly answer cannot show 0 open while the Findings screen lists Sentinel findings of unknown status.
-  const sentinelReturned = !anomalyUnknown && !findings.length ? sentinelFindingsWithoutLifecycle() : 0;
+  // An empty anomaly answer shows 0 open only beside a Sentinel feed that loaded empty (sentinelFeedState).
+  const feed = !anomalyUnknown && !findings.length ? sentinelFeedState() : null;
+  const feedUnavailable = !!feed && feed.state === SENTINEL_FEED.UNAVAILABLE;
+  const feedListed = !!feed && feed.state === SENTINEL_FEED.LISTED;
   const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
   const digest = home.digest || {};
   const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
@@ -4747,7 +4798,9 @@ function renderPostureScreen() {
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       // Must match renderAnomalyFindingsCard on the Findings screen: both count /api/anomaly/findings.
-      overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : sentinelReturned ? overviewChip("unknown", sentinelFindingsCount(sentinelReturned).toUpperCase(), "status unknown") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : sentinelReturned ? 'Sentinels returned ' + escHtml(sentinelFindingsCount(sentinelReturned)) + '; lifecycle is not served · <a href="#findings">findings</a>' : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
+      overviewTile("Open Sentinel findings",
+        anomalyUnknown || feedUnavailable ? overviewChip("unknown", "Not evaluated") : feedListed ? overviewChip("unknown", sentinelFindingsCount(feed.total).toUpperCase(), "status unknown") : escHtml(findings.length),
+        anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : feedUnavailable ? escHtml(overviewSourceReason(SENTINEL_FEED_PATH, "Sentinel findings")) + ' · <a href="#findings">findings</a>' : feedListed ? 'Sentinels returned ' + escHtml(sentinelFindingsCount(feed.total)) + '; lifecycle is not served · <a href="#findings">findings</a>' : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
       overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
   return [
