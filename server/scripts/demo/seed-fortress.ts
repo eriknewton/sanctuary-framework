@@ -8,6 +8,7 @@ import {
   DEMO_TEMP_PREFIX,
   createDemoRoot,
   demoTempParent,
+  loadOrCreateDemoTokenFile,
   parseDemoPort,
   seedDemoFortress,
   type SeedDemoFortressResult,
@@ -26,7 +27,7 @@ const HOLD_KEEPALIVE_MS = 60_000;
 function usage(): string {
   return [
     "Usage:",
-    `  SANCTUARY_PASSPHRASE=... npx tsx scripts/demo/seed-fortress.ts [--port ${DEMO_SEED_DEFAULT_PORT}] [--keep]`,
+    `  SANCTUARY_PASSPHRASE=... npx tsx scripts/demo/seed-fortress.ts [--port ${DEMO_SEED_DEFAULT_PORT}] [--keep] [--token-file <path>]`,
     `  npx tsx scripts/demo/seed-fortress.ts --teardown /tmp/${DEMO_TEMP_PREFIX}...`,
   ].join("\n");
 }
@@ -88,6 +89,17 @@ async function main(): Promise<void> {
   if (!passphrase) {
     throw new Error("SANCTUARY_PASSPHRASE is required; it is never read from keychain.");
   }
+  let tokenFilePath: string | undefined;
+  if (args.includes("--token-file")) {
+    const raw = argValue(args, "--token-file");
+    // A bare --token-file is a usage error, never a request to mint a token nobody can find.
+    if (!raw || raw.startsWith("--")) {
+      throw new Error(`--token-file needs a path.\n${usage()}`);
+    }
+    tokenFilePath = resolve(raw);
+  }
+  // Read or minted before the root exists, so a refused token file starts nothing.
+  const stableToken = tokenFilePath ? await loadOrCreateDemoTokenFile(tokenFilePath) : undefined;
 
   const keep = args.includes("--keep");
   const controller = new AbortController();
@@ -132,12 +144,17 @@ async function main(): Promise<void> {
       startDashboard: true,
       removeOnStop: !keep,
       signal: controller.signal,
+      ...(stableToken ? { authToken: stableToken.token } : {}),
       holdBeforeDashboard,
     });
     phase = "ready";
     console.log(`Dashboard URL: ${seeded.dashboardUrl}`);
     console.log(`API base URL: ${seeded.apiBaseUrl}`);
     console.log(`Operator token file: ${seeded.authTokenPath}`);
+    if (tokenFilePath && stableToken) {
+      // Only the path and whether it was reused are printed, never the token.
+      console.log(`Stable token file (${stableToken.reused ? "reused" : "created"}): ${tokenFilePath}`);
+    }
     console.log("Paste the token from that file into the console when it asks for operator authorization.");
     console.log(`Storage path: ${seeded.storagePath}`);
     console.log(`Teardown: npx tsx scripts/demo/seed-fortress.ts --teardown ${home}`);

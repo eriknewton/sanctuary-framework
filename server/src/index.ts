@@ -1636,7 +1636,13 @@ export async function createSanctuaryServer(options?: {
     injectionDetector,
     onInjectionAlert,
     undefined,
-    { currentSessionBinding, approvalProofStore }
+    {
+      currentSessionBinding,
+      approvalProofStore,
+      // Same server-set supplier as createServer's currentAgentId below, so a
+      // held call's card names the agent the router attributes the call to.
+      currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
+    }
   );
 
   gate.setApprovalEventCallback((event) => {

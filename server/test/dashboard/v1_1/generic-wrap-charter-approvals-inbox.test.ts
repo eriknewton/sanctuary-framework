@@ -54,15 +54,20 @@ import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { OperatorAuthorizationSpentStore } from "../../../src/v1/operator-authorization-spent-store.js";
 import {
+  CHARTER_DECIDED_HISTORY_LIMIT,
   HUB_API_PREFIX,
   HUB_INBOX_DEFAULT_LIMIT,
 } from "../../../src/hub/constants.js";
+import { renderTemplate } from "../../../src/dashboard/v1_1/templates.js";
 import { charterApprovalItemId } from "../../../src/hub/charter-approval-bridge.js";
 import { InMemoryLocalAgentRegistry } from "../../../src/hub/agent-registry.js";
 import { ApprovalGate } from "../../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../../src/principal-policy/baseline.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
-import type { HubInboxItem } from "../../../src/contracts/v1.1/hub-events.js";
+import type {
+  HubDisplayTemplateArg,
+  HubInboxItem,
+} from "../../../src/contracts/v1.1/hub-events.js";
 import type { ApprovalResponse } from "../../../src/principal-policy/types.js";
 import { getFreePort } from "../../helpers/free-port.js";
 
@@ -733,5 +738,167 @@ describe("a hub-resolved hold is a real gate decision", () => {
       tier: 1,
       decided_by: "human",
     });
+  });
+});
+
+// The wrap-time agent id a wrapped harness's MCP server carries as SANCTUARY_AGENT_ID.
+const WRAPPED_AGENT_ID = "claude-code:fortress-0123456789abcdef";
+// Must match the `agent:` form of requestingAgentId in server/src/principal-policy/gate.ts.
+const REQUESTING_AGENT_ID = `agent:${WRAPPED_AGENT_ID}`;
+// Decisions beyond the cap that the eviction test drives, so eviction is observable twice.
+const DECISIONS_BEYOND_HISTORY_CAP = 2;
+
+interface AttributedCard {
+  item_id: string;
+  kind: string;
+  tier?: string;
+  resolved: boolean;
+  resolved_at?: string;
+  agent_id?: string;
+  display_template_id: string;
+  display_template_args: HubDisplayTemplateArg[];
+  operation_category?: string;
+}
+
+async function inboxCards(rig: Rig): Promise<AttributedCard[]> {
+  const { body } = await getJson(rig, `${HUB_API_PREFIX}/inbox`);
+  return inboxItems(body) as unknown as AttributedCard[];
+}
+
+function gateForWrappedAgent(rig: Rig): ApprovalGate {
+  // The same supplier shape index.ts wires from SANCTUARY_AGENT_ID.
+  return new ApprovalGate(
+    DEFAULT_POLICY,
+    rig.baseline,
+    rig.dashboard,
+    rig.auditLog,
+    undefined,
+    undefined,
+    undefined,
+    { currentAgentId: () => WRAPPED_AGENT_ID },
+  );
+}
+
+describe("Charter cards name the requesting agent and stay listed once decided", () => {
+  let rig: Rig;
+
+  beforeEach(async () => {
+    rig = await startRig();
+  });
+
+  afterEach(async () => {
+    await rig.stop();
+  });
+
+  it("carries the gate-stamped requesting agent into the card's agent_id and its agent_id template arg", async () => {
+    const evaluation = gateForWrappedAgent(rig).evaluate("state_export", {
+      namespace: "project-notes",
+    });
+
+    expect(await waitForUnresolvedApprovals(rig, 1)).toHaveLength(1);
+    const [card] = (await inboxCards(rig)).filter((i) => !i.resolved);
+    expect(card!.agent_id).toBe(REQUESTING_AGENT_ID);
+    expect(card!.display_template_id).toBe("approval_pending.tier1.state_export");
+    expect(card!.operation_category).toBe("state_export");
+    expect(card!.display_template_args).toEqual([
+      { kind: "identity_id", value: IDENTITY_ID },
+      { kind: "agent_id", value: REQUESTING_AGENT_ID },
+    ]);
+    // The server-side catalog renders the requester, not the "(no agent)" fallback.
+    expect(
+      renderTemplate(card!.display_template_id, card!.display_template_args),
+    ).toBe(`Export agent ${REQUESTING_AGENT_ID} state as a portable bundle.`);
+
+    expect((await postInboxAction(rig, card!.item_id, "deny")).status).toBe(200);
+    expect((await evaluation).allowed).toBe(false);
+  });
+
+  it("never names a requester from a hold's caller-built context", async () => {
+    // A caller that raises a hold directly can put anything in `context`; only
+    // the gate's typed requesting_agent_id may name the requester on a card.
+    const held = rig.dashboard.requestApproval({
+      operation: "state_export",
+      tier: 1,
+      reason: "context carries an agent id the gate never stamped",
+      context: { agent_id: "agent:someone-else" },
+      timestamp: new Date().toISOString(),
+    });
+
+    expect(await waitForUnresolvedApprovals(rig, 1)).toHaveLength(1);
+    const [card] = (await inboxCards(rig)).filter((i) => !i.resolved);
+    expect(card!.agent_id).toBeUndefined();
+    expect(card!.display_template_args).toEqual([
+      { kind: "identity_id", value: IDENTITY_ID },
+    ]);
+
+    expect((await postInboxAction(rig, card!.item_id, "deny")).status).toBe(200);
+    expect((await held).decision).toBe("deny");
+  });
+
+  it("audits a Tier 2 hold decided over the hub route and keeps the decided card listed, never as open", async () => {
+    // state_write is Tier 3 by policy; a first write to an unseen namespace is
+    // the Tier 2 anomaly, as for a real agent.
+    const evaluation = gateForWrappedAgent(rig).evaluate("state_write", {
+      namespace: "customer-notes",
+      key: "renewal-plan",
+      value: "Draft renewal terms for review.",
+    });
+
+    expect(await waitForUnresolvedApprovals(rig, 1)).toHaveLength(1);
+    const [card] = (await inboxCards(rig)).filter((i) => !i.resolved);
+    expect(card!.tier).toBe("tier2");
+    expect(card!.agent_id).toBe(REQUESTING_AGENT_ID);
+
+    expect((await postInboxAction(rig, card!.item_id, "approve")).status).toBe(200);
+    const result = await evaluation;
+    expect(result.tier).toBe(2);
+    expect(result.allowed).toBe(true);
+
+    // The gate awaits its append before returning, so the row is durable here.
+    const audit = await rig.auditLog.query({
+      layer: "l2",
+      operation_type: "gate_approve:state_write",
+      limit: 10,
+    });
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]!.details).toMatchObject({ tier: 2, decided_by: "human" });
+
+    const decided = (await inboxCards(rig)).filter(
+      (i) => i.item_id === card!.item_id,
+    );
+    expect(decided).toHaveLength(1);
+    expect(decided[0]!.resolved).toBe(true);
+    expect(typeof decided[0]!.resolved_at).toBe("string");
+    expect(decided[0]!.agent_id).toBe(REQUESTING_AGENT_ID);
+    expect(await waitForUnresolvedApprovals(rig, 1, 0)).toHaveLength(0);
+    // Open projections (Overview, concierge) never see decided history.
+    expect(
+      rig.bindings.hubService
+        .listInbox({ openOnly: true })
+        .some((i) => i.item_id === card!.item_id),
+    ).toBe(false);
+    // A decided card cannot be decided again through its id.
+    expect((await postInboxAction(rig, card!.item_id, "approve")).status).toBe(404);
+  });
+
+  it("caps decided history at CHARTER_DECIDED_HISTORY_LIMIT and evicts the oldest first", async () => {
+    const decisions = CHARTER_DECIDED_HISTORY_LIMIT + DECISIONS_BEYOND_HISTORY_CAP;
+    const decidedIds: string[] = [];
+    for (let i = 0; i < decisions; i++) {
+      const held = raiseMemoryInsertHold(rig, `passage-${i}`);
+      const [card] = await waitForUnresolvedApprovals(rig, 1);
+      expect((await postInboxAction(rig, card!.item_id, "approve")).status).toBe(200);
+      expect((await held).decision).toBe("approve");
+      decidedIds.push(card!.item_id);
+    }
+
+    const listed = (await inboxCards(rig))
+      .filter((i) => i.kind === "approval_pending" && i.resolved)
+      .map((i) => i.item_id);
+    expect(listed).toHaveLength(CHARTER_DECIDED_HISTORY_LIMIT);
+    // Newest first; the earliest decisions beyond the cap are gone.
+    expect(listed).toEqual(
+      decidedIds.slice(DECISIONS_BEYOND_HISTORY_CAP).reverse(),
+    );
   });
 });

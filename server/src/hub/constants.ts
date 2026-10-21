@@ -154,6 +154,16 @@ export const HUB_CHAT_TURNS_MAX_LIMIT = 1000;
 export const HUB_INBOX_DEFAULT_LIMIT = 100;
 export const HUB_INBOX_MAX_LIMIT = 500;
 
+// Share of one default inbox page that decided Charter history may occupy.
+const CHARTER_DECIDED_HISTORY_PAGE_DIVISOR = 5;
+/**
+ * Most decided Charter cards the hub keeps for the "Decided" view (20 = one
+ * fifth of HUB_INBOX_DEFAULT_LIMIT). Small on purpose: decided cards trail open
+ * items in a page, and the audit log, not this list, is the decision record.
+ */
+export const CHARTER_DECIDED_HISTORY_LIMIT =
+  HUB_INBOX_DEFAULT_LIMIT / CHARTER_DECIDED_HISTORY_PAGE_DIVISOR;
+
 /**
  * Default + max agents-list page size.
  */

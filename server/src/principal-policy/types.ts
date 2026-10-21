@@ -145,6 +145,20 @@ export interface ApprovalRequest {
    * the historic `<timestamp>:<operation>` form.
    */
   args_binding?: string;
+  /**
+   * The hub agent id of the agent whose tool call raised this hold, in the
+   * registry form `agent:<SANCTUARY_AGENT_ID>`. Set only by `ApprovalGate`
+   * from its server-set `currentAgentId` supplier (the wrap-time
+   * `SANCTUARY_AGENT_ID` of this MCP server process, the same source the
+   * router uses for `callerIdentity`), never from tool arguments or request
+   * context. It is display attribution for operator cards, cooperative in the
+   * same way the router's `callerIdentity` is: it names which wrapped process
+   * asked, and it is not authority or evidence for any decision. Absent when
+   * the process serves no wrapped agent or the hold was raised outside the gate.
+   * Must match `requesting_agent_id` in
+   * server/src/hub/charter-approval-bridge.ts (`CharterApprovalRecord`).
+   */
+  requesting_agent_id?: string;
 }
 
 /** Approval response from the human */

@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 
@@ -24,9 +25,11 @@ import {
   DEMO_PID_FILE_BASENAME,
   createDemoRoot,
   type SeedDemoFortressOptions,
-  DEMO_POLICY_TEMPLATE_CHANGE_OPERATION,
-  DEMO_STATE_EXPORT_OPERATION,
+  DEMO_APPROVALS_SEEDED_OPERATION,
+  DEMO_TIER1_OPERATION,
+  DEMO_TIER2_OPERATION,
   demoTempParent,
+  loadOrCreateDemoTokenFile,
   seedDemoFortress,
   seededItemsForDemo,
 } from "../../scripts/demo/seed-fortress-lib.js";
@@ -479,8 +482,8 @@ describe("seedDemoFortress", () => {
       )) as Array<Record<string, unknown>>;
       expect(pending).toHaveLength(2);
       expect(pending.map((item) => item.operation).sort()).toEqual([
-        DEMO_POLICY_TEMPLATE_CHANGE_OPERATION,
-        DEMO_STATE_EXPORT_OPERATION,
+        DEMO_TIER1_OPERATION,
+        DEMO_TIER2_OPERATION,
       ]);
 
       const findingsPayload = dataRecord(
@@ -848,4 +851,275 @@ describe("seedDemoFortress", () => {
     }
     expect(await pathExists(run.home!)).toBe(false);
   });
+});
+
+// Must match the operation and layer of the gate's decision row (gate.ts requestApproval) and the "Sentinels"
+// label for l2 in EVIDENCE_LAYER_NAMES in server/src/dashboard/v1_1/client.ts.
+const GATE_DECISION_LAYER = "l2";
+const CHARTER_LAYER = "l3";
+// The gate writes its row after the hold is released; 100 polls 50 ms apart bound the wait at 5 seconds.
+const AUDIT_POLL_ATTEMPTS = 100;
+const AUDIT_POLL_INTERVAL_MS = 50;
+// A reset includes one stop and one seeded start; 60 s bounds it on a loaded build box.
+const RESET_TIMEOUT_MS = 60_000;
+// Two resets plus teardown within one test.
+const RESET_TEST_TIMEOUT_MS = 3 * RESET_TIMEOUT_MS;
+// Group and other read bits, which a reused token file must not carry.
+const GROUP_OTHER_READABLE_MODE = 0o644;
+// 22 = base64url length of 16 random bytes with no padding, the minted demo token.
+const MINTED_TOKEN_PATTERN = /^[A-Za-z0-9_-]{22}$/;
+// Must match the state file names in server/scripts/demo/reset.sh.
+const RESET_TOKEN_FILE = "operator-token";
+const RESET_ROOT_FILE = "demo-root";
+
+interface InboxCard {
+  item_id: string;
+  kind: string;
+  tier?: string;
+  resolved: boolean;
+  agent_id?: string;
+  display_template_id: string;
+}
+
+async function hubInbox(baseUrl: string, token: string): Promise<InboxCard[]> {
+  const payload = dataRecord(await getJson(baseUrl, "/api/hub/inbox", token));
+  return dataRecord(payload.data).items as InboxCard[];
+}
+
+async function auditEntries(baseUrl: string, token: string): Promise<Array<Record<string, unknown>>> {
+  const payload = dataRecord(await getJson(baseUrl, `/api/audit-log?limit=${AUDIT_READ_LIMIT}`, token));
+  return payload.entries as Array<Record<string, unknown>>;
+}
+
+async function scratchDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  roots.add(dir);
+  return dir;
+}
+
+interface ResetRun { code: number | null; stdout: string; stderr: string }
+
+async function runReset(env: NodeJS.ProcessEnv): Promise<ResetRun> {
+  const child = spawn("bash", ["scripts/demo/reset.sh"], { cwd: process.cwd(), env });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const code = await Promise.race([
+      new Promise<number | null>((resolveExit, rejectExit) => {
+        child.once("error", rejectExit);
+        child.once("close", (exitCode) => resolveExit(exitCode));
+      }),
+      new Promise<never>((_, rejectExit) => {
+        timeout = setTimeout(() => {
+          child.kill("SIGKILL");
+          rejectExit(new Error(`reset did not finish in time: ${stderr}`));
+        }, RESET_TIMEOUT_MS);
+      }),
+    ]);
+    return { code, stdout, stderr };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Stops a demo started in the background by reset.sh, through the pid file it recorded, and waits for the exit.
+function stopRecordedDemo(root: string): () => Promise<void> {
+  return async () => {
+    const pidText = await readFile(join(root, DEMO_PID_FILE_BASENAME), "utf8").catch(() => undefined);
+    if (pidText === undefined) return;
+    const pid = Number(pidText.trim());
+    try { process.kill(pid, "SIGTERM"); } catch { return; }
+    for (let attempt = 0; attempt < AUDIT_POLL_ATTEMPTS; attempt++) {
+      try { process.kill(pid, 0); } catch { return; }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, AUDIT_POLL_INTERVAL_MS));
+    }
+    process.kill(pid, "SIGKILL");
+  };
+}
+
+describe("seeded approvals go through the real gate", () => {
+  it("names the requesting agent on each card and records a decision only as the gate's own audit entry", async () => {
+    process.env.HOME = await makeFakeOperatorHome();
+    const seeded = await seedOwned(ownedDemoRoot(), {
+      passphrase: PASSPHRASE,
+      port: await getFreePort(),
+      startDashboard: true,
+      removeOnStop: true,
+    });
+    const open = (await hubInbox(seeded.apiBaseUrl, seeded.authToken)).filter(
+      (card) => card.kind === "approval_pending" && !card.resolved,
+    );
+    expect(open).toHaveLength(2);
+    const tier1 = open.find((card) => card.display_template_id === "approval_pending.tier1.state_export");
+    const tier2 = open.find((card) => card.display_template_id === "approval_pending.tier2.other");
+    expect(tier1?.agent_id).toBe(seeded.agentIds[0]);
+    expect(tier2?.agent_id).toBe(seeded.agentIds[1]);
+    expect(tier2?.tier).toBe("tier2");
+
+    // Nothing is recorded as decided before the operator decides.
+    const before = await auditEntries(seeded.apiBaseUrl, seeded.authToken);
+    expect(before.some((entry) => String(entry.operation).startsWith("gate_"))).toBe(false);
+    expect(before.filter((entry) => entry.layer === CHARTER_LAYER).map((entry) => entry.operation)).toEqual([
+      DEMO_APPROVALS_SEEDED_OPERATION,
+    ]);
+
+    const approved = await fetch(
+      `${seeded.apiBaseUrl}/api/hub/inbox/${encodeURIComponent(tier1!.item_id)}/approve`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${seeded.authToken}`, "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    expect(approved.status).toBe(200);
+
+    let decision: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < AUDIT_POLL_ATTEMPTS && !decision; attempt++) {
+      decision = (await auditEntries(seeded.apiBaseUrl, seeded.authToken)).find(
+        (entry) => entry.operation === `gate_approve:${DEMO_TIER1_OPERATION}`,
+      );
+      if (!decision) await new Promise((resolveDelay) => setTimeout(resolveDelay, AUDIT_POLL_INTERVAL_MS));
+    }
+    expect(decision?.layer).toBe(GATE_DECISION_LAYER);
+    expect(decision?.details).toMatchObject({ tier: 1, decided_by: "human" });
+
+    const after = await auditEntries(seeded.apiBaseUrl, seeded.authToken);
+    // The fixture writes no decision of its own: every entry about the export is the gate's single row.
+    expect(
+      after.filter((entry) => String(entry.operation).includes(DEMO_TIER1_OPERATION)).map((entry) => entry.operation),
+    ).toEqual([`gate_approve:${DEMO_TIER1_OPERATION}`]);
+    expect(after.filter((entry) => entry.layer === CHARTER_LAYER).map((entry) => entry.operation)).toEqual([
+      DEMO_APPROVALS_SEEDED_OPERATION,
+    ]);
+
+    const decided = (await hubInbox(seeded.apiBaseUrl, seeded.authToken)).find(
+      (card) => card.item_id === tier1!.item_id,
+    );
+    expect(decided?.resolved).toBe(true);
+    expect(decided?.agent_id).toBe(seeded.agentIds[0]);
+  });
+});
+
+describe("stable demo token file", () => {
+  it("mints a mode-0600 token file once and reuses it afterwards", async () => {
+    const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
+    const first = await loadOrCreateDemoTokenFile(path);
+    expect(first.reused).toBe(false);
+    expect(first.token).toMatch(MINTED_TOKEN_PATTERN);
+    const file = await readModeAndText(path);
+    expect(file.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
+    expect(file.text.trim()).toBe(first.token);
+    expect(await loadOrCreateDemoTokenFile(path)).toEqual({ token: first.token, reused: true });
+  });
+
+  it("refuses a token file readable by group or others", async () => {
+    const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
+    const { token } = await loadOrCreateDemoTokenFile(path);
+    await chmod(path, GROUP_OTHER_READABLE_MODE);
+    const error = await loadOrCreateDemoTokenFile(path).then(() => undefined, (err: Error) => err);
+    expect(error?.message).toMatch(/readable by group or others/);
+    expect(error?.message).not.toContain(token);
+  });
+
+  it("refuses a symlinked token file", async () => {
+    const dir = await scratchDir("sanctuary-demo-token-");
+    const target = join(dir, "real-token");
+    await loadOrCreateDemoTokenFile(target);
+    const link = join(dir, "operator-token");
+    await symlink(target, link);
+    await expect(loadOrCreateDemoTokenFile(link)).rejects.toThrow(/not a regular file/);
+  });
+
+  it.each([
+    ["text that is not a token", "not a demo token at all\n"],
+    ["a token shorter than a minted one", "abc123\n"],
+  ])("refuses a file holding %s without echoing it", async (_label, contents) => {
+    const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
+    await writeFile(path, contents, { mode: OPERATOR_TOKEN_FILE_MODE });
+    const error = await loadOrCreateDemoTokenFile(path).then(() => undefined, (err: Error) => err);
+    expect(error?.message).toMatch(/does not hold a demo token/);
+    expect(error?.message).not.toContain(contents.trim());
+  });
+
+  it("serves the reused token from --token-file and prints only its path", async () => {
+    const path = join(await scratchDir("sanctuary-demo-token-"), "operator-token");
+    const { token } = await loadOrCreateDemoTokenFile(path);
+    const run = await spawnCli(["--port", String(await getFreePort()), "--token-file", path]);
+    try {
+      await waitForOutput(run, /^Teardown: /m);
+      expect(run.stdout).toContain(`Stable token file (reused): ${path}`);
+      const apiBase = run.stdout.match(/^API base URL: (.+)$/m)![1]!;
+      const pending = await fetch(`${apiBase}/api/pending`, { headers: { Authorization: `Bearer ${token}` } });
+      expect(pending.status).toBe(200);
+      await pending.body?.cancel();
+      run.child.kill("SIGTERM");
+      expect(await waitForExit(run)).toEqual({ code: 0, signal: null });
+      assertNoTokenOutput(token, run, true);
+      // The stable file outlives the demo root.
+      expect((await readFile(path, "utf8")).trim()).toBe(token);
+    } finally {
+      await cleanupOwned();
+    }
+  });
+
+  it.each([[["--token-file"]], [["--token-file", "--keep"]]])("refuses %j without a path and starts no demo", async (args) => {
+    const run = await spawnCli(args);
+    try {
+      expect(await waitForExit(run)).toEqual({ code: 1, signal: null });
+      expect(run.stderr).toContain("--token-file needs a path.");
+      expect(run.stdout).not.toContain("Demo HOME:");
+    } finally {
+      await cleanupOwned();
+    }
+  });
+});
+
+describe("one-command demo reset", () => {
+  it("stops the demo it started and restarts with the same token", async () => {
+    const stateDir = await scratchDir("sanctuary-demo-reset-");
+    const port = await getFreePort();
+    const env = {
+      ...process.env,
+      HOME: await makeFakeOperatorHome(),
+      SANCTUARY_DEMO_STATE_DIR: stateDir,
+      SANCTUARY_DEMO_PORT: String(port),
+      SANCTUARY_DEMO_PASSPHRASE: PASSPHRASE,
+    };
+    const apiBase = `http://127.0.0.1:${port}`;
+    try {
+      const first = await runReset(env);
+      expect(first.code, first.stderr).toBe(0);
+      const firstRoot = (await readFile(join(stateDir, RESET_ROOT_FILE), "utf8")).trim();
+      roots.add(firstRoot);
+      stops.push(stopRecordedDemo(firstRoot));
+      const tokenFile = await readModeAndText(join(stateDir, RESET_TOKEN_FILE));
+      expect(tokenFile.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
+      const token = tokenFile.text.trim();
+      const before = await fetch(`${apiBase}/api/pending`, { headers: { Authorization: `Bearer ${token}` } });
+      expect(before.status).toBe(200);
+      await before.body?.cancel();
+
+      const second = await runReset(env);
+      expect(second.code, second.stderr).toBe(0);
+      const secondRoot = (await readFile(join(stateDir, RESET_ROOT_FILE), "utf8")).trim();
+      roots.add(secondRoot);
+      stops.push(stopRecordedDemo(secondRoot));
+      expect(secondRoot).not.toBe(firstRoot);
+      // The previous demo removed its own root when the reset stopped it.
+      expect(await pathExists(firstRoot)).toBe(false);
+      expect((await readFile(join(stateDir, RESET_TOKEN_FILE), "utf8")).trim()).toBe(token);
+      const after = await fetch(`${apiBase}/api/pending`, { headers: { Authorization: `Bearer ${token}` } });
+      expect(after.status).toBe(200);
+      await after.body?.cancel();
+      for (const output of [first.stdout, second.stdout]) {
+        expect(output).toContain(`Dashboard: ${apiBase}/v1.1`);
+        expect(output).not.toContain(token);
+      }
+    } finally {
+      await cleanupOwned();
+    }
+  }, RESET_TEST_TIMEOUT_MS);
 });

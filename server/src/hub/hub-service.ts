@@ -33,6 +33,7 @@ import { CHANNEL_TEMPLATE_IDS } from "../policy-engine/constants.js";
 import { applyChannelTemplate } from "../policy-engine/channel-templates.js";
 
 import {
+  CHARTER_DECIDED_HISTORY_LIMIT,
   HUB_AGENT_CONTROL_ACTIONS,
   HUB_INBOX_TEMPLATE_NAMESPACES,
   HUB_TIER_1_AGENT_CONTROL_ACTIONS,
@@ -199,6 +200,13 @@ export class HubService {
   private taskService?: TaskService;
   private concierge?: ConciergeService;
   private charterApprovals: CharterApprovalBridge | null = null;
+  /**
+   * Charter holds this hub decided, newest first, so the Approvals "Decided"
+   * view can list them after the queue has released them. Bounded by
+   * CHARTER_DECIDED_HISTORY_LIMIT with oldest-first eviction; see
+   * rememberCharterDecision.
+   */
+  private charterDecisions: HubApprovalPendingItem[] = [];
 
   constructor(deps: HubServiceTaskDeps) {
     this.deps = deps;
@@ -240,6 +248,26 @@ export class HubService {
    */
   setCharterApprovalBridge(bridge: CharterApprovalBridge | null): void {
     this.charterApprovals = bridge;
+    // Decisions belong to the queue they were made against; a detached or
+    // replaced queue takes its decided history with it.
+    this.charterDecisions = [];
+  }
+
+  /**
+   * Keep one decided Charter card for the "Decided" view.
+   *
+   * Rule 8: each entry is admitted only by an operator decision that the
+   * queue accepted, never by agent call volume, and the list is still capped
+   * with oldest-first eviction so it cannot grow without bound. This is a
+   * convenience view of recent decisions made through this hub in this server
+   * process; the gate's decision audit row is the record, and decisions made
+   * on another surface or by timeout are not listed here.
+   */
+  private rememberCharterDecision(item: HubApprovalPendingItem): void {
+    this.charterDecisions.unshift(item);
+    if (this.charterDecisions.length > CHARTER_DECIDED_HISTORY_LIMIT) {
+      this.charterDecisions.length = CHARTER_DECIDED_HISTORY_LIMIT;
+    }
   }
 
   /**
@@ -281,9 +309,12 @@ export class HubService {
     const limit = options?.limit ?? Number.POSITIVE_INFINITY;
     // Charter holds lead: they are the only items with a caller blocked on
     // the operator right now, and the list is truncated at `limit`.
+    // Decided Charter cards come last, after the live holds and every hub
+    // inbox item, so this history never takes a page slot ahead of them.
     const items = [
       ...this.charterApprovalItems(limit),
       ...aggregateInbox(this.deps.inboxSources, this.inboxStore),
+      ...(options?.openOnly ? [] : this.charterDecisions),
     ];
     const scopedItems = items.filter((i) => i.identity_id === this.deps.identityId);
     // Open projections apply the resolved filter before the caller's page
@@ -330,11 +361,15 @@ export class HubService {
         throw new HubConflictError(`inbox item ${itemId} already resolved`);
       }
       const resolvedAt = this.nowIso();
-      return {
+      const decided: HubApprovalPendingItem = {
         ...projectCharterApproval(record, this.deps.identityId),
         resolved: true,
         resolved_at: resolvedAt,
       };
+      // Remembered only after resolve() returned true: a lost race or a
+      // timed-out hold never enters the decided view as an operator decision.
+      this.rememberCharterDecision(decided);
+      return decided;
     }
 
     // Aggregate first so source-pulled items (egress, privacy, budget,

@@ -151,6 +151,9 @@ function shortTime(iso: string | null): string {
 // "[unrecognized template: ...]" on a live operator-facing card.
 const TEMPLATES: Record<string, TemplateRenderer> = {
   // ── approval_pending.tier1.* ─────────────────────────────────────────
+  // For a Charter hold, `agent_id` is the requesting agent. Must match the
+  // `agent_id` arg pushed by projectCharterApproval in
+  // server/src/hub/charter-approval-bridge.ts.
   "approval_pending.tier1.lockdown": (a) =>
     `Cut agent ${arg(a, "agent_id")}'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
   "approval_pending.tier1.fortress_lockdown": () =>

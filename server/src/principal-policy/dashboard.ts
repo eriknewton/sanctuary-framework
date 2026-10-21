@@ -461,11 +461,18 @@ interface PendingRequest {
  * `server/src/hub/charter-approval-bridge.ts`).
  */
 function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
+  // Only the gate-stamped typed field is carried, never a `context` key: the
+  // context is built by whichever caller raised the hold, while
+  // `requesting_agent_id` has one writer (ApprovalGate.requestingAgentId).
+  const requestingAgentId = pending.request.requesting_agent_id;
   return {
     id: pending.id,
     operation: pending.request.operation,
     tier: pending.request.tier,
     created_at: pending.created_at,
+    ...(typeof requestingAgentId === "string" && requestingAgentId.length > 0
+      ? { requesting_agent_id: requestingAgentId }
+      : {}),
   };
 }
 
