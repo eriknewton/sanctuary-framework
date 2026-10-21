@@ -715,36 +715,38 @@ describe("one retained decision result", () => {
     expect(h.read("state.approvals.alwaysAllow")).toBe(false);
   });
 
-  // Records every #main paint with whether the decision lock was held when it landed.
+  // Records every renderMain call (whether or not it rewrote #main) with the fake-clock time, whether the decision
+  // lock was held, and the #main markup it left.
+  type Paint = { time: number; locked: boolean; html: string };
   function recordPaints(h: ReturnType<typeof boot>) {
-    const paints: Array<{ html: string; locked: boolean }> = [];
-    const main = h.el.main!;
-    const inner = Object.getOwnPropertyDescriptor(FakeElement.prototype, "innerHTML")!;
-    Object.defineProperty(main, "innerHTML", {
-      get() { return inner.get!.call(main); },
-      set(value: string) { inner.set!.call(main, value); paints.push({ html: String(value), locked: !!h.read("state.approvals.lock") }); },
-    });
+    const paints: Paint[] = [];
+    (h.context as Record<string, unknown>).__paintLog = (locked: boolean) => paints.push({ time: Date.now(), locked, html: h.main() });
+    h.read("const __renderMainUnderTest = renderMain; renderMain = function () { __renderMainUnderTest(); __paintLog(!!state.approvals.lock); };");
     return paints;
   }
-  // The release paint may change only the attributes the lock adds: a lock reason title with its disabled
-  // flag, the bare disabled flag on the consent checkbox, and the row Snooze menu's own title. Only tag text is
-  // normalized, so a changed sentence, label or unrelated tooltip still fails the comparison.
+  // The release paint may change only the attributes the lock adds: a lock reason title with its disabled flag,
+  // the bare disabled flag on the Always allow checkbox, and the row Snooze menu's own title when it is live.
+  // Only those tags are normalized, so a changed sentence, label, other control's state or tooltip still fails.
   const LOCK_REASONS = [BUSY, REREAD_BUSY].map((pair) => " " + pair);
   const withoutLockAttributes = (html: string) => html.replace(/<[^>]*>/g, (tag) => {
     let out = tag;
     for (const reason of LOCK_REASONS) out = out.split(reason).join("");
-    return out.replace(' title="Snooze"', "").replace(/(?<="| checked) disabled(?=[ >])/g, "");
+    if (out.includes('data-action="approval-always-allow"')) out = out.replace(/(?<="| checked) disabled(?=[ >])/, "");
+    if (out.includes('data-action="inbox-snooze-menu"')) out = out.replace(' title="Snooze"', "");
+    return out;
   });
-  function expectAttributeOnlyRelease(h: ReturnType<typeof boot>, paints: Array<{ html: string; locked: boolean }>) {
-    expect(paints.some((p) => p.locked), "the decision painted under the lock").toBe(true);
+  function expectAttributeOnlyRelease(paints: Paint[]) {
     const release = paints.findIndex((p, i) => i > 0 && !p.locked && paints[i - 1]!.locked);
-    // No release paint means the released markup equals the last held paint, so nothing could move; the
-    // screen must then carry no paused control either.
-    const held = release > 0 ? paints[release - 1]!.html : paints[paints.length - 1]!.html;
-    const released = release > 0 ? paints[release]!.html : h.main();
-    expect(released).not.toContain(BUSY);
-    expect(released).not.toContain(REREAD_BUSY);
-    expect(withoutLockAttributes(released)).toBe(withoutLockAttributes(held));
+    expect(release, "a repaint released the lock").toBeGreaterThan(0);
+    const released = paints[release]!;
+    expect(released.html).not.toContain(BUSY);
+    expect(released.html).not.toContain(REREAD_BUSY);
+    expect(withoutLockAttributes(released.html)).toBe(withoutLockAttributes(paints[release - 1]!.html));
+    // The last held paint that changed #main stayed on screen, controls paused, for the whole hold.
+    let lastChange = -1;
+    for (let i = 1; i < release; i++) if (paints[i]!.html !== paints[i - 1]!.html) lastChange = i;
+    expect(lastChange, "the decision changed #main under the lock").toBeGreaterThan(0);
+    expect(released.time - paints[lastChange]!.time, "held after its last change").toBeGreaterThanOrEqual(RELEASE_HOLD_MS);
   }
 
   for (const [label, items, decided, answer, pre] of [
@@ -772,7 +774,7 @@ describe("one retained decision result", () => {
       await settle();
       expect(h.posts()).toEqual([decided]);
       expect(h.read("state.approvals.lock")).toBeNull();
-      expectAttributeOnlyRelease(h, paints);
+      expectAttributeOnlyRelease(paints);
     });
   }
 
@@ -794,7 +796,7 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.read("state.approvals.result.refresh")).toBe("unavailable");
     expect(h.read("state.approvals.lock")).toBeNull();
-    expectAttributeOnlyRelease(h, paints);
+    expectAttributeOnlyRelease(paints);
   });
 
   it("releasing the lock after a refused batch changes only the paused attributes", async () => {
@@ -811,7 +813,7 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-batch-delete" });
     await settle();
     expect(h.posts()).toEqual(["/api/inbox/unified/batch"]);
-    expectAttributeOnlyRelease(h, paints);
+    expectAttributeOnlyRelease(paints);
   });
 
   it("the release hold matches the client constant", () => {
@@ -868,18 +870,21 @@ describe("one retained decision result", () => {
     expect(h.read("state.approvals.lock")).toBeNull();
   });
 
-  it("a screen that keeps changing cannot hold decisions paused past the bounded number of holds", async () => {
+  it("a screen that keeps changing keeps decisions paused until it has been quiet for a full hold", async () => {
     vi.useFakeTimers();
     const h = await refusedAllowAlways();
     h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" });
     await drain();
-    const maxHolds = h.read("DECISION_RELEASE_MAX_HOLDS") as number;
-    for (let hold = 0; hold < maxHolds; hold++) {
-      expect(h.read("state.approvals.lock"), "held through hold " + hold).not.toBeNull();
+    // Fifteen holds, each rewritten mid-hold: none may release onto a layout the operator has not seen.
+    for (let hold = 0; hold < 15; hold++) {
+      await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS / 2);
       h.read('state.inbox.push(Object.assign({}, state.inbox[0], { item_id: "churn-' + hold + '" })); rerender();');
-      await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+      await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS / 2);
       await drain();
+      expect(h.read("state.approvals.lock"), "held through hold " + hold).not.toBeNull();
     }
+    await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+    await drain();
     expect(h.read("state.approvals.lock")).toBeNull();
   });
 

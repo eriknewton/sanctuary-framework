@@ -6650,27 +6650,32 @@ async function refreshAfterDecision(result) {
   result.refresh = loaded ? "loaded" : "unavailable";
   if (!loaded) announceDecision(result);
 }
-// Every layout change a decision causes is painted and held on screen with every decision control still
-// disabled for DECISION_RELEASE_HOLD_MS before the lock is released. 300 ms = the upper end of a human
-// visual reaction (200 to 300 ms), about 18 frames at 60 Hz, so the browser displays the held layout and a
-// pointer already moving toward an old position lands on a disabled control, never on a moved live one.
+// Every layout change a decision causes is painted with every decision control still disabled, and the lock
+// is released only after DECISION_RELEASE_HOLD_MS in which #main was not rewritten. 300 ms = the upper end of a
+// human visual reaction (200 to 300 ms), about 18 frames at 60 Hz, so a visible tab displays the held layout
+// and a pointer already moving toward an old position lands on a disabled control, never on a moved live one.
+// In a hidden tab the browser throttles timers, so the hold lasts longer there and nothing is displayed.
+// Must match RELEASE_HOLD_MS in test/dashboard/v1_1/approval-decision-result.test.ts and
+// shell-wired-consumers.test.ts, and DECISION_RELEASE_HOLD_MS in test/e2e/feedback-isolation-helpers.ts.
 const DECISION_RELEASE_HOLD_MS = 300;
-// A background read can rewrite #main during a hold and restart it; after this many restarts the lock is
-// released anyway, so a constantly changing screen cannot hold decisions paused for more than about 3 s.
-const DECISION_RELEASE_MAX_HOLDS = 10;
 async function state_SETTLINGDecision(result) {
   if (state.approvals.lock !== result) return;
   // Consent belongs to the selected request; a decision on another row leaves it in place.
   if (result.ids.indexOf(state.approvals.selectedId) >= 0) resetApprovalConsent();
   rerender();
-  for (let hold = 0; hold < DECISION_RELEASE_MAX_HOLDS; hold++) {
+  // Invariant: the lock is released only after a full hold in which #main was not rewritten and a repaint
+  // under the lock rewrites nothing, so the release repaint that follows differs from the displayed held
+  // layout only in the lock's own attributes and in anything time-derived that changes between those two
+  // synchronous repaints. A rewrite restarts the hold, with no cap: giving up would release onto a layout
+  // the operator has not seen, so a screen that keeps changing keeps decisions paused, and each hold costs
+  // one timer and one repaint. Only renderMain rewrites #main on the screens with decision controls (Talk
+  // and Machines patch their own routes), so mainWriteCount sees every rewrite that can move one.
+  for (;;) {
     const writes = mainWriteCount;
     await new Promise(function (resolve) { setTimeout(resolve, DECISION_RELEASE_HOLD_MS); });
     if (state.approvals.lock !== result) return;
-    // Invariant: the lock is released only after a full hold in which #main was not rewritten and a
-    // repaint under the lock rewrites nothing, so the release repaint that follows changes only the
-    // disabled and title attributes the lock adds. A repaint that throws ends the hold early; the release
-    // repaints again, so a failure that persists still surfaces there.
+    // A repaint that throws ends the hold early; the release repaints again, so a persistent failure
+    // still surfaces there.
     try { rerender(); } catch (e) { return; }
     if (mainWriteCount === writes) return;
   }
