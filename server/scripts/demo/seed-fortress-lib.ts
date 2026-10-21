@@ -273,47 +273,27 @@ export function mintDemoAuthToken(): string {
  * A reused file must be a regular file (not a symlink) owned by this user with
  * no group or other permission bits, and must hold one base64url token at least
  * as long as a minted one; anything else is refused without echoing its
- * contents. A new file is created exclusively with mode 0600, so this never
- * overwrites a file it did not validate.
+ * contents. A missing file is created with mode 0600, and only an empty file
+ * that passes the same checks is ever written, so this never overwrites a token
+ * or a file it did not validate.
  */
 export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: string; reused: boolean }> {
-  // Create first, exclusively: O_CREAT|O_EXCL is one atomic step that either
-  // makes a new file (mode 0600, never through a symlink) or fails with EEXIST.
-  // There is no prior existence check, so nothing is decided on a stale view of
-  // the path, and an existing file is never overwritten.
-  const created = await open(
+  // One open, and every decision after it is made on that descriptor, never on
+  // the path, so the file validated is the file read or written (no
+  // check-then-use window). O_CREAT makes a missing file with mode 0600;
+  // O_NOFOLLOW refuses a symlink at the final component with ELOOP, so nothing
+  // is created or read through one; O_NONBLOCK keeps a FIFO planted at the path
+  // from blocking the open (the regular-file check then refuses it).
+  const handle = await open(
     path,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
     OPERATOR_TOKEN_FILE_MODE,
-  ).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "EEXIST") return undefined;
-    throw error;
-  });
-  if (created !== undefined) {
-    const token = mintDemoAuthToken();
-    try {
-      await created.chmod(OPERATOR_TOKEN_FILE_MODE);
-      await created.writeFile(`${token}\n`);
-    } finally {
-      await created.close();
-    }
-    return { token, reused: false };
-  }
-  // Something already exists at the path (a file, or a symlink, which EEXIST
-  // also reports). Every check below runs on the opened descriptor, never on
-  // the path, so the file validated is the file read; O_NOFOLLOW refuses a
-  // symlink at the final component with ELOOP, and O_NONBLOCK keeps a FIFO
-  // planted at the path from blocking the open (the regular-file check then
-  // refuses it).
-  const reading = await open(
-    path,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
   ).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ELOOP") throw new Error(`refusing demo token file that is not a regular file: ${path}`);
     throw error;
   });
   try {
-    const existing = await reading.stat();
+    const existing = await handle.stat();
     if (!existing.isFile()) {
       throw new Error(`refusing demo token file that is not a regular file: ${path}`);
     }
@@ -326,10 +306,17 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
     if (existing.size > DEMO_TOKEN_FILE_MAX_BYTES) {
       throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
     }
+    if (existing.size === 0) {
+      // Just created, or an empty owner-only file that already passed the checks
+      // above: nothing is lost by writing the minted token through this descriptor.
+      const token = mintDemoAuthToken();
+      await handle.writeFile(`${token}\n`);
+      return { token, reused: false };
+    }
     // Bounded read through the validated descriptor: one byte past the cap is
     // requested, so a file that grew after the size check is refused, never read whole.
     const buffer = Buffer.alloc(DEMO_TOKEN_FILE_MAX_BYTES + 1);
-    const { bytesRead } = await reading.read(buffer, 0, buffer.length, 0);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead > DEMO_TOKEN_FILE_MAX_BYTES) {
       throw new Error(`refusing demo token file larger than ${DEMO_TOKEN_FILE_MAX_BYTES} bytes: ${path}`);
     }
@@ -339,7 +326,7 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
     }
     return { token, reused: true };
   } finally {
-    await reading.close();
+    await handle.close();
   }
 }
 
