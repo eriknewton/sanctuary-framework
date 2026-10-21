@@ -187,6 +187,14 @@ const TARGET_DEFAULTING_CATEGORIES: ReadonlySet<HubApprovalPendingItem["operatio
  */
 export const HOLD_REASON_SUBJECT_MAX_CHARS = 128;
 
+/**
+ * Display bound on a card's held `operation` name, in UTF-16 code units. It is
+ * the same bound as a quoted subject for the same reason: a proxied tool name
+ * is advertised by an upstream server and an uncategorised one is whatever the
+ * call named, so neither has a length bound before it reaches the card.
+ */
+export const CARD_OPERATION_MAX_CHARS = HOLD_REASON_SUBJECT_MAX_CHARS;
+
 function finiteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -208,6 +216,16 @@ interface HoldReasonInputs {
  */
 interface HoldReasonTemplate {
   code: Exclude<HubHoldReasonCode, "unrecognized">;
+  /**
+   * The reason literal exactly as it is written in
+   * server/src/principal-policy/gate.ts, `${...}` placeholders included (a
+   * literal split across `+` is joined). Must match that literal: the coverage
+   * test in server/test/hub/charter-hold-reason.test.ts reads every reason
+   * literal the gate source can send to the approval channel and requires each
+   * to equal one template's `gateSource`, so a new or reworded gate reason fails
+   * a test instead of quietly reaching the operator as `unrecognized`.
+   */
+  gateSource: string;
   render(inputs: HoldReasonInputs): { text: string; subject?: string } | null;
 }
 
@@ -222,12 +240,16 @@ interface HoldReasonTemplate {
 export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   {
     code: "tier1_forced",
+    gateSource: '"${operation}" is a forced Tier 1 operation (always requires approval)',
     render: ({ operation }) => ({
       text: `"${operation}" is a forced Tier 1 operation (always requires approval)`,
     }),
   },
   {
     code: "tier1_secret_waiver",
+    gateSource:
+      '"${operation}" names at least one allow_files path (a secret-classifier ' +
+      "waiver) and is always Tier 1 regardless of policy (always requires approval)",
     render: ({ operation }) => ({
       text:
         `"${operation}" names at least one allow_files path (a secret-classifier ` +
@@ -236,12 +258,14 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "tier1_policy",
+    gateSource: '"${operation}" is a Tier 1 operation (always requires approval)',
     render: ({ operation }) => ({
       text: `"${operation}" is a Tier 1 operation (always requires approval)`,
     }),
   },
   {
     code: "tier1_unclassified",
+    gateSource: '"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)',
     render: ({ operation }) => ({
       // \u2014 is the gate's own separator character in this reason.
       text: `"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)`,
@@ -249,6 +273,7 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "proxy_tier1",
+    gateSource: 'Proxy tool "${toolName}" is configured as Tier 1 (always requires approval)',
     render: ({ context }) => {
       const tool = nonEmptyString(context.operation);
       return tool === null
@@ -258,10 +283,12 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "first_session",
+    gateSource: 'First session: "${operation}" has no established baseline',
     render: ({ operation }) => ({ text: `First session: "${operation}" has no established baseline` }),
   },
   {
     code: "first_namespace_access",
+    gateSource: 'First access to namespace "${namespace}" (not in session baseline)',
     render: ({ context }) => {
       const namespace = nonEmptyString(context.namespace);
       return namespace === null
@@ -271,6 +298,7 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "first_counterparty",
+    gateSource: 'First interaction with counterparty "${counterpartyDid}"',
     render: ({ context }) => {
       const did = nonEmptyString(context.counterparty_did);
       return did === null ? null : { text: `First interaction with counterparty "${did}"`, subject: did };
@@ -278,6 +306,7 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "signing_rate",
+    gateSource: "Signing frequency (${signCount}/min) exceeds limit (${config.max_signs_per_minute}/min)",
     render: ({ context }) => {
       const count = finiteNumber(context.signs_per_minute);
       const limit = finiteNumber(context.limit);
@@ -288,6 +317,8 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "bulk_read",
+    gateSource:
+      'Bulk read detected: ${readCount} reads from "${namespace}" in 60 seconds (threshold: ${config.bulk_read_threshold})',
     render: ({ context }) => {
       const namespace = nonEmptyString(context.namespace);
       const reads = finiteNumber(context.reads_in_window);
@@ -302,6 +333,8 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
   },
   {
     code: "frequency_spike",
+    gateSource:
+      'Frequency spike: "${operation}" at ${callRate}/min (${config.frequency_spike_multiplier}\u00d7 above average ${avgRate.toFixed(1)}/min)',
     render: ({ operation, context }) => {
       const rate = finiteNumber(context.current_rate);
       const multiplier = finiteNumber(context.multiplier);
@@ -314,10 +347,34 @@ export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
           };
     },
   },
+  {
+    code: "injection_escalation",
+    gateSource:
+      'Potential prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%, ${injectionResult.signals.length} signal(s))',
+    render: ({ operation, context }) => {
+      const detection =
+        context.injection_detection !== null && typeof context.injection_detection === "object"
+          ? (context.injection_detection as Record<string, unknown>)
+          : {};
+      const confidence = finiteNumber(detection.confidence);
+      const signals = finiteNumber(detection.signal_count);
+      // 100 turns the gate's 0..1 confidence into the whole percent it prints.
+      return confidence === null || signals === null
+        ? null
+        : {
+            text: `Potential prompt injection detected in "${operation}" (confidence: ${(confidence * 100).toFixed(0)}%, ${signals} signal(s))`,
+          };
+    },
+  },
 ];
 
-// Must match the "Proxy: " prefix the gate puts on a proxied anomaly reason in gate.ts.
-const PROXY_REASON_PREFIX = "Proxy: ";
+/**
+ * The prefix the gate puts on a proxied anomaly reason. Must match the
+ * `Proxy: ${anomaly.reason}` literal in server/src/principal-policy/gate.ts,
+ * pinned whole as PROXY_REASON_GATE_SOURCE for the coverage test.
+ */
+export const PROXY_REASON_PREFIX = "Proxy: ";
+export const PROXY_REASON_GATE_SOURCE = "Proxy: ${anomaly.reason}";
 
 function boundedSubject(subject: string): Pick<HubHoldReason, "subject" | "subject_truncated"> {
   return subject.length <= HOLD_REASON_SUBJECT_MAX_CHARS
@@ -404,9 +461,17 @@ export function projectCharterApproval(
   // The operation name is the gate's own `operation` (the tool it classified),
   // not an argument of the call, so the catch-all `.other` sentence and the
   // console's Operation column can name what is held instead of "other".
+  // The name itself is untrusted (an upstream server names a proxied tool, and
+  // an uncategorised tool is whatever the call named), so the card carries a
+  // copy bounded before it enters the inbox or the decided history, flagged when
+  // shortened; the console renders it only as delimited, escaped data.
+  const operationTruncated = record.operation.length > CARD_OPERATION_MAX_CHARS;
   const displayArgs: HubDisplayTemplateArg[] = [
     { kind: "identity_id", value: identityId },
-    { kind: "operation", value: record.operation },
+    {
+      kind: "operation",
+      value: operationTruncated ? record.operation.slice(0, CARD_OPERATION_MAX_CHARS) : record.operation,
+    },
   ];
   // Must-never #7 bounds what the AGENT learns from a denial: the gate returns
   // it a generic reason. This card is OPERATOR copy, served only to
@@ -430,6 +495,7 @@ export function projectCharterApproval(
     resolved: false,
     tier,
     operation_category: category,
+    ...(operationTruncated ? { operation_truncated: true as const } : {}),
     ...(holdReason ? { hold_reason: holdReason } : {}),
   };
 }

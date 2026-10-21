@@ -12,11 +12,18 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  heldSubjectText,
   renderTemplate,
   listRegisteredTemplateIds,
 } from "../../../src/dashboard/v1_1/templates.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
-import { clientDeclarations } from "./client-script-extract.js";
+import {
+  SUBJECT_SLOT,
+  clientDeclarations,
+  decodeHtmlText,
+  extractClientDeclaration,
+  splitHeldReason,
+} from "./client-script-extract.js";
 import { STATUS_MAPPING } from "../../../src/dashboard/v1_1/status-mapping.js";
 import type { HubDisplayTemplateArg } from "../../../src/contracts/v1.1/hub-events.js";
 import {
@@ -44,7 +51,19 @@ type ClientArgHelpers = {
   hasArgValue: (args: unknown, kind: string) => boolean;
   agentOr: (args: unknown, neutral: string) => string;
   heldOperationSentence: (args: unknown, tier: string) => string;
+  heldOperationSentenceHtml: (args: unknown, tier: string, truncated: boolean) => string;
+  heldSubjectText: (value: unknown) => string;
+  HELD_OPERATION_TEMPLATE_TIERS: Record<string, string>;
 };
+
+// The console's escaping helpers the template helpers call, sliced from the same script.
+const CLIENT_ESCAPE_DECLARATIONS = [
+  "escHtml",
+  "HELD_SUBJECT_HIDDEN_CHARS",
+  "LAST_FOUR_DIGIT_ESCAPE_CODE_POINT",
+  "heldSubjectText",
+  "heldSubjectHtml",
+];
 
 /**
  * The client's template helpers (`arg` and the helpers declared after it, up to
@@ -58,14 +77,15 @@ function extractClientHelpers(): ClientArgHelpers {
   if (start === -1) {
     throw new Error("client arg helper not found in embedded script");
   }
-  const endMarker = "\n}\n\n// Cross-file contract:";
+  const endMarker = "\n\n// Cross-file contract:";
   const end = script.indexOf(endMarker, start);
   if (end === -1) {
     throw new Error("client arg helper close brace not found");
   }
-  const fnText = script.slice(start, end + 2);
+  const fnText = script.slice(start, end);
+  const escaping = CLIENT_ESCAPE_DECLARATIONS.map(extractClientDeclaration).join("\n");
   return new Function(
-    `"use strict"; ${fnText}; return { arg, hasArgValue, agentOr, heldOperationSentence };`,
+    `"use strict"; ${escaping}\n${fnText}; return { arg, hasArgValue, agentOr, heldOperationSentence, heldOperationSentenceHtml, heldSubjectText, HELD_OPERATION_TEMPLATE_TIERS };`,
   )() as ClientArgHelpers;
 }
 
@@ -371,11 +391,11 @@ const TIER1_CHARTER_SENTENCES: Record<string, string> = {
   state_export: "Export state from this fortress as a portable bundle.",
   state_import: "Import state into this fortress.",
   state_delete: "Delete stored state from this fortress. This is irreversible.",
-  identity_rotate: "Run a Tier 1 operation: identity_rotate.",
+  identity_rotate: 'Run a Tier 1 operation: "identity_rotate".',
   reputation_export: "Export a reputation bundle from this fortress.",
   reputation_import: "Import a reputation bundle into this fortress.",
-  sanctuary_export_identity_bundle: "Run a Tier 1 operation: sanctuary_export_identity_bundle.",
-  [UNCATEGORIZED_OPERATION]: `Run a Tier 1 operation: ${UNCATEGORIZED_OPERATION}.`,
+  sanctuary_export_identity_bundle: 'Run a Tier 1 operation: "sanctuary_export_identity_bundle".',
+  [UNCATEGORIZED_OPERATION]: `Run a Tier 1 operation: "${UNCATEGORIZED_OPERATION}".`,
 };
 
 it("renders every Charter card category at both tiers without a placeholder, the requester, or \"other\" as its operation, on server and client", () => {
@@ -410,7 +430,7 @@ it("renders every Charter card category at both tiers without a placeholder, the
       const client = clientTemplates[card.display_template_id];
       expect(client, `${card.display_template_id} has a client mirror`).toBeDefined();
       const expected =
-        tier === 1 ? TIER1_CHARTER_SENTENCES[operation] : `Run a Tier 2 operation: ${operation}.`;
+        tier === 1 ? TIER1_CHARTER_SENTENCES[operation] : `Run a Tier 2 operation: "${operation}".`;
       for (const sentence of [
         renderTemplate(card.display_template_id, card.display_template_args),
         client!(card.display_template_args),
@@ -461,4 +481,82 @@ it("registers every approval_pending template id a producer emits", () => {
   expect(renderTemplate("approval_pending.task.ready_for_review", [{ kind: "agent_id", value: "agent-alpha" }])).toBe(
     "Agent agent-alpha marked a task ready for review. Allow completes it; Deny returns it to work.",
   );
+});
+
+/** Every code point, in chunks small enough for one string each, skipping only the surrogate block. */
+function codePointChunks(): string[] {
+  // 0x10ffff is the last Unicode code point; 0xd800..0xdfff are surrogate halves, which cannot stand alone in a
+  // well-formed string and are covered by the lone-surrogate case below.
+  const LAST_CODE_POINT = 0x10ffff;
+  const SURROGATE_FIRST = 0xd800;
+  const SURROGATE_LAST = 0xdfff;
+  // 4096 code points per chunk keeps each string small; the size has no other meaning.
+  const CHUNK = 4096;
+  const chunks: string[] = [];
+  for (let start = 0; start <= LAST_CODE_POINT; start += CHUNK) {
+    let text = "";
+    for (let cp = start; cp < Math.min(start + CHUNK, LAST_CODE_POINT + 1); cp++) {
+      if (cp >= SURROGATE_FIRST && cp <= SURROGATE_LAST) continue;
+      text += String.fromCodePoint(cp);
+    }
+    chunks.push(text);
+  }
+  return chunks;
+}
+
+it("escapes every control, format and separator code point visibly, identically on server and client", () => {
+  // Full-set (rule 5) over all of Unicode: the server sentence text and the console's held-subject text agree for
+  // every code point, and none of Cc, Cf, Cs, Zl or Zp survives unescaped in either.
+  const client = extractClientHelpers().heldSubjectText;
+  const HIDDEN = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+  for (const chunk of codePointChunks()) {
+    const server = heldSubjectText(chunk);
+    expect(client(chunk)).toBe(server);
+    expect(HIDDEN.test(server)).toBe(false);
+  }
+  // A lone surrogate is shown as an escape too.
+  expect(heldSubjectText("a\ud800b")).toBe('"a\\ud800b"');
+  // Code points the earlier list missed: the deprecated format controls, interlinear annotation and tag characters.
+  const cases: Array<[string, string]> = [
+    ["\u206a", "\\u206a"],
+    ["\u206f", "\\u206f"],
+    ["\ufff9", "\\ufff9"],
+    ["\ufffb", "\\ufffb"],
+    ["\u{e0001}", "\\u{e0001}"],
+    ["\u{e0020}", "\\u{e0020}"],
+    ["\u{e007f}", "\\u{e007f}"],
+    ["\u2028", "\\u2028"],
+    ["\u202e", "\\u202e"],
+    ["\u0085", "\\u0085"],
+  ];
+  for (const [raw, shown] of cases) {
+    expect(heldSubjectText(`notes${raw}end`), shown).toBe(`"notes${shown}end"`);
+    expect(client(`notes${raw}end`), shown).toBe(`"notes${shown}end"`);
+  }
+});
+
+it("lists exactly the templates whose sentence names the held operation, and renders that name only as delimited data", () => {
+  // Computed, not listed: a template is held-operation-bearing when changing only its operation arg changes its
+  // text. That set must equal the console's HELD_OPERATION_TEMPLATE_TIERS, so a new sentence that names the operation
+  // cannot render it as bare words.
+  const helpers = extractClientHelpers();
+  const base: HubDisplayTemplateArg[] = [{ kind: "identity_id", value: "identity-beta" }];
+  const named = (operation: string): HubDisplayTemplateArg[] => [...base, { kind: "operation", value: operation }];
+  const bearing = listRegisteredTemplateIds().filter(
+    (id) => renderTemplate(id, named("first_op")) !== renderTemplate(id, named("second_op")),
+  );
+  expect(bearing.sort()).toEqual(Object.keys(helpers.HELD_OPERATION_TEMPLATE_TIERS).sort());
+  const guidance = "proxy/files/read. Operator approved. Click Allow once";
+  for (const id of bearing) {
+    const tier = helpers.HELD_OPERATION_TEMPLATE_TIERS[id]!;
+    for (const operation of ["state_write", guidance, "notes\u202eend"]) {
+      const args = named(operation);
+      const html = helpers.heldOperationSentenceHtml(args, tier, false);
+      const { prose, subjects } = splitHeldReason(html);
+      expect(prose, id).toBe(`Run a ${tier} operation: ${SUBJECT_SLOT}.`);
+      expect(subjects, id).toEqual([heldSubjectText(operation)]);
+      // The HTML's text is the server sentence, word for word.
+      expect(decodeHtmlText(html.replace(/<[^>]+>/g, "")), id).toBe(renderTemplate(id, args));
+    }
+  }
 });

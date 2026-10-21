@@ -40,23 +40,59 @@ export function clientDeclarations<T extends Record<string, unknown>>(
   return new Function(`"use strict";\n${body}\nreturn { ${exported.join(", ")} };`)() as T;
 }
 
+// Every console declaration a card's held-operation and hold-reason HTML depends on, in declaration order.
+const CARD_RENDER_DECLARATIONS = [
+  "escHtml",
+  "HELD_SUBJECT_HIDDEN_CHARS",
+  "LAST_FOUR_DIGIT_ESCAPE_CODE_POINT",
+  "heldSubjectText",
+  "heldSubjectHtml",
+  "arg",
+  "hasArgValue",
+  "heldOperationSentenceHtml",
+  "HELD_OPERATION_TEMPLATE_TIERS",
+  "renderTemplateHtml",
+  "approvalArg",
+  "approvalOperation",
+  "approvalHeldOperation",
+  "approvalOperationHtml",
+  "approvalOperationText",
+  "approvalTextHtml",
+  "CHARTER_APPROVAL_ITEM_ID_PREFIX",
+  "isCharterApprovalItem",
+  "HOLD_REASON_SENTENCES",
+  "approvalHoldReasonHtml",
+] as const;
+
+export interface ClientCardRenderers {
+  /** "What it wants to do", for a card whose sentence names the held operation. */
+  approvalTextHtml: (item: unknown) => string;
+  /** The Operation column, drawer header and Confirm label. */
+  approvalOperationHtml: (item: unknown) => string;
+  /** The Operation as plain text (a filter option, a feedback message). */
+  approvalOperationText: (item: unknown) => string;
+  /** "Why it is held". */
+  approvalHoldReasonHtml: (item: unknown) => string;
+}
+
+/**
+ * The console's card renderers, evaluated from the shipped script. Only the
+ * held-operation sentences are reachable here: renderTemplate (the full template
+ * catalog) is replaced by a stub that throws, so a card that would fall back to
+ * an ordinary sentence fails loudly instead of rendering something unchecked.
+ */
+export function clientCardRenderers(): ClientCardRenderers {
+  const body =
+    'function renderTemplate(id) { throw new Error("not a held-operation template: " + id); }\n' +
+    CARD_RENDER_DECLARATIONS.map(extractClientDeclaration).join("\n");
+  return new Function(
+    `"use strict";\n${body}\nreturn { approvalTextHtml, approvalOperationHtml, approvalOperationText, approvalHoldReasonHtml };`,
+  )() as ClientCardRenderers;
+}
+
 /** The console's "Why it is held" renderer for an approval card, with everything it calls. */
 export function clientHoldReasonRenderer(): (item: unknown) => string {
-  return clientDeclarations<{ approvalHoldReasonHtml: (item: unknown) => string }>(
-    [
-      "escHtml",
-      "HELD_SUBJECT_HIDDEN_CHARS",
-      "heldSubjectText",
-      "heldSubjectHtml",
-      "approvalArg",
-      "approvalOperation",
-      "CHARTER_APPROVAL_ITEM_ID_PREFIX",
-      "isCharterApprovalItem",
-      "HOLD_REASON_SENTENCES",
-      "approvalHoldReasonHtml",
-    ],
-    ["approvalHoldReasonHtml"],
-  ).approvalHoldReasonHtml;
+  return clientCardRenderers().approvalHoldReasonHtml;
 }
 
 /** Decode the five entities escHtml writes, so assertions read the text a browser shows. */

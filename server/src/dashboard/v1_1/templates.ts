@@ -132,14 +132,48 @@ function agentOr(args: HubDisplayTemplateArg[], neutral: string): string {
 }
 
 /**
- * The approval_pending catch-all: "Run a Tier 2 operation: state_write." The
+ * Characters that can hide, disguise or reorder displayed text: every control
+ * (Cc), format (Cf, which covers bidi embeddings, overrides and isolates,
+ * zero-width marks, the interlinear annotation marks and the supplementary tag
+ * characters), lone surrogate (Cs), line separator (Zl) and paragraph separator
+ * (Zp) code point, plus the visibly blank combining grapheme joiner, Hangul
+ * fillers and variation selectors. Must match HELD_SUBJECT_HIDDEN_CHARS in
+ * client.ts; the parity test in server/test/dashboard/v1_1/templates.test.ts
+ * compares both over every code point.
+ */
+export const HELD_SUBJECT_HIDDEN_CHARS =
+  /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\u034f\u115f\u1160\u3164\uffa0\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/gu;
+
+// The last code point a four-digit \uXXXX escape can name; anything above it is written \u{XXXXX}.
+const LAST_FOUR_DIGIT_ESCAPE_CODE_POINT = 0xffff;
+
+/**
+ * An untrusted identifier (a held operation name, a namespace, a counterparty
+ * DID) as visible data: JSON-quoted so its own quotes and backslashes are
+ * escaped, and every hidden or reordering character written as a visible
+ * escape. Must match heldSubjectText in client.ts, which also wraps this text in
+ * the console's delimited held-subject element.
+ */
+export function heldSubjectText(value: string): string {
+  return JSON.stringify(String(value)).replace(HELD_SUBJECT_HIDDEN_CHARS, (c) => {
+    const codePoint = c.codePointAt(0)!;
+    return codePoint > LAST_FOUR_DIGIT_ESCAPE_CODE_POINT
+      ? `\\u{${codePoint.toString(16)}}`
+      : `\\u${codePoint.toString(16).padStart(4, "0")}`;
+  });
+}
+
+/**
+ * The approval_pending catch-all: `Run a Tier 2 operation: "state_write".` The
  * operation clause appears only when the card names its operation and the agent
- * clause only when a target agent is named. Must match heldOperationSentence in
- * client.ts.
+ * clause only when a target agent is named. The held operation name is
+ * untrusted (an upstream server names a proxied tool), so it is written only in
+ * heldSubjectText's quoted, escaped form, never as bare words of the sentence.
+ * Must match heldOperationSentence in client.ts.
  */
 function heldOperationSentence(args: HubDisplayTemplateArg[], tier: "Tier 1" | "Tier 2"): string {
   const target = hasArgValue(args, "agent_id") ? ` on agent ${arg(args, "agent_id")}` : "";
-  const operation = hasArgValue(args, "operation") ? `: ${arg(args, "operation")}` : "";
+  const operation = hasArgValue(args, "operation") ? `: ${heldSubjectText(arg(args, "operation"))}` : "";
   return `Run a ${tier} operation${target}${operation}.`;
 }
 

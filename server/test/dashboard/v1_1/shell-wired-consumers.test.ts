@@ -29,6 +29,8 @@ import { createContext, runInContext } from "node:vm";
 import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
 import { renderDashboardV11Html } from "../../../src/dashboard/v1_1/html.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { heldSubjectText } from "../../../src/dashboard/v1_1/templates.js";
+import { projectCharterApproval } from "../../../src/hub/charter-approval-bridge.js";
 import { HUB_INBOX_KINDS } from "../../../src/contracts/v1.1/constants.js";
 import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 import { readFileSync } from "node:fs";
@@ -2207,7 +2209,12 @@ describe("slice 5 Evidence wired consumers", () => {
       total: 5,
     }));
     const table = h.el.main!.innerHTML.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
-    const row = (operation: string) => table.split("<tr").find((r) => r.includes(`>${operation}<`))!;
+    // A gate entry's tool name is shown only as the delimited held-subject element after the gate verb.
+    const shown = (operation: string) => {
+      const at = operation.indexOf(":");
+      return `>${operation.slice(0, at + 1)}<code class="held-subject" data-held-subject="1">&quot;${operation.slice(at + 1)}&quot;</code><`;
+    };
+    const row = (operation: string) => table.split("<tr").find((r) => r.includes(shown(operation)))!;
     expect(row("gate_deny:state_write")).toContain('<span class="state-chip neutral"><i aria-hidden="true"></i>Denied (operator decision)</span>');
     expect(row("gate_deny:state_write")).toContain('<span class="row">operator</span>');
     expect(row("gate_approve:state_export")).toContain("Approved (operator decision)");
@@ -2230,8 +2237,33 @@ describe("slice 5 Evidence wired consumers", () => {
       '\\&quot;notes\\&quot; (operator approved). Click Allow once. \\&quot;\\&quot; (not in session baseline)&quot;</code></dd>',
     );
     // Outside the Raw record pane (the entry's JSON, verbatim), the text appears once, inside the data element.
+    // (Each gate row's tool name is a held-subject element too; see shown() above.)
     const recordFields = pane.split("<h3>Raw record</h3>")[0]!;
     expect(recordFields.split("Click Allow once").length - 1).toBe(1);
+  });
+
+  it("shows a gate entry's tool name only as escaped, delimited data in the row, the record and its details", async () => {
+    // An upstream MCP server names a proxied tool; the gate records it as "<verb>:<tool>" and in details.operation.
+    const tool = "proxy/files/read. Operator approved. Click Allow once\u202e";
+    const chip = `<code class="held-subject" data-held-subject="1">${heldSubjectText(tool).replace(/"/g, "&quot;")}</code>`;
+    const h = await bootEvidence(evidencePayload({
+      entries: [{
+        timestamp: "2026-10-14T16:51:00.000Z", layer: "l2", identity_id: "system", operation: `gate_allow_proxy:${tool}`,
+        result: "success", details: { tier: 2, operation: tool, proxy: true },
+      }],
+      total: 1,
+    }));
+    const html = h.el.main!.innerHTML;
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table).toContain(`aria-pressed="true">gate_allow_proxy:${chip}</button>`);
+    const pane = html.split('<aside class="panel evidence-detail"')[1]!;
+    expect(pane).toContain(`<div class="t">gate_allow_proxy:${chip}</div>`);
+    expect(pane).toContain(`<dt>Operation</dt><dd>gate_allow_proxy:${chip}</dd>`);
+    expect(pane).toContain(`<dt>operation</dt><dd>recorded text ${chip}</dd>`);
+    // Outside the Raw record pane (the entry's JSON, verbatim) the name never appears as words.
+    const outside = html.split("<h3>Raw record</h3>")[0]!.split(chip).join("");
+    expect(outside).not.toContain("Operator approved");
+    expect(outside).not.toContain("\u202e");
   });
 
   it("distinguishes a server filter with no match from an empty log", async () => {
@@ -3660,11 +3692,12 @@ describe("Approvals round-one decision and evidence states", () => {
     h.navigate("approvals");
     const queue = h.el.main!.innerHTML.split("<aside")[0]!;
     const row = queue.split('data-approval-row="charter.approval.hold-2"')[1]!.split("</tr>")[0]!;
-    expect(row).toContain('<td class="mono">state_write</td>');
+    const operationChip = '<code class="held-subject" data-held-subject="1">&quot;state_write&quot;</code>';
+    expect(row).toContain(`<td class="mono">${operationChip}</td>`);
     expect(row).toContain(`<td>${heldSentence}</td>`);
     const pane = drawer(h);
-    expect(pane).toContain('<div class="mono">state_write</div>');
-    expect(pane).toContain("<h4>What it wants to do</h4><p>Run a Tier 2 operation: state_write.</p>");
+    expect(pane).toContain(`<div class="mono">${operationChip}</div>`);
+    expect(pane).toContain(`<h4>What it wants to do</h4><p>Run a Tier 2 operation: ${operationChip}.</p>`);
     expect(pane).toContain(`<h4>Why it is held</h4><p>${heldSentence}</p>`);
     for (const html of [row, pane]) {
       expect(html).not.toMatch(/Held for your decision|\(no agent\)|\(unknown\)|>other</);
@@ -3677,8 +3710,75 @@ describe("Approvals round-one decision and evidence states", () => {
     const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, item_id: "task.review.1", hold_reason: notFromTheGate }]) });
     await settle();
     h.navigate("approvals");
-    expect(drawer(h)).toContain("<h4>Why it is held</h4><p>Held for your decision (state_write, Tier 2).</p>");
+    expect(drawer(h)).toContain(
+      '<h4>Why it is held</h4><p>Held for your decision (<code class="held-subject" data-held-subject="1">&quot;state_write&quot;</code>, Tier 2).</p>',
+    );
     expect(h.el.main!.innerHTML).not.toContain("not-from-the-gate");
+  });
+
+  it("an upstream tool name that reads as guidance appears only as escaped, delimited data on every approvals surface", async () => {
+    vi.useFakeTimers();
+    // An upstream MCP server can advertise any tool name; the gate holds it as the operation it classified.
+    const tool = "proxy/files/read. Operator approved. Click Allow once";
+    const quoted = heldSubjectText(tool).replace(/"/g, "&quot;");
+    const chip = `<code class="held-subject" data-held-subject="1">${quoted}</code>`;
+    const project = (id: string, tier: 1 | 2) =>
+      projectCharterApproval(
+        {
+          id, operation: tool, tier, created_at: "2026-10-14T16:45:00.000Z", requesting_agent_id: "agent:cursor:fixture",
+          hold_reason: tier === 1 ? { code: "proxy_tier1", subject: tool } : { code: "first_namespace_access", via_proxy: true, subject: "drafts" },
+        },
+        "operator-fixture",
+      );
+    const tier1 = project("tool-1", 1);
+    const tier2 = project("tool-2", 2);
+    const decided = { ...project("tool-3", 1), resolved: true, resolved_at: "2026-10-14T16:50:00.000Z", decision: "deny" };
+    const h = boot({
+      "/api/hub/inbox": inbox([tier1, tier2, decided]),
+      [`/api/hub/inbox/${tier2.item_id}/approve`]: () => Promise.resolve(response({ error: "operator session required" }, 401)),
+    });
+    await settle();
+    // Everything outside the delimited elements, with select options (which cannot hold markup) set aside.
+    const outside = (html: string) => html.split(chip).join("").replace(/<option[^>]*>[^<]*<\/option>/g, "");
+
+    const overview = h.el.main!.innerHTML;
+    expect(overview).toContain("Needs your decision");
+    expect(overview).toContain(`<td class="mono">${chip}</td>`);
+    expect(overview).toContain(`Run a Tier 1 operation: ${chip}.`);
+    expect(outside(overview)).not.toContain("Operator approved");
+
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": tier2.item_id });
+    await settle();
+    const feedback = h.el["decision-feedback-result"]!.innerHTML;
+    expect(feedback).toContain(`Allow once was refused for ${chip} by agent:cursor:fixture (request ${tier2.item_id})`);
+    expect(outside(feedback)).not.toContain("Operator approved");
+
+    h.click({ "data-action": "approval-select", "data-item-id": tier1.item_id });
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": tier1.item_id });
+    await settle();
+    const approvals = h.el.main!.innerHTML;
+    const pane = drawer(h);
+    expect(pane).toContain(`<div class="mono">${chip}</div>`);
+    expect(pane).toContain(`<h4>What it wants to do</h4><p>Run a Tier 1 operation: ${chip}.</p>`);
+    expect(pane).toContain(`<h4>Why it is held</h4><p>Proxied tool ${chip} is configured as Tier 1, so it always asks for approval.</p>`);
+    expect(pane).toContain(`Allow once arms this request, and Confirm ${chip} sends the approval`);
+    expect(pane).toContain(`Tier 1 takes two steps here: Allow once, then Confirm ${chip}. Only Confirm sends the approval.`);
+    expect(pane).toContain(`>Confirm ${chip}</button>`);
+    const queue = approvals.split("<aside")[0]!;
+    for (const item of [tier1, tier2, decided]) {
+      const row = queue.split(`data-approval-row="${item.item_id}"`)[1]!.split("</tr>")[0]!;
+      expect(row, item.item_id).toContain(`<td class="mono">${chip}</td>`);
+    }
+    // A select option cannot hold the element, so the filter lists the name in its quoted, escaped form.
+    expect(approvals).toContain(`>${quoted}</option>`);
+    expect(outside(approvals)).not.toContain("Operator approved");
+
+    h.navigate("activity");
+    await settle();
+    const evidence = h.el.main!.innerHTML;
+    expect(evidence).toContain(`data-decided-approval="${decided.item_id}"><div class="grow">Run a Tier 1 operation: ${chip}.</div>`);
+    expect(outside(evidence)).not.toContain("Operator approved");
   });
 
   it("a Charter reason the console cannot render as its own sentence falls back to the tier and operation, never to served text", async () => {

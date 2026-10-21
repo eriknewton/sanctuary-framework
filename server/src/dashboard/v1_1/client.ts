@@ -31,6 +31,7 @@ import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
 import { ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE } from "./templates.js";
+import { CARD_OPERATION_MAX_CHARS } from "../../hub/charter-approval-bridge.js";
 
 /**
  * Returns the inline client script body. The HTML shell wraps this in
@@ -415,17 +416,24 @@ function escHtml(v) {
   });
 }
 
-// Characters that can disguise or reorder displayed text: DEL and C1 controls, the soft hyphen and Arabic letter
-// mark, Mongolian vowel separator, zero-width and directional marks, line and paragraph separators, bidi
-// embeddings, overrides and isolates, word joiner and invisible operators, and the byte-order mark. C0 controls
-// are already escaped by JSON.stringify.
-const HELD_SUBJECT_HIDDEN_CHARS = /[\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+// Characters that can hide, disguise or reorder displayed text: every control (Cc), format (Cf: bidi embeddings,
+// overrides and isolates, zero-width marks, interlinear annotation marks, supplementary tag characters), lone
+// surrogate (Cs), line separator (Zl) and paragraph separator (Zp) code point, plus the visibly blank combining
+// grapheme joiner, Hangul fillers and variation selectors. Must match HELD_SUBJECT_HIDDEN_CHARS in templates.ts.
+const HELD_SUBJECT_HIDDEN_CHARS = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\u034f\u115f\u1160\u3164\uffa0\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/gu;
+// The last code point a four-digit \uXXXX escape can name; anything above it is written \u{XXXXX}. Must match
+// LAST_FOUR_DIGIT_ESCAPE_CODE_POINT in templates.ts.
+const LAST_FOUR_DIGIT_ESCAPE_CODE_POINT = 0xffff;
 
-// An agent-chosen identifier as visible data: JSON-quoted so its own quotes and backslashes are escaped, every
-// hidden or reordering character shown as a \uXXXX escape, and the whole value inside a code element.
+// An untrusted identifier (a held operation name, a namespace, a counterparty DID) as visible data: JSON-quoted so
+// its own quotes and backslashes are escaped, and every hidden or reordering character shown as a visible escape.
+// Must match heldSubjectText in templates.ts, which writes the same text into server-rendered sentences.
 function heldSubjectText(value) {
   return JSON.stringify(String(value)).replace(HELD_SUBJECT_HIDDEN_CHARS, function (c) {
-    return "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4);
+    const codePoint = c.codePointAt(0);
+    return codePoint > LAST_FOUR_DIGIT_ESCAPE_CODE_POINT
+      ? "\\u{" + codePoint.toString(16) + "}"
+      : "\\u" + ("0000" + codePoint.toString(16)).slice(-4);
   });
 }
 
@@ -902,13 +910,29 @@ function agentOr(args, neutral) {
   return hasArgValue(args, "agent_id") ? "agent " + arg(args, "agent_id") : neutral;
 }
 
-// The approval_pending catch-all, "Run a Tier 2 operation: state_write.". Must match heldOperationSentence in
+// The approval_pending catch-all, 'Run a Tier 2 operation: "state_write".'. Must match heldOperationSentence in
 // templates.ts: the operation clause only when the card names its operation, the agent clause only for a target.
+// The held operation name is untrusted (an upstream server names a proxied tool), so it is written only in
+// heldSubjectText's quoted, escaped form.
 function heldOperationSentence(args, tier) {
   const target = hasArgValue(args, "agent_id") ? " on agent " + arg(args, "agent_id") : "";
-  const operation = hasArgValue(args, "operation") ? ": " + arg(args, "operation") : "";
+  const operation = hasArgValue(args, "operation") ? ": " + heldSubjectText(arg(args, "operation")) : "";
   return "Run a " + tier + " operation" + target + operation + ".";
 }
+
+// The same sentence as HTML: the console's words escaped, the operation only inside the held-subject element.
+// Its text content must equal heldOperationSentence(args, tier) whenever the name was not shortened.
+function heldOperationSentenceHtml(args, tier, truncated) {
+  const head = "Run a " + tier + " operation" + (hasArgValue(args, "agent_id") ? " on agent " + arg(args, "agent_id") : "");
+  return hasArgValue(args, "operation")
+    ? escHtml(head + ": ") + heldSubjectHtml(arg(args, "operation"), truncated) + escHtml(".")
+    : escHtml(head + ".");
+}
+
+// Template ids whose sentence names the held operation, with the tier each one names. Must match the
+// heldOperationSentence entries of TEMPLATES below and of TEMPLATES in templates.ts; a test renders every
+// template with two different operation names and requires each id whose text changes to be listed here.
+const HELD_OPERATION_TEMPLATE_TIERS = { "approval_pending.tier1.other": "Tier 1", "approval_pending.tier2.other": "Tier 2" };
 
 // Cross-file contract: every key here must have a matching key in the
 // server TEMPLATES registry in templates.ts (this map is a mirror of that
@@ -1003,6 +1027,14 @@ function renderTemplate(id, args) {
   }
   if (!fn) return "[unrecognized template: " + id + "]";
   try { return fn(args || []); } catch (e) { return "[template render failed: " + id + "]"; }
+}
+
+// A template sentence as HTML for any surface that shows it. Invariant: a sentence that names the held operation
+// renders that name only as the delimited, escaped held-subject element, so an upstream-chosen tool name can never
+// read as words of the console's sentence; every other sentence is the escaped text of renderTemplate.
+function renderTemplateHtml(id, args, operationTruncated) {
+  const tier = Object.prototype.hasOwnProperty.call(HELD_OPERATION_TEMPLATE_TIERS, id) ? HELD_OPERATION_TEMPLATE_TIERS[id] : null;
+  return tier ? heldOperationSentenceHtml(Array.isArray(args) ? args : [], tier, operationTruncated === true) : escHtml(renderTemplate(id, args));
 }
 
 // ── Status mapping ─────────────────────────────────────────────────────
@@ -2381,7 +2413,7 @@ function agentApprovalRows(items) {
       ? '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Deny</button><button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Allow once</button>' + renderDecisionInline(item)
       : '<a class="btn" href="#approvals">Review in Approvals</a>';
     return '<div class="approval-row"><div class="what">' + overviewChip("warn", "WAITING") + ' <span>' + (item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : "Tier Unknown") + '</span> ' +
-      escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '<span class="muted"> · ' + escHtml(item.created_at ? relTimeFromIso(item.created_at) : "age Unknown") + '</span></div><div class="actions">' + controls + '</div></div>';
+      renderTemplateHtml(item.display_template_id, item.display_template_args, item.operation_truncated) + '<span class="muted"> · ' + escHtml(item.created_at ? relTimeFromIso(item.created_at) : "age Unknown") + '</span></div><div class="actions">' + controls + '</div></div>';
   }).join("");
 }
 function renderAgentApprovals(agent) {
@@ -2399,7 +2431,7 @@ function renderAgentTimeline(agent, evidenceTab) {
     // Even egress admits dynamic operation names from multiple producers, so no category alone proves a layer.
     const layer = "Layer not served";
     return '<div class="agent-event"><time>' + escHtml(relTimeFromIso(e.emitted_at)) + '</time>' + overviewChip(verdict[0], verdict[1]) +
-      '<a href="' + escHtml(href) + '" title="Evidence entry ' + escHtml(e.entry_id) + '">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) + '<small>Entry ' + escHtml(e.entry_id) + '</small></a><span class="muted">' + layer + '</span>' +
+      '<a href="' + escHtml(href) + '" title="Evidence entry ' + escHtml(e.entry_id) + '">' + renderTemplateHtml(e.display_template_id, e.display_template_args) + '<small>Entry ' + escHtml(e.entry_id) + '</small></a><span class="muted">' + layer + '</span>' +
       (e.attestation ? '<div class="att">' + renderActionAttestationBadge(e.attestation.state, e.attestation.fragment) + '</div>' : '') + '</div>';
   }).join("");
   return '<section class="card"><h3>' + (evidenceTab ? 'Agent evidence' : 'Recent activity') + '</h3>' + (entries ? (entries.length ? rows : agentEmpty("No agent activity in this read", "The loaded feed has no entries for this agent.", href, "Open Evidence")) +
@@ -2455,7 +2487,7 @@ function renderAgentInspectPanel(agent) {
     const activityHtml = activity.length
       ? '<div class="timeline">' +
         activity.map(function (e) {
-          const t = renderTemplate(e.display_template_id, e.display_template_args);
+          const tHtml = renderTemplateHtml(e.display_template_id, e.display_template_args);
           const badgeHtml = e.attestation
             ? renderActionAttestationBadge(e.attestation.state, e.attestation.fragment)
             : '';
@@ -2463,7 +2495,7 @@ function renderAgentInspectPanel(agent) {
           // dash; the pass circle is kept for an observed success.
           return '<div class="timeline-item">' +
             '<div class="ts">' + escHtml(shortTime(e.emitted_at)) + '</div>' +
-            '<div class="what">' + escHtml(t) + '</div>' +
+            '<div class="what">' + tHtml + '</div>' +
             (badgeHtml ? '<div class="att">' + badgeHtml + '</div>' : '') +
             '</div>';
         }).join("") +
@@ -3810,6 +3842,22 @@ function evidenceEvent(entry) {
   return entry && entry.operation || "operation not named";
 }
 
+// An audit operation the approval gate writes as "<gate verb>:<tool name>" (gate.ts) names the tool it classified,
+// which an upstream server names for a proxied tool.
+const EVIDENCE_GATE_OPERATION = /^(gate_[a-z_]+|injection_detected):([\s\S]+)$/;
+// Must match CARD_OPERATION_MAX_CHARS in server/src/hub/charter-approval-bridge.ts, injected from it.
+const EVIDENCE_HELD_OPERATION_MAX_CHARS = ${CARD_OPERATION_MAX_CHARS};
+
+// Evidence's operation as HTML. Invariant: a gate entry's tool name is shown only as the delimited, escaped
+// held-subject element, bounded like a card's operation, so it cannot read as words of the console's record view.
+function evidenceEventHtml(entry) {
+  const event = evidenceEvent(entry);
+  const gate = EVIDENCE_GATE_OPERATION.exec(event);
+  if (!gate) return escHtml(event);
+  const truncated = gate[2].length > EVIDENCE_HELD_OPERATION_MAX_CHARS;
+  return escHtml(gate[1] + ":") + heldSubjectHtml(truncated ? gate[2].slice(0, EVIDENCE_HELD_OPERATION_MAX_CHARS) : gate[2], truncated);
+}
+
 function evidenceResult(entry) {
   const raw = String(entry && entry.result || "").toLowerCase();
   if (raw === "success" || raw === "failure") return raw;
@@ -3876,11 +3924,12 @@ function evidenceDetailsList(entry) {
   if (!details) return "";
   const keys = Object.keys(details).sort();
   if (!keys.length) return "";
-  // A gate entry's recorded reason can quote an identifier the agent chose, so it is shown as delimited recorded
-  // data (heldSubjectHtml), never as a line of prose the operator could read as guidance.
-  const gateEntry = String(entry && entry.operation || "").indexOf("gate_") === 0;
+  // A gate entry's recorded reason can quote an identifier the agent chose, and its recorded operation is a tool name
+  // an upstream server can choose, so both are shown as delimited recorded data (heldSubjectHtml), never as a line of
+  // prose the operator could read as guidance.
+  const gateEntry = EVIDENCE_GATE_OPERATION.test(String(entry && entry.operation || ""));
   return '<dt>Details</dt><dd>showing ' + Math.min(keys.length, EVIDENCE_DETAIL_KEY_LIMIT) + ' of ' + keys.length + ' fields</dd>' + keys.slice(0, EVIDENCE_DETAIL_KEY_LIMIT).map(function (key) {
-    const value = gateEntry && key === "reason" && typeof details[key] === "string"
+    const value = gateEntry && (key === "reason" || key === "operation") && typeof details[key] === "string"
       ? 'recorded text ' + heldSubjectHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS), false)
       : escHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS));
     return '<dt>' + escHtml(cappedText(key, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dt><dd>' + value + '</dd>';
@@ -4156,7 +4205,7 @@ function renderEvidenceRow(entry, index) {
     '<td class="mono">' + escHtml(shortTime(evidenceTimestamp(entry)) || "timestamp missing") + '</td>' +
     '<td><span class="lay">' + escHtml(evidenceLayerName(entry.layer)) + '</span></td>' +
     '<td><span class="row">' + escHtml(evidenceRowActor(entry)) + '</span></td>' +
-    '<td><button class="btn" data-action="evidence-select" data-evidence-index="' + index + '" aria-pressed="' + selected + '">' + escHtml(evidenceEvent(entry)) + '</button></td>' +
+    '<td><button class="btn" data-action="evidence-select" data-evidence-index="' + index + '" aria-pressed="' + selected + '">' + evidenceEventHtml(entry) + '</button></td>' +
     '<td>' + evidenceResultChip(entry) + '</td>' +
   '</tr>';
 }
@@ -4170,9 +4219,9 @@ function renderEvidenceDrawer(entry) {
   const contributors = evidenceContributorsList(entry);
   const raw = cappedText(entry, EVIDENCE_RAW_RECORD_MAX_CHARS);
   return '<aside class="panel evidence-detail" aria-label="Selected entry">' +
-    '<div class="hd"><div class="t">' + escHtml(evidenceEvent(entry)) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
+    '<div class="hd"><div class="t">' + evidenceEventHtml(entry) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
     '<div class="sec"><h3>What happened</h3><dl class="kv">' +
-      '<dt>Operation</dt><dd>' + escHtml(evidenceEvent(entry)) + '</dd>' +
+      '<dt>Operation</dt><dd>' + evidenceEventHtml(entry) + '</dd>' +
       '<dt>Agent</dt><dd>' + escHtml(evidenceAgent(entry)) + '</dd>' +
       '<dt>Layer</dt><dd>' + escHtml(evidenceLayerName(entry.layer)) + '</dd>' +
       '<dt>Result</dt><dd>' + evidenceResultChip(entry) + '</dd>' +
@@ -4277,7 +4326,7 @@ function renderEvidenceDecidedApprovals() {
     ' loaded decisions · inbox read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</p>' +
     (shown.length ? shown.map(function (item) {
       return '<div class="row" data-decided-approval="' + escHtml(item.item_id) + '"><div class="grow">' +
-        escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '</div>' +
+        renderTemplateHtml(item.display_template_id, item.display_template_args, item.operation_truncated) + '</div>' +
         renderEvidenceStatusChip("neutral", item.decision === "approve" ? "Allowed" : item.decision === "deny" ? "Denied" : "Resolved") + '<span class="mono">' + escHtml(item.resolved_at || "resolution time not served") + '</span></div>';
     }).join("") : '<p class="muted">No decided approvals in this loaded view.</p>') + '</section>';
 }
@@ -4340,7 +4389,7 @@ function renderEvidenceOperationsSection() {
     var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
     var otherItems = visibleInbox.filter(function (i) { return i.kind !== "approval_pending" || (i.tier !== "tier1" && i.tier !== "tier2"); });
     function renderInboxRow(i) {
-      var text = renderTemplate(i.display_template_id, i.display_template_args);
+      var textHtml = renderTemplateHtml(i.display_template_id, i.display_template_args, i.operation_truncated);
       var actions = inboxActions(i);
       // Invariant: as on the Overview, a held approval is decided inline only at Tier 2; every other
       // served tier links to Approvals, where a Tier 1 decision takes the drawer's two steps.
@@ -4358,7 +4407,7 @@ function renderEvidenceOperationsSection() {
       return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
         (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
         '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + batchSelectionDisabled() + '>' +
-        '<div class="grow">' + escHtml(text) + '</div>' +
+        '<div class="grow">' + textHtml + '</div>' +
         tierBadge +
         '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '"' + (decisionInFlight() ? approvalDecisionDisabled() : ' title="Snooze"') + '>...</button>' +
         '<div style="display:flex;gap:4px;">' + buttons + '</div>' + renderDecisionInline(i) +
@@ -4603,7 +4652,7 @@ function overviewFirstRun(home) {
 }
 
 function overviewDecisionRow(item) {
-  const text = renderTemplate(item.display_template_id, item.display_template_args);
+  const textHtml = renderTemplateHtml(item.display_template_id, item.display_template_args, item.operation_truncated);
   const agentId = item.agent_id || "";
   const createdAt = parseEvidenceTimestamp(item.created_at || "");
   const wait = Number.isFinite(createdAt) ? durationLabelFromMs(Date.now() - createdAt) + " ago" : "Unknown";
@@ -4617,7 +4666,7 @@ function overviewDecisionRow(item) {
     ? '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(agentId) + '">' + escHtml(agentId) + '</a>'
     : '<span>agent not named</span>';
   return '<tr><td class="overview-tier"><span class="mono">' + escHtml(tier) + '</span></td><td>' + agentCell + '</td>' +
-    '<td class="mono">' + escHtml(item.operation_category ? approvalOperation(item) : "approval") + '</td><td>' + escHtml(text) + '</td><td class="mono">' + escHtml(wait) + '</td><td>' + actions + '</td></tr>';
+    '<td class="mono">' + (item.operation_category ? approvalOperationHtml(item) : escHtml("approval")) + '</td><td>' + textHtml + '</td><td class="mono">' + escHtml(wait) + '</td><td>' + actions + '</td></tr>';
 }
 
 function renderOverviewDecisionQueue() {
@@ -5124,7 +5173,7 @@ function searchGroups(needle) {
       hits: heldApprovalItems(null).filter(function (i) {
         return match(renderTemplate(i.display_template_id, i.display_template_args)) || match(i.agent_id);
       }).map(function (i) {
-        return '<a href="#approvals">' + escHtml(renderTemplate(i.display_template_id, i.display_template_args)) +
+        return '<a href="#approvals">' + renderTemplateHtml(i.display_template_id, i.display_template_args, i.operation_truncated) +
           '<span class="sr-meta">' + escHtml(i.tier || "") + '</span></a>';
       })
     },
@@ -5135,7 +5184,7 @@ function searchGroups(needle) {
       hits: state.activity.filter(function (e) {
         return match(renderTemplate(e.display_template_id, e.display_template_args)) || match(e.agent_id) || match(e.category);
       }).map(function (e) {
-        return '<a href="#activity">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) +
+        return '<a href="#activity">' + renderTemplateHtml(e.display_template_id, e.display_template_args) +
           '<span class="sr-meta">' + escHtml(shortTime(e.emitted_at)) + '</span></a>';
       })
     }
@@ -5273,8 +5322,30 @@ function approvalOperation(item) {
   return category === "other" ? approvalArg(item, ["operation"], category) : category;
 }
 
-function approvalText(item) {
-  return renderTemplate(item.display_template_id, item.display_template_args);
+// The held operation name a card shows, or null when the card shows a console category instead. The name is the tool
+// the gate classified, which an upstream server names for a proxied tool and the call names for an uncategorised
+// one, so it is untrusted: callers render it only through heldSubjectHtml or heldSubjectText, never as bare words.
+function approvalHeldOperation(item) {
+  const category = item.operation_category || String(item.display_template_id || "").split(".").pop() || "approval";
+  if (category !== "other") return null;
+  const operation = approvalArg(item, ["operation"], "");
+  return operation ? operation : null;
+}
+
+// The Operation as HTML: a console category as plain text, a held operation name only as the delimited element.
+function approvalOperationHtml(item) {
+  const held = approvalHeldOperation(item);
+  return held === null ? escHtml(approvalOperation(item)) : heldSubjectHtml(held, item.operation_truncated === true);
+}
+
+// The Operation as plain text, for a select option or a feedback message: a held name in its quoted, escaped form.
+function approvalOperationText(item) {
+  const held = approvalHeldOperation(item);
+  return held === null ? approvalOperation(item) : heldSubjectText(held) + (item.operation_truncated === true ? " (shortened)" : "");
+}
+
+function approvalTextHtml(item) {
+  return renderTemplateHtml(item.display_template_id, item.display_template_args, item.operation_truncated);
 }
 
 // Why a Charter hold is held, written by this console from the card's structured hold_reason code. Must match
@@ -5291,7 +5362,8 @@ const HOLD_REASON_SENTENCES = {
   first_counterparty: { before: "First interaction with counterparty ", after: "." },
   signing_rate: { before: "Signing is happening faster than the policy limit." },
   bulk_read: { before: "Many reads from namespace ", after: " in the last 60 seconds." },
-  frequency_spike: { before: "This operation is being called far more often than its average." }
+  frequency_spike: { before: "This operation is being called far more often than its average." },
+  injection_escalation: { before: "The injection check flagged this call's arguments as possible prompt injection, so it asks for approval." }
 };
 
 // "Why it is held" as HTML. Must-never #7 keeps denials returned to the AGENT generic. This text is shown to the
@@ -5312,11 +5384,13 @@ function approvalHoldReasonHtml(item) {
       const prefix = reason.via_proxy === true ? "Through a proxied tool: " : "";
       return escHtml(prefix + sentence.before) + (hasSubject ? heldSubjectHtml(reason.subject, reason.subject_truncated === true) + escHtml(sentence.after) : "");
     }
-    return escHtml("Held under the operator policy (" + tier + "): ") + heldSubjectHtml(approvalOperation(item), false);
+    const held = approvalHeldOperation(item);
+    return escHtml("Held under the operator policy (" + tier + "): ") +
+      heldSubjectHtml(held === null ? approvalOperation(item) : held, held !== null && item.operation_truncated === true);
   }
   // Hub controls and the catch-all category carry no policy-gate reason in the served item.
-  if (item.operation_category === "other" || !isCharterApprovalItem(item)) return escHtml("Held for your decision (" + approvalOperation(item) + ", " + tier + ").");
-  return escHtml(approvalOperation(item) + " is a " + tier + " operation under the operator policy.");
+  if (item.operation_category === "other" || !isCharterApprovalItem(item)) return escHtml("Held for your decision (") + approvalOperationHtml(item) + escHtml(", " + tier + ").");
+  return approvalOperationHtml(item) + escHtml(" is a " + tier + " operation under the operator policy.");
 }
 
 // Rule 7: item.decision is the operator action the hub delivered and the approval queue accepted
@@ -5378,7 +5452,7 @@ function approvalDecisionDisabled() {
 function renderApprovalRow(item, selectedId) {
   const selected = item.item_id === selectedId;
   const agent = approvalAgentId(item);
-  const op = approvalOperation(item);
+  const opHtml = approvalOperationHtml(item);
   const created = item.created_at || "";
   const age = created ? relTimeFromIso(created) : "age unknown";
   const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
@@ -5390,7 +5464,7 @@ function renderApprovalRow(item, selectedId) {
     return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
       '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
       '<td><strong>' + escHtml(agent) + '</strong></td>' +
-      '<td class="mono">' + escHtml(op) + '</td>' +
+      '<td class="mono">' + opHtml + '</td>' +
       '<td>' + approvalHoldReasonHtml(item) + '</td>' +
       '<td class="mono muted decided-at">Decided at ' + escHtml(shortTime(item.resolved_at || created)) + '</td>' +
       '<td><span class="state-chip neutral" data-approval-decision="' + escHtml(decisionLabel.toLowerCase()) + '"><i aria-hidden="true"></i>' + escHtml(decisionLabel) + '</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
@@ -5405,7 +5479,7 @@ function renderApprovalRow(item, selectedId) {
   return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
     '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
     '<td><strong>' + escHtml(agent) + '</strong></td>' +
-    '<td class="mono">' + escHtml(op) + '</td>' +
+    '<td class="mono">' + opHtml + '</td>' +
     '<td>' + approvalHoldReasonHtml(item) + '</td>' +
     '<td class="mono">' + escHtml(age) + '</td>' +
     '<td>' + decisionCell + echo + '</td>' +
@@ -5424,7 +5498,8 @@ function renderApprovalDrawer(item, empty) {
     return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>' + escHtml(title) + '</h3><p>' + escHtml(line) + ' Queue checked ' + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + '.</p>' + evidence.warning + '<a class="btn" href="#activity">Open Evidence</a></div></aside>';
   }
   const agent = approvalAgentId(item);
-  const op = approvalOperation(item);
+  // The held operation name is untrusted, so every drawer line that names it uses the delimited element.
+  const opHtml = approvalOperationHtml(item);
   const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
   const standing = approvalStandingState(item);
   const checked = state.approvals.alwaysAllow && standing.enabled && !item.resolved;
@@ -5445,27 +5520,27 @@ function renderApprovalDrawer(item, empty) {
   const denyButton = item.resolved ? "" : '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button>';
   // Confirm occupies a separate row so the second click in the first-step slot can only cancel.
   const confirmRow = !item.resolved && tier1Confirming
-    ? '<div class="approval-confirm-row"><button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Confirm ' + escHtml(op) + '</button></div>' : "";
+    ? '<div class="approval-confirm-row"><button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Confirm ' + opHtml + '</button></div>' : "";
   // Keep Cancel in its original slot and focused after disarming; a new Allow step uses a separate slot.
   const restartButton = !item.resolved && tier1Cancelled ? startButton : "";
   const standingEffect = checked
     ? "Later matching operations stop asking only if the policy engine accepts both steps."
     : "The next matching operation asks again.";
   // A Tier 1 Allow once only arms the request; the card says so, matching the note below it.
-  const allowCopy = checked
-    ? "Allows this request once, then requests a standing rule for every agent on this fortress. " + standingEffect
+  const allowCopyHtml = checked
+    ? escHtml("Allows this request once, then requests a standing rule for every agent on this fortress. " + standingEffect)
     : item.tier === "tier1" && !item.resolved
-      ? "Allow once arms this request, and Confirm " + op + " sends the approval; the decision is " + approvalRecordLine(item) + "."
-      : "Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".";
+      ? escHtml("Allow once arms this request, and Confirm ") + opHtml + escHtml(" sends the approval; the decision is " + approvalRecordLine(item) + ".")
+      : escHtml("Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".");
   const tier1Note = item.tier === "tier1" && !item.resolved
-    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + escHtml(op) + '. Only Confirm sends the approval.</div>'
+    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + opHtml + '. Only Confirm sends the approval.</div>'
     : "";
   return '<aside class="card approval-drawer" aria-label="Selected approval">' +
-    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? approvalDecisionLabel(item) : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
-    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
+    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? approvalDecisionLabel(item) : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + opHtml + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + approvalTextHtml(item) + '</p></div>' +
     // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
     '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + approvalHoldReasonHtml(item) + '</p></div>' +
-    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
+    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + allowCopyHtml + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
     tier1Note +
     '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + restartButton + '</div>' + confirmRow + renderDecisionInline(item) + '<p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
   '</aside>';
@@ -5474,7 +5549,8 @@ function renderApprovalDrawer(item, empty) {
 function approvalFilterOptions(items, field, current) {
   const seen = Object.create(null);
   items.forEach(function (item) {
-    const value = field === "agent" ? approvalAgentId(item) : approvalOperation(item);
+    // A held operation name is untrusted; a select option cannot hold markup, so it is listed in its quoted, escaped form.
+    const value = field === "agent" ? approvalAgentId(item) : approvalOperationText(item);
     if (value) seen[value] = true;
   });
   // A stale filter remains visible and selected, so choosing All can actually clear it.
@@ -5493,7 +5569,7 @@ function filterApprovalItems(items) {
     if (f.agent && approvalAgentId(item) !== f.agent) return false;
     if (f.tier === "tier1" && item.tier !== "tier1") return false;
     if (f.tier === "tier2" && item.tier !== "tier2") return false;
-    if (f.category && approvalOperation(item) !== f.category) return false;
+    if (f.category && approvalOperationText(item) !== f.category) return false;
     return true;
   });
 }
@@ -6871,7 +6947,7 @@ async function onInboxAction(itemId, action) {
   // Invariant: a second decision is never admitted while one holds the lock, so a stale or repeated click
   // sends nothing and the retained result keeps naming the first request only.
   if (decisionInFlight()) return false;
-  const fields = { kind: "item", action: action, itemId: itemId, ids: [itemId], subject: decisionSubject(itemId) };
+  const fields = { kind: "item", action: action, itemId: itemId, ids: [itemId], subject: decisionSubject(itemId), heldOperation: decisionHeldOperation(itemId) };
   const blocked = decisionNotAdmissible([itemId]);
   if (blocked) { state_NOTADMITTEDDecision(fields, blocked); return false; }
   const result = state_ADMITTEDDecision(fields);
@@ -6907,8 +6983,24 @@ function decisionDone(action) { return DECISION_DONE[action] || "Done"; }
 function decisionSubject(itemId) {
   // Captured at admission: after the refresh the item may have left the served projection.
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
-  // The category is an internal token (state_export); the operator reads it as words (state export).
-  return (item ? approvalOperation(item).replace(/_/g, " ") + " by " + approvalAgentId(item) + " " : "") + "(request " + itemId + ")";
+  if (!item) return "(request " + itemId + ")";
+  // The category is an internal token (state_export); the operator reads it as words (state export). A held operation
+  // name is untrusted, so it keeps its quoted, escaped form, which renderFeedbackText turns into the delimited element.
+  const operation = approvalHeldOperation(item) === null ? approvalOperation(item).replace(/_/g, " ") : approvalOperationText(item);
+  return operation + " by " + approvalAgentId(item) + " (request " + itemId + ")";
+}
+// The held operation name a decision is about, captured at admission with its subject, so the feedback can show it as
+// the delimited element even after the item leaves the served projection.
+function decisionHeldOperation(itemId) {
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  return item ? approvalHeldOperation(item) : null;
+}
+// Feedback text as HTML. Invariant: the quoted form of the decision's held operation name, which decisionSubject
+// wrote into the message, is shown only as the delimited held-subject element, never as words of the message.
+function renderFeedbackText(text, result) {
+  const html = escHtml(text);
+  const held = result && typeof result.heldOperation === "string" && result.heldOperation ? result.heldOperation : null;
+  return held === null ? html : html.split(escHtml(heldSubjectText(held))).join(heldSubjectHtml(held, false));
 }
 function decisionHeadline(result) {
   // A batch that was taken for some items and refused for others says so in its headline, never "taken" alone.
@@ -7029,13 +7121,13 @@ function renderDecisionResult() {
   if (!r || r.cleared) return "";
   const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
   const records = r.records.length
-    ? '<ul>' + r.records.map(function (rec) { return '<li>' + escHtml(rec.message) + '</li>'; }).join("") + '</ul>' : "";
+    ? '<ul>' + r.records.map(function (rec) { return '<li>' + renderFeedbackText(rec.message, r) + '</li>'; }).join("") + '</ul>' : "";
   // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock. An
   // unconfirmed result has no Clear at all: the operator owes the queue a check, and only the next decision
   // replaces the warning, so it cannot be dismissed unread.
   const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS + (r.notSent ? " " + r.notSent : "") : "";
   const clear = r.status === "pending" || r.status === "uncertain" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
-  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + escHtml(r.message + note + stays) + '</p>' + records + '</div>' + clear + '</section>';
+  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + renderFeedbackText(r.message + note + stays, r) + '</p>' + records + '</div>' + clear + '</section>';
 }
 function decisionFirstSentence(message) {
   const first = message.split(". ")[0];
@@ -7101,7 +7193,7 @@ async function state_APPROVINGAlwaysAllow(itemId) {
   // Only an explicitly checked, available standing option on this waiting item can begin promotion.
   if (!item || item.resolved || state.approvals.selectedId !== itemId || !state.approvals.alwaysAllow || !approvalStandingState(item).enabled || decisionInFlight()) return;
   const op = promotableOperation(item);
-  const fields = { kind: "item", action: "approve", itemId: itemId, ids: [itemId], subject: decisionSubject(itemId), rule: "pending" };
+  const fields = { kind: "item", action: "approve", itemId: itemId, ids: [itemId], subject: decisionSubject(itemId), heldOperation: decisionHeldOperation(itemId), rule: "pending" };
   const blocked = decisionNotAdmissible([itemId]);
   if (blocked) { state_NOTADMITTEDDecision(fields, blocked); return; }
   const result = state_ADMITTEDDecision(fields);

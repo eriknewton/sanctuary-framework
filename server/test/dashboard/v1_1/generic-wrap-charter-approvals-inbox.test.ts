@@ -896,7 +896,7 @@ describe("Charter cards name the requesting agent and stay listed once decided",
     expect(card!.display_template_id).toBe("approval_pending.tier2.other");
     expect(
       renderTemplate(card!.display_template_id, card!.display_template_args),
-    ).toBe("Run a Tier 2 operation: state_write.");
+    ).toBe('Run a Tier 2 operation: "state_write".');
     expect(card!.hold_reason).toEqual({ code: "first_namespace_access", subject: "customer-notes" });
     const { prose, subjects } = splitHeldReason(clientHoldReasonRenderer()(card));
     expect(prose).toBe(`First access to namespace ${SUBJECT_SLOT}. It is not in this session's baseline.`);

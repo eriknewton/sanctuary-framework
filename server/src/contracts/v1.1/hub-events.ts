@@ -183,6 +183,14 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
    */
   hold_reason?: HubHoldReason;
   /**
+   * True when the card's `operation` display arg was shortened to
+   * CARD_OPERATION_MAX_CHARS (server/src/hub/charter-approval-bridge.ts). The
+   * held operation is the tool name the gate classified, and a proxied or
+   * uncategorised tool name is chosen upstream of this fortress, so the card
+   * carries a bounded copy and says when it is not the whole name.
+   */
+  operation_truncated?: true;
+  /**
    * The operator decision the hub delivered for a decided Charter card, set
    * only by `HubService.resolveInboxItem` after the approval queue accepted that
    * decision. Absent on open cards and on cards decided anywhere else; the
@@ -209,6 +217,7 @@ export const HUB_HOLD_REASON_CODES = [
   "signing_rate",
   "bulk_read",
   "frequency_spike",
+  "injection_escalation",
   "unrecognized",
 ] as const;
 
