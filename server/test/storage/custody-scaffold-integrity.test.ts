@@ -18,12 +18,19 @@ import { withExitAdmissionLock } from "../../src/storage/exit-import-journal.js"
 
 const injection = vi.hoisted(() => ({
   beforeOpen: undefined as undefined | ((path: string) => Promise<void>),
+  beforeParentOpen: undefined as undefined | ((path: string) => Promise<void>),
+  runtimePlatform: undefined as NodeJS.Platform | undefined,
   beforeLstat: undefined as undefined | ((path: string) => Promise<void>),
   afterStat: undefined as undefined | ((stats: Stats) => Stats),
   chmodFailure: false,
   handles: [] as FileHandle[],
   createServer: vi.fn(),
 }));
+
+vi.mock("node:os", async (importOriginal) => {
+  const os = await importOriginal<typeof import("node:os")>();
+  return { ...os, platform: () => injection.runtimePlatform ?? os.platform() };
+});
 
 vi.mock("node:net", async (importOriginal) => {
   const net = await importOriginal<typeof import("node:net")>();
@@ -39,7 +46,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       if (scaffold && args[1] === (constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))) {
         await injection.beforeOpen?.(path);
       }
+      const parentOpen = args[1] === (constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_DIRECTORY ?? 0));
+      if (parentOpen) await injection.beforeParentOpen?.(path);
       const handle = await fs.open(...args);
+      if (parentOpen) injection.handles.push(handle);
       if (!scaffold) return handle;
       injection.handles.push(handle);
       return new Proxy(handle, {
@@ -68,6 +78,9 @@ const PRIVATE_DIRECTORY_MODE = 0o700; // Owner rwx; no group or other access.
 const PRIVATE_FILE_MODE = 0o600; // Owner rw; no group or other access.
 const UNSAFE_FILE_MODE = 0o660; // Adds group rw, outside the secure and legacy shapes.
 const LEGACY_FILE_MODE = 0o644; // The historical owner-rw, publicly readable scaffold.
+const WORLD_WRITABLE_DIRECTORY_MODE = 0o777; // Owner, group and other rwx, without sticky.
+const GROUP_WRITABLE_DIRECTORY_MODE = 0o770; // Owner and group rwx, without sticky.
+const DIRECTORY_CHANGES = ["tree changed mid-check", "parent changed before binding", "parent rebound before creation", "parent rebound during creation"] as const;
 const NAMESPACE = "_meta";
 const BARRIER = "scaffold-integrity-test";
 const SUFFIXES = [".reaper", ".reader-reaper"] as const;
@@ -97,6 +110,8 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")(
     });
 
     afterEach(async () => {
+      injection.beforeParentOpen = undefined;
+      injection.runtimePlatform = undefined;
       injection.beforeOpen = undefined;
       injection.beforeLstat = undefined;
       injection.afterStat = undefined;
@@ -153,6 +168,73 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")(
     }
 
     for (const degradeOnEnvironmentalLoss of MODES) {
+      for (const change of DIRECTORY_CHANGES) {
+        it(`refuses ${change} with ${degradeOnEnvironmentalLoss} intent`, async () => {
+          const parent = join(root, "parent");
+          const original = join(root, "original");
+          await fs.mkdir(parent, { mode: PRIVATE_DIRECTORY_MODE });
+          const canonicalParent = await fs.realpath(parent);
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = join(parent, "locks");
+          let changed = false;
+          const substitute = async (symlink = false) => {
+            expect(changed).toBe(false);
+            changed = true;
+            await fs.rename(parent, original);
+            if (symlink) await fs.symlink(original, parent);
+            else await fs.mkdir(parent, { mode: PRIVATE_DIRECTORY_MODE });
+          };
+          if (change === "parent changed before binding") {
+            injection.beforeParentOpen = async (path) => {
+              if (path === canonicalParent) await substitute();
+            };
+          } else {
+            // Exercise the canonical-path branch on either host. Filesystem locality
+            // still uses the actual host through __testPlatform below; this is not a Darwin drill.
+            if (change !== "tree changed mid-check") injection.runtimePlatform = "darwin";
+            let parentChecks = 0;
+            // Ancestry, pre-create and post-create are the three ordered parent observations.
+            const targetCheck = change === "tree changed mid-check" ? 1
+              : change === "parent rebound before creation" ? 2 : 3;
+            injection.beforeLstat = async (path) => {
+              if (path !== canonicalParent) return;
+              parentChecks += 1;
+              if (parentChecks === targetCheck) await substitute(change === "tree changed mid-check");
+            };
+          }
+          const expectedMessage = {
+            "tree changed mid-check": "not a non-symlink directory",
+            "parent changed before binding": "changed between verification and binding",
+            "parent rebound before creation": "rebound before leaf creation",
+            "parent rebound during creation": "rebound during leaf creation",
+          }[change];
+          await expect(acquire({ degradeOnEnvironmentalLoss, __testPlatform: process.platform })).rejects.toMatchObject({
+            kind: "scaffold-integrity", message: expect.stringContaining(expectedMessage),
+          });
+          expect(changed).toBe(true);
+          await assertNoAdmission();
+          // Inspect both directory identities, including any leaf, for leaked sockets.
+          const entries = await fs.readdir(root, { recursive: true });
+          expect(entries.filter((name) => name.endsWith(".sock"))).toEqual([]);
+        });
+      }
+
+      for (const mode of [WORLD_WRITABLE_DIRECTORY_MODE, GROUP_WRITABLE_DIRECTORY_MODE]) {
+        it(`keeps parent mode ${mode.toString(8)} environmental with ${degradeOnEnvironmentalLoss} intent`, async () => {
+          const parent = join(root, "parent");
+          await fs.mkdir(parent, { mode: PRIVATE_DIRECTORY_MODE });
+          await fs.chmod(parent, mode);
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = join(parent, "locks");
+          // First pin the classification without degradation, then exercise caller intent.
+          await expect(acquire()).rejects.toMatchObject({ kind: "capability", message: expect.stringContaining("writable") });
+          const lease = await acquire({ degradeOnEnvironmentalLoss });
+          expect(lease.socketPath).toBeUndefined();
+          expect(injection.createServer).not.toHaveBeenCalled();
+          expect(() => lease.assertSessionHeld()).not.toThrow();
+          if (degradeOnEnvironmentalLoss === "inert") expect(() => lease.assertHeld()).not.toThrow();
+          else expect(() => lease.assertHeld()).toThrow(/writable/);
+          expect((await fs.readdir(root, { recursive: true })).filter((name) => name.endsWith(".sock"))).toEqual([]);
+        });
+      }
       for (const suffix of SUFFIXES) {
         for (const shape of SHAPES) {
           it(`refuses ${suffix} ${shape} with ${degradeOnEnvironmentalLoss} intent`, async () => {
