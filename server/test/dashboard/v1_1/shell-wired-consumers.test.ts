@@ -22,6 +22,7 @@
  * fields; activity rows without a verdict wearing no pass mark; and the
  * auto-trigger trend naming each bar shape in words.
  */
+// fail-before-exempt: adapts the decision tests to the release hold (settleDecision drains DECISION_RELEASE_HOLD_MS after a decision click); asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the hold lives in approval-decision-result.test.ts and decision-release-hold.e2e.ts.
 import { mfpScenario } from "./fixtures/mfp-scenarios.js";
 import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
