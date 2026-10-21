@@ -316,7 +316,17 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
   const input = (action: string, value: string) => { const target = new FakeInput({ "data-action": action }); target.value = value; docListeners.input!({ target }); };
   return { el, railLink, context, navigate, click, clickRenderedButton, keydown, type, change, input, requests, downloads };
 }
+// Must match DECISION_RELEASE_HOLD_MS in src/dashboard/v1_1/client.ts: a decision keeps its lock through this
+// hold after its last layout change, so a drain under fake timers advances past it.
+const RELEASE_HOLD_MS = 300;
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
+// Drains a decision through its release hold; only decision tests use it, so time-boundary tests keep their clock.
+async function settleDecision() {
+  await settle();
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+  else await new Promise((resolve) => setTimeout(resolve, RELEASE_HOLD_MS));
+  await settle();
+}
 afterEach(() => {
   setAttributeThrowFor = null;
   vi.useRealTimers();
@@ -777,9 +787,9 @@ describe("slice 2 shell wired consumers", () => {
     h.navigate("approvals");
     expect(h.el.main!.innerHTML).toContain('data-approval-primary="wait-1" data-action="inbox-approve"');
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
-    await settle();
+    await settleDecision();
     h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
-    await settle();
+    await settleDecision();
     expect(calls).toEqual([
       { url: "/api/hub/inbox/wait-1/approve", body: "{}" },
       { url: "/api/hub/inbox/wait-1/deny", body: "{}" },
@@ -2293,7 +2303,7 @@ describe("slice 5 Evidence wired consumers", () => {
         for (const control of ["inbox-batch-snooze", "inbox-snooze-custom", "inbox-batch-snooze-custom", "inbox-batch-snooze-close"]) expect(h.el.main!.innerHTML).toContain('data-action="' + control + '"');
         h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
       }
-      await settle();
+      await settleDecision();
       if (action === "dismiss") expect(h.requests.some(r => r.url === "/api/hub/inbox/privacy_event/dismiss" && r.init?.method === "POST")).toBe(true);
       else expect(h.requests.some(r => r.url === "/api/inbox/unified/batch" && JSON.parse(String(r.init?.body)).action === action)).toBe(true);
     }
@@ -2915,7 +2925,7 @@ describe("slice 6a Agents wired consumers", () => {
       expect(html).toContain('data-action="inbox-approve" data-item-id="tier2">Allow once');
       expect(html).toContain('data-action="inbox-deny" data-item-id="tier2">Deny');
     }
-    for (const action of ["approve", "deny"]) { h.click({ "data-action": `inbox-${action}`, "data-item-id": "tier2" }); await settle(); }
+    for (const action of ["approve", "deny"]) { h.click({ "data-action": `inbox-${action}`, "data-item-id": "tier2" }); await settleDecision(); }
     expect(calls).toEqual(["approve", "deny"]);
   });
 
@@ -3820,8 +3830,8 @@ describe("Approvals round-one decision and evidence states", () => {
     h.click({ "data-action": "inbox-deny", "data-item-id": "item-1" });
     expect(calls).toEqual(["approve"]);
     finish(response({ data: { item: tier2 } }));
-    await settle();
-    await settle();
+    await settleDecision();
+    await settleDecision();
     expect(drawer(h)).not.toMatch(/data-item-id="item-1" disabled/);
   });
   }

@@ -1,7 +1,7 @@
 import { test, expect } from "./fixtures/dashboard.js";
 import {
   FEEDBACK_VIEWPORTS, TOAST_LIFETIME_MS, prepareFeedback,
-  recordFeedbackBaseline, assertFeedbackIsolation, SETTLE_FRAMES_MS,
+  recordFeedbackBaseline, assertFeedbackIsolation, SETTLE_FRAMES_MS, DECISION_RELEASE_HOLD_MS,
 } from "./feedback-isolation-helpers.js";
 
 // Slice 1 owns feedback-only transitions. Admission, release, reconstruction,
@@ -94,6 +94,7 @@ for (const config of configurations) {
           if (config.surface === "A") {
             // The liveness decision replaces the earlier variation; vary its settled result before navigation.
             await expect(page.locator('#decision-feedback-result')).toContainText("Fixture refusal");
+            await page.clock.runFor(DECISION_RELEASE_HOLD_MS);
             await expect(page.locator('[data-action="decision-result-clear"]')).toBeEnabled();
             await page.evaluate('feedbackDriver.varyResult()');
           }

@@ -18,8 +18,9 @@
  * nothing being noted on it instead; a local non-admission
  * is its own "not sent" outcome, never a refusal; the row Snooze menu and the selection pause while a batch holds
  * the lock; a batch summary is confirmed only when every count and missing id is accounted for; the result block
- * remains beside the stopped-updates panel too; releasing the lock repaints only the paused attributes, so no
- * decision control moves in the frame it becomes clickable. The decision-result witness for D5-approval; this header carries the bare
+ * remains beside the stopped-updates panel too; a decision keeps every control paused for the release hold after
+ * its last layout change, restarts the hold when a repaint lands in it (a bounded number of times), still releases
+ * when a repaint throws, and releases with a repaint that changes only the paused attributes. The decision-result witness for D5-approval; this header carries the bare
  * id only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -185,7 +186,15 @@ function boot(overrides: Record<string, Override> = {}) {
   const read = (expression: string) => runInContext(expression, context);
   return { el, context, navigate, click, requests, posts, main, result, read };
 }
-async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
+// Must match DECISION_RELEASE_HOLD_MS in src/dashboard/v1_1/client.ts: a decision keeps its lock through this
+// hold after its last layout change, so a drain under fake timers advances past it.
+const RELEASE_HOLD_MS = 300;
+async function settle() {
+  for (let i = 0; i < 100; i++) await Promise.resolve();
+  if (!vi.isFakeTimers()) return;
+  await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+  for (let i = 0; i < 100; i++) await Promise.resolve();
+}
 function gate<T>() { let release!: (value: T) => void; const promise = new Promise<T>((resolve) => { release = resolve; }); return { promise, release }; }
 afterEach(() => { vi.useRealTimers(); });
 
@@ -717,9 +726,15 @@ describe("one retained decision result", () => {
     });
     return paints;
   }
-  // The release paint may change only the disabled and title attributes the lock adds; anything else would
-  // move a decision control in the frame it becomes clickable.
-  const withoutLockAttributes = (html: string) => html.replace(/ disabled(?: title="[^"]*")?/g, "").replace(/ title="[^"]*"/g, "");
+  // The release paint may change only the attributes the lock adds: a lock reason title with its disabled
+  // flag, the bare disabled flag on the consent checkbox, and the row Snooze menu's own title. Only tag text is
+  // normalized, so a changed sentence, label or unrelated tooltip still fails the comparison.
+  const LOCK_REASONS = [BUSY, REREAD_BUSY].map((pair) => " " + pair);
+  const withoutLockAttributes = (html: string) => html.replace(/<[^>]*>/g, (tag) => {
+    let out = tag;
+    for (const reason of LOCK_REASONS) out = out.split(reason).join("");
+    return out.replace(' title="Snooze"', "").replace(/(?<="| checked) disabled(?=[ >])/g, "");
+  });
   function expectAttributeOnlyRelease(h: ReturnType<typeof boot>, paints: Array<{ html: string; locked: boolean }>) {
     expect(paints.some((p) => p.locked), "the decision painted under the lock").toBe(true);
     const release = paints.findIndex((p, i) => i > 0 && !p.locked && paints[i - 1]!.locked);
@@ -797,6 +812,96 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.posts()).toEqual(["/api/inbox/unified/batch"]);
     expectAttributeOnlyRelease(h, paints);
+  });
+
+  it("the release hold matches the client constant", () => {
+    const h = boot();
+    expect(h.read("DECISION_RELEASE_HOLD_MS")).toBe(RELEASE_HOLD_MS);
+  });
+
+  // Boots the Approvals screen with Allow always chosen on wait-1 and a refused approval, the path whose consent
+  // reset rewrites the drawer copy above Allow once.
+  async function refusedAllowAlways() {
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/inbox/wait-1/approve": () => Promise.resolve(response({ error: "refused" }, 403)),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    h.click({ "data-action": "approval-select", "data-item-id": "wait-1" });
+    h.click({ "data-action": "approval-always-allow" }, true);
+    return h;
+  }
+  async function drain() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
+
+  it("the decision's layout is painted under the lock and held for the full hold before the controls enable", async () => {
+    vi.useFakeTimers();
+    const h = await refusedAllowAlways();
+    h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" });
+    await drain();
+    // The refusal, the re-read and the consent reset are all on screen, every decision control still paused.
+    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.read("state.approvals.alwaysAllow")).toBe(false);
+    expect(h.main()).toContain('data-approval-primary="wait-1" data-action="inbox-approve" data-item-id="wait-1" ' + REREAD_BUSY + '>Allow once</button>');
+    await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS - 1);
+    expect(h.read("state.approvals.lock"), "still held one millisecond before the hold ends").not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    await drain();
+    expect(h.read("state.approvals.lock")).toBeNull();
+    expect(h.main()).toContain('data-approval-primary="wait-1" data-action="inbox-approve" data-item-id="wait-1">Allow once</button>');
+  });
+
+  it("a background repaint during the hold restarts it", async () => {
+    vi.useFakeTimers();
+    const h = await refusedAllowAlways();
+    h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" });
+    await drain();
+    await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS / 2);
+    // A background read lands mid-hold and adds a row above nothing the operator chose; #main is rewritten.
+    h.read('state.inbox.push(Object.assign({}, state.inbox[0], { item_id: "wait-3" })); rerender();');
+    await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS / 2);
+    await drain();
+    expect(h.read("state.approvals.lock"), "the first hold saw a rewrite, so it does not release").not.toBeNull();
+    await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+    await drain();
+    expect(h.read("state.approvals.lock")).toBeNull();
+  });
+
+  it("a screen that keeps changing cannot hold decisions paused past the bounded number of holds", async () => {
+    vi.useFakeTimers();
+    const h = await refusedAllowAlways();
+    h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" });
+    await drain();
+    const maxHolds = h.read("DECISION_RELEASE_MAX_HOLDS") as number;
+    for (let hold = 0; hold < maxHolds; hold++) {
+      expect(h.read("state.approvals.lock"), "held through hold " + hold).not.toBeNull();
+      h.read('state.inbox.push(Object.assign({}, state.inbox[0], { item_id: "churn-' + hold + '" })); rerender();');
+      await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+      await drain();
+    }
+    expect(h.read("state.approvals.lock")).toBeNull();
+  });
+
+  it("a repaint that throws during the hold still releases the lock", async () => {
+    vi.useFakeTimers();
+    const h = await refusedAllowAlways();
+    const main = h.el.main!;
+    let throwOnce = false;
+    let threw = false;
+    Object.defineProperty(h.el, "main", {
+      configurable: true,
+      get() { if (throwOnce) { throwOnce = false; threw = true; throw new Error("fixture repaint failure"); } return main; },
+    });
+    h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" });
+    await drain();
+    expect(h.read("state.approvals.lock")).not.toBeNull();
+    throwOnce = true;
+    await vi.advanceTimersByTimeAsync(RELEASE_HOLD_MS);
+    await drain();
+    expect(threw, "the hold's repaint threw").toBe(true);
+    expect(h.read("state.approvals.lock")).toBeNull();
+    expect(h.main()).toContain('data-approval-primary="wait-1" data-action="inbox-approve" data-item-id="wait-1">Allow once</button>');
   });
 
   it("the result survives a route change and clears only through its own control", async () => {

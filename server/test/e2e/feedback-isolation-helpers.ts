@@ -8,6 +8,9 @@ export const FEEDBACK_VIEWPORTS = {
   N: { width: 375, height: 667 },
 };
 export const TOAST_LIFETIME_MS = 4 * 1000;
+// Must match DECISION_RELEASE_HOLD_MS in src/dashboard/v1_1/client.ts: a decision keeps its controls paused
+// for this long after its last layout change, so a paused fake clock must run past it.
+export const DECISION_RELEASE_HOLD_MS = 300;
 // Two controlled frames deliver MutationObserver and ResizeObserver samples.
 export const SETTLE_FRAMES_MS = 2 * Math.ceil(1000 / 60);
 const FIXTURE_TIME = "2026-10-19T12:00:00.000Z";
@@ -76,6 +79,7 @@ export async function prepareFeedback(page: Page, url: string, routeName: string
     await expect(seed).toBeEnabled();
     await seed.click();
     await expect(page.locator('#feedback [data-decision-status="refused"]')).toContainText("Fixture refusal");
+    await page.clock.runFor(DECISION_RELEASE_HOLD_MS);
     await expect(page.locator('[data-action="decision-result-clear"]')).toBeEnabled();
   }
   await page.evaluate("document.fonts.ready");

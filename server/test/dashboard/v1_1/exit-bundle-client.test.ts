@@ -91,6 +91,7 @@ function makeInboxActionSandbox(): {
       var toast = function() {};
       var fetchAll = async function() {};
       var rerender = function() {};
+      var mainWriteCount = 0;
       var renderTopbar = function() {};
       var onAgentInspectOpen = async function() {};
       var document = { getElementById: function() { return null; } };

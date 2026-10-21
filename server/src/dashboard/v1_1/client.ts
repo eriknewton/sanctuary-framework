@@ -1283,6 +1283,8 @@ function renderPostureSeal() {
 // chat surface, making it impossible for operators to copy a Sanctuary-
 // generated reply via the standard macOS selection mechanism.
 const __renderCache = { route: null, html: null };
+// Counts every #main replacement; the decision release waits for a quiet hold measured against it.
+let mainWriteCount = 0;
 
 // Talk owns one live composer for the lifetime of its current host. Background
 // reads hydrate only named presentation parts; they never replace the form.
@@ -1577,6 +1579,7 @@ function renderMain() {
     if (talkOwner && (talkOwner.host === main || talkMain)) disposeTalkOwner();
     main.innerHTML = nextHtml;
     didWrite = true;
+    mainWriteCount++;
     __renderCache.route = state.route;
     __renderCache.html = talkMain ? null : nextHtml;
     if (talkMain) attachTalkOwner(main);
@@ -6570,8 +6573,9 @@ async function onInboxAction(itemId, action) {
 // Every per-item and batch decision is admitted into state.approvals.result and settles there; the screens
 // with decision controls render from it, and nothing else reports a decision. Named states, in order:
 // state_ADMITTEDDecision, then settleDecision (acknowledged, refused or uncertain), then
-// refreshAfterDecision, then state_RELEASEDDecision. The lock (state.approvals.lock) is the admitted result
-// and is held through the refresh, so no new decision is taken against a list the last one has not re-read.
+// refreshAfterDecision, then state_SETTLINGDecision (the held layout), then state_RELEASEDDecision. The lock
+// (state.approvals.lock) is the admitted result and is held through the refresh and the hold, so no new
+// decision is taken against a list the last one has not re-read.
 // Must match the reason and note text asserted in test/dashboard/v1_1/approval-decision-result.test.ts.
 const DECISION_BUSY_REASON = "Another decision is being sent.";
 const DECISION_REREAD_NOTE = "The queue could not be re-read after this decision, so this list may be out of date.";
@@ -6646,14 +6650,33 @@ async function refreshAfterDecision(result) {
   result.refresh = loaded ? "loaded" : "unavailable";
   if (!loaded) announceDecision(result);
 }
-function state_RELEASEDDecision(result) {
+// Every layout change a decision causes is painted and held on screen with every decision control still
+// disabled for DECISION_RELEASE_HOLD_MS before the lock is released. 300 ms = the upper end of a human
+// visual reaction (200 to 300 ms), about 18 frames at 60 Hz, so the browser displays the held layout and a
+// pointer already moving toward an old position lands on a disabled control, never on a moved live one.
+const DECISION_RELEASE_HOLD_MS = 300;
+// A background read can rewrite #main during a hold and restart it; after this many restarts the lock is
+// released anyway, so a constantly changing screen cannot hold decisions paused for more than about 3 s.
+const DECISION_RELEASE_MAX_HOLDS = 10;
+async function state_SETTLINGDecision(result) {
   if (state.approvals.lock !== result) return;
   // Consent belongs to the selected request; a decision on another row leaves it in place.
   if (result.ids.indexOf(state.approvals.selectedId) >= 0) resetApprovalConsent();
-  // Invariant: everything the decision changed is painted while the lock still disables every decision
-  // control, so the release repaint below changes only their disabled and title attributes and no control
-  // moves in the frame it becomes clickable (the consent reset alone rewrites the drawer copy above Allow once).
   rerender();
+  for (let hold = 0; hold < DECISION_RELEASE_MAX_HOLDS; hold++) {
+    const writes = mainWriteCount;
+    await new Promise(function (resolve) { setTimeout(resolve, DECISION_RELEASE_HOLD_MS); });
+    if (state.approvals.lock !== result) return;
+    // Invariant: the lock is released only after a full hold in which #main was not rewritten and a
+    // repaint under the lock rewrites nothing, so the release repaint that follows changes only the
+    // disabled and title attributes the lock adds. A repaint that throws ends the hold early; the release
+    // repaints again, so a failure that persists still surfaces there.
+    try { rerender(); } catch (e) { return; }
+    if (mainWriteCount === writes) return;
+  }
+}
+function state_RELEASEDDecision(result) {
+  if (state.approvals.lock !== result) return;
   state.approvals.lock = null;
   state.approvals.inFlightItemId = null;
   rerender();
@@ -6663,7 +6686,11 @@ async function runDecision(result, send) {
     try { await send(); }
     catch (e) { settleDecision(result, "uncertain", "The server's answer could not be read (" + ((e && e.message) || "no detail") + "). " + DECISION_UNCERTAIN_ADVICE); }
     await refreshAfterDecision(result);
-  } finally { state_RELEASEDDecision(result); }
+  } finally {
+    // A repaint that throws before the hold still releases the lock, so decisions are never stranded paused.
+    try { await state_SETTLINGDecision(result); }
+    finally { state_RELEASEDDecision(result); }
+  }
 }
 function decisionRefusedByServer(error) {
   // Invariant: only a 4xx answer proves the server refused; no answer, a 5xx or an unreadable body leaves the
