@@ -300,7 +300,9 @@ export async function loadOrCreateDemoTokenFile(path: string): Promise<{ token: 
       if (error.code === "EACCES" || error.code === "EROFS") return undefined;
       throw error;
     });
-    if (temp === undefined) return readExistingDemoToken(path);
+    // `return await`, not `return`: the read must settle inside this try, or a
+    // rejection could go unhandled while the finally below is still awaiting.
+    if (temp === undefined) return await readExistingDemoToken(path);
     try {
       // The umask may have narrowed the create mode; the published file is exactly owner read/write.
       await temp.chmod(OPERATOR_TOKEN_FILE_MODE);
