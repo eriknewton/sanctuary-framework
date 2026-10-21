@@ -18,7 +18,8 @@
  * nothing being noted on it instead; a local non-admission
  * is its own "not sent" outcome, never a refusal; the row Snooze menu and the selection pause while a batch holds
  * the lock; a batch summary is confirmed only when every count and missing id is accounted for; the result block
- * remains beside the stopped-updates panel too. The decision-result witness for D5-approval; this header carries the bare
+ * remains beside the stopped-updates panel too; releasing the lock repaints only the paused attributes, so no
+ * decision control moves in the frame it becomes clickable. The decision-result witness for D5-approval; this header carries the bare
  * id only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -703,6 +704,99 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
     await settle();
     expect(h.read("state.approvals.alwaysAllow")).toBe(false);
+  });
+
+  // Records every #main paint with whether the decision lock was held when it landed.
+  function recordPaints(h: ReturnType<typeof boot>) {
+    const paints: Array<{ html: string; locked: boolean }> = [];
+    const main = h.el.main!;
+    const inner = Object.getOwnPropertyDescriptor(FakeElement.prototype, "innerHTML")!;
+    Object.defineProperty(main, "innerHTML", {
+      get() { return inner.get!.call(main); },
+      set(value: string) { inner.set!.call(main, value); paints.push({ html: String(value), locked: !!h.read("state.approvals.lock") }); },
+    });
+    return paints;
+  }
+  // The release paint may change only the disabled and title attributes the lock adds; anything else would
+  // move a decision control in the frame it becomes clickable.
+  const withoutLockAttributes = (html: string) => html.replace(/ disabled(?: title="[^"]*")?/g, "").replace(/ title="[^"]*"/g, "");
+  function expectAttributeOnlyRelease(h: ReturnType<typeof boot>, paints: Array<{ html: string; locked: boolean }>) {
+    expect(paints.some((p) => p.locked), "the decision painted under the lock").toBe(true);
+    const release = paints.findIndex((p, i) => i > 0 && !p.locked && paints[i - 1]!.locked);
+    // No release paint means the released markup equals the last held paint, so nothing could move; the
+    // screen must then carry no paused control either.
+    const held = release > 0 ? paints[release - 1]!.html : paints[paints.length - 1]!.html;
+    const released = release > 0 ? paints[release]!.html : h.main();
+    expect(released).not.toContain(BUSY);
+    expect(released).not.toContain(REREAD_BUSY);
+    expect(withoutLockAttributes(released)).toBe(withoutLockAttributes(held));
+  }
+
+  for (const [label, items, decided, answer, pre] of [
+    ["Allow always refused on the selected request", [held("wait-1"), held("wait-2")], "/api/hub/inbox/wait-1/approve", () => Promise.resolve(response({ error: "refused" }, 403)),
+      (h: ReturnType<typeof boot>) => { h.click({ "data-action": "approval-select", "data-item-id": "wait-1" }); h.click({ "data-action": "approval-always-allow" }, true); h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" }); }],
+    ["Allow always unconfirmed on the selected request", [held("wait-1"), held("wait-2")], "/api/hub/inbox/wait-1/approve", () => Promise.reject(new Error("network down")),
+      (h: ReturnType<typeof boot>) => { h.click({ "data-action": "approval-select", "data-item-id": "wait-1" }); h.click({ "data-action": "approval-always-allow" }, true); h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" }); }],
+    ["a Tier 1 Confirm refused on the selected request", [held("wait-1", { tier: "tier1" }), held("wait-2")], "/api/hub/inbox/wait-1/approve", () => Promise.resolve(response({ error: "refused" }, 403)),
+      (h: ReturnType<typeof boot>) => { h.click({ "data-action": "approval-select", "data-item-id": "wait-1" }); h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "wait-1" }); h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "wait-1" }); }],
+    ["a deny on another row while Allow always stays chosen", [held("wait-1"), held("wait-2")], "/api/hub/inbox/wait-2/deny", () => Promise.resolve(response(resolvedBody("wait-2"))),
+      (h: ReturnType<typeof boot>) => { h.click({ "data-action": "approval-select", "data-item-id": "wait-1" }); h.click({ "data-action": "approval-always-allow" }, true); h.click({ "data-action": "inbox-deny", "data-item-id": "wait-2" }); }],
+  ] as const) {
+    it(`releasing the lock after ${label} changes only the paused attributes`, async () => {
+      vi.useFakeTimers();
+      const h = boot({
+        "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+        [decided]: answer,
+      });
+      await settle();
+      h.navigate("approvals");
+      await settle();
+      const paints = recordPaints(h);
+      pre(h);
+      await settle();
+      await settle();
+      expect(h.posts()).toEqual([decided]);
+      expect(h.read("state.approvals.lock")).toBeNull();
+      expectAttributeOnlyRelease(h, paints);
+    });
+  }
+
+  it("releasing the lock after a decision whose re-read fails changes only the paused attributes", async () => {
+    vi.useFakeTimers();
+    let decided = false;
+    const h = boot({
+      "/api/hub/inbox": () => decided ? Promise.resolve(response({ error: "down" }, 503)) : Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/inbox/wait-1/approve": () => { decided = true; return Promise.resolve(response({ error: "refused" }, 403)); },
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    const paints = recordPaints(h);
+    h.click({ "data-action": "approval-select", "data-item-id": "wait-1" });
+    h.click({ "data-action": "approval-always-allow" }, true);
+    h.click({ "data-action": "inbox-promote", "data-item-id": "wait-1" });
+    await settle();
+    await settle();
+    expect(h.read("state.approvals.result.refresh")).toBe("unavailable");
+    expect(h.read("state.approvals.lock")).toBeNull();
+    expectAttributeOnlyRelease(h, paints);
+  });
+
+  it("releasing the lock after a refused batch changes only the paused attributes", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      "/api/inbox/unified/batch": () => Promise.resolve(response({ ok: false, error: "delete_confirmation_required" }, 400)),
+    });
+    await settle();
+    h.navigate("activity");
+    h.read('state.inboxOps.selected["wait-1"] = true; state.inboxOps.selected["wait-2"] = true; rerender();');
+    const paints = recordPaints(h);
+    h.click({ "data-action": "inbox-batch-delete" });
+    await settle();
+    expect(h.posts()).toEqual(["/api/inbox/unified/batch"]);
+    expectAttributeOnlyRelease(h, paints);
   });
 
   it("the result survives a route change and clears only through its own control", async () => {

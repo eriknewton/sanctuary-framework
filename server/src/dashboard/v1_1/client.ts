@@ -6648,10 +6648,14 @@ async function refreshAfterDecision(result) {
 }
 function state_RELEASEDDecision(result) {
   if (state.approvals.lock !== result) return;
-  state.approvals.lock = null;
-  state.approvals.inFlightItemId = null;
   // Consent belongs to the selected request; a decision on another row leaves it in place.
   if (result.ids.indexOf(state.approvals.selectedId) >= 0) resetApprovalConsent();
+  // Invariant: everything the decision changed is painted while the lock still disables every decision
+  // control, so the release repaint below changes only their disabled and title attributes and no control
+  // moves in the frame it becomes clickable (the consent reset alone rewrites the drawer copy above Allow once).
+  rerender();
+  state.approvals.lock = null;
+  state.approvals.inFlightItemId = null;
   rerender();
 }
 async function runDecision(result, send) {
