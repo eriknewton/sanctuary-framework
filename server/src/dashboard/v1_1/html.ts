@@ -56,6 +56,21 @@ const OVERVIEW_FULL_ROW_MIN_PX = OVERVIEW_TILE_COUNT * OVERVIEW_TILE_MIN_PX + (O
 const OVERVIEW_COMPACT_COLUMNS = 3;
 const OVERVIEW_COMPACT_ROW_MIN_PX = OVERVIEW_COMPACT_COLUMNS * OVERVIEW_TILE_MIN_PX + (OVERVIEW_COMPACT_COLUMNS - 1) * OVERVIEW_TILE_GAP_PX;
 
+// The console's one modal scrim: 40% black over the page, shared by .intel-modal-backdrop and the operator-token
+// dialog's ::backdrop so the two modals dim the page alike.
+const MODAL_SCRIM = "rgba(0,0,0,0.4)";
+// The token notice sentence keeps a line of its own below this basis and shares the line with its button above it.
+// 320px = the narrowest phone viewport the console supports (an iPhone SE width), so on a phone the sentence wraps
+// above the button and on any wider screen they sit side by side.
+const OPERATOR_TOKEN_NOTICE_BASIS_PX = 320;
+// The token dialog is sized in characters: 60ch is the conventional upper bound of a comfortable reading line, so
+// the dialog's explanation reads as short lines at any font size; on a narrower screen it keeps a --space-4 gutter
+// on each side (the 2 is the two sides).
+const OPERATOR_TOKEN_DIALOG_MEASURE_CH = 60;
+// 600 = semibold, the weight the console's labels and headings already use (.card h3, .layer-card h4, the top-bar
+// buttons), so the token field's label reads as a label beside them.
+const OPERATOR_TOKEN_LABEL_WEIGHT = 600;
+
 const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
 ${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
@@ -443,6 +458,32 @@ body {
 }
 /* Match the shared keyboard ring, inset by its width so F cannot clip it. */
 .feedback:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+/* An empty F is visually quiet: its edge and fill go transparent while the
+   grid track (--feedback-height) and the 1px border widths stay, so its box
+   and every control above it keep their exact place. Any child in one of its
+   three hosts restores the visible row. The host ids must match toast-host
+   (toast), decision-feedback-result (renderFeedback) and operator-token-entry
+   (renderOperatorTokenEntry) in client.ts. A browser without :has() drops this
+   rule and keeps the bordered row, which is the previous look. */
+.feedback:not(:has(#toast-host > *, #decision-feedback-result > *, #operator-token-entry > *)) {
+  border-color: transparent; background: transparent;
+}
+/* The notice basis and dialog measure are derived beside their constants above STYLES. */
+.operator-token-entry { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.operator-token-entry p { margin: 0; flex: 1 1 ${OPERATOR_TOKEN_NOTICE_BASIS_PX}px; }
+.operator-token-dialog {
+  width: min(${OPERATOR_TOKEN_DIALOG_MEASURE_CH}ch, calc(100vw - 2 * var(--space-4))); padding: var(--space-4);
+  background: var(--surface); color: var(--ink); border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
+}
+/* MODAL_SCRIM, shared with .intel-modal-backdrop. */
+.operator-token-dialog::backdrop { background: ${MODAL_SCRIM}; }
+.operator-token-dialog h2 { margin: 0 0 var(--space-2); font-size: var(--text-lg); }
+.operator-token-dialog p { margin: 0 0 var(--space-2); color: var(--ink-2); }
+.operator-token-dialog label { display: block; margin-bottom: var(--space-1); font-weight: ${OPERATOR_TOKEN_LABEL_WEIGHT}; }
+/* --ink-3 is the control boundary every input wears (see .btn). */
+.operator-token-dialog input { width: 100%; padding: var(--space-1) var(--space-2); border: 1px solid var(--ink-3); border-radius: var(--rad); font: inherit; color: var(--ink); background: var(--surface-2); }
+.operator-token-error { color: var(--rust); margin-top: var(--space-2); }
+.operator-token-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-3); }
 .toast {
   background: var(--ink); color: var(--paper); padding: var(--space-2);
   border-radius: var(--rad); font-size: var(--text-sm);
@@ -560,7 +601,7 @@ body {
 .intel-hardware dt { color: var(--ink-3); font-family: var(--mono); }
 .intel-hardware dd { margin: 0; }
 .intel-modal-backdrop {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 1100;
+  position: fixed; inset: 0; background: ${MODAL_SCRIM}; z-index: 1100;
   display: flex; align-items: flex-start; justify-content: center;
   padding: 40px 16px; overflow-y: auto;
 }
@@ -2469,10 +2510,27 @@ export function renderDashboardV11Html(
       <div id="toast-host" aria-live="polite"></div>
       <!-- Must match renderFeedback in client.ts; it replaces only this host's children. -->
       <div id="decision-feedback-result"></div>
+      <!-- Must match renderOperatorTokenEntry in client.ts; it writes only this host, and only after a read is refused. -->
+      <div id="operator-token-entry"></div>
     </section>
   </div>
   <!-- announceDecision in client.ts uses this permanent body-level live region across route redraws. -->
   <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+  <!-- Must match the operator-token-* ids in client.ts (openOperatorTokenDialog, submitOperatorToken). The field is a
+       password input that client.ts empties on submit, cancel and close, so a pasted token never stays in the page. -->
+  <dialog class="operator-token-dialog" id="operator-token-dialog" aria-labelledby="operator-token-dialog-title">
+    <form id="operator-token-form" data-action="operator-token-submit" method="dialog" autocomplete="off">
+      <h2 id="operator-token-dialog-title">Paste operator token</h2>
+      <p>This console reads your fortress with its operator token. The token is kept only for this browser tab, and the page reloads once it is saved.</p>
+      <label for="operator-token-input">Operator token</label>
+      <input id="operator-token-input" name="operator-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p id="operator-token-error" class="operator-token-error" role="alert" hidden></p>
+      <div class="operator-token-actions">
+        <button type="button" class="btn" data-action="operator-token-cancel">Cancel</button>
+        <button type="submit" class="btn btn-primary">Use token</button>
+      </div>
+    </form>
+  </dialog>
   <aside class="talk-panel" id="talk-panel" aria-label="Talk to your fortress" hidden>
     <div class="talk-panel-head"><strong>Talk</strong><a href="#dashboard" data-action="talk-open-full">Open as a full page</a><button type="button" class="iconbtn" data-action="talk-close" aria-label="Close the Talk panel" title="Close">${ICON_CLOSE}</button></div>
     <div class="talk-panel-body" id="talk-panel-body"></div>
