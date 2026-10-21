@@ -160,6 +160,8 @@ export function createServer(
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as Record<string, unknown>;
     const currentAgentId = options?.currentAgentId?.();
+    // The `agent:` form must match requestingAgentId in
+    // server/src/principal-policy/gate.ts, which attributes held calls.
     const callerIdentity = currentAgentId
       ? `agent:${currentAgentId}`
       : "agent:unknown";

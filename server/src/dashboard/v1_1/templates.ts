@@ -151,6 +151,10 @@ function shortTime(iso: string | null): string {
 // "[unrecognized template: ...]" on a live operator-facing card.
 const TEMPLATES: Record<string, TemplateRenderer> = {
   // ── approval_pending.tier1.* ─────────────────────────────────────────
+  // `agent_id` here is the operation's TARGET. A projected Charter hold never
+  // supplies it (its requester is the card's top-level agent_id instead), and a
+  // fallback that names a definite subject must be listed in
+  // TARGET_DEFAULTING_CATEGORIES in server/src/hub/charter-approval-bridge.ts.
   "approval_pending.tier1.lockdown": (a) =>
     `Cut agent ${arg(a, "agent_id")}'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
   "approval_pending.tier1.fortress_lockdown": () =>

@@ -22,10 +22,16 @@
  * leaves the queue (approved elsewhere, denied elsewhere, or auto-denied on
  * timeout) must vanish from the inbox in the same breath. Upserting these into
  * the store would instead retain one unresolved phantom card per agent-raised
- * approval, forever, driven by agent-controlled call volume.
+ * approval, forever, driven by agent-controlled call volume. The hub keeps a
+ * separate, capped list of cards IT decided (`HubService.rememberCharterDecision`)
+ * so the Decided view can show them; those entries are resolved cards admitted
+ * only by an accepted operator decision, so they never read as open holds.
  */
 
-import type { HubApprovalPendingItem } from "../contracts/v1.1/hub-events.js";
+import type {
+  HubApprovalPendingItem,
+  HubDisplayTemplateArg,
+} from "../contracts/v1.1/hub-events.js";
 import { HUB_INBOX_TEMPLATE_NAMESPACES } from "./constants.js";
 
 /**
@@ -40,6 +46,16 @@ export interface CharterApprovalRecord {
   operation: string;
   tier: 1 | 2;
   created_at: string;
+  /**
+   * The hub agent id of the agent this server process is configured for
+   * (its wrap-time `SANCTUARY_AGENT_ID`), when the gate knew it: the agent
+   * whose call was held. It is the REQUESTER, never the operation's target; the
+   * target is whatever the held call's own arguments name. Must match
+   * `ApprovalRequest.requesting_agent_id` in server/src/principal-policy/types.ts,
+   * whose only writer is `ApprovalGate.requestingAgentId` (never a tool
+   * argument). Absent means unattributed.
+   */
+  requesting_agent_id?: string;
 }
 
 /**
@@ -116,7 +132,7 @@ export function charterApprovalIdFromItemId(itemId: string): string | null {
  * `server/src/contracts/v1.1/hub-events.ts` AND to the Tier 1 set in
  * `server/src/principal-policy/loader.ts` in the same change.
  */
-const OPERATION_NAME_CATEGORIES = [
+export const OPERATION_NAME_CATEGORIES = [
   "state_export",
   "state_import",
   "state_delete",
@@ -139,14 +155,30 @@ function categoryFor(
 }
 
 /**
+ * Categories whose catalog sentence, given no `agent_id` argument, still names
+ * a definite subject: `identity_rotate` reads "Rotate the identity key for this
+ * fortress." and `sanctuary_export_identity_bundle` reads as the operator's
+ * bundle, while both tools take an `identity_id` that can name another
+ * identity. A Charter card carries no verified target, so for these the card
+ * renders the tier's catch-all sentence, which names no target, while
+ * `operation_category` still says what is held. Must match the `agent_id`
+ * fallbacks in the approval_pending.* entries of
+ * server/src/dashboard/v1_1/templates.ts; a full-set test renders every
+ * category in OPERATION_NAME_CATEGORIES to keep this list complete.
+ */
+const TARGET_DEFAULTING_CATEGORIES: ReadonlySet<HubApprovalPendingItem["operation_category"]> =
+  new Set(["identity_rotate", "sanctuary_export_identity_bundle"]);
+
+/**
  * Project one live Charter hold into an inbox card.
  *
  * The card carries NO argument detail. `HubDisplayTemplateArg` is a closed
  * typed union with no free-text member precisely so a backend cannot smuggle
  * raw tool arguments into operator copy, and a Charter hold's context is raw
- * tool arguments. The card therefore says which tier is waiting and on which
- * identity; `GET /api/pending` remains the surface that carries the redacted
- * argument summary.
+ * tool arguments. The card therefore says which tier is waiting, on which
+ * identity, and (when the gate stamped it) which configured agent asked; it
+ * names no target. `GET /api/pending` remains the surface that carries the
+ * redacted argument summary.
  */
 export function projectCharterApproval(
   record: CharterApprovalRecord,
@@ -154,17 +186,36 @@ export function projectCharterApproval(
 ): HubApprovalPendingItem {
   const tier = record.tier === 1 ? "tier1" : "tier2";
   const category = categoryFor(record.operation);
+  // The approval_pending.tier2.* catalog has no sentence for any category this
+  // bridge maps (only `policy_change`, which it never emits, and `other`), so a
+  // Tier 2 hold always uses the Tier 2 catch-all rather than an unregistered id.
+  const templateCategory =
+    tier === "tier2" || TARGET_DEFAULTING_CATEGORIES.has(category) ? "other" : category;
+  // Rule 7: `requesting_agent_id` is the agent this server process is configured
+  // for, stamped by the gate; it says who ASKED, never what the operation acts
+  // on. It is therefore carried only as the card's top-level `agent_id`, which
+  // the console renders as the requester (approvalAgentId in
+  // server/src/dashboard/v1_1/client.ts: the Agent column and "Requested by"),
+  // and NEVER as a template `agent_id` argument, because the approval_pending.*
+  // sentences read that argument as the operation's TARGET ("Rotate the identity
+  // key for <agent_id>"). A Charter card has no verified target, so its sentence
+  // gets none. `identity_id` stays the hub identity because the inbox scopes by it.
+  const agentId = record.requesting_agent_id;
+  const displayArgs: HubDisplayTemplateArg[] = [
+    { kind: "identity_id", value: identityId },
+  ];
   return {
     version: "1.1",
     item_id: charterApprovalItemId(record.id),
     kind: "approval_pending",
     created_at: record.created_at,
     identity_id: identityId,
+    ...(agentId ? { agent_id: agentId } : {}),
     // Template ids are `<namespace>.<tier>.<category>`; `.other` is the
     // catalog's registered fallback, so an unmapped operation still renders
     // real copy instead of "[unrecognized template: ...]" on a live card.
-    display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.${tier}.${category}`,
-    display_template_args: [{ kind: "identity_id", value: identityId }],
+    display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.${tier}.${templateCategory}`,
+    display_template_args: displayArgs,
     resolved: false,
     tier,
     operation_category: category,

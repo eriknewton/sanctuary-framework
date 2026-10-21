@@ -60,6 +60,7 @@
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "test:security": "vitest run test/security",
+    "demo:reset": "bash scripts/demo/reset.sh",
     "test:integration": "vitest run test/integration",
     "test:conformance": "vitest run test/conformance",
     "test:zero-pii-regression": "vitest run test/query-anonymity/zero-pii-regression.test.ts",

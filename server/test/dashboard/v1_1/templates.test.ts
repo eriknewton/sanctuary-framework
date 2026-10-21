@@ -17,6 +17,10 @@ import {
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { STATUS_MAPPING } from "../../../src/dashboard/v1_1/status-mapping.js";
 import type { HubDisplayTemplateArg } from "../../../src/contracts/v1.1/hub-events.js";
+import {
+  OPERATION_NAME_CATEGORIES,
+  projectCharterApproval,
+} from "../../../src/hub/charter-approval-bridge.js";
 
 /**
  * Extracts the key set of the client's `TEMPLATES` mirror map by
@@ -320,4 +324,46 @@ describe("v1.1 dashboard template registry", () => {
 
 it("anchors the approved pending-removal sentence", () => {
   expect(renderTemplate("approval_pending.tier1.unwrap", [{ kind: "agent_id", value: "agent-alpha" }])).toBe("Request to remove protection from agent agent-alpha. This build refuses unsupported removals before approval is queued.");
+});
+
+// A configured requester with a distinctive id, so any sentence that names it is caught.
+const CHARTER_REQUESTER = "agent:claude-code:fortress-requester-a";
+// The catalog's neutral fallback for a missing target, shared by server and client arg().
+const UNKNOWN_TARGET = "(unknown)";
+
+it("renders every Charter card category without naming the requester or a defaulted target, on server and client", () => {
+  // Full-set (AGENTS.md rule 5): every category the bridge can emit is projected
+  // and rendered by both catalogs, so a category added later whose sentence
+  // defaults its target cannot slip past TARGET_DEFAULTING_CATEGORIES.
+  const clientTemplates = extractClientTemplates();
+  for (const operation of OPERATION_NAME_CATEGORIES) {
+    for (const tier of [1, 2] as const) {
+      const card = projectCharterApproval(
+        {
+          id: "hold-1",
+          operation,
+          tier,
+          created_at: "2026-10-21T00:00:00.000Z",
+          requesting_agent_id: CHARTER_REQUESTER,
+        },
+        "operator-identity",
+      );
+      expect(card.agent_id, operation).toBe(CHARTER_REQUESTER);
+      expect(card.display_template_args.some((a) => a.kind === "agent_id"), operation).toBe(false);
+      const client = clientTemplates[card.display_template_id];
+      expect(client, `${card.display_template_id} has a client mirror`).toBeDefined();
+      for (const sentence of [
+        renderTemplate(card.display_template_id, card.display_template_args),
+        client!(card.display_template_args),
+      ]) {
+        expect(sentence, operation).not.toContain(CHARTER_REQUESTER);
+        expect(sentence.startsWith("[unrecognized template"), operation).toBe(false);
+        // Either the sentence leaves the target unknown, or the card uses the
+        // tier's catch-all, whose sentence names no target.
+        const neutral =
+          sentence.includes(UNKNOWN_TARGET) || card.display_template_id.endsWith(".other");
+        expect(neutral, `${operation} tier ${tier}: ${sentence}`).toBe(true);
+      }
+    }
+  }
 });

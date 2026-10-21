@@ -156,6 +156,7 @@ export class ApprovalGate {
   private proxyTierResolver?: ProxyTierResolver;
   private approvalProofStore: ApprovalProofStore;
   private currentSessionBinding?: () => SessionBinding | undefined;
+  private currentAgentId?: () => string | undefined;
 
   constructor(
     policy: PrincipalPolicy,
@@ -168,6 +169,13 @@ export class ApprovalGate {
     options?: {
       approvalProofStore?: ApprovalProofStore;
       currentSessionBinding?: () => SessionBinding | undefined;
+      /**
+       * The wrap-time agent id of the agent this server process serves
+       * (`SANCTUARY_AGENT_ID`), the same supplier the router takes. Display
+       * attribution only: absence leaves holds unattributed and changes no
+       * verdict, so it is optional without weakening any security property.
+       */
+      currentAgentId?: () => string | undefined;
     }
   ) {
     this.policy = policy;
@@ -179,6 +187,30 @@ export class ApprovalGate {
     this.onApprovalEvent = onApprovalEvent;
     this.approvalProofStore = options?.approvalProofStore ?? new ApprovalProofStore();
     this.currentSessionBinding = options?.currentSessionBinding;
+    this.currentAgentId = options?.currentAgentId;
+  }
+
+  /**
+   * The hub id of the agent this server process is configured for, used as
+   * the requester of a hold, or undefined. It names who asked, never the
+   * operation's target.
+   *
+   * Rule-7 provenance: the value comes from the server-set `currentAgentId`
+   * supplier and never from tool arguments, so an agent cannot name a different
+   * agent as the requester of its own call. The `agent:` prefix must match the
+   * router's `callerIdentity` in server/src/router.ts and `agent_id` in
+   * `buildLocalAgentRecord` (server/src/wrap/cli.ts), so the card names the same
+   * registry row the Agents screen lists. A throwing supplier yields no
+   * attribution rather than failing the gate, because attribution is display.
+   */
+  private requestingAgentId(): string | undefined {
+    let raw: string | undefined;
+    try {
+      raw = this.currentAgentId?.();
+    } catch {
+      return undefined;
+    }
+    return typeof raw === "string" && raw.length > 0 ? `agent:${raw}` : undefined;
   }
 
   /**
@@ -800,6 +832,7 @@ export class ApprovalGate {
     binding?: { argsHash: string; targetResource?: string }
   ): Promise<GateResult> {
     const requestTimestamp = new Date().toISOString();
+    const requestingAgentId = this.requestingAgentId();
     const request: ApprovalRequest = {
       operation,
       tier,
@@ -807,6 +840,9 @@ export class ApprovalGate {
       context,
       timestamp: requestTimestamp,
       ...(binding ? { args_binding: binding.argsHash } : {}),
+      // A typed field outside `context`, so no caller-built context key can
+      // stand in for it; see requestingAgentId() for where the value comes from.
+      ...(requestingAgentId ? { requesting_agent_id: requestingAgentId } : {}),
     };
 
     // Fire `requested` lifecycle to the aggregator before the channel
