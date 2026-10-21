@@ -420,7 +420,7 @@ function escHtml(v) {
 // overrides and isolates, zero-width marks, interlinear annotation marks, supplementary tag characters), lone
 // surrogate (Cs), line separator (Zl) and paragraph separator (Zp) code point, plus the visibly blank combining
 // grapheme joiner, Hangul fillers and variation selectors. Must match HELD_SUBJECT_HIDDEN_CHARS in templates.ts.
-const HELD_SUBJECT_HIDDEN_CHARS = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\u034f\u115f\u1160\u3164\uffa0\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/gu;
+const HELD_SUBJECT_HIDDEN_CHARS = /\p{Cc}|\p{Cf}|\p{Cs}|\p{Zl}|\p{Zp}|\u034f|\u115f|\u1160|\u3164|\uffa0|[\ufe00-\ufe0f]|[\u{e0100}-\u{e01ef}]/gu;
 // The last code point a four-digit \uXXXX escape can name; anything above it is written \u{XXXXX}. Must match
 // LAST_FOUR_DIGIT_ESCAPE_CODE_POINT in templates.ts.
 const LAST_FOUR_DIGIT_ESCAPE_CODE_POINT = 0xffff;

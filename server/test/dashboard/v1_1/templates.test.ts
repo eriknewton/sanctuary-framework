@@ -20,7 +20,6 @@ import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import {
   SUBJECT_SLOT,
   clientDeclarations,
-  decodeHtmlText,
   extractClientDeclaration,
   splitHeldReason,
 } from "./client-script-extract.js";
@@ -555,8 +554,8 @@ it("lists exactly the templates whose sentence names the held operation, and ren
       const { prose, subjects } = splitHeldReason(html);
       expect(prose, id).toBe(`Run a ${tier} operation: ${SUBJECT_SLOT}.`);
       expect(subjects, id).toEqual([heldSubjectText(operation)]);
-      // The HTML's text is the server sentence, word for word.
-      expect(decodeHtmlText(html.replace(/<[^>]+>/g, "")), id).toBe(renderTemplate(id, args));
+      // The HTML's text is the server sentence, word for word: the console's words with the element's text in its slot.
+      expect(prose.split(SUBJECT_SLOT).join(subjects[0]!), id).toBe(renderTemplate(id, args));
     }
   }
 });

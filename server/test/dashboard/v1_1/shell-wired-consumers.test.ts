@@ -3739,7 +3739,9 @@ describe("Approvals round-one decision and evidence states", () => {
     });
     await settle();
     // Everything outside the delimited elements, with select options (which cannot hold markup) set aside.
-    const outside = (html: string) => html.split(chip).join("").replace(/<option[^>]*>[^<]*<\/option>/g, "");
+    const withoutOptions = (html: string) =>
+      html.split("<option").map((part, i) => (i === 0 ? part : part.slice(part.indexOf("</option>") + "</option>".length))).join("");
+    const outside = (html: string) => withoutOptions(html.split(chip).join(""));
 
     const overview = h.el.main!.innerHTML;
     expect(overview).toContain("Needs your decision");
