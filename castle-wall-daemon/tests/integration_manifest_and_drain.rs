@@ -25,7 +25,7 @@
 //! isolation structural — there is no way to boot this suite's daemon without it.
 
 use base64::Engine;
-use castle_wall_daemon::audit::WalWriter;
+use castle_wall_daemon::audit::{WalEntry, WalWriter};
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::boot;
 use castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY;
@@ -37,7 +37,10 @@ use castle_wall_daemon::manifest::verify::{
     AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
-use castle_wall_daemon::policy::OPERATION_VERDICT_SUPERSEDED;
+use castle_wall_daemon::policy::{
+    OPERATION_EGRESS_APPROVED, OPERATION_EGRESS_BLOCKED, OPERATION_EGRESS_PENDING,
+    OPERATION_VERDICT_SUPERSEDED,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -1090,7 +1093,7 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
         .iter()
         .find(|e| {
             e.event_canonical_json
-                .contains("\"operation\":\"egress_approved\"")
+                .contains(&format!("\"operation\":\"{OPERATION_EGRESS_APPROVED}\""))
         })
         .expect("the allow receipt this race is about");
     let superseding = events
@@ -1134,7 +1137,52 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
     let _ = booted.handle.stop();
 }
 
-fn wal_operations(wal: &mut WalWriter) -> Vec<(u64, String)> {
+/// Publish the fixture's first active-generation pointer, retaining the boot policy.
+fn publish_signed_manifest_atomically(
+    policy_dir: &Path,
+    signing: &SigningKey,
+    rule_count: usize,
+    generation: u64,
+) {
+    use std::os::unix::fs::DirBuilderExt;
+
+    // These private on-disk names must match ACTIVE_GENERATION_FILENAME and
+    // GENERATIONS_SUBDIR in src/manifest/store.rs. The fixture test below loads
+    // through that production reader to check the complete layout contract.
+    let pointer = policy_dir.join(".active-policy-generation");
+    let generations = policy_dir.join(".policy-generations");
+    // Only a first publication is supported: replacing a pointer could unlink
+    // an open inode before read_bounded_regular_no_follow checks its link count.
+    assert!(
+        !pointer.exists(),
+        "fixture must retain the original policy and pointer inodes"
+    );
+    const OWNER_ONLY_DIRECTORY_MODE: u32 = 0o700; // Owner read/write/traverse only.
+    fs::DirBuilder::new()
+        .mode(OWNER_ONLY_DIRECTORY_MODE)
+        .create(&generations)
+        .unwrap();
+    // resolve_active_policy_dir requires g- followed by 16 lowercase hex digits
+    // (the complete 64-bit generation encoded at four bits per hex digit).
+    let generation_name = format!("g-{generation:016x}");
+    let staged = generations.join(&generation_name);
+    fs::DirBuilder::new()
+        .mode(OWNER_ONLY_DIRECTORY_MODE)
+        .create(&staged)
+        .unwrap();
+    write_signed_manifest(&staged, signing, rule_count, generation);
+    let mut staged_pointer = tempfile::NamedTempFile::new_in(policy_dir).unwrap();
+    staged_pointer
+        .write_all(generation_name.as_bytes())
+        .unwrap();
+    // load_signed_manifest_from_disk resolves the pointer once, then reads all
+    // files from that exact directory. The absent-pointer path still has the
+    // untouched boot policy, so either side of this rename is a complete set.
+    // Keep both generations until the fixture's TempDir is dropped after stop.
+    fs::rename(staged_pointer.path(), pointer).unwrap();
+}
+
+fn capped_wal_snapshot(wal: &mut WalWriter) -> Vec<WalEntry> {
     // Preserve the fixture's existing 500-row bound; reaching it must not hide later rows.
     const SNAPSHOT_ROW_LIMIT: usize = 500;
     let rows = wal.snapshot_after(None, SNAPSHOT_ROW_LIMIT).unwrap();
@@ -1143,6 +1191,11 @@ fn wal_operations(wal: &mut WalWriter) -> Vec<(u64, String)> {
         "fixture WAL snapshot reached its cap: limit {SNAPSHOT_ROW_LIMIT}, row count {}",
         rows.len()
     );
+    rows
+}
+
+fn wal_operations(wal: &mut WalWriter) -> Vec<(u64, String)> {
+    let rows = capped_wal_snapshot(wal);
     rows.iter()
         .map(|row| {
             let event: serde_json::Value = serde_json::from_str(&row.event_canonical_json)
@@ -1168,15 +1221,12 @@ const EXPECTED_RELOAD_CONTROL_OPERATIONS: &[&str] = &[
     "ipc_policy_reload_authorized",
     // src/runtime_providers.rs: handle_manifest_watcher_event authorizes a reload.
     "manifest_watcher_reload_authorized",
-    // src/runtime_providers.rs: reload_manifest_from_watcher audits verification
-    // failure after releasing the reload lock. A read during write_signed_manifest
-    // can fail transiently and its audit can arrive after the baseline.
-    "manifest_verify_failed_kept_prior",
 ];
 
 fn assert_only_reload_control_rows_after(operations: &[(u64, String)], baseline_seq: u64) {
     for (seq, operation) in operations.iter().filter(|(seq, _)| *seq > baseline_seq) {
-        // Only expected reload control evidence may extend the WAL after admission.
+        // Failure and loss operations are fault evidence, never authorization;
+        // accepting them would hide a broken reload or a mis-tagged egress write.
         assert!(
             EXPECTED_RELOAD_CONTROL_OPERATIONS.contains(&operation.as_str()),
             "unexpected operation {operation} at sequence {seq} after baseline sequence {baseline_seq}"
@@ -1189,8 +1239,11 @@ fn egress_row_count_detects_appended_egress_records() {
     const EMPTY_EGRESS_COUNT: usize = 0; // The baseline contains only a control row.
     const APPENDED_EGRESS_ROWS: usize = 1; // Each iteration appends one row.
     const UNADMITTED_IDENTITY: &str = "unadmitted/agent-x";
-    // These verdict names must match `operation_for_verdict` in `src/policy.rs`.
-    const VERDICT_OPERATIONS: &[&str] = &["egress_approved", "egress_pending", "egress_blocked"];
+    const VERDICT_OPERATIONS: &[&str] = &[
+        OPERATION_EGRESS_APPROVED,
+        OPERATION_EGRESS_PENDING,
+        OPERATION_EGRESS_BLOCKED,
+    ];
     let dir = TempDir::new().expect("tempdir");
     let mut wal = WalWriter::open(&dir.path().join("filter-events.wal")).unwrap();
     wal.append_control_critical(r#"{"operation":"ipc_policy_reload_authorized"}"#)
@@ -1213,7 +1266,7 @@ fn egress_row_count_detects_appended_egress_records() {
             "identity_id": UNADMITTED_IDENTITY,
         });
         let seq = wal.append_critical(&event.to_string()).unwrap();
-        let appended_rows = wal.snapshot_after(None, usize::MAX).unwrap();
+        let appended_rows = capped_wal_snapshot(&mut wal);
         let appended = appended_rows.iter().find(|row| row.seq == seq).unwrap();
         let persisted: serde_json::Value =
             serde_json::from_str(&appended.event_canonical_json).unwrap();
@@ -1263,6 +1316,78 @@ fn egress_row_count_rejects_unexpected_non_egress_row_after_baseline() {
 }
 
 #[test]
+#[should_panic(expected = "unexpected operation manifest_verify_failed_kept_prior at sequence")]
+fn egress_row_count_rejects_manifest_verification_failure_after_baseline() {
+    assert_post_baseline_fault_rejected("manifest_verify_failed_kept_prior");
+}
+
+#[test]
+#[should_panic(expected = "unexpected operation manifest_watcher_lost at sequence")]
+fn egress_row_count_rejects_watcher_loss_after_baseline() {
+    assert_post_baseline_fault_rejected("manifest_watcher_lost");
+}
+
+fn assert_post_baseline_fault_rejected(operation: &str) {
+    let dir = TempDir::new().expect("tempdir");
+    let mut wal = WalWriter::open(&dir.path().join("filter-events.wal")).unwrap();
+    let baseline_seq = wal
+        .append_control_critical(r#"{"operation":"ipc_policy_reload_authorized"}"#)
+        .unwrap();
+    let baseline_count = egress_row_count(&wal_operations(&mut wal));
+    wal.append_control_critical(&serde_json::json!({"operation": operation}).to_string())
+        .unwrap();
+    let rows = wal_operations(&mut wal);
+    assert_eq!(egress_row_count(&rows), baseline_count);
+    assert_only_reload_control_rows_after(&rows, baseline_seq);
+}
+
+#[test]
+fn egress_row_count_fixture_publishes_complete_policy_without_rewriting_active_rules() {
+    use castle_wall_daemon::manifest::load_signed_manifest_from_disk;
+    use std::os::unix::fs::MetadataExt;
+
+    const INITIAL_GENERATION: u64 = 1; // First signed fixture generation.
+    const NEXT_GENERATION: u64 = INITIAL_GENERATION + 1; // Advance by one generation.
+    const NO_ORDINARY_RULES: usize = 0; // Only the mandatory habeas rule at boot.
+    const ONE_ORDINARY_RULE: usize = 1; // The admitted attempt's allow rule.
+    let dir = TempDir::new().expect("tempdir");
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = signing.verifying_key().to_bytes();
+    write_signed_manifest(dir.path(), &signing, NO_ORDINARY_RULES, INITIAL_GENERATION);
+    let before = load_signed_manifest_from_disk(dir.path(), &pinned).unwrap();
+    let mut old_manifest = fs::File::open(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let old_manifest_bytes = fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap();
+    let old_rules = before
+        .rule_files
+        .iter()
+        .map(|(name, bytes)| {
+            let path = dir.path().join(RULES_SUBDIR).join(name);
+            (path.clone(), fs::metadata(path).unwrap().ino(), bytes)
+        })
+        .collect::<Vec<_>>();
+
+    publish_signed_manifest_atomically(dir.path(), &signing, ONE_ORDINARY_RULE, NEXT_GENERATION);
+
+    // The loader checks link count after open, so retaining both the original
+    // manifest and its rules matters even after the pointer has been published.
+    const SINGLE_LINK: u64 = 1; // read_bounded_regular_no_follow requires one link.
+    assert_eq!(old_manifest.metadata().unwrap().nlink(), SINGLE_LINK);
+    let mut retained_bytes = Vec::new();
+    old_manifest.read_to_end(&mut retained_bytes).unwrap();
+    assert_eq!(retained_bytes, old_manifest_bytes);
+    for (path, inode, bytes) in old_rules {
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(path).unwrap(), *bytes);
+    }
+    let after = load_signed_manifest_from_disk(dir.path(), &pinned).unwrap();
+    assert_eq!(after.signed.manifest.generation, NEXT_GENERATION);
+    assert_eq!(
+        after.rule_files.len(),
+        before.rule_files.len() + ONE_ORDINARY_RULE
+    );
+}
+
+#[test]
 fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
     // End-to-end: boot the daemon with one allow rule, drive a real
     // evaluate_attempt through the DaemonHandle, drain via the IPC server
@@ -1274,12 +1399,18 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         build_verdict_callback, register_agent_mark, resolve_agent_mark, NfVerdict, PendingPacket,
     };
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let booted = boot_daemon_with_policy(0);
-    // Manifest store currently has no rule; reload from disk via the
-    // DaemonHandle to load the snapshot. boot_daemon_with_policy(0) wrote
-    // a manifest with zero rules, so we install a real rule manifest now.
+    const NO_ORDINARY_RULES: usize = 0; // Only the mandatory habeas rule at boot.
+    const ONE_ORDINARY_RULE: usize = 1; // The admitted attempt's allow rule.
+    const RELOAD_GENERATION: u64 = 2; // The boot helper publishes generation 1.
+    let booted = boot_daemon_with_policy(NO_ORDINARY_RULES);
+    // Publish the allow rule without replacing files the live watcher may read.
     let signing = &booted.signing_key;
-    write_signed_manifest(&booted.policy_dir, signing, 1, 2);
+    publish_signed_manifest_atomically(
+        &booted.policy_dir,
+        signing,
+        ONE_ORDINARY_RULE,
+        RELOAD_GENERATION,
+    );
     let mut reload_stream = connect_and_handshake(
         &booted.socket_path,
         &booted.signing_key,
@@ -1422,7 +1553,10 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
             assert!(events.len() >= 2);
             let approved = events
                 .iter()
-                .filter(|e| e.event_canonical_json.contains("\"egress_approved\""))
+                .filter(|e| {
+                    e.event_canonical_json
+                        .contains(&format!("\"{OPERATION_EGRESS_APPROVED}\""))
+                })
                 .collect::<Vec<_>>();
             assert_eq!(approved.len(), 1, "the admitted mark writes one egress row");
             let approved = approved[0];
