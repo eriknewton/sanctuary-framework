@@ -141,7 +141,8 @@ export async function recordFeedbackBaseline(page: Page, controlSelector: string
     const observedSample = () => { observerCallbacks++; sample(); };
     const fm = new MutationObserver(observedSample);
     fm.observe(feedback, { subtree: true, childList: true, attributes: true, characterData: true });
-    const ro = new ResizeObserver(observedSample);
+    let initialResizeDelivered = false;
+    const ro = new ResizeObserver(() => { initialResizeDelivered = true; observedSample(); });
     nodes.forEach(n => ro.observe(n));
     // Freeze user scroll input without changing CSS overflow or content geometry.
     main.addEventListener('wheel', e => e.preventDefault(), { passive: false });
@@ -149,12 +150,16 @@ export async function recordFeedbackBaseline(page: Page, controlSelector: string
     main.addEventListener('keydown', e => {
       if (['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
     });
-    window.feedbackRecord = { sample, failures, disconnect: () => { mo.disconnect(); fm.disconnect(); ro.disconnect(); }, resetObservers: () => { observerCallbacks = 0; },
+    window.feedbackRecord = { sample, failures, disconnect: () => { mo.disconnect(); fm.disconnect(); ro.disconnect(); }, resetObservers: () => { observerCallbacks = 0; }, initialResizeDelivered: () => initialResizeDelivered,
       stats: () => ({ samples, observerCallbacks, mutations }) };
     sample();
   })()`);
   // Drain the mandatory initial ResizeObserver delivery before counting the transition.
+  // That delivery rides a real rendering frame, which the paused fake clock does not
+  // advance; resetting before it lands lets it count as a post-setup observer sample.
   await page.clock.runFor(SETTLE_FRAMES_MS);
+  await expect.poll(() => page.evaluate<boolean>("feedbackRecord.initialResizeDelivered()"),
+    { message: "initial ResizeObserver delivery before the observer reset" }).toBe(true);
   await page.evaluate("feedbackRecord.resetObservers()");
 }
 
