@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
-- `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install already carrying another form keeps running under its installed policy, where that rule matches nothing, and units already enabled still start at boot; `start` and `enable` refuse until the policy is re-signed with the `uid-<uid>` form and reinstalled.
+- `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.
 
 ### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
 
@@ -44,7 +44,7 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 
 ### Fixed
 
-- Full exports and checkpoints include every durable namespace, including from a freshly started process, and exit bundles find namespaces the same way storage does.
+- Full exports and checkpoints include every exportable durable namespace (reserved internal namespaces are not exported), including from a freshly started process, and exit bundles find namespaces the same way storage does.
 - State import and checkpoint restore check version floors before writing anything, and accept entries signed before an identity rotation; an entry whose rotation chain does not verify is still refused. The export and exit guarantee as a whole stays `partial` in the Assurance Matrix.
 - An interrupted restore, or an interrupted master-key rotation (`rotate-master --resume`), completes on the next retry. A custody write commits its envelope and sentinel together, so an interrupted write leaves the old pair or the new pair, never one of each.
 - A confirmed `castle-wall re-pin` and `castle-wall provision-pin` open the fortress through the same custody resolver as `protect`, `export-passphrase` and the install planner, and `protect` hands the pin step no credential in arguments or environment.
@@ -89,7 +89,7 @@ The Linux wall ships as a separate package, [Castle Wall Linux 0.1.0-1](https://
 
 ## [1.8.6] - unreleased
 
-Pre-releases rc.1 to rc.5 on `next` only; superseded by 1.9.0, which carries these fixes. One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published.
+Pre-releases rc.1 to rc.5 on `next` only; superseded by 1.9.0-rc.1, which carries these fixes. One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published.
 
 ### Fixed
 
