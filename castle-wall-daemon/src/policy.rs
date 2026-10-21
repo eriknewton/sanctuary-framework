@@ -1382,13 +1382,20 @@ fn reject_identity_collision<'a>(
     Ok(())
 }
 
+/// Audit operation for an allowed attempt; consumers use this exact wire tag.
+pub const OPERATION_EGRESS_APPROVED: &str = "egress_approved";
+/// Audit operation for an attempt awaiting approval; consumers use this exact wire tag.
+pub const OPERATION_EGRESS_PENDING: &str = "egress_pending";
+/// Audit operation for a denied attempt; consumers use this exact wire tag.
+pub const OPERATION_EGRESS_BLOCKED: &str = "egress_blocked";
+
 /// Operation tag that maps to the existing Sanctuary `AuditEntry.operation`
 /// enum per scope-lock §8.
 fn operation_for_verdict(verdict: &Verdict) -> &'static str {
     match verdict {
-        Verdict::Allow { .. } => "egress_approved",
-        Verdict::PromptRequired { .. } => "egress_pending",
-        Verdict::Deny { .. } => "egress_blocked",
+        Verdict::Allow { .. } => OPERATION_EGRESS_APPROVED,
+        Verdict::PromptRequired { .. } => OPERATION_EGRESS_PENDING,
+        Verdict::Deny { .. } => OPERATION_EGRESS_BLOCKED,
     }
 }
 
