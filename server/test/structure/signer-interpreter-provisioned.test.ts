@@ -7,61 +7,88 @@
  * real entry point. setup-node's tool cache is runner-writable, so a job that
  * skips the provisioning step fails those tests. The step was hand-mirrored into
  * ci.yml and test-baseline-guard.yml and missed in publish-on-tag.yml, which
- * blocked a release; this test derives the job set from the workflow files
- * themselves so a new suite-running job cannot be missed.
+ * blocked a release. This test parses every workflow as YAML, derives the
+ * suite-running jobs from the parsed steps, and requires an executable
+ * provisioning command in an earlier step of the same job.
  */
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { load as loadYaml } from "js-yaml";
 
 const repoRoot = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 const workflowsDir = join(repoRoot, ".github", "workflows");
 
-// Must match the step name in ci.yml, test-baseline-guard.yml and publish-on-tag.yml.
-const PROVISION_STEP = "name: Provision the root-owned workstation signer interpreter";
+// Must match the run line of the "Provision the root-owned workstation signer
+// interpreter" step in ci.yml, test-baseline-guard.yml and publish-on-tag.yml.
 const PROVISION_COMMAND = 'sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node';
 
-/** Splits a workflow into its jobs (two-space-indented keys under `jobs:`). */
-function jobsOf(source: string): Array<{ name: string; body: string }> {
-  const start = source.indexOf("\njobs:\n");
-  if (start < 0) return [];
-  const lines = source.slice(start + "\njobs:\n".length).split("\n");
-  const jobs: Array<{ name: string; body: string[] }> = [];
-  for (const line of lines) {
-    const header = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line);
-    if (header) { jobs.push({ name: header[1], body: [] }); continue; }
-    if (/^\S/.test(line)) break;
-    jobs[jobs.length - 1]?.body.push(line);
+// The full suite is `npm test` or `npm run test` as a command; `npm run test:<x>`
+// targets a named subset and is not the suite.
+const SUITE_COMMAND = /(?:^|[\s;&|(])npm (?:run )?test(?=$|[\s;&|)])/;
+
+type Step = { run?: unknown };
+type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
+
+/** The executable lines of a step's run script: comment and blank lines removed. */
+function commandLines(step: Step): string[] {
+  if (typeof step.run !== "string") return [];
+  return step.run.split("\n").map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("#"));
+}
+
+/** Every suite-running job in one workflow source, with whether it is provisioned in time. */
+export function auditWorkflow(source: string): Array<{ job: string; provisioned: boolean }> {
+  const workflow = (loadYaml(source) ?? {}) as Workflow;
+  const results: Array<{ job: string; provisioned: boolean }> = [];
+  for (const [job, body] of Object.entries(workflow.jobs ?? {})) {
+    const steps = body?.steps ?? [];
+    const suiteAt = steps.findIndex((s) => commandLines(s).some((l) => SUITE_COMMAND.test(l)));
+    if (suiteAt < 0) continue;
+    // Provisioning counts only as an executable line in a step that runs before the suite step.
+    const provisioned = steps.slice(0, suiteAt).some((s) => commandLines(s).includes(PROVISION_COMMAND));
+    results.push({ job, provisioned });
   }
-  return jobs.map((j) => ({ name: j.name, body: j.body.join("\n") }));
+  return results;
 }
 
-// A non-comment line whose command is `npm test` (bare, after `run:`, or after `cd server &&`).
-const NPM_TEST_COMMAND = /^\s*(?:run:\s*)?(?:cd server &&\s*)?npm test(?:\s|$)/m;
-
-/** True when the job runs the server suite. */
-function runsServerSuite(body: string): boolean {
-  return NPM_TEST_COMMAND.test(body);
-}
-
-const suiteJobs = readdirSync(workflowsDir)
+const audited = readdirSync(workflowsDir)
   .filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"))
-  .flatMap((file) => jobsOf(readFileSync(join(workflowsDir, file), "utf8"))
-    .filter((job) => runsServerSuite(job.body))
-    .map((job) => ({ file, ...job })));
+  .flatMap((file) => auditWorkflow(readFileSync(join(workflowsDir, file), "utf8")).map((r) => ({ file, ...r })));
 
 describe("packaged signer interpreter is provisioned before every server suite run", () => {
-  it("finds the suite-running jobs (non-vacuous)", () => {
-    const files = new Set(suiteJobs.map((j) => j.file));
-    for (const f of ["ci.yml", "test-baseline-guard.yml", "publish-on-tag.yml"]) expect(files.has(f), f).toBe(true);
+  it("the suite-running jobs are exactly the known set (a new one must be added here deliberately)", () => {
+    expect(audited.map((r) => `${r.file}#${r.job}`).sort()).toEqual([
+      "ci.yml#test",
+      "publish-on-tag.yml#build-release",
+      "test-baseline-guard.yml#test-baseline-guard",
+    ]);
   });
-  for (const job of suiteJobs) {
-    it(`${job.file} job ${job.name} provisions the root-owned node before npm test`, () => {
-      const provision = job.body.indexOf(PROVISION_STEP);
-      expect(provision, "provisioning step missing").toBeGreaterThanOrEqual(0);
-      expect(job.body.slice(provision)).toContain(PROVISION_COMMAND);
-      expect(provision).toBeLessThan(job.body.search(NPM_TEST_COMMAND));
+
+  for (const r of audited) {
+    it(`${r.file} job ${r.job} runs the provisioning command in a step before the suite`, () => {
+      expect(r.provisioned).toBe(true);
     });
   }
+
+  // Negative fixtures: shapes a line scanner would miss or wrongly accept.
+  const provision = `      - name: Provision the root-owned workstation signer interpreter\n        run: ${PROVISION_COMMAND}\n`;
+  const fixtures: Array<[string, string, boolean]> = [
+    ["provisioned before a working-directory suite step", `jobs:\n  t:\n    steps:\n${provision}      - working-directory: server\n        run: npm test\n`, true],
+    ["sequence-marker run with no provisioning", `jobs:\n  t:\n    steps:\n      - run: npm test\n        working-directory: server\n`, false],
+    ["provisioning commented out", `jobs:\n  t:\n    steps:\n      - name: Provision the root-owned workstation signer interpreter\n        run: |\n          # ${PROVISION_COMMAND}\n          echo skipped\n      - run: npm test\n`, false],
+    ["step name kept, install moved after the suite", `jobs:\n  t:\n    steps:\n      - name: Provision the root-owned workstation signer interpreter\n        run: echo placeholder\n      - run: cd server && npm test\n      - run: ${PROVISION_COMMAND}\n`, false],
+    ["suite inside a multi-line pipeline", `jobs:\n  t:\n    steps:\n      - run: |\n          set -o pipefail\n          npm test 2>&1 | tee out.log\n`, false],
+  ];
+  for (const [label, source, expected] of fixtures) {
+    it(`audit fixture: ${label}`, () => {
+      const result = auditWorkflow(source);
+      expect(result).toHaveLength(1);
+      expect(result[0].provisioned).toBe(expected);
+    });
+  }
+
+  it("a named subset script is not the suite", () => {
+    expect(auditWorkflow(`jobs:\n  t:\n    steps:\n      - run: npm run test:security\n`)).toEqual([]);
+  });
 });
