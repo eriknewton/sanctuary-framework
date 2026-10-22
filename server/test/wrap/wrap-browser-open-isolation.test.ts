@@ -23,6 +23,13 @@ import {
 const DASHBOARD_URL = "http://127.0.0.1:3501";
 const TEST_SIGNALS = ["VITEST", "VITEST_WORKER_ID", "NODE_ENV", "CI"] as const;
 
+// Custody cleanup can also spawn a Linux scaffold reaper. This contract is
+// specifically the OS browser boundary; every child remains mocked above.
+function browserSpawnCalls() {
+  return opener.spawn.mock.calls.filter(([command]) =>
+    command === "open" || command === "cmd" || command === "xdg-open");
+}
+
 describe("wrapper default browser isolation", () => {
   let fortress: TempFortress;
   let configPath: string;
@@ -79,7 +86,7 @@ describe("wrapper default browser isolation", () => {
     vi.stubEnv(signal, value);
     await runWrap({ wrap: configPath }, deps());
     expect(startOwnedDashboard).toHaveBeenCalledOnce();
-    expect(opener.spawn).not.toHaveBeenCalled();
+    expect(browserSpawnCalls()).toEqual([]);
   });
 
   it("preserves an injected opener under test signals", async () => {
@@ -87,13 +94,13 @@ describe("wrapper default browser isolation", () => {
     const openBrowser = vi.fn(async () => {});
     await runWrap({ wrap: configPath }, { ...deps(), openBrowser });
     expect(openBrowser).toHaveBeenCalledExactlyOnceWith(DASHBOARD_URL);
-    expect(opener.spawn).not.toHaveBeenCalled();
+    expect(browserSpawnCalls()).toEqual([]);
   });
 
   it("preserves --no-open without relying on a test signal", async () => {
     await runWrap({ wrap: configPath, noOpen: true }, deps());
     expect(startOwnedDashboard).toHaveBeenCalledOnce();
-    expect(opener.spawn).not.toHaveBeenCalled();
+    expect(browserSpawnCalls()).toEqual([]);
   });
 
   it("routes ordinary production opening to the mocked OS process", async () => {
@@ -101,8 +108,8 @@ describe("wrapper default browser isolation", () => {
     const command = process.platform === "darwin" ? "open"
       : process.platform === "win32" ? "cmd" : "xdg-open";
     const args = process.platform === "win32" ? ["/c", "start", "", DASHBOARD_URL] : [DASHBOARD_URL];
-    expect(opener.spawn).toHaveBeenCalledExactlyOnceWith(command, args, {
+    expect(browserSpawnCalls()).toEqual([[command, args, {
       stdio: "ignore", detached: true,
-    });
+    }]]);
   });
 });
