@@ -86,7 +86,7 @@ describe("publish workflow trust zones", () => {
     expect(sign).toContain("sparse-checkout-cone-mode: false");
     expect(sign).not.toContain("sparse-checkout: scripts\n");
     expect(sign).toContain("Use pinned Node.js for isolated signing");
-    expect(sign).toContain("node-version: 24.14.0");
+    expect(sign).toContain("node-version: 24.22.1");
   });
 
   it("never combines repository-write and npm-OIDC authority", () => {
@@ -121,11 +121,11 @@ describe("publish workflow trust zones", () => {
     expect(stage).toContain("expected_assets=");
     expect(stage).toContain("became public while assets were being staged");
     expect(stage).toContain("Use pinned Node.js for staged artifact verification");
-    expect(stage).toContain("node-version: 24.14.0");
+    expect(stage).toContain("node-version: 24.22.1");
     expect(finalize).toContain("expected_assets=");
     expect(finalize).toContain("gh release download \"$TAG\"");
     expect(finalize).toContain("Use pinned Node.js for final artifact verification");
-    expect(finalize).toContain("node-version: 24.14.0");
+    expect(finalize).toContain("node-version: 24.22.1");
     expect(finalize).toContain("node scripts/verify-release-artifact.mjs");
     expect(finalize.indexOf("verify-release-artifact.mjs")).toBeLessThan(finalize.indexOf("gh release edit"));
   });
@@ -174,7 +174,7 @@ describe("publish workflow trust zones", () => {
   it("pins the hosted runner and release Node runtime", () => {
     expect(workflow).not.toContain("runs-on: ubuntu-latest");
     expect(occurrences(workflow, "runs-on: ubuntu-24.04")).toBe(6);
-    expect(occurrences(workflow, "node-version: 24.14.0")).toBe(6);
+    expect(occurrences(workflow, "node-version: 24.22.1")).toBe(6);
   });
 
   it("gates workflow/client release-key parity before signing", () => {
