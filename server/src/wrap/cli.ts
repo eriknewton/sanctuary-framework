@@ -5806,6 +5806,11 @@ function isAddressInUse(err: unknown): boolean {
 // ── Browser auto-open ───────────────────────────────────────────────
 
 async function defaultOpenBrowser(url: string): Promise<void> {
+  // The operator's browser is never a test fixture; injected openers above
+  // remain available for routing assertions without creating real OS effects.
+  if (process.env.VITEST || process.env.NODE_ENV === "test" || process.env.CI) {
+    return;
+  }
   const plat = platform();
   let cmd: string;
   let args: string[];
