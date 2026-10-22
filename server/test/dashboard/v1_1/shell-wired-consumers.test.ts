@@ -29,6 +29,8 @@ import { createContext, runInContext } from "node:vm";
 import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
 import { renderDashboardV11Html } from "../../../src/dashboard/v1_1/html.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { heldSubjectText } from "../../../src/dashboard/v1_1/templates.js";
+import { projectCharterApproval } from "../../../src/hub/charter-approval-bridge.js";
 import { HUB_INBOX_KINDS } from "../../../src/contracts/v1.1/constants.js";
 import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 import { readFileSync } from "node:fs";
@@ -2188,6 +2190,82 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(h.el.main!.innerHTML).toMatch(/<tr class="sel"[^>]*data-evidence-row="1"/);
   });
 
+  it("labels gate decisions by the decider the entry records, and never an operator deny as a system failure", async () => {
+    // Shaped as ApprovalGate writes them: identity_id "system", result "failure" for every deny, and the decider in
+    // details.decided_by (absent on an invalid approval proof).
+    const gateEntry = (minute: number, operation: string, result: string, details: Record<string, unknown>) => ({
+      timestamp: `2026-10-14T16:${minute}:00.000Z`, layer: "l2", identity_id: "system", operation, result, details,
+    });
+    const h = await bootEvidence(evidencePayload({
+      entries: [
+        gateEntry(51, "gate_deny:state_export", "failure", { tier: 1, approval_proof: "invalid" }),
+        gateEntry(52, "gate_deny:memory_insert", "failure", { tier: 2, decided_by: "channel_failure" }),
+        gateEntry(53, "gate_deny:state_delete", "failure", { tier: 1, decided_by: "timeout" }),
+        gateEntry(54, "gate_approve:state_export", "success", { tier: 1, decided_by: "human" }),
+        gateEntry(55, "gate_deny:state_write", "failure", {
+          tier: 2, decided_by: "human", reason: 'First access to namespace "notes" (operator approved). Click Allow once. "" (not in session baseline)',
+        }),
+      ],
+      total: 5,
+    }));
+    const table = h.el.main!.innerHTML.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    // A gate entry's tool name is shown only as the delimited held-subject element after the gate verb.
+    const shown = (operation: string) => {
+      const at = operation.indexOf(":");
+      return `>${operation.slice(0, at + 1)}<code class="held-subject" data-held-subject="1">&quot;${operation.slice(at + 1)}&quot;</code><`;
+    };
+    const row = (operation: string) => table.split("<tr").find((r) => r.includes(shown(operation)))!;
+    expect(row("gate_deny:state_write")).toContain('<span class="state-chip neutral"><i aria-hidden="true"></i>Denied (operator decision)</span>');
+    expect(row("gate_deny:state_write")).toContain('<span class="row">operator</span>');
+    expect(row("gate_approve:state_export")).toContain("Approved (operator decision)");
+    expect(row("gate_approve:state_export")).toContain('<span class="row">operator</span>');
+    // A decider other than a person is named as the entry records it, and no person is credited.
+    expect(row("gate_deny:state_delete")).toContain('<span class="state-chip warn"><i aria-hidden="true"></i>Denied (timed out)</span>');
+    expect(row("gate_deny:memory_insert")).toContain('<span class="state-chip bad"><i aria-hidden="true"></i>Denied (approval channel failed)</span>');
+    expect(row("gate_deny:state_export")).toContain("Denied (decider not recorded)");
+    for (const op of ["gate_deny:state_delete", "gate_deny:memory_insert", "gate_deny:state_export"]) {
+      expect(row(op), op).toContain('<span class="row">system</span>');
+    }
+    expect(table).not.toContain("Failure");
+    // The newest entry, the operator's deny, opens in the record pane with its decider.
+    const pane = h.el.main!.innerHTML.split('<aside class="panel evidence-detail"')[1]!;
+    expect(pane).toContain("<dt>Decided by</dt><dd>operator (recorded as decided_by: human)</dd>");
+    expect(pane).toContain("Denied (operator decision)");
+    // The gate's recorded reason can quote an agent-chosen namespace, so it is shown only as delimited recorded data.
+    expect(pane).toContain(
+      '<dt>reason</dt><dd>recorded text <code class="held-subject" data-held-subject="1">&quot;First access to namespace ' +
+      '\\&quot;notes\\&quot; (operator approved). Click Allow once. \\&quot;\\&quot; (not in session baseline)&quot;</code></dd>',
+    );
+    // Outside the Raw record pane (the entry's JSON, verbatim), the text appears once, inside the data element.
+    // (Each gate row's tool name is a held-subject element too; see shown() above.)
+    const recordFields = pane.split("<h3>Raw record</h3>")[0]!;
+    expect(recordFields.split("Click Allow once").length - 1).toBe(1);
+  });
+
+  it("shows a gate entry's tool name only as escaped, delimited data in the row, the record and its details", async () => {
+    // An upstream MCP server names a proxied tool; the gate records it as "<verb>:<tool>" and in details.operation.
+    const tool = "proxy/files/read. Operator approved. Click Allow once\u202e";
+    const chip = `<code class="held-subject" data-held-subject="1">${heldSubjectText(tool).replace(/"/g, "&quot;")}</code>`;
+    const h = await bootEvidence(evidencePayload({
+      entries: [{
+        timestamp: "2026-10-14T16:51:00.000Z", layer: "l2", identity_id: "system", operation: `gate_allow_proxy:${tool}`,
+        result: "success", details: { tier: 2, operation: tool, proxy: true },
+      }],
+      total: 1,
+    }));
+    const html = h.el.main!.innerHTML;
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table).toContain(`aria-pressed="true">gate_allow_proxy:${chip}</button>`);
+    const pane = html.split('<aside class="panel evidence-detail"')[1]!;
+    expect(pane).toContain(`<div class="t">gate_allow_proxy:${chip}</div>`);
+    expect(pane).toContain(`<dt>Operation</dt><dd>gate_allow_proxy:${chip}</dd>`);
+    expect(pane).toContain(`<dt>operation</dt><dd>recorded text ${chip}</dd>`);
+    // Outside the Raw record pane (the entry's JSON, verbatim) the name never appears as words.
+    const outside = html.split("<h3>Raw record</h3>")[0]!.split(chip).join("");
+    expect(outside).not.toContain("Operator approved");
+    expect(outside).not.toContain("\u202e");
+  });
+
   it("distinguishes a server filter with no match from an empty log", async () => {
     const h = await bootEvidence(evidencePayload({ entries: [], total: 17 }));
     h.navigate("activity?result=failure"); await settle();
@@ -3593,6 +3671,281 @@ describe("Approvals round-one decision and evidence states", () => {
   };
   const inbox = (items: unknown[]) => () => Promise.resolve(response({ data: { items } }));
   const pageOthers = (count: number) => Array.from({ length: count }, (_, index) => ({ ...heldItem, kind: "blocked_egress", item_id: `other-${index}` }));
+
+  // A Charter hold as the hub serves it for a first write to a new namespace (projectCharterApproval).
+  const gateReason = { code: "first_namespace_access", subject: "customer-notes" };
+  const heldSentence =
+    'First access to namespace <code class="held-subject" data-held-subject="1">&quot;customer-notes&quot;</code>. ' +
+    "It is not in this session&#039;s baseline.";
+  const charterHold = {
+    item_id: "charter.approval.hold-2", kind: "approval_pending", tier: "tier2", agent_id: "agent:cursor:fixture",
+    display_template_id: "approval_pending.tier2.other",
+    display_template_args: [{ kind: "identity_id", value: "operator-fixture" }, { kind: "operation", value: "state_write" }],
+    resolved: false, created_at: "2026-10-14T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "other",
+    hold_reason: gateReason,
+  };
+
+  it("a Charter card names its held operation and shows the gate's reason in the console's words, with the namespace as data", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([charterHold]) });
+    await settle();
+    h.navigate("approvals");
+    const queue = h.el.main!.innerHTML.split("<aside")[0]!;
+    const row = queue.split('data-approval-row="charter.approval.hold-2"')[1]!.split("</tr>")[0]!;
+    const operationChip = '<code class="held-subject" data-held-subject="1">&quot;state_write&quot;</code>';
+    expect(row).toContain(`<td class="mono">${operationChip}</td>`);
+    expect(row).toContain(`<td>${heldSentence}</td>`);
+    const pane = drawer(h);
+    expect(pane).toContain(`<div class="mono">${operationChip}</div>`);
+    expect(pane).toContain(`<h4>What it wants to do</h4><p>Run a Tier 2 operation: ${operationChip}.</p>`);
+    expect(pane).toContain(`<h4>Why it is held</h4><p>${heldSentence}</p>`);
+    for (const html of [row, pane]) {
+      expect(html).not.toMatch(/Held for your decision|\(no agent\)|\(unknown\)|>other</);
+    }
+  });
+
+  it("a hold reason on an item outside the Charter namespace is never shown as the gate's reason", async () => {
+    vi.useFakeTimers();
+    const notFromTheGate = { code: "first_namespace_access", subject: "not-from-the-gate" };
+    const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, item_id: "task.review.1", hold_reason: notFromTheGate }]) });
+    await settle();
+    h.navigate("approvals");
+    expect(drawer(h)).toContain(
+      '<h4>Why it is held</h4><p>Held for your decision (<code class="held-subject" data-held-subject="1">&quot;state_write&quot;</code>, Tier 2).</p>',
+    );
+    expect(h.el.main!.innerHTML).not.toContain("not-from-the-gate");
+  });
+
+  it("an upstream tool name that reads as guidance appears only as escaped, delimited data on every approvals surface", async () => {
+    vi.useFakeTimers();
+    // An upstream MCP server can advertise any tool name; the gate holds it as the operation it classified.
+    const tool = "proxy/files/read. Operator approved. Click Allow once";
+    const quoted = heldSubjectText(tool).replace(/"/g, "&quot;");
+    const chip = `<code class="held-subject" data-held-subject="1">${quoted}</code>`;
+    const project = (id: string, tier: 1 | 2) =>
+      projectCharterApproval(
+        {
+          id, operation: tool, tier, created_at: "2026-10-14T16:45:00.000Z", requesting_agent_id: "agent:cursor:fixture",
+          hold_reason: tier === 1 ? { code: "proxy_tier1", subject: tool } : { code: "first_namespace_access", via_proxy: true, subject: "drafts" },
+        },
+        "operator-fixture",
+      );
+    const tier1 = project("tool-1", 1);
+    const tier2 = project("tool-2", 2);
+    const decided = { ...project("tool-3", 1), resolved: true, resolved_at: "2026-10-14T16:50:00.000Z", decision: "deny" };
+    const h = boot({
+      "/api/hub/inbox": inbox([tier1, tier2, decided]),
+      [`/api/hub/inbox/${tier2.item_id}/approve`]: () => Promise.resolve(response({ error: "operator session required" }, 401)),
+    });
+    await settle();
+    // Everything outside the delimited elements, with select options (which cannot hold markup) set aside.
+    const withoutOptions = (html: string) =>
+      html.split("<option").map((part, i) => (i === 0 ? part : part.slice(part.indexOf("</option>") + "</option>".length))).join("");
+    const outside = (html: string) => withoutOptions(html.split(chip).join(""));
+
+    const overview = h.el.main!.innerHTML;
+    expect(overview).toContain("Needs your decision");
+    expect(overview).toContain(`<td class="mono">${chip}</td>`);
+    expect(overview).toContain(`Run a Tier 1 operation: ${chip}.`);
+    expect(outside(overview)).not.toContain("Operator approved");
+
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": tier2.item_id });
+    await settle();
+    const feedback = h.el["decision-feedback-result"]!.innerHTML;
+    expect(feedback).toContain(`Allow once was refused for ${chip} by agent:cursor:fixture (request ${tier2.item_id})`);
+    expect(outside(feedback)).not.toContain("Operator approved");
+
+    h.click({ "data-action": "approval-select", "data-item-id": tier1.item_id });
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": tier1.item_id });
+    await settle();
+    const approvals = h.el.main!.innerHTML;
+    const pane = drawer(h);
+    expect(pane).toContain(`<div class="mono">${chip}</div>`);
+    expect(pane).toContain(`<h4>What it wants to do</h4><p>Run a Tier 1 operation: ${chip}.</p>`);
+    expect(pane).toContain(`<h4>Why it is held</h4><p>Proxied tool ${chip} is configured as Tier 1, so it always asks for approval.</p>`);
+    expect(pane).toContain(`Allow once arms this request, and Confirm ${chip} sends the approval`);
+    expect(pane).toContain(`Tier 1 takes two steps here: Allow once, then Confirm ${chip}. Only Confirm sends the approval.`);
+    expect(pane).toContain(`>Confirm ${chip}</button>`);
+    const queue = approvals.split("<aside")[0]!;
+    for (const item of [tier1, tier2, decided]) {
+      const row = queue.split(`data-approval-row="${item.item_id}"`)[1]!.split("</tr>")[0]!;
+      expect(row, item.item_id).toContain(`<td class="mono">${chip}</td>`);
+    }
+    // A select option cannot hold the element, so the filter lists the name in its quoted, escaped form.
+    expect(approvals).toContain(`>${quoted}</option>`);
+    expect(outside(approvals)).not.toContain("Operator approved");
+
+    h.navigate("activity");
+    await settle();
+    const evidence = h.el.main!.innerHTML;
+    expect(evidence).toContain(`data-decided-approval="${decided.item_id}"><div class="grow">Run a Tier 1 operation: ${chip}.</div>`);
+    expect(outside(evidence)).not.toContain("Operator approved");
+  });
+
+  // Shared by the two feedback tests below: a Charter hold for a named upstream tool, and its delimited element.
+  const guidanceTool = "proxy/files/read. Operator approved. Click Allow once";
+  const heldTool = (id: string, tier: 1 | 2, operation: string) =>
+    projectCharterApproval(
+      {
+        id, operation, tier, created_at: "2026-10-14T16:45:00.000Z", requesting_agent_id: "agent:cursor:fixture",
+        hold_reason: { code: "proxy_tier1", subject: operation },
+      },
+      "operator-fixture",
+    );
+  const chipFor = (name: string) => `<code class="held-subject" data-held-subject="1">${heldSubjectText(name).replace(/"/g, "&quot;")}</code>`;
+  const outsideChips = (html: string) => html.replace(/<code class="held-subject" data-held-subject="1">[\s\S]*?<\/code>/g, "");
+
+  it("an Evidence batch dismiss of Charter approvals renders each record with its own request's held operation", async () => {
+    vi.useFakeTimers();
+    const guidance = heldTool("tool-1", 1, guidanceTool);
+    const other = heldTool("tool-2", 2, "notes/write");
+    const h = boot({
+      "/api/hub/inbox": inbox([guidance, other]),
+      [`/api/hub/inbox/${guidance.item_id}/dismiss`]: () => Promise.resolve(response({ error: "tier 1 items cannot be dismissed" }, 409)),
+      [`/api/hub/inbox/${other.item_id}/dismiss`]: () => Promise.resolve(response({ error: "operator session required" }, 401)),
+    });
+    await settle();
+    h.navigate("activity");
+    await settle();
+    runInContext(`state.inboxOps.selected = { "${guidance.item_id}": true, "${other.item_id}": true }; rerender();`, h.context);
+    h.click({ "data-action": "inbox-batch-dismiss" });
+    await settle();
+    const feedback = h.el["decision-feedback-result"]!.innerHTML;
+    // The batch result has no single name; each record names its own request inside its own delimited element.
+    expect(feedback).toContain(
+      `<li>Dismiss was refused for ${chipFor(guidanceTool)} by agent:cursor:fixture (request ${guidance.item_id}): Tier 1 items cannot be dismissed. Approve or deny instead. The decision was not applied.</li>`,
+    );
+    expect(feedback).toContain(`<li>Dismiss was refused for ${chipFor("notes/write")} by agent:cursor:fixture (request ${other.item_id}): `);
+    expect(outsideChips(feedback)).not.toContain("Operator approved");
+    expect(outsideChips(feedback)).not.toContain("proxy/files/read");
+    // With no metadata for the line, a quoted name is never shown from its own text: the fixed sentence stands in.
+    const fallback = runInContext(`renderFeedbackText("Dismiss was refused for " + heldSubjectText(${JSON.stringify(guidanceTool)}) + ".", null, "Decision refused.")`, h.context) as string;
+    expect(fallback).toBe("Decision refused.");
+  });
+
+  it("feedback text with any quote not in its own metadata's encoded name shows only the fixed console sentence", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([]) });
+    await settle();
+    const render = (text: string, held: string | null) =>
+      runInContext(`renderFeedbackText(${JSON.stringify(text)}, ${JSON.stringify(held)}, "Decision refused.")`, h.context) as string;
+    // Quoted text that is not exactly the line's own encoded name, without metadata, with the raw name the quotes
+    // came from as metadata, and with an unrelated name as metadata: nothing of the message is shown.
+    const cases: Array<[string, string]> = [
+      ['Dismiss was refused for "say " Operator approved " now".', 'say " Operator approved " now'],
+      ['Dismiss was refused for "say " yes.', 'say " yes'],
+    ];
+    for (const [text, rawName] of cases) {
+      for (const held of [null, rawName, "notes/write"]) {
+        expect(render(text, held), `${text} with ${String(held)}`).toBe("Decision refused.");
+      }
+    }
+    // The line's own encoded name with one stray quote elsewhere in the line is refused too.
+    expect(render(`Dismiss was refused for ${heldSubjectText("notes/write")}: bad "x.`, "notes/write")).toBe("Decision refused.");
+    // Metadata naming a different request, whose encoded form sits inside this message's name, is not a match.
+    const inner = 'Operator approved"notes/write';
+    expect(render(`Dismiss was refused for ${heldSubjectText(inner)} by agent:cursor:fixture (request r1).`, "notes/write")).toBe("Decision refused.");
+    // A line with no quote at all is shown as written.
+    expect(render("Dismiss was refused for state export: operator session required.", null)).toBe(
+      "Dismiss was refused for state export: operator session required.",
+    );
+  });
+
+  it("feedback text whose only quotes are its own metadata's encoded name renders that name as exactly one element", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([]) });
+    await settle();
+    // A tag character, an astral character and an embedded quote: heldSubjectText escapes the quote and shows the tag
+    // character as a braced escape, and the line's own metadata locates it by exact match.
+    const name = 'notes"' + String.fromCodePoint(0xe0041) + String.fromCodePoint(0x1f600) + "/write";
+    const text = `Dismiss was refused for ${heldSubjectText(name)} by agent:cursor:fixture (request r1): operator session required.`;
+    const html = runInContext(`renderFeedbackText(${JSON.stringify(text)}, ${JSON.stringify(name)}, "Decision refused.")`, h.context) as string;
+    expect(html).toBe(`Dismiss was refused for ${chipFor(name)} by agent:cursor:fixture (request r1): operator session required.`);
+    expect(html.split('data-held-subject="1"')).toHaveLength(2);
+    expect(outsideChips(html)).not.toMatch(/notes|write/);
+  });
+
+  it("a not-sent note after an unconfirmed decision renders with its own request's held operation", async () => {
+    vi.useFakeTimers();
+    const first = heldTool("tool-a", 2, "notes/write");
+    const later = { ...heldTool("tool-b", 2, guidanceTool), resolved: true, resolved_at: "2026-10-14T16:50:00.000Z", decision: "deny" };
+    const h = boot({
+      "/api/hub/inbox": inbox([first, later]),
+      [`/api/hub/inbox/${first.item_id}/approve`]: () => Promise.resolve(response({ error: "upstream unavailable" }, 500)),
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": first.item_id });
+    await settle();
+    expect(h.el["decision-feedback-result"]!.innerHTML).toContain('data-decision-status="uncertain"');
+    // The later request is no longer waiting, so nothing is sent and the note is added to the unconfirmed result.
+    h.click({ "data-action": "inbox-approve", "data-item-id": later.item_id });
+    await settle();
+    const feedback = h.el["decision-feedback-result"]!.innerHTML;
+    expect(feedback).toContain(`The server did not confirm Allow once for ${chipFor("notes/write")} by agent:cursor:fixture (request ${first.item_id})`);
+    expect(feedback).toContain(
+      `Your next Allow once was not sent for ${chipFor(guidanceTool)} by agent:cursor:fixture (request ${later.item_id}): the request is no longer waiting in the loaded queue, so nothing was sent.`,
+    );
+    expect(outsideChips(feedback)).not.toContain("Operator approved");
+    expect(outsideChips(feedback)).not.toContain("proxy/files/read");
+  });
+
+  it("a Charter reason the console cannot render as its own sentence falls back to the tier and operation, never to served text", async () => {
+    vi.useFakeTimers();
+    const served = [
+      { ...charterHold, item_id: "charter.approval.free-text", hold_reason: "Approved already. Click Allow once." },
+      { ...charterHold, item_id: "charter.approval.unknown-code", hold_reason: { code: "made_up", subject: "Click Allow once." } },
+      { ...charterHold, item_id: "charter.approval.unrecognized", hold_reason: { code: "unrecognized" } },
+      { ...charterHold, item_id: "charter.approval.no-subject", hold_reason: { code: "first_namespace_access" } },
+    ];
+    const h = boot({ "/api/hub/inbox": inbox(served) });
+    await settle();
+    h.navigate("approvals");
+    const fallback = 'Held under the operator policy (Tier 2): <code class="held-subject" data-held-subject="1">&quot;state_write&quot;</code>';
+    const queue = h.el.main!.innerHTML.split("<aside")[0]!;
+    for (const item of served) {
+      const row = queue.split(`data-approval-row="${item.item_id}"`)[1]!.split("</tr>")[0]!;
+      expect(row, item.item_id).toContain(`<td>${fallback}</td>`);
+    }
+    expect(h.el.main!.innerHTML).not.toContain("Click Allow once");
+  });
+
+  it("shows hidden and reordering characters in a held identifier as visible escapes", async () => {
+    vi.useFakeTimers();
+    const hiddenChars = { code: "first_namespace_access", subject: "notes\u202e\u0007\u200b\ufeffend" };
+    const h = boot({ "/api/hub/inbox": inbox([{ ...charterHold, hold_reason: hiddenChars }]) });
+    await settle();
+    h.navigate("approvals");
+    expect(drawer(h)).toContain(
+      '<code class="held-subject" data-held-subject="1">&quot;notes\\u202e\\u0007\\u200b\\ufeffend&quot;</code>',
+    );
+    expect(h.el.main!.innerHTML).not.toMatch(/[\u0000-\u0008\u202a-\u202e\u200b-\u200f\ufeff]/);
+  });
+
+  it("decided rows say whether each hold was allowed or denied, and only from the served decision", async () => {
+    vi.useFakeTimers();
+    const decided = (id: string, decision?: string) => ({
+      ...charterHold, item_id: `charter.approval.${id}`, resolved: true, resolved_at: "2026-10-14T16:50:00.000Z",
+      ...(decision ? { decision } : {}),
+    });
+    const h = boot({ "/api/hub/inbox": inbox([decided("allowed", "approve"), decided("denied", "deny"), decided("unknown")]) });
+    await settle();
+    h.navigate("approvals");
+    const queue = h.el.main!.innerHTML.split("<aside")[0]!;
+    const row = (id: string) => queue.split(`data-approval-row="charter.approval.${id}"`)[1]!.split("</tr>")[0]!;
+    expect(row("allowed")).toContain('data-approval-decision="allowed"><i aria-hidden="true"></i>ALLOWED</span>');
+    expect(row("denied")).toContain('data-approval-decision="denied"><i aria-hidden="true"></i>DENIED</span>');
+    expect(row("unknown")).toContain('data-approval-decision="decided"><i aria-hidden="true"></i>DECIDED</span>');
+    h.click({ "data-action": "approval-select", "data-item-id": "charter.approval.denied" });
+    expect(drawer(h)).toContain('<i aria-hidden="true"></i>DENIED</span>');
+    h.navigate("activity");
+    await settle();
+    const evidence = h.el.main!.innerHTML;
+    expect(evidence).toMatch(/data-decided-approval="charter\.approval\.allowed"[\s\S]*?Allowed<\/span>/);
+    expect(evidence).toMatch(/data-decided-approval="charter\.approval\.denied"[\s\S]*?Denied<\/span>/);
+    expect(evidence).toMatch(/data-decided-approval="charter\.approval\.unknown"[\s\S]*?Resolved<\/span>/);
+  });
 
   it("a full page without holds earns no empty claim on the queue, drawer or fortress", async () => {
     vi.useFakeTimers();

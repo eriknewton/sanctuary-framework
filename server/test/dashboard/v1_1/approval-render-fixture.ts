@@ -16,5 +16,6 @@ export function renderApprovalFixture(alwaysAllow = false): string {
     decisionInFlight: () => false, renderDecisionInline: () => "",
     escHtml: (v: unknown) => String(v ?? ""),
     renderTemplate: () => "fixture operation",
+    renderTemplateHtml: () => "fixture operation",
   }) as string;
 }

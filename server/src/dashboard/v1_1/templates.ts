@@ -108,6 +108,7 @@ function arg(
     case "destination_category":
     case "tier":
     case "iso8601":
+    case "operation":
       return String(found.value);
     case "count":
     case "duration_ms":
@@ -123,6 +124,57 @@ function hasArgValue(args: HubDisplayTemplateArg[], kind: HubDisplayTemplateArg[
   // A null element is skipped, as the client mirror skips it, so a malformed arg list reaches the diagnostic fallback.
   const found = Array.isArray(args) ? args.find((a) => Boolean(a) && a.kind === kind) : undefined;
   return found !== undefined && typeof found.value === "string" && found.value.length > 0;
+}
+
+/** "agent <id>" when a target agent is named, otherwise the neutral phrase. Must match agentOr in client.ts. */
+function agentOr(args: HubDisplayTemplateArg[], neutral: string): string {
+  return hasArgValue(args, "agent_id") ? `agent ${arg(args, "agent_id")}` : neutral;
+}
+
+/**
+ * Characters that can hide, disguise or reorder displayed text: every control
+ * (Cc), format (Cf, which covers bidi embeddings, overrides and isolates,
+ * zero-width marks, the interlinear annotation marks and the supplementary tag
+ * characters), lone surrogate (Cs), line separator (Zl) and paragraph separator
+ * (Zp) code point, plus the visibly blank combining grapheme joiner, Hangul
+ * fillers and variation selectors. Must match HELD_SUBJECT_HIDDEN_CHARS in
+ * client.ts; the parity test in server/test/dashboard/v1_1/templates.test.ts
+ * compares both over every code point.
+ */
+export const HELD_SUBJECT_HIDDEN_CHARS =
+  /\p{Cc}|\p{Cf}|\p{Cs}|\p{Zl}|\p{Zp}|\u034f|\u115f|\u1160|\u3164|\uffa0|[\ufe00-\ufe0f]|[\u{e0100}-\u{e01ef}]/gu;
+
+// The last code point a four-digit \uXXXX escape can name; anything above it is written \u{XXXXX}.
+const LAST_FOUR_DIGIT_ESCAPE_CODE_POINT = 0xffff;
+
+/**
+ * An untrusted identifier (a held operation name, a namespace, a counterparty
+ * DID) as visible data: JSON-quoted so its own quotes and backslashes are
+ * escaped, and every hidden or reordering character written as a visible
+ * escape. Must match heldSubjectText in client.ts, which also wraps this text in
+ * the console's delimited held-subject element.
+ */
+export function heldSubjectText(value: string): string {
+  return JSON.stringify(String(value)).replace(HELD_SUBJECT_HIDDEN_CHARS, (c) => {
+    const codePoint = c.codePointAt(0)!;
+    return codePoint > LAST_FOUR_DIGIT_ESCAPE_CODE_POINT
+      ? `\\u{${codePoint.toString(16)}}`
+      : `\\u${codePoint.toString(16).padStart(4, "0")}`;
+  });
+}
+
+/**
+ * The approval_pending catch-all: `Run a Tier 2 operation: "state_write".` The
+ * operation clause appears only when the card names its operation and the agent
+ * clause only when a target agent is named. The held operation name is
+ * untrusted (an upstream server names a proxied tool), so it is written only in
+ * heldSubjectText's quoted, escaped form, never as bare words of the sentence.
+ * Must match heldOperationSentence in client.ts.
+ */
+function heldOperationSentence(args: HubDisplayTemplateArg[], tier: "Tier 1" | "Tier 2"): string {
+  const target = hasArgValue(args, "agent_id") ? ` on agent ${arg(args, "agent_id")}` : "";
+  const operation = hasArgValue(args, "operation") ? `: ${heldSubjectText(arg(args, "operation"))}` : "";
+  return `Run a ${tier} operation${target}${operation}.`;
 }
 
 /**
@@ -155,19 +207,23 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   // supplies it (its requester is the card's top-level agent_id instead), and a
   // fallback that names a definite subject must be listed in
   // TARGET_DEFAULTING_CATEGORIES in server/src/hub/charter-approval-bridge.ts.
+  // Every other sentence reads target-neutrally when its target is absent, so a
+  // card never shows a "(unknown)" or "(no agent)" placeholder; the full-set
+  // test in templates.test.ts renders every approval_pending id with no args.
+  // Each entry must match its mirror in the client TEMPLATES map in client.ts.
   "approval_pending.tier1.lockdown": (a) =>
-    `Cut agent ${arg(a, "agent_id")}'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
+    `Cut ${hasArgValue(a, "agent_id") ? `agent ${arg(a, "agent_id")}'s` : "an agent's"} network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
   "approval_pending.tier1.fortress_lockdown": () =>
     "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
   // Must match "approval_pending.tier1.unwrap" in client.ts.
   "approval_pending.tier1.unwrap": (a) =>
-    `Request to remove protection from agent ${arg(a, "agent_id")}. This build refuses unsupported removals before approval is queued.`,
+    `Request to remove protection from ${agentOr(a, "an agent")}. This build refuses unsupported removals before approval is queued.`,
   "approval_pending.tier1.policy_change": (a) =>
-    `Bind agent ${arg(a, "agent_id")} to policy ${arg(a, "policy_id")}.`,
+    `Bind ${agentOr(a, "an agent")} to ${hasArgValue(a, "policy_id") ? `policy ${arg(a, "policy_id")}` : "a policy"}.`,
   "approval_pending.tier1.policy_change_template": (a) =>
-    `Bind agent ${arg(a, "agent_id")} to template ${arg(a, "policy_id")}.`,
+    `Bind ${agentOr(a, "an agent")} to ${hasArgValue(a, "policy_id") ? `template ${arg(a, "policy_id")}` : "a template"}.`,
   "approval_pending.tier1.exit_bundle_export": (a) =>
     `Export the fortress as a portable bundle. Agent: ${arg(a, "agent_id", "all agents")}.`,
   "approval_pending.tier1.exit_bundle_import": (a) =>
@@ -175,27 +231,49 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   "approval_pending.tier1.exit_bundle_rekey": (a) =>
     `Re-key encrypted state for portable export. Agent: ${arg(a, "agent_id", "all agents")}.`,
   "approval_pending.tier1.state_export": (a) =>
-    `Export agent ${arg(a, "agent_id")} state as a portable bundle.`,
+    hasArgValue(a, "agent_id")
+      ? `Export agent ${arg(a, "agent_id")} state as a portable bundle.`
+      : "Export state from this fortress as a portable bundle.",
   "approval_pending.tier1.state_import": (a) =>
-    `Import state into agent ${arg(a, "agent_id")}.`,
+    hasArgValue(a, "agent_id")
+      ? `Import state into agent ${arg(a, "agent_id")}.`
+      : "Import state into this fortress.",
   "approval_pending.tier1.state_delete": (a) =>
-    `Delete state for agent ${arg(a, "agent_id")}. This is irreversible.`,
+    hasArgValue(a, "agent_id")
+      ? `Delete state for agent ${arg(a, "agent_id")}. This is irreversible.`
+      : "Delete stored state from this fortress. This is irreversible.",
   "approval_pending.tier1.identity_rotate": (a) =>
     `Rotate the identity key for ${arg(a, "agent_id", "this fortress")}.`,
   "approval_pending.tier1.reputation_export": (a) =>
-    `Export reputation bundle for ${arg(a, "agent_id")}.`,
+    hasArgValue(a, "agent_id")
+      ? `Export reputation bundle for ${arg(a, "agent_id")}.`
+      : "Export a reputation bundle from this fortress.",
   "approval_pending.tier1.reputation_import": (a) =>
-    `Import reputation bundle for ${arg(a, "agent_id")}.`,
+    hasArgValue(a, "agent_id")
+      ? `Import reputation bundle for ${arg(a, "agent_id")}.`
+      : "Import a reputation bundle into this fortress.",
   "approval_pending.tier1.sanctuary_export_identity_bundle": (a) =>
     `Export the operator identity bundle for ${arg(a, "agent_id", "this operator")}.`,
-  "approval_pending.tier1.other": (a) =>
-    `Tier 1 operation pending on agent ${arg(a, "agent_id", "(no agent)")}.`,
+  // The catch-all names the held operation when the card carries it, and an
+  // agent only when one is the target; with neither it still reads as a plain
+  // request rather than a placeholder.
+  "approval_pending.tier1.other": (a) => heldOperationSentence(a, "Tier 1"),
 
   // ── approval_pending.tier2.* ─────────────────────────────────────────
   "approval_pending.tier2.policy_change": (a) =>
-    `Tier 2 policy change requested on agent ${arg(a, "agent_id")}.`,
-  "approval_pending.tier2.other": (a) =>
-    `Tier 2 operation pending on agent ${arg(a, "agent_id", "(no agent)")}.`,
+    hasArgValue(a, "agent_id")
+      ? `Tier 2 policy change requested on agent ${arg(a, "agent_id")}.`
+      : "Tier 2 policy change requested.",
+  "approval_pending.tier2.other": (a) => heldOperationSentence(a, "Tier 2"),
+
+  // ── approval_pending.task.* ──────────────────────────────────────────
+  // Emitted by HubService.enqueueTaskReviewApproval in server/src/hub/hub-service.ts, whose handler completes the
+  // task on approve and returns it to in_progress on deny. Must match "approval_pending.task.ready_for_review" in
+  // client.ts.
+  "approval_pending.task.ready_for_review": (a) =>
+    hasArgValue(a, "agent_id")
+      ? `Agent ${arg(a, "agent_id")} marked a task ready for review. Allow completes it; Deny returns it to work.`
+      : "A task is ready for review. Allow completes it; Deny returns it to work.",
 
   // ── blocked_egress.* ─────────────────────────────────────────────────
   "blocked_egress.egress_policy_deny": (a) =>
@@ -270,8 +348,9 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     `Privacy event recorded for agent ${arg(a, "agent_id")}.`,
   "activity.handoff": (a) =>
     `Internal handoff event involving agent ${arg(a, "agent_id")}.`,
+  // The time clause appears only when the row carries one. Must match "activity.lifecycle" in client.ts.
   "activity.lifecycle": (a) =>
-    `Lifecycle change on agent ${arg(a, "agent_id")} at ${shortTime(arg(a, "iso8601", ""))}.`,
+    `Lifecycle change on agent ${arg(a, "agent_id")}${hasArgValue(a, "iso8601") ? ` at ${shortTime(arg(a, "iso8601"))}` : ""}.`,
   "activity.lifecycle.agent_lockdown_engaged": (a) =>
     `Network access revoked for agent ${arg(a, "agent_id")}.`,
   "activity.lifecycle.agent_lockdown_partial": (a) =>

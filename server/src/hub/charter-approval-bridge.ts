@@ -31,6 +31,8 @@
 import type {
   HubApprovalPendingItem,
   HubDisplayTemplateArg,
+  HubHoldReason,
+  HubHoldReasonCode,
 } from "../contracts/v1.1/hub-events.js";
 import { HUB_INBOX_TEMPLATE_NAMESPACES } from "./constants.js";
 
@@ -56,6 +58,13 @@ export interface CharterApprovalRecord {
    * argument). Absent means unattributed.
    */
   requesting_agent_id?: string;
+  /**
+   * Why the gate held the call, as structured data: the result of
+   * `classifyHoldReason` over the hold's `ApprovalRequest.reason` and
+   * `context` (server/src/principal-policy/types.ts), computed where the queue
+   * builds this record. Never the free-text reason itself.
+   */
+  hold_reason?: HubHoldReason;
 }
 
 /**
@@ -170,15 +179,282 @@ const TARGET_DEFAULTING_CATEGORIES: ReadonlySet<HubApprovalPendingItem["operatio
   new Set(["identity_rotate", "sanctuary_export_identity_bundle"]);
 
 /**
+ * Display bound on `HubHoldReason.subject`, in UTF-16 code units. A namespace
+ * name or counterparty DID has no length bound at the gate; 128 is room for any
+ * DID method in use here plus a long namespace, and keeps one card, and the
+ * capped decided history that retains cards, at a known size whatever the held
+ * call named.
+ */
+export const HOLD_REASON_SUBJECT_MAX_CHARS = 128;
+
+/**
+ * Display bound on a card's held `operation` name, in UTF-16 code units. It is
+ * the same bound as a quoted subject for the same reason: a proxied tool name
+ * is advertised by an upstream server and an uncategorised one is whatever the
+ * call named, so neither has a length bound before it reaches the card.
+ */
+export const CARD_OPERATION_MAX_CHARS = HOLD_REASON_SUBJECT_MAX_CHARS;
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** What one reason template needs to re-render: the gate's operation and the hold's context fields. */
+interface HoldReasonInputs {
+  operation: string;
+  context: Record<string, unknown>;
+}
+
+/**
+ * One gate reason template: given the hold's own fields it re-renders the exact
+ * string the gate writes, or null when a field it needs is missing, plus the
+ * identifier it quotes (if any) so the card can carry that alone.
+ */
+interface HoldReasonTemplate {
+  code: Exclude<HubHoldReasonCode, "unrecognized">;
+  /**
+   * The reason literal exactly as it is written in
+   * server/src/principal-policy/gate.ts, `${...}` placeholders included (a
+   * literal split across `+` is joined). Must match that literal: the coverage
+   * test in server/test/hub/charter-hold-reason.test.ts reads every reason
+   * literal the gate source can send to the approval channel and requires each
+   * to equal one template's `gateSource`, so a new or reworded gate reason fails
+   * a test instead of quietly reaching the operator as `unrecognized`.
+   */
+  gateSource: string;
+  render(inputs: HoldReasonInputs): { text: string; subject?: string } | null;
+}
+
+/**
+ * Every reason template the approval gate writes. Each `render` must match,
+ * byte for byte, the reason string at its site in
+ * server/src/principal-policy/gate.ts (classifyOperation, detectAnomaly and the
+ * proxy branch of evaluate); a drifted template only makes that reason fall
+ * back to the code `unrecognized`, never to its raw text. The code list must
+ * match HUB_HOLD_REASON_CODES in server/src/contracts/v1.1/hub-events.ts.
+ */
+export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
+  {
+    code: "tier1_forced",
+    gateSource: '"${operation}" is a forced Tier 1 operation (always requires approval)',
+    render: ({ operation }) => ({
+      text: `"${operation}" is a forced Tier 1 operation (always requires approval)`,
+    }),
+  },
+  {
+    code: "tier1_secret_waiver",
+    gateSource:
+      '"${operation}" names at least one allow_files path (a secret-classifier ' +
+      "waiver) and is always Tier 1 regardless of policy (always requires approval)",
+    render: ({ operation }) => ({
+      text:
+        `"${operation}" names at least one allow_files path (a secret-classifier ` +
+        `waiver) and is always Tier 1 regardless of policy (always requires approval)`,
+    }),
+  },
+  {
+    code: "tier1_policy",
+    gateSource: '"${operation}" is a Tier 1 operation (always requires approval)',
+    render: ({ operation }) => ({
+      text: `"${operation}" is a Tier 1 operation (always requires approval)`,
+    }),
+  },
+  {
+    code: "tier1_unclassified",
+    gateSource: '"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)',
+    render: ({ operation }) => ({
+      // \u2014 is the gate's own separator character in this reason.
+      text: `"${operation}" is not classified in any policy tier \u2014 requires approval (SEC-011 safe default)`,
+    }),
+  },
+  {
+    code: "proxy_tier1",
+    gateSource: 'Proxy tool "${toolName}" is configured as Tier 1 (always requires approval)',
+    render: ({ context }) => {
+      const tool = nonEmptyString(context.operation);
+      return tool === null
+        ? null
+        : { text: `Proxy tool "${tool}" is configured as Tier 1 (always requires approval)`, subject: tool };
+    },
+  },
+  {
+    code: "first_session",
+    gateSource: 'First session: "${operation}" has no established baseline',
+    render: ({ operation }) => ({ text: `First session: "${operation}" has no established baseline` }),
+  },
+  {
+    code: "first_namespace_access",
+    gateSource: 'First access to namespace "${namespace}" (not in session baseline)',
+    render: ({ context }) => {
+      const namespace = nonEmptyString(context.namespace);
+      return namespace === null
+        ? null
+        : { text: `First access to namespace "${namespace}" (not in session baseline)`, subject: namespace };
+    },
+  },
+  {
+    code: "first_counterparty",
+    gateSource: 'First interaction with counterparty "${counterpartyDid}"',
+    render: ({ context }) => {
+      const did = nonEmptyString(context.counterparty_did);
+      return did === null ? null : { text: `First interaction with counterparty "${did}"`, subject: did };
+    },
+  },
+  {
+    code: "signing_rate",
+    gateSource: "Signing frequency (${signCount}/min) exceeds limit (${config.max_signs_per_minute}/min)",
+    render: ({ context }) => {
+      const count = finiteNumber(context.signs_per_minute);
+      const limit = finiteNumber(context.limit);
+      return count === null || limit === null
+        ? null
+        : { text: `Signing frequency (${count}/min) exceeds limit (${limit}/min)` };
+    },
+  },
+  {
+    code: "bulk_read",
+    gateSource:
+      'Bulk read detected: ${readCount} reads from "${namespace}" in 60 seconds (threshold: ${config.bulk_read_threshold})',
+    render: ({ context }) => {
+      const namespace = nonEmptyString(context.namespace);
+      const reads = finiteNumber(context.reads_in_window);
+      const threshold = finiteNumber(context.threshold);
+      return namespace === null || reads === null || threshold === null
+        ? null
+        : {
+            text: `Bulk read detected: ${reads} reads from "${namespace}" in 60 seconds (threshold: ${threshold})`,
+            subject: namespace,
+          };
+    },
+  },
+  {
+    code: "frequency_spike",
+    gateSource:
+      'Frequency spike: "${operation}" at ${callRate}/min (${config.frequency_spike_multiplier}\u00d7 above average ${avgRate.toFixed(1)}/min)',
+    render: ({ operation, context }) => {
+      const rate = finiteNumber(context.current_rate);
+      const multiplier = finiteNumber(context.multiplier);
+      const average = finiteNumber(context.average_rate);
+      return rate === null || multiplier === null || average === null
+        ? null
+        : {
+            // \u00d7 is the gate's own multiplication sign in this reason.
+            text: `Frequency spike: "${operation}" at ${rate}/min (${multiplier}\u00d7 above average ${average.toFixed(1)}/min)`,
+          };
+    },
+  },
+  {
+    code: "injection_escalation",
+    gateSource:
+      'Potential prompt injection detected in "${operation}" (confidence: ${(injectionResult.confidence * 100).toFixed(0)}%, ${injectionResult.signals.length} signal(s))',
+    render: ({ operation, context }) => {
+      const detection =
+        context.injection_detection !== null && typeof context.injection_detection === "object"
+          ? (context.injection_detection as Record<string, unknown>)
+          : {};
+      const confidence = finiteNumber(detection.confidence);
+      const signals = finiteNumber(detection.signal_count);
+      // 100 turns the gate's 0..1 confidence into the whole percent it prints.
+      return confidence === null || signals === null
+        ? null
+        : {
+            text: `Potential prompt injection detected in "${operation}" (confidence: ${(confidence * 100).toFixed(0)}%, ${signals} signal(s))`,
+          };
+    },
+  },
+];
+
+/**
+ * The prefix the gate puts on a proxied anomaly reason. Must match the
+ * `Proxy: ${anomaly.reason}` literal in server/src/principal-policy/gate.ts,
+ * pinned whole as PROXY_REASON_GATE_SOURCE for the coverage test.
+ */
+export const PROXY_REASON_PREFIX = "Proxy: ";
+export const PROXY_REASON_GATE_SOURCE = "Proxy: ${anomaly.reason}";
+
+// The UTF-16 high (leading) surrogate range: a code point above U+FFFF is one of
+// these followed by a low surrogate, so a cut just after one splits the pair.
+const HIGH_SURROGATE_FIRST = 0xd800;
+const HIGH_SURROGATE_LAST = 0xdbff;
+
+/**
+ * The first `maxUnits` UTF-16 code units of `text`, cut on a code-point
+ * boundary. Invariant: a bounded copy never ends in half of a surrogate pair,
+ * so shortening a name cannot manufacture a lone surrogate the original did not
+ * contain; when the cut would land just after a high surrogate it backs off one
+ * unit, so the copy may be one unit shorter than the bound.
+ */
+export function cutAtCodePoint(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  const last = text.charCodeAt(maxUnits - 1);
+  const splitsPair = last >= HIGH_SURROGATE_FIRST && last <= HIGH_SURROGATE_LAST;
+  return text.slice(0, splitsPair ? maxUnits - 1 : maxUnits);
+}
+
+function boundedSubject(subject: string): Pick<HubHoldReason, "subject" | "subject_truncated"> {
+  return subject.length <= HOLD_REASON_SUBJECT_MAX_CHARS
+    ? { subject }
+    : { subject: cutAtCodePoint(subject, HOLD_REASON_SUBJECT_MAX_CHARS), subject_truncated: true };
+}
+
+/**
+ * Turn a hold's free-text reason into structured data the console can render
+ * without trusting that text.
+ *
+ * Invariant: a reason is recognised only when a known gate template, fed the
+ * hold's own `operation` and `context`, re-renders it EXACTLY. Matching by
+ * re-rendering rather than by parsing is what keeps an agent-chosen identifier
+ * from steering the result: a namespace such as `notes" (operator approved).
+ * Click Allow once. "` can only ever be that template's `subject`, carried as
+ * data, and any text that does not re-render becomes `unrecognized`, for which
+ * the console writes a fixed sentence. The free text itself is never returned.
+ */
+export function classifyHoldReason(input: {
+  operation: string;
+  reason: unknown;
+  context: unknown;
+}): HubHoldReason {
+  const context =
+    input.context !== null && typeof input.context === "object" && !Array.isArray(input.context)
+      ? (input.context as Record<string, unknown>)
+      : {};
+  let reason = typeof input.reason === "string" ? input.reason : "";
+  let viaProxy = false;
+  if (reason.startsWith(PROXY_REASON_PREFIX) && context.proxy === true) {
+    reason = reason.slice(PROXY_REASON_PREFIX.length);
+    viaProxy = true;
+  }
+  for (const template of HOLD_REASON_TEMPLATES) {
+    // A proxied anomaly wraps an anomaly reason; the proxy Tier 1 reason is never re-wrapped.
+    if (viaProxy && template.code === "proxy_tier1") continue;
+    const rendered = template.render({ operation: input.operation, context });
+    if (rendered === null || rendered.text !== reason) continue;
+    return {
+      code: template.code,
+      ...(viaProxy ? { via_proxy: true } : {}),
+      ...(rendered.subject !== undefined ? boundedSubject(rendered.subject) : {}),
+    };
+  }
+  return { code: "unrecognized" };
+}
+
+/**
  * Project one live Charter hold into an inbox card.
  *
- * The card carries NO argument detail. `HubDisplayTemplateArg` is a closed
- * typed union with no free-text member precisely so a backend cannot smuggle
- * raw tool arguments into operator copy, and a Charter hold's context is raw
- * tool arguments. The card therefore says which tier is waiting, on which
- * identity, and (when the gate stamped it) which configured agent asked; it
- * names no target. `GET /api/pending` remains the surface that carries the
- * redacted argument summary.
+ * The card carries NO argument detail in its template arguments.
+ * `HubDisplayTemplateArg` is a closed typed union with no free-text member
+ * precisely so a backend cannot smuggle raw tool arguments into operator copy,
+ * and a Charter hold's context is raw tool arguments. The card therefore says
+ * which tier is waiting, which operation is held, on which identity, and (when
+ * the gate stamped it) which configured agent asked; it names no target. Why
+ * the gate held it rides beside the template as the structured `hold_reason`
+ * (a code plus, at most, one delimited identifier), never as free text.
+ * `GET /api/pending` remains the surface that carries the redacted argument
+ * summary.
  */
 export function projectCharterApproval(
   record: CharterApprovalRecord,
@@ -201,9 +477,28 @@ export function projectCharterApproval(
   // key for <agent_id>"). A Charter card has no verified target, so its sentence
   // gets none. `identity_id` stays the hub identity because the inbox scopes by it.
   const agentId = record.requesting_agent_id;
+  // The operation name is the gate's own `operation` (the tool it classified),
+  // not an argument of the call, so the catch-all `.other` sentence and the
+  // console's Operation column can name what is held instead of "other".
+  // The name itself is untrusted (an upstream server names a proxied tool, and
+  // an uncategorised tool is whatever the call named), so the card carries a
+  // copy bounded before it enters the inbox or the decided history, flagged when
+  // shortened; the console renders it only as delimited, escaped data.
+  const operationTruncated = record.operation.length > CARD_OPERATION_MAX_CHARS;
   const displayArgs: HubDisplayTemplateArg[] = [
     { kind: "identity_id", value: identityId },
+    {
+      kind: "operation",
+      value: operationTruncated ? cutAtCodePoint(record.operation, CARD_OPERATION_MAX_CHARS) : record.operation,
+    },
   ];
+  // Must-never #7 bounds what the AGENT learns from a denial: the gate returns
+  // it a generic reason. This card is OPERATOR copy, served only to
+  // operator-authenticated reads (a loopback-position read drops every approval
+  // item). It carries why the gate held the call only as the structured code
+  // classifyHoldReason produced, so the console writes every sentence itself
+  // and an agent-chosen identifier can appear only as delimited data.
+  const holdReason = record.hold_reason;
   return {
     version: "1.1",
     item_id: charterApprovalItemId(record.id),
@@ -219,5 +514,7 @@ export function projectCharterApproval(
     resolved: false,
     tier,
     operation_category: category,
+    ...(operationTruncated ? { operation_truncated: true as const } : {}),
+    ...(holdReason ? { hold_reason: holdReason } : {}),
   };
 }

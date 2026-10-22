@@ -252,7 +252,10 @@ import type { OperatorAuthorizationConsumeParams } from "../v1/operator-signed.j
 import { OperatorAuthorizationSpentStore } from "../v1/operator-authorization-spent-store.js";
 import { FederationReissueChallengeStore } from "../v1/federation-reissue-challenge-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
-import type { CharterApprovalRecord } from "../hub/charter-approval-bridge.js";
+import {
+  classifyHoldReason,
+  type CharterApprovalRecord,
+} from "../hub/charter-approval-bridge.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
 import {
@@ -455,10 +458,13 @@ interface PendingRequest {
  *
  * The ONE place the projection's field selection is written, so the bridge's
  * list read and its by-id read cannot drift into describing the same hold
- * differently. Deliberately header-only: no `reason` and no `context`, because
- * a hold's context is raw tool arguments and an inbox card carries no
- * free-text member to put them in (see
- * `server/src/hub/charter-approval-bridge.ts`).
+ * differently. Header plus a STRUCTURED hold reason: never `context` and never
+ * the free-text `reason`, because a hold's context is raw tool arguments, the
+ * reason can quote an agent-chosen identifier, and an inbox card carries no
+ * free-text member to put either in (see
+ * `server/src/hub/charter-approval-bridge.ts`). `classifyHoldReason` reads both
+ * here only to re-render the gate's own template and keep its code plus, at
+ * most, one identifier as delimited data.
  */
 function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
   // Only the gate-stamped typed field is carried, never a `context` key: the
@@ -473,6 +479,11 @@ function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
     ...(typeof requestingAgentId === "string" && requestingAgentId.length > 0
       ? { requesting_agent_id: requestingAgentId }
       : {}),
+    hold_reason: classifyHoldReason({
+      operation: pending.request.operation,
+      reason: pending.request.reason,
+      context: pending.request.context,
+    }),
   };
 }
 
