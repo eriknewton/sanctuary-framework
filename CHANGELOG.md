@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
+- `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
