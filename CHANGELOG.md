@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
+
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
 - `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.

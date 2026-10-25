@@ -83,7 +83,7 @@ A checkpoint is written after every `checkpointInterval` critical appends (defau
 | `signer_kid` | Identity ID of the signing key, or `null` if unsigned |
 | `signature` | Base64url-encoded Ed25519 signature, or `null` if unsigned |
 | `public_key` | Base64url-encoded Ed25519 public key (embedded for verifier convenience), present when signed |
-| `unsigned` | `true` if no signing identity was available at checkpoint time |
+| `unsigned` | Required boolean: `true` means no signing identity was available at checkpoint time; this `type: "checkpoint"` record produces `checkpoint_unsigned` and the export does not PASS. A missing or non-boolean value produces `schema_error`. |
 
 **Signature verification:** The signed bytes are:
 
@@ -126,7 +126,7 @@ Records appear in this order:
 1. All `entry` records, sorted by `seq` ascending
 2. All `checkpoint` and `legacy_anchor` records, sorted by `checkpoint_sequence` ascending
 
-An export file with no entries is valid (zero records). An export file with entries but no checkpoints is valid (checkpoints are written asynchronously; they may not yet exist for short-lived logs).
+An empty export does not PASS verification. An export with entries but no `type: "checkpoint"` records may PASS without a key policy, with `signature_basis: "none"` and no signature evidence (short-lived logs may not yet have checkpoints). With `--public-key` or `--trust-embedded`, zero checkpoint records produces `checkpoint_coverage_absent` and FAIL. An export whose only records are rotation or legacy anchors has no checkpoint to verify and PASSes its other checks when no key is supplied, and FAILs with `checkpoint_coverage_absent` under a key.
 
 ## Verification Algorithm
 
@@ -138,25 +138,29 @@ A verifier reading a JSONL export MUST:
 4. **prev_hash walk:** Assert that each entry's `prev_hash` equals the `entry_hash` of the previous entry (or `"GENESIS"` for the first, or the legacy anchor `root_hash` after migration).
 5. **Hash recomputation:** For each entry, recompute `entry_hash` from the envelope fields and compare to the stored value.
 6. **Checkpoint root:** For each checkpoint, collect the `entry_hash` values for `[from_sequence, checkpoint_sequence]` and recompute the root hash; compare to `root_hash`.
-7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production call sites derive the checkpoint signer when the fortress holds an identity; identity-less fortresses and the root daemon split audit store write honest unsigned checkpoints. Open defect: **IC-05**.
-8. **Legacy anchor:** Assert that `root_hash` is a valid 64-character hex string.
+7. **Checkpoint signature:** Each `type: "checkpoint"` record must carry a boolean `unsigned` field, otherwise report `schema_error`. An `unsigned: true` checkpoint yields `checkpoint_unsigned` under every key policy and the export does not PASS. For a signed checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the supplied trusted key, or the embedded key only with explicit `--trust-embedded` opt-in. A checkpoint marked signed yields `checkpoint_signature_missing_key` when no key is supplied; an absent or invalid signature under a key produces `checkpoint_signature_invalid`. A requested key policy with zero checkpoint records produces `checkpoint_coverage_absent`. Production call sites derive the checkpoint signer when the fortress holds an identity; identity-less fortresses and the root daemon split audit store write honest unsigned checkpoints. Open defect: **IC-05**.
+8. **Legacy anchor:** Assert that `root_hash` is a valid 64-character hex string. Legacy-anchor signatures are outside this verifier's checks; `checkpoint_unsigned` covers only `type: "checkpoint"` records.
 
 In strict mode (default), any single failure causes the verdict to be `FAIL` and the process exits 1. With `--no-strict`, verification still reports `FAIL` with findings and exits 10 after completing the full scan. A clean verification exits 0.
 
 ## Verification Report Schema
+
+<!-- The finding kind list must match RecordFindingKind in server/src/cli/audit-chain-verify.ts. -->
 
 ```json
 {
   "verdict": "PASS | FAIL",
   "entries_verified": 100,
   "checkpoints_verified": 1,
+  "signature_basis": "pinned | embedded | none",
   "signatures_verified": 1,
   "signatures_skipped": 0,
   "legacy_anchors_verified": 0,
   "rotation_anchor_scope": "Human-readable bound on what standalone rotation-anchor verification proves",
+  "signature_coverage_scope": "Human-readable bound on checkpoint signature policy, coverage, and legacy anchors",
   "findings": [
     {
-      "kind": "entry_hash_mismatch | prev_hash_mismatch | sequence_gap | checkpoint_root_mismatch | checkpoint_signature_invalid | checkpoint_signature_missing_key | legacy_anchor_mismatch | schema_error",
+      "kind": "empty_input | malformed_input | entry_hash_mismatch | prev_hash_mismatch | sequence_gap | checkpoint_root_mismatch | checkpoint_unsigned | checkpoint_coverage_absent | checkpoint_signature_invalid | checkpoint_signature_missing_key | legacy_anchor_mismatch | rotation_anchor_mismatch | schema_error",
       "seq": 5,
       "message": "Human-readable description",
       "expected": "<value>",
@@ -165,6 +169,8 @@ In strict mode (default), any single failure causes the verdict to be `FAIL` and
   ]
 }
 ```
+
+`signature_basis` names the caller's requested policy, not verified signer evidence. `checkpoints_verified` counts checkpoint records examined; `signatures_verified` counts signatures successfully checked. `signatures_skipped` is retained for compatibility and equals the number of `checkpoint_unsigned` findings. The fixed `signature_coverage_scope` field states the keyed zero-checkpoint bound and excludes legacy-anchor signatures.
 
 ## Running the Verifier
 

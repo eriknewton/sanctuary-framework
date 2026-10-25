@@ -1,3 +1,8 @@
+/**
+ * Doctor distinguishes missing signature evidence from integrity findings.
+ * AUDIT-VERIFY-UNSIGNED-1024
+ */
+// fail-before-exempt: These regression guards preserve the base identity FAIL and audit-chain WARN behavior; the coverage and exit tests supply the fail-before cases.
 import { afterEach, describe, expect, it } from "vitest";
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -302,6 +307,59 @@ approval_channel:
     expect(out.text()).toContain(
       "checkpoint signatures were not verified against a pinned public key"
     );
+  });
+
+  it("warns for unsigned checkpoints while identity remains the only FAIL in an identity-less fortress", async () => {
+    const fortress = await makeFortress({ identity: false, policy: "valid", audit: "unsigned-checkpoint" });
+    const checks = await runDoctorChecks({
+      storagePath: fortress,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(checks.find((check) => check.name === "identity")).toMatchObject({
+      status: "FAIL", message: "no identity records found",
+      hint: "run identity_create or sanctuary init",
+    });
+    expect(checks.find((check) => check.name === "audit chain")).toMatchObject({
+      status: "WARN",
+      message: "no checkpoint signature was verified",
+      hint: "wire a production checkpoint signer before treating checkpoint signatures as evidence",
+    });
+    expect(checks.filter((check) => check.status === "FAIL").map((check) => check.name)).toEqual(["identity"]);
+    expect(await runDoctorCommand({
+      argv: ["--fortress", fortress], out: new Capture(),
+      env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
+    })).toBe(1);
+  });
+
+  it.each([
+    { label: "missing-key", corruptRoot: false, status: "WARN", exit: 0 },
+    { label: "root mismatch", corruptRoot: true, status: "FAIL", exit: 1 },
+  ])("keeps the doctor $status boundary for unsigned checkpoints mixed with $label", async ({ corruptRoot, status, exit }) => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: "signed-checkpoint" });
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const [meta] = await storage.list("_audit_checkpoints", "audit-checkpoint-");
+    const raw = await storage.read("_audit_checkpoints", meta!.key);
+    const unsigned = JSON.parse(bytesToString(raw!));
+    unsigned.unsigned = true;
+    unsigned.signature = null;
+    unsigned.signature_algorithm = null;
+    unsigned.signer_kid = null;
+    delete unsigned.public_key;
+    if (corruptRoot) unsigned.root_hash = computeAuditRoot([]);
+    // Preserve the signed record to exercise mixed findings in the real export consumer.
+    await storage.write("_audit_checkpoints", "audit-checkpoint-unsigned-fixture", stringToBytes(JSON.stringify(unsigned)));
+    const checks = await runDoctorChecks({
+      storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
+    });
+    expect(checks.find((check) => check.name === "audit chain")).toMatchObject({
+      status,
+      message: corruptRoot ? expect.stringContaining("integrity finding(s)") : "no checkpoint signature was verified",
+    });
+    expect(await runDoctorCommand({
+      argv: ["--fortress", fortress], out: new Capture(),
+      env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
+    })).toBe(exit);
   });
 
   it("does not report OK for a tampered chain re-signed with embedded checkpoint keys", async () => {

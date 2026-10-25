@@ -633,15 +633,24 @@ async function checkAuditChain(
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line) as ExportRecord);
   const report = verifyAuditChainRecords(records);
+  // Continuing-path table: PASS -> OK; unsigned plus optional missing-key
+  // findings -> signer WARN; missing-key only -> pinned-key WARN.
+  // Refusal path: every other finding set -> FAIL, even alongside unsigned findings.
   if (report.verdict === "PASS") {
-    if (report.signatures_verified === 0 && report.signatures_skipped > 0) {
-      return warn(
-        "audit chain",
-        "no checkpoint signature was verified",
-        "wire a production checkpoint signer before treating checkpoint signatures as evidence",
-      );
-    }
     return ok("audit chain", `${report.entries_verified} entries verified`, "none");
+  }
+  // Only missing signature evidence is a setup warning; any integrity or
+  // schema finding must still reach FAIL, including when mixed with unsigned records.
+  if (
+    report.findings.some((finding) => finding.kind === "checkpoint_unsigned") &&
+    report.findings.every((finding) =>
+      finding.kind === "checkpoint_unsigned" || finding.kind === "checkpoint_signature_missing_key")
+  ) {
+    return warn(
+      "audit chain",
+      "no checkpoint signature was verified",
+      "wire a production checkpoint signer before treating checkpoint signatures as evidence",
+    );
   }
   if (
     report.findings.length > 0 &&
@@ -902,7 +911,7 @@ async function checkCastleWall(opts: {
   // is NOT-PROVEN, and not-proven never renders OK. Before this arm, a truncated
   // or garbled record fell into the `absent` path and the check reported OK from
   // `[activated enabled]` alone, which is the exact borrowed-machine-evidence
-  // fail-open this whole check exists to close — with the added twist that the
+  // fail-open this whole check exists to close, with the added twist that the
   // vault very likely DID carry a claim and the operator was told the opposite.
   // The message is deliberately its own sentence rather than a suffix on the
   // machine state, so "I cannot read this vault's wall claim" is never mistaken
@@ -937,7 +946,7 @@ async function checkCastleWall(opts: {
       // STATED BOUND on the OK case: `absent` means this fortress predates the
       // vault-level claim, so all doctor can honestly report here is the
       // MACHINE's extension state. Saying so inline keeps a green line from
-      // being read as "this vault is protected" — the claim doctor cannot make
+      // being read as "this vault is protected", the claim doctor cannot make
       // without the anchor verdict and this fortress's arm evidence, neither of
       // which it observes. `sanctuary castle-wall status` is the surface that
       // does.
