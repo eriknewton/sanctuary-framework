@@ -145,6 +145,11 @@ let homeFreshnessTimer = null;
 const DASHBOARD_MILLISECONDS_PER_SECOND = 1000;
 const DASHBOARD_READ_DEADLINE_SECONDS = 5;
 const DASHBOARD_READ_DEADLINE_MS = DASHBOARD_READ_DEADLINE_SECONDS * DASHBOARD_MILLISECONDS_PER_SECOND;
+// Ten evenly spaced reads in the ten-minute seal window cap each panel at one refetch per minute.
+const STEADY_REFETCH_INTERVAL_DIVISOR = 10;
+const DASHBOARD_STEADY_REFETCH_INTERVAL_MS = SEAL_FRESHNESS_MAX_MS / STEADY_REFETCH_INTERVAL_DIVISOR;
+// Retry deferred admission after one read budget, without increasing the successful wave rate.
+const DASHBOARD_STEADY_REFETCH_RETRY_MS = DASHBOARD_READ_DEADLINE_MS;
 const SEAL_REREAD_MIN_INTERVAL_DIVISOR = 20;
 // 20 = at most one automatic seal re-read per source per 30 s of the 10-minute
 // SEAL_FRESHNESS_MAX_MS window (10m / 20 = 30 s); the 5 s read deadline is added so a
@@ -166,7 +171,8 @@ const DASHBOARD_MODE_NOT_SERVED_MODE = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NO
 const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE)};
 // Invariant: every panel tracks one explicit read state per source; only
 // state_LOADED may render a count, checked empty list, clear, configured or
-// protective status. UNREAD/LOADING/FAILED render Unknown with a labeled Retry;
+// protective status, including while a steady read has refreshing=true and retains
+// the loaded snapshot. UNREAD/LOADING/FAILED render Unknown with a labeled Retry;
 // state_NOT_SERVED renders the positive standalone-mode signal with no Retry.
 // Protection additionally requires fresh evidence. Fixed sources never evict.
 const sourceReads = new Map([
@@ -178,7 +184,7 @@ const sourceReads = new Map([
   AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
   "/api/honeypot/tool-traps", "/api/honeypot/credential-traps",
   "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings", "/api/fleet/roster", "/api/sentinels/findings"
-].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0, lastReadAt: 0 }]; }));
+].map(function (path) { return [readKey(path), { state: "state_UNREAD", refreshing: false, error: null, failures: 0, nextReadAt: 0, revision: 0, lastReadAt: 0 }]; }));
 const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute after repeated failures.
 function readKey(url) {
   const parsed = new URL(url, location.origin);
@@ -601,7 +607,7 @@ function beginMfpRead(path) {
 function currentMfpRead(path, generation) { return sourceRead(path).generation === generation; }
 // For the three snapshot readers (fetchMfpRead and readPolicyView), every site that bumps the read's revision also sets
 // its state (queuePanel to LOADING and queues the trailing read; a restart to UNREAD; a stop to FAILED), so this refusal
-// means "not mine to publish", never a failed read. Other panels reach loadPanel's catch and still fail on it.
+// means "not mine to publish", never a failed read. loadPanel also preserves that refusal for other panels.
 function supersededByRefresh() {
   const error = new Error("A newer refresh is pending.");
   error.supersededByRefresh = true;
@@ -609,7 +615,7 @@ function supersededByRefresh() {
 }
 // A rejected race cannot publish late bytes, even if a transport ignores abort.
 // Only GETs use this helper; a mutation timeout must not imply it was undone.
-function readResponse(url, init, deadlineMs, generation) {
+function readResponse(url, init, deadlineMs, generation, refreshing) {
   const key = readKey(url);
   if (generation === undefined && pendingReads.has(key)) return pendingReads.get(key);
   const source = sourceReads.get(key);
@@ -617,11 +623,17 @@ function readResponse(url, init, deadlineMs, generation) {
   if (source && source.state === "state_FAILED" && Date.now() < source.nextReadAt) {
     const error = new Error(source.error); error.status = source.status; return Promise.reject(error);
   }
-  if (source) { clearSealFreshnessTimer(url); source.lastReadAt = Date.now(); source.state = "state_LOADING"; source.error = null; rerender(); }
+  if (source) {
+    clearSealFreshnessTimer(url); source.lastReadAt = Date.now();
+    // A steady read retains loaded controls until its result arrives; timer feedback must not move decision targets.
+    source.refreshing = refreshing === true && source.state === "state_LOADED";
+    if (!source.refreshing) source.state = "state_LOADING";
+    source.error = null; rerender();
+  }
   const controller = new AbortController();
   let timer;
   const expired = new Promise(function (_, reject) {
-    timer = setTimeout(function () {
+    timer = setTimeout(function dashboardReadDeadline() {
       reject(new Error("Read timed out. The latest result is unavailable."));
       controller.abort();
     }, deadlineMs === undefined ? DASHBOARD_READ_DEADLINE_MS : deadlineMs);
@@ -669,7 +681,7 @@ function readResponse(url, init, deadlineMs, generation) {
     if (generation !== undefined && !currentMfpRead(url, generation)) throw error;
     // A snapshot read whose revision moved failed after a trailing read or a stop took over its state, so the failure
     // is not this source's result: the reader keeps its snapshot, as it does when a superseded read succeeds.
-    if (generation !== undefined && source && source.revision !== revision) throw supersededByRefresh();
+    if (source && source.revision !== revision) throw supersededByRefresh();
     if (error && error.dashboardModeNotServed) markSourceNotServed(url);
     else failSource(url, error);
     if (source && source.state !== "state_NOT_SERVED") { source.status = error.status; source.tokenUnsendable = !!(error && error.operatorTokenUnsendable); }
@@ -677,15 +689,16 @@ function readResponse(url, init, deadlineMs, generation) {
     throw error;
   }).finally(function () {
     clearTimeout(timer);
+    if (source && source.revision === revision) source.refreshing = false;
     if (pendingReads.get(key) === result) pendingReads.delete(key);
   });
   pendingReads.set(key, result);
   return result;
 }
 
-function dashboardResponse(url, init, deadlineAt) {
+function dashboardResponse(url, init, deadlineAt, refreshing) {
   return !init || !init.method || init.method.toUpperCase() === "GET"
-    ? readResponse(url, init, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()))
+    ? readResponse(url, init, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()), undefined, refreshing)
     : fetch(url, init);
 }
 
@@ -732,7 +745,7 @@ function restoreRetryFocus(active, container) {
   else if (container.setAttribute && container.focus) { container.setAttribute("tabindex", "-1"); container.focus(); }
 }
 
-async function api(path, opts, deadlineAt) {
+async function api(path, opts, deadlineAt, refreshing) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
   if (init.body && typeof init.body !== "string") {
@@ -764,7 +777,7 @@ async function api(path, opts, deadlineAt) {
     url += (url.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
   url = credentialedReadUrl(url, method);
-  let res = await dashboardResponse(url, init, deadlineAt);
+  let res = await dashboardResponse(url, init, deadlineAt, refreshing);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
     res = await fetch(url, init);
@@ -6329,12 +6342,12 @@ const panelJobs = [
   { paths: [INBOX_PREFS], load: loadInboxPrefs },
   { paths: ["/api/fleet/roster"], load: function () { return fetchMfpRead("/api/fleet/roster", "roster"); } },
   { paths: ["/api/sentinels/findings"], load: function () { return fetchMfpRead("/api/sentinels/findings", "findings"); } },
-  { paths: [HUB + "/agents"], load: async function () {
-    const ar = await api("/agents");
+  { paths: [HUB + "/agents"], load: async function (deadlineAt, refreshing) {
+    const ar = await api("/agents", undefined, deadlineAt, refreshing);
     state.agents = ar.data.agents || [];
     state.chatActiveAgentId = state.chatActiveAgentId || (state.agents[0] ? state.agents[0].agent_id : null);
   } },
-  { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
+  { paths: [HUB + "/inbox"], load: async function (deadlineAt, refreshing) { const r = await api("/inbox", undefined, deadlineAt, refreshing); applyInboxPayload(r.data || {}); } },
   { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
   { paths: ["/api/posture/evidence"], load: async function (deadlineAt) {
     const url = evidenceReadUrl();
@@ -6363,13 +6376,15 @@ const panelJobs = [
 ];
 const policyPanelJob = { paths: [POLICY + "/current"], load: readPolicyView };
 const pendingPanels = new Map();
-function loadPanel(job) {
+function loadPanel(job, refreshing) {
   if (pendingPanels.has(job)) return pendingPanels.get(job);
   // Dependent reads share the panel's budget instead of resetting it per step.
   const deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
-  const pending = Promise.resolve().then(function () { return job.load(deadlineAt); }).then(function () {
+  const pending = Promise.resolve().then(function () { return job.load(deadlineAt, refreshing); }).then(function () {
     return job.paths.some(function (path) { const read = sourceRead(path); return read && read.state === "state_LOADED"; });
   }).catch(function (error) {
+    // A newer refresh owns this source; supersession is not a failed read or a backoff attempt.
+    if (error && error.supersededByRefresh === true) return false;
     job.paths.forEach(function (path) { if (sourceRead(path) && sourceRead(path).state !== "state_FAILED" && sourceRead(path).state !== "state_NOT_SERVED") failSource(path, error); });
     return false;
   }).finally(function () { pendingPanels.delete(job); rerender(); });
@@ -6377,17 +6392,22 @@ function loadPanel(job) {
   return pending;
 }
 const trailingPanels = new Map();
+function settlePanelRead(pending) {
+  // Admission waits for ownership to end, even when a renderer or transport rejects.
+  return Promise.resolve(pending).then(function (value) { return value; }, function () { return false; });
+}
 function queuePanel(job) {
   // One queued read per fixed panel coalesces bursts; every event invalidates older admitted bytes.
   job.paths.forEach(function (path) {
     sourceReads.forEach(function (read, key) {
       if (key === readKey(path) || key.indexOf(readKey(path) + "/") === 0) {
-        read.revision++; read.state = "state_LOADING"; read.nextReadAt = 0;
+        read.revision++; read.refreshing = false; read.state = "state_LOADING"; read.nextReadAt = 0;
       }
     });
   });
   if (trailingPanels.has(job)) return trailingPanels.get(job);
-  const queued = Promise.resolve(pendingPanels.get(job)).then(function () {
+  // Capture only the current steady wave; queued reads own admission before another wave can start.
+  const queued = Promise.all([settlePanelRead(pendingPanels.get(job)), settlePanelRead(steadyRefetch)]).then(function () {
     trailingPanels.delete(job); // An event during the new read must queue a subsequent read.
     job.paths.forEach(function (path) {
       sourceReads.forEach(function (read, key) { if (key === readKey(path) || key.indexOf(readKey(path) + "/") === 0) read.nextReadAt = 0; });
@@ -6401,9 +6421,9 @@ function orderedPanelJobs(jobs) {
   const critical = jobs.filter(function (job) { return job.load === fetchSovereignty || job.load === fetchPostureHome; });
   return critical.concat(jobs.filter(function (job) { return critical.indexOf(job) < 0; }));
 }
-async function fetchAll(afterMutation, selectedJobs) {
+async function fetchAll(afterMutation, selectedJobs, refreshing) {
   const jobs = selectedJobs || panelJobs.filter(function (job) { return job.load !== loadInboxPrefs; });
-  const pending = orderedPanelJobs(jobs).map(afterMutation ? queuePanel : loadPanel);
+  const pending = orderedPanelJobs(jobs).map(function (job) { return afterMutation ? queuePanel(job) : loadPanel(job, refreshing); });
   if (afterMutation) rerender();
   const results = await Promise.all(pending);
   return results.some(Boolean);
@@ -7574,7 +7594,49 @@ async function onTemplateBind(agentId) {
 }
 
 // ── SSE wire-up ────────────────────────────────────────────────────────
+let steadyRefetchTimer = null;
+let steadyRefetch = null;
+let connectedStream = null;
+function clearSteadyRefetchTimer() {
+  if (steadyRefetchTimer !== null) clearTimeout(steadyRefetchTimer);
+  steadyRefetchTimer = null;
+}
+function scheduleSteadyRefetch(delay) {
+  // One timer and one wave cover the fixed panel set; reconnects and visibility changes never accumulate work.
+  clearSteadyRefetchTimer();
+  if (connectedStream && connectedStream.readyState !== EventSource.OPEN) connectedStream = null;
+  if (!connectedStream || liveUpdatesStopped || pollingStarted || document.visibilityState === "hidden" || steadyRefetch) return;
+  steadyRefetchTimer = setTimeout(async function () {
+    clearSteadyRefetchTimer();
+    if (connectedStream && connectedStream.readyState !== EventSource.OPEN) connectedStream = null;
+    if (!connectedStream || liveUpdatesStopped || pollingStarted || document.visibilityState === "hidden") return;
+    const paths = [HUB + "/inbox", HUB + "/agents"];
+    // Only competing panels own admission first; unrelated activity cannot starve these producer-less sources.
+    const targets = jobsForPaths(paths);
+    if (targets.some(function (job) { return pendingPanels.has(job) || trailingPanels.has(job); }) || steadyRefetch) {
+      scheduleSteadyRefetch(DASHBOARD_STEADY_REFETCH_RETRY_MS); return;
+    }
+    // Retry and mode bounds belong to each source, so a deferred source cannot suppress its due sibling.
+    const duePaths = paths.filter(function (path) {
+      const read = sourceRead(path);
+      return !read || (read.state !== "state_NOT_SERVED" && Date.now() >= read.nextReadAt);
+    });
+    const jobs = jobsForPaths(duePaths);
+    steadyRefetch = (async function () {
+      try { return await fetchAll(false, jobs, true); }
+      finally {
+        // Aggregate rejection must not release queued reads while a sibling still owns a panel.
+        await Promise.all(jobs.map(function (job) { return settlePanelRead(pendingPanels.get(job)); }));
+      }
+    })();
+    try { await steadyRefetch; }
+    catch (error) { /* Read failures already carry panel feedback; renderer rejection must not stop the scheduler. */ }
+    finally { steadyRefetch = null; scheduleSteadyRefetch(); }
+  }, delay === undefined ? DASHBOARD_STEADY_REFETCH_INTERVAL_MS : delay);
+}
 function connectStream() {
+  clearSteadyRefetchTimer();
+  connectedStream = null;
   let es = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
@@ -7583,11 +7645,25 @@ function connectStream() {
     reconnectAttempts = 0;
   }
   async function open() {
+    if (liveUpdatesStopped || pollingStarted) return;
     try {
       const sessionQuery = await createStreamSessionQuery();
+      if (liveUpdatesStopped || pollingStarted) return;
       const url = credentialedReadUrl(STREAM + sessionQuery, "GET");
       es = new EventSource(url);
+      const stream = es;
+      const close = stream.close;
+      // Native close emits no error event, so release timer ownership synchronously at the close boundary.
+      stream.close = function () {
+        if (connectedStream === stream) { clearSteadyRefetchTimer(); connectedStream = null; }
+        return close.call(stream);
+      };
     } catch (e) { schedulePolling(); return; }
+    es.onopen = function () {
+      if (liveUpdatesStopped || pollingStarted) return;
+      connectedStream = es;
+      scheduleSteadyRefetch();
+    };
     es.addEventListener("snapshot", function () { markStreamFrameReceived(); /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
     es.addEventListener("activity", function (ev) {
       try {
@@ -7625,17 +7701,21 @@ function connectStream() {
     });
     es.addEventListener("approval", function () { markStreamFrameReceived(); void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
     es.onerror = function () {
+      clearSteadyRefetchTimer();
+      connectedStream = null;
       try { es && es.close(); } catch (e) { /* ignore */ }
       es = null;
+      if (liveUpdatesStopped || pollingStarted) return;
       // The bounded recovery budget ends visibly; no loaded clear stays current after give-up.
       if (reconnectTimer) return;
       if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { stopLiveUpdates(); return; }
       const delay = 1000 * Math.pow(2, reconnectAttempts++);
       reconnectTimer = setTimeout(async function () {
         reconnectTimer = null;
-        await fetchAll(true);
-        rerender();
-        void open();
+        if (liveUpdatesStopped || pollingStarted) return;
+        try { await fetchAll(true); rerender(); }
+        catch (error) { /* A rejected restore cannot strand stream recovery. */ }
+        finally { void open(); }
       }, delay);
     };
   }
@@ -7644,8 +7724,10 @@ function connectStream() {
 
 function stopLiveUpdates() {
   liveUpdatesStopped = true;
+  clearSteadyRefetchTimer();
+  connectedStream = null;
   clearSealFreshnessTimer();
-  sourceReads.forEach(function (read) { read.revision++; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
+  sourceReads.forEach(function (read) { read.revision++; read.refreshing = false; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
   // Every read is now failed, so no findings snapshot is current: the selection closes, as a failed findings read
   // closes it, and a restart cannot reopen it.
   state.mfp.findingId = null;
@@ -7657,6 +7739,8 @@ function stopLiveUpdates() {
 // is unavailable.
 let pollingStarted = false;
 function schedulePolling() {
+  clearSteadyRefetchTimer();
+  connectedStream = null;
   if (pollingStarted) return;
   pollingStarted = true;
   let failedWaves = 0;
@@ -7741,6 +7825,8 @@ document.addEventListener("keydown", function (ev) {
 });
 
 document.addEventListener("visibilitychange", function () {
+  clearSteadyRefetchTimer();
+  if (document.visibilityState === "visible") scheduleSteadyRefetch();
   if (document.visibilityState === "visible") rerender();
 });
 
