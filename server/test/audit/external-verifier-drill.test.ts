@@ -9,9 +9,13 @@
  *   C. Checkpoint signature invalidation
  *
  * This is the kind of artifact handed to a security reviewer as proof.
+ *
+ * AUDIT-VERIFY-UNSIGNED-1024
  */
+// fail-before-exempt: this change makes the rotated export a signed positive compatibility fixture that passes on both revisions; the regression coverage for the unsigned-checkpoint verdict lives in the CLI signature-coverage test.
 
 import { describe, expect, it, beforeEach } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import { Writable } from "node:stream";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -380,11 +384,25 @@ describe("external-verifier-drill: happy path", () => {
   it("exports a rotated chain with its rotation anchor and verifies it as PASS", async () => {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
+    const signingSeedBytes = 32; // Ed25519 private seeds contain 32 bytes.
+    const signingSeed = new Uint8Array(signingSeedBytes).fill(1);
+    const publicKey = toBase64url(ed25519.getPublicKey(signingSeed));
+    const maxEntries = 5; // Retain a suffix spanning more than one checkpoint interval.
+    const checkpointInterval = 3; // Checkpoint before and after retention starts.
+    const appendedEntries = checkpointInterval * 4; // Four intervals force repeated rotation.
     const log = new AuditLog(storage, masterKey, {
-      maxEntries: 5,
-      checkpointInterval: 3,
+      maxEntries,
+      checkpointInterval,
+      // Sign the production writer's payload so exported checkpoints exercise
+      // the same signing and rotation path as a configured fortress identity.
+      checkpointSigner: async (payload) => ({
+        signer_kid: "rotated-drill-signer",
+        signature: toBase64url(ed25519.sign(checkpointSigningBytes(payload), signingSeed)),
+        public_key: publicKey,
+      }),
+      checkpointPublicKeyResolver: () => publicKey,
     });
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < appendedEntries; i++) {
       await log.appendCritical({
         layer: "l1",
         operation: `rotated_op_${i}`,
@@ -398,20 +416,22 @@ describe("external-verifier-drill: happy path", () => {
     const records = parseJsonl(jsonl);
     const checkpointCount = records.filter((r) => r.type === "checkpoint").length;
 
-    expect(records.filter((r) => r.type === "entry")).toHaveLength(5);
+    expect(records.filter((r) => r.type === "entry")).toHaveLength(maxEntries);
     expect(records).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "rotation_anchor",
-          base_sequence: 8,
+          base_sequence: appendedEntries - maxEntries + 1,
         }),
       ])
     );
-    const report = verifyAuditChainRecords(records);
+    expect(checkpointCount).toBeGreaterThan(0);
+    const report = verifyAuditChainRecords(records, { publicKey });
     expect(report.verdict).toBe("PASS");
     expect(report.findings).toHaveLength(0);
-    expect(report.signatures_verified).toBe(0);
-    expect(report.signatures_skipped).toBe(checkpointCount);
+    expect(report.signature_basis).toBe("pinned");
+    expect(report.signatures_verified).toBe(checkpointCount);
+    expect(report.signatures_skipped).toBe(0);
   });
 });
 

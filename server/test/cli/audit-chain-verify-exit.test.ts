@@ -8,8 +8,15 @@ import {
   AUDIT_CHAIN_GENESIS,
   AUDIT_CHAIN_SCHEMA_VERSION,
   computeAuditEntryHash,
+  computeAuditRoot,
 } from "../../src/audit/chain.js";
-import type { EntryExportRecord } from "../../src/cli/audit-chain-verify.js";
+import {
+  AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS as AUDIT_CHAIN_VERIFY_EXIT_FAIL,
+  auditChainVerifyExitCode,
+  verifyAuditChainContent,
+  type CheckpointExportRecord,
+  type EntryExportRecord,
+} from "../../src/cli/audit-chain-verify.js";
 import {
   CLI_PATH,
   CLI_SUBPROCESS_TEST_TIMEOUT_MS,
@@ -117,6 +124,35 @@ describe("sanctuary audit-chain verify process behavior", () => {
     );
     expect(relaxedFindings.code).toBe(10);
     expect(JSON.parse(relaxedFindings.stdout)).toMatchObject({ verdict: "FAIL" });
+  }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
+
+  it("returns strict FAIL for an all-unsigned export through source and the built bundle", async () => {
+    const entries = cleanEntries(1);
+    const entry = entries[0]!;
+    const checkpoint: CheckpointExportRecord = {
+      type: "checkpoint",
+      checkpoint_kind: "audit-checkpoint",
+      checkpoint_sequence: entry.seq,
+      from_sequence: entry.seq,
+      previous_checkpoint_sequence: entry.seq - 1,
+      root_hash: computeAuditRoot([entry.entry_hash]),
+      signed_at: entry.timestamp,
+      signer_kid: null,
+      signature: null,
+      unsigned: true,
+    };
+    const content = asJsonl([...entries, checkpoint]);
+    // Source verification keeps this regression visible when fail-before restores source only.
+    expect(auditChainVerifyExitCode(verifyAuditChainContent(content), true)).toBe(AUDIT_CHAIN_VERIFY_EXIT_FAIL);
+    const input = await writeFixture("unsigned.jsonl", content);
+    const result = await runCli("audit-chain", "verify", "--input", input);
+    expect(result.code).toBe(AUDIT_CHAIN_VERIFY_EXIT_FAIL);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      verdict: "FAIL",
+      signatures_verified: 0,
+      signatures_skipped: 1,
+      findings: [expect.objectContaining({ kind: "checkpoint_unsigned" })],
+    });
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 
   it("keeps a piped large findings report parseable", async () => {

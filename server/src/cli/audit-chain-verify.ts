@@ -243,6 +243,7 @@ export type ExportRecord =
 
 // ---- Verification report types ----------------------------------------------
 
+// Must match the finding kind list in server/docs/audit-chain-export-format.md.
 export type RecordFindingKind =
   | "empty_input"
   | "malformed_input"
@@ -250,6 +251,8 @@ export type RecordFindingKind =
   | "prev_hash_mismatch"
   | "sequence_gap"
   | "checkpoint_root_mismatch"
+  | "checkpoint_unsigned"
+  | "checkpoint_coverage_absent"
   | "checkpoint_signature_invalid"
   | "checkpoint_signature_missing_key"
   | "legacy_anchor_mismatch"
@@ -265,6 +268,7 @@ export interface RecordFinding {
 }
 
 export type VerifyVerdict = "PASS" | "FAIL";
+/** The checkpoint key policy requested by the caller, not evidence of coverage. */
 export type SignatureBasis = "pinned" | "embedded" | "none";
 export const AUDIT_CHAIN_VERIFY_EXIT_OK = 0;
 export const AUDIT_CHAIN_VERIFY_EXIT_STRICT_FINDINGS = 1;
@@ -274,6 +278,7 @@ export interface VerifyReport {
   verdict: VerifyVerdict;
   entries_verified: number;
   checkpoints_verified: number;
+  /** Policy applied; checkpoints_verified and signatures_verified name what was actually checked. */
   signature_basis: SignatureBasis;
   signatures_verified: number;
   signatures_skipped: number;
@@ -285,6 +290,8 @@ export interface VerifyReport {
    * can never be read as proof of anchor authenticity.
    */
   rotation_anchor_scope: string;
+  /** Fixed bound on checkpoint signature policy, coverage, and legacy anchors. */
+  signature_coverage_scope: string;
 }
 
 /**
@@ -297,6 +304,14 @@ export const ROTATION_ANCHOR_SCOPE =
   "standalone tool does not hold, so a PASS does not prove the anchor is " +
   "authentic; MAC verification requires the fortress runtime (the exported " +
   "anchor carries its mac field for that purpose).";
+
+/** Signature coverage bounds printed in every report for relying callers. */
+export const SIGNATURE_COVERAGE_SCOPE =
+  'signature_basis names the requested key policy, while checkpoints_verified and ' +
+  'signatures_verified count what was checked; unsigned findings cover type: "checkpoint" ' +
+  'records, keyed verification with zero such records reports checkpoint_coverage_absent, ' +
+  'no-key verification with zero checkpoints may PASS without signature evidence, and ' +
+  'legacy-anchor signatures are outside this verifier\'s checks.';
 
 // ---- Core verification logic (pure, no I/O) ---------------------------------
 
@@ -318,11 +333,6 @@ export function verifyAuditChainRecords(
   const findings: RecordFinding[] = [];
   let signaturesVerified = 0;
   let signaturesSkipped = 0;
-  const signatureBasis: SignatureBasis = opts.publicKey
-    ? "pinned"
-    : opts.trustEmbedded
-      ? "embedded"
-      : "none";
 
   // Partition records
   const entries = records
@@ -331,6 +341,18 @@ export function verifyAuditChainRecords(
   const checkpoints = records
     .filter((r): r is CheckpointExportRecord => r.type === "checkpoint")
     .sort((a, b) => a.checkpoint_sequence - b.checkpoint_sequence);
+  const signatureBasis: SignatureBasis = opts.publicKey
+    ? "pinned"
+    : opts.trustEmbedded
+      ? "embedded"
+      : "none";
+  // A requested key policy requires a checkpoint witness; counters alone cannot satisfy it.
+  if (signatureBasis !== "none" && checkpoints.length === 0) {
+    findings.push({
+      kind: "checkpoint_coverage_absent",
+      message: "no checkpoint record was present to verify against the supplied key",
+    });
+  }
   const legacyAnchors = records
     .filter((r): r is LegacyAnchorExportRecord => r.type === "legacy_anchor")
     .sort((a, b) => a.checkpoint_sequence - b.checkpoint_sequence);
@@ -348,12 +370,14 @@ export function verifyAuditChainRecords(
       verdict: "FAIL",
       entries_verified: 0,
       checkpoints_verified: 0,
-      signature_basis: "none",
+      signature_basis: signatureBasis,
       signatures_verified: 0,
       signatures_skipped: 0,
       legacy_anchors_verified: 0,
       rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
+      signature_coverage_scope: SIGNATURE_COVERAGE_SCOPE,
       findings: [
+        ...findings,
         {
           kind: "empty_input",
           message:
@@ -481,8 +505,25 @@ export function verifyAuditChainRecords(
       }
     }
 
-    // Signature verification
-    if (cp.unsigned) {
+    // The unsigned discriminator describes this checkpoint's signature state;
+    // only a boolean can select a verification branch for the relying caller.
+    if (typeof cp.unsigned !== "boolean") {
+      findings.push({
+        kind: "schema_error",
+        seq: cp.checkpoint_sequence,
+        message: `Checkpoint at seq ${cp.checkpoint_sequence} must have a boolean unsigned field`,
+      });
+      continue;
+    }
+    if (cp.unsigned === true) {
+      // A PASS requires signature verification for every type: "checkpoint"
+      // record; an unsigned record supplies no evidence of its producer.
+      // Legacy-anchor signatures remain outside this verifier's checks.
+      findings.push({
+        kind: "checkpoint_unsigned",
+        seq: cp.checkpoint_sequence,
+        message: `Checkpoint at seq ${cp.checkpoint_sequence} is marked unsigned (unsigned: true); no signature was verified for it`,
+      });
       signaturesSkipped += 1;
     } else {
       // Embedded checkpoint keys are attacker-controllable in an export; using
@@ -549,11 +590,12 @@ export function verifyAuditChainRecords(
     checkpoints_verified: checkpoints.length,
     signature_basis: signatureBasis,
     signatures_verified: signaturesVerified,
-    // These counters are positive evidence, not a partition: missing-key and
-    // marked-signed-without-signature checkpoints produce findings instead.
+    // Compatibility counter: exactly the number of checkpoint_unsigned findings.
+    // Missing-key and invalid-signature findings do not increment this counter.
     signatures_skipped: signaturesSkipped,
     legacy_anchors_verified: legacyAnchors.length,
     rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
+    signature_coverage_scope: SIGNATURE_COVERAGE_SCOPE,
     findings,
   };
 }
@@ -575,36 +617,19 @@ export function parseJsonl(content: string): ExportRecord[] {
     });
 }
 
-export function emptyInputReport(): VerifyReport {
-  return {
-    verdict: "FAIL",
-    entries_verified: 0,
-    checkpoints_verified: 0,
-    signature_basis: "none",
-    signatures_verified: 0,
-    signatures_skipped: 0,
-    legacy_anchors_verified: 0,
-    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
-    findings: [
-      {
-        kind: "empty_input",
-        message:
-          "audit chain export is empty (0 bytes); chain must contain at least one entry or checkpoint",
-      },
-    ],
-  };
+export function emptyInputReport(
+  opts: { publicKey?: string; trustEmbedded?: boolean } = {}
+): VerifyReport {
+  return verifyAuditChainRecords([], opts);
 }
 
-export function malformedInputReport(err: unknown): VerifyReport {
+export function malformedInputReport(
+  err: unknown,
+  opts: { publicKey?: string; trustEmbedded?: boolean } = {}
+): VerifyReport {
   return {
-    verdict: "FAIL",
-    entries_verified: 0,
-    checkpoints_verified: 0,
-    signature_basis: "none",
-    signatures_verified: 0,
-    signatures_skipped: 0,
-    legacy_anchors_verified: 0,
-    rotation_anchor_scope: ROTATION_ANCHOR_SCOPE,
+    // Malformed bytes cannot erase the relying caller's requested key policy.
+    ...emptyInputReport(opts),
     findings: [
       {
         kind: "malformed_input",
@@ -619,14 +644,14 @@ export function verifyAuditChainContent(
   opts: { publicKey?: string; strict?: boolean; trustEmbedded?: boolean } = {}
 ): VerifyReport {
   if (content.length === 0) {
-    return emptyInputReport();
+    return emptyInputReport(opts);
   }
 
   let records: ExportRecord[];
   try {
     records = parseJsonl(content);
   } catch (err) {
-    return malformedInputReport(err);
+    return malformedInputReport(err, opts);
   }
 
   return verifyAuditChainRecords(records, opts);
