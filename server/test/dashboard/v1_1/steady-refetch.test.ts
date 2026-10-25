@@ -3,6 +3,7 @@
  * visible read failures, and teardown across stream and page transitions.
  * D7
  */
+// fail-before-exempt: regression guard for behaviour that already shipped; these late-fulfil cases pass on both revisions by design and pin the refusal of a superseded steady response.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
@@ -384,5 +385,45 @@ describe("connected dashboard bounded hub refetch", () => {
     expect(h.count(TARGETS[1])).toBe(agentsBefore + 1);
     await vi.advanceTimersByTimeAsync(INTERVAL_MS);
     expect(h.count(TARGETS[0])).toBe(before + 1);
+  });
+});
+
+// Regression guard added after the steady-refetch change shipped: a steady response admitted under one revision is
+// refused once stopLiveUpdates or a queued mutation moves the revision, and the control case proves the fixture payload
+// is otherwise accepted. Witnessed first as an uncommitted box run during the gate on 2026-10-25.
+const LATE_INBOX = { data: { configured: false, surfaces: [], agents: [], items: [{ id: "LATE-ITEM", severity: "high", source: "fixture", status: "pending" }], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
+const LATE_AGENTS = { data: { configured: false, surfaces: [], agents: [{ agent_id: "LATE-AGENT", label: "late" }], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
+describe("regression guard: a steady GET that fulfils after the revision moved is refused", () => {
+  it("control: with no ownership move, the late payload IS applied", async () => {
+    const h = await connected(); const slowInbox = deferred(); const slowAgents = deferred();
+    h.overrides[TARGETS[0]] = () => slowInbox.promise; h.overrides[TARGETS[1]] = () => slowAgents.promise;
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(h.count(TARGETS[0])).toBe(2); expect(h.count(TARGETS[1])).toBe(2);
+    slowInbox.resolve(response(LATE_INBOX)); slowAgents.resolve(response(LATE_AGENTS)); await settle();
+    expect(h.read("JSON.stringify(state.inbox)")).toContain("LATE-ITEM");
+    expect(h.read("JSON.stringify(state.agents)")).toContain("LATE-AGENT");
+  });
+  it("stop: a steady GET that fulfils after stopLiveUpdates does not publish inbox or agents bytes", async () => {
+    const h = await connected(); const slowInbox = deferred(); const slowAgents = deferred();
+    h.overrides[TARGETS[0]] = () => slowInbox.promise; h.overrides[TARGETS[1]] = () => slowAgents.promise;
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(h.count(TARGETS[0])).toBe(2); expect(h.count(TARGETS[1])).toBe(2);
+    h.read("stopLiveUpdates()");
+    slowInbox.resolve(response(LATE_INBOX)); slowAgents.resolve(response(LATE_AGENTS)); await settle();
+    await vi.advanceTimersByTimeAsync(SECOND_MS); await settle();
+    expect(h.read("JSON.stringify(state.inbox)")).not.toContain("LATE-ITEM");
+    expect(h.read("JSON.stringify(state.agents)")).not.toContain("LATE-AGENT");
+  });
+  it("mutation: a steady GET that fulfils after queuePanel bumped the revision never publishes, before or after the trailing read", async () => {
+    const h = await connected(); const slowInbox = deferred(); const trailing = deferred(); let inboxReads = 0;
+    h.overrides[TARGETS[0]] = () => (inboxReads++ === 0 ? slowInbox.promise : trailing.promise);
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(h.count(TARGETS[0])).toBe(2);
+    const wave = h.read("fetchAll(true)") as Promise<unknown>;
+    slowInbox.resolve(response(LATE_INBOX)); await settle();
+    expect(h.read("JSON.stringify(state.inbox)")).not.toContain("LATE-ITEM");
+    expect(h.count(TARGETS[0])).toBe(3); // The trailing read has started.
+    trailing.resolve(response()); await settle(); await wave;
+    expect(h.read("JSON.stringify(state.inbox)")).not.toContain("LATE-ITEM");
   });
 });
