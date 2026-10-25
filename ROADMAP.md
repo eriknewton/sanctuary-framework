@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-10-21. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-25. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -76,7 +76,7 @@ The signed system extension, host app, content-filter provider, and retail UX sh
 
 ### Cryptographic identity, encrypted state, audit chain
 
-Ed25519 identity you hold (Argon2id passphrase unlock, per-purpose HKDF subkeys). AES-256-GCM state at rest. Hash-chained audit log with a standalone external verifier. Production checkpoints are signed by the fortress identity and verified through authenticated identity records. Local, on-host tamper-evidence for the audit chain is built at code level but does not yet catch every class of chain tampering, and it has no drill evidence yet; the standalone external verifier remains the primary guarantee until this closes. Register id: **IC-05**. Identity keys never leave Sanctuary in plaintext. Recovery is inspectable, with M-of-N guardian eviction shipped for the guardian-recovery path. Audit entries embed a scheme identifier, and hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) has landed on that crypto-agility path without breaking historical receipts. **Why it matters:** the cryptographic primitives are what makes "your keys" a structural claim rather than a marketing claim.
+Ed25519 identity you hold (Argon2id passphrase unlock, per-purpose HKDF subkeys). AES-256-GCM state at rest. Hash-chained audit log with a standalone external verifier. The verifier reports unsigned checkpoints as findings, so an export with unsigned checkpoints does not PASS; `doctor` surfaces the same state as a warning. Production checkpoints are signed by the fortress identity and verified through authenticated identity records. Local, on-host tamper-evidence for the audit chain is built at code level but does not yet catch every class of chain tampering, and it has no drill evidence yet; the standalone external verifier remains the primary guarantee until this closes. Register id: **IC-05**. Identity keys never leave Sanctuary in plaintext. Recovery is inspectable, with M-of-N guardian eviction shipped for the guardian-recovery path. Audit entries embed a scheme identifier, and hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) has landed on that crypto-agility path without breaking historical receipts. **Why it matters:** the cryptographic primitives are what makes "your keys" a structural claim rather than a marketing claim.
 
 *Status: shipped for state encryption, state envelope integrity, critical audit durability, did:key encoding, and identity signing authority. ASSURANCE_MATRIX row "Tamper-evident audit chain" stays partial pending drill evidence (**IC-05**).*
 
@@ -106,7 +106,7 @@ Operator can export identity, state, reputation, and audit-chain material throug
 
 ### Local multi-agent coordination and Sovereignty Dashboard
 
-Wrap many agents on one machine. Coordinate workflows across them with handoff visualization. See them all in one dashboard at `http://localhost:3501`. Menubar status app with click-to-approve. Plain-English activity log. Cross-harness approval inbox aggregating pending approvals from concurrent wrapped agents. **Why it matters:** operators run more than one agent; the substrate has to scale beyond a single wrap without forcing the operator into many control surfaces.
+Wrap many agents on one machine. Coordinate workflows across them with handoff visualization. See them all in one dashboard at `http://localhost:3501`. While the dashboard's live stream is healthy it also refetches hub state on a fixed schedule, so a quiet stream cannot leave the console silently out of date. Menubar status app with click-to-approve. Plain-English activity log. Cross-harness approval inbox aggregating pending approvals from concurrent wrapped agents. **Why it matters:** operators run more than one agent; the substrate has to scale beyond a single wrap without forcing the operator into many control surfaces.
 
 *Status: shipped.*
 
