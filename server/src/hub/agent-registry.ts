@@ -107,8 +107,12 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
     const prior = this.records.get(record.agent_id);
     this.records.set(record.agent_id, record);
     // Must match snapshotForRecord in hub-service.ts: unchanged persisted refreshes must not trigger refetch loops.
+    // An identity change is a roster change for the hub's own view even when the snapshot fields stand still, so it
+    // notifies too (the stream's identity guard in hub-service.ts announces or drops the id on it).
     if (!prior || prior.status !== record.status || prior.status_reason_class !== record.status_reason_class ||
-        prior.last_activity_at !== record.last_activity_at) this.notify(record.agent_id, record);
+        prior.last_activity_at !== record.last_activity_at || prior.identity_id !== record.identity_id) {
+      this.notify(record.agent_id, record);
+    }
   }
 
   /**

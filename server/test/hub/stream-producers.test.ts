@@ -41,10 +41,12 @@ function setup(publisher?: HubStreamPublisher) {
   return { registry, sources, service };
 }
 function recorder() { return { publishInbox: vi.fn(), publishAgentStatus: vi.fn() }; }
-function expectHeader(frame: unknown, item: HubInboxItem) {
+// Emission times step one millisecond per frame under a frozen clock (nextInboxEmissionIso in hub-service.ts).
+function emittedAt(frameIndex: number) { return new Date(Date.parse(NOW) + frameIndex).toISOString(); }
+function expectHeader(frame: unknown, item: HubInboxItem, frameIndex: number) {
   expect(Object.keys(frame as object).sort()).toEqual(HEADER_KEYS);
   expect(frame).toEqual({ item_id: item.item_id, kind: item.kind, identity_id: item.identity_id,
-    fortress_id: FORTRESS, emitted_at: new Date().toISOString(), resolved: item.resolved });
+    fortress_id: FORTRESS, emitted_at: emittedAt(frameIndex), resolved: item.resolved });
 }
 
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(NOW); });
@@ -56,16 +58,16 @@ describe("hub stream producers", () => {
     const { service } = setup(publisher);
     const items = service.listInbox();
     expect(publisher.publishInbox).toHaveBeenCalledTimes(items.length);
-    for (const [frame] of publisher.publishInbox.mock.calls) expectHeader(frame, items.find((i) => i.item_id === frame.item_id)!);
+    for (const [index, [frame]] of publisher.publishInbox.mock.calls.entries()) expectHeader(frame, items.find((i) => i.item_id === frame.item_id)!, index);
     publisher.publishInbox.mockClear();
     const queued = service.enqueueFortressLockdown();
     const pending = service.listInbox().find((i) => i.item_id === queued.inbox_item_id)!;
     expect(publisher.publishInbox).toHaveBeenCalledTimes(1);
-    expectHeader(publisher.publishInbox.mock.calls[0][0], pending);
+    expectHeader(publisher.publishInbox.mock.calls[0][0], pending, items.length);
     publisher.publishInbox.mockClear();
     const resolved = await service.resolveInboxItem(queued.inbox_item_id, "approve");
     expect(publisher.publishInbox).toHaveBeenCalledTimes(1);
-    expectHeader(publisher.publishInbox.mock.calls[0][0], resolved);
+    expectHeader(publisher.publishInbox.mock.calls[0][0], resolved, items.length + 1);
     expect((resolved as HubApprovalPendingItem).resolution_payload).toBeDefined();
   });
 
@@ -88,14 +90,14 @@ describe("hub stream producers", () => {
     sources.listPresentSourceIds = undefined;
     service.listInbox();
     expect(publisher.publishInbox).toHaveBeenCalledTimes(1);
-    expectHeader(publisher.publishInbox.mock.calls[0][0], { ...errors[0], resolved: true });
+    expectHeader(publisher.publishInbox.mock.calls[0][0], { ...errors[0], resolved: true }, 3); // Frame four.
     publisher.publishInbox.mockClear();
     for (let wave = 0; wave < REFRESH_WAVES; wave++) service.listInbox();
     expect(publisher.publishInbox).not.toHaveBeenCalled();
     sources.listRecentAgentErrors = () => errors;
     service.listInbox();
     expect(publisher.publishInbox).toHaveBeenCalledTimes(1);
-    expectHeader(publisher.publishInbox.mock.calls[0][0], errors[0]);
+    expectHeader(publisher.publishInbox.mock.calls[0][0], errors[0], 4); // Frame five.
   });
 
   it("publishes post-change status and open ids once for updates, insertions and removals", () => {
@@ -247,6 +249,43 @@ describe("hub stream producers", () => {
     expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
     expect(publisher.publishAgentStatus.mock.calls[0][0]).toMatchObject({ agent_id: agent().agent_id, status: "unknown" });
     registry.remove(agent().agent_id);
+    expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
+    expect(service.streamPublishErrorCount).toBe(0);
+  });
+  it("a clear and re-emission under a frozen clock carry distinct emission times, so the client keys them apart", () => {
+    // Round 3 finding: the dedupe key is item, state and time; a same-millisecond re-open must not share the first key.
+    const publisher = recorder();
+    const { service, sources } = setup(publisher);
+    const items = service.listInbox();
+    const errors = sources.listRecentAgentErrors();
+    sources.listRecentAgentErrors = () => [];
+    sources.listPresentSourceIds = undefined;
+    service.listInbox();
+    sources.listRecentAgentErrors = () => errors;
+    service.listInbox();
+    const frames = publisher.publishInbox.mock.calls.map(([frame]) => frame);
+    expect(frames).toHaveLength(items.length + 2);
+    const times = frames.map((frame) => frame.emitted_at);
+    expect(new Set(times).size).toBe(times.length);
+    for (let i = 1; i < times.length; i++) expect(Date.parse(times[i])).toBe(Date.parse(times[i - 1]) + 1);
+    const keys = frames.map((frame) => `${frame.item_id}:${frame.resolved ? "resolved" : "open"}:${frame.emitted_at}`);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(Date.parse(times[0])).toBe(Date.parse(NOW));
+  });
+
+  it("announces an agent that crosses into the hub identity and silences one that leaves it, snapshot fields unchanged", () => {
+    // Round 3 finding: put notifies on an identity change too, so the announced set follows the record's identity.
+    const publisher = recorder();
+    const { registry, service } = setup(publisher);
+    const incoming = { ...agent(), agent_id: "crossing-agent", identity_id: "other-operator" };
+    registry.put(incoming);
+    expect(publisher.publishAgentStatus).not.toHaveBeenCalled();
+    registry.put({ ...incoming, identity_id: IDENTITY }); // Same status, reason and activity time; only the identity moves.
+    expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
+    expect(publisher.publishAgentStatus.mock.calls[0][0]).toMatchObject({ agent_id: "crossing-agent" });
+    registry.put({ ...incoming, identity_id: "other-operator" }); // Leaves the hub identity: nothing published.
+    expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
+    registry.remove("crossing-agent"); // Its removal is silent, as the routes stopped listing it on the crossing.
     expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
     expect(service.streamPublishErrorCount).toBe(0);
   });

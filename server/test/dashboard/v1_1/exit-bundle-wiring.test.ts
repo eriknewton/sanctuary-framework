@@ -182,7 +182,9 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
       expect(streamPublisher.publishInbox.mock.calls[0][0]).toEqual(header);
       await hubService.resolveInboxItem(enqueued.inbox_item_id, "deny");
       expect(streamPublisher.publishInbox).toHaveBeenCalledTimes(2); // Enqueue plus resolution.
-      expect(streamPublisher.publishInbox.mock.calls[1][0]).toEqual({ ...header, resolved: true });
+      // The resolution's emission time steps one millisecond past the enqueue under the frozen clock.
+      const resolvedAt = new Date(Date.now() + 1).toISOString();
+      expect(streamPublisher.publishInbox.mock.calls[1][0]).toEqual({ ...header, emitted_at: resolvedAt, resolved: true });
     } finally {
       vi.useRealTimers();
       await auditLog.flush();
@@ -238,9 +240,11 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
           expect(bytes.startsWith("event: inbox\ndata: ")).toBe(true);
           const frame = JSON.parse(bytes.split("\ndata: ")[1]);
           // A position-only client sees one pending approval on enqueue and none on its resolution.
+          // Emission times step one millisecond per frame under the frozen clock: the source card, then these two.
+          const emittedAt = new Date(Date.parse(timestamp) + 1 + index).toISOString();
           expect(frame).toEqual(admission === "loopback_position"
             ? { pending_approvals_redacted: true, pending_approvals_count: index > 0 ? 0 : 1 }
-            : { ...header, item_id: queued.inbox_item_id, kind: "approval_pending", resolved: index > 0 });
+            : { ...header, item_id: queued.inbox_item_id, kind: "approval_pending", emitted_at: emittedAt, resolved: index > 0 });
         }
       } finally {
         clients.delete(client);

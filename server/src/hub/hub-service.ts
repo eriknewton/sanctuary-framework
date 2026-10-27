@@ -224,7 +224,7 @@ export class HubService {
         // item_id, resolved and emitted_at dedupe together, then /inbox, /activity and /agents are refetched.
         publisher.publishInbox({ item_id: item.item_id, kind: item.kind,
           identity_id: item.identity_id, fortress_id: deps.fortressId,
-          emitted_at: this.nowIso(), resolved: item.resolved });
+          emitted_at: this.nextInboxEmissionIso(), resolved: item.resolved });
       }));
       // The routes serve only this hub's identity (listAgents filters, getAgent refuses), so the stream never announces
       // a record the operator's own console cannot list. A removal carries no record, so it publishes only for an id
@@ -234,7 +234,8 @@ export class HubService {
       );
       deps.agentRegistry.subscribe?.((agentId, record) => this.publishStream(() => {
         if (record) {
-          if (record.identity_id !== deps.identityId) return;
+          // A record that left the hub identity is dropped from the announced set so its later removal stays silent.
+          if (record.identity_id !== deps.identityId) { announcedAgentIds.delete(agentId); return; }
           announcedAgentIds.add(agentId);
         } else if (!announcedAgentIds.delete(agentId)) {
           return;
@@ -254,6 +255,19 @@ export class HubService {
   }
 
   private streamPublishErrors = 0;
+  private lastInboxEmissionMs = 0;
+
+  /**
+   * Strictly increasing per service: the client keys inbox frames on item, state and emission time (must match the
+   * inbox handler in dashboard/v1_1/client.ts and extractStreamEventId in dashboard/v1_1/sse-events.ts), so two frames
+   * for one item must never share a time even when the clock has not moved between a clear and a re-emission. Under a
+   * same-millisecond burst the stamp runs ahead of the clock by one millisecond per frame.
+   */
+  private nextInboxEmissionIso(): string {
+    const ms = Math.max(this.now().getTime(), this.lastInboxEmissionMs + 1);
+    this.lastInboxEmissionMs = ms;
+    return new Date(ms).toISOString();
+  }
 
   /** Saturating count of failed best-effort stream attempts, with no retained payloads. */
   get streamPublishErrorCount(): number { return this.streamPublishErrors; }
