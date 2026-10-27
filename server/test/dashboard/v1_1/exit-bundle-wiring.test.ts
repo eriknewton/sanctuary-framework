@@ -230,8 +230,9 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
         for (const [index, bytes] of wire.entries()) {
           expect(bytes.startsWith("event: inbox\ndata: ")).toBe(true);
           const frame = JSON.parse(bytes.split("\ndata: ")[1]);
+          // A position-only client sees one pending approval on enqueue and none on its resolution.
           expect(frame).toEqual(admission === "loopback_position"
-            ? { pending_approvals_redacted: true, pending_approvals_count: 1 }
+            ? { pending_approvals_redacted: true, pending_approvals_count: index > 0 ? 0 : 1 }
             : { ...header, item_id: queued.inbox_item_id, kind: "approval_pending", resolved: index > 0 });
         }
       } finally {

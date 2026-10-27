@@ -203,4 +203,34 @@ describe("hub stream producers", () => {
     setup(recorder());
     expect(inbox).toHaveBeenCalledTimes(1); expect(registry).toHaveBeenCalledTimes(1);
   });
+  it("a publisher that re-enters the service during a publish neither recurses nor adds frames", async () => {
+    // Rule 12: a sink that reads the inbox from inside a publish meets the refresh-is-silent rule, so the publish
+    // depth stays one and no extra frame is produced; the shipped sink (broadcastSSE) never re-enters at all.
+    let service!: HubService; let registry!: InMemoryLocalAgentRegistry;
+    let depth = 0; let maxDepth = 0; const inboxFrames: unknown[] = []; let statusFrames = 0;
+    const reenter = () => { depth++; maxDepth = Math.max(maxDepth, depth); try { service.listInbox(); } finally { depth--; } };
+    const publisher: HubStreamPublisher = {
+      publishInbox: (frame) => { inboxFrames.push(frame); reenter(); },
+      publishAgentStatus: () => { statusFrames++; reenter(); },
+    };
+    ({ service, registry } = setup(publisher));
+    const items = service.listInbox();
+    expect(inboxFrames).toHaveLength(items.length);
+    // The first aggregation stores each new card before notifying, so a re-entrant read nests at most once per card
+    // still to be stored and never republishes one: depth is bounded by the card count, not by the sink.
+    expect(maxDepth).toBeLessThanOrEqual(items.length);
+    expect(new Set(inboxFrames.map((f) => JSON.stringify(f))).size).toBe(items.length);
+    maxDepth = 0;
+    const enqueued = service.enqueueFortressLockdown();
+    await service.resolveInboxItem(enqueued.inbox_item_id, "deny");
+    expect(inboxFrames).toHaveLength(items.length + 2); // Enqueue plus resolution, nothing from the re-entrant reads.
+    // A healthy insertion raises no source card, so the re-entrant read inside the status publish finds nothing new.
+    const statusBefore = statusFrames;
+    registry.put({ ...agent(), agent_id: "quiet-agent", status: "active", status_reason_class: undefined,
+      budget_summary: { last_refreshed_at: NOW, daily: { unit: "tokens", cap: 100, used: 1 } } });
+    expect(statusFrames).toBe(statusBefore + 1);
+    expect(inboxFrames).toHaveLength(items.length + 2);
+    expect(maxDepth).toBe(1);
+    expect(service.streamPublishErrorCount).toBe(0);
+  });
 });

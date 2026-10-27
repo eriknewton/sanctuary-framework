@@ -3,46 +3,39 @@ import { extractStreamEventId } from "../../../src/dashboard/v1_1/sse-events.js"
 import type {
   HubActivityFeedEntry,
   HubAgentStatusSnapshot,
-  HubInboxItem,
 } from "../../../src/contracts/v1.1/hub-events.js";
+import type { HubInboxStreamFrame } from "../../../src/hub/types.js";
 
 describe("v1.1 dashboard SSE event ids", () => {
-  it("returns the inbox item_id", () => {
-    const inboxItem = {
-      version: "1.1",
+  it("returns the inbox item_id with its state and emission time", () => {
+    const frame = {
       item_id: "inbox-item-001",
       kind: "approval_pending",
-      created_at: "2026-06-06T10:00:00.000Z",
       identity_id: "identity-001",
-      display_template_id: "approval_pending.tier1.export",
-      display_template_args: [],
+      fortress_id: "fortress-001",
+      emitted_at: "2026-06-06T10:00:00.000Z",
       resolved: false,
-      tier: "tier1",
-      operation_category: "state_export",
-    } satisfies HubInboxItem;
+    } satisfies HubInboxStreamFrame;
 
-    const otherInboxItem = {
-      ...inboxItem,
-      item_id: "inbox-item-002",
-    } satisfies HubInboxItem;
+    const otherItem = { ...frame, item_id: "inbox-item-002" } satisfies HubInboxStreamFrame;
 
-    // Stability half of the dedup property: a distinct snapshot object
-    // carrying the same item_id must produce the same id (so a duplicate
-    // inbox event arriving across the reconnect refetch overlap dedupes).
-    const sameItemDifferentSnapshot = {
-      ...inboxItem,
-      resolved: true,
-      display_template_id: "approval_pending.tier1.import",
-    } satisfies HubInboxItem;
+    // Stability half of the dedup property: a distinct frame object carrying
+    // the same item, state and emission time must produce the same id (so a
+    // duplicate inbox event arriving across the reconnect refetch overlap dedupes).
+    const sameFrameDifferentObject = { ...frame };
 
-    const id = extractStreamEventId({ type: "inbox", data: inboxItem });
-    expect(id).toBe("inbox-item-001");
-    expect(
-      extractStreamEventId({ type: "inbox", data: otherInboxItem }),
-    ).toBe("inbox-item-002");
-    expect(
-      extractStreamEventId({ type: "inbox", data: sameItemDifferentSnapshot }),
-    ).toBe(id);
+    // The item is announced again when it resolves and when it re-emits after
+    // a clear; each announcement is a new event, never a duplicate of the first.
+    const resolvedLater = { ...frame, resolved: true, emitted_at: "2026-06-06T10:00:05.000Z" } satisfies HubInboxStreamFrame;
+    const reemittedLater = { ...frame, emitted_at: "2026-06-06T10:00:09.000Z" } satisfies HubInboxStreamFrame;
+
+    const id = extractStreamEventId({ type: "inbox", data: frame });
+    expect(id).toBe("inbox-item-001:open:2026-06-06T10:00:00.000Z");
+    expect(extractStreamEventId({ type: "inbox", data: otherItem })).toBe("inbox-item-002:open:2026-06-06T10:00:00.000Z");
+    expect(extractStreamEventId({ type: "inbox", data: sameFrameDifferentObject })).toBe(id);
+    expect(extractStreamEventId({ type: "inbox", data: resolvedLater })).not.toBe(id);
+    expect(extractStreamEventId({ type: "inbox", data: reemittedLater })).not.toBe(id);
+    expect(extractStreamEventId({ type: "inbox", data: resolvedLater })).not.toBe(extractStreamEventId({ type: "inbox", data: reemittedLater }));
   });
 
   it("returns the agent_status composite agent_id:last_activity_at key", () => {

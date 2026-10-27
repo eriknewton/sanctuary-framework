@@ -220,7 +220,8 @@ export class HubService {
       // One synchronous attempt per mutation, no queue or retries; publication never re-enters aggregation.
       this.inboxStore.subscribe((item) => this.publishStream(() => {
         // Header only: loopback stream clients may lack inbox admission; details belong to the filtered refetch route.
-        // Must match dashboard/v1_1/client.ts inbox handler: item_id dedupes, then /inbox and /activity are refetched.
+        // Must match dashboard/v1_1/client.ts inbox handler and extractStreamEventId in dashboard/v1_1/sse-events.ts:
+        // item_id, resolved and emitted_at dedupe together, then /inbox, /activity and /agents are refetched.
         publisher.publishInbox({ item_id: item.item_id, kind: item.kind,
           identity_id: item.identity_id, fortress_id: deps.fortressId,
           emitted_at: this.nowIso(), resolved: item.resolved });
@@ -229,7 +230,8 @@ export class HubService {
         const openIds = this.inboxStore.list()
           .filter((item) => !item.resolved && item.agent_id === agentId && item.identity_id === deps.identityId)
           .map((item) => item.item_id);
-        // Removal invalidates the roster with unknown status; it cannot attest continued activity for a missing record.
+        // Removal invalidates the roster with unknown status; no record remains to attest activity, so last_activity_at
+        // carries the invalidation time and the consumer refetches the roster rather than trusting this snapshot.
         publisher.publishAgentStatus(record ? snapshotForRecord(record, openIds) : {
           version: "1.1", agent_id: agentId, status: "unknown",
           last_activity_at: this.nowIso(), open_inbox_item_ids: openIds,

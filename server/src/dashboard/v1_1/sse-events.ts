@@ -16,13 +16,17 @@
 import type {
   HubActivityFeedEntry,
   HubAgentStatusSnapshot,
-  HubInboxItem,
 } from "../../contracts/v1.1/hub-events.js";
+import type { HubInboxStreamFrame } from "../../hub/types.js";
 
-/** New v1.1 SSE event for hub inbox updates. */
+/**
+ * New v1.1 SSE event for hub inbox updates. The payload is the header-only
+ * invalidation frame the hub service publishes (never the full item); the
+ * client refetches the admission-filtered inbox on receipt.
+ */
 export interface HubInboxStreamEvent {
   type: "inbox";
-  data: HubInboxItem;
+  data: HubInboxStreamFrame;
 }
 
 /** New v1.1 SSE event for per-agent status changes. */
@@ -54,7 +58,9 @@ export function extractStreamEventId(
 ): string | null {
   switch (event.type) {
     case "inbox":
-      return event.data.item_id;
+      // Must match the inbox handler in client.ts: an item is announced again when it resolves or re-emits after a
+      // clear, so the id carries the state and emission time; item_id alone would drop every frame after the first.
+      return `${event.data.item_id}:${event.data.resolved ? "resolved" : "open"}:${event.data.emitted_at}`;
     case "agent_status":
       return `${event.data.agent_id}:${event.data.last_activity_at}`;
     case "activity":

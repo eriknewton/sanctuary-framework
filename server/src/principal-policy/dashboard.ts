@@ -9183,8 +9183,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       case "approval":
         return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
       case "inbox":
+        // Position-only admission sees approval traffic as a count marker. The marker is an invalidation the client
+        // follows with a filtered refetch at once; a resolution frame must not announce a pending approval.
         return isHubApprovalPendingItem(dashboardEvent.data)
-          ? pendingApprovalsRedactedMarker(1)
+          ? pendingApprovalsRedactedMarker(
+              (dashboardEvent.data as { resolved?: unknown }).resolved === true ? 0 : 1,
+            )
           : dashboardEvent.data;
       default:
         return dashboardEvent.data;

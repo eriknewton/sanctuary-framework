@@ -43,19 +43,15 @@ describe("v1.1 dashboard SSE reconnect-and-restore", () => {
       extractStreamEventId({
         type: "inbox",
         data: {
-          version: "1.1",
           item_id: "inbox-001",
           kind: "approval_pending",
-          created_at: "2026-04-25T10:00:00.000Z",
           identity_id: "op-1",
-          display_template_id: "approval_pending.tier1.lockdown",
-          display_template_args: [],
+          fortress_id: "fortress-1",
+          emitted_at: "2026-04-25T10:00:00.000Z",
           resolved: false,
-          tier: "tier1",
-          operation_category: "lockdown",
         },
       }),
-    ).toBe("inbox-001");
+    ).toBe("inbox-001:open:2026-04-25T10:00:00.000Z");
 
     expect(
       extractStreamEventId({
