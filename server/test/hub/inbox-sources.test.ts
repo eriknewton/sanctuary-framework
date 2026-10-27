@@ -46,7 +46,7 @@ describe("local inbox sources", () => {
       activitySources: { auditLog, identityId: IDENTITY },
       policyBudgetSources: { listPolicySummaries: () => [], listBudgetSummaries: () => [] },
       agentController: { supports: () => false, pause: unsupported, resume: unsupported, restart: unsupported,
-        unwrap: unsupported, lockdown: unsupported, bindPolicy: unsupported,
+        unwrap: unsupported, lockdown: unsupported, liftLockdown: unsupported, bindPolicy: unsupported,
         bindChannelTemplate: unsupported },
     });
   });
