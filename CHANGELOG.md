@@ -37,7 +37,7 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 - A second approval of the same agent's lockdown lift is refused while the first is running or after it has restored the agent, so one approval set lifts once; a lift that fails leaves the agent locked down and a later approval can try again.
 - `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
 - Dashboard approval cards and decision labels read in plain language; operator token entry, the findings count and scroll position are consistent, and an empty feedback row stays quiet.
-- Automated and headless runs no longer open a browser by default.
+- Runs with the `CI` environment variable set no longer open the dashboard in a browser; `--no-open` remains the switch for every other scripted run.
 
 ## [1.9.0-rc.1] - 2026-10-21
 
