@@ -308,6 +308,19 @@ describe("one-time browser delivery", () => {
     ]) expect(client).toContain(sentence);
     const storeSource = store!;
     expect(storeSource).not.toMatch(/from ["'](?:node:fs|.*storage|.*keychain)/);
-    for (const source of [wiring!, service!, store!]) expect(source).not.toMatch(/(?:publishInbox|broadcastSSE)\(/);
+    // The dashboard stream carries the inbox header only: the frame type has only the six header members (an optional,
+    // readonly or index-signature member would show here too), and the service's one publish site is the exact header
+    // literal with no spread or variable argument, so a decision payload (and the re-key key inside it) has no path onto
+    // SSE. Wiring and the store never publish at all.
+    for (const source of [wiring!, service!, store!]) expect(source).not.toMatch(/broadcastSSE\(/);
+    for (const source of [wiring!, store!]) expect(source).not.toMatch(/publishInbox\(/);
+    const frameType = types!.split("export interface HubInboxStreamFrame")[1]!.split("\n}")[0]!;
+    expect(frameType).not.toMatch(/\[\s*\w+\s*:/);
+    expect((frameType.match(/^\s+(?:readonly\s+)?(\w+)\??:/gm) ?? []).map((f) => f.replace(/readonly|[\s:?]/g, "")).sort())
+      .toEqual(["emitted_at", "fortress_id", "identity_id", "item_id", "kind", "resolved"]);
+    expect(frameType.match(/;\s*$/gm) ?? []).toHaveLength(6);
+    expect(service!.match(/publishInbox\(/g) ?? []).toHaveLength(1);
+    expect(service).toMatch(/publishInbox\(\{ item_id: item\.item_id, kind: item\.kind,\s+identity_id: item\.identity_id, fortress_id: deps\.fortressId,\s+emitted_at: this\.nextInboxEmissionIso\(\), resolved: item\.resolved \}\);/);
+    expect(service).not.toMatch(/publishInbox\([^)]*\.\.\./);
   });
 });
