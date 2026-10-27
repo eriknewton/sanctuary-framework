@@ -6,20 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added
-
-- Hub inbox and agent status changes now publish dashboard stream updates.
-
-- The hub inbox projects budget warnings and agent errors from the local agent registry when the registry carries them; no shipped producer writes budget caps or error status yet, and blocked egress, privacy events and recovery prompts stay empty until their producers carry a witness the card may claim.
-- Dashboard exports containing encrypted state include a re-key key shown once, in the approving dashboard; a lost response means a new export.
-
-### Fixed
-
-- A lockdown-lift refusal names a missing snapshot only when the snapshot is missing.
-- Hub inbox reads refresh persisted agents and reconcile complete registry pages, and concierge context represents unknown item ages as null.
-- A second approval of the same agent's lockdown lift is refused while the first is running or after it has restored the agent, so one approval set lifts once; a lift that fails leaves the agent locked down and a later approval can try again.
-- `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
-
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
 - `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.
@@ -27,6 +13,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
 
 - `@sanctuary-framework/quickstart` 0.2.0: publishing is opt-in. In a terminal it shows the destination and the exact request body and asks `[y/N]` (default No); `--publish` publishes without asking, `--no-publish` never publishes, and a run without a terminal does not publish unless `--publish` is given. The local identity exists before the publish decision in every case. A saved identity in `~/.sanctuary/quickstart-identity.json` is reused and never rewritten; `--new-identity` mints a fresh one after copying the old file to a backup.
+
+## [1.9.0-rc.2] - 2026-10-27
+
+Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 until 1.9.0 ships. Adds the dashboard work merged since rc.1.
+
+### Added
+
+- Hub inbox and agent status changes now publish dashboard stream updates.
+- The hub inbox projects budget warnings and agent errors from the local agent registry when the registry carries them; no shipped producer writes budget caps or error status yet, and blocked egress, privacy events and recovery prompts stay empty until their producers carry a witness the card may claim.
+- Dashboard exports containing encrypted state include a re-key key shown once, in the approving dashboard; a lost response means a new export.
+- The operator can restore a locked-down agent's network access from the dashboard through Tier 1 approval.
+- The dashboard refetches hub data on a bounded schedule while its live stream is healthy, so the console does not go silently stale.
+
+### Changed
+
+- The MCP SDK dependency is updated to 1.32.0.
+
+### Fixed
+
+- A lockdown-lift refusal names a missing snapshot only when the snapshot is missing.
+- Hub inbox reads refresh persisted agents and reconcile complete registry pages, and concierge context represents unknown item ages as null.
+- A second approval of the same agent's lockdown lift is refused while the first is running or after it has restored the agent, so one approval set lifts once; a lift that fails leaves the agent locked down and a later approval can try again.
+- `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
+- Dashboard approval cards and decision labels read in plain language; operator token entry, the findings count and scroll position are consistent, and an empty feedback row stays quiet.
+- Automated and headless runs no longer open a browser by default.
 
 ## [1.9.0-rc.1] - 2026-10-21
 

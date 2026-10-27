@@ -11,9 +11,9 @@ This posture reflects the remediation of the independent 2026-06-16 hygiene and 
 | Field | Value |
 |---|---|
 | npm `latest` | `@sanctuary-framework/mcp-server@1.8.4` |
-| npm `next` | `@sanctuary-framework/mcp-server@1.9.0-rc.1` |
-| Git tag | `v1.8.4` for stable; `v1.9.0-rc.1` for the current prerelease |
-| GitHub release | `v1.8.4` for stable; `v1.9.0-rc.1` for the current prerelease; `castle-wall-linux-0.1.0-1` for the bounded Ubuntu 24.04 x86-64 Linux Castle Wall pre-release |
+| npm `next` | `@sanctuary-framework/mcp-server@1.9.0-rc.2` |
+| Git tag | `v1.8.4` for stable; `v1.9.0-rc.2` for the current prerelease |
+| GitHub release | `v1.8.4` for stable; `v1.9.0-rc.2` for the current prerelease; `castle-wall-linux-0.1.0-1` for the bounded Ubuntu 24.04 x86-64 Linux Castle Wall pre-release |
 | Supported versions | Current stable and current prerelease, with older supported lines governed by [`SECURITY.md`](../../SECURITY.md). |
 | Publish flow | npm Trusted Publishing (OIDC), manual `workflow_dispatch`. No static npm token. |
 
