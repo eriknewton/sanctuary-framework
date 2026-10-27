@@ -1191,6 +1191,7 @@ const TIME_RANGE_ROUTES = ["activity"];
 // route-walk test asserts this for every hash id but "dashboard".
 const ROUTE_FULL = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "machines", "enforcement", "findings", "integrations", "settings", "attestation"];
 function setRoute(route) {
+  if (state.route !== route) clearExitRekey();
   // A queued reach read belongs to the open detail route, never to a remembered selection; a cleared subject was
   // never read, so its loading placeholder returns to unread rather than claiming a read in progress.
   if (route !== "agent-detail") {
@@ -3503,6 +3504,71 @@ function renderTemplatePicker(agent) {
   '</div>';
 }
 
+// Must match the permanent exit-rekey-view host in html.ts; normal renders never replace it.
+const EXIT_REKEY_DISPLAY_TTL_MS = 5 * 60 * 1000; // Five minutes, seconds per minute, milliseconds per second.
+const EXIT_REKEY_UNAVAILABLE = "The re-key key is no longer available here. If you did not save it, create a new export from the source fortress.";
+const EXIT_REKEY_LOST = "The export may have completed, but this dashboard did not receive its re-key key. Check the export result and create a new export if you did not save the key.";
+const EXIT_REKEY_EMPTY = "This bundle contains no encrypted state. No re-key key was created.";
+let exitRekeyActive = false;
+let exitRekeyItemId = null;
+let exitRekeyTimer = null;
+let exitRekeyEpoch = 0;
+function clearExitRekey() {
+  // Clearing ends this disclosure; another decision cannot overwrite the view or queue a second secret.
+  exitRekeyEpoch++;
+  clearTimeout(exitRekeyTimer);
+  exitRekeyTimer = null;
+  exitRekeyActive = false;
+  exitRekeyItemId = null;
+  const host = document.getElementById("exit-rekey-view");
+  if (host) { host.textContent = ""; host.hidden = true; }
+}
+function consumeOneTimeExport(response, itemId, action, epoch) {
+  // Must match one_time_export in hub/api-router.ts; consume only in the one-time DOM host, never shared state, storage, feedback, or telemetry.
+  const data = response && response.data;
+  const delivery = data && data.one_time_export;
+  try {
+    if (!delivery) return false;
+    const item = data.item;
+    const payload = item && item.resolution_payload;
+    const host = document.getElementById("exit-rekey-view");
+    if (action !== "approve" || !item || item.item_id !== itemId || item.resolved !== true ||
+        item.operation_category !== "exit_bundle_export" || !payload ||
+        !Number.isSafeInteger(payload.state_entry_count) || payload.state_entry_count <= 0 ||
+        !Number.isSafeInteger(payload.artifact_count) || payload.artifact_count <= 0 ||
+        typeof delivery.bundle_dir !== "string" || !delivery.bundle_dir.startsWith("/") ||
+        delivery.bundle_dir !== payload.bundle_dir || delivery.manifest_hash !== payload.manifest_hash ||
+        !/^[a-f0-9]{64}$/.test(delivery.manifest_hash) ||
+        typeof delivery.state_rekey_key !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(delivery.state_rekey_key) ||
+        epoch !== exitRekeyEpoch || exitRekeyActive || document.hidden || !host) return false;
+    host.textContent = "";
+    host.hidden = false;
+    const heading = document.createElement("h2");
+    heading.textContent = "Re-key key available for this export.";
+    const explanation = document.createElement("p");
+    explanation.textContent = "Bundle created. Save this re-key key separately from the bundle. You will need it to import the encrypted state on another machine.";
+    const bound = document.createElement("p");
+    bound.textContent = "This key is shown once and is not saved by Sanctuary. It disappears when you close this view or after five minutes.";
+    const key = document.createElement("pre");
+    key.textContent = delivery.state_rekey_key;
+    const button = document.createElement("button");
+    button.textContent = "I saved it";
+    button.setAttribute("data-action", "exit-rekey-clear");
+    [heading, explanation, bound, key, button].forEach(function (node) { host.appendChild(node); });
+    if (host.getClientRects && host.getClientRects().length === 0) { clearExitRekey(); return false; }
+    exitRekeyActive = true;
+    exitRekeyItemId = itemId;
+    exitRekeyTimer = setTimeout(function () { clearExitRekey(); rerender(); }, EXIT_REKEY_DISPLAY_TTL_MS);
+    return true;
+  } catch (_) {
+    clearExitRekey();
+    return false;
+  } finally {
+    if (delivery) delete delivery.state_rekey_key;
+    if (data) delete data.one_time_export;
+  }
+}
+
 // ── Render: exit drill ────────────────────────────────────────────────
 function renderExitDrill() {
   const step = state.exitDrill.step;
@@ -3518,7 +3584,7 @@ function renderExitDrill() {
     : exportPending
     ? '<span class="muted">Awaiting approval. It waits in <a href="#approvals">Approvals</a>.</span>'
     : '<button class="btn btn-primary" data-action="exit-export-start">Snapshot now</button>';
-  const step2Body = exportDone ? 'Re-key complete.' : '<span class="muted">Re-keying state for portable export.</span>';
+  const step2Body = escHtml(exportDone ? (state.exitDrill.bundleResult.state_entry_count === 0 ? EXIT_REKEY_EMPTY : exitRekeyActive && exitRekeyItemId === state.exitDrill.inboxItemId ? "Re-key key available for this export." : EXIT_REKEY_UNAVAILABLE) : "This export includes a re-key key when it contains encrypted state. The key will be shown only in the dashboard that approves this export.");
   // A7: always render state_entry_count (including 0) so "Bundle ready" cannot
   // imply state was included when none was. When count is null/undefined despite
   // exportDone, render explicit "Unavailable" so absence is not silent.
@@ -3540,7 +3606,7 @@ function renderExitDrill() {
   const importCmd = "sanctuary import-exit-bundle &lt;bundle_dir&gt;";
   const step4Body = '<p class="muted">Run on a fresh shell:</p><pre class="code-block">' + verifyCmd + '</pre>' +
     '<button class="btn" data-action="exit-mark-verified">Mark verified</button>';
-  const step5Body = '<p class="muted">Run this command on the destination fortress, not on this one. The destination will prompt for the bundle source passphrase or recovery key.</p><pre class="code-block">' + importCmd + '</pre>';
+  const step5Body = '<p class="muted">Import on the destination fortress using the re-key key saved with this export. Sanctuary has not verified the import from this dashboard.</p><pre class="code-block">' + importCmd + '</pre>';
   const step6Body = '<p class="muted">Optional. Re-protect the destination harness using <code>sanctuary protect</code>. See <a href="#" data-action="open-harness-doc">harness compatibility matrix</a>.</p>';
   return '<h1>Exit drill</h1>' +
     '<p class="muted">Six-step wizard. Verify and import are run out-of-band on the operator shell. The dashboard does not call the verifier in-process.</p>' +
@@ -5462,7 +5528,7 @@ function approvalStandingState(item) {
   return { enabled: true, reason: "Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
 }
 
-function batchSelectionLocked() { return decisionInFlight() && state.approvals.lock.kind === "batch"; }
+function batchSelectionLocked() { return exitRekeyActive || !!state.approvals.lock && state.approvals.lock.kind === "batch"; }
 function batchSelectionDisabled() {
   // The selection checkboxes pause only while a batch holds the lock; an item decision leaves them live.
   return batchSelectionLocked() ? ' disabled title="' + DECISION_BUSY_REASON + '"' : "";
@@ -5471,6 +5537,7 @@ function approvalDecisionDisabled() {
   // Invariant: every decision control on every screen reads the one decision lock, so while a decision is in
   // flight no second request can be clicked anywhere, and each paused control says why.
   if (!decisionInFlight()) return "";
+  if (exitRekeyActive) return ' disabled title="Save or close the export key view first."';
   return ' disabled title="' + (state.approvals.lock.status === "pending" ? DECISION_BUSY_REASON : DECISION_REREAD_BUSY_REASON) + '"';
 }
 
@@ -7014,7 +7081,7 @@ const DECISION_UNCERTAIN_STAYS = "This result stays on screen until your next de
 // The fixed sentence a not-sent note falls back to when its text cannot be shown safely.
 const DECISION_NOT_SENT_FIXED = "Your next decision was not sent.";
 
-function decisionInFlight() { return !!state.approvals.lock; }
+function decisionInFlight() { return !!state.approvals.lock || exitRekeyActive; }
 function decisionVerb(action) { return DECISION_VERB[action] || action; }
 function decisionDone(action) { return DECISION_DONE[action] || "Done"; }
 function decisionSubject(itemId) {
@@ -7282,12 +7349,15 @@ async function performInboxAction(itemId, action, subject) {
   const boundAgentId = (item0 && item0.agent_id) || null;
   // The subject was captured at admission, so a row that moves during the request cannot rewrite the sentence.
   subject = subject || decisionSubject(itemId);
+  const deliveryEpoch = exitRekeyEpoch;
   let r;
   try {
     r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
   } catch (e) {
+    if (item0 && item0.operation_category === "exit_bundle_export" && action === "approve") return { status: "uncertain", message: EXIT_REKEY_LOST };
     return decisionOutcomeFromError(action, subject, e, item0);
   }
+  const delivered = consumeOneTimeExport(r, itemId, action, deliveryEpoch);
   if (!decisionAcknowledges(r, itemId)) {
     return { status: "uncertain", message: "The server answered but did not confirm " + decisionVerb(action) + " for " + subject + ". " + DECISION_UNCERTAIN_ADVICE };
   }
@@ -7297,6 +7367,7 @@ async function performInboxAction(itemId, action, subject) {
   // exit-drill branch and causes ReferenceError when the lockdown branch did not execute.
   const payload = item.resolution_payload || {};
   let effect = "";
+  if (item.operation_category === "exit_bundle_export" && action === "approve" && !delivered) effect = " " + (payload.state_entry_count === 0 ? EXIT_REKEY_EMPTY : EXIT_REKEY_UNAVAILABLE);
   if (item && state.tier1.lockdown.inboxItemId === itemId) {
     if (action === "approve" && payload.outcome === "engaged") {
       state.tier1.lockdown.state = "engaged";
@@ -7446,6 +7517,7 @@ async function onInboxBatchAction(action, until) {
     if (action === "dismiss") {
       // Each id takes the same path as an individual decision under the batch's lock, and each outcome is kept.
       for (const entry of admitted) {
+        if (exitRekeyActive) break;
         const outcome = await performInboxAction(entry.id, "dismiss", entry.subject);
         result.records.push({ itemId: entry.id, status: outcome.status, message: outcome.message, heldOperation: entry.heldOperation });
       }
@@ -7794,7 +7866,8 @@ function bindHashRoute() {
     }
     setRoute(h.split("?")[0] || "posture");
   }
-  window.addEventListener("hashchange", fromHash);
+  window.addEventListener("hashchange", function () { clearExitRekey(); fromHash(); });
+  window.addEventListener("pagehide", clearExitRekey);
   fromHash();
 }
 
@@ -7835,6 +7908,7 @@ document.addEventListener("keydown", function (ev) {
 });
 
 document.addEventListener("visibilitychange", function () {
+  if (document.hidden || document.visibilityState === "hidden") clearExitRekey();
   clearSteadyRefetchTimer();
   if (document.visibilityState === "visible") scheduleSteadyRefetch();
   if (document.visibilityState === "visible") rerender();
@@ -8087,6 +8161,7 @@ document.addEventListener("click", function (ev) {
   }
   if (action === "evidence-export-json") return void onEvidenceJsonExport();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
+  if (action === "exit-rekey-clear") { clearExitRekey(); return rerender(); }
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) {
     if (ev && typeof ev.preventDefault === "function") ev.preventDefault();

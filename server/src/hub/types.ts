@@ -122,6 +122,7 @@ export interface HubTier1FortressApprovalEnqueuedResult {
  * an empty-state export. Must match the `resolution_payload` field
  * in `hub-events.ts` `HubApprovalPendingItem`.
  */
+// Must match the safe projection in dashboard/v1_1/wiring.ts; keys belong only to the response-only delivery channel.
 export interface HubFortressExportResult {
   bundle_dir: string;
   manifest_hash: string;
@@ -130,6 +131,40 @@ export interface HubFortressExportResult {
   state_entry_count: number;
   /** Non-fatal export advisories (e.g., audit-receipt truncation). Absent when none. */
   warnings?: string[];
+}
+
+/** Response-only sibling of the safe item; must match one_time_export in hub/api-router.ts. */
+export interface HubOneTimeExport {
+  state_rekey_key: string;
+  bundle_dir: string;
+  manifest_hash: string;
+}
+
+/** Invocation-local delivery port; never attach to an inbox item or retained handler. */
+export interface HubExportDeliveryReceiver {
+  isLive(): boolean;
+  receive(delivery: HubOneTimeExport): void;
+}
+
+const MAX_EXPORT_PATH_CHARACTERS = 4 * 1024; // Four KiB of path characters bounds reusable metadata, independently of filesystem limits.
+
+/** Copy validated export metadata; invalid counts/paths throw and arbitrary advisories become fixed copy. */
+export function projectHubExportResult(value: HubFortressExportResult): HubFortressExportResult {
+  // SHA-256 is 32 bytes rendered as two hex characters per byte; paths have an explicit metadata cap.
+  if (typeof value.bundle_dir !== "string" || !value.bundle_dir.startsWith("/") || value.bundle_dir.length > MAX_EXPORT_PATH_CHARACTERS ||
+      value.bundle_dir.includes("\0") || typeof value.manifest_hash !== "string" ||
+      !/^[a-f0-9]{64}$/.test(value.manifest_hash) ||
+      !Number.isSafeInteger(value.artifact_count) || value.artifact_count <= 0 ||
+      !Number.isSafeInteger(value.state_entry_count) || value.state_entry_count < 0) {
+    throw new Error("Export metadata unavailable.");
+  }
+  return {
+    bundle_dir: value.bundle_dir,
+    manifest_hash: value.manifest_hash,
+    artifact_count: value.artifact_count,
+    state_entry_count: value.state_entry_count,
+    ...(value.warnings?.length ? { warnings: ["Export advisories are available in the bundle."] } : {}),
+  };
 }
 
 /**
@@ -412,6 +447,7 @@ export interface HubServiceDeps {
    */
   fortressExportBundle?: (
     approvalAuditId?: string,
+    receiver?: HubExportDeliveryReceiver,
   ) => Promise<HubFortressExportResult>;
   /**
    * Clock override for deterministic timestamp emission in tests.

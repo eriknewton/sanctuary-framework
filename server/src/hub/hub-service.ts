@@ -14,6 +14,7 @@
  * auto-approves Tier 1 work.
  */
 
+import { projectHubExportResult, type HubExportDeliveryReceiver } from "./types.js";
 import { randomUUID } from "node:crypto";
 
 import type {
@@ -64,7 +65,6 @@ import type {
   HubAgentLockdownControllerResult,
   HubBudgetSummary,
   HubAgentInspectPanel,
-  HubFortressExportResult,
   HubPolicySummary,
   HubServiceDeps,
   HubTier1ApprovalEnqueuedResult,
@@ -334,6 +334,7 @@ export class HubService {
   async resolveInboxItem(
     itemId: string,
     action: HubInboxAction,
+    receiver?: HubExportDeliveryReceiver,
   ): Promise<HubInboxItem> {
     // A projected Charter hold is owned by the approval queue, not by the
     // inbox store, so its resolution must reach the blocked caller. Marking
@@ -386,7 +387,7 @@ export class HubService {
     // recovery, agent_error) are present in the store before we resolve.
     // Tier 1 hub-enqueued items already live in the store regardless.
     aggregateInbox(this.deps.inboxSources, this.inboxStore, this.nowIso());
-    return this.inboxStore.resolve(itemId, action, this.nowIso());
+    return this.inboxStore.resolve(itemId, action, this.nowIso(), receiver);
   }
 
   // ── Tasks ──────────────────────────────────────────────────────────
@@ -1106,7 +1107,7 @@ export class HubService {
    * created; on operator approval the handler invokes
    * `fortressExportBundle()` once at fortress scope, attaches
    * `bundle_dir` + `manifest_hash` + `artifact_count` to the inbox item's
-   * `resolution_payload`, and emits a `lifecycle` activity entry.
+   * `resolution_payload`, and durably records export metadata.
    * Stacked exports are rejected with `HubConflictError`.
    */
   enqueueFortressExportBundle(): HubTier1FortressApprovalEnqueuedResult {
@@ -1133,40 +1134,26 @@ export class HubService {
     };
 
     const fortressExportBundle = this.deps.fortressExportBundle;
-    this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
+    this.inboxStore.enqueueTier1(item, async (_approvedItem, decision, receiver) => {
       if (decision === "deny") return;
-      // Thread the inbox item id into the callback as the approval audit
-      // id so `exportExitBundle()` can embed it in the manifest's
-      // `export_approval_audit_id` field (v1.0.2 (j)).
-      const result: HubFortressExportResult = await fortressExportBundle(
-        itemId,
-      );
-      void this.deps.activitySources.auditLog.append(
-        "l2",
-        "exit_bundle_exported",
-        this.deps.identityId,
-        {
+      if (!receiver?.isLive()) throw new HubConflictError("Export delivery unavailable.");
+      const result = projectHubExportResult(await fortressExportBundle(itemId, receiver));
+      // Only these metadata fields may enter durable audit; keys and delivery context must never enter an audit argument.
+      await this.deps.activitySources.auditLog.appendCritical({
+        layer: "l2",
+        operation: "exit_bundle_exported",
+        identity_id: this.deps.identityId,
+        result: "success",
+        details: {
           fortress_id: this.deps.fortressId,
           bundle_dir: result.bundle_dir,
           manifest_hash: result.manifest_hash,
           artifact_count: result.artifact_count,
           state_entry_count: result.state_entry_count,
         },
-      );
-      return {
-        resolution_payload: {
-          bundle_dir: result.bundle_dir,
-          manifest_hash: result.manifest_hash,
-          artifact_count: result.artifact_count,
-          // A7: carry state_entry_count and warnings through so the dashboard
-          // inbox item carries the honest count. Must match HubFortressExportResult
-          // in hub/types.ts and resolution_payload in hub-events.ts.
-          state_entry_count: result.state_entry_count,
-          ...(result.warnings !== undefined
-            ? { warnings: result.warnings }
-            : {}),
-        },
-      };
+      });
+      // Inbox items are retained and re-fetched, so this explicit projection contains no key or delivery capability.
+      return { resolution_payload: projectHubExportResult(result) };
     });
 
     return {

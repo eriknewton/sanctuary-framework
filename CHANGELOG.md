@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - The hub inbox projects budget warnings and agent errors from the local agent registry when the registry carries them; no shipped producer writes budget caps or error status yet, and blocked egress, privacy events and recovery prompts stay empty until their producers carry a witness the card may claim.
+- Dashboard exports containing encrypted state include a re-key key shown once, in the approving dashboard; a lost response means a new export.
 
 ### Fixed
 

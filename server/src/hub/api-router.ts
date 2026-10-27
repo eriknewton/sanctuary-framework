@@ -17,6 +17,7 @@
  * v1.3 federation introduces a separate surface.
  */
 
+import type { HubExportDeliveryReceiver, HubOneTimeExport } from "./types.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import {
@@ -423,11 +424,46 @@ export async function handleHubRoute(
           `unknown inbox action: ${inboxMatch.action}`,
         );
       }
-      const item = await deps.service.resolveInboxItem(
-        inboxMatch.itemId,
-        inboxMatch.action,
-      );
-      writeJSON(res, 200, { ok: true, data: { item } });
+      let slot: HubOneTimeExport | undefined;
+      let live = !res.destroyed;
+      // Lost delivery clears the secret slot; fixed errors omit raw causes because diagnostics are another disclosure channel.
+      const close = () => { live = false; slot = undefined; };
+      res.once("close", close);
+      const receiver: HubExportDeliveryReceiver = {
+        isLive: () => live && !res.destroyed,
+        receive: (delivery) => {
+          if (!live || res.destroyed) return;
+          if (slot) throw new Error("Export delivery unavailable.");
+          // A 32-byte key has 43 unpadded base64url characters; no alternate fields cross this port.
+          if (!/^[A-Za-z0-9_-]{43}$/.test(delivery.state_rekey_key)) throw new Error("Export delivery unavailable.");
+          slot = { state_rekey_key: delivery.state_rekey_key, bundle_dir: delivery.bundle_dir, manifest_hash: delivery.manifest_hash };
+        },
+      };
+      try {
+        const item = await deps.service.resolveInboxItem(inboxMatch.itemId, inboxMatch.action, receiver);
+        if (live && !res.destroyed) {
+          // The key describes this resolved export, verified against its metadata, never another pending item.
+          if (slot && (inboxMatch.action !== "approve" || item.kind !== "approval_pending" ||
+              item.operation_category !== "exit_bundle_export" || !item.resolved ||
+              !item.resolution_payload || !(item.resolution_payload.state_entry_count! > 0) ||
+              item.resolution_payload.bundle_dir !== slot.bundle_dir || item.resolution_payload.manifest_hash !== slot.manifest_hash)) {
+            throw new Error("Export delivery unavailable.");
+          }
+          // Only this authenticated winning response may serialize the key; its sibling item stays safe for refetch and broadcast.
+          // Response-only DTO must match HubOneTimeExport in hub/types.ts and consumeOneTimeExport in dashboard/v1_1/client.ts.
+          writeJSON(res, 200, { ok: true, data: { item, ...(slot ? { one_time_export: slot } : {}) } });
+        }
+      } catch (error) {
+        close();
+        if (!res.destroyed && !res.headersSent) {
+          const status = error instanceof HubError ? error.statusCode : 500;
+          try { writeJSON(res, status, { ok: false, error: publicCodeForStatus(status) }); }
+          catch { res.destroy(); }
+        } else if (!res.destroyed) res.destroy();
+      } finally {
+        close();
+        res.removeListener("close", close);
+      }
       return true;
     }
 
