@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- The hub inbox projects budget warnings and agent errors from the local agent registry when the registry carries them; no shipped producer writes budget caps or error status yet, and blocked egress, privacy events and recovery prompts stay empty until their producers carry a witness the card may claim.
+
 ### Fixed
 
 - `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.

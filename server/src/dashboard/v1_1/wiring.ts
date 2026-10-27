@@ -13,9 +13,11 @@
  *     `storagePath` (`<storagePath>/state/_hub/local-agents.json`),
  *     written by `sanctuary wrap` for each successfully wrapped harness.
  *     Real harness-discovery via `discoverTenants()` remains v1.2 work.
- *   - Inbox sources return empty arrays. The privacy chokepoint already
- *     emits audit events through PR #69 / PR #71; the inbox aggregator is
- *     the v1.2 work to project those into operator cards. Live Tier 1 / 2
+ *   - The hub inbox projects budget warnings and agent errors from the local
+ *     agent registry when the registry carries them; no shipped producer writes
+ *     budget caps or error status yet, and blocked egress, privacy events and
+ *     recovery prompts stay empty until their producers carry a witness the card
+ *     may claim. Live Tier 1 / 2
  *     approval holds do NOT arrive through these sources: the approval
  *     channel installs a read-through Charter bridge on the HubService in
  *     `DashboardApprovalChannel.setV11Bindings`, so an empty
@@ -48,6 +50,7 @@ import { StateStore } from "../../cognitive/state-store.js";
 import {
   HubService,
   InMemoryLocalAgentRegistry,
+  createHubInboxSources,
 } from "../../hub/index.js";
 import {
   readPersistedLocalAgents,
@@ -669,17 +672,16 @@ export function buildV11Bindings(
   };
 
   const inboxSources = {
+    ...createHubInboxSources({
+      identityId: inputs.identityId,
+      agentRegistry: registry,
+    }),
     // Empty on purpose, and NOT the approvals surface: live Charter holds
     // reach the inbox through the read-through bridge the approval channel
     // installs (`HubService.setCharterApprovalBridge`). Filling this in with
     // the same holds would double-count them and copy queue-owned rows into
     // `HubInboxStore`, where a decided hold could not be removed.
     listPendingApprovals: () => [],
-    listRecentBlockedEgress: () => [],
-    listRecentPrivacyEvents: () => [],
-    listActiveBudgetWarnings: () => [],
-    listActiveRecoveryPrompts: () => [],
-    listRecentAgentErrors: () => [],
   };
   const policyBudgetSources = {
     listPolicySummaries: () => [],

@@ -35,6 +35,7 @@ import { applyChannelTemplate } from "../policy-engine/channel-templates.js";
 import {
   CHARTER_DECIDED_HISTORY_LIMIT,
   HUB_AGENT_CONTROL_ACTIONS,
+  HUB_INBOX_RESOLVED_RETENTION_MS,
   HUB_INBOX_TEMPLATE_NAMESPACES,
   HUB_TIER_1_AGENT_CONTROL_ACTIONS,
   type HubAgentControlAction,
@@ -303,6 +304,10 @@ export class HubService {
    *   down. `openOnly` filters resolved items before the page bound is applied.
    */
   listInbox(options?: { limit?: number; openOnly?: boolean }): HubInboxItem[] {
+    const nowIso = this.nowIso();
+    const nowMs = new Date(nowIso).getTime();
+    // Cleared source cards would otherwise accumulate across agent-id churn.
+    this.inboxStore.pruneResolvedOlderThan(nowMs, HUB_INBOX_RESOLVED_RETENTION_MS);
     // Infinity, not a large number: it makes "no bound was asked for" a
     // distinct value from any real page size, so the slice below is a no-op
     // for internal readers instead of a cap that happens to be generous.
@@ -313,7 +318,7 @@ export class HubService {
     // inbox item, so this history never takes a page slot ahead of them.
     const items = [
       ...this.charterApprovalItems(limit),
-      ...aggregateInbox(this.deps.inboxSources, this.inboxStore),
+      ...aggregateInbox(this.deps.inboxSources, this.inboxStore, nowIso),
       ...(options?.openOnly ? [] : this.charterDecisions),
     ];
     const scopedItems = items.filter((i) => i.identity_id === this.deps.identityId);
@@ -380,7 +385,7 @@ export class HubService {
     // Aggregate first so source-pulled items (egress, privacy, budget,
     // recovery, agent_error) are present in the store before we resolve.
     // Tier 1 hub-enqueued items already live in the store regardless.
-    aggregateInbox(this.deps.inboxSources, this.inboxStore);
+    aggregateInbox(this.deps.inboxSources, this.inboxStore, this.nowIso());
     return this.inboxStore.resolve(itemId, action, this.nowIso());
   }
 

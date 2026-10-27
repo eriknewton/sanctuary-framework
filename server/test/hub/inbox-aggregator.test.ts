@@ -127,7 +127,7 @@ describe("aggregateInbox", () => {
     const rig = sourceRig();
     const store = new HubInboxStore();
 
-    expect(aggregateInbox(rig.sources, store)).toEqual([]);
+    expect(aggregateInbox(rig.sources, store, CREATED_AT)).toEqual([]);
     expect(store.size()).toBe(0);
   });
 
@@ -136,7 +136,7 @@ describe("aggregateInbox", () => {
     const store = new HubInboxStore();
     rig.approvals.push(approval("approval-single-001"));
 
-    expect(aggregateInbox(rig.sources, store)).toEqual([
+    expect(aggregateInbox(rig.sources, store, CREATED_AT)).toEqual([
       approval("approval-single-001"),
     ]);
     expect(store.size()).toBe(1);
@@ -152,7 +152,7 @@ describe("aggregateInbox", () => {
     rig.recoveryPrompts.push(recoveryPrompt("recovery-prompt-all-001"));
     rig.agentErrors.push(agentError("agent-error-all-001"));
 
-    const items = aggregateInbox(rig.sources, store);
+    const items = aggregateInbox(rig.sources, store, CREATED_AT);
 
     expect(items).toHaveLength(6);
     expect(ids(items)).toEqual([
@@ -172,11 +172,11 @@ describe("aggregateInbox", () => {
     rig.approvals.push(approval("approval-dedup-001"));
     rig.agentErrors.push(agentError("agent-error-dedup-001"));
 
-    expect(ids(aggregateInbox(rig.sources, store))).toEqual([
+    expect(ids(aggregateInbox(rig.sources, store, CREATED_AT))).toEqual([
       "approval-dedup-001",
       "agent-error-dedup-001",
     ]);
-    expect(ids(aggregateInbox(rig.sources, store))).toEqual([
+    expect(ids(aggregateInbox(rig.sources, store, CREATED_AT))).toEqual([
       "approval-dedup-001",
       "agent-error-dedup-001",
     ]);
@@ -188,7 +188,7 @@ describe("aggregateInbox", () => {
     const store = new HubInboxStore();
     rig.blockedEgress.push(blockedEgress("blocked-egress-resolved-001"));
 
-    aggregateInbox(rig.sources, store);
+    aggregateInbox(rig.sources, store, CREATED_AT);
     await store.resolve("blocked-egress-resolved-001", "dismiss", RESOLVED_AT);
     rig.blockedEgress[0] = {
       ...blockedEgress("blocked-egress-resolved-001"),
@@ -198,7 +198,7 @@ describe("aggregateInbox", () => {
       ],
     };
 
-    const items = aggregateInbox(rig.sources, store);
+    const items = aggregateInbox(rig.sources, store, CREATED_AT);
     const resolvedItem = items.find(
       (item) => item.item_id === "blocked-egress-resolved-001",
     );
@@ -220,13 +220,13 @@ describe("aggregateInbox", () => {
     const store = new HubInboxStore();
     rig.privacyEvents.push(privacyEvent("privacy-event-mutation-001"));
 
-    expect(ids(aggregateInbox(rig.sources, store))).toEqual([
+    expect(ids(aggregateInbox(rig.sources, store, CREATED_AT))).toEqual([
       "privacy-event-mutation-001",
     ]);
 
     rig.privacyEvents.push(privacyEvent("privacy-event-mutation-002"));
 
-    expect(ids(aggregateInbox(rig.sources, store))).toEqual([
+    expect(ids(aggregateInbox(rig.sources, store, CREATED_AT))).toEqual([
       "privacy-event-mutation-001",
       "privacy-event-mutation-002",
     ]);
@@ -239,7 +239,7 @@ describe("aggregateInbox", () => {
     rig.approvals.push(approval("COLLIDE-001"));
     rig.agentErrors.push(agentError("COLLIDE-001"));
 
-    const items = aggregateInbox(rig.sources, store);
+    const items = aggregateInbox(rig.sources, store, CREATED_AT);
 
     // CHARACTERIZATION ONLY — this pins current behavior, it does NOT endorse it.
     // upsertFromSource keys solely on item_id, so a later source pull overwrites
@@ -265,7 +265,7 @@ describe("aggregateInbox", () => {
 
     store.enqueueTier1(hubItem, async () => undefined);
 
-    const items = aggregateInbox(rig.sources, store);
+    const items = aggregateInbox(rig.sources, store, CREATED_AT);
 
     expect(ids(items)).toEqual([
       "approval-hub-enqueued-001",
@@ -273,5 +273,53 @@ describe("aggregateInbox", () => {
     ]);
     expect(items).toEqual([hubItem, budgetWarning("budget-warning-source-001")]);
     expect(store.size()).toBe(2);
+  });
+});
+
+/** Source conditions clear independently of hub-owned approvals and errors. IC-12. */
+describe("source condition reconciliation", () => {
+  it("clears all five source kinds without clearing pending approvals or hub-owned items", () => {
+    const rig = sourceRig();
+    const store = new HubInboxStore();
+    const sourceItems = [
+      blockedEgress("source.blocked_egress.test"),
+      privacyEvent("source.privacy_event.test"),
+      budgetWarning("source.budget_warning.test"),
+      recoveryPrompt("source.recovery_prompt.test"),
+      agentError("source.agent_error.test"),
+    ];
+    for (const item of sourceItems) store.upsertFromSource(item);
+    const pending = approval("source.approval_pending.test");
+    store.upsertFromSource(pending);
+    const tier1 = approval("tier1.lockdown.agent-a.test");
+    store.enqueueTier1(tier1, async () => undefined);
+    const lockdown = agentError("fortress.lockdown.error.agent-a.uuid");
+    store.upsertFromSource(lockdown);
+
+    const items = aggregateInbox(rig.sources, store, RESOLVED_AT);
+    expect(items.filter((item) => !item.resolved)).toEqual([pending, tier1, lockdown]);
+    for (const item of sourceItems) {
+      expect(store.get(item.item_id)).toEqual({ ...item, resolved: true, resolved_at: RESOLVED_AT });
+    }
+    expect(() => store.reconcileSourceItems("source.", new Set([pending.item_id]), CREATED_AT)).toThrow(/source/);
+  });
+
+  it.each(["", "tier1.", "fortress.lockdown.error.", "source", "source.", "source.unknown.",
+    "source.approval_pending.", "source.budget_warning", "source.budget_warning.extra."])(
+    "refuses reconciliation outside the source namespace: %s", (prefix) => {
+      const store = new HubInboxStore();
+      expect(() => store.reconcileSourceItems(prefix, new Set(), RESOLVED_AT)).toThrow(/source/);
+    });
+
+  it("counts each newly cleared condition once and preserves a prior dismissal timestamp", async () => {
+    const store = new HubInboxStore();
+    const item = budgetWarning("source.budget_warning.test");
+    store.upsertFromSource(item);
+    await store.resolve(item.item_id, "dismiss", CREATED_AT);
+    expect(store.reconcileSourceItems("source.budget_warning.", new Set(), RESOLVED_AT)).toBe(1);
+    expect(store.reconcileSourceItems("source.budget_warning.", new Set(), RESOLVED_AT)).toBe(0);
+    expect(store.get(item.item_id)?.resolved_at).toBe(CREATED_AT);
+    store.upsertFromSource({ ...item, resolved: true, resolved_at: CREATED_AT });
+    expect(store.get(item.item_id)).toEqual(item);
   });
 });
