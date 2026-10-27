@@ -23,8 +23,8 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 - Hub inbox and agent status changes now publish dashboard stream updates.
 - The hub inbox projects budget warnings and agent errors from the local agent registry when the registry carries them; no shipped producer writes budget caps or error status yet, and blocked egress, privacy events and recovery prompts stay empty until their producers carry a witness the card may claim.
 - Dashboard exports containing encrypted state include a re-key key shown once, in the approving dashboard; a lost response means a new export.
-- The operator can restore a locked-down agent's network access from the dashboard through Tier 1 approval.
-- The dashboard also refetches hub data about once a minute while its live stream is healthy.
+- On macOS, the operator can restore a locked-down agent's network access from the dashboard through Tier 1 approval.
+- The dashboard also refetches its inbox and agent data about once a minute while its live stream is open.
 
 ### Changed
 
@@ -37,7 +37,7 @@ Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 
 - A second approval of the same agent's lockdown lift is refused while the first is running or after it has restored the agent, so one approval set lifts once; a lift that fails leaves the agent locked down and a later approval can try again.
 - `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
 - Dashboard approval cards and decision labels read in plain language; operator token entry, the findings count and scroll position are consistent, and an empty feedback row stays quiet.
-- Runs in CI no longer open the dashboard in a browser; pass `--no-open` to keep any other scripted run from opening it.
+- Runs with the `CI` environment variable set no longer open the dashboard in a browser. `--no-open` keeps any run from opening it.
 
 ## [1.9.0-rc.1] - 2026-10-21
 
