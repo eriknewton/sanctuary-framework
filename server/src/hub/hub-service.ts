@@ -199,6 +199,8 @@ function snapshotForRecord(
 export class HubService {
   private deps: HubServiceDeps;
   private inboxStore: HubInboxStore;
+  // At most one claim per admitted agent; completion or failure removes it without retaining card history.
+  private readonly lockdownLiftsInFlight = new Set<string>();
   private taskService?: TaskService;
   private concierge?: ConciergeService;
   private charterApprovals: CharterApprovalBridge | null = null;
@@ -786,10 +788,20 @@ export class HubService {
           try {
             // Revalidate after the approval wait so a stale card cannot restore an agent in another state.
             await this.assertCapability(this.getAgent(record.agent_id), action);
-            // The lift acts on the record this handler just re-authorized, never on an id read off the
-            // approved card: the registry write and the audit rows below name record.agent_id, and a
-            // card naming another agent must not restore that agent's egress under this one's approval.
-            result = await this.deps.agentController.liftLockdown(record.agent_id);
+            // The current status re-check and claim are one serialized decision: an in-flight lift counts as
+            // not locked down, including while an asynchronous capability probe was waiting to return.
+            if (this.lockdownLiftsInFlight.has(record.agent_id) || this.getAgent(record.agent_id).status !== "locked_down") {
+              throw new HubCapabilityError("agent_control_lockdown_lift_unsupported_not_locked_down");
+            }
+            this.lockdownLiftsInFlight.add(record.agent_id);
+            try {
+              // The lift acts on the record this handler just re-authorized, never on an id read off the
+              // approved card: the registry write and the audit rows below name record.agent_id, and a
+              // card naming another agent must not restore that agent's egress under this one's approval.
+              result = await this.deps.agentController.liftLockdown(record.agent_id);
+            } finally {
+              this.lockdownLiftsInFlight.delete(record.agent_id);
+            }
           } catch (err) {
             if (err instanceof HubCapabilityError) {
               void this.deps.activitySources.auditLog.append(
