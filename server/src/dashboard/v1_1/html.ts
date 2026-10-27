@@ -2525,6 +2525,8 @@ export function renderDashboardV11Html(
       <div id="operator-token-entry"></div>
     </section>
   </div>
+  <!-- Must match consumeOneTimeExport/clearExitRekey in client.ts; outside normal render and live regions. -->
+  <section id="exit-rekey-view" hidden aria-label="One-time export key" style="position:fixed;inset:10%;z-index:1000;overflow:auto;background:var(--surface);padding:2rem;border:2px solid currentColor"></section>
   <!-- announceDecision in client.ts uses this permanent body-level live region across route redraws. -->
   <p id="decision-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
   <!-- Must match the operator-token-* ids in client.ts (openOperatorTokenDialog, submitOperatorToken). The field is a

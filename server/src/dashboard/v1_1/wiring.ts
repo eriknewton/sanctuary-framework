@@ -30,8 +30,9 @@
  *     after Tier 1 approval.
  */
 
+import { projectHubExportResult, type HubExportDeliveryReceiver } from "../../hub/types.js";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { defaultConfig, type SanctuaryConfig } from "../../config.js";
@@ -751,7 +752,9 @@ export function buildV11Bindings(
     }),
     ...(inputs.storage && inputs.masterKey
       ? {
-          fortressExportBundle: async (approvalAuditId?: string) => {
+          fortressExportBundle: async (approvalAuditId?: string, receiver?: HubExportDeliveryReceiver) => {
+            // Mint only for a live request-scoped receiver, because an undisclosed key leaves this bundle without an operator re-key path.
+            if (!receiver?.isLive()) throw new Error("Export delivery unavailable.");
             const storage = inputs.storage!;
             const masterKey = inputs.masterKey!;
             const storagePath = inputs.storagePath;
@@ -792,31 +795,27 @@ export function buildV11Bindings(
               // the exit-machinery Slice 1 ownership partition is deliberately
               // not applied. Named acknowledgement, not a silent skip.
               unpartitionedLegacyExport: true,
-              // `mintStateRekeyKey` is DELIBERATELY absent (A10): this path's
-              // results are persisted into the hub inbox `resolution_payload`,
-              // and key material must never be persisted (CLAUDE.md #6). A
-              // minted key here would either be persisted with the result
-              // (forbidden) or destroyed while the bundle advertises a re-key
-              // path the operator can never satisfy. Must match the
-              // non-minting-caller pin on `mintStateRekeyKey` in
-              // exit/bundle.ts.
+              // Must match the caller contract for mintStateRekeyKey in exit/bundle.ts. Liveness was required at entry;
+              // a receiver that dies during the export discards the minted key at the router, so the arm has one shape
+              // (minted, undelivered, discarded) and a nonempty bundle never ships without its custody block.
+              mintStateRekeyKey: true,
               ...(approvalAuditId !== undefined
                 ? { exportApprovalAuditId: approvalAuditId }
                 : {}),
             });
-            return {
-              bundle_dir: exported.bundle_dir,
-              manifest_hash: exported.manifest_hash,
-              artifact_count: exported.artifact_count,
-              // A7: carry trusted export values through so the dashboard can
-              // surface an honest count and prevent "Bundle ready" from masking
-              // a zero-state export. Must match HubFortressExportResult in
-              // hub/types.ts and resolution_payload in hub-events.ts.
-              state_entry_count: exported.state_entry_count,
-              ...(exported.warnings !== undefined
-                ? { warnings: exported.warnings }
-                : {}),
-            };
+            try {
+              // Reusable path/hash metadata describes the artifact we wrote, never arbitrary result text.
+              const manifestHash = createHash("sha256").update(await readFile(join(bundleDir, "manifest.json"))).digest("hex");
+              if (exported.bundle_dir !== bundleDir || exported.manifest_hash !== manifestHash) throw new Error("Export metadata unavailable.");
+              // This secret-free projection must match HubFortressExportResult in hub/types.ts; only the request receiver may receive the key.
+              const safe = projectHubExportResult(exported);
+              if (exported.state_rekey_key !== undefined) {
+                receiver.receive({ state_rekey_key: exported.state_rekey_key, bundle_dir: bundleDir, manifest_hash: safe.manifest_hash });
+              }
+              return safe;
+            } finally {
+              delete exported.state_rekey_key;
+            }
           },
         }
       : {}),

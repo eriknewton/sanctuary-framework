@@ -176,7 +176,9 @@ describe("hub stream producers", () => {
     expect(registry.listenerErrorCount).toBe(3);
   });
 
-  it("publishes one resolution across overlapping late completions and repeated waves", async () => {
+  it("publishes one resolution when a concurrent decision loses the execution claim, across repeated waves", async () => {
+    // The store claims execution before awaiting the handler (one owner per item), so the second concurrent
+    // decision loses with a conflict and never reaches the handler; the one real resolution notifies once.
     const store = new HubInboxStore();
     const listener = vi.fn();
     store.subscribe(listener);
@@ -186,15 +188,37 @@ describe("hub stream producers", () => {
       store.enqueueTier1(item, () => new Promise<void>((resolve) => releases.push(resolve)));
       listener.mockClear();
       const first = store.resolve(item.item_id, "approve", NOW);
-      const second = store.resolve(item.item_id, "approve", NOW);
+      await expect(store.resolve(item.item_id, "approve", NOW)).rejects.toMatchObject({ statusCode: 409 });
+      expect(releases).toHaveLength(1);
       expect(listener).not.toHaveBeenCalled();
-      releases[1](); await second;
       releases[0](); await first;
       expect(listener).toHaveBeenCalledTimes(1);
       expect(listener.mock.calls[0][0].resolved).toBe(true);
       vi.runAllTimers();
       expect(listener).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("publishes one resolved frame when an export approval fails terminally, carrying no cause bytes", async () => {
+    // The export failure arm is terminal (no replay can mint again) and is still a resolution the stream must see.
+    const store = new HubInboxStore();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    const SENTINEL = "SENTINEL-MINTED-KEY-BYTES";
+    const item: HubApprovalPendingItem = { ...approval("export-fail"), operation_category: "exit_bundle_export",
+      display_template_id: "approval_pending.tier1.fortress_exit_bundle_export",
+      display_template_args: [{ kind: "identity_id", value: IDENTITY }, { kind: "tier", value: "tier1" }] };
+    store.enqueueTier1(item, async () => { throw new Error(`mint failed ${SENTINEL}`); });
+    listener.mockClear();
+    const receiver = { isLive: () => true, receive: () => {} };
+    await expect(store.resolve(item.item_id, "approve", NOW, receiver)).rejects.toThrow("Export approval failed.");
+    expect(listener).toHaveBeenCalledTimes(1);
+    const frame = listener.mock.calls[0][0];
+    expect(frame.resolved).toBe(true);
+    expect(frame.resolution_payload).toEqual({ outcome: "failed" });
+    expect(JSON.stringify(frame)).not.toContain(SENTINEL);
+    await expect(store.resolve(item.item_id, "approve", NOW, receiver)).rejects.toMatchObject({ statusCode: 409 });
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("installs no listeners without a publisher and does install them when supplied", () => {
