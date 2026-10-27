@@ -218,6 +218,7 @@ export class HubInboxStore {
           entry.resolved_at = nowIso;
           entry.item = { ...entry.item, resolved: true, resolved_at: nowIso, resolution_payload: { outcome: "failed" } };
           entry.tier1Handler = undefined;
+          // eslint-disable-next-line preserve-caught-error -- intentional: the cause may carry the minted key; diagnostics are a disclosure channel
           throw new Error("Export approval failed.");
         }
         throw error;
