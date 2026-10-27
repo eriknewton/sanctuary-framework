@@ -22,6 +22,7 @@ import { DashboardApprovalChannel } from "../../../src/principal-policy/dashboar
 import { handleRequest } from "../../../src/dashboard/api.js";
 import { createDashboardReadFlightMap } from "../../../src/dashboard/read-response.js";
 import { handlePostureRoute } from "../../../src/principal-policy/posture-routes.js";
+import type { HubApprovalPendingItem } from "../../../src/contracts/v1.1/hub-events.js";
 import { HubInboxStore } from "../../../src/hub/inbox-store.js";
 
 const TOKEN = "synthetic-operator";
@@ -351,6 +352,25 @@ describe("response-only export delivery", () => {
       for (const undo of restore) undo();
       expect((await f.call(`/api/hub/inbox/${id}/approve`)).statusCode).toBe(409);
     }
+  });
+
+  it("receiver-that-dies-during-the-export-still-mints-and-the-key-is-discarded", async () => {
+    // Liveness is required at entry only; the mint does not re-read it, so a nonempty bundle always carries custody
+    // and a receiver that died mid-export sees the key offered once and never stored anywhere else.
+    const f = await fortress(); syntheticMint();
+    // Three entry probes (the store, the service, then the wiring) see a live receiver; every later probe sees a dead one.
+    const ENTRY_PROBES = 3; let probes = 0; const offered: string[] = [];
+    const receiver = { isLive: () => probes++ < ENTRY_PROBES, receive: (d: { state_rekey_key: string }) => { offered.push(d.state_rekey_key); } };
+    const enqueued = f.bindings.hubService.enqueueFortressExportBundle();
+    const item = await f.bindings.hubService.resolveInboxItem(enqueued.inbox_item_id, "approve", receiver);
+    expect(probes).toBeGreaterThanOrEqual(ENTRY_PROBES);
+    expect(offered).toHaveLength(1);
+    expect(offered[0]).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const payload = (item as HubApprovalPendingItem).resolution_payload!;
+    expect(payload.state_entry_count).toBe(1);
+    const state = JSON.parse(await readFile(join(payload.bundle_dir!, "artifacts/encrypted_state.json"), "utf8"));
+    expect(state.source_custody.format).toBe("SANCTUARY_EXIT_SOURCE_CUSTODY_V1");
+    secretFree(item); secretFree(f.bindings.hubService.listInbox());
   });
 
   it("empty-export-has-no-key-or-custody", async () => {

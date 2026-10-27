@@ -792,8 +792,10 @@ export function buildV11Bindings(
               // the exit-machinery Slice 1 ownership partition is deliberately
               // not applied. Named acknowledgement, not a silent skip.
               unpartitionedLegacyExport: true,
-              // Must match the caller contract for mintStateRekeyKey in exit/bundle.ts.
-              mintStateRekeyKey: receiver.isLive(),
+              // Must match the caller contract for mintStateRekeyKey in exit/bundle.ts. Liveness was required at entry;
+              // a receiver that dies during the export discards the minted key at the router, so the arm has one shape
+              // (minted, undelivered, discarded) and a nonempty bundle never ships without its custody block.
+              mintStateRekeyKey: true,
               ...(approvalAuditId !== undefined
                 ? { exportApprovalAuditId: approvalAuditId }
                 : {}),

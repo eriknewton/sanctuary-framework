@@ -7354,7 +7354,9 @@ async function performInboxAction(itemId, action, subject) {
   try {
     r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
   } catch (e) {
-    if (item0 && item0.operation_category === "exit_bundle_export" && action === "approve") return { status: "uncertain", message: EXIT_REKEY_LOST };
+    // Only an uncertain answer (no answer, a 5xx, an unreadable body) can mean the export ran without delivering its key;
+    // a 4xx proves the server refused before any export, so the refusal sentence applies and no key was ever at stake.
+    if (item0 && item0.operation_category === "exit_bundle_export" && action === "approve" && !decisionRefusedByServer(e)) return { status: "uncertain", message: EXIT_REKEY_LOST };
     return decisionOutcomeFromError(action, subject, e, item0);
   }
   const delivered = consumeOneTimeExport(r, itemId, action, deliveryEpoch);

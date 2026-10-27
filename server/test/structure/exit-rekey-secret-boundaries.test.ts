@@ -271,6 +271,16 @@ describe("one-time browser delivery", () => {
     }
   });
 
+  it("refused-export-approve-reads-as-refused-not-lost", async () => {
+    // A 4xx proves the server refused before any export ran, so the lost-response sentence must not appear.
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [exportItem()] } })), "/api/hub/inbox/export-1/approve": () => Promise.resolve(response({ ok: false, error: "unauthorized" }, 401)) });
+    await settle(); h.click({ "data-action": "inbox-approve", "data-item-id": "export-1" }); await settle();
+    expect(h.result()).toContain("was refused for");
+    expect(h.result()).toContain("The decision was not applied.");
+    expect(h.result()).not.toContain("did not receive its re-key key");
+    expect(h.el["exit-rekey-view"]?.textContent || "").toBe(""); noSharedSecret(h);
+  });
+
   it("decision-wire-and-display-contract-diff-is-intentional", async () => {
     const { readFile } = await import("node:fs/promises");
     const client = getClientScript();
