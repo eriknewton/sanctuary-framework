@@ -1,3 +1,5 @@
+import { parseBlockedEgressMetadata } from "../contracts/v1.1/index.js";
+
 /**
  * WP-V1.3-4 Psi-2 Unified Inbox encrypted persistence.
  *
@@ -136,7 +138,11 @@ export class UnifiedInboxStore {
       ) {
         return null;
       }
-      return persisted.entry;
+      // Must match cachePersistedEntry in unified-inbox-bridge.ts: invalid metadata reads as legacy.
+      const { blocked_egress, ...legacy } = persisted.entry;
+      const metadata = parseBlockedEgressMetadata(blocked_egress);
+      // A malformed stored claim is omitted in memory, never repaired or written back.
+      return metadata.ok ? { ...legacy, blocked_egress: metadata.value } : legacy;
     } catch {
       return null;
     }

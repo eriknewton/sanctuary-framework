@@ -371,3 +371,60 @@ describe("Psi-2 - producer wiring", () => {
     expect(JSON.stringify(entries)).not.toContain("verified");
   });
 });
+
+import { encrypt } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { stringToBytes } from "../../src/core/encoding.js";
+import { InMemoryLocalAgentRegistry } from "../../src/hub/agent-registry.js";
+import { createHubInboxSources, emptyHubInboxSource } from "../../src/hub/inbox-sources.js";
+
+describe("structured blocked-egress encrypted round trip", () => {
+  it.each(["verified", "unverified"] as const)("retains %s evidence through cache, encryption and restart", async (state) => {
+    const { storage, masterKey, store, bridge } = rig();
+    const metadata = {
+      destination_host: "bounded.example", destination_ip: "2001:db8::1",
+      attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state } as const,
+      ...(state === "verified" ? { subject: "fortress/uid-1" } : {}),
+    };
+    const entry = bridge.ingestBlockedEgress({ source_event_id: `structured-${state}`, destination_category: "unchanged.example", block_reason_class: "other", observed_at: OBSERVED_AT, blocked_egress: metadata })!;
+    expect(bridge.get(entry.inbox_id)?.blocked_egress).toEqual(metadata);
+    await bridge.flushPersistence();
+    expect((await store.get(entry.inbox_id))?.blocked_egress).toEqual(metadata);
+    const raw = await storage.read(UNIFIED_INBOX_NAMESPACE, `${UNIFIED_INBOX_KEY_PREFIX}${entry.inbox_id}`);
+    expect(bytesToString(raw!)).not.toContain(metadata.destination_host);
+    const next = rig({ storage, masterKey });
+    await next.bridge.rehydratePendingFromStore();
+    expect(next.bridge.get(entry.inbox_id)?.blocked_egress).toEqual(metadata);
+    expect(next.bridge.get(entry.inbox_id)?.summary).toBe(entry.summary);
+    expect(createHubInboxSources({ identityId: IDENTITY, agentRegistry: new InMemoryLocalAgentRegistry() }).listRecentBlockedEgress).toBe(emptyHubInboxSource);
+  });
+
+  it("reads legacy and malformed stored metadata as legacy without rewriting storage", async () => {
+    const { storage, masterKey, store, bridge } = rig();
+    const entry = bridge.ingestBlockedEgress({ source_event_id: "legacy", destination_category: "legacy.example", block_reason_class: "other", observed_at: OBSERVED_AT })!;
+    await bridge.flushPersistence();
+    const legacy = (await store.get(entry.inbox_id))!;
+    expect(legacy).not.toHaveProperty("blocked_egress");
+    const metadataVariants = [
+      { attribution: { state: "neutral" } },
+      { attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state: "verified" }, destination_host: "bad/host" },
+      { extra: true },
+    ];
+    for (const blocked_egress of metadataVariants) {
+      const payload = encrypt(
+        stringToBytes(JSON.stringify({ version: 1, entry: { ...legacy, blocked_egress } })),
+        derivePurposeKey(masterKey, "principal-policy-unified-inbox-v1"),
+        stringToBytes(`${FORTRESS}|${entry.inbox_id}`),
+      );
+      const bytes = stringToBytes(JSON.stringify(payload));
+      const key = `${UNIFIED_INBOX_KEY_PREFIX}${entry.inbox_id}`;
+      await storage.write(UNIFIED_INBOX_NAMESPACE, key, bytes);
+      expect(await store.get(entry.inbox_id)).toEqual(legacy);
+      const next = rig({ storage, masterKey });
+      await next.bridge.rehydratePendingFromStore();
+      expect(next.bridge.get(entry.inbox_id)).not.toHaveProperty("blocked_egress");
+      expect(next.bridge.get(entry.inbox_id)?.summary).toBe(entry.summary);
+      expect(await storage.read(UNIFIED_INBOX_NAMESPACE, key)).toEqual(bytes);
+    }
+  });
+});

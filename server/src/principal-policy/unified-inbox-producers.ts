@@ -1,3 +1,5 @@
+import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
+
 /**
  * Psi-2 producer adapters for UnifiedInboxBridge.
  *
@@ -24,6 +26,8 @@ export const PSI2_AUDIT_OPS = {
 export function ingestCastleWallBlockedEgress(params: {
   bridge: UnifiedInboxBridge;
   event: CastleWallAuditEvent;
+  /** Consumer-minted metadata, validated before bridge admission. */
+  blocked_egress?: BlockedEgressMetadata;
 }): UnifiedInboxEntry | null {
   const { event } = params;
   if (event.event_type !== "egress_blocked") return null;
@@ -36,9 +40,11 @@ export function ingestCastleWallBlockedEgress(params: {
         : "other";
   const seq =
     typeof event.details.seq === "number" ? String(event.details.seq) : host;
+  const metadata = parseBlockedEgressMetadata(params.blocked_egress);
   return params.bridge.ingestBlockedEgress({
     source_event_id: `${event.timestamp}:${seq}`,
     agent_id: event.agent?.id,
+    ...(metadata.ok ? { blocked_egress: metadata.value } : {}),
     destination_category: host,
     block_reason_class: reason,
     observed_at: event.timestamp,
@@ -50,6 +56,8 @@ export async function emitCastleWallBlockedEgress(params: {
   auditLog?: AuditLog;
   identityId: string;
   event: CastleWallAuditEvent;
+  /** Consumer-minted metadata, validated before bridge admission. */
+  blocked_egress?: BlockedEgressMetadata;
 }): Promise<UnifiedInboxEntry | null> {
   const entry = ingestCastleWallBlockedEgress(params);
   if (entry && params.auditLog) {

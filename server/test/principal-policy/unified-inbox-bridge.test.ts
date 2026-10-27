@@ -533,3 +533,39 @@ describe("Psi-1 — subscribers + audit + multi-fortress + Castle-walking", () =
     expect(ops.has("intelligence_substrate_invoked")).toBe(false);
   });
 });
+
+import { ingestCastleWallBlockedEgress } from "../../src/principal-policy/unified-inbox-producers.js";
+import { buildAuditEvent } from "../../src/castle-wall/audit/builder.js";
+
+describe("structured blocked-egress bridge admission", () => {
+  it.each(["verified", "unverified"] as const)("retains %s metadata without changing legacy projection fields", (state) => {
+    const { bridge } = makeBridge();
+    const { bridge: legacy } = makeBridge();
+    const event = buildAuditEvent({
+      timestamp: OBSERVED_AT, fortress_id: FORTRESS_A, event_type: "egress_blocked",
+      destination: { host: "legacy.example", ip: "192.0.2.1", port: 443, protocol: "tcp" },
+      details: { seq: 0, reason: "original reason" },
+    });
+    const metadata = {
+      destination_host: "signed.example", destination_ip: "192.0.2.2",
+      attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state } as const,
+    };
+    const entry = ingestCastleWallBlockedEgress({ bridge, event, blocked_egress: metadata })!;
+    const old = ingestCastleWallBlockedEgress({ bridge: legacy, event })!;
+    expect(entry.blocked_egress).toEqual(metadata);
+    expect(bridge.get(entry.inbox_id)?.blocked_egress).toEqual(metadata);
+    expect(entry.summary).toBe(old.summary);
+    expect(entry.summary).toBe("Egress to legacy.example blocked: original reason");
+    expect(entry.source_event_id).toBe(old.source_event_id);
+    expect(entry.severity).toBe(old.severity);
+  });
+
+  it("preserves unknown host fallback and omits invalid metadata", () => {
+    const { bridge } = makeBridge();
+    const event = buildAuditEvent({ timestamp: OBSERVED_AT, fortress_id: FORTRESS_A, event_type: "egress_blocked", details: {} });
+    const entry = ingestCastleWallBlockedEgress({ bridge, event, blocked_egress: { attribution: { state: "neutral" } } as never })!;
+    expect(entry.summary).toBe("Egress to unknown blocked: other");
+    expect(entry.source_event_id).toBe(`${OBSERVED_AT}:unknown`);
+    expect(entry).not.toHaveProperty("blocked_egress");
+  });
+});

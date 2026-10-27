@@ -589,3 +589,134 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
     );
   });
 });
+
+// The real bridge exercises the consumer-to-producer-to-cache handoff.
+import { UnifiedInboxBridge } from "../../../src/principal-policy/unified-inbox-bridge.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../../src/storage/memory.js";
+import { vi } from "vitest";
+
+function structuredBridge() {
+  // 32 bytes is the AES-256 fixture key length; storage is isolated per test.
+  return new UnifiedInboxBridge({
+    auditLog: new AuditLog(new MemoryStorage(), new Uint8Array(32)),
+    identityId: FORTRESS_ID, fortressId: FORTRESS_ID, now: () => new Date(NOW),
+  });
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe("structured blocked-egress producer evidence", () => {
+  it.each(["macos_audit_token", "signed_identity_id"] as const)("keeps signed destinations and subject for %s", async (binding) => {
+    const sink = new RecordingSink();
+    const bridge = structuredBridge();
+    const consumer = new AuditConsumer(sink, bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW });
+    const env = signedEnvelope(blockedEvent(0, null), daemonPriv);
+    if (binding === "signed_identity_id") env.producerSubjectBinding = { kind: binding };
+    env.event = { ...env.event, destination: { ...DEST, host: "envelope.example", ip: "192.0.2.1" } };
+    await consumer.ingestCritical(env);
+    expect(bridge.list()[0]?.blocked_egress).toEqual({
+      destination_host: DEST.host, destination_ip: DEST.ip,
+      subject: binding === "signed_identity_id" ? AGENT.id : `${FORTRESS_ID}/uid-${SIGNED_AGENT_UID}`,
+      attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state: "verified" },
+    });
+  });
+
+  it.each(["host", "ip", "unavailable"])("keeps verified attribution with %s destination", async (mode) => {
+    const bridge = structuredBridge();
+    const consumer = new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW });
+    const body = JSON.parse(walBodyFor(blockedEvent(0, null)));
+    if (mode !== "host") body.details.dest_host = "bad/host";
+    if (mode === "unavailable") body.details.dest_ip = "bad/ip";
+    const env = signedEnvelope(blockedEvent(0, null), daemonPriv, { bodyOverride: canonicalize(body) });
+    env.event = { ...env.event, destination: null, agent: null };
+    env.producerSubjectBinding = { kind: "signed_identity_id" };
+    await consumer.ingestCritical(env);
+    const metadata = bridge.list()[0]?.blocked_egress;
+    expect(metadata?.attribution.state).toBe("verified");
+    expect(metadata?.destination_host).toBe(mode === "host" ? DEST.host : undefined);
+    expect(metadata?.destination_ip).toBe(mode === "unavailable" ? undefined : DEST.ip);
+  });
+
+  it("mints unsigned attribution independently of a success row or claimed details", async () => {
+    const sink = new RecordingSink();
+    const bridge = structuredBridge();
+    const event = blockedEvent(0, null);
+    event.details.attribution = { state: "verified" };
+    event.details.subject = "claimed-subject";
+    await new AuditConsumer(sink, bridge).ingestCritical({ event, ack: async () => {} });
+    expect(sink.entries.find((entry) => entry.operation === "egress_blocked")?.result).toBe("success");
+    expect(bridge.list()[0]?.blocked_egress).toEqual({
+      destination_host: DEST.host, destination_ip: DEST.ip,
+      attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state: "unverified" },
+    });
+  });
+
+  it("publishes only accepted signatures and preserves the accepted metadata", async () => {
+    const bridge = structuredBridge();
+    const ingest = vi.spyOn(bridge, "ingestBlockedEgress");
+    const consumer = new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW });
+    const bad = signedEnvelope(blockedEvent(0, null), daemonPriv);
+    bad.producer!.signatureB64url = "invalid";
+    await expect(consumer.ingestCritical(bad)).rejects.toBeInstanceOf(AuditChainError);
+    expect(ingest).not.toHaveBeenCalled();
+    await consumer.ingestCritical(signedEnvelope(blockedEvent(0, null), daemonPriv));
+    expect(bridge.list()[0]?.blocked_egress?.attribution.state).toBe("verified");
+  });
+
+  it.each(["append", "flush"] as const)("waits for %s before publishing structured evidence", async (stage) => {
+    const bridge = structuredBridge();
+    const sink = new RecordingSink();
+    const entered = deferred();
+    const release = deferred();
+    const order: string[] = [];
+    const append = sink.append.bind(sink);
+    sink.append = async (...args) => {
+      if (stage === "append" && args[1] === "egress_blocked") { entered.resolve(); await release.promise; }
+      append(...args);
+    };
+    sink.flush = async () => {
+      if (stage === "flush") { entered.resolve(); await release.promise; }
+      order.push("flushed");
+    };
+    bridge.onEvent(() => order.push("published"));
+    const pending = new AuditConsumer(sink, bridge).ingestCritical({ event: blockedEvent(0, null), ack: async () => {} });
+    await entered.promise;
+    expect(bridge.list()).toEqual([]);
+    release.resolve();
+    await pending;
+    expect(order).toEqual(["flushed", "published"]);
+    expect(bridge.list()[0]?.blocked_egress?.attribution.state).toBe("unverified");
+  });
+
+  it.each(["append", "flush"] as const)("withholds publication on %s failure and publishes after a successful retry", async (stage) => {
+    const sink = new RecordingSink();
+    const bridge = structuredBridge();
+    const consumer = new AuditConsumer(sink, bridge);
+    const fail = vi.spyOn(sink, stage).mockImplementationOnce(() => { throw new Error("isolated sink failure"); });
+    const env = { event: blockedEvent(0, null), ack: vi.fn(async () => {}) };
+    await expect(consumer.ingestCritical(env)).rejects.toThrow("isolated sink failure");
+    expect(bridge.list()).toEqual([]);
+    expect(env.ack).not.toHaveBeenCalled();
+    fail.mockRestore();
+    await consumer.ingestCritical(env);
+    expect(bridge.list()[0]?.blocked_egress?.attribution.state).toBe("unverified");
+    expect(env.ack).toHaveBeenCalled();
+  });
+
+  it("keeps the durable audit outcome and ACK when projection fails", async () => {
+    const sink = new RecordingSink();
+    const bridge = structuredBridge();
+    vi.spyOn(bridge, "ingestBlockedEgress").mockImplementationOnce(() => { throw new Error("isolated projection failure"); });
+    const consumer = new AuditConsumer(sink, bridge);
+    const ack = vi.fn(async () => {});
+    await consumer.ingestCritical({ event: blockedEvent(0, null), ack });
+    expect(ack).toHaveBeenCalled();
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+    expect(sink.entries.some((entry) => entry.operation === "egress_blocked")).toBe(true);
+  });
+});

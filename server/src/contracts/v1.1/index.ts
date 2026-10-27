@@ -38,3 +38,4 @@ export * from "./hub-events.js";
 export * from "./local-agent-records.js";
 export * from "./handoff-records.js";
 export * from "./exit-bundle-manifest.js";
+export * from "./blocked-egress.js";

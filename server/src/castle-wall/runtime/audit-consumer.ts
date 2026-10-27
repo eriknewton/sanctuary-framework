@@ -1,3 +1,5 @@
+import { parseBlockedEgressHost, parseBlockedEgressIp, parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../../contracts/v1.1/index.js";
+
 /**
  * Audit consumer: drains the daemon's WAL by accepting `audit_emit`
  * notifications, validating shape, and folding into Sanctuary's existing
@@ -696,10 +698,6 @@ export class AuditConsumer {
         resultForSignatureOutcome(sigOutcome),
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
-        ingestCastleWallBlockedEgress({
-          bridge: this.inboxBridge,
-          event: envelope.event,
-        });
         await this.sink.append(
           CASTLE_WALL_AUDIT_LAYER,
           "castle_wall_blocked_egress",
@@ -720,6 +718,18 @@ export class AuditConsumer {
       if (Number.isSafeInteger(failedSeq)) this.pendingUnpersistedSeq = failedSeq;
       await this.emitPersistenceFailure(err, envelope.event);
       throw err;
+    }
+    if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
+      // No blocked-egress projection is published before its primary audit receipt is durably appended and flushed; projection failure never rewrites the enforcement outcome.
+      try {
+        ingestCastleWallBlockedEgress({
+          bridge: this.inboxBridge,
+          event: envelope.event,
+          blocked_egress: blockedEgressMetadataFor(envelope, sigOutcome, identityOutcome.identityId),
+        });
+      } catch {
+        // The primary receipt is durable; projection availability cannot change its ACK or chain state.
+      }
     }
     // Update state BEFORE the ACK call. The event is now durably persisted;
     // a transport-layer ACK failure must NOT leave the consumer's chain view
@@ -1242,6 +1252,7 @@ export class AuditConsumer {
  *     or a non-enforcement-evidence event).
  *   - `rejected`: enforcement evidence missing a valid signature; fail closed.
  */
+// Must match the verified input of blockedEgressReasonClass in contracts/v1.1/blocked-egress.ts.
 type SignatureOutcome =
   | {
       kind: "verified";
@@ -1672,4 +1683,31 @@ export function buildChainAnchorSourceFromAuditLog(
     }
     return null;
   };
+}
+
+/** Mint display facts only after the consumer has accepted the signature and subject binding. */
+function blockedEgressMetadataFor(
+  envelope: CriticalEventEnvelope,
+  signature: SignatureOutcome,
+  signedSubject: string,
+): BlockedEgressMetadata | undefined {
+  // This attribution carries the enrolled Castle Wall producer's credibility: verified means its signature and signed event semantics verified against the enrolled daemon key; operation success is not producer verification.
+  const verified = signature.kind === "verified";
+  const details = verified ? signedDetailsFromBody(signature.signedBody) : envelope.event.details;
+  const host = parseBlockedEgressHost(verified ? details.dest_host : envelope.event.destination?.host ?? details.dest_host);
+  const ip = parseBlockedEgressIp(verified ? details.dest_ip : envelope.event.destination?.ip ?? details.dest_ip);
+  // Continuing arms: verified host/IP/unavailable retains verified attribution; unsigned never carries a subject.
+  // Refusing arms: signature/subject rejection and audit failure never reach this projection.
+  const metadata = parseBlockedEgressMetadata({
+    attribution: {
+      subject: "castle_wall_producer",
+      evidence_source: "producer_signature",
+      verifier: "castle_wall_audit_consumer",
+      state: verified ? "verified" : "unverified",
+    },
+    ...(host.ok ? { destination_host: host.value } : {}),
+    ...(ip.ok ? { destination_ip: ip.value } : {}),
+    ...(verified ? { subject: signedSubject } : {}),
+  });
+  return metadata.ok ? metadata.value : undefined;
 }

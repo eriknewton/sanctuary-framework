@@ -1,3 +1,5 @@
+import type { BlockedEgressAttribution } from "./blocked-egress.js";
+
 /**
  * Sanctuary v1.1 Operator Hub Event Contracts
  *
@@ -247,6 +249,17 @@ export interface HubHoldReason {
  */
 export interface HubBlockedEgressItem extends HubInboxItemHeader {
   kind: "blocked_egress";
+  /** Bounded host text for destination display, never a navigation target. */
+  destination_host?: string;
+  /** Bounded literal IP fallback when no valid host is available. */
+  destination_ip?: string;
+  /** Whether a verified subject has one same-owner enrolled agent match. */
+  agent_binding?: "bound" | "unattributed";
+  /**
+   * This attribution carries the enrolled Castle Wall producer's credibility: verified means its signature and signed event semantics verified against the enrolled daemon key; operation success is not producer verification.
+   * Legacy absence is unverified. Must match BlockedEgressAttribution in blocked-egress.ts.
+   */
+  attribution?: BlockedEgressAttribution;
   /**
    * Destination category. Same enum as the privacy filter so unified inbox,
    * privacy panel, and egress dashboards group consistently. Drift is a
