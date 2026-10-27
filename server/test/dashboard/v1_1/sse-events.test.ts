@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractStreamEventId } from "../../../src/dashboard/v1_1/sse-events.js";
+import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import type {
   HubActivityFeedEntry,
   HubAgentStatusSnapshot,
@@ -106,5 +107,11 @@ describe("v1.1 dashboard SSE event ids", () => {
     expect(
       extractStreamEventId({ type: "activity", data: activityEntry }),
     ).toBe("activity-entry-001");
+  });
+  it("keys a frame without an emission time the way the live client handler does, and the handler carries the pinned expression", () => {
+    const frame = { item_id: "inbox-009", kind: "agent_error", identity_id: "op-1", fortress_id: "f-1", resolved: false } as unknown as HubInboxStreamFrame;
+    expect(extractStreamEventId({ type: "inbox", data: frame })).toBe("inbox-009:open:");
+    // Structural pin: the inline browser handler in client.ts is a string copy of this key; a drift fails here.
+    expect(getClientScript()).toContain('item.item_id + ":" + (item.resolved ? "resolved" : "open") + ":" + (item.emitted_at || "")');
   });
 });

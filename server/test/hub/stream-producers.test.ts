@@ -233,4 +233,21 @@ describe("hub stream producers", () => {
     expect(maxDepth).toBe(1);
     expect(service.streamPublishErrorCount).toBe(0);
   });
+  it("never publishes a record outside the hub identity, and a removal only for an announced id", () => {
+    // The agents routes filter and refuse foreign-identity records; the stream must match them (round 2 finding 2).
+    const publisher = recorder();
+    const { registry, service } = setup(publisher);
+    const foreign = { ...agent(), agent_id: "foreign-agent", identity_id: "other-operator" };
+    registry.put(foreign);
+    registry.updateStatus("foreign-agent", "paused", "other");
+    registry.remove("foreign-agent");
+    expect(publisher.publishAgentStatus).not.toHaveBeenCalled();
+    // A record present before the subscription is announced by seeding, so its removal still publishes once.
+    registry.remove(agent().agent_id);
+    expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
+    expect(publisher.publishAgentStatus.mock.calls[0][0]).toMatchObject({ agent_id: agent().agent_id, status: "unknown" });
+    registry.remove(agent().agent_id);
+    expect(publisher.publishAgentStatus).toHaveBeenCalledTimes(1);
+    expect(service.streamPublishErrorCount).toBe(0);
+  });
 });

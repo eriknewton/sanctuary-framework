@@ -60,7 +60,7 @@ export function extractStreamEventId(
     case "inbox":
       // Must match the inbox handler in client.ts: an item is announced again when it resolves or re-emits after a
       // clear, so the id carries the state and emission time; item_id alone would drop every frame after the first.
-      return `${event.data.item_id}:${event.data.resolved ? "resolved" : "open"}:${event.data.emitted_at}`;
+      return `${event.data.item_id}:${event.data.resolved ? "resolved" : "open"}:${event.data.emitted_at || ""}`;
     case "agent_status":
       return `${event.data.agent_id}:${event.data.last_activity_at}`;
     case "activity":

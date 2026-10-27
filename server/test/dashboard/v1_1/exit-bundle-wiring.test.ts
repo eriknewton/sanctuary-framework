@@ -205,6 +205,11 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
       const clients = (channel as unknown as { dashboardStreamClients: Map<object, string> }).dashboardStreamClients;
       const client = { write: (bytes: string) => { wire.push(bytes); return true; } };
       clients.set(client, admission);
+      // The legacy /events loop runs first in broadcastSSE and admits the same positions; it must show the same bytes.
+      const legacyWire: string[] = [];
+      const legacyClients = (channel as unknown as { sseClients: Map<object, string> }).sseClients;
+      const legacyClient = { write: (bytes: string) => { legacyWire.push(bytes); return true; } };
+      legacyClients.set(legacyClient, admission);
       const timestamp = "2026-10-26T12:00:00.000Z";
       vi.useFakeTimers({ toFake: ["Date"] });
       vi.setSystemTime(timestamp);
@@ -223,10 +228,12 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
         const header = { item_id: item.item_id, kind: item.kind, identity_id: item.identity_id,
           fortress_id: fortressIdFromStoragePath(storagePath), emitted_at: timestamp, resolved: false };
         expect(wire).toEqual([`event: inbox\ndata: ${JSON.stringify(header)}\n\n`]);
-        wire.length = 0;
+        expect(legacyWire).toEqual(wire);
+        wire.length = 0; legacyWire.length = 0;
         const queued = hubService.enqueueFortressLockdown();
         await hubService.resolveInboxItem(queued.inbox_item_id, "deny");
         expect(wire).toHaveLength(2); // Enqueue plus resolution, with no refresh echo.
+        expect(legacyWire).toEqual(wire);
         for (const [index, bytes] of wire.entries()) {
           expect(bytes.startsWith("event: inbox\ndata: ")).toBe(true);
           const frame = JSON.parse(bytes.split("\ndata: ")[1]);
@@ -237,6 +244,7 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
         }
       } finally {
         clients.delete(client);
+        legacyClients.delete(legacyClient);
         await channel.stop();
         vi.useRealTimers();
         await auditLog.flush();

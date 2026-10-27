@@ -9163,6 +9163,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     authAdmission: DashboardAuthAdmission,
   ): unknown {
     if (authAdmission !== "loopback_position") return data;
+    // The legacy /events loop carries the hub events too, so a position-only reader of /events must see exactly what
+    // the /api/stream loop shows it; one arm serves both loops.
+    if (event === "inbox" || event === "agent_status") {
+      return this.redactDashboardStreamDataForAdmission({ event, data }, authAdmission);
+    }
     if (event === "pending-request") {
       return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
     }

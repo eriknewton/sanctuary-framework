@@ -226,7 +226,20 @@ export class HubService {
           identity_id: item.identity_id, fortress_id: deps.fortressId,
           emitted_at: this.nowIso(), resolved: item.resolved });
       }));
+      // The routes serve only this hub's identity (listAgents filters, getAgent refuses), so the stream never announces
+      // a record the operator's own console cannot list. A removal carries no record, so it publishes only for an id
+      // this hub has announced; the set is bounded by the registry size and seeded from the records present now.
+      const announcedAgentIds = new Set(
+        deps.agentRegistry.list({ identity_id: deps.identityId }).map((record) => record.agent_id),
+      );
       deps.agentRegistry.subscribe?.((agentId, record) => this.publishStream(() => {
+        if (record) {
+          if (record.identity_id !== deps.identityId) return;
+          announcedAgentIds.add(agentId);
+        } else if (!announcedAgentIds.delete(agentId)) {
+          return;
+        }
+        // Open ids come from the store; Charter holds are route-only, so this list is a subset of the agents route's.
         const openIds = this.inboxStore.list()
           .filter((item) => !item.resolved && item.agent_id === agentId && item.identity_id === deps.identityId)
           .map((item) => item.item_id);
