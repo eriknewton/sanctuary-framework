@@ -18,7 +18,7 @@
  *     `storage_not_transactional` before touching the store (IC-27).
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
@@ -39,7 +39,8 @@ import {
 } from "../../src/core/signing-domains.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import { DEFAULT_POLICY, generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
+import { fixedDenial } from "../../src/agent-native/safety-base.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { fromBase64url } from "../../src/core/encoding.js";
@@ -211,6 +212,76 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
     if (savedAgentId === undefined) delete process.env.SANCTUARY_AGENT_ID;
     else process.env.SANCTUARY_AGENT_ID = savedAgentId;
     await home.cleanup();
+  });
+
+  it("an import with an empty source key reference records its denial before returning without approval", async () => {
+    // Owner-only policy permissions match the file created by the server.
+    await writeFile(
+      join(home.defaultFortressPath, "principal-policy.yaml"),
+      generateDefaultPolicyYaml().replace(
+        /approval_channel:\n  type: \w+/,
+        "approval_channel:\n  type: callback",
+      ),
+      { mode: 0o600 },
+    );
+    const approvalCallback = vi.fn(async () => ({
+      decision: "deny" as const,
+      decided_at: "2026-10-27T00:00:00.000Z",
+      decided_by: "human" as const,
+    }));
+    // This pre-approval refusal must never enter a storage transaction.
+    const sdwTransaction = vi.fn(async () => {
+      throw new Error("Import must be refused before a transaction");
+    });
+    const storage = Object.assign(new MemoryStorage(), { sdwTransaction });
+    const signing = makeSigning();
+    const source = { listNamespaceSync: () => [] };
+    const { bundle } = buildSignedSdwExportBundle({
+      inventory: enumerateSdwExportInventory(source),
+      source,
+      fortressId: "fortress:source",
+      exportAuditEventId: "sdw-export:empty-source-key-ref",
+      signingKey: signing.signingKey,
+      now: "2026-10-27T00:00:00.000Z",
+    });
+    process.env.SANCTUARY_AGENT_ID = wrappedAgentId("claude-code", home.defaultFortressPath);
+    const { server, auditLog, cleanup } = await createSanctuaryServer({
+      storage,
+      passphrase: "vault-wiring-empty-source-key-ref",
+      approvalCallback,
+    });
+    try {
+      const result = await callTool(server, "sdw_import", {
+        bundle: toBase64url(stringToBytes(JSON.stringify(bundle))),
+        source_key_ref: "",
+      });
+      const denials = await auditOps(auditLog, "sdw_import_denied");
+      const { entries } = await auditLog.query({});
+      expect({
+        result,
+        denials: denials.map((entry) => [entry.operation, entry.details?.denial_class]),
+        // Negative one selects the last entry in the oldest-first audit query.
+        lastEntry: entries.at(-1),
+        approvalPrompts: approvalCallback.mock.calls,
+        scopeApprovals: await auditOps(auditLog, "sdw_import_scope_approved"),
+        transactions: sdwTransaction.mock.calls,
+      }).toEqual({
+        result: fixedDenial("audit:gate:sdw_import", "unavailable", null),
+        denials: [["sdw_import_denied", "invalid_source_key_ref"]],
+        lastEntry: expect.objectContaining({
+          layer: "l1",
+          operation: "sdw_import_denied",
+          identity_id: "system",
+          result: "failure",
+          details: { denial_class: "invalid_source_key_ref" },
+        }),
+        approvalPrompts: [],
+        scopeApprovals: [],
+        transactions: [],
+      });
+    } finally {
+      await cleanup();
+    }
   });
 
   it("sanctuary wrap writes SANCTUARY_AGENT_ID into the MCP entry env, distinct per harness and per fortress", () => {
