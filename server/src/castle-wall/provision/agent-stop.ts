@@ -44,6 +44,7 @@ export const AGENT_STOP_REASON_CODES = [
   "stop_policy_writer_busy",
   "stop_residual_allow_rules",
   "stop_reload_unconfirmed",
+  "stop_snapshot_missing",
 ] as const;
 
 export type AgentStopReasonCode = (typeof AGENT_STOP_REASON_CODES)[number];
@@ -319,7 +320,17 @@ export async function liftAgentEgressStop(
 ): Promise<LiftAgentEgressStopObservation> {
   const select = agentMatchableSelector(input.fortressPath);
   const snapshotPath = stopSnapshotPath(input.storagePath, input.agentId);
-  const snapshot = await readStopSnapshot(snapshotPath);
+  let snapshot: ReadonlyArray<ProvisionedEgressRuleFile>;
+  try {
+    snapshot = await readStopSnapshot(snapshotPath);
+  } catch (err) {
+    // The missing-snapshot reason is bound only to the snapshot path, never to other files the lift touches.
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      // stop_snapshot_missing must match the liftLockdown mapping in dashboard/v1_1/castle-wall-agent-controller.ts.
+      throw new AgentEgressStopError("stop_snapshot_missing", "Stop snapshot is missing.");
+    }
+    throw err;
+  }
   const result = await restoreProvisionedEgressRules({
     fortressPath: input.fortressPath,
     harnessId: input.agentId,

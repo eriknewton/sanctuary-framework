@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
+// Snapshot restoration preserves file-specific refusal reasons. IC-11.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   mkdir,
   mkdtemp,
@@ -25,6 +26,11 @@ import { listAgentMatchableAllowRuleFiles } from "../../../src/castle-wall/allow
 import { HABEAS_RULE_ID_PREFIX } from "../../../src/castle-wall/allowlist/habeas-port.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { ResolvedEnforcementAvailability } from "../../../src/castle-wall/runtime/enforcement-availability.js";
+import { removeRulesBeforeRestoreWrite, stoppedAgentFixture } from "./agent-stop-fixture.js";
+
+vi.mock("node:fs/promises", async importOriginal => ({
+  ...await importOriginal<typeof import("node:fs/promises")>(),
+}));
 
 const AGENT_ID = "agent-hermes";
 const FORTRESS_ID = "fortress-test";
@@ -38,6 +44,36 @@ afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+describe("snapshot-scoped lift refusals IC-11", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(NOW));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("names an absent snapshot with the actuator's typed reason", async () => {
+    const fortress = await makeFortress();
+    await expectStopReason(liftAgentEgressStop({
+      agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+    }), "stop_snapshot_missing");
+  });
+
+  it("preserves the restore refusal when a present snapshot's rules directory disappears", async () => {
+    const fortress = await makeFortress();
+    const { stopped, rulesDir, rulePath } = await stoppedAgentFixture(fortress, AGENT_ID);
+    await rm(rulesDir, { recursive: true });
+    removeRulesBeforeRestoreWrite(rulesDir, rulePath);
+    await expectStopReason(liftAgentEgressStop({
+      agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+      reloadPolicy: async () => ({ ok: true }),
+    }), "stop_residual_allow_rules");
+    await expect(readFile(stopped.snapshot_path, "utf8")).resolves.toContain("agent-allow.json");
+  });
 });
 
 async function makeFortress(): Promise<string> {

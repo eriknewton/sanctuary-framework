@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+// Snapshot restoration preserves file-specific refusal reasons. IC-11.
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +22,11 @@ import {
   fortressIdFromStoragePath,
 } from "../../../src/dashboard/v1_1/wiring.js";
 import { CastleWallAgentController } from "../../../src/dashboard/v1_1/castle-wall-agent-controller.js";
+import { removeRulesBeforeRestoreWrite, stoppedAgentFixture } from "../../castle-wall/provision/agent-stop-fixture.js";
+
+vi.mock("node:fs/promises", async importOriginal => ({
+  ...await importOriginal<typeof import("node:fs/promises")>(),
+}));
 
 async function withTmpFortress<T>(
   fn: (storagePath: string) => Promise<T>,
@@ -230,6 +236,14 @@ import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
 import type { LiftAgentEgressStopInput } from "../../../src/castle-wall/provision/agent-stop.js";
 
 describe("per-agent lockdown lift controller IC-11", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T00:00:00.000Z"));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
   function controllerFor(record: LocalAgentRecord, storagePath: string, lift?: typeof import("../../../src/castle-wall/provision/agent-stop.js").liftAgentEgressStop) {
     return new CastleWallAgentController({
       storagePath, fortressPath: storagePath, fortressId: record.identity_id,
@@ -307,5 +321,40 @@ describe("per-agent lockdown lift controller IC-11", () => {
     const fault = new Error("actuator fault");
     const failed = controllerFor(record, "/unused-fixture", async () => { throw fault; });
     await expect(failed.liftLockdown(record.agent_id)).rejects.toBe(fault);
+  });
+
+  it("propagates the same raw rule-file ENOENT from the lift dependency", async () => {
+    await withTmpFortress(async storagePath => {
+      const record = makeRecord({ status: "locked_down" });
+      const fault: NodeJS.ErrnoException = Object.assign(new Error("Rule file is missing."), {
+        code: "ENOENT", path: join(storagePath, "policy", "egress", "rules", "agent-allow.json"),
+      });
+      const controller = controllerFor(record, storagePath, async () => { throw fault; });
+      await expect(controller.liftLockdown(record.agent_id)).rejects.toBe(fault);
+    });
+  });
+
+  it("maps the typed snapshot reason to the served no-snapshot code", async () => {
+    const record = makeRecord({ status: "locked_down" });
+    const controller = controllerFor(record, "/unused-fixture", async () => {
+      throw new AgentEgressStopError("stop_snapshot_missing");
+    });
+    await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({
+      reasonCode: "lockdown_lift_no_snapshot",
+    });
+  });
+
+  it("serves the real restore refusal when a present snapshot's rules directory disappears", async () => {
+    await withTmpFortress(async storagePath => {
+      const record = makeRecord({ status: "locked_down" });
+      const { stopped, rulesDir, rulePath } = await stoppedAgentFixture(storagePath, record.agent_id);
+      await rm(rulesDir, { recursive: true });
+      removeRulesBeforeRestoreWrite(rulesDir, rulePath);
+      const controller = controllerFor(record, storagePath);
+      await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({
+        reasonCode: "stop_residual_allow_rules",
+      });
+      await expect(readFile(stopped.snapshot_path, "utf8")).resolves.toContain("agent-allow.json");
+    });
   });
 });
