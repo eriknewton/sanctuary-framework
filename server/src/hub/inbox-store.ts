@@ -77,6 +77,27 @@ interface StoredEntry {
 
 export class HubInboxStore {
   private entries: Map<string, StoredEntry> = new Map();
+  private listener?: (item: HubInboxItem) => void;
+  private listenerErrors = 0;
+
+  /** Count failed notifications without retaining exceptions or item data. */
+  get listenerErrorCount(): number { return this.listenerErrors; }
+
+  /** Attach the sole stream observer; disposal releases its reference. */
+  subscribe(listener: (item: HubInboxItem) => void): () => void {
+    // One owner bounds retained callbacks and work per mutation independently of caller volume.
+    if (this.listener) throw new HubConflictError("inbox observer already attached");
+    this.listener = listener;
+    return () => { if (this.listener === listener) this.listener = undefined; };
+  }
+
+  private notify(item: HubInboxItem): void {
+    try { this.listener?.(item); }
+    catch {
+      // Saturation bounds accounting; delivery failure must never undo committed store state.
+      this.listenerErrors = Math.min(Number.MAX_SAFE_INTEGER, this.listenerErrors + 1);
+    }
+  }
 
   /**
    * Record a fresh inbox item the aggregator pulled from a source. If the
@@ -93,6 +114,7 @@ export class HubInboxStore {
         resolved: prior.resolved,
         ...(prior.resolved_at ? { resolved_at: prior.resolved_at } : {}),
       };
+      // Refresh never notifies: inbox frames trigger refetch, whose aggregator re-upserts every item.
       return;
     }
     const freshItem = { ...item, resolved: false };
@@ -102,6 +124,7 @@ export class HubInboxStore {
       resolved: false,
       cleared: false,
     });
+    this.notify(freshItem);
   }
 
   /** Resolve absent source conditions and allow their next emission to open fresh. */
@@ -119,6 +142,7 @@ export class HubInboxStore {
         entry.resolved = true;
         entry.resolved_at = nowIso;
         entry.item = { ...entry.item, resolved: true, resolved_at: nowIso };
+        this.notify(entry.item);
       }
       cleared++;
     }
@@ -138,11 +162,13 @@ export class HubInboxStore {
     if (this.entries.has(item.item_id)) {
       throw new HubConflictError(`inbox item ${item.item_id} already exists`);
     }
+    const storedItem = { ...item, resolved: false };
     this.entries.set(item.item_id, {
-      item: { ...item, resolved: false },
+      item: storedItem,
       resolved: false,
       tier1Handler: handler,
     });
+    this.notify(storedItem);
   }
 
   /**
@@ -187,6 +213,8 @@ export class HubInboxStore {
       );
     }
 
+    // Concurrent or late handler completions notify only the first actual resolution transition.
+    if (entry.resolved) return entry.item;
     entry.resolved = true;
     entry.resolved_at = nowIso;
     const resolutionPayload =
@@ -207,6 +235,7 @@ export class HubInboxStore {
         resolved_at: nowIso,
       };
     }
+    this.notify(entry.item);
     return entry.item;
   }
 

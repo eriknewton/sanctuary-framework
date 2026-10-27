@@ -24,6 +24,7 @@ import type {
   HubAgentErrorItem,
   HubInboxItem,
   HubActivityFeedEntry,
+  HubAgentStatusSnapshot,
 } from "../contracts/v1.1/hub-events.js";
 import type {
   LocalAgentRecord,
@@ -33,6 +34,25 @@ import type {
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
 import type { OperatorChatService } from "../chat/operator-chat-service.js";
 import type { ConciergeService } from "../concierge/index.js";
+
+/** Minimal invalidation header; consumers refetch the admission-filtered inbox. */
+export interface HubInboxStreamFrame {
+  item_id: string;
+  kind: HubInboxKind;
+  identity_id: string;
+  fortress_id: string;
+  emitted_at: string;
+  resolved: boolean;
+}
+
+/** Synchronous dashboard invalidation sink; delivery is best effort, without retries. */
+export interface HubStreamPublisher {
+  publishInbox(frame: HubInboxStreamFrame): void;
+  publishAgentStatus(snapshot: HubAgentStatusSnapshot): void;
+}
+
+/** Post-mutation registry observation; null means the agent was removed. */
+export type HubAgentRegistryChangeListener = (agentId: string, record: LocalAgentRecord | null) => void;
 
 // -----------------------------------------------------------------------
 // Agent control
@@ -327,6 +347,8 @@ export interface HubPolicyAndBudgetSources {
  * may persist records to disk or recompute them per call.
  */
 export interface HubAgentRegistrySource {
+  /** Optional single-owner change subscription; return the disposer to detach it. */
+  subscribe?(listener: HubAgentRegistryChangeListener): () => void;
   /**
    * Insert or replace a record. Used by wrap-side registration and by
    * read-side persistence refresh to merge records written after dashboard
@@ -364,6 +386,8 @@ export interface HubAgentRegistrySource {
 // -----------------------------------------------------------------------
 
 export interface HubServiceDeps {
+  /** Optional live dashboard sink; absence installs no store listeners. */
+  streamPublisher?: HubStreamPublisher;
   /** Operator identity id this hub is scoped to. */
   identityId: string;
   /** Stable fortress id. */

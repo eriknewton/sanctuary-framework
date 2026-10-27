@@ -1358,6 +1358,10 @@ export async function createSanctuaryServer(options?: {
     const embeddedHubIdentityId = intelligenceIdentityId;
     dashboard.setV11Bindings(
       buildV11Bindings({
+        streamPublisher: {
+          publishInbox: (frame) => dashboard!.broadcastSSE("inbox", frame),
+          publishAgentStatus: (snapshot) => dashboard!.broadcastSSE("agent_status", snapshot),
+        },
         identityId: embeddedHubIdentityId,
         fortressId: fortressIdFromStoragePath(config.storage_path),
         auditLog,

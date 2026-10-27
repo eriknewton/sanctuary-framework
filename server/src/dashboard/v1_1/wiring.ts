@@ -111,6 +111,8 @@ import {
 } from "../../recognition/did-web.js";
 
 export interface BuildV11BindingsInputs {
+  /** Optional dashboard stream sink for hub mutations. */
+  streamPublisher?: import("../../hub/index.js").HubStreamPublisher;
   /** Operator identity id this hub is scoped to. */
   identityId: string;
   /** Stable fortress id surfaced through the API + dashboard top bar. */
@@ -718,6 +720,7 @@ export function buildV11Bindings(
   }
 
   const hubService = new HubService({
+    streamPublisher: inputs.streamPublisher,
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
     agentRegistry: registry,

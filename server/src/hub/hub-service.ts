@@ -177,6 +177,7 @@ function snapshotForRecord(
   record: LocalAgentRecord,
   openInboxItemIds: string[],
 ): HubAgentStatusSnapshot {
+  // Snapshot fields must match the change comparison in agent-registry.ts put and binding updates.
   // Liveness aging: the stored `active` status is the last value written and is
   // never aged, so a dead agent would keep reading "Running / protected /
   // verified". Age a stale `active` (last_activity_at past the window) down to
@@ -214,6 +215,40 @@ export class HubService {
     this.inboxStore = new HubInboxStore();
     this.taskService = deps.taskService;
     this.concierge = deps.concierge;
+    const publisher = deps.streamPublisher;
+    if (publisher) {
+      // One synchronous attempt per mutation, no queue or retries; publication never re-enters aggregation.
+      this.inboxStore.subscribe((item) => this.publishStream(() => {
+        // Header only: loopback stream clients may lack inbox admission; details belong to the filtered refetch route.
+        // Must match dashboard/v1_1/client.ts inbox handler: item_id dedupes, then /inbox and /activity are refetched.
+        publisher.publishInbox({ item_id: item.item_id, kind: item.kind,
+          identity_id: item.identity_id, fortress_id: deps.fortressId,
+          emitted_at: this.nowIso(), resolved: item.resolved });
+      }));
+      deps.agentRegistry.subscribe?.((agentId, record) => this.publishStream(() => {
+        const openIds = this.inboxStore.list()
+          .filter((item) => !item.resolved && item.agent_id === agentId && item.identity_id === deps.identityId)
+          .map((item) => item.item_id);
+        // Removal invalidates the roster with unknown status; it cannot attest continued activity for a missing record.
+        publisher.publishAgentStatus(record ? snapshotForRecord(record, openIds) : {
+          version: "1.1", agent_id: agentId, status: "unknown",
+          last_activity_at: this.nowIso(), open_inbox_item_ids: openIds,
+        });
+      }));
+    }
+  }
+
+  private streamPublishErrors = 0;
+
+  /** Saturating count of failed best-effort stream attempts, with no retained payloads. */
+  get streamPublishErrorCount(): number { return this.streamPublishErrors; }
+
+  private publishStream(publish: () => void): void {
+    try { publish(); }
+    catch {
+      // Publication is observational: a failed sink must not fail the already committed mutation.
+      this.streamPublishErrors = Math.min(Number.MAX_SAFE_INTEGER, this.streamPublishErrors + 1);
+    }
   }
 
   // ── Internal helpers ────────────────────────────────────────────────

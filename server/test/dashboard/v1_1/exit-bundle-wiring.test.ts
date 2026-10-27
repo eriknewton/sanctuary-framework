@@ -164,4 +164,82 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
     }
   });
 
+  /** Tier 1 mutations reach the stream sink through the production graph. IC-12. */
+  it("publishes enqueue and resolution headers through buildV11Bindings", async () => {
+    const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-stream-wire-"));
+    tempDirs.push(storagePath);
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const streamPublisher = { publishInbox: vi.fn(), publishAgentStatus: vi.fn() };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-10-26T12:00:00.000Z");
+    try {
+      const { hubService } = buildV11Bindings({ identityId: "operator-stream",
+        fortressId: fortressIdFromStoragePath(storagePath), auditLog, storagePath, streamPublisher });
+      const enqueued = hubService.enqueueFortressLockdown();
+      expect(streamPublisher.publishInbox).toHaveBeenCalledTimes(1);
+      const header = { item_id: enqueued.inbox_item_id, kind: "approval_pending", identity_id: "operator-stream",
+        fortress_id: fortressIdFromStoragePath(storagePath), emitted_at: new Date().toISOString(), resolved: false };
+      expect(streamPublisher.publishInbox.mock.calls[0][0]).toEqual(header);
+      await hubService.resolveInboxItem(enqueued.inbox_item_id, "deny");
+      expect(streamPublisher.publishInbox).toHaveBeenCalledTimes(2); // Enqueue plus resolution.
+      expect(streamPublisher.publishInbox.mock.calls[1][0]).toEqual({ ...header, resolved: true });
+    } finally {
+      vi.useRealTimers();
+      await auditLog.flush();
+    }
+  });
+
+  /** Production channel framing preserves minimal headers and admission redaction. IC-12. */
+  it.each(["operator_credential", "loopback_position"] as const)(
+    "writes header-only inbox wire bytes for %s admission", async (admission) => {
+      const { DashboardApprovalChannel } = await import("../../../src/principal-policy/dashboard.js");
+      const { writePersistedLocalAgents } = await import("../../../src/hub/agent-registry-persistence.js");
+      const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-stream-channel-"));
+      tempDirs.push(storagePath);
+      const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+      // Port zero requests an ephemeral listener if started; this byte-capture fixture never starts one.
+      const channel = new DashboardApprovalChannel({ port: 0, host: "127.0.0.1",
+        timeout_seconds: 30, auto_deny: true }); // Standard thirty-second approval deadline, unused here.
+      const wire: string[] = [];
+      // Capture the production broadcast path after stream admission without network timing or a listening server.
+      const clients = (channel as unknown as { dashboardStreamClients: Map<object, string> }).dashboardStreamClients;
+      const client = { write: (bytes: string) => { wire.push(bytes); return true; } };
+      clients.set(client, admission);
+      const timestamp = "2026-10-26T12:00:00.000Z";
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(timestamp);
+      try {
+        writePersistedLocalAgents(storagePath, [{ version: "1.1", agent_id: "agent-stream", identity_id: "operator-stream",
+          harness: "other", model_provider: { vendor: "local", model_id: "test", runs_locally: true },
+          policy_id: "policy", status: "error", status_reason_class: "harness_error",
+          last_activity_at: timestamp, wrapped_at: timestamp, budget_summary: { last_refreshed_at: timestamp },
+          capabilities: { can_pause: false, can_resume: false, can_restart: false, can_unwrap: false,
+            can_lockdown: false, can_chat: false, can_change_template: false } }]);
+        const { hubService } = buildV11Bindings({ identityId: "operator-stream",
+          fortressId: fortressIdFromStoragePath(storagePath), auditLog, storagePath,
+          streamPublisher: { publishInbox: (frame) => channel.broadcastSSE("inbox", frame),
+            publishAgentStatus: (snapshot) => channel.broadcastSSE("agent_status", snapshot) } });
+        const [item] = hubService.listInbox();
+        const header = { item_id: item.item_id, kind: item.kind, identity_id: item.identity_id,
+          fortress_id: fortressIdFromStoragePath(storagePath), emitted_at: timestamp, resolved: false };
+        expect(wire).toEqual([`event: inbox\ndata: ${JSON.stringify(header)}\n\n`]);
+        wire.length = 0;
+        const queued = hubService.enqueueFortressLockdown();
+        await hubService.resolveInboxItem(queued.inbox_item_id, "deny");
+        expect(wire).toHaveLength(2); // Enqueue plus resolution, with no refresh echo.
+        for (const [index, bytes] of wire.entries()) {
+          expect(bytes.startsWith("event: inbox\ndata: ")).toBe(true);
+          const frame = JSON.parse(bytes.split("\ndata: ")[1]);
+          expect(frame).toEqual(admission === "loopback_position"
+            ? { pending_approvals_redacted: true, pending_approvals_count: 1 }
+            : { ...header, item_id: queued.inbox_item_id, kind: "approval_pending", resolved: index > 0 });
+        }
+      } finally {
+        clients.delete(client);
+        await channel.stop();
+        vi.useRealTimers();
+        await auditLog.flush();
+      }
+    });
+
 });
