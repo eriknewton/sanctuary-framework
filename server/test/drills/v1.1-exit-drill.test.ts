@@ -1,4 +1,4 @@
-// fail-before-exempt: Slice 6a declares the export-only fixture support probe as false, preserving its existing no-control behavior.
+// fail-before-exempt: IC-11 adds only the required refusing lift fixture method; this drill does not exercise per-agent restoration.
 /**
  * Sanctuary v1.1 Acceptance Drill - Pillar 4: Portability and Exit.
  *
@@ -705,3 +705,7 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
     });
   });
 });
+
+// This fixture has no network restoration actuator.
+interface StubAgentController { liftLockdown(agentId: string): Promise<never>; }
+StubAgentController.prototype.liftLockdown = async () => { throw new Error("network restoration is outside this fixture"); };

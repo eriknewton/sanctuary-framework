@@ -213,6 +213,9 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   // Each entry must match its mirror in the client TEMPLATES map in client.ts.
   "approval_pending.tier1.lockdown": (a) =>
     `Cut ${hasArgValue(a, "agent_id") ? `agent ${arg(a, "agent_id")}'s` : "an agent's"} network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
+  // Must match approval_pending.tier1.lockdown_lift in client.ts.
+  "approval_pending.tier1.lockdown_lift": (a) =>
+    `Restore ${hasArgValue(a, "agent_id") ? `agent ${arg(a, "agent_id")}'s` : "an agent's"} network access. Castle Wall puts back the allow rules it removed at lockdown; the agent reaches off-machine destinations again once the reload is confirmed.`,
   "approval_pending.tier1.fortress_lockdown": () =>
     "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
@@ -357,6 +360,13 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     `Network access was revoked on disk for agent ${arg(a, "agent_id")}, but the live Castle Wall reload was not confirmed.`,
   "activity.lifecycle.agent_lockdown_refused": (a) =>
     `Network stop refused for agent ${arg(a, "agent_id")}.`,
+  // These lift templates must match the activity.lifecycle.agent_lockdown_lift* entries in client.ts.
+  "activity.lifecycle.agent_lockdown_lifted": (a) =>
+    `Network access restored for agent ${arg(a, "agent_id")}.`,
+  "activity.lifecycle.agent_lockdown_lift_partial": (a) =>
+    `Network access rules were restored on disk for agent ${arg(a, "agent_id")}, but the live Castle Wall reload was not confirmed.`,
+  "activity.lifecycle.agent_lockdown_lift_refused": (a) =>
+    `Network restore refused for agent ${arg(a, "agent_id")}.`,
   "activity.lifecycle.fortress_lockdown_engaged": () =>
     "Fortress lockdown engaged for all confined agents.",
   "activity.lifecycle.fortress_lockdown_partial": () =>

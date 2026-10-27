@@ -1,4 +1,4 @@
-// fail-before-exempt: Slice 6a adds the true support probe for the fortress fixture that already implements every control.
+// fail-before-exempt: IC-11 adds only the required refusing lift fixture method; this suite does not exercise per-agent restoration.
 /**
  * Sanctuary v1.1 — Fortress-scope Tier 1 endpoints regression suite.
  *
@@ -973,3 +973,7 @@ describe("Fortress endpoints sentinel /agents/all alias (Test 9)", () => {
     expect(body.data.operation_category).toBe("exit_bundle_export");
   });
 });
+
+// This fixture has no network restoration actuator.
+interface StubAgentController { liftLockdown(agentId: string): Promise<never>; }
+StubAgentController.prototype.liftLockdown = async () => { throw new Error("network restoration is outside this fixture"); };

@@ -1,4 +1,4 @@
-// fail-before-exempt: Slice 6a adds an explicit true support probe to the existing all-controls chat fixture.
+// fail-before-exempt: IC-11 adds only the required refusing lift fixture method; this suite does not exercise per-agent restoration.
 /**
  * Hub Chat Routes — Behavioral Tests (WP-V1.2-4)
  *
@@ -439,3 +439,7 @@ describe("Hub default-deny on mutation under loopback auto-auth (#806 review fix
     expect(res.status).not.toBe(401);
   });
 });
+
+// This fixture has no network restoration actuator.
+interface StubController { liftLockdown(agentId: string): Promise<never>; }
+StubController.prototype.liftLockdown = async () => { throw new Error("network restoration is outside this fixture"); };

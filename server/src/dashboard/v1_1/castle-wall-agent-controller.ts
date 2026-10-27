@@ -11,6 +11,7 @@ import type { HubAgentControlAction } from "../../hub/constants.js";
 import type {
   HubAgentController,
   HubAgentLockdownControllerResult,
+  HubAgentLockdownLiftControllerResult,
 } from "../../hub/types.js";
 import { HubCapabilityError, HubNotFoundError } from "../../hub/errors.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
@@ -19,6 +20,7 @@ import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import {
   AgentEgressStopError,
   stopAgentEgress,
+  liftAgentEgressStop,
   type StopAgentEgressObservation,
 } from "../../castle-wall/provision/agent-stop.js";
 
@@ -30,6 +32,7 @@ export interface CastleWallAgentControllerDeps {
   now: () => Date;
   getAgentRecord(agentId: string): LocalAgentRecord | null;
   stopAgentEgress?: typeof stopAgentEgress;
+  liftAgentEgressStop?: typeof liftAgentEgressStop;
 }
 
 function unsupported(action: string): never {
@@ -66,6 +69,9 @@ export class CastleWallAgentController implements HubAgentController {
         return false;
       case "lockdown":
         return record.capabilities.can_lockdown === true;
+      case "lockdown_lift":
+        // A lift consumes a lockdown snapshot, so other states must refuse before approval is queued.
+        return record.capabilities.can_lockdown === true && record.status === "locked_down";
     }
   }
 
@@ -102,6 +108,39 @@ export class CastleWallAgentController implements HubAgentController {
     } catch (err) {
       if (err instanceof AgentEgressStopError) {
         throw new HubCapabilityError(err.reasonCode);
+      }
+      throw err;
+    }
+  }
+
+  async liftLockdown(agentId: string): Promise<HubAgentLockdownLiftControllerResult> {
+    if (!this.deps.getAgentRecord(agentId)) throw new HubNotFoundError(`agent ${agentId}`);
+    // Approval can outlive the locked state; recheck before restoring any allow rules.
+    if (!this.supports("lockdown_lift", agentId)) {
+      throw new HubCapabilityError("agent_control_lockdown_lift_unsupported_not_locked_down");
+    }
+    try {
+      const lift = this.deps.liftAgentEgressStop ?? liftAgentEgressStop;
+      const observation = await lift({
+        agentId,
+        fortressPath: this.deps.fortressPath,
+        storagePath: this.deps.storagePath,
+      });
+      const restored = observation.reload_confirmed === true;
+      return {
+        outcome: restored ? "restored" : "partial",
+        // Rules on disk do not prove a live reload; partial lifts must stay locked_down for retry.
+        ...(restored ? { new_status: "active" as const } : {}),
+        restored_rule_ids: observation.restored_rule_ids,
+        removed_rule_ids: observation.removed_rule_ids,
+        reload_confirmed: restored,
+      };
+    } catch (err) {
+      if (err instanceof AgentEgressStopError) {
+        throw new HubCapabilityError(err.reasonCode);
+      }
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new HubCapabilityError("lockdown_lift_no_snapshot");
       }
       throw err;
     }

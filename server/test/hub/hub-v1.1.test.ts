@@ -493,13 +493,14 @@ describe("Hub API constants", () => {
     expect(DEFAULT_POLICY.tier1_always_approve).toContain("policy_change");
   });
 
-  it("exposes exactly five agent-control actions", () => {
+  it("exposes exactly six agent-control actions", () => {
     expect([...HUB_AGENT_CONTROL_ACTIONS]).toEqual([
       "pause",
       "resume",
       "restart",
       "unwrap",
       "lockdown",
+      "lockdown_lift",
     ]);
   });
 });
@@ -1959,4 +1960,134 @@ describe("slice 6a composed agent capabilities", () => {
     } finally { await rig.stop(); }
   });
 
+});
+
+// Per-agent network restoration requires operator approval and live reload evidence. IC-11.
+import { HubCapabilityError } from "../../src/hub/errors.js";
+import type { HubAgentLockdownLiftControllerResult } from "../../src/hub/types.js";
+interface StubAgentController {
+  liftLockdown(agentId: string): Promise<HubAgentLockdownLiftControllerResult>;
+}
+StubAgentController.prototype.liftLockdown = async function (agentId) {
+  this.calls.push({ action: "lockdown_lift", agentId });
+  return { outcome: "restored", new_status: "active", restored_rule_ids: ["allow-inference"], removed_rule_ids: [], reload_confirmed: true };
+};
+
+describe("operator-approved per-agent network restoration IC-11", () => {
+  let rig: TestRig;
+  beforeEach(async () => {
+    rig = await startRig();
+    rig.registry.updateStatus("agent-alpha", "locked_down", "operator_lockdown");
+  });
+  afterEach(async () => rig.stop());
+
+  async function enqueueLift() {
+    const response = await fetch(`${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/lockdown_lift`, {
+      method: "POST", headers: withAuth({}, rig.authToken),
+    });
+    expect(response.status).toBe(202); // Existing control route accepts asynchronous Tier 1 work.
+    const body = await response.json() as { data: { inbox_item_id: string; operation_category: string } };
+    expect(body.data.operation_category).toBe("lockdown_lift");
+    expect(rig.controller.calls).toEqual([]);
+    return body.data.inbox_item_id;
+  }
+
+  async function liftActivity() {
+    await rig.auditLog.flush();
+    const response = await fetch(`${rig.url}${HUB_API_PREFIX}/activity?category=lifecycle`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    const body = await response.json() as { data: { entries: Array<{ category: string; display_template_id: string }> } };
+    return body.data.entries.filter(entry => entry.display_template_id.includes("agent_lockdown_lift"));
+  }
+
+  it("the existing HTTP route waits for approval, restores active, clears the reason and emits lifecycle activity once", async () => {
+    const itemId = await enqueueLift();
+    const response = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox/${encodeURIComponent(itemId)}/approve`, {
+      method: "POST", headers: withAuth({}, rig.authToken),
+    });
+    expect(response.status).toBe(200); // Approved inbox resolution succeeds through the served route.
+    expect(rig.controller.calls).toEqual([{ action: "lockdown_lift", agentId: "agent-alpha" }]);
+    expect(rig.registry.get("agent-alpha")!.status).toBe("active");
+    expect(rig.registry.get("agent-alpha")).not.toHaveProperty("status_reason_class");
+    expect(await liftActivity()).toMatchObject([{ category: "lifecycle", display_template_id: "activity.lifecycle.agent_lockdown_lifted" }]);
+    expect(rig.service.listInbox().find(item => item.item_id === itemId)).toMatchObject({ resolution_payload: {
+      outcome: "restored", reload_confirmed: true, restored_rule_ids: ["allow-inference"], removed_rule_ids: [],
+    } });
+    await expect(rig.service.resolveInboxItem(itemId, "approve")).rejects.toThrow();
+    expect(rig.controller.calls).toHaveLength(1); // One approved item permits one actuator call.
+  });
+
+  it("denial calls no controller and emits no lift activity", async () => {
+    const itemId = await enqueueLift();
+    await rig.service.resolveInboxItem(itemId, "deny");
+    expect(rig.controller.calls).toEqual([]);
+    expect(await liftActivity()).toEqual([]);
+    expect(rig.registry.get("agent-alpha")!.status).toBe("locked_down");
+  });
+
+  it.each(["partial", "restored"] as const)("an unconfirmed %s result stays locked and emits partial, allowing a retry", async (outcome) => {
+    rig.controller.liftLockdown = async agentId => {
+      rig.controller.calls.push({ action: "lockdown_lift", agentId });
+      return { outcome, new_status: "active", restored_rule_ids: ["allow-inference"], removed_rule_ids: [], reload_confirmed: false };
+    };
+    const itemId = await enqueueLift();
+    const resolved = await rig.service.resolveInboxItem(itemId, "approve");
+    expect(resolved).toMatchObject({ resolution_payload: { outcome: "partial", reload_confirmed: false } });
+    expect(rig.registry.get("agent-alpha")).toMatchObject({ status: "locked_down", status_reason_class: "operator_lockdown" });
+    expect(await liftActivity()).toMatchObject([{ display_template_id: "activity.lifecycle.agent_lockdown_lift_partial" }]);
+    expect(await rig.service.controlAgent("agent-alpha", "lockdown_lift")).toMatchObject({ status: "approval_pending" });
+  });
+
+  it("a controller refusal is audited and rethrown without a registry transition", async () => {
+    rig.controller.liftLockdown = async () => { throw new HubCapabilityError("lockdown_lift_no_snapshot"); };
+    const itemId = await enqueueLift();
+    await expect(rig.service.resolveInboxItem(itemId, "approve")).rejects.toMatchObject({ reasonCode: "lockdown_lift_no_snapshot" });
+    expect(rig.registry.get("agent-alpha")!.status).toBe("locked_down");
+    expect(await liftActivity()).toMatchObject([{ display_template_id: "activity.lifecycle.agent_lockdown_lift_refused" }]);
+  });
+
+  it("unexpected actuator errors propagate without claiming restoration", async () => {
+    rig.controller.liftLockdown = async () => { throw new Error("actuator unavailable"); };
+    const itemId = await enqueueLift();
+    await expect(rig.service.resolveInboxItem(itemId, "approve")).rejects.toThrow("actuator unavailable");
+    expect(rig.registry.get("agent-alpha")!.status).toBe("locked_down");
+    expect(await liftActivity()).toEqual([]);
+  });
+
+  it("approval rechecks a changed status before calling the actuator", async () => {
+    const itemId = await enqueueLift();
+    rig.registry.updateStatus("agent-alpha", "active");
+    await expect(rig.service.resolveInboxItem(itemId, "approve")).rejects.toMatchObject({ reasonCode: "agent_control_lockdown_lift_unsupported_not_locked_down" });
+    expect(rig.controller.calls).toEqual([]);
+    expect(await liftActivity()).toMatchObject([{ display_template_id: "activity.lifecycle.agent_lockdown_lift_refused" }]);
+  });
+
+  it("non-locked agents refuse before queueing, and served records render lift disabled or enabled by state", async () => {
+    await rig.stop();
+    rig = await startRig({ productionController: true });
+    const script = getClientScript();
+    const controls = script.slice(script.indexOf("const AGENT_CONTROL_LABELS ="), script.indexOf("// Wave 1: the fortress-column"));
+    for (const status of ["active", "locked_down"] as const) {
+      rig.registry.updateStatus("agent-alpha", status);
+      for (const path of ["/agents", "/agents/agent-alpha"]) {
+        const response = await fetch(rig.url + HUB_API_PREFIX + path, { headers: withAuth({}, rig.authToken) });
+        const body = await response.json() as { data: { agents?: LocalAgentRecord[]; agent?: LocalAgentRecord } };
+        const record = body.data.agent ?? body.data.agents![0]!;
+        expect(record.capabilities.can_lockdown).toBe(true);
+        expect(record.capabilities).not.toHaveProperty("can_lockdown_lift");
+        const html = runInNewContext(controls + '\nrenderAgentControlButtons(record, true)', { record, escHtml: String }) as string;
+        const button = html.match(/<button[^>]*data-action="agent-lockdown_lift"[^>]*>[^<]*<\/button>/)?.[0];
+        expect(button).toContain("Restore network access");
+        expect(button!.includes(" disabled")).toBe(status !== "locked_down");
+      }
+      const response = await fetch(`${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/lockdown_lift`, { method: "POST", headers: withAuth({}, rig.authToken) });
+      if (status === "active") {
+        expect(response.status).toBe(422); // Capability refusal, not an approval item.
+        expect(rig.service.listInbox()).toEqual([]);
+      } else {
+        expect(response.status).toBe(202); // A locked agent can queue a lift.
+      }
+    }
+  });
 });
