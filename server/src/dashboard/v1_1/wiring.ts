@@ -127,6 +127,8 @@ export interface BuildV11BindingsInputs {
    * uses the real stop actuator constructed by `CastleWallAgentController`.
    */
   stopAgentEgress?: CastleWallAgentControllerDeps["stopAgentEgress"];
+  /** Test seam for network restoration; production uses the real lift actuator. */
+  liftAgentEgressStop?: CastleWallAgentControllerDeps["liftAgentEgressStop"];
   /**
    * Optional Intelligence Substrate Selector. When present, the dashboard
    * dispatch layer mounts `/api/hub/intelligence/*` against this selector
@@ -737,6 +739,9 @@ export function buildV11Bindings(
       getAgentRecord: (agentId) => registry.get(agentId),
       ...(inputs.stopAgentEgress
         ? { stopAgentEgress: inputs.stopAgentEgress }
+        : {}),
+      ...(inputs.liftAgentEgressStop
+        ? { liftAgentEgressStop: inputs.liftAgentEgressStop }
         : {}),
     }),
     ...(inputs.storage && inputs.masterKey

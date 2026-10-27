@@ -223,3 +223,89 @@ describe("CastleWallAgentController", () => {
     expect(matches).toEqual([]);
   });
 });
+
+// Per-agent restoration uses the shipped controller and preserves honest reload status. IC-11.
+import { vi } from "vitest";
+import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
+import type { LiftAgentEgressStopInput } from "../../../src/castle-wall/provision/agent-stop.js";
+
+describe("per-agent lockdown lift controller IC-11", () => {
+  function controllerFor(record: LocalAgentRecord, storagePath: string, lift?: typeof import("../../../src/castle-wall/provision/agent-stop.js").liftAgentEgressStop) {
+    return new CastleWallAgentController({
+      storagePath, fortressPath: storagePath, fortressId: record.identity_id,
+      auditLog: makeAuditLog(), now: () => new Date("2026-10-26T00:00:00.000Z"),
+      getAgentRecord: id => id === record.agent_id ? record : null,
+      liftAgentEgressStop: lift,
+    });
+  }
+
+  it("only locked agents with explicit permission support lifting, and every other status refuses before the actuator", async () => {
+    const record = makeRecord();
+    const lift = vi.fn();
+    const controller = controllerFor(record, "/unused-fixture", lift);
+    for (const status of HUB_AGENT_STATUSES) {
+      record.status = status;
+      expect(controller.supports("lockdown_lift", record.agent_id)).toBe(status === "locked_down");
+      if (status !== "locked_down") {
+        await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({ reasonCode: "agent_control_lockdown_lift_unsupported_not_locked_down" });
+      }
+    }
+    record.status = "locked_down";
+    record.capabilities.can_lockdown = false;
+    expect(controller.supports("lockdown_lift", record.agent_id)).toBe(false);
+    await expect(controller.liftLockdown(record.agent_id)).rejects.toBeInstanceOf(HubCapabilityError);
+    expect(controller.supports("lockdown_lift", "missing-agent")).toBe(false);
+    await expect(controller.liftLockdown("missing-agent")).rejects.toMatchObject({ statusCode: 404 }); // Unknown agent cannot consume a snapshot.
+    expect(lift).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("production wiring reaches the lift actuator after approval with reload confirmed=%s", async reloadConfirmed => {
+    await withTmpFortress(async storagePath => {
+      const fortressId = fortressIdFromStoragePath(storagePath);
+      const record = makeRecord({ status: "locked_down", status_reason_class: "operator_lockdown" });
+      writePersistedLocalAgents(storagePath, [record]);
+      const lift = vi.fn(async (_input: LiftAgentEgressStopInput) => ({
+        restored_rule_ids: ["allow-inference"], removed_rule_ids: ["temporary-rule"],
+        reload_confirmed: reloadConfirmed, snapshot_path: join(storagePath, "private-snapshot.json"),
+      }));
+      const auditLog = makeAuditLog();
+      const { hubService } = buildV11Bindings({
+        identityId: record.identity_id, fortressId, storagePath, auditLog,
+        liftAgentEgressStop: lift,
+      });
+      const enqueued = await hubService.controlAgent(record.agent_id, "lockdown_lift");
+      expect("inbox_item_id" in enqueued).toBe(true);
+      expect(lift).not.toHaveBeenCalled();
+      const resolved = await hubService.resolveInboxItem("inbox_item_id" in enqueued ? enqueued.inbox_item_id : "", "approve");
+      expect(lift).toHaveBeenCalledTimes(1); // One approved request reaches one real controller invocation.
+      expect(lift).toHaveBeenCalledWith({ agentId: record.agent_id, fortressPath: storagePath, storagePath });
+      expect(resolved).toMatchObject({ resolution_payload: {
+        outcome: reloadConfirmed ? "restored" : "partial", reload_confirmed: reloadConfirmed,
+        restored_rule_ids: ["allow-inference"], removed_rule_ids: ["temporary-rule"],
+      } });
+      expect(JSON.stringify(resolved)).not.toContain(storagePath);
+      expect(hubService.getAgent(record.agent_id).status).toBe(reloadConfirmed ? "active" : "locked_down");
+      if (reloadConfirmed) expect(hubService.getAgent(record.agent_id)).not.toHaveProperty("status_reason_class");
+      else expect(await hubService.controlAgent(record.agent_id, "lockdown_lift")).toMatchObject({ status: "approval_pending" });
+      await auditLog.flush();
+    });
+  });
+
+  it("the real lift actuator refuses a missing snapshot in temporary storage", async () => {
+    await withTmpFortress(async storagePath => {
+      const record = makeRecord({ status: "locked_down" });
+      const controller = controllerFor(record, storagePath);
+      await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({ reasonCode: "lockdown_lift_no_snapshot" });
+      expect(record.status).toBe("locked_down");
+    });
+  });
+
+  it("maps restoration refusals and propagates unexpected actuator failures", async () => {
+    const record = makeRecord({ status: "locked_down" });
+    const refused = controllerFor(record, "/unused-fixture", async () => { throw new AgentEgressStopError("stop_residual_allow_rules"); });
+    await expect(refused.liftLockdown(record.agent_id)).rejects.toMatchObject({ reasonCode: "stop_residual_allow_rules" });
+    const fault = new Error("actuator fault");
+    const failed = controllerFor(record, "/unused-fixture", async () => { throw fault; });
+    await expect(failed.liftLockdown(record.agent_id)).rejects.toBe(fault);
+  });
+});

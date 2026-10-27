@@ -1,4 +1,5 @@
 {
+  "_comment": "tier1_always_approve must match DEFAULT_POLICY in src/principal-policy/loader.ts and the control subset HUB_TIER_1_AGENT_CONTROL_ACTIONS in src/hub/constants.ts.",
   "tier1_always_approve": [
     "audit_export_siem",
     "bootstrap_provide_guarantee",
@@ -17,6 +18,7 @@
     "identity_rotate",
     "identity_sign",
     "lockdown",
+    "lockdown_lift",
     "memory_archive_export",
     "memory_archive_import",
     "memory_checkpoint_restore",

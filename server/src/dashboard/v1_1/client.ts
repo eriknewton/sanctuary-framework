@@ -959,6 +959,8 @@ const TEMPLATES = {
   // Each approval_pending entry must match its server sentence in templates.ts, including the target-neutral
   // wording it renders when its target is absent, so no card reads "(unknown)" or "(no agent)".
   "approval_pending.tier1.lockdown": (a) => "Cut " + (hasArgValue(a,"agent_id") ? "agent " + arg(a,"agent_id") + "'s" : "an agent's") + " network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.",
+  // Must match approval_pending.tier1.lockdown_lift in templates.ts.
+  "approval_pending.tier1.lockdown_lift": (a) => "Restore " + (hasArgValue(a,"agent_id") ? "agent " + arg(a,"agent_id") + "'s" : "an agent's") + " network access. Castle Wall puts back the allow rules it removed at lockdown; the agent reaches off-machine destinations again once the reload is confirmed.",
   "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   // Must match "approval_pending.tier1.fortress_exit_bundle_export" in templates.ts.
   "approval_pending.tier1.fortress_exit_bundle_export": () => "Export the entire fortress as a portable exit bundle.",
@@ -1014,6 +1016,10 @@ const TEMPLATES = {
   "activity.lifecycle.agent_lockdown_engaged": (a) => "Network access revoked for agent " + arg(a,"agent_id") + ".",
   "activity.lifecycle.agent_lockdown_partial": (a) => "Network access was revoked on disk for agent " + arg(a,"agent_id") + ", but the live Castle Wall reload was not confirmed.",
   "activity.lifecycle.agent_lockdown_refused": (a) => "Network stop refused for agent " + arg(a,"agent_id") + ".",
+  // These lift templates must match the activity.lifecycle.agent_lockdown_lift* entries in templates.ts.
+  "activity.lifecycle.agent_lockdown_lifted": (a) => "Network access restored for agent " + arg(a,"agent_id") + ".",
+  "activity.lifecycle.agent_lockdown_lift_partial": (a) => "Network access rules were restored on disk for agent " + arg(a,"agent_id") + ", but the live Castle Wall reload was not confirmed.",
+  "activity.lifecycle.agent_lockdown_lift_refused": (a) => "Network restore refused for agent " + arg(a,"agent_id") + ".",
   "activity.lifecycle.fortress_lockdown_engaged": () => "Fortress lockdown engaged for all confined agents.",
   "activity.lifecycle.fortress_lockdown_partial": () => "Fortress lockdown partially engaged; at least one confined agent could not be locked.",
   "activity.lifecycle.fortress_lockdown_failed": () => "Fortress lockdown failed; no confined agent was locked.",
@@ -3692,6 +3698,7 @@ const AGENT_CONTROL_LABELS = {
   restart: "Restart",
   // Must match TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts; both renderers use this map.
   lockdown: "Lock down",
+  lockdown_lift: "Restore network access",
   // Must match TIER1_BUTTON_COPY.unwrap.idle in status-mapping.ts; both renderers use this map.
   unwrap: "Remove protection",
   edit_policy: "Edit policy",
@@ -3705,6 +3712,7 @@ function agentControlLabel(action) {
 function renderAgentControlButtons(a, scoped) {
   // Must match projectAgentCapabilities in hub/hub-service.ts: a flag includes stored permission AND controller support.
   const c = a.capabilities || {};
+  // Must match HUB_AGENT_CONTROL_ACTIONS in hub/constants.ts.
   const menuItems = [
     { action: "pause", enabled: !!c.can_pause },
     { action: "resume", enabled: !!c.can_resume },
@@ -3713,6 +3721,7 @@ function renderAgentControlButtons(a, scoped) {
     // operator's word for the frozen "unwrap" action id, which stays
     // the wire name in data-action only.
     { action: "lockdown", enabled: !!c.can_lockdown, tier1: true },
+    { action: "lockdown_lift", enabled: !!c.can_lockdown && a.status === "locked_down", tier1: true },
     { action: "unwrap", enabled: !!c.can_unwrap, tier1: true }
   ];
   const disabledTipByAction = {
@@ -3725,7 +3734,7 @@ function renderAgentControlButtons(a, scoped) {
   return menuItems.map(function (mi) {
     const tip = mi.enabled
       ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
-      : disabledTipByAction[mi.action];
+      : (disabledTipByAction[mi.action] || "");
     return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(agentControlLabel(mi.action) + (scoped && mi.action === "lockdown" ? " this agent" : "")) + '</button>';
   }).join("");
 }
@@ -3796,6 +3805,7 @@ function renderRecognitionHealthCard() {
 const NON_PROMOTABLE_OPERATIONS = {
   policy_change: true,
   lockdown: true,
+  lockdown_lift: true,
   unwrap: true,
   // "other" is the category enum's catch-all, never an operation name, so
   // promoting it would compile the standing rule "auto-allow other" against

@@ -126,6 +126,8 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     | "exit_bundle_rekey"
     | "policy_change"
     | "lockdown"
+    // Must match HUB_TIER_1_AGENT_CONTROL_ACTIONS in hub/constants.ts and DEFAULT_POLICY in principal-policy/loader.ts.
+    | "lockdown_lift"
     | "unwrap"
     | "other";
   /** ISO8601 deadline after which the request will be auto-denied if applicable. */
@@ -155,12 +157,15 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
      * `HubFortressExportResult.warnings` in `hub/types.ts`.
      */
     warnings?: string[];
-    outcome?: "engaged" | "partial" | "failed" | "no_agents";
+    outcome?: "engaged" | "partial" | "failed" | "no_agents" | "restored";
     locked_count?: number;
     failed_count?: number;
     reason_code?: string;
     agent_uid?: number;
     revoked_rule_ids?: string[];
+    // Must match HubAgentLockdownLiftControllerResult in hub/types.ts; snapshot paths are never included.
+    restored_rule_ids?: string[];
+    removed_rule_ids?: string[];
     residual_allow_count?: number;
     reload_confirmed?: boolean;
   };

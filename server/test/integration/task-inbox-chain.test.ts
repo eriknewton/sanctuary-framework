@@ -1,4 +1,4 @@
-// fail-before-exempt: Slice 6a declares false support for a task-inbox fixture that exercises no agent controls.
+// fail-before-exempt: IC-11 adds only the required refusing lift fixture method; this task-inbox suite does not exercise per-agent restoration.
 import { describe, expect, it } from "vitest";
 
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -34,7 +34,7 @@ const controller: HubAgentController = {
   async lockdown() {
     return "locked_down";
   },
-  async bindPolicy() {},
+  async liftLockdown() { throw new Error("network restoration is outside this fixture"); }, async bindPolicy() {},
   async bindChannelTemplate() {},
 };
 

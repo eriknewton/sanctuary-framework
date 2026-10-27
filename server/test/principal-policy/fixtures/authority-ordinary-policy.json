@@ -22,6 +22,7 @@
       "exit_bundle_rekey",
       "policy_change",
       "lockdown",
+      "lockdown_lift",
       "unwrap",
       "principal_policy_view",
       "principal_baseline_view",

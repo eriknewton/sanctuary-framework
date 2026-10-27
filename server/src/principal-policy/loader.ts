@@ -613,7 +613,10 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // endpoint that surfaces it. Drift between the contract enum and this
     // list is a release blocker per the contract comment.
     "policy_change", // Operator-driven policy bind on a wrapped agent.
+    // Control operations must match HUB_TIER_1_AGENT_CONTROL_ACTIONS in hub/constants.ts
+    // and tier1_always_approve in test/fixtures/operation-policy-golden.json.
     "lockdown", // Operator-driven hard-stop of a wrapped agent.
+    "lockdown_lift", // Operator-approved restoration of a locked-down agent's network access.
     "unwrap", // Operator-driven removal of the Sanctuary wrap from an agent.
     "principal_policy_view", // Reads Principal Policy; always requires approval.
     "principal_baseline_view", // Reads Principal Policy baseline; always requires approval.

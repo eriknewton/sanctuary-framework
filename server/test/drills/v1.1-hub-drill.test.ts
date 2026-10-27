@@ -1,4 +1,4 @@
-// fail-before-exempt: Slice 6a declares support only for pause, resume and lockdown already exercised by this drill.
+// fail-before-exempt: IC-11 adds only the required refusing lift fixture method; this drill does not exercise per-agent restoration.
 /**
  * Sanctuary v1.1 Acceptance Drill - Pillar 2: Operator Hub.
  *
@@ -430,3 +430,7 @@ describe("v1.1 acceptance drill - Pillar 2: operator hub end-to-end", () => {
     expect(rig.registry.get("agent-drill-alpha")!.status).toBe("active");
   });
 });
+
+// This fixture has no network restoration actuator.
+interface StubAgentController { liftLockdown(agentId: string): Promise<never>; }
+StubAgentController.prototype.liftLockdown = async () => { throw new Error("network restoration is outside this fixture"); };

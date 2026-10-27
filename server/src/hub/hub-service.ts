@@ -540,6 +540,11 @@ export class HubService {
     // Must match renderAgentControlButtons in dashboard/v1_1/client.ts: permission AND executor support, never stored intent alone.
     // Continuing paths: stored false stays false; only explicit support returns true; missing or failed probes disable the control.
     for (const action of HUB_AGENT_CONTROL_ACTIONS) {
+      // lockdown_lift has no stored flag of its own: the console derives it from can_lockdown AND
+      // status === "locked_down" (renderAgentControlButtons in client.ts), and the controller re-checks
+      // the status at enqueue and at approval. Folding the lift probe into can_lockdown here would make
+      // the stop flag depend on the iteration order of HUB_AGENT_CONTROL_ACTIONS, so the lift is skipped.
+      if (action === "lockdown_lift") continue;
       const key = `can_${action}` as keyof Pick<LocalAgentRecord["capabilities"], "can_pause" | "can_resume" | "can_restart" | "can_unwrap" | "can_lockdown">;
       let supported = false;
       try { supported = await this.deps.agentController.supports?.(action, record.agent_id) === true; }
@@ -631,6 +636,7 @@ export class HubService {
       restart: c.can_restart,
       unwrap: c.can_unwrap,
       lockdown: c.can_lockdown,
+      lockdown_lift: c.can_lockdown,
     };
     // Must match projectAgentCapabilities in hub-service.ts: malformed stored flags never grant permission.
     if (supports[action] !== true) throw new HubCapabilityError(action);
@@ -639,13 +645,15 @@ export class HubService {
     let executorSupports = false;
     try { executorSupports = (await this.deps.agentController.supports?.(action, record.agent_id)) === true; }
     catch { /* A failed support probe is not evidence that a control can run. */ }
-    if (!executorSupports) {
+    // A lift may only leave locked_down; stored permission alone cannot authorize another state's transition.
+    if (!executorSupports || (action === "lockdown_lift" && record.status !== "locked_down")) {
       const reasonByAction: Record<HubAgentControlAction, string> = {
         pause: "agent_control_pause_unsupported_no_process_handle",
         resume: "agent_control_resume_unsupported_no_process_handle",
         restart: "agent_control_restart_unsupported_no_process_handle",
         unwrap: "agent_control_unwrap_unsupported_operator_decision_pending",
         lockdown: "agent_control_lockdown_unsupported_no_confinement",
+        lockdown_lift: "agent_control_lockdown_lift_unsupported_not_locked_down",
       };
       throw new HubCapabilityError(reasonByAction[action]);
     }
@@ -703,6 +711,55 @@ export class HubService {
             },
           );
           return;
+        }
+        case "lockdown_lift": {
+          let result: Awaited<ReturnType<typeof this.deps.agentController.liftLockdown>>;
+          try {
+            // Revalidate after the approval wait so a stale card cannot restore an agent in another state.
+            await this.assertCapability(this.getAgent(record.agent_id), action);
+            // The lift acts on the record this handler just re-authorized, never on an id read off the
+            // approved card: the registry write and the audit rows below name record.agent_id, and a
+            // card naming another agent must not restore that agent's egress under this one's approval.
+            result = await this.deps.agentController.liftLockdown(record.agent_id);
+          } catch (err) {
+            if (err instanceof HubCapabilityError) {
+              void this.deps.activitySources.auditLog.append(
+                "l2",
+                "agent_lockdown_lift_refused",
+                this.deps.identityId,
+                {
+                  agent_id: record.agent_id,
+                  identity_id: record.identity_id,
+                  operator_audit_id: itemId,
+                  reason_code: err.reasonCode,
+                },
+              );
+            }
+            throw err;
+          }
+          const restored = result.outcome === "restored" && result.reload_confirmed === true;
+          // On-disk rules are not live enforcement evidence; an unconfirmed lift stays locked_down for retry.
+          if (restored) this.deps.agentRegistry.updateStatus(record.agent_id, "active");
+          // Allowlist response metadata so actuator paths can never cross the API boundary.
+          const payload = {
+            outcome: restored ? "restored" as const : "partial" as const,
+            restored_rule_ids: result.restored_rule_ids,
+            removed_rule_ids: result.removed_rule_ids,
+            reload_confirmed: result.reload_confirmed === true,
+            ...(result.reason_code ? { reason_code: result.reason_code } : {}),
+          };
+          void this.deps.activitySources.auditLog.append(
+            "l2",
+            restored ? "agent_lockdown_lifted" : "agent_lockdown_lift_partial",
+            this.deps.identityId,
+            {
+              agent_id: record.agent_id,
+              identity_id: record.identity_id,
+              operator_audit_id: itemId,
+              ...payload,
+            },
+          );
+          return { resolution_payload: payload };
         }
         case "lockdown": {
           let result: Awaited<ReturnType<typeof this.deps.agentController.lockdown>>;

@@ -96,17 +96,19 @@ export type HubInboxAction = (typeof HUB_INBOX_ACTIONS)[number];
  * `pause` / `resume` / `restart` are control-plane operations that the
  * underlying harness may execute immediately; they are not Tier 1.
  *
- * `unwrap` and `lockdown` are Tier 1 operations per the Principal Policy
+ * `unwrap`, `lockdown`, and `lockdown_lift` are Tier 1 operations per the Principal Policy
  * loader. Hub endpoints for these MUST enqueue an `approval_pending` inbox
  * item rather than execute directly. Tier 1 approval gates remain in force
  * from the dashboard. The dashboard never auto-approves Tier 1 work.
  */
+// Must match the control menu in dashboard/v1_1/client.ts.
 export const HUB_AGENT_CONTROL_ACTIONS = [
   "pause",
   "resume",
   "restart",
   "unwrap",
   "lockdown",
+  "lockdown_lift",
 ] as const;
 export type HubAgentControlAction =
   (typeof HUB_AGENT_CONTROL_ACTIONS)[number];
@@ -119,9 +121,13 @@ export type HubAgentControlAction =
  * Mirrors the names enrolled in `principal-policy/loader.ts`
  * `tier1_always_approve`. Drift between the two lists is a release blocker.
  */
+// Must match DEFAULT_POLICY.tier1_always_approve in principal-policy/loader.ts
+// and test/fixtures/operation-policy-golden.json for these control operations.
+// These categories must also match HubApprovalPendingItem in contracts/v1.1/hub-events.ts.
 export const HUB_TIER_1_AGENT_CONTROL_ACTIONS = [
   "unwrap",
   "lockdown",
+  "lockdown_lift",
 ] as const;
 export type HubTier1AgentControlAction =
   (typeof HUB_TIER_1_AGENT_CONTROL_ACTIONS)[number];

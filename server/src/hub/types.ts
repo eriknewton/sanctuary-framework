@@ -85,6 +85,19 @@ export interface HubAgentLockdownControllerResult {
 }
 
 /**
+ * Dashboard-safe lift evidence; snapshot paths stay inside Castle Wall.
+ * Payload fields must match HubApprovalPendingItem.resolution_payload in contracts/v1.1/hub-events.ts.
+ */
+export interface HubAgentLockdownLiftControllerResult {
+  outcome: "restored" | "partial";
+  new_status?: "active";
+  restored_rule_ids: string[];
+  removed_rule_ids: string[];
+  reload_confirmed: boolean;
+  reason_code?: string;
+}
+
+/**
  * Result returned from a fortress-scope Tier-1 action that has been
  * deferred to operator approval. Distinguished from the per-agent shape by
  * the absence of `agent_id` and the presence of `fortress_scope: true`.
@@ -155,6 +168,8 @@ export interface HubAgentController {
   lockdown(
     agentId: string,
   ): Promise<HubAgentStatus | HubAgentLockdownControllerResult>;
+  /** Restore per-agent network access after Tier 1 approval; only confirmed reloads restore status. */
+  liftLockdown(agentId: string): Promise<HubAgentLockdownLiftControllerResult>;
   /**
    * Apply an operator-approved policy bind. Called only after a Tier 1
    * approval lands.
