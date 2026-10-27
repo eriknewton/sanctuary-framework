@@ -81,8 +81,8 @@ function projection<T extends HubInboxItemHeader>(items: T[], cap: number, compl
  * Read current memory only. No polling, I/O, or retained adapter history.
  * Registry projections inspect one capped agent-id page and sort eligible cards
  * newest first within that page; timestamps never gate presence and the registry owns listing cost.
- * A full page means the read may be incomplete: the emission is still served, but the present set
- * is reported as unknown so the store clears nothing until a complete read.
+ * A full page gets one successor probe: if another matching record exists, the emission is still
+ * served but the present set is unknown so the store clears nothing until a complete read.
  * Dismiss hides this incident while its condition holds; a condition that stops holding and holds again is a new incident.
  */
 export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources {
@@ -118,7 +118,17 @@ export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources
       limit: HUB_INBOX_REGISTRY_SCAN_CAP,
     });
     // A page shorter than the cap is the whole matching registry; a full page may have more behind it.
-    const complete = page.length < HUB_INBOX_REGISTRY_SCAN_CAP;
+    let complete = page.length < HUB_INBOX_REGISTRY_SCAN_CAP;
+    if (page.length === HUB_INBOX_REGISTRY_SCAN_CAP) {
+      // One successor suffices to prove truncation: only a full page adds one read per source call.
+      // Must match InMemoryLocalAgentRegistry.list in agent-registry.ts: cursor starts AFTER the matched id.
+      complete = deps.agentRegistry.list({
+        identity_id: deps.identityId,
+        ...(statuses ? { statuses } : {}),
+        cursor: page[page.length - 1]!.agent_id,
+        limit: 1, // Only existence of a successor matters; it is never projected.
+      }).length === 0;
+    }
     // Bound the adapter even if a replacement source accidentally ignores limit.
     const records = page.slice(0, HUB_INBOX_REGISTRY_SCAN_CAP).filter((record) =>
       record.identity_id === deps.identityId && identifier(record.agent_id));
