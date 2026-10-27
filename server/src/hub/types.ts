@@ -197,6 +197,13 @@ export interface HubAgentController {
  */
 export interface HubInboxSources {
   /**
+   * Ids of every condition that holds now, before any emission cap. The
+   * aggregator clears a stored card only when its id is absent from this set;
+   * a source without this method is reconciled against its emitted ids.
+   * Must match reconcile() in inbox-aggregator.ts and the projections in inbox-sources.ts.
+   */
+  listPresentSourceIds?(kind: HubInboxItem["kind"]): ReadonlySet<string>;
+  /**
    * Currently unresolved Tier 1 / Tier 2 approval requests. Items already
    * in the hub-side inbox store are deduplicated by `item_id` against these.
    */
@@ -224,7 +231,7 @@ export interface HubInboxSources {
    */
   listActiveRecoveryPrompts: () => HubRecoveryPromptItem[];
   /**
-   * Recent agent-error events.
+   * Current agent-error conditions, ordered by activity time without ageing out.
    */
   listRecentAgentErrors: () => HubAgentErrorItem[];
 }

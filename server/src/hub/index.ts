@@ -19,6 +19,7 @@ export {
   type Tier1HandlerResult,
   type Tier1ResolutionHandler,
 } from "./inbox-store.js";
+export * from "./inbox-sources.js";
 export { aggregateInbox } from "./inbox-aggregator.js";
 export {
   CHARTER_APPROVAL_ITEM_ID_PREFIX,

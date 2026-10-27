@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -127,4 +127,41 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
       }
     }
   });
+  /** Local producer observations reach the dashboard inbox. IC-12. */
+  it("serves registry observations through the production inbox graph", async () => {
+    const { writePersistedLocalAgents } = await import("../../../src/hub/agent-registry-persistence.js");
+    const timestamp = "2026-10-26T12:00:00.000Z";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(timestamp);
+    try {
+      const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-inbox-wire-"));
+      tempDirs.push(storagePath);
+      const identityId = "operator-inbox-wire";
+      const fortressId = fortressIdFromStoragePath(storagePath);
+      const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+      const record: import("../../../src/contracts/v1.1/local-agent-records.js").LocalAgentRecord = {
+        version: "1.1", agent_id: "agent-wire", identity_id: identityId, harness: "other",
+        model_provider: { vendor: "local", model_id: "test", runs_locally: true },
+        policy_id: "test", status: "error", status_reason_class: "harness_error",
+        budget_summary: { last_refreshed_at: timestamp, daily: { unit: "tokens", cap: 1, used: 1 } },
+        wrapped_at: timestamp, last_activity_at: timestamp,
+        capabilities: { can_pause: false, can_resume: false, can_restart: false, can_unwrap: false,
+          can_lockdown: false, can_chat: false, can_change_template: false },
+      };
+      writePersistedLocalAgents(storagePath, [record]);
+      const { hubService } = buildV11Bindings({ identityId, fortressId, auditLog, storagePath });
+      const items = hubService.listInbox();
+      expect(items.map((item) => item.kind)).toEqual(["budget_warning", "agent_error"]);
+      for (const item of items) {
+        expect(item.identity_id).toBe(identityId);
+        await hubService.resolveInboxItem(item.item_id, "dismiss");
+      }
+      expect(hubService.listInbox()).toEqual(items.map((item) => ({ ...item,
+        resolved: true, resolved_at: timestamp })));
+      await auditLog.flush();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
 });

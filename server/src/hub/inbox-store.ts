@@ -19,6 +19,7 @@ import type {
   HubInboxItem,
 } from "../contracts/v1.1/hub-events.js";
 import { HubConflictError, HubNotFoundError, HubValidationError } from "./errors.js";
+import { HUB_INBOX_SOURCE_RECONCILE_PREFIXES, hubInboxSourceIdPrefix } from "./inbox-sources.js";
 // Must match `CHARTER_APPROVAL_ITEM_ID_PREFIX` in
 // `server/src/hub/charter-approval-bridge.ts`, which mints the projected ids
 // this store must never hold; `HubService.resolveInboxItem` routes on the same
@@ -69,6 +70,7 @@ interface StoredEntry {
   item: HubInboxItem;
   resolved: boolean;
   resolved_at?: string;
+  cleared?: boolean;
   /** Set when the entry is a hub-enqueued Tier 1 control action. */
   tier1Handler?: Tier1ResolutionHandler;
 }
@@ -78,13 +80,14 @@ export class HubInboxStore {
 
   /**
    * Record a fresh inbox item the aggregator pulled from a source. If the
-   * item already exists, the resolution state is preserved; the underlying
-   * shape is refreshed.
+   * item is continuously present, preserve resolution; a cleared condition
+   * that reappears starts a fresh unresolved incident.
    */
   upsertFromSource(item: HubInboxItem): void {
     assertNotReservedItemId(item.item_id);
     const prior = this.entries.get(item.item_id);
-    if (prior) {
+    // Dismiss hides this incident while its condition holds; a condition that stops holding and holds again is a new incident.
+    if (prior && !prior.cleared) {
       prior.item = {
         ...item,
         resolved: prior.resolved,
@@ -92,10 +95,34 @@ export class HubInboxStore {
       };
       return;
     }
+    const freshItem = { ...item, resolved: false };
+    delete freshItem.resolved_at;
     this.entries.set(item.item_id, {
-      item: { ...item, resolved: false },
+      item: freshItem,
       resolved: false,
+      cleared: false,
     });
+  }
+
+  /** Resolve absent source conditions and allow their next emission to open fresh. */
+  reconcileSourceItems(prefix: string, liveIds: ReadonlySet<string>, nowIso: string): number {
+    // Must match HUB_INBOX_SOURCE_RECONCILE_PREFIXES in inbox-sources.ts: other namespaces retain their owners.
+    if (!HUB_INBOX_SOURCE_RECONCILE_PREFIXES.has(prefix)) {
+      throw new HubValidationError("inbox reconciliation requires a known source kind prefix");
+    }
+    let cleared = 0;
+    for (const entry of this.entries.values()) {
+      if (!entry.item.item_id.startsWith(prefix) || liveIds.has(entry.item.item_id) || entry.cleared) continue;
+      // A source card inherits resolution only while continuously present; absence clears it and its next emission opens fresh.
+      entry.cleared = true;
+      if (!entry.resolved) {
+        entry.resolved = true;
+        entry.resolved_at = nowIso;
+        entry.item = { ...entry.item, resolved: true, resolved_at: nowIso };
+      }
+      cleared++;
+    }
+    return cleared;
   }
 
   /**
@@ -184,14 +211,18 @@ export class HubInboxStore {
   }
 
   /**
-   * Clear resolved entries older than `maxAgeMs`. Long-lived sessions
-   * accumulate resolved entries otherwise; v1.1 ships with a default
-   * trim policy in the service layer; this is just the primitive.
+   * Clear resolved history older than `maxAgeMs`, preserving dismissals of
+   * source conditions that have not cleared. HubService.listInbox supplies
+   * the default retention policy before aggregation.
    */
   pruneResolvedOlderThan(nowMs: number, maxAgeMs: number): number {
     let removed = 0;
     for (const [id, entry] of this.entries) {
       if (!entry.resolved || !entry.resolved_at) continue;
+      // Must match the source namespaces in inbox-sources.ts: retention cannot reopen a continuously present dismissed incident.
+      const sourcePrefix = hubInboxSourceIdPrefix(entry.item.kind);
+      if (!entry.cleared && HUB_INBOX_SOURCE_RECONCILE_PREFIXES.has(sourcePrefix) &&
+          entry.item.item_id.startsWith(sourcePrefix)) continue;
       const ageMs = nowMs - new Date(entry.resolved_at).getTime();
       if (ageMs > maxAgeMs) {
         this.entries.delete(id);
