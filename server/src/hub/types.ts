@@ -200,9 +200,12 @@ export interface HubInboxSources {
    * Ids of every condition that holds now, before any emission cap. The
    * aggregator clears a stored card only when its id is absent from this set;
    * a source without this method is reconciled against its emitted ids.
+   * `undefined` means the source could not see every condition this call (its
+   * bounded registry read returned a full page), so absence is not evidence and
+   * the aggregator clears nothing for that kind until a later complete read.
    * Must match reconcile() in inbox-aggregator.ts and the projections in inbox-sources.ts.
    */
-  listPresentSourceIds?(kind: HubInboxItem["kind"]): ReadonlySet<string>;
+  listPresentSourceIds?(kind: HubInboxItem["kind"]): ReadonlySet<string> | undefined;
   /**
    * Currently unresolved Tier 1 / Tier 2 approval requests. Items already
    * in the hub-side inbox store are deduplicated by `item_id` against these.

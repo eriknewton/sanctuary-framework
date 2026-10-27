@@ -125,7 +125,8 @@ describe("local inbox sources", () => {
       expect(ordered).toHaveLength(timestamps.length);
       // The three valid instants precede all missing, offset-less and malformed stamps, even before 1970.
       expect(ordered.slice(0, 3).map((item) => item.created_at)).toEqual(timestamps.slice(3).reverse());
-      expect(new Set(ordered.slice(3).map((item) => item.created_at))).toEqual(new Set(timestamps.slice(0, 3)));
+      // A missing stamp reaches the card as the typed empty string, never as undefined.
+      expect(new Set(ordered.slice(3).map((item) => item.created_at))).toEqual(new Set(["", ...timestamps.slice(1, 3)]));
     }
     registry.put(agent({ agent_id: "", status: "error" }));
     expect(service.listInbox()).toEqual(items);
@@ -297,7 +298,7 @@ describe("local inbox sources", () => {
         expect(items.find((item) => item.item_id === open.item_id)).toEqual(open);
         expect(items.find((item) => item.item_id === dismissed.item_id)).toMatchObject({ resolved: true, resolved_at: iso() });
       }
-      expect(sources.listPresentSourceIds!(kind).size).toBe(cap + 1);
+      expect(sources.listPresentSourceIds!(kind)?.size).toBe(cap + 1);
       put(0, iso(cap + 1)); // Returning the open card to emission now excludes the dismissed card.
       service.listInbox();
       service.listInbox();
@@ -344,13 +345,46 @@ describe("local inbox sources", () => {
     expect(sources.listActiveBudgetWarnings()).toEqual([]);
     expect(list).toHaveBeenCalledTimes(1);
     list.mockClear();
-    expect(sources.listPresentSourceIds!("budget_warning")).toEqual(new Set());
+    // A full page is an incomplete read: the present set is unknown, not empty.
+    expect(sources.listPresentSourceIds!("budget_warning")).toBeUndefined();
     expect(list).toHaveBeenCalledTimes(1);
     list.mockClear();
     expect(sources.listRecentAgentErrors()).toEqual([]);
     expect(list).toHaveBeenCalledTimes(1);
     list.mockClear();
-    expect(sources.listPresentSourceIds!("agent_error")).toEqual(new Set());
+    expect(sources.listPresentSourceIds!("agent_error")).toBeUndefined();
     expect(list).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears nothing while the registry exceeds the scan page, so a live condition past the page stays open", () => {
+    // The registry lists by agent_id, so an id that sorts last falls off a full page first. Budget
+    // warnings scan every status, so healthy agents can fill the page; the error source pages error
+    // records only, and the same rule applies once more than a page of them exist.
+    registry.put(agent({ agent_id: "zz-last",
+      budget_summary: { last_refreshed_at: iso(), daily: { unit: "tokens", cap: 1, used: 1 } } }));
+    const [card] = service.listInbox({ openOnly: true });
+    expect(card).toMatchObject({ kind: "budget_warning", agent_id: "zz-last", severity: "hard_cap", resolved: false });
+    expect(sources.listPresentSourceIds!("budget_warning")).toEqual(new Set([card!.item_id]));
+    const filler = (i: number) => `a-${String(i).padStart(4, "0")}`;
+    for (let i = 0; i < Hub.HUB_INBOX_REGISTRY_SCAN_CAP; i++) registry.put(agent({ agent_id: filler(i) }));
+    // The page is now full of healthy agents; the breached agent is unseen but not absent.
+    expect(sources.listActiveBudgetWarnings()).toEqual([]);
+    expect(sources.listPresentSourceIds!("budget_warning")).toBeUndefined();
+    for (const items of [service.listInbox(), service.listInbox()]) {
+      expect(items.find((item) => item.item_id === card!.item_id)).toEqual(card);
+    }
+    // Once the page is complete again the condition is scanned and the same card is still the open one.
+    for (let i = 0; i < Hub.HUB_INBOX_REGISTRY_SCAN_CAP; i++) registry.remove(filler(i));
+    expect(service.listInbox({ openOnly: true })).toEqual([card]);
+  });
+
+  it("bounds a malformed registry timestamp before it reaches the card", () => {
+    registry.put(agent({ status: "error", status_reason_class: "harness_error",
+      last_activity_at: "x".repeat(4 * 64 + 1) }));
+    registry.put(agent({ agent_id: "agent-b", status: "error", status_reason_class: "harness_error",
+      last_activity_at: 12345 as unknown as string }));
+    const items = sources.listRecentAgentErrors();
+    expect(items).toHaveLength(2);
+    for (const item of items) expect(item.created_at).toBe("");
   });
 });

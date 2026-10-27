@@ -67,10 +67,13 @@ function newestFirst(a: HubInboxItemHeader, b: HubInboxItemHeader): number {
   return aTime === bTime ? a.item_id.localeCompare(b.item_id) : aTime > bTime ? -1 : 1;
 }
 
-function projection<T extends HubInboxItemHeader>(items: T[], cap: number) {
+function projection<T extends HubInboxItemHeader>(items: T[], cap: number, complete: boolean) {
   // Must match reconcile() in inbox-aggregator.ts and HubInboxSources in types.ts:
-  // a card dropped by the cap is still present; only absence from the present set clears it.
-  const presentIds: ReadonlySet<string> = new Set(items.map((item) => item.item_id));
+  // a card dropped by the cap is still present; only absence from the present set clears it,
+  // and a present set built from a truncated registry page is no present set at all (undefined),
+  // because a live condition past the page would otherwise read as cleared.
+  const presentIds: ReadonlySet<string> | undefined =
+    complete ? new Set(items.map((item) => item.item_id)) : undefined;
   return { presentIds, items: items.sort(newestFirst).slice(0, cap) };
 }
 
@@ -78,6 +81,8 @@ function projection<T extends HubInboxItemHeader>(items: T[], cap: number) {
  * Read current memory only. No polling, I/O, or retained adapter history.
  * Registry projections inspect one capped agent-id page and sort eligible cards
  * newest first within that page; timestamps never gate presence and the registry owns listing cost.
+ * A full page means the read may be incomplete: the emission is still served, but the present set
+ * is reported as unknown so the store clears nothing until a complete read.
  * Dismiss hides this incident while its condition holds; a condition that stops holding and holds again is a new incident.
  */
 export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources {
@@ -106,19 +111,31 @@ export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources
     };
   }
 
-  function agents(statuses?: LocalAgentRecord["status"][]): LocalAgentRecord[] {
-    // Bound the adapter even if a replacement source accidentally ignores limit.
-    return deps.agentRegistry.list({
+  function agents(statuses?: LocalAgentRecord["status"][]): { records: LocalAgentRecord[]; complete: boolean } {
+    const page = deps.agentRegistry.list({
       identity_id: deps.identityId,
       ...(statuses ? { statuses } : {}),
       limit: HUB_INBOX_REGISTRY_SCAN_CAP,
-    }).slice(0, HUB_INBOX_REGISTRY_SCAN_CAP).filter((record) =>
+    });
+    // A page shorter than the cap is the whole matching registry; a full page may have more behind it.
+    const complete = page.length < HUB_INBOX_REGISTRY_SCAN_CAP;
+    // Bound the adapter even if a replacement source accidentally ignores limit.
+    const records = page.slice(0, HUB_INBOX_REGISTRY_SCAN_CAP).filter((record) =>
       record.identity_id === deps.identityId && identifier(record.agent_id));
+    return { records, complete };
+  }
+
+  function boundedTimestamp(value: unknown): string {
+    // Persisted registry JSON is not a type witness: a missing, non-string or oversized timestamp
+    // must not reach the card verbatim. An empty string is the typed "unknown"; it sorts last and
+    // never gates presence (timestamps only order the emission).
+    return identifier(value) ? value : "";
   }
 
   function budgetProjection() {
     const items: HubBudgetWarningItem[] = [];
-    for (const record of agents()) {
+    const scan = agents();
+    for (const record of scan.records) {
       const summary = record.budget_summary;
       if (!summary) continue;
       for (const bucket of BUDGET_BUCKETS) {
@@ -135,7 +152,7 @@ export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources
         // Attribution names the registry record's subject, never a parsed display string.
         items.push({
           ...header("budget_warning", [record.agent_id, bucket, severity],
-            summary.last_refreshed_at, severity, record.agent_id),
+            boundedTimestamp(summary.last_refreshed_at), severity, record.agent_id),
           kind: "budget_warning",
           bucket,
           severity,
@@ -143,13 +160,15 @@ export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources
         });
       }
     }
-    return projection(items, HUB_BUDGET_WARNING_SOURCE_CAP);
+    return projection(items, HUB_BUDGET_WARNING_SOURCE_CAP, scan.complete);
   }
 
   function errorProjection() {
     const items: HubAgentErrorItem[] = [];
-    for (const record of agents(["error"])) {
-      // operator_lockdown belongs to locked_down status, already excluded by this error filter.
+    const scan = agents(["error"]);
+    for (const record of scan.records) {
+      // operator_lockdown is written with locked_down status; an error record that still carries it
+      // passes the closed set and renders with the generic template, which is the honest reading.
       if (record.status !== "error") continue;
       const reason = record.status_reason_class;
       const errorClass = identifier(reason) && STATUS_REASON_CLASSES.has(reason) ? reason : "other";
@@ -159,7 +178,7 @@ export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources
       if (errorClass === "passphrase_required") continue;
       items.push({
         ...header("agent_error", [record.agent_id, errorClass],
-          record.last_activity_at,
+          boundedTimestamp(record.last_activity_at),
             ["harness_error", "harness_unreachable", "policy_breach", "config_drift"].includes(errorClass)
               ? errorClass : "other", record.agent_id),
         kind: "agent_error",
@@ -167,7 +186,7 @@ export function createHubInboxSources(deps: HubInboxSourceDeps): HubInboxSources
         agent_still_active: false,
       });
     }
-    return projection(items, HUB_AGENT_ERROR_SOURCE_CAP);
+    return projection(items, HUB_AGENT_ERROR_SOURCE_CAP, scan.complete);
   }
 
   return {

@@ -45,7 +45,11 @@ export function aggregateInbox(
     }
     // Must match projection() in inbox-sources.ts and HubInboxSources in types.ts:
     // a card dropped by the cap is still present; only absence from the present set clears it.
-    const liveIds = sources.listPresentSourceIds?.(kind) ?? emittedIds;
+    const presentIds = sources.listPresentSourceIds?.(kind);
+    // A source that reports its present set as unknown (a truncated registry page) has shown no
+    // absence; clearing on it would resolve live cards past the page, so this call clears nothing.
+    if (sources.listPresentSourceIds && presentIds === undefined) return;
+    const liveIds = presentIds ?? emittedIds;
     // An ordinary empty callback can mean its last condition stopped; only permanent stubs skip above.
     // Must match header() in inbox-sources.ts via hubInboxSourceIdPrefix; approvals are never reconciled.
     store.reconcileSourceItems(hubInboxSourceIdPrefix(kind), liveIds, nowIso);
