@@ -368,6 +368,8 @@ export class HubService {
    *   down. `openOnly` filters resolved items before the page bound is applied.
    */
   listInbox(options?: { limit?: number; openOnly?: boolean }): HubInboxItem[] {
+    // Wrap can persist agents after boot; refresh before aggregation so inbox visibility does not depend on an agents read.
+    this.refreshPersistedLocalAgents();
     const nowIso = this.nowIso();
     const nowMs = new Date(nowIso).getTime();
     // Cleared source cards would otherwise accumulate across agent-id churn.

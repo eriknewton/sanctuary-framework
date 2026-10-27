@@ -96,6 +96,28 @@ function makeReader(overrides: Partial<ConstructorParameters<typeof SanctuaryCon
 }
 
 describe("SanctuaryContextReader", () => {
+  it.each(["", "invalid", undefined])("reports an unknown age for created_at=%s alongside numeric valid ages", async (createdAt) => {
+    const validCreatedAt = "2026-05-16T00:00:00.000Z";
+    const futureCreatedAt = "2026-05-16T00:01:00.000Z";
+    const reader = makeReader({
+      inboxSources: {
+        listPendingApprovals: () => [createdAt, validCreatedAt, futureCreatedAt].map((timestamp, index) => ({
+          version: "1.1", item_id: `approval-${index}`, kind: "approval_pending",
+          // Persisted input can omit a timestamp despite its static string contract.
+          created_at: timestamp as string, identity_id: "operator", resolved: false,
+          display_template_id: "approval.test", display_template_args: [],
+          tier: "tier1", operation_category: "policy_change",
+        })),
+        listRecentBlockedEgress: () => [], listRecentPrivacyEvents: () => [],
+        listActiveBudgetWarnings: () => [], listActiveRecoveryPrompts: () => [], listRecentAgentErrors: () => [],
+      },
+    });
+    const context = await reader.readContext({ question: "pending approvals",
+      now: new Date("2026-05-16T00:00:30.500Z") });
+    // The fixed clock is 30 whole seconds after the valid stamp; future stamps retain the zero clamp.
+    expect(context.approval_inbox.items.map((item) => item.age_seconds)).toEqual([null, 30, 0]);
+  });
+
   it("returns all configured read-surface shapes", async () => {
     const context = await makeReader().readContext({
       question: "how many pending approvals are there?",
