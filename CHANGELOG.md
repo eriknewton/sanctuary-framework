@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - A lockdown-lift refusal names a missing snapshot only when the snapshot is missing.
+- Hub inbox reads refresh persisted agents and reconcile complete registry pages, and concierge context represents unknown item ages as null.
 - `audit-chain verify` no longer PASSes an export with unsigned `type: "checkpoint"` records, and keyed verification with no checkpoint records now FAILs. On a fortress with a single audit chain, `doctor` reports honestly unsigned checkpoints as the existing `WARN audit chain` instead of an integrity FAIL; its identity check is unchanged.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)

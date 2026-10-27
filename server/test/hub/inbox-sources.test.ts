@@ -387,4 +387,63 @@ describe("local inbox sources", () => {
     expect(items).toHaveLength(2);
     for (const item of items) expect(item.created_at).toBe("");
   });
+
+  it.each(["budget_warning", "agent_error"] as const)(
+    "%s probes only full pages and clears stopped conditions only after proving completeness", (kind) => {
+      const cap = Hub.HUB_INBOX_REGISTRY_SCAN_CAP;
+      const targetId = "a-target";
+      const successorId = "z-successor";
+      // Excluded error reasons keep the matching registry page full without emitting filler cards.
+      const quiet = (agentId: string) => agent({ agent_id: agentId,
+        status: "error", status_reason_class: "passphrase_required" });
+      registry.put(agent({ agent_id: targetId, status: "error", status_reason_class: "harness_error",
+        budget_summary: { last_refreshed_at: iso(), daily: { unit: "tokens", cap: 1, used: 1 } } }));
+      const emit = () => kind === "budget_warning"
+        ? sources.listActiveBudgetWarnings() : sources.listRecentAgentErrors();
+      const filter = { identity_id: IDENTITY, ...(kind === "agent_error" ? { statuses: ["error"] as const } : {}) };
+      const list = vi.spyOn(registry, "list");
+
+      // A short page still performs exactly the original read, for emission and presence separately.
+      const [card] = emit();
+      expect(card).toBeDefined();
+      expect(list.mock.calls).toEqual([[{ ...filter, limit: cap }]]);
+      list.mockClear();
+      expect(sources.listPresentSourceIds!(kind)).toEqual(new Set([card!.item_id]));
+      expect(list.mock.calls).toEqual([[{ ...filter, limit: cap }]]);
+      service.listInbox();
+
+      // One target plus cap - 1 fillers fills the page; one successor makes the scan incomplete.
+      const fillers = Array.from({ length: cap - 1 }, (_, index) => quiet(`m-${index}`));
+      for (const record of fillers) registry.put(record);
+      registry.put(quiet(successorId));
+      registry.put(quiet(targetId)); // Stops both conditions while preserving the error-status match count.
+      const page = registry.list({ identity_id: IDENTITY, statuses: ["error"], limit: cap });
+      const cursor = page[page.length - 1]!.agent_id;
+      // Pins agent-registry.ts list's slice(idx + 1): the cursor record is excluded, not repeated.
+      expect(registry.list({ identity_id: IDENTITY, statuses: ["error"], cursor, limit: 1 }))
+        .toEqual([quiet(successorId)]);
+      const fullReads = [[{ ...filter, limit: cap }], [{ ...filter, cursor, limit: 1 }]];
+      list.mockClear();
+      expect(emit()).toEqual([]);
+      expect.soft(list.mock.calls).toEqual(fullReads);
+      list.mockClear();
+      expect(sources.listPresentSourceIds!(kind)).toBeUndefined();
+      expect.soft(list.mock.calls).toEqual(fullReads);
+      expect(service.listInbox().find((item) => item.item_id === card!.item_id)).toEqual(card);
+
+      registry.remove(successorId); // Exactly cap matching records remain, with no successor.
+      // A foreign record must not make the same-identity probe look incomplete.
+      registry.put({ ...quiet(successorId), identity_id: "foreign" });
+      if (kind === "agent_error") registry.put(agent({ agent_id: "zz-active" }));
+      expect(registry.list({ identity_id: IDENTITY, ...(kind === "agent_error" ? { statuses: ["error" as const] } : {}),
+        cursor, limit: 1 })).toEqual([]);
+      list.mockClear();
+      expect(emit()).toEqual([]);
+      expect.soft(list.mock.calls).toEqual(fullReads);
+      list.mockClear();
+      expect.soft(sources.listPresentSourceIds!(kind)).toEqual(new Set());
+      expect.soft(list.mock.calls).toEqual(fullReads);
+      expect(service.listInbox().find((item) => item.item_id === card!.item_id))
+        .toEqual({ ...card, resolved: true, resolved_at: iso() });
+    });
 });

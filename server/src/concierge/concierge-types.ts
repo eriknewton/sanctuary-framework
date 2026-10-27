@@ -82,7 +82,8 @@ export interface ApprovalInboxContext {
   pending_count: number;
   items: Array<
     Pick<HubInboxItem, "item_id" | "kind" | "created_at" | "resolved"> & {
-      age_seconds: number;
+      /** Nonnegative elapsed seconds, or null for unknown creation time; must match sanctuary-context-reader.ts. */
+      age_seconds: number | null;
       status: "pending" | "resolved";
       tier?: string;
       operation_category?: string;

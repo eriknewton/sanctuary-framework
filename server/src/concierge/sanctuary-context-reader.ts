@@ -127,23 +127,28 @@ export class SanctuaryContextReader {
     const pending = items.filter((item) => !item.resolved);
     return {
       pending_count: pending.length,
-      items: pending.map((item) => ({
-        item_id: item.item_id,
-        kind: item.kind,
-        created_at: item.created_at,
-        resolved: item.resolved,
-        age_seconds: Math.max(
-          0,
-          Math.floor((now.getTime() - new Date(item.created_at).getTime()) / 1000),
-        ),
-        status: item.resolved ? "resolved" : "pending",
-        ...("tier" in item && typeof item.tier === "string" ? { tier: item.tier } : {}),
-        ...("operation_category" in item && typeof item.operation_category === "string"
-          ? { operation_category: item.operation_category }
-          : {}),
-        ...(item.agent_id ? { agent_id: item.agent_id } : {}),
-        ...(item.identity_id ? { identity_id: item.identity_id } : {}),
-      })),
+      items: pending.map((item) => {
+        const createdAtMs = new Date(item.created_at).getTime();
+        // Unknown creation time cannot attest a fresh item: null means unknown, not zero elapsed seconds.
+        // Must match ApprovalInboxContext.age_seconds in concierge-types.ts.
+        const ageSeconds = Number.isFinite(createdAtMs)
+          ? Math.max(0, Math.floor((now.getTime() - createdAtMs) / 1000)) // Milliseconds per second.
+          : null;
+        return {
+          item_id: item.item_id,
+          kind: item.kind,
+          created_at: item.created_at,
+          resolved: item.resolved,
+          age_seconds: ageSeconds,
+          status: item.resolved ? "resolved" : "pending",
+          ...("tier" in item && typeof item.tier === "string" ? { tier: item.tier } : {}),
+          ...("operation_category" in item && typeof item.operation_category === "string"
+            ? { operation_category: item.operation_category }
+            : {}),
+          ...(item.agent_id ? { agent_id: item.agent_id } : {}),
+          ...(item.identity_id ? { identity_id: item.identity_id } : {}),
+        };
+      }),
     };
   }
 
