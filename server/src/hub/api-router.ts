@@ -128,6 +128,17 @@ function rejectCrossFortressParams(url: URL): void {
   }
 }
 
+/**
+ * Rebuild a failed approve as a status-only error: the message, stack and cause of the failing phase never reach the
+ * caught-error log, because a phase that ran after the mint can carry the one-time re-key key in any of them.
+ */
+function scrubbedDecisionError(error: unknown): HubError {
+  const status = error instanceof HubError ? error.statusCode : 500;
+  const scrubbed = new HubError("inbox decision failed", status, "inbox decision failed");
+  scrubbed.stack = `${scrubbed.name}: ${scrubbed.message}`;
+  return scrubbed;
+}
+
 function handleError(
   res: ServerResponse,
   err: unknown,
@@ -455,11 +466,14 @@ export async function handleHubRoute(
         }
       } catch (error) {
         close();
-        if (!res.destroyed && !res.headersSent) {
-          const status = error instanceof HubError ? error.statusCode : 500;
-          try { writeJSON(res, status, { ok: false, error: publicCodeForStatus(status) }); }
-          catch { res.destroy(); }
-        } else if (!res.destroyed) res.destroy();
+        if (res.destroyed || res.headersSent) {
+          if (!res.destroyed) res.destroy();
+          return true;
+        }
+        // One envelope for every decision error: the route's shared caught-error path writes it, so a refused export reads
+        // exactly like any other refused decision (test/http/error-envelope-routes pins the shape). An approve may have
+        // minted a key and diagnostics are a disclosure channel, so an approve error reaches that path with its status only.
+        throw inboxMatch.action === "approve" ? scrubbedDecisionError(error) : error;
       } finally {
         close();
         res.removeListener("close", close);
