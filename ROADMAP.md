@@ -28,7 +28,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 `sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, Cline, and Mastra today (Mastra fixture-tested only; no live Mastra-agent drill is recorded; other MCP-compatible harnesses can use the `--wrap` flag, whose generic config rewrite is tested but not that harness's own path). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
-*Status: shipped through v1.8.4 (npm `latest`, released 2026-09-05); v1.9.0-rc.1 is the opt-in preview on the `next` channel.*
+*Status: shipped through v1.8.4 (npm `latest`, released 2026-09-05); v1.9.0-rc.2 is the opt-in preview on the `next` channel.*
 
 *`sanctuary protect --passphrase-stdin` (from the 1.9.0-rc.1 preview) reads the passphrase from stdin for scripted setup.*
 
