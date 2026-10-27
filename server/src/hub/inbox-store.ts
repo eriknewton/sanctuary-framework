@@ -243,6 +243,8 @@ export class HubInboxStore {
           entry.resolved_at = nowIso;
           entry.item = { ...entry.item, resolved: true, resolved_at: nowIso, resolution_payload: { outcome: "failed" } };
           entry.tier1Handler = undefined;
+          // A terminal failure is a resolution the stream must learn like any other; the frame is the header only.
+          this.notify(entry.item);
           // eslint-disable-next-line preserve-caught-error -- intentional: the cause may carry the minted key; diagnostics are a disclosure channel
           throw new Error("Export approval failed.");
         }
@@ -252,7 +254,8 @@ export class HubInboxStore {
       }
     }
 
-    // Concurrent or late handler completions notify only the first actual resolution transition.
+    // The execution claim above makes a concurrent decision lose before the handler runs; this guard is the
+    // backstop for a handler that resolved the entry itself, so a resolution never notifies twice.
     if (entry.resolved) return entry.item;
     entry.tier1Handler = undefined;
     entry.resolved = true;

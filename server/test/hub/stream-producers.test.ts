@@ -199,6 +199,28 @@ describe("hub stream producers", () => {
     }
   });
 
+  it("publishes one resolved frame when an export approval fails terminally, carrying no cause bytes", async () => {
+    // The export failure arm is terminal (no replay can mint again) and is still a resolution the stream must see.
+    const store = new HubInboxStore();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    const SENTINEL = "SENTINEL-MINTED-KEY-BYTES";
+    const item: HubApprovalPendingItem = { ...approval("export-fail"), operation_category: "exit_bundle_export",
+      display_template_id: "approval_pending.tier1.fortress_exit_bundle_export",
+      display_template_args: [{ kind: "identity_id", value: IDENTITY }, { kind: "tier", value: "tier1" }] };
+    store.enqueueTier1(item, async () => { throw new Error(`mint failed ${SENTINEL}`); });
+    listener.mockClear();
+    const receiver = { isLive: () => true, receive: () => {} };
+    await expect(store.resolve(item.item_id, "approve", NOW, receiver)).rejects.toThrow("Export approval failed.");
+    expect(listener).toHaveBeenCalledTimes(1);
+    const frame = listener.mock.calls[0][0];
+    expect(frame.resolved).toBe(true);
+    expect(frame.resolution_payload).toEqual({ outcome: "failed" });
+    expect(JSON.stringify(frame)).not.toContain(SENTINEL);
+    await expect(store.resolve(item.item_id, "approve", NOW, receiver)).rejects.toMatchObject({ statusCode: 409 });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it("installs no listeners without a publisher and does install them when supplied", () => {
     const inbox = vi.spyOn(HubInboxStore.prototype, "subscribe");
     const registry = vi.spyOn(InMemoryLocalAgentRegistry.prototype, "subscribe");
