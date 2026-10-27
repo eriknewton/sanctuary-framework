@@ -1516,6 +1516,10 @@ async function wireUnlockedDeps(args: {
     throw err;
   }
   const v11Bindings = buildV11Bindings({
+    streamPublisher: {
+      publishInbox: (frame) => dashboard.broadcastSSE("inbox", frame),
+      publishAgentStatus: (snapshot) => dashboard.broadcastSSE("agent_status", snapshot),
+    },
     identityId: hubIdentityId,
     fortressId: fortressIdFromStoragePath(config.storage_path),
     auditLog,

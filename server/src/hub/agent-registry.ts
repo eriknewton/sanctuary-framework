@@ -28,8 +28,8 @@ import type {
   LocalHarnessKind,
 } from "../contracts/v1.1/local-agent-records.js";
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
-import type { HubAgentRegistrySource } from "./types.js";
-import { HubNotFoundError, HubValidationError } from "./errors.js";
+import type { HubAgentRegistrySource, HubAgentRegistryChangeListener } from "./types.js";
+import { HubConflictError, HubNotFoundError, HubValidationError } from "./errors.js";
 
 const FORBIDDEN_RECORD_KEYS = new Set([
   "private_key",
@@ -70,6 +70,28 @@ function assertNoSecretFields(record: LocalAgentRecord): void {
 export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
   private records: Map<string, LocalAgentRecord> = new Map();
 
+  private listener?: HubAgentRegistryChangeListener;
+  private listenerErrors = 0;
+
+  /** Count failed notifications without retaining records or exception details. */
+  get listenerErrorCount(): number { return this.listenerErrors; }
+
+  /** Attach the sole stream observer; disposal releases its reference. */
+  subscribe(listener: HubAgentRegistryChangeListener): () => void {
+    // A single owner bounds callback retention and synchronous work per mutation.
+    if (this.listener) throw new HubConflictError("registry observer already attached");
+    this.listener = listener;
+    return () => { if (this.listener === listener) this.listener = undefined; };
+  }
+
+  private notify(agentId: string, record: LocalAgentRecord | null): void {
+    try { this.listener?.(agentId, record); }
+    catch {
+      // Saturating accounting keeps delivery failures observable without blocking a committed mutation.
+      this.listenerErrors = Math.min(Number.MAX_SAFE_INTEGER, this.listenerErrors + 1);
+    }
+  }
+
   constructor(seed?: LocalAgentRecord[]) {
     if (seed) {
       for (const r of seed) this.put(r);
@@ -82,14 +104,22 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
    */
   put(record: LocalAgentRecord): void {
     assertNoSecretFields(record);
+    const prior = this.records.get(record.agent_id);
     this.records.set(record.agent_id, record);
+    // Must match snapshotForRecord in hub-service.ts: unchanged persisted refreshes must not trigger refetch loops.
+    // An identity change is a roster change for the hub's own view even when the snapshot fields stand still, so it
+    // notifies too (the stream's identity guard in hub-service.ts announces or drops the id on it).
+    if (!prior || prior.status !== record.status || prior.status_reason_class !== record.status_reason_class ||
+        prior.last_activity_at !== record.last_activity_at || prior.identity_id !== record.identity_id) {
+      this.notify(record.agent_id, record);
+    }
   }
 
   /**
    * Remove a record entirely. Used after an approved unwrap completes.
    */
   remove(agentId: string): void {
-    this.records.delete(agentId);
+    if (this.records.delete(agentId)) this.notify(agentId, null);
   }
 
   list(filter?: LocalAgentRegistryFilter): LocalAgentRecord[] {
@@ -147,6 +177,7 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
       delete (next as { status_reason_class?: unknown }).status_reason_class;
     }
     this.records.set(agentId, next);
+    this.notify(agentId, next);
     return next;
   }
 
@@ -162,6 +193,8 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
       last_activity_at: new Date().toISOString(),
     };
     this.records.set(agentId, next);
+    // Binding ids are absent from snapshotForRecord in hub-service.ts; only its activity timestamp can change here.
+    if (prior.last_activity_at !== next.last_activity_at) this.notify(agentId, next);
     return next;
   }
 
@@ -177,6 +210,8 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
       last_activity_at: new Date().toISOString(),
     };
     this.records.set(agentId, next);
+    // Binding ids are absent from snapshotForRecord in hub-service.ts; only its activity timestamp can change here.
+    if (prior.last_activity_at !== next.last_activity_at) this.notify(agentId, next);
     return next;
   }
 

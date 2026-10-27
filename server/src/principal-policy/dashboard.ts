@@ -9163,6 +9163,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     authAdmission: DashboardAuthAdmission,
   ): unknown {
     if (authAdmission !== "loopback_position") return data;
+    // The legacy /events loop carries the hub events too, so a position-only reader of /events must see exactly what
+    // the /api/stream loop shows it; one arm serves both loops.
+    if (event === "inbox" || event === "agent_status") {
+      return this.redactDashboardStreamDataForAdmission({ event, data }, authAdmission);
+    }
     if (event === "pending-request") {
       return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
     }
@@ -9183,8 +9188,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       case "approval":
         return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
       case "inbox":
+        // Position-only admission sees approval traffic as a count marker. The marker is an invalidation the client
+        // follows with a filtered refetch at once; a resolution frame must not announce a pending approval.
         return isHubApprovalPendingItem(dashboardEvent.data)
-          ? pendingApprovalsRedactedMarker(1)
+          ? pendingApprovalsRedactedMarker(
+              (dashboardEvent.data as { resolved?: unknown }).resolved === true ? 0 : 1,
+            )
           : dashboardEvent.data;
       default:
         return dashboardEvent.data;
