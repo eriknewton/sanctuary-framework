@@ -137,10 +137,10 @@ export class CastleWallAgentController implements HubAgentController {
       };
     } catch (err) {
       if (err instanceof AgentEgressStopError) {
-        throw new HubCapabilityError(err.reasonCode);
-      }
-      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-        throw new HubCapabilityError("lockdown_lift_no_snapshot");
+        // stop_snapshot_missing must match the snapshot-read reason in castle-wall/provision/agent-stop.ts.
+        throw new HubCapabilityError(
+          err.reasonCode === "stop_snapshot_missing" ? "lockdown_lift_no_snapshot" : err.reasonCode,
+        );
       }
       throw err;
     }
