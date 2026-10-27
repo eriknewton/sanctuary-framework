@@ -18,6 +18,7 @@ import type {
   HubApprovalPendingItem,
   HubInboxItem,
 } from "../contracts/v1.1/hub-events.js";
+import { projectHubExportResult, type HubExportDeliveryReceiver } from "./types.js";
 import { HubConflictError, HubNotFoundError, HubValidationError } from "./errors.js";
 import { HUB_INBOX_SOURCE_RECONCILE_PREFIXES, hubInboxSourceIdPrefix } from "./inbox-sources.js";
 // Must match `CHARTER_APPROVAL_ITEM_ID_PREFIX` in
@@ -60,6 +61,7 @@ function assertNotReservedItemId(itemId: string): void {
 export type Tier1ResolutionHandler = (
   item: HubApprovalPendingItem,
   decision: "approve" | "deny",
+  receiver?: HubExportDeliveryReceiver,
 ) => Promise<Tier1HandlerResult | void>;
 
 export interface Tier1HandlerResult {
@@ -69,6 +71,7 @@ export interface Tier1HandlerResult {
 interface StoredEntry {
   item: HubInboxItem;
   resolved: boolean;
+  resolving?: boolean;
   resolved_at?: string;
   cleared?: boolean;
   /** Set when the entry is a hub-enqueued Tier 1 control action. */
@@ -107,6 +110,11 @@ export class HubInboxStore {
   upsertFromSource(item: HubInboxItem): void {
     assertNotReservedItemId(item.item_id);
     const prior = this.entries.get(item.item_id);
+    // Export completions belong to resolve below; a source refresh cannot replace their safe retained projection.
+    if (prior?.item.kind === "approval_pending" && prior.item.operation_category === "exit_bundle_export") return;
+    if (item.kind === "approval_pending" && item.operation_category === "exit_bundle_export") {
+      throw new HubValidationError("Export items require the Tier 1 enqueue path.");
+    }
     // Dismiss hides this incident while its condition holds; a condition that stops holding and holds again is a new incident.
     if (prior && !prior.cleared) {
       prior.item = {
@@ -162,13 +170,20 @@ export class HubInboxStore {
     if (this.entries.has(item.item_id)) {
       throw new HubConflictError(`inbox item ${item.item_id} already exists`);
     }
-    const storedItem = { ...item, resolved: false };
+    // Export enqueue accepts only the existing approval contract; completion payloads enter through resolve.
+    const pendingItem: HubApprovalPendingItem = item.operation_category === "exit_bundle_export" ? {
+      version: "1.1", item_id: item.item_id, kind: "approval_pending",
+      created_at: item.created_at, identity_id: item.identity_id,
+      display_template_id: "approval_pending.tier1.fortress_exit_bundle_export",
+      display_template_args: [{ kind: "identity_id", value: item.identity_id }, { kind: "tier", value: "tier1" }],
+      tier: "tier1", operation_category: "exit_bundle_export", resolved: false,
+    } : { ...item, resolved: false };
     this.entries.set(item.item_id, {
-      item: storedItem,
+      item: pendingItem,
       resolved: false,
       tier1Handler: handler,
     });
-    this.notify(storedItem);
+    this.notify(pendingItem);
   }
 
   /**
@@ -193,10 +208,11 @@ export class HubInboxStore {
     itemId: string,
     decision: "approve" | "deny" | "dismiss",
     nowIso: string,
+    receiver?: HubExportDeliveryReceiver,
   ): Promise<HubInboxItem> {
     const entry = this.entries.get(itemId);
     if (!entry) throw new HubNotFoundError(`inbox item ${itemId}`);
-    if (entry.resolved) {
+    if (entry.resolved || entry.resolving) {
       throw new HubConflictError(`inbox item ${itemId} already resolved`);
     }
 
@@ -207,14 +223,41 @@ export class HubInboxStore {
           "tier 1 approval items cannot be dismissed; use approve or deny",
         );
       }
-      handlerResult = await entry.tier1Handler(
-        entry.item as HubApprovalPendingItem,
-        decision,
-      );
+      const isExport = entry.item.operation_category === "exit_bundle_export";
+      if (isExport && decision === "approve" && !receiver?.isLive()) {
+        throw new HubConflictError("Export delivery unavailable.");
+      }
+      // Claim execution before awaiting so concurrent decisions cannot mint twice or share the winning response.
+      entry.resolving = true;
+      try {
+        // The delivery context is invocation-local, never stored in the item, handler closure, or a replayable promise.
+        handlerResult = await entry.tier1Handler(entry.item, decision, receiver);
+        if (isExport && handlerResult?.resolution_payload) {
+          // Completion assignment uses the same metadata schema as the service in hub-service.ts.
+          handlerResult = { resolution_payload: projectHubExportResult(handlerResult.resolution_payload as import("./types.js").HubFortressExportResult) };
+        }
+      } catch (error) {
+        if (isExport) {
+          // Once export execution starts, failure stays terminal because replay could mint again after uncertain delivery.
+          entry.resolved = true;
+          entry.resolved_at = nowIso;
+          entry.item = { ...entry.item, resolved: true, resolved_at: nowIso, resolution_payload: { outcome: "failed" } };
+          entry.tier1Handler = undefined;
+          // A terminal failure is a resolution the stream must learn like any other; the frame is the header only.
+          this.notify(entry.item);
+          // eslint-disable-next-line preserve-caught-error -- intentional: the cause may carry the minted key; diagnostics are a disclosure channel
+          throw new Error("Export approval failed.");
+        }
+        throw error;
+      } finally {
+        entry.resolving = false;
+      }
     }
 
-    // Concurrent or late handler completions notify only the first actual resolution transition.
+    // The execution claim above makes a concurrent decision lose before the handler runs; this guard is the
+    // backstop for a handler that resolved the entry itself, so a resolution never notifies twice.
     if (entry.resolved) return entry.item;
+    entry.tier1Handler = undefined;
     entry.resolved = true;
     entry.resolved_at = nowIso;
     const resolutionPayload =

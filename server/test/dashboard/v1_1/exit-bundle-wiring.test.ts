@@ -55,10 +55,10 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
     const enqueued = hubService.enqueueFortressExportBundle();
     expect(enqueued.operation_category).toBe("exit_bundle_export");
     expect(enqueued.fortress_scope).toBe(true);
-
+    await expect(hubService.resolveInboxItem(enqueued.inbox_item_id, "approve")).rejects.toThrow("Export delivery unavailable.");
     const resolved = await hubService.resolveInboxItem(
       enqueued.inbox_item_id,
-      "approve",
+      "approve", { isLive: () => true, receive: () => { throw new Error("Empty fixture must not mint."); } },
     );
     const payload = resolved.resolution_payload;
     expect(payload?.bundle_dir).toContain("exit-bundles");
@@ -103,9 +103,9 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
     });
 
     const enqueued = hubService.enqueueFortressExportBundle();
-    const resolved = await hubService.resolveInboxItem(
+    await expect(hubService.resolveInboxItem(enqueued.inbox_item_id, "approve")).rejects.toThrow("Export delivery unavailable."); const resolved = await hubService.resolveInboxItem(
       enqueued.inbox_item_id,
-      "approve",
+      "approve", { isLive: () => true, receive: () => { throw new Error("Empty fixture must not mint."); } },
     );
     // Cast to the specific subtype: resolveInboxItem returns the union HubInboxItem
     // and resolution_payload lives on HubApprovalPendingItem. The existing first test

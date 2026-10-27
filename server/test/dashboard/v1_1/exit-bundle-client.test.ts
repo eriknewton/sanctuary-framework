@@ -10,7 +10,7 @@
  * static CLIENT_SCRIPT string into a sandboxed Function so it can be called
  * against synthetic state objects without a real browser.
  */
-// fail-before-exempt: adapts the onInboxAction sandbox to the retained decision result the client now settles on every decision (state.approvals.lock and result, the decision-announcement live region, the inbox source read, the admission check against the loaded queue) and to the acknowledgement shape the server returns (resolved: true); asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the decision paths lives in approval-decision-result.test.ts.
+// fail-before-exempt: this change includes the response-only view helpers in the existing extracted decision-handler sandbox; its metadata assertions are unchanged. The new delivery and lifecycle assertions are in exit-rekey-delivery.test.ts and exit-rekey-secret-boundaries.test.ts, which fail against pre-fix source.
 import { describe, expect, it } from "vitest";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
@@ -81,6 +81,8 @@ function makeInboxActionSandbox(): {
   const fnStart = src.indexOf("async function onInboxAction(");
   const fnEnd = src.indexOf("// Tunability UX: promote a pending approval", fnStart);
   const fnText = src.slice(fnStart, fnEnd).trim();
+  const deliveryStart = src.indexOf("// Must match the permanent exit-rekey-view host");
+  const deliveryHelpers = deliveryStart < 0 ? "" : src.slice(deliveryStart, src.indexOf("// ── Render: exit drill", deliveryStart));
 
   const wrapper = `
     return async function invoke(stateObj, itemId, action, apiReturn) {
@@ -97,6 +99,7 @@ function makeInboxActionSandbox(): {
       var sourceLoaded = function() { return false; };
       var decisionNotAdmissible = function() { return ""; };
       var HUB = "/api/hub";
+      ${deliveryHelpers}
       ${fnText}
       await onInboxAction(itemId, action);
     };

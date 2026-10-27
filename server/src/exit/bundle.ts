@@ -468,16 +468,15 @@ export interface ExportExitBundleOptions {
    * `state_rekey_key` for operator disclosure. OPT-IN because the caller
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
-   * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted - CLAUDE.md #6). Known intentional
-   * non-minting caller: `fortressExportBundle` in `dashboard/v1_1/wiring.ts`
-   * (the dashboard exit endpoint), whose omission is a custody boundary, not
-   * an oversight; must match the acknowledgement comment there.
+   * retained in inbox items must keep their metadata projection secret-free.
+   * The additive response-only HubOneTimeExport DTO in hub/types.ts is the
+   * dashboard delivery contract; must match dashboard/v1_1/wiring.ts.
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
    * `source_key_derivation` path).
    */
+  // Dashboard minting requires its request-scoped receiver; metadata-only callers leave mintStateRekeyKey unset.
   mintStateRekeyKey?: boolean;
   /**
    * Exit machinery Slice 1: ownership partition. When supplied, the encrypted-
