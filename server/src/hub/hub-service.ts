@@ -177,6 +177,7 @@ function snapshotForRecord(
   record: LocalAgentRecord,
   openInboxItemIds: string[],
 ): HubAgentStatusSnapshot {
+  // Snapshot fields must match the change comparison in agent-registry.ts put and binding updates.
   // Liveness aging: the stored `active` status is the last value written and is
   // never aged, so a dead agent would keep reading "Running / protected /
   // verified". Age a stale `active` (last_activity_at past the window) down to
@@ -214,6 +215,69 @@ export class HubService {
     this.inboxStore = new HubInboxStore();
     this.taskService = deps.taskService;
     this.concierge = deps.concierge;
+    const publisher = deps.streamPublisher;
+    if (publisher) {
+      // One synchronous attempt per mutation, no queue or retries; publication never re-enters aggregation.
+      this.inboxStore.subscribe((item) => this.publishStream(() => {
+        // Header only: loopback stream clients may lack inbox admission; details belong to the filtered refetch route.
+        // Must match dashboard/v1_1/client.ts inbox handler and extractStreamEventId in dashboard/v1_1/sse-events.ts:
+        // item_id, resolved and emitted_at dedupe together, then /inbox, /activity and /agents are refetched.
+        publisher.publishInbox({ item_id: item.item_id, kind: item.kind,
+          identity_id: item.identity_id, fortress_id: deps.fortressId,
+          emitted_at: this.nextInboxEmissionIso(), resolved: item.resolved });
+      }));
+      // The routes serve only this hub's identity (listAgents filters, getAgent refuses), so the stream never announces
+      // a record the operator's own console cannot list. A removal carries no record, so it publishes only for an id
+      // this hub has announced; the set is bounded by the registry size and seeded from the records present now.
+      const announcedAgentIds = new Set(
+        deps.agentRegistry.list({ identity_id: deps.identityId }).map((record) => record.agent_id),
+      );
+      deps.agentRegistry.subscribe?.((agentId, record) => this.publishStream(() => {
+        if (record) {
+          // A record that left the hub identity is dropped from the announced set so its later removal stays silent.
+          if (record.identity_id !== deps.identityId) { announcedAgentIds.delete(agentId); return; }
+          announcedAgentIds.add(agentId);
+        } else if (!announcedAgentIds.delete(agentId)) {
+          return;
+        }
+        // Open ids come from the store; Charter holds are route-only, so this list is a subset of the agents route's.
+        const openIds = this.inboxStore.list()
+          .filter((item) => !item.resolved && item.agent_id === agentId && item.identity_id === deps.identityId)
+          .map((item) => item.item_id);
+        // Removal invalidates the roster with unknown status; no record remains to attest activity, so last_activity_at
+        // carries the invalidation time and the consumer refetches the roster rather than trusting this snapshot.
+        publisher.publishAgentStatus(record ? snapshotForRecord(record, openIds) : {
+          version: "1.1", agent_id: agentId, status: "unknown",
+          last_activity_at: this.nowIso(), open_inbox_item_ids: openIds,
+        });
+      }));
+    }
+  }
+
+  private streamPublishErrors = 0;
+  private lastInboxEmissionMs = 0;
+
+  /**
+   * Strictly increasing per service: the client keys inbox frames on item, state and emission time (must match the
+   * inbox handler in dashboard/v1_1/client.ts and extractStreamEventId in dashboard/v1_1/sse-events.ts), so two frames
+   * for one item must never share a time even when the clock has not moved between a clear and a re-emission. Under a
+   * same-millisecond burst the stamp runs ahead of the clock by one millisecond per frame.
+   */
+  private nextInboxEmissionIso(): string {
+    const ms = Math.max(this.now().getTime(), this.lastInboxEmissionMs + 1);
+    this.lastInboxEmissionMs = ms;
+    return new Date(ms).toISOString();
+  }
+
+  /** Saturating count of failed best-effort stream attempts, with no retained payloads. */
+  get streamPublishErrorCount(): number { return this.streamPublishErrors; }
+
+  private publishStream(publish: () => void): void {
+    try { publish(); }
+    catch {
+      // Publication is observational: a failed sink must not fail the already committed mutation.
+      this.streamPublishErrors = Math.min(Number.MAX_SAFE_INTEGER, this.streamPublishErrors + 1);
+    }
   }
 
   // ── Internal helpers ────────────────────────────────────────────────

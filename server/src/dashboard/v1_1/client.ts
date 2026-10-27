@@ -7694,12 +7694,16 @@ function connectStream() {
         const item = JSON.parse(ev.data);
         if (isPendingApprovalsRedactedMarker(item)) {
           setInboxRedacted(item);
-          void queueStreamRefresh([HUB + "/inbox", HUB + "/activity"]);
+          void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]);
           return;
         }
-        if (state.seenEventIds.has(item.item_id)) return;
-        state.seenEventIds.add(item.item_id);
-        void queueStreamRefresh([HUB + "/inbox", HUB + "/activity"]);
+        // Must match extractStreamEventId in sse-events.ts: a resolution or re-emission of a known item carries a new
+        // state and emission time and must refetch; item_id alone would drop every frame after the first for that item.
+        // The agent snapshot carries open_inbox_item_ids, so an inbox change invalidates the agents panel as well.
+        const inboxKey = item.item_id + ":" + (item.resolved ? "resolved" : "open") + ":" + (item.emitted_at || "");
+        if (state.seenEventIds.has(inboxKey)) return;
+        state.seenEventIds.add(inboxKey);
+        void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("agent_status", function (ev) {
