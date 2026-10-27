@@ -717,9 +717,10 @@ export class HubService {
           try {
             // Revalidate after the approval wait so a stale card cannot restore an agent in another state.
             await this.assertCapability(this.getAgent(record.agent_id), action);
-            result = await this.deps.agentController.liftLockdown(
-              approvedItem.agent_id ?? record.agent_id,
-            );
+            // The lift acts on the record this handler just re-authorized, never on an id read off the
+            // approved card: the registry write and the audit rows below name record.agent_id, and a
+            // card naming another agent must not restore that agent's egress under this one's approval.
+            result = await this.deps.agentController.liftLockdown(record.agent_id);
           } catch (err) {
             if (err instanceof HubCapabilityError) {
               void this.deps.activitySources.auditLog.append(
