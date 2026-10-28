@@ -138,10 +138,11 @@ export class UnifiedInboxStore {
       ) {
         return null;
       }
-      // Must match cachePersistedEntry in unified-inbox-bridge.ts: invalid metadata reads as legacy.
+      // Must match cachePersistedEntry in unified-inbox-bridge.ts: invalid or non-blocked-egress metadata reads as legacy.
       const { blocked_egress, ...legacy } = persisted.entry;
-      const metadata = parseBlockedEgressMetadata(blocked_egress);
-      // A malformed stored claim is omitted in memory, never repaired or written back.
+      const metadata = parseBlockedEgressMetadata(legacy.source_class === "blocked_egress" ? blocked_egress : undefined);
+      // The encrypted store is fortress-owned; verified entries were written only from consumer-minted values.
+      // Reads omit malformed or wrong-source metadata; resolve later rewrites that sanitized entry.
       return metadata.ok ? { ...legacy, blocked_egress: metadata.value } : legacy;
     } catch {
       return null;

@@ -1,3 +1,4 @@
+import { readConsumerMintedBlockedEgress, type ConsumerMintedBlockedEgress } from "../castle-wall/runtime/audit-consumer.js";
 import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
 
 /**
@@ -203,7 +204,7 @@ export interface SentinelFindingIngest {
 }
 
 export interface BlockedEgressIngest {
-  /** Consumer-minted block evidence, parsed again at admission. */
+  /** Raw block evidence, parsed at admission and never accepted as verified. */
   blocked_egress?: BlockedEgressMetadata;
   source_event_id: string;
   agent_id?: string;
@@ -380,8 +381,19 @@ export class UnifiedInboxBridge {
     });
   }
 
-  ingestBlockedEgress(input: BlockedEgressIngest): UnifiedInboxEntry | null {
-    const metadata = parseBlockedEgressMetadata(input.blocked_egress);
+  ingestBlockedEgress(input: BlockedEgressIngest, minted?: ConsumerMintedBlockedEgress): UnifiedInboxEntry | null {
+    // Must match readConsumerMintedBlockedEgress in castle-wall/runtime/audit-consumer.ts: shape alone grants no producer credibility.
+    const projection = readConsumerMintedBlockedEgress(minted);
+    let metadata = parseBlockedEgressMetadata(projection?.metadata ?? input.blocked_egress);
+    if (!projection && metadata.ok && metadata.value.attribution.state === "verified") {
+      const { subject: _subject, ...unsigned } = metadata.value;
+      metadata = parseBlockedEgressMetadata({ ...unsigned, attribution: { ...unsigned.attribution, state: "unverified" } });
+    }
+    if (projection?.signedFields) {
+      // Display and dedup fields covered by verification come from the same signed snapshot as the metadata.
+      input = { ...input, ...projection.signedFields, agent_id: projection.signedFields.agent_id,
+        destination_category: projection.metadata.destination_host ?? projection.metadata.destination_ip ?? "unknown" };
+    }
     const summary = truncateSummary(
       `Egress to ${input.destination_category} blocked: ${input.block_reason_class}${input.agent_id ? ` (agent ${input.agent_id})` : ""}`,
     );
@@ -923,8 +935,8 @@ export class UnifiedInboxBridge {
         if (evicted) this.keyByInboxId.delete(evicted.inbox_id);
       }
     }
-    // Must match UnifiedInboxStore.get in unified-inbox-store.ts: invalid metadata reads as legacy.
-    const metadata = parseBlockedEgressMetadata(entry.blocked_egress);
+    // Must match UnifiedInboxStore.get in unified-inbox-store.ts: invalid or non-blocked-egress metadata reads as legacy.
+    const metadata = parseBlockedEgressMetadata(entry.source_class === "blocked_egress" ? entry.blocked_egress : undefined);
     const cached: UnifiedInboxEntry = {
       ...(metadata.ok ? { blocked_egress: metadata.value } : {}),
       inbox_id: entry.inbox_id,

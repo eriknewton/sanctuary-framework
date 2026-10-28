@@ -1,3 +1,4 @@
+import type { ConsumerMintedBlockedEgress } from "../castle-wall/runtime/audit-consumer.js";
 import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
 
 /**
@@ -26,12 +27,15 @@ export const PSI2_AUDIT_OPS = {
 export function ingestCastleWallBlockedEgress(params: {
   bridge: UnifiedInboxBridge;
   event: CastleWallAuditEvent;
-  /** Consumer-minted metadata, validated before bridge admission. */
+  /** Raw metadata cannot confer verified attribution. */
   blocked_egress?: BlockedEgressMetadata;
+  /** Opaque consumer mint forwarded to bridge admission without reconstructing it. */
+  minted?: ConsumerMintedBlockedEgress;
 }): UnifiedInboxEntry | null {
   const { event } = params;
   if (event.event_type !== "egress_blocked") return null;
   const host = event.destination?.host ?? event.destination?.ip ?? "unknown";
+  // Reasons and reason classes are envelope display data on both arms; verified never covers them.
   const reason =
     typeof event.details.reason === "string"
       ? event.details.reason
@@ -48,7 +52,7 @@ export function ingestCastleWallBlockedEgress(params: {
     destination_category: host,
     block_reason_class: reason,
     observed_at: event.timestamp,
-  });
+  }, params.minted);
 }
 
 export async function emitCastleWallBlockedEgress(params: {
@@ -56,8 +60,10 @@ export async function emitCastleWallBlockedEgress(params: {
   auditLog?: AuditLog;
   identityId: string;
   event: CastleWallAuditEvent;
-  /** Consumer-minted metadata, validated before bridge admission. */
+  /** Raw metadata cannot confer verified attribution. */
   blocked_egress?: BlockedEgressMetadata;
+  /** Opaque consumer mint forwarded to bridge admission without reconstructing it. */
+  minted?: ConsumerMintedBlockedEgress;
 }): Promise<UnifiedInboxEntry | null> {
   const entry = ingestCastleWallBlockedEgress(params);
   if (entry && params.auditLog) {

@@ -3,7 +3,7 @@ import {
   BLOCKED_EGRESS_HOST_MAX_CHARS, BLOCKED_EGRESS_LABEL_MAX_CHARS,
   BLOCKED_EGRESS_IP_MAX_CHARS, BLOCKED_EGRESS_METADATA_MAX_BYTES,
   parseBlockedEgressHost, parseBlockedEgressIp, parseBlockedEgressMetadata,
-  blockedEgressReasonClass,
+  BLOCKED_EGRESS_SUBJECT_MAX_CHARS,
 } from "../../src/contracts/v1.1/index.js";
 
 const attribution = {
@@ -53,7 +53,7 @@ describe("bounded blocked-egress parser", () => {
     const subject = "a".repeat(BLOCKED_EGRESS_METADATA_MAX_BYTES - Buffer.byteLength(prefix));
     const exact = JSON.stringify({ attribution, subject });
     expect(Buffer.byteLength(exact)).toBe(BLOCKED_EGRESS_METADATA_MAX_BYTES);
-    expect(parseBlockedEgressMetadata(exact).ok).toBe(true);
+    expect(parseBlockedEgressMetadata(exact)).toEqual({ ok: false, reason: "invalid_subject" });
     expect(parseBlockedEgressMetadata({ attribution, subject: subject + "a" })).toEqual({ ok: false, reason: "too_large" });
     expect(parseBlockedEgressMetadata({ attribution, subject: "é".repeat(subject.length) })).toEqual({ ok: false, reason: "too_large" });
   });
@@ -98,21 +98,32 @@ describe("bounded blocked-egress parser", () => {
     const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
     expect(parseBlockedEgressMetadata(cyclic)).toEqual({ ok: false, reason: "malformed" });
   });
-  it("maps only verified policy failures to the coarse policy reason", () => {
-    const outcome = (kind: string, result: string, provenance: unknown, operation = "egress_blocked") => ({
-      kind, signedBody: { operation, result, details: { decision_provenance: provenance, reason: "private", rule_id: "private" } },
-    });
-    for (const provenance of ["default_deny", "static_rule"]) {
-      for (const result of ["failure", "blocked"]) {
-        expect(blockedEgressReasonClass(outcome("verified", result, provenance))).toBe("egress_policy_deny");
-      }
+  it.each(["0177.0.0.1", "192.168.001.1", "0x7f.0.0.1", "0X7f.0.0.1", "2130706433", "127.1", "0x7f000001", "01.2.3.4", "a.123", "a.0Xff.example"])("refuses numeric IPv4 host form %s", (host) => {
+    expect(parseBlockedEgressHost(host)).toEqual({ ok: false, reason: "literal_ip" });
+  });
+  it.each(["a1.example", "1a.example"])("accepts ordinary digit-bearing name %s", (host) => {
+    expect(parseBlockedEgressHost(host)).toEqual({ ok: true, value: host });
+  });
+  it("bounds subjects and refuses controls and markup", () => {
+    const subject = "a".repeat(BLOCKED_EGRESS_SUBJECT_MAX_CHARS);
+    expect(parseBlockedEgressMetadata({ attribution, subject })).toEqual({ ok: true, value: { attribution, subject } });
+    for (const bad of [subject + "a", "x\0", "x\n", "x\t", "x\x7f", "<x>", "é"]) {
+      expect(parseBlockedEgressMetadata({ attribution, subject: bad })).toEqual({ ok: false, reason: "invalid_subject" });
     }
-    for (const raw of [undefined, {}, { kind: "verified", signedBody: null },
-      outcome("unsigned", "failure", "default_deny"), outcome("rejected", "failure", "static_rule"),
-      outcome("verified", "success", "default_deny"), outcome("verified", "unknown", "static_rule"),
-      outcome("verified", "failure", "unknown"), outcome("verified", "failure", null),
-      outcome("verified", "failure", "static_rule", "egress_approved")]) {
-      expect(blockedEgressReasonClass(raw)).toBe("other");
-    }
+  });
+  it("bounds object work before serialization without invoking getters or toJSON", () => {
+    const stringify = vi.spyOn(JSON, "stringify");
+    const getter = vi.fn(() => "secret");
+    const toJSON = vi.fn(() => ({}));
+    try {
+      expect(parseBlockedEgressMetadata({ attribution, subject: "a".repeat(BLOCKED_EGRESS_METADATA_MAX_BYTES + 1) })).toEqual({ ok: false, reason: "too_large" });
+      expect(parseBlockedEgressMetadata(Object.fromEntries(Array.from({ length: 10000 }, (_, i) => [String(i), "x"])))).toEqual({ ok: false, reason: "unknown_field" });
+      expect(parseBlockedEgressMetadata(Object.defineProperty({}, "subject", { enumerable: true, get: getter }))).toEqual({ ok: false, reason: "malformed" });
+      expect(parseBlockedEgressMetadata({ toJSON })).toEqual({ ok: false, reason: "malformed" });
+      expect(parseBlockedEgressMetadata(new Date(0))).toEqual({ ok: false, reason: "type" });
+      expect(stringify).not.toHaveBeenCalled();
+      expect(getter).not.toHaveBeenCalled();
+      expect(toJSON).not.toHaveBeenCalled();
+    } finally { stringify.mockRestore(); }
   });
 });

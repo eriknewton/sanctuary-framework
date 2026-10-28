@@ -98,7 +98,7 @@ async function auditOps(auditLog: AuditLog): Promise<string[]> {
   return result.entries.map((e: AuditEntry) => e.operation);
 }
 
-describe("Psi-1 — per-source-class ingest", () => {
+describe("Psi-1 - per-source-class ingest", () => {
   it("ingestApproval normalizes into a UnifiedInboxEntry", () => {
     const { bridge } = makeBridge();
     const entry = bridge.ingestApproval({
@@ -225,7 +225,7 @@ describe("Psi-1 — per-source-class ingest", () => {
   });
 });
 
-describe("Psi-1 — deduplication", () => {
+describe("Psi-1 - deduplication", () => {
   it("same (source_class, source_event_id) ingested twice produces one entry + a DEDUPED audit event", async () => {
     const { bridge, auditLog } = makeBridge();
     const first = bridge.ingestApproval({
@@ -248,7 +248,7 @@ describe("Psi-1 — deduplication", () => {
     expect(ops).toContain(UNIFIED_INBOX_AUDIT_OPS.DEDUPED);
   });
 
-  it("dedup is per source_class — same source_event_id across classes co-exists", () => {
+  it("dedup is per source_class - same source_event_id across classes co-exists", () => {
     const { bridge } = makeBridge();
     bridge.ingestApproval({
       source_event_id: "shared-id",
@@ -267,7 +267,7 @@ describe("Psi-1 — deduplication", () => {
   });
 });
 
-describe("Psi-1 — HTTP routes", () => {
+describe("Psi-1 - HTTP routes", () => {
   it("GET /api/inbox/unified lists entries and supports source_class + severity filters", async () => {
     const { bridge } = makeBridge();
     bridge.ingestApproval({
@@ -457,7 +457,7 @@ describe("Psi-1 — HTTP routes", () => {
   });
 });
 
-describe("Psi-1 — subscribers + audit + multi-fortress + Castle-walking", () => {
+describe("Psi-1 - subscribers + audit + multi-fortress + Castle-walking", () => {
   it("subscribers receive ingested + resolved events", () => {
     const { bridge } = makeBridge();
     const events: UnifiedInboxBridgeEvent[] = [];
@@ -538,7 +538,7 @@ import { ingestCastleWallBlockedEgress } from "../../src/principal-policy/unifie
 import { buildAuditEvent } from "../../src/castle-wall/audit/builder.js";
 
 describe("structured blocked-egress bridge admission", () => {
-  it.each(["verified", "unverified"] as const)("retains %s metadata without changing legacy projection fields", (state) => {
+  it.each(["verified", "unverified"] as const)("downgrades raw %s claims without changing legacy projection fields", (state) => {
     const { bridge } = makeBridge();
     const { bridge: legacy } = makeBridge();
     const event = buildAuditEvent({
@@ -552,12 +552,21 @@ describe("structured blocked-egress bridge admission", () => {
     };
     const entry = ingestCastleWallBlockedEgress({ bridge, event, blocked_egress: metadata })!;
     const old = ingestCastleWallBlockedEgress({ bridge: legacy, event })!;
-    expect(entry.blocked_egress).toEqual(metadata);
-    expect(bridge.get(entry.inbox_id)?.blocked_egress).toEqual(metadata);
+    const expected = { ...metadata, attribution: { ...metadata.attribution, state: "unverified" } };
+    expect(entry.blocked_egress).toEqual(expected);
+    expect(bridge.get(entry.inbox_id)?.blocked_egress).toEqual(expected);
     expect(entry.summary).toBe(old.summary);
     expect(entry.summary).toBe("Egress to legacy.example blocked: original reason");
     expect(entry.source_event_id).toBe(old.source_event_id);
     expect(entry.severity).toBe(old.severity);
+  });
+
+  it("refuses a caller-built mint and removes its claimed subject", () => {
+    const { bridge } = makeBridge();
+    const blocked_egress = { subject: "forged-subject", destination_host: "forged.example",
+      attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state: "verified" } as const };
+    const entry = bridge.ingestBlockedEgress({ source_event_id: "forged", destination_category: "legacy.example", block_reason_class: "other", observed_at: OBSERVED_AT, blocked_egress }, { metadata: blocked_egress } as never)!;
+    expect(entry.blocked_egress).toEqual({ destination_host: "forged.example", attribution: { ...blocked_egress.attribution, state: "unverified" } });
   });
 
   it("preserves unknown host fallback and omits invalid metadata", () => {

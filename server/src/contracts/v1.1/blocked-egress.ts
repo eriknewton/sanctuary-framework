@@ -9,6 +9,9 @@ export const BLOCKED_EGRESS_IP_MAX_CHARS = 45;
 /** 2048 bytes = the design's 2 KiB encoded metadata budget. */
 export const BLOCKED_EGRESS_METADATA_MAX_BYTES = 2048;
 
+/** 64 = a 32-byte audit token in hex; also fits the minted identity hex + /uid- + uint32 (32 + 5 + 10; core/identity.ts). */
+export const BLOCKED_EGRESS_SUBJECT_MAX_CHARS = 64;
+
 /** Closed diagnostics never include rejected destination text. */
 export type BlockedEgressParseReason =
   | "type" | "too_long" | "invalid_host" | "literal_ip" | "invalid_ip"
@@ -25,8 +28,13 @@ export function parseBlockedEgressHost(raw: unknown): BlockedEgressParseResult<s
   if (raw.length > BLOCKED_EGRESS_HOST_MAX_CHARS) return { ok: false, reason: "too_long" };
   if (raw.length === 0 || /[^A-Za-z0-9.-]/.test(raw)) return { ok: false, reason: "invalid_host" };
   const name = raw.endsWith(".") ? raw.slice(0, -1) : raw;
+  const labels = name.split(".");
+  // Numeric final labels and hex-prefixed labels can be interpreted as inet_aton IPv4, never DNS names.
+  if (/^[0-9]+$/.test(labels[labels.length - 1]!) || labels.some((label) => /^0x/i.test(label))) {
+    return { ok: false, reason: "literal_ip" };
+  }
   if (isIP(name)) return { ok: false, reason: "literal_ip" };
-  if (name.split(".").some((label) =>
+  if (labels.some((label) =>
     label.length === 0 || label.length > BLOCKED_EGRESS_LABEL_MAX_CHARS ||
     label.startsWith("-") || label.endsWith("-"))) {
     return { ok: false, reason: "invalid_host" };
@@ -42,7 +50,14 @@ export function parseBlockedEgressIp(raw: unknown): BlockedEgressParseResult<str
   return { ok: true, value: raw };
 }
 
-/** Producer verification is separate from operation success and enrolled-agent binding. */
+/**
+ * Verified carries the pinned Castle Wall producer's credibility only for signed
+ * destination host/IP, signed agent_id and timestamp, signature-bound seq, and
+ * the consumer subject derived from signed agent_id (local fortress scope) or
+ * signed identity_id. It does not vouch for reason, reason class, severity, or
+ * any other envelope field, nor does it prove operation success or enrollment.
+ * Must match blockedEgressMetadataFor in castle-wall/runtime/audit-consumer.ts.
+ */
 // Must match the attribution field in hub-events.ts; both use this shared type.
 export interface BlockedEgressAttribution {
   subject: "castle_wall_producer";
@@ -66,16 +81,23 @@ function record(raw: unknown): raw is Record<string, unknown> {
 
 /** Validate either encoded JSON or an object, returning a detached, complete metadata value. */
 export function parseBlockedEgressMetadata(raw: unknown): BlockedEgressParseResult<BlockedEgressMetadata> {
-  let value: unknown = raw;
+  let value: unknown;
   try {
-    const encoded = typeof raw === "string" ? raw : JSON.stringify(raw);
-    if (encoded === undefined) return { ok: false, reason: "type" };
-    // Reject oversized encodings before JSON parsing or field validation.
-    if (encoded.length > BLOCKED_EGRESS_METADATA_MAX_BYTES ||
-        Buffer.byteLength(encoded, "utf8") > BLOCKED_EGRESS_METADATA_MAX_BYTES) {
-      return { ok: false, reason: "too_large" };
+    if (typeof raw === "string") {
+      // Bound the encoding before parsing attacker-selected text.
+      if (raw.length > BLOCKED_EGRESS_METADATA_MAX_BYTES || Buffer.byteLength(raw, "utf8") > BLOCKED_EGRESS_METADATA_MAX_BYTES) {
+        return { ok: false, reason: "too_large" };
+      }
+      value = JSON.parse(raw);
+    } else {
+      // Copy only bounded plain data before serialization; getters and toJSON never execute.
+      const copied = boundedMetadataCopy(raw);
+      if (!copied.ok) return copied;
+      value = copied.value;
+      if (Buffer.byteLength(JSON.stringify(value), "utf8") > BLOCKED_EGRESS_METADATA_MAX_BYTES) {
+        return { ok: false, reason: "too_large" };
+      }
     }
-    if (typeof raw === "string") value = JSON.parse(raw);
   } catch {
     return { ok: false, reason: "malformed" };
   }
@@ -110,7 +132,7 @@ export function parseBlockedEgressMetadata(raw: unknown): BlockedEgressParseResu
   }
   if ("subject" in value) {
     // Only authenticated subject bindings may survive into structured metadata.
-    if (attribution.state !== "verified" || typeof value.subject !== "string" || value.subject.length === 0) {
+    if (attribution.state !== "verified" || !isBlockedEgressSubject(value.subject)) {
       return { ok: false, reason: "invalid_subject" };
     }
     out.subject = value.subject;
@@ -118,12 +140,45 @@ export function parseBlockedEgressMetadata(raw: unknown): BlockedEgressParseResu
   return { ok: true, value: out };
 }
 
-/** Map an already verified consumer outcome; this function does not verify signatures itself. */
-export function blockedEgressReasonClass(signedEvent: unknown): "egress_policy_deny" | "other" {
-  // Must match SignatureOutcome in castle-wall/runtime/audit-consumer.ts; only its verified arm carries signedBody.
-  if (!record(signedEvent) || signedEvent.kind !== "verified" || !record(signedEvent.signedBody)) return "other";
-  const body = signedEvent.signedBody;
-  if (body.operation !== "egress_blocked" || (body.result !== "failure" && body.result !== "blocked") || !record(body.details)) return "other";
-  return body.details.decision_provenance === "default_deny" || body.details.decision_provenance === "static_rule"
-    ? "egress_policy_deny" : "other";
+/** Bound display subjects independently of the whole metadata budget. */
+export function isBlockedEgressSubject(raw: unknown): raw is string {
+  // Signed text is still untrusted display data; reject controls and markup before projection.
+  return typeof raw === "string" && raw.length > 0 && raw.length <= BLOCKED_EGRESS_SUBJECT_MAX_CHARS &&
+    !/[^\x20-\x7e]|[<>]/.test(raw);
+}
+
+function boundedMetadataCopy(raw: unknown): BlockedEgressParseResult<unknown> {
+  // Metadata and attribution each have four fields and at most two object levels.
+  const MAX_FIELDS = 4;
+  const MAX_OBJECT_DEPTH = 2;
+  let remaining = BLOCKED_EGRESS_METADATA_MAX_BYTES;
+  function copy(value: unknown, depth: number): BlockedEgressParseResult<unknown> {
+    if (!record(value) || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+      return { ok: false, reason: "type" };
+    }
+    if (depth > MAX_OBJECT_DEPTH) return { ok: false, reason: "malformed" };
+    const out: Record<string, unknown> = Object.create(null);
+    let count = 0;
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      if (++count > MAX_FIELDS) return { ok: false, reason: "unknown_field" };
+      remaining -= key.length;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) return { ok: false, reason: "malformed" };
+      const item: unknown = descriptor.value;
+      if (typeof item === "string") remaining -= item.length;
+      if (remaining < 0) return { ok: false, reason: "too_large" };
+      if (record(item)) {
+        const nested = copy(item, depth + 1);
+        if (!nested.ok) return nested;
+        out[key] = nested.value;
+      } else if (item === null || item === undefined || ["string", "number", "boolean"].includes(typeof item)) {
+        out[key] = item;
+      } else {
+        return { ok: false, reason: key === "attribution" ? "invalid_attribution" : "malformed" };
+      }
+    }
+    return { ok: true, value: out };
+  }
+  return copy(raw, 1);
 }

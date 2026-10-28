@@ -256,7 +256,7 @@ export interface HubBlockedEgressItem extends HubInboxItemHeader {
   /** Whether a verified subject has one same-owner enrolled agent match. */
   agent_binding?: "bound" | "unattributed";
   /**
-   * This attribution carries the enrolled Castle Wall producer's credibility: verified means its signature and signed event semantics verified against the enrolled daemon key; operation success is not producer verification.
+   * Verified covers signed host/IP, agent_id, timestamp, signature-bound seq, and the consumer-derived subject only. Reason fields and other envelope data are unsigned; producer credibility is not operation success.
    * Legacy absence is unverified. Must match BlockedEgressAttribution in blocked-egress.ts.
    */
   attribution?: BlockedEgressAttribution;
