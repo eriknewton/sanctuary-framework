@@ -18,7 +18,7 @@
  *     `storage_not_transactional` before touching the store (IC-27).
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
@@ -39,7 +39,8 @@ import {
 } from "../../src/core/signing-domains.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import { DEFAULT_POLICY, generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js";
+import { fixedDenial } from "../../src/agent-native/safety-base.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { fromBase64url } from "../../src/core/encoding.js";
@@ -211,6 +212,223 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
     if (savedAgentId === undefined) delete process.env.SANCTUARY_AGENT_ID;
     else process.env.SANCTUARY_AGENT_ID = savedAgentId;
     await home.cleanup();
+  });
+
+  describe("IC-15: import reference refusals preserve audit evidence before approval", () => {
+    const bundleMarker = "private-bundle-marker-packet-11";
+    const sourceRefMarker = "private-source-ref-marker-packet-11";
+    const nonStringReferences = [
+      { label: "null", value: null, violation: 'Required field "source_key_ref" is missing' },
+      // One is an arbitrary non-string input, not a boundary or a quota.
+      { label: "number", value: 1, violation: 'Expected string for "source_key_ref", got number' },
+      { label: "object", value: { marker: sourceRefMarker }, violation: 'Expected string for "source_key_ref", got object' },
+      { label: "undefined", value: undefined, violation: 'Required field "source_key_ref" is missing' },
+    ];
+
+    async function withImportFixture(
+      run: (fixture: Awaited<ReturnType<typeof createImportFixture>>) => Promise<void>,
+    ) {
+      const previousAgentId = process.env.SANCTUARY_AGENT_ID;
+      let fixture: Awaited<ReturnType<typeof createImportFixture>> | undefined;
+      try {
+        fixture = await createImportFixture();
+        await run(fixture);
+      } finally {
+        try {
+          await fixture?.cleanup();
+        } finally {
+          if (previousAgentId === undefined) delete process.env.SANCTUARY_AGENT_ID;
+          else process.env.SANCTUARY_AGENT_ID = previousAgentId;
+        }
+      }
+    }
+
+    async function createImportFixture() {
+      // Owner-only policy permissions match the file created by the server.
+      await writeFile(
+        join(home.defaultFortressPath, "principal-policy.yaml"),
+        generateDefaultPolicyYaml().replace(
+          /approval_channel:\n  type: \w+/,
+          "approval_channel:\n  type: callback",
+        ),
+        { mode: 0o600 },
+      );
+      const approvalCallback = vi.fn(async () => ({
+        decision: "deny" as const,
+        decided_at: "2026-10-27T00:00:00.000Z",
+        decided_by: "human" as const,
+      }));
+      const sdwTransaction = vi.fn(async () => {
+        throw new Error("Import must be refused before a transaction");
+      });
+      const storage = Object.assign(new MemoryStorage(), { sdwTransaction });
+      process.env.SANCTUARY_AGENT_ID = wrappedAgentId("claude-code", home.defaultFortressPath);
+      const runtime = await createSanctuaryServer({
+        storage,
+        passphrase: "vault-wiring-empty-source-key-ref",
+        approvalCallback,
+      });
+      try {
+        // The positive control must verify with the production identity resolver.
+        const encryptionKey = derivePurposeKey(runtime.masterKey, IDENTITY_ENCRYPTION_PURPOSE);
+        const { storedIdentity } = createIdentity("import-control", encryptionKey, "passphrase");
+        await storage.write(
+          "_identities",
+          storedIdentity.identity_id,
+          stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(storedIdentity)), encryptionKey))),
+        );
+        await runtime.identityManager.load();
+        const signingKey = {
+          keyRef: storedIdentity.identity_id,
+          encryptedPrivateKey: storedIdentity.encrypted_private_key,
+          encryptionKey,
+        };
+        const source = { listNamespaceSync: () => [] };
+        const { bundle } = buildSignedSdwExportBundle({
+          inventory: enumerateSdwExportInventory(source),
+          source,
+          fortressId: bundleMarker,
+          exportAuditEventId: sourceRefMarker,
+          signingKey,
+          now: "2026-10-27T00:00:00.000Z",
+        });
+        const encodedBundle = toBase64url(stringToBytes(JSON.stringify(bundle)));
+        const importTool = createSdwTools({
+          storage,
+          inventory: source,
+          auditLog: runtime.auditLog,
+          fortressId: "fortress:reference-test",
+          exportDir: join(home.defaultFortressPath, "sdw-exports"),
+          signingKey,
+          resolvePublicKey: (ref) => ref === storedIdentity.identity_id ? fromBase64url(storedIdentity.public_key) : null,
+          resolveSourceMasterKey: () => runtime.masterKey,
+          targetMasterKey: runtime.masterKey,
+        }).find((tool) => tool.name === "sdw_import")!;
+        return { ...runtime, approvalCallback, sdwTransaction, encodedBundle, importTool };
+      } catch (error) {
+        await runtime.cleanup();
+        throw error;
+      }
+    }
+
+    async function refusalEvidence(fixture: Awaited<ReturnType<typeof createImportFixture>>) {
+      const denials = await auditOps(fixture.auditLog, "sdw_import_denied");
+      const { entries } = await fixture.auditLog.query({});
+      const serializedRows = JSON.stringify(denials);
+      return {
+        denials,
+        // Negative one selects the newest row in the oldest-first query.
+        lastEntry: entries.at(-1),
+        containsBundleBytes: serializedRows.includes(fixture.encodedBundle),
+        containsBundleMarker: serializedRows.includes(bundleMarker),
+        containsSourceRefMarker: serializedRows.includes(sourceRefMarker),
+        approvalPrompts: fixture.approvalCallback.mock.calls,
+        // These are the actual gate decision operations; imports have no scope-approved operation.
+        scopeApprovals: entries.filter((entry) =>
+          entry.operation === "gate_approve:sdw_import" || entry.operation === "gate_approval_proof:sdw_import"),
+        transactions: fixture.sdwTransaction.mock.calls,
+      };
+    }
+
+    function expectedRefusalEvidence() {
+      // Subject: this refused call, attributed to the local system, never the caller's credibility.
+      // Evidence: the tool's reference check supplies operation/result/details; layer names its subsystem.
+      // The audit writer supplies timestamp; query verifies the persisted chain before returning the row.
+      // No subject/evidence/contributor fields or caller payload may extend this exact six-field row.
+      const row = {
+        timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+        layer: "l1",
+        operation: "sdw_import_denied",
+        identity_id: "system",
+        result: "failure",
+        details: { denial_class: "invalid_source_key_ref" },
+      };
+      return {
+        denials: [row],
+        lastEntry: row,
+        containsBundleBytes: false,
+        containsBundleMarker: false,
+        containsSourceRefMarker: false,
+        approvalPrompts: [],
+        scopeApprovals: [],
+        transactions: [],
+      };
+    }
+
+    // Path table: empty ref reaches the hook and audits; non-strings stop at schema validation.
+    // Direct hook callers also audit non-strings. Valid ref + verified manifest continues to
+    // exactly one prompt; the control's human denial prevents the handler and transaction.
+    it("records the whole empty-reference denial before returning without approval", async () => {
+      await withImportFixture(async (fixture) => {
+        const result = await callTool(fixture.server, "sdw_import", {
+          bundle: fixture.encodedBundle,
+          source_key_ref: "",
+        });
+        // Every string contains the empty string: exact row equality excludes source_key_ref,
+        // while the bundle plants both nonempty markers for meaningful whole-row leak checks.
+        expect({ result, ...await refusalEvidence(fixture) }).toEqual({
+          result: fixedDenial("audit:gate:sdw_import", "unavailable", null),
+          ...expectedRefusalEvidence(),
+        });
+      });
+    });
+
+    it("control: a valid reference and verified manifest reach exactly one approval prompt", async () => {
+      await withImportFixture(async (fixture) => {
+        const result = await callTool(fixture.server, "sdw_import", {
+          bundle: fixture.encodedBundle,
+          source_key_ref: "this-fortress",
+        });
+        expect(fixture.approvalCallback).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+          operation: "sdw_import",
+          tier: 1,
+        }));
+        expect({
+          result,
+          gateDenials: (await auditOps(fixture.auditLog, "gate_deny:sdw_import")).map((row) => row.result),
+          importDenials: await auditOps(fixture.auditLog, "sdw_import_denied"),
+          transactions: fixture.sdwTransaction.mock.calls,
+        }).toEqual({
+          result: fixedDenial("audit:gate:sdw_import", "unavailable", null),
+          gateDenials: ["failure"],
+          importDenials: [],
+          transactions: [],
+        });
+      });
+    });
+
+    it.each(nonStringReferences)("control: the router refuses $label references at schema validation", async ({ value, violation }) => {
+      await withImportFixture(async (fixture) => {
+        // The shipping schema rejects all four cases before approvalTargetArgs, including undefined.
+        expect(await callTool(fixture.server, "sdw_import", {
+          bundle: fixture.encodedBundle,
+          source_key_ref: value,
+        })).toEqual({
+          error: "validation_failed",
+          message: "Tool arguments failed schema validation",
+          violations: [{ field: "source_key_ref", message: violation }],
+        });
+        expect({
+          denials: await auditOps(fixture.auditLog, "sdw_import_denied"),
+          approvalPrompts: fixture.approvalCallback.mock.calls,
+          transactions: fixture.sdwTransaction.mock.calls,
+        }).toEqual({ denials: [], approvalPrompts: [], transactions: [] });
+      });
+    });
+
+    it.each(nonStringReferences)("records the whole $label reference denial for direct approval-hook callers", async ({ value }) => {
+      await withImportFixture(async (fixture) => {
+        // Direct callers bypass schema validation; this hook throws, it does not serve an MCP response.
+        const error = await Promise.resolve(fixture.importTool.approvalTargetArgs!({
+          bundle: fixture.encodedBundle,
+          source_key_ref: value,
+        })).catch((caught: unknown) => caught);
+        expect({ error, ...await refusalEvidence(fixture) }).toEqual({
+          error: expect.objectContaining({ category: "invalid_identifier" }),
+          ...expectedRefusalEvidence(),
+        });
+      });
+    });
   });
 
   it("sanctuary wrap writes SANCTUARY_AGENT_ID into the MCP entry env, distinct per harness and per fortress", () => {

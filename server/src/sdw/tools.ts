@@ -648,6 +648,8 @@ function buildSdwTools(
       }
       const sourceKeyRef = args.source_key_ref;
       if (typeof sourceKeyRef !== "string" || sourceKeyRef.length === 0) {
+        // Audit before throwing because the router's fixed denial would otherwise leave this refusal invisible in the audit log.
+        await auditFailure("sdw_import_denied", { denial_class: "invalid_source_key_ref" });
         // Fail closed pre-prompt; the router converts the throw to the fixed
         // denial without prompting.
         throw new SdwValidationError(
