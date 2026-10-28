@@ -48,10 +48,14 @@ async function journal(r: Awaited<ReturnType<typeof rig>>, value: unknown) {
 }
 // Snapshot names, modes, ownership and bytes without following a malformed root symlink.
 async function treeSnapshot(path: string): Promise<unknown> {
-  const link = await lstat(path);
-  if (link.isSymbolicLink()) return { mode: link.mode, uid: link.uid, ino: link.ino, target: await readlink(path) };
   // Identity and bytes come from one no-follow descriptor, so they always describe the same inode (no check-then-read race).
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  // A symlink as the final component refuses the open with ELOOP; only then is the link itself described.
+  let handle;
+  try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ELOOP") throw error;
+    const target = await readlink(path); const link = await lstat(path);
+    return { mode: link.mode, uid: link.uid, ino: link.ino, target };
+  }
   try {
     const stat = await handle.stat();
     const identity = { mode: stat.mode, uid: stat.uid, ino: stat.ino };
