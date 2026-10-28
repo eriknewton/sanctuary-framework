@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { approvalHoldRig } from './approval-hold-rig.js';
+import { HubApprovalRefusalError, type ApprovalRefusal } from '../../../src/hub/errors.js';
 import * as dashboardModule from '../../../src/principal-policy/dashboard.js';
 
 let rig: Awaited<ReturnType<typeof approvalHoldRig>> | undefined;
@@ -112,12 +113,31 @@ it('redacts expiry stream frames for a loopback-position reader', async () => {
   const reading = (async () => { try { while (true) { const next = await reader.read(); if (next.done) break; frames += new TextDecoder().decode(next.value); } } catch { /* Abort owns teardown. */ } })();
   try {
     const first = await held();
+    await vi.waitFor(() => expect(frames).toContain('event: approval'));
     frames = '';
     await first.result;
-    await vi.waitFor(() => expect(frames).toContain('"pending_approvals_count":0'));
+    await vi.waitFor(() => expect(frames).toContain('event: approval'));
+    const data = JSON.parse(frames.split('event: approval\ndata: ')[1]!.split('\n\n')[0]!);
+    const inspect = rig.channel as unknown as { pendingApprovalRedactionCount(): number; redactLegacySSEDataForAdmission(event: string, data: unknown, admission: string): unknown };
+    expect(data.pending_approvals_count).toBe(inspect.pendingApprovalRedactionCount());
+    expect(inspect.redactLegacySSEDataForAdmission('request-resolved', {}, 'loopback_position')).toEqual(data);
     expect(frames).toContain('event: approval');
     expect(frames).not.toContain(first.item.item_id.replace('charter.approval.', ''));
     expect(frames).not.toContain('memory_insert');
     expect(frames).not.toContain('operator_preview');
   } finally { controller.abort(); await reading; }
+});
+
+it.each([
+  { public_code: 'approval_expired', expired_after_seconds: 'PRIVATE-KEY' },
+  { public_code: 'approval_expired', expired_after_seconds: -1 },
+  { public_code: 'approval_already_decided', decided_at: 'PRIVATE-KEY', decided_by: 'human' },
+  { public_code: 'approval_already_decided', decided_at: '2026-10-28T12:00:00.000Z', decided_by: 'PRIVATE-KEY' },
+])('scrubs an approval refusal with invalid fields %j', async fields => {
+  rig = await approvalHoldRig();
+  const error = new HubApprovalRefusalError(fields as unknown as ApprovalRefusal);
+  error.message = 'PRIVATE-KEY';
+  vi.spyOn(rig.bindings.hubService, 'resolveInboxItem').mockRejectedValue(error);
+  const answer = await decide('charter.approval.invalid');
+  expect(answer).toEqual({ status: 500, body: { error: 'internal_error' } });
 });

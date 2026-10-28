@@ -5607,7 +5607,7 @@ const APPROVAL_DEADLINE_RETRY_MS = 5 * 1000; // One retry after the ordinary fiv
 function confirmApprovalClose(close) {
   // Must match request-resolved projection in principal-policy/dashboard.ts; only a timeout denial permits automatic-denial wording.
   if (!close || close.resolved !== true || close.decision !== "deny" || close.decided_by !== "timeout" || typeof close.id !== "string") return;
-  const id = "charter.approval." + close.id;
+  const id = CHARTER_APPROVAL_ITEM_ID_PREFIX + close.id;
   const item = state.inbox.find(function (entry) { return entry.item_id === id; }) || (expiredApprovalSelection && expiredApprovalSelection.item_id === id ? expiredApprovalSelection : null);
   if (!item) return;
   item.timeoutConfirmed = true;
@@ -8056,7 +8056,8 @@ function bindHashRoute() {
   window.addEventListener("pagehide", function () {
     clearExitRekey();
     if (approvalDeadlineTimer !== null) clearTimeout(approvalDeadlineTimer);
-  if (approvalDeadlineRetryTimer !== null) clearTimeout(approvalDeadlineRetryTimer);
+    if (approvalDeadlineRetryTimer !== null) clearTimeout(approvalDeadlineRetryTimer);
+    expiredApprovalSelection = null;
     if (disposeStream) disposeStream();
     if (recoveryProbeTimer !== null) clearTimeout(recoveryProbeTimer);
     recoveryProbeTimer = null;

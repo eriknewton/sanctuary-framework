@@ -518,6 +518,8 @@ export async function handleHubRoute(
             catch (writeError) { throw scrubbedDecisionError(writeError); }
             return true;
           }
+          // Invalid typed metadata is an internal failure; neither its claimed status nor its fields authorize a public refusal.
+          error = new Error("invalid approval refusal");
         }
         const refusal = inboxMatch.action === "approve" ? approvedLiftRefusal(approvalCategory, error) : undefined;
         if (refusal) {

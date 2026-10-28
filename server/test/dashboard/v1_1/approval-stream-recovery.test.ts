@@ -47,7 +47,7 @@ function harness(options: { deferDeadlines?: boolean } = {}) {
     querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} },
   };
   const context = createContext({
-    document, window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
+    document, window: { addEventListener: (event: string, listener: () => void) => { listeners[event] = listener; } }, location: { hash: "", search: "", origin: "http://fixture" },
     sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, TextDecoder, Date,
     // Defer deadline delivery beyond two more steady ticks while transport remains pending.
     setTimeout: (callback: () => void, delay: number) => setTimeout(callback,
@@ -72,7 +72,7 @@ function harness(options: { deferDeadlines?: boolean } = {}) {
     finally { deferCurrentReadDeadline = false; }
   };
   const read = (expression: string) => runInContext(expression, context);
-  return { calls, overrides, streams, main, fortress, read,
+  return { calls, overrides, streams, main, fortress, read, pagehide: () => listeners.pagehide(),
     count: (path: string) => calls.filter(call => call.path === path).length,
     visibility: (value: string) => { document.visibilityState = value; listeners.visibilitychange(); },
   };
@@ -195,4 +195,31 @@ it.each([-6, 6])("uses server time with a %i minute browser skew and waits for a
   await vi.advanceTimersByTimeAsync(20 * SECOND_MS);
   // The stream itself invalidates once; deadline processing admits at most one read and one retry.
   expect(h.count("/api/hub/inbox") - earlyReads).toBeLessThanOrEqual(3);
+});
+
+it.each([
+  { decision: "approve", decided_by: "human" },
+  { decision: "deny", decided_by: "human" },
+  { decision: "deny" },
+  { decision: "deny", decided_by: "untrusted" },
+])("does not infer a timeout from close metadata %j", async close => {
+  const h = await connected();
+  const item = { item_id: "charter.approval.human", resolved: false, created_at: new Date(Date.now() - SECOND_MS).toISOString(), expires_at: new Date().toISOString() };
+  h.read('applyInboxPayload(' + JSON.stringify({ items: [item], server_now: new Date().toISOString() }) + ')');
+  h.streams[0].frame("approval", { id: "human", resolved: true, ...close });
+  expect(h.read('state.inbox[0].timeoutConfirmed')).toBeUndefined();
+  expect(h.read('approvalCountdownHtml(state.inbox[0])')).not.toContain("denied automatically");
+  expect(h.read('expiredApprovalSelection')).toBeNull();
+});
+
+it("pagehide clears the retained closed card before back-forward restoration", async () => {
+  const h = await connected();
+  const item = { item_id: "charter.approval.hidden", resolved: false, created_at: new Date(Date.now() - SECOND_MS).toISOString(), expires_at: new Date().toISOString() };
+  h.read('applyInboxPayload(' + JSON.stringify({ items: [item], server_now: new Date().toISOString() }) + '); state.approvals.selectedId = "charter.approval.hidden"');
+  h.streams[0].frame("approval", { id: "hidden", resolved: true, decision: "deny", decided_by: "timeout" });
+  expect(h.read('expiredApprovalSelection.timeoutConfirmed')).toBe(true);
+  h.read('applyInboxPayload({ items: [] })');
+  h.pagehide();
+  expect(h.read('expiredApprovalSelection')).toBeNull();
+  expect(h.read('renderApprovalsScreen()')).not.toContain("denied automatically");
 });

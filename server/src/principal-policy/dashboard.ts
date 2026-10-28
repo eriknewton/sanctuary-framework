@@ -1043,7 +1043,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   private pruneClosedApprovals(): void {
-    // At most APPROVAL_CLOSED_LIMIT entries are visited, independent of lifetime call volume.
+    // This scans every entry; rememberClosedApproval, the only writer, caps the map at APPROVAL_CLOSED_LIMIT (at most that many plus one during insertion).
     const cutoff = Date.now() - APPROVAL_CLOSED_TTL_MS;
     for (const [id, closed] of this.closedHolds) {
       if ((parseIsoInstantWithOffset(closed.decided_at) ?? 0) <= cutoff) this.closedHolds.delete(id);
@@ -1052,6 +1052,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   private rememberClosedApproval(id: string, decision: "approve" | "deny", decided_by: "timeout" | "human" | "shutdown", decided_at: string): void {
     this.pruneClosedApprovals();
+    // expired_after_seconds is the configured approval budget, not measured elapsed time when a delayed callback runs.
     this.closedHolds.set(id, { decision, decided_by, decided_at, expired_after_seconds: this.config.timeout_seconds });
     // Oldest insertion is evicted; caller-driven closes can never grow this map past the fixed cap.
     while (this.closedHolds.size > APPROVAL_CLOSED_LIMIT) this.closedHolds.delete(this.closedHolds.keys().next().value!);
@@ -5847,10 +5848,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Shutdown denies pending requests and closes streams without a resolution frame; only human/timeout closes emit one.
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
-      this.rememberClosedApproval(pending.id, "deny", "shutdown", new Date().toISOString());
+      const decided_at = new Date().toISOString();
+      this.rememberClosedApproval(pending.id, "deny", "shutdown", decided_at);
       pending.resolve({
         decision: "deny",
-        decided_at: new Date().toISOString(),
+        decided_at,
         decided_by: "auto",
       });
     }
@@ -8690,6 +8692,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   /** Deny a hold at its server-owned deadline even if the timer callback is delayed. */
   private expireApproval(id: string): void {
+    // This and resolveApprovalDecision are synchronous; deleting pending before resolve prevents their close paths from interleaving.
     const pending = this.pending.get(id);
     if (!pending) return;
     clearTimeout(pending.timer);
@@ -9222,7 +9225,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return this.redactDashboardStreamDataForAdmission({ event, data }, authAdmission);
     }
     if (event === "pending-request" || event === "request-resolved") {
-      return pendingApprovalsRedactedMarker(event === "request-resolved" ? this.pending.size : this.pendingApprovalRedactionCount());
+      return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
     }
     if (event === "snapshot") {
       return redactPendingApprovalsFromSnapshotPayload(data);
@@ -9240,7 +9243,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         return redactPendingApprovalsFromSnapshotPayload(dashboardEvent.data);
       case "approval":
         return pendingApprovalsRedactedMarker(
-          (dashboardEvent.data as { resolved?: boolean }).resolved ? this.pending.size : this.pendingApprovalRedactionCount(),
+          this.pendingApprovalRedactionCount(),
         );
       case "inbox":
         // Position-only admission sees approval traffic as a count marker. The marker is an invalidation the client
