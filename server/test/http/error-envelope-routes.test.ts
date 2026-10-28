@@ -198,7 +198,7 @@ describe("HTTP caught-error envelopes", () => {
 });
 
 // Only the complete approved lift-refusal set reaches operator feedback. IC-11.
-import { readFile } from "node:fs/promises";
+import { APPROVED_LIFT_REFUSALS_VIEW } from "../../src/hub/api-router.js";
 import { HubCapabilityError, HubError } from "../../src/hub/errors.js";
 import type { HubApprovalPendingItem } from "../../src/contracts/v1.1/hub-events.js";
 import { liftFixture, LIFT_REASONS, REFUSAL_STATUS, refusalDetail, ApprovalReply } from "../hub/lift-refusal-fixture.js";
@@ -242,9 +242,12 @@ describe("exact stored lift-refusal tuples", () => {
           expect(JSON.stringify(log.mock.calls)).not.toContain(LEAKY_MESSAGE);
         }
       }
-      const source = await readFile(new URL("../../src/hub/api-router.ts", import.meta.url), "utf8");
-      const map = source.split("const APPROVED_LIFT_REFUSALS = new Map([")[1]!.split("]);" )[0]!;
-      expect([...map.matchAll(/\["([^"]+)", \{ reason: "([^"]+)", detail: "([^"]+)" \}\]/g)].map(m => m.slice(1))).toEqual(LIFT_REASONS.map(reason => [reason, reason, refusalDetail(reason)]));
+      expect(Object.isFrozen(APPROVED_LIFT_REFUSALS_VIEW)).toBe(true);
+      expect(Object.keys(APPROVED_LIFT_REFUSALS_VIEW).sort()).toEqual([...LIFT_REASONS].sort());
+      for (const reason of LIFT_REASONS) {
+        expect(APPROVED_LIFT_REFUSALS_VIEW[reason]).toEqual({ reason, detail: refusalDetail(reason) });
+        expect(Object.isFrozen(APPROVED_LIFT_REFUSALS_VIEW[reason])).toBe(true);
+      }
       expect(exposed).toEqual(LIFT_REASONS.map(reason => `lockdown_lift:${reason}`));
     } finally { await f.close(); }
   });
@@ -267,7 +270,7 @@ describe("exact stored lift-refusal tuples", () => {
     } finally { await f.close(); }
   });
 
-  it("missing entries, early faults, non-approvals and refreshed categories stay scrubbed", async () => {
+  it("missing entries, non-approvals and refreshed categories stay scrubbed", async () => {
     const f = await liftFixture();
     const fail = () => { throw new HubCapabilityError(LIFT_REASONS[0]); };
     try {
@@ -277,16 +280,31 @@ describe("exact stored lift-refusal tuples", () => {
       vi.spyOn(f.deps.inboxSources, "listPendingApprovals").mockReturnValue([categoryItem("refresh", "other")]);
       expect((await f.call("/api/hub/inbox/refresh/approve")).json()).toEqual({ error: "bad_request" });
       vi.restoreAllMocks();
-      const get = vi.spyOn(f.inboxStore, "get").mockImplementation(fail);
-      expect((await f.call("/api/hub/inbox/refresh/approve")).json()).toEqual({ error: "bad_request" });
-      get.mockRestore();
-      vi.spyOn(f.deps.inboxSources, "listPendingApprovals").mockImplementation(fail);
-      expect((await f.call("/api/hub/inbox/refresh/approve")).json()).toEqual({ error: "bad_request" });
-      vi.restoreAllMocks();
       f.inboxStore.upsertFromSource({ ...categoryItem("notice", "lockdown_lift"), kind: "agent_error" } as never);
       vi.spyOn(f.inboxStore, "resolve").mockImplementation(async () => fail());
       expect((await f.call("/api/hub/inbox/notice/approve")).json()).toEqual({ error: "bad_request" });
     } finally { await f.close(); }
+  });
+
+  it.each(["get", "listPendingApprovals"] as const)("early %s faults on a fresh lift item stay scrubbed", async (fault) => {
+    const f = await liftFixture();
+    const id = `early-${fault}`;
+    const fail = () => { throw new HubCapabilityError(LIFT_REASONS[0]); };
+    try {
+      f.inboxStore.enqueueTier1(categoryItem(id, "lockdown_lift"), async () => fail());
+      // The same pending item and error disclose detail when category observation completes.
+      const control = await f.call(`/api/hub/inbox/${id}/approve`);
+      expect(control.statusCode).toBe(REFUSAL_STATUS);
+      expect(control.json()).toEqual({ ok: false, error: "HubCapabilityError", detail: refusalDetail(LIFT_REASONS[0]) });
+      expect(f.inboxStore.get(id)).toMatchObject({ operation_category: "lockdown_lift", resolved: false });
+      const spy = fault === "get"
+        ? vi.spyOn(f.inboxStore, "get").mockImplementation(fail)
+        : vi.spyOn(f.deps.inboxSources, "listPendingApprovals").mockImplementation(fail);
+      const reply = await f.call(`/api/hub/inbox/${id}/approve`);
+      expect(spy).toHaveBeenCalled();
+      expect(reply.statusCode).toBe(REFUSAL_STATUS);
+      expect(reply.json()).toEqual({ error: "bad_request" });
+    } finally { vi.restoreAllMocks(); await f.close(); }
   });
 
   it("no category observation means no disclosure", async () => {

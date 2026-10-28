@@ -117,6 +117,7 @@ export class CastleWallAgentController implements HubAgentController {
     if (!this.deps.getAgentRecord(agentId)) throw new HubNotFoundError(`agent ${agentId}`);
     // Approval can outlive the locked state; recheck before restoring any allow rules.
     if (!this.supports("lockdown_lift", agentId)) {
+      // Suffix must match APPROVED_LIFT_REFUSALS in server/src/hub/api-router.ts so this refusal retains its reviewed detail.
       throw new HubCapabilityError("agent_control_lockdown_lift_unsupported_not_locked_down");
     }
     try {

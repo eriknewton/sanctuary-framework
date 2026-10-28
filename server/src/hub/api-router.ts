@@ -146,10 +146,16 @@ const LIFT_REFUSAL_STATUS = 422; // HTTP Unprocessable Content: the approval can
 // Must match api() detail precedence and decisionOutcomeFromError in server/src/dashboard/v1_1/client.ts.
 const APPROVED_LIFT_REFUSALS = new Map([
   // Suffix must match assertCapability and enqueueTier1ControlAction in server/src/hub/hub-service.ts.
+  // It must also match liftLockdown in server/src/dashboard/v1_1/castle-wall-agent-controller.ts.
   ["agent_control_lockdown_lift_unsupported_not_locked_down", { reason: "agent_control_lockdown_lift_unsupported_not_locked_down", detail: "capability not supported: agent_control_lockdown_lift_unsupported_not_locked_down" }],
   // Suffix must match liftLockdown in server/src/dashboard/v1_1/castle-wall-agent-controller.ts.
   ["lockdown_lift_no_snapshot", { reason: "lockdown_lift_no_snapshot", detail: "capability not supported: lockdown_lift_no_snapshot" }],
 ]);
+
+/** Read-only runtime tuples for full-set parity checks without exposing the router's mutable Map. */
+export const APPROVED_LIFT_REFUSALS_VIEW = Object.freeze(Object.fromEntries(
+  Array.from(APPROVED_LIFT_REFUSALS, ([reason, entry]) => [reason, Object.freeze({ ...entry })]),
+));
 
 function approvedLiftRefusal(category: string | undefined, error: unknown): HubCapabilityError | undefined {
   if (category !== "lockdown_lift" || !(error instanceof HubCapabilityError) ||
