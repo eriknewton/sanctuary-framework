@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- An SDW import refused for an empty source key reference now leaves a denial row in the audit log, like the other refusals the import handler makes before approval.
+- An SDW import refused by the import handler for an empty or non-string source key reference now leaves a denial row in the audit log, like the other refusals the import handler makes before approval.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
