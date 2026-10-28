@@ -27,7 +27,7 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
-import { HUB_APPROVAL_PREVIEW_MAX_FIELDS } from "../../contracts/v1.1/hub-events.js";
+import { HUB_APPROVAL_PREVIEW_MAX_FIELDS, HUB_APPROVAL_PASSAGE_MAX_UNITS } from "../../contracts/v1.1/hub-events.js";
 import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
@@ -5554,15 +5554,25 @@ function approvalPreviewHtml(item) {
   const fields = item.operator_preview;
   if (!Array.isArray(fields)) return "";
   const labels = { memory: "bytes", tags: "tags", payload: "bytes", namespace: "Namespace", format: "Format", identity_id: "Identity", type: "Type", destination_host: "Destination host" };
+  let excerpt = "";
   const parts = fields.slice(0, ${HUB_APPROVAL_PREVIEW_MAX_FIELDS}).map(function (arg) {
     if (!arg || !Object.prototype.hasOwnProperty.call(labels, arg.field)) return "";
+    // passage_excerpt must match principal-policy/gate.ts, principal-policy/types.ts and contracts/v1.1/hub-events.ts.
+    if (arg.kind === "passage_excerpt" && arg.field === "memory" && approvalHeldOperation(item) === "memory_insert" && typeof arg.value === "string" && !excerpt) {
+      let end = Math.min(arg.value.length, ${HUB_APPROVAL_PASSAGE_MAX_UNITS});
+      if (end && arg.value.codePointAt(end - 1) > 0xffff) end--;
+      // Escape each line through the existing held-subject renderer before inserting fixed line breaks; never interpret HTML or links.
+      excerpt = '<blockquote class="approval-passage">' + arg.value.slice(0, end).split(/\r\n|\r|\n/).map(function (line) { return heldSubjectHtml(line, false); }).join('<br>') + '</blockquote>' +
+        (arg.truncated === true || end < arg.value.length ? '<p class="muted">(cut to the first ${HUB_APPROVAL_PASSAGE_MAX_UNITS} characters)</p>' : '');
+      return "";
+    }
     if ((arg.kind === "byte_count" || arg.kind === "item_count") && Number.isSafeInteger(arg.value) && arg.value >= 0)
       return arg.value.toLocaleString("en-US") + " " + labels[arg.field];
     if (arg.kind === "subject" && typeof arg.value === "string") return labels[arg.field] + " " + heldSubjectHtml(arg.value.slice(0, ${CARD_OPERATION_MAX_CHARS}), arg.value.length > ${CARD_OPERATION_MAX_CHARS});
     if (arg.kind === "digest12" && arg.field === "payload" && /^[a-f0-9]{12}$/.test(arg.value)) return "SHA-256 of signed bytes " + heldSubjectHtml(arg.value, false);
     return "";
   }).filter(Boolean);
-  return parts.length ? '<p class="approval-preview">' + (approvalHeldOperation(item) === "memory_insert" ? "Save a memory: " : "") + parts.join(", ") + '</p>' : "";
+  return parts.length ? '<p class="approval-preview">' + (approvalHeldOperation(item) === "memory_insert" ? "Save a memory: " : "") + parts.join(", ") + '</p>' + excerpt : excerpt;
 }
 // One retained selected card and one timer bound local expiry feedback independently of request volume.
 let expiredApprovalSelection = null;

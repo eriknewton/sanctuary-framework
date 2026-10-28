@@ -1,3 +1,7 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createServer, toolResult } from '../../src/router.js';
+import { memoryInsertApprovalArgs } from '../../src/sdw/memory-tools.js';
 import { test, expect } from './fixtures/dashboard.js';
 import { approvalHoldRig } from '../dashboard/v1_1/approval-hold-rig.js';
 
@@ -83,4 +87,32 @@ test('server restart with the same token reconnects without a click and explains
     await expect(banner).toHaveText('The server restarted. Requests that were waiting before the restart were denied.');
     await expect(page.locator('[data-action="approval-select"]')).toHaveCount(0);
   } finally { await page.close(); await rig.stop(); }
+});
+
+test('router memory excerpt reaches only the operator card through the real gate and channel', async ({ page }) => {
+  const rig = await approvalHoldRig(30);
+  const server = createServer([{ name: 'memory_insert', description: 'test', tool_class: 'write', approvalTargetArgs: memoryInsertApprovalArgs,
+    inputSchema: { type: 'object', properties: { text: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } } }, handler: async () => toolResult({ executed: true }) }], { gate: rig.gate });
+  const client = new Client({ name: 'browser-memory-preview', version: '1.0.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  const text = '<script>alert(1)</script>\n<img onerror="alert(2)" src=x>\n<a href="javascript:alert(3)">link</a>\n' + 'a'.repeat(600);
+  const held = client.callTool({ name: 'memory_insert', arguments: { text, tags: ['one', 'two'] } });
+  try {
+    await page.addInitScript(token => sessionStorage.setItem('authToken', token), rig.token);
+    await page.goto(rig.url + '/v1.1#approvals');
+    await page.locator('[data-action="approval-select"]').first().click();
+    const drawer = page.locator('.approval-drawer');
+    await expect(drawer).toContainText('Save a memory: ' + Buffer.byteLength(text).toLocaleString('en-US') + ' bytes, 2 tags');
+    await expect(drawer).toContainText('(cut to the first 600 characters)');
+    const quote = drawer.locator('.approval-passage');
+    await expect(quote).toContainText('<script>alert(1)</script>');
+    await expect(quote).toContainText('javascript:alert(3)');
+    await expect(quote.locator('script,img,a')).toHaveCount(0);
+    await expect(quote.locator('br')).toHaveCount(3);
+    await drawer.locator('[data-action="inbox-deny"]').click();
+    expect(JSON.stringify(await held)).not.toContain('alert(');
+    const audit = await rig.auditLog.query({});
+    expect(JSON.stringify(audit)).not.toContain('alert(');
+  } finally { await page.close(); await rig.stop(); await held; await client.close(); await server.close(); }
 });

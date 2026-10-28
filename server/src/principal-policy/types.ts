@@ -125,7 +125,7 @@ export interface ApprovalRequest {
    * the request drops it. Consumers requiring correlation must reject absence.
    */
   readonly approval_audit_id?: string;
-  /** Must match HubApprovalPendingItem.operator_preview in contracts/v1.1/hub-events.ts and charterApprovalRecord in principal-policy/dashboard.ts; never agent response data. */
+  /** Must match HubApprovalPendingItem.operator_preview in contracts/v1.1/hub-events.ts and charterApprovalRecord in principal-policy/dashboard.ts; never agent response data. passage_excerpt must match gate.ts and dashboard/v1_1/client.ts; a request containing it exposes this property non-enumerably, only for explicit operator projection. */
   operator_preview?: HubApprovalPreviewArg[];
   operation: string;
   tier: 1 | 2;

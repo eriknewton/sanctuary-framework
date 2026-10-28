@@ -102,14 +102,18 @@ export interface HubInboxItemHeader {
 /**
  * A pending Tier 1 or Tier 2 approval surfaced to the operator inbox.
  */
-/** Two metadata fields cover every closed preview operation; must match the producer bound in principal-policy/gate.ts and consumer in dashboard/v1_1/client.ts. */
-export const HUB_APPROVAL_PREVIEW_MAX_FIELDS = 2;
+/** Two metadata fields plus one optional memory excerpt cover every closed preview operation; must match the producer bound in principal-policy/gate.ts and consumer in dashboard/v1_1/client.ts. */
+export const HUB_APPROVAL_PREVIEW_MAX_FIELDS = 3;
+/** 600 UTF-16 units are about eight lines of the card at its width; must match passage_excerpt in principal-policy/gate.ts and dashboard/v1_1/client.ts. */
+export const HUB_APPROVAL_PASSAGE_MAX_UNITS = 600;
 
 /** Operator-only, closed preview arguments; must match buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts. */
 export type HubApprovalPreviewArg =
   | { kind: "byte_count" | "item_count"; field: "memory" | "tags" | "payload"; value: number }
   | { kind: "subject"; field: "namespace" | "format" | "identity_id" | "type" | "destination_host"; value: string }
-  | { kind: "digest12"; field: "payload"; value: string };
+  | { kind: "digest12"; field: "payload"; value: string }
+  // passage_excerpt must match ApprovalRequest in principal-policy/types.ts, buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
+  | { kind: "passage_excerpt"; field: "memory"; value: string; truncated: boolean };
 
 export interface HubApprovalPendingItem extends HubInboxItemHeader {
   kind: "approval_pending";

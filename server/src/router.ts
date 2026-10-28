@@ -258,7 +258,10 @@ export function createServer(
       const result = await gate.evaluate(
         tool.approvalTargetToolName ?? name,
         gateArgs,
-        approvalRef ? { approval_ref: approvalRef } : undefined
+        approvalRef ? { approval_ref: approvalRef } : undefined,
+        // Must match operatorPreviewSource in principal-policy/gate.ts. Registered identity and validated args are display-only;
+        // keep enforcement target, gateArgs, proof binding, context and agent responses independent of this handoff.
+        { operation: name, args: handlerArgs }
       );
       if (!result.allowed) {
         // Invariant #7: the agent-facing denial must not reveal which policy

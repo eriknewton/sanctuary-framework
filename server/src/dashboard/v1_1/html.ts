@@ -1888,6 +1888,8 @@ body {
 }
 /* Held labels inside buttons use the button's own contrasting paint in either theme. */
 .btn .held-subject { color: inherit; background: transparent; border-color: currentColor; }
+.approval-passage { margin: 0.75rem 0; padding: 0.75rem; border: 1px solid var(--rule); border-radius: 4px; overflow-wrap: anywhere; }
+.approval-passage .held-subject { padding: 0; border: 0; background: transparent; white-space: pre-wrap; }
 .approval-confirm-row { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; margin-top: 1rem; min-width: 0; }
 .approval-confirm-row .btn { max-width: 100%; white-space: normal; flex-wrap: wrap; overflow-wrap: anywhere; }
 .approval-confirm-row p { margin: 0; }
