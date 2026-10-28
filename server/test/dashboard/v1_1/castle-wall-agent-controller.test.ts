@@ -1,4 +1,5 @@
 // Snapshot restoration preserves file-specific refusal reasons. IC-11.
+// The controller preserves the lift platform refusal and stopped state. IC-11.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
@@ -14,6 +15,7 @@ import { writePersistedLocalAgents } from "../../../src/hub/agent-registry-persi
 import { protectionSubjectForUid } from "../../../src/castle-wall/subject-binding.js";
 import {
   AgentEgressStopError,
+  liftAgentEgressStop,
   type StopAgentEgressInput,
   type StopAgentEgressObservation,
 } from "../../../src/castle-wall/provision/agent-stop.js";
@@ -308,9 +310,29 @@ describe("per-agent lockdown lift controller IC-11", () => {
   it("the real lift actuator refuses a missing snapshot in temporary storage", async () => {
     await withTmpFortress(async storagePath => {
       const record = makeRecord({ status: "locked_down" });
-      const controller = controllerFor(record, storagePath);
+      const controller = controllerFor(record, storagePath, input => liftAgentEgressStop({ ...input, platform: "darwin" }));
       await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({ reasonCode: "lockdown_lift_no_snapshot" });
       expect(record.status).toBe("locked_down");
+    });
+  });
+
+  it("serves the real lift platform refusal unchanged and preserves the snapshot without reloading", async () => {
+    await withTmpFortress(async storagePath => {
+      const record = makeRecord({ status: "locked_down" });
+      const { stopped } = await stoppedAgentFixture(storagePath, record.agent_id);
+      const snapshotBytes = await readFile(stopped.snapshot_path);
+      const reloadPolicy = vi.fn(async () => ({ ok: true }));
+      const controller = controllerFor(record, storagePath, input => liftAgentEgressStop({
+        ...input, platform: "linux", reloadPolicy,
+      }));
+
+      const result = await controller.liftLockdown(record.agent_id).catch(error => error);
+
+      expect.soft(result).toBeInstanceOf(HubCapabilityError);
+      expect.soft(result).toMatchObject({ reasonCode: "stop_unsupported_platform", statusCode: 422 });
+      await expect.soft(readFile(stopped.snapshot_path)).resolves.toEqual(snapshotBytes);
+      expect.soft(reloadPolicy).not.toHaveBeenCalled();
+      expect.soft(record.status).toBe("locked_down");
     });
   });
 
@@ -350,7 +372,7 @@ describe("per-agent lockdown lift controller IC-11", () => {
       const { stopped, rulesDir, rulePath } = await stoppedAgentFixture(storagePath, record.agent_id);
       await rm(rulesDir, { recursive: true });
       removeRulesBeforeRestoreWrite(rulesDir, rulePath);
-      const controller = controllerFor(record, storagePath);
+      const controller = controllerFor(record, storagePath, input => liftAgentEgressStop({ ...input, platform: "darwin" }));
       await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({
         reasonCode: "stop_residual_allow_rules",
       });

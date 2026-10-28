@@ -1,5 +1,7 @@
 // Snapshot restoration preserves file-specific refusal reasons. IC-11.
+// Stop and lift share one supported platform boundary. IC-11.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs/promises";
 import {
   mkdir,
   mkdtemp,
@@ -60,6 +62,7 @@ describe("snapshot-scoped lift refusals IC-11", () => {
     const fortress = await makeFortress();
     await expectStopReason(liftAgentEgressStop({
       agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+      platform: "darwin",
     }), "stop_snapshot_missing");
   });
 
@@ -70,9 +73,66 @@ describe("snapshot-scoped lift refusals IC-11", () => {
     removeRulesBeforeRestoreWrite(rulesDir, rulePath);
     await expectStopReason(liftAgentEgressStop({
       agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+      platform: "darwin",
       reloadPolicy: async () => ({ ok: true }),
     }), "stop_residual_allow_rules");
     await expect(readFile(stopped.snapshot_path, "utf8")).resolves.toContain("agent-allow.json");
+  });
+});
+
+describe("stop and lift share one platform boundary IC-11", () => {
+  it("refuses an unsupported lift while preserving snapshot bytes, rules, and reload state", async () => {
+    const fortress = await makeFortress();
+    const { stopped, rulesDir } = await stoppedAgentFixture(fortress, AGENT_ID);
+    const snapshotBytes = await readFile(stopped.snapshot_path);
+    const reloadPolicy = vi.fn(async () => ({ ok: true }));
+
+    const result = await liftAgentEgressStop({
+      agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+      platform: "linux", reloadPolicy,
+    }).catch(error => error);
+
+    // Soft assertions exercise every refusal invariant against the base implementation too.
+    expect.soft(result).toBeInstanceOf(AgentEgressStopError);
+    expect.soft(result).toMatchObject({ reasonCode: "stop_unsupported_platform" });
+    await expect.soft(readFile(stopped.snapshot_path)).resolves.toEqual(snapshotBytes);
+    expect.soft(await readdir(rulesDir)).toEqual([]);
+    expect.soft(reloadPolicy).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unsupported lift before looking for a snapshot", async () => {
+    const fortress = await makeFortress();
+    const readSnapshot = vi.spyOn(fs, "readFile");
+    try {
+      await expect(liftAgentEgressStop({
+        agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+        platform: "linux",
+      })).rejects.toMatchObject({
+        name: "AgentEgressStopError", reasonCode: "stop_unsupported_platform",
+      });
+      // A swallowed snapshot read still violates the refusal's no-lookup boundary.
+      expect(readSnapshot).not.toHaveBeenCalled();
+    } finally {
+      readSnapshot.mockRestore();
+    }
+  });
+
+  it("refuses every non-darwin host platform when the caller omits the platform", async () => {
+    const fortress = await makeFortress();
+    const hostPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    try {
+      for (const platform of ["linux", "win32", "freebsd", ""]) {
+        // Production callers omit platform, so the host platform alone must decide the refusal.
+        Object.defineProperty(process, "platform", { value: platform, configurable: true });
+        await expect(liftAgentEgressStop({
+          agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+        })).rejects.toMatchObject({
+          name: "AgentEgressStopError", reasonCode: "stop_unsupported_platform",
+        });
+      }
+    } finally {
+      if (hostPlatform) Object.defineProperty(process, "platform", hostPlatform);
+    }
   });
 });
 
@@ -219,6 +279,7 @@ describe("stopAgentEgress", () => {
       agentId: AGENT_ID,
       fortressPath: fortress,
       storagePath: fortress,
+      platform: "darwin",
       reloadPolicy: async () => ({ ok: true }),
     });
 
