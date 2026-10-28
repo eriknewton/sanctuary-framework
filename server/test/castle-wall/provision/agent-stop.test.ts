@@ -1,6 +1,7 @@
 // Snapshot restoration preserves file-specific refusal reasons. IC-11.
 // Stop and lift share one supported platform boundary. IC-11.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs/promises";
 import {
   mkdir,
   mkdtemp,
@@ -101,12 +102,19 @@ describe("stop and lift share one platform boundary IC-11", () => {
 
   it("refuses an unsupported lift before looking for a snapshot", async () => {
     const fortress = await makeFortress();
-    await expect(liftAgentEgressStop({
-      agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
-      platform: "linux",
-    })).rejects.toMatchObject({
-      name: "AgentEgressStopError", reasonCode: "stop_unsupported_platform",
-    });
+    const readSnapshot = vi.spyOn(fs, "readFile");
+    try {
+      await expect(liftAgentEgressStop({
+        agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+        platform: "linux",
+      })).rejects.toMatchObject({
+        name: "AgentEgressStopError", reasonCode: "stop_unsupported_platform",
+      });
+      // A swallowed snapshot read still violates the refusal's no-lookup boundary.
+      expect(readSnapshot).not.toHaveBeenCalled();
+    } finally {
+      readSnapshot.mockRestore();
+    }
   });
 });
 

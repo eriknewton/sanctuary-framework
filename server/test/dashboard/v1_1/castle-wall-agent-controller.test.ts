@@ -1,5 +1,5 @@
-// fail-before-exempt: this change only passes platform darwin to the real lift actuator adapters so existing lift cases keep darwin semantics on a Linux runner; no new product behavior is asserted in this file.
 // Snapshot restoration preserves file-specific refusal reasons. IC-11.
+// The controller preserves the lift platform refusal and stopped state. IC-11.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
@@ -313,6 +313,26 @@ describe("per-agent lockdown lift controller IC-11", () => {
       const controller = controllerFor(record, storagePath, input => liftAgentEgressStop({ ...input, platform: "darwin" }));
       await expect(controller.liftLockdown(record.agent_id)).rejects.toMatchObject({ reasonCode: "lockdown_lift_no_snapshot" });
       expect(record.status).toBe("locked_down");
+    });
+  });
+
+  it("serves the real lift platform refusal unchanged and preserves the snapshot without reloading", async () => {
+    await withTmpFortress(async storagePath => {
+      const record = makeRecord({ status: "locked_down" });
+      const { stopped } = await stoppedAgentFixture(storagePath, record.agent_id);
+      const snapshotBytes = await readFile(stopped.snapshot_path);
+      const reloadPolicy = vi.fn(async () => ({ ok: true }));
+      const controller = controllerFor(record, storagePath, input => liftAgentEgressStop({
+        ...input, platform: "linux", reloadPolicy,
+      }));
+
+      const result = await controller.liftLockdown(record.agent_id).catch(error => error);
+
+      expect.soft(result).toBeInstanceOf(HubCapabilityError);
+      expect.soft(result).toMatchObject({ reasonCode: "stop_unsupported_platform", statusCode: 422 });
+      await expect.soft(readFile(stopped.snapshot_path)).resolves.toEqual(snapshotBytes);
+      expect.soft(reloadPolicy).not.toHaveBeenCalled();
+      expect.soft(record.status).toBe("locked_down");
     });
   });
 
