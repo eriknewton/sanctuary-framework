@@ -29,3 +29,11 @@ export {
   CROSS_PROCESS_LOCK_RETRY_MS,
   type CrossProcessLockOptions,
 } from "./cross-process-lock.js";
+
+export { SdwStorageError } from "./sdw-journal-contract.js";
+export type {
+  SdwAdmissionToken, SdwApplied, SdwCertificate, SdwDecision, SdwEpochs,
+  SdwGeneration, SdwJournalName, SdwPlan, SdwPlanBody, SdwPlanEntry, SdwPlanPage,
+  SdwPrepared, SdwPrimarySigner, SdwPrimaryVerifier, SdwRecordTypes, SdwRecoveryResult,
+  SdwSigningReceipt, SdwStorageBoundaryCapabilities, SdwStorageReason, SdwJournalAdmission,
+} from "./sdw-journal-contract.js";
