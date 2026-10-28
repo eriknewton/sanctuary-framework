@@ -782,3 +782,71 @@ describe("one retained decision result", () => {
     expect(h.read("state.approvals.result.rule")).toBe("refused");
   });
 });
+
+// The shipped client renders authenticated lift-refusal responses. IC-11.
+import { liftFixture, LIFT_REASONS, REFUSAL_STATUS, refusalDetail } from "../../hub/lift-refusal-fixture.js";
+
+describe("wired approval refusal rendering", () => {
+  it.each(LIFT_REASONS)("Tier 1 confirmation renders the real %s response as refused", async reason => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = await liftFixture();
+    try {
+      const id = await f.enqueue();
+      if (reason === LIFT_REASONS[0]) f.setStatus("active");
+      let receivedStatus: number | undefined;
+      const completed = gate<void>();
+      const h = boot({
+        "/api/hub/inbox": async () => { const r = await f.call("/api/hub/inbox", "GET"); return response(r.json(), r.statusCode); },
+        [`/api/hub/inbox/${id}/approve`]: async () => {
+          const r = await f.call(`/api/hub/inbox/${id}/approve`);
+          receivedStatus = r.statusCode;
+          completed.release();
+          return response(r.json(), r.statusCode);
+        },
+      });
+      await settle();
+      h.navigate("approvals");
+      h.click({ "data-action": "approval-select", "data-item-id": id });
+      h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": id });
+      h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": id });
+      await completed.promise;
+      await settle();
+      expect(receivedStatus).toBe(REFUSAL_STATUS);
+      expect(h.posts()).toEqual([`/api/hub/inbox/${id}/approve`]);
+      expect(h.result()).toContain('data-decision-status="refused"');
+      expect(h.result()).toContain(refusalDetail(reason) + ` (HTTP ${REFUSAL_STATUS})`);
+      expect(h.el["decision-announcement"]!.textContent).toContain(refusalDetail(reason) + ` (HTTP ${REFUSAL_STATUS})`);
+      expect(h.result()).toContain("The decision was not applied.");
+      expect(h.result()).not.toContain('data-decision-status="acknowledged"');
+    } finally { await f.close(); }
+  });
+});
+
+it.each(["refused", "uncertain"])("real export %s retains the existing feedback copy", async outcome => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const f = await liftFixture();
+  try {
+    const id = "export-feedback";
+    f.inboxStore.enqueueTier1({ ...held(id, { tier: "tier1", operation_category: "exit_bundle_export" }), version: "1.1" } as never, async () => { throw new Error("fixture fault"); });
+    const h = boot({
+      "/api/hub/inbox": async () => { const r = await f.call("/api/hub/inbox", "GET"); return response(r.json(), r.statusCode); },
+      [`/api/hub/inbox/${id}/approve`]: async () => { const r = await f.call(`/api/hub/inbox/${id}/approve`); return response(r.json(), r.statusCode); },
+    });
+    await settle();
+    // Keep the loaded card while another operator decides it, producing a real pre-execution conflict.
+    if (outcome === "refused") await f.call(`/api/hub/inbox/${id}/deny`);
+    h.navigate("approvals");
+    h.click({ "data-action": "approval-select", "data-item-id": id });
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": id });
+    h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": id });
+    await settle();
+    expect(h.result()).toContain(`data-decision-status="${outcome}"`);
+    if (outcome === "refused") {
+      expect(h.result()).toContain("conflict (HTTP 409). The decision was not applied.");
+      expect(h.result()).not.toContain("did not receive its re-key key");
+    } else {
+      expect(h.result()).toContain("The export may have completed, but this dashboard did not receive its re-key key. Check the export result and create a new export if you did not save the key.");
+    }
+    expect(h.result()).not.toContain('data-decision-status="acknowledged"');
+  } finally { await f.close(); }
+});

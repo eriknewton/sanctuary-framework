@@ -380,3 +380,63 @@ describe("per-agent lockdown lift controller IC-11", () => {
     });
   });
 });
+
+// Refused lift approvals preserve the operator's reason through authenticated dispatch. IC-11.
+import { liftFixture, LIFT_REASONS, REFUSAL_STATUS, refusalDetail } from "../../hub/lift-refusal-fixture.js";
+
+describe("wired lift refusal feedback", () => {
+  it("stale lift approval reports its reason without invoking the actuator or resolving the item", async () => {
+    const lift = vi.fn();
+    const f = await liftFixture(lift);
+    try {
+      const id = await f.enqueue();
+      f.setStatus("active");
+      const reply = await f.call(`/api/hub/inbox/${id}/approve`);
+      expect(reply.statusCode).toBe(REFUSAL_STATUS);
+      expect(reply.json()).toEqual({ ok: false, error: "HubCapabilityError", detail: refusalDetail(LIFT_REASONS[0]) });
+      expect(reply.headers["Cache-Control"]).toBe("no-store");
+      expect(lift).not.toHaveBeenCalled();
+      expect(f.inboxStore.get(id)?.resolved).toBe(false);
+      await f.auditLog.flush();
+      expect((await f.auditLog.query({})).entries).toEqual(expect.arrayContaining([expect.objectContaining({ operation: "agent_lockdown_lift_refused", details: expect.objectContaining({ reason_code: LIFT_REASONS[0] }) })]));
+    } finally { await f.close(); }
+  });
+
+  it("real missing snapshot approval reports its reason before any restore", async () => {
+    const f = await liftFixture();
+    const write = vi.spyOn(await import("node:fs/promises"), "writeFile");
+    try {
+      const id = await f.enqueue();
+      write.mockClear();
+      const reply = await f.call(`/api/hub/inbox/${id}/approve`);
+      expect(reply.statusCode).toBe(REFUSAL_STATUS);
+      expect(reply.json()).toEqual({ ok: false, error: "HubCapabilityError", detail: refusalDetail(LIFT_REASONS[1]) });
+      expect(write).not.toHaveBeenCalled();
+      expect(f.inboxStore.get(id)?.resolved).toBe(false);
+      expect(f.service.getAgent(f.record.agent_id).status).toBe("locked_down");
+    } finally { write.mockRestore(); await f.close(); }
+  });
+
+  it("concurrent lift approvals disclose only the losing refusal while one actuator completes", async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const admitted = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const lift = vi.fn(async () => { entered(); await gate; return { restored_rule_ids: [], removed_rule_ids: [], reload_confirmed: true, snapshot_path: "fixture" }; });
+    const f = await liftFixture(lift);
+    let winner: ReturnType<typeof f.call> | undefined;
+    try {
+      const first = await f.enqueue();
+      const second = await f.enqueue();
+      winner = f.call(`/api/hub/inbox/${first}/approve`);
+      await admitted;
+      const loser = await f.call(`/api/hub/inbox/${second}/approve`);
+      expect(loser.statusCode).toBe(REFUSAL_STATUS);
+      expect(loser.json()).toEqual({ ok: false, error: "HubCapabilityError", detail: refusalDetail(LIFT_REASONS[0]) });
+      expect(f.inboxStore.get(second)?.resolved).toBe(false);
+      expect(lift).toHaveBeenCalledTimes(1);
+      release();
+      expect((await winner).json().data.item.resolution_payload.outcome).toBe("restored");
+    } finally { release(); await winner; await f.close(); }
+  });
+});
