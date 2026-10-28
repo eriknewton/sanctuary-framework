@@ -8,21 +8,31 @@
  * cycle). This file has no dependency on cognitive/ or reputation/, so it
  * is safe for both to import.
  *
- * CONTRACT PIN: `EXIT_IMPORT_JOURNAL_NAMESPACE` here is the SAME literal
- * server/src/exit/bundle.ts re-exports under the same name (bundle.ts
- * imports it from here rather than defining its own copy) - "must match"
+ * CONTRACT PIN: `EXIT_IMPORT_JOURNAL_NAMESPACE` is defined once in
+ * storage/cross-process-lock.ts and re-exported here and by exit/bundle.ts - "must match"
  * is enforced by construction, not by two independent literals.
  */
 
-import type { StorageBackend } from "./interface.js";
+import { lstat } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type { StorageBackend, FilesystemStorageCapabilities } from "./interface.js";
+import { installedSdwFence } from "./sdw-fence.js";
+import {
+  SDW_JOURNAL_NAMESPACES, SDW_JOURNAL_NAMESPACE, SDW_MAX_STAGED_BYTES,
+  SdwStorageError,
+} from "./sdw-fence.js";
+import {
+  hasOversizedSnapshotsArray, isWellFormedExitImportJournalRecord,
+} from "./exit-import-journal-record.js";
+import type { CrossProcessLockLease } from "./cross-process-lock.js";
 import {
   withCrossProcessLock,
   CrossProcessLockError,
-  ExitAdmissionLockError,
+  ExitAdmissionLockError, EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_ADMISSION_LOCK_FILE, EXIT_ADMISSION_LOCK_TIMEOUT_MS,
 } from "./cross-process-lock.js";
-export { ExitAdmissionLockError };
+export { ExitAdmissionLockError, EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_ADMISSION_LOCK_FILE, EXIT_ADMISSION_LOCK_TIMEOUT_MS };
+export { withSdwJournalAdmission, SDW_ROTATION_JOURNAL_KEY } from "./sdw-fence.js";
 
-export const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
 
 /**
  * CONTRACT PIN (F1, Exit V2 D1 operator finding, 2026-08-23): the one verb
@@ -149,54 +159,84 @@ export type ExitAdmissionOwner =
   | "memory_bad_signer"
   | "memory_signer_prune";
 
-const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
 
-/**
- * Bounded wait before an admission-lock contention fails closed. This
- * bounds how long a CONTENDER waits to acquire, not how long the holder
- * may run - the holder keeps the lock for its whole operation (see the
- * doc comment above); a caller that cannot acquire within this window
- * fails closed rather than waiting indefinitely on a live or crashed
- * holder.
- */
-const EXIT_ADMISSION_LOCK_TIMEOUT_MS = 10_000;
-
+/** Existing owners enter preflight below the acquired admission lock. */
 export async function withExitAdmissionLock<T>(
   storage: StorageBackend,
   owner: ExitAdmissionOwner,
   operation: () => Promise<T>
 ): Promise<T> {
-  try {
-    return await withCrossProcessLock(
-      storage,
-      EXIT_IMPORT_JOURNAL_NAMESPACE,
-      EXIT_ADMISSION_LOCK_FILE,
-      operation,
-      {
-        timeoutMs: EXIT_ADMISSION_LOCK_TIMEOUT_MS,
-        metadata: { owner, pid: process.pid },
+  return runAdmission(storage, owner, async lease => {
+    await sdwExitPreflight(storage, owner, lease);
+    return operation();
+  }, EXIT_ADMISSION_LOCK_TIMEOUT_MS);
+}
+
+async function sdwExitPreflight(storage: StorageBackend, owner: ExitAdmissionOwner, lease: CrossProcessLockLease): Promise<void> {
+  const filesystem = storage as Partial<FilesystemStorageCapabilities>;
+  if (typeof filesystem.namespacePath !== "function" || typeof filesystem.writeDurable !== "function") return;
+  let selected: readonly typeof SDW_JOURNAL_NAMESPACES[number][] = SDW_JOURNAL_NAMESPACES;
+  if (owner === "recovery") {
+    const entries = await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
+    // Empty recovery must not even open the SDW root, including malformed roots.
+    if (entries.length === 0) return;
+    // Existing Exit recovery refuses multiple entries; unknown overlap stays all-six.
+    if (entries.length === 1) {
+      const entry = entries[0]!;
+      // Check metadata before reading/allocating and bytes before parsing. This
+      // only bounds preflight; the shared parser's accepted schema is unchanged.
+      if (entry.size_bytes <= SDW_MAX_STAGED_BYTES) {
+        const bytes = await storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, entry.key);
+        if (bytes !== null && bytes.byteLength <= SDW_MAX_STAGED_BYTES) {
+          let record: unknown;
+          try { record = JSON.parse(Buffer.from(bytes).toString("utf8")); } catch { /* Unknown overlap. */ }
+          if (!hasOversizedSnapshotsArray(record) && isWellFormedExitImportJournalRecord(record)) {
+            const affected = new Set(record.snapshots.map(snapshot => snapshot.namespace));
+            selected = SDW_JOURNAL_NAMESPACES.filter(ns => affected.has(ns));
+            if (selected.length === 0) return;
+          }
+        }
       }
-    );
+    }
+  }
+  // A1: lstat is non-creating. In particular, do not call withPathLock on an
+  // absent root: its mkdir would turn a clean fortress into partial scaffold.
+  const root = join(dirname(filesystem.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE)), SDW_JOURNAL_NAMESPACE);
+  // An unobserved root cannot support a nothing-committed claim, so these
+  // refusals carry unknown and never grant a later consumer discard authority.
+  try {
+    const stat = await lstat(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+      throw new SdwStorageError("storage_plan_invalid", "unknown");
+    }
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
+    if (cause instanceof SdwStorageError) throw cause;
+    throw new SdwStorageError("storage_capability_unavailable", "unknown", undefined, { cause });
+  }
+  const fence = installedSdwFence(storage);
+  // Slice 1 installs no production producer/observer. Existing private state
+  // requires the engine's authenticated observer; pathname presence grants no trust.
+  if (!fence) throw new SdwStorageError("storage_capability_unavailable", "unknown");
+  await fence.preflight(selected, lease);
+}
+
+async function runAdmission<T>(storage: StorageBackend, owner: ExitAdmissionOwner | "sdw_journal",
+  operation: (lease: CrossProcessLockLease) => Promise<T>, timeoutMs: number): Promise<T> {
+  let acquired = false;
+  try {
+    return await withCrossProcessLock(storage, EXIT_IMPORT_JOURNAL_NAMESPACE,
+      EXIT_ADMISSION_LOCK_FILE, async lease => {
+        acquired = true;
+        return operation(lease);
+      }, { timeoutMs, metadata: { owner, pid: process.pid } });
   } catch (err) {
-    // Only acquisition/reaper failure is an admission refusal. A
-    // CrossProcessLockError thrown BY the protected operation (notably custody
-    // holder-loss during rotation) must retain its real classification instead
-    // of being rewritten as fictitious admission-lock contention. Scaffold
-    // tampering also needs its own refusal, never a stale-lock removal hint.
-    if (
-      err instanceof CrossProcessLockError
-      && err.kind !== "holder-lost"
-      && err.kind !== "capability"
-      && err.kind !== "scaffold-integrity"
-      && err.kind !== "poisoned"
-    ) {
+    // Only actual acquisition contention receives the Exit remediation. I/O,
+    // cancellation, scaffold failures and protected-operation errors retain identity.
+    if (!acquired && err instanceof CrossProcessLockError && err.kind === "contention") {
       throw new ExitAdmissionLockError(
         `refusing to proceed (${owner}): another exit-import, master-rotation, or memory-migration ` +
           "operation holds the admission lock for this fortress, or a prior " +
-          // F1/round-3: must name EXIT_RECOVERY_VERB (defined above in
-          // this same file) AND the exact "--fortress <fortress path>"
-          // form - recover takes no ambient path (exit/cli.ts's
-          // ExitRecoverFortressPathRequiredError).
           `holder crashed while holding it. Run \`sanctuary exit ${EXIT_RECOVERY_VERB} ` +
           "--fortress <fortress path>` to recover, then retry. If no other " +
           "Sanctuary operation is actually running against this fortress, " +

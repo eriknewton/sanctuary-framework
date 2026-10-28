@@ -163,3 +163,68 @@ function fixtureRecord(namespace: Exclude<SdwNamespace, "_sdw_meta">, index: num
     };
   }
 }
+
+/** Test-only authenticated observation model; no production filesystem producer. */
+export async function createSdwFenceFixture(root?: string) {
+  const { mkdir, lstat, readFile, writeFile } = await import("node:fs/promises");
+  const { withPathLock } = await import("../../src/storage/cross-process-lock.js");
+  const { installSdwFence } = await import("../../src/storage/sdw-fence.js");
+  const directory = root ?? await mkdtemp(join(tmpdir(), "sdw-fence-"));
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const rootStat = await lstat(directory);
+  const binding = `${rootStat.dev}:${rootStat.ino}:fixture-fortress`;
+  const journal = join(directory, "_sdw_journal_v1");
+  const control = join(directory, "observation.fixture");
+  const storage = new FilesystemStorage(directory);
+  const trace: string[] = [];
+  const counters = { observations: 0, fences: 0 };
+  const absent: import("../../src/storage/sdw-fence.js").SdwObservation = {
+    state: "ABSENT", binding, generation: null, decision: "none",
+  };
+  const port: import("../../src/storage/sdw-fence.js").SdwFencePort = {
+    binding,
+    async assertBinding() {
+      const current = await lstat(directory);
+      if (current.dev !== rootStat.dev || current.ino !== rootStat.ino) throw new SdwStorageError("storage_holder_lost", "none");
+    },
+    async observe() {
+      counters.observations++;
+      try { return JSON.parse(await readFile(control, "utf8")); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return absent; throw error; }
+    },
+    async withFence(operation) {
+      counters.fences++;
+      return withPathLock(journal, "fence.lock", async lease => {
+        trace.push("4:fence-enter");
+        try { return await operation(lease); }
+        finally { trace.push("4:fence-release"); }
+      }, { kernelBacked: true });
+    },
+    mutationDirectory(namespace) { return join(directory, namespace); },
+  };
+  const fence = installSdwFence(storage, port);
+  async function publish(state: import("../../src/storage/sdw-fence.js").SdwObservation["state"],
+    epoch = 1, mask = (1 << SDW_JOURNAL_NAMESPACES.length) - 1) {
+    await mkdir(journal, { recursive: true, mode: 0o700 });
+    const terminal = state === "CLEAN" || state === "APPLIED" || state === "RETIRED";
+    const observation: import("../../src/storage/sdw-fence.js").SdwObservation = {
+      state, binding, decision: ["COMMIT", "APPLIED", "RETIRED"].includes(state) ? "committed" : "none",
+      generation: state === "ABSENT" ? null : {
+        version: 1, epochs: fixtureEpochs(epoch), transaction_id: state === "CLEAN" ? null : FIXTURE_TRANSACTION,
+        affected_mask: state === "CLEAN" ? 0 : mask,
+        phase: terminal ? state as "CLEAN" | "APPLIED" | "RETIRED" : "BUSY",
+      },
+    };
+    await writeFile(control, JSON.stringify(observation), { mode: 0o600 });
+  }
+  return { root: directory, journal, control, storage, fence, port, trace, counters, publish,
+    cleanup: () => rm(directory, { recursive: true, force: true }) };
+}
+
+/** Explicit scheduling barrier: tests never infer contention from a sleep. */
+export function sdwDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
