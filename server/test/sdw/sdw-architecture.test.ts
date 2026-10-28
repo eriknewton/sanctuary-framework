@@ -15,7 +15,8 @@ import { createRequire } from "node:module";
 import type * as TypeScript from "typescript";
 const ts: typeof import("typescript") = createRequire(import.meta.url)("typescript");
 import { readFile, readdir } from "node:fs/promises";
-import { relative, join } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { relative, join, dirname, isAbsolute, normalize } from "node:path";
 import { describe, expect, it } from "vitest";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -998,10 +999,41 @@ describe("SDW receipt subject ownership", () => {
   });
 
   it("keeps contract runtime imports below cognitive and exports no transaction/token factory", async () => {
-    const source = await readFile("src/storage/sdw-journal-contract.ts", "utf8");
-    const parsed = ts.createSourceFile("contract.ts", source, ts.ScriptTarget.Latest, true);
-    const imports = parsed.statements.filter(ts.isImportDeclaration).map(n => (n.moduleSpecifier as TypeScript.StringLiteral).text);
-    expect(imports.some(path => path.includes("cognitive"))).toBe(false);
+    const visited = new Set<string>();
+    const queue = [normalize("src/storage/sdw-journal-contract.ts")];
+    const violations: Array<{ file: string; specifier: string }> = [];
+    while (queue.length > 0) {
+      const file = queue.pop()!;
+      if (visited.has(file)) continue;
+      visited.add(file);
+      const source = await readFile(file, "utf8");
+      // Must match the import/export-from regex shapes in test/drills/v1.1-coordination-drill.test.ts;
+      // type-only edges count too, since the coordination boundary follows them.
+      const patterns = [
+        /import\s+(?:[\s\S]+?)\s+from\s+["']([^"']+)["']/g,
+        /export\s+(?:[\s\S]+?)\s+from\s+["']([^"']+)["']/g,
+        /import\s*["']([^"']+)["']/g, // side-effect imports also load runtime code
+      ];
+      for (const pattern of patterns) for (const match of source.matchAll(pattern)) {
+        const specifier = match[1]!;
+        let resolved: string | undefined;
+        if (specifier.startsWith(".") || isAbsolute(specifier)) {
+          const base = specifier.startsWith(".") ? join(dirname(file), specifier) : specifier;
+          resolved = [base, base.replace(/\.js$/, ".ts"), base.replace(/\.js$/, ".tsx"),
+            base + ".ts", base + ".tsx", join(base, "index.ts")]
+            .find(candidate => existsSync(candidate) && statSync(candidate).isFile());
+          expect(resolved, `${file}: unresolved static import ${specifier}`).toBeDefined();
+        }
+        const path = (resolved ?? specifier).replace(/\\/g, "/");
+        if (/(?:^|\/)(?:cognitive|bridge|reputation|composition)(?:\/|$)|concordia|verascore|storage\/exit-import-journal|sdw\/write-gate/i.test(path)) {
+          violations.push({ file, specifier });
+        }
+        if (resolved) queue.push(normalize(resolved));
+      }
+    }
+    expect(visited.has(normalize("src/sdw/records.ts"))).toBe(true);
+    expect(visited.has(normalize("src/storage/interface.ts"))).toBe(true);
+    expect(violations).toEqual([]);
     const barrel = await import("../../src/storage/index.js");
     expect(barrel).toHaveProperty("SdwStorageError");
     for (const name of ["sdwTransaction", "withSdwWriteSet", "withSdwJournalAdmission", "sdwSigningBytes", "parseSdwJournalRecord"]) expect(barrel).not.toHaveProperty(name);

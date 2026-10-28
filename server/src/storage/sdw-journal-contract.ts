@@ -3,7 +3,6 @@ import { z } from "zod";
 import { hash } from "../core/hashing.js";
 import { verify } from "../core/identity.js";
 import { INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX } from "../core/signing-domains.js";
-import { isSdwNamespace } from "../sdw/write-gate.js";
 import {
   SDW_CATALOG_NAMESPACE, SDW_DOCUMENT_CORPUS_NAMESPACE, SDW_META_NAMESPACE,
   SDW_QUERY_HISTORY_NAMESPACE, SDW_VECTOR_MEMORY_NAMESPACE, SDW_WORKING_STATE_NAMESPACE,
@@ -38,10 +37,13 @@ export const SDW_JOURNAL_NAMESPACE = "_sdw_journal_v1";
 export const SDW_JOURNAL_TEMP = ".tmp";
 export const SDW_NAMESPACE_MUTATION_LOCK = ".sdw-mutation.lock";
 /** Bit positions in affected_mask, also the canonical epoch/coverage order. */
-export const SDW_JOURNAL_NAMESPACES = [
+export const SDW_JOURNAL_NAMESPACES = Object.freeze([
   SDW_CATALOG_NAMESPACE, SDW_DOCUMENT_CORPUS_NAMESPACE, SDW_META_NAMESPACE,
   SDW_QUERY_HISTORY_NAMESPACE, SDW_VECTOR_MEMORY_NAMESPACE, SDW_WORKING_STATE_NAMESPACE,
-] as const;
+] as const);
+// Must match isSdwNamespace in sdw/write-gate.ts; pinned here only because that
+// higher-level module is outside this packet's scope. Full-set parity is tested.
+const journalNamespaces: ReadonlySet<string> = new Set(SDW_JOURNAL_NAMESPACES);
 export type SdwJournalName = "generation" | "plan.json" | "receipt.bin" |
   "PREPARED" | "COMMIT" | "APPLIED" | "RETIRED";
 export type SdwDecision = "none" | "unknown" | "committed";
@@ -85,7 +87,7 @@ const encodedBytes = (length: number) => z.string()
 const keySchema = z.string().min(1).max(SDW_MAX_KEY_ENCODED_BYTES).refine(v =>
   !v.includes("\0") && v !== "." && v !== ".." && filesystemStorageNameRoundTrips(v) &&
   Buffer.byteLength(encodeFilesystemStorageName(v)) <= SDW_MAX_KEY_ENCODED_BYTES);
-const namespaceSchema = z.custom<SdwNamespace>(v => typeof v === "string" && isSdwNamespace(v));
+const namespaceSchema = z.custom<SdwNamespace>(v => typeof v === "string" && journalNamespaces.has(v));
 const namespacesSchema = z.array(namespaceSchema).min(1).max(SDW_JOURNAL_NAMESPACES.length)
   .refine(v => v.every((ns, i) => i === 0 || v[i - 1]! < ns));
 const epochsSchema = z.object({
@@ -287,7 +289,11 @@ function assertAttestation(record: SdwPlan | SdwCertificate): void {
 /** Trust is fortress primary authority, supplied independently of the journal's claimed key. */
 export interface SdwPrimaryVerifier {
   readonly fortress_id: string;
-  /** Reject foreign/stored-only keys; accept prior keys only with authenticated primary history. */
+  /**
+   * Reject foreign/stored-only keys; accept prior keys only with authenticated primary history.
+   * Rejections become storage_plan_invalid. If trust cannot be evaluated, explicitly throw
+   * SdwStorageError with reason storage_capability_unavailable instead.
+   */
   assertPlanSigner(identity_id: string, public_key: Uint8Array): Promise<void>;
 }
 /** Slice 2 must wire this required authority before any production journal creation. */
@@ -312,7 +318,8 @@ export async function verifySdwSignedRecord(record: SdwPlan | SdwCertificate, au
     await authority.assertPlanSigner(checked.body.identity_id, new Uint8Array(key));
   } catch (cause) {
     if (cause instanceof SdwStorageError) throw cause;
-    throw new SdwStorageError("storage_capability_unavailable", "none", checked.body.transaction_id, { cause });
+    // Only an explicit unavailable result denotes missing evidence; rejection is invalid trust.
+    throw new SdwStorageError("storage_plan_invalid", "none", checked.body.transaction_id, { cause });
   }
   requireValid(verify(sdwSigningBytes(checked.attestation), Buffer.from(checked.signature, "base64url"), key));
 }
@@ -342,12 +349,14 @@ export function validateSdwPlanClosure(plan: SdwPlan, pages: readonly Uint8Array
   requireValid(records === checked.body.record_count && bytes === checked.body.staged_bytes);
   return parsed;
 }
-/** Bind a terminal/decision certificate to the exact signed root, receipt and observed epoch vector. */
+/** Bind a certificate to its expected role, exact signed root, receipt and observed epoch vector. */
 export async function verifySdwCertificate(
   certificate: SdwCertificate, plan: SdwPlan, epochs: SdwEpochs,
-  authority: SdwPrimaryVerifier,
+  expectedState: SdwCertificate["body"]["state"], authority: SdwPrimaryVerifier,
 ): Promise<void> {
   certificate = parseSdwJournalRecord("certificate", sdwCanonicalBytes(certificate, SDW_MAX_MARKER_BYTES));
+  // The primary's signature authenticates its stated role; the relying caller must bind that role.
+  requireValid(certificate.body.state === expectedState);
   plan = parseSdwJournalRecord("plan", sdwCanonicalBytes(plan, SDW_MAX_PLAN_BYTES));
   const checkedEpochs = epochsSchema.safeParse(epochs);
   requireValid(checkedEpochs.success);
@@ -385,8 +394,7 @@ export interface SdwStorageBoundaryCapabilities {
 
 /**
  * Admission implementation belongs to the fence packet; no token factory is exported here.
- * Defined here, not in interface.ts: interface.ts must not import this module, because this module
- * imports the SDW write gate and the coordination import-boundary drill walks interface.ts.
+ * Defined here to keep the opt-in journal seam separate from the base StorageBackend contract.
  */
 export type SdwJournalAdmission = <T>(
   storage: StorageBackend,

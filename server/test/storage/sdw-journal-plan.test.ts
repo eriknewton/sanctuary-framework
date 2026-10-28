@@ -11,6 +11,7 @@ import {
 import { createL1Tools, domainSeparatedSigningBytes, INTERNAL_RECEIPT_SIGNING_DOMAIN } from "../../src/cognitive/tools.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { isSdwNamespace, assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
+import * as sdwRecords from "../../src/sdw/records.js";
 import * as locks from "../../src/storage/cross-process-lock.js";
 import * as admission from "../../src/storage/exit-import-journal.js";
 import * as custody from "../../src/core/master-custody.js";
@@ -79,7 +80,6 @@ describe("SDW canonical journal schema", () => {
       expect(await rig.storage.read(row.namespace, row.storageKey)).toEqual(row.data);
     }
     expect(validateSdwPlanClosure(rig.plan, rig.pages, rig.receipt)).toEqual([rig.page]);
-    expect(SDW_JOURNAL_NAMESPACES.every(isSdwNamespace)).toBe(true);
     for (const ns of ["_sdw_memory_bad_signers", "_sdw_journal_v1", "_sdw_catalog_suffix", "_sdw", "memory"]) {
       const page = structuredClone(rig.page);
       page.entries[0]!.namespace = ns as any;
@@ -87,6 +87,29 @@ describe("SDW canonical journal schema", () => {
     }
     expect(await readdir(rig.root)).not.toContain("_sdw_journal_v1");
     expect(rig.storage).not.toHaveProperty("sdwTransaction");
+  });
+
+  it("matches the full write-gate namespace set over every records constant and negative strings", () => {
+    const constants: unknown[] = Object.values(sdwRecords).flat();
+    const candidates = [...constants.filter((v): v is string => typeof v === "string"),
+      "", "_sdw_memory_bad_signers", "_sdw_journal_v1", "_sdw_catalog_suffix", "_sdw", "memory"];
+    const accepted = candidates.filter(namespace => {
+      const page = structuredClone(rig.page);
+      page.entries = [{ ...page.entries[0]!, namespace: namespace as any }];
+      try { parse("page", page); return true; }
+      catch (error) { expect(error).toBeInstanceOf(SdwStorageError); return false; }
+    });
+    expect(new Set(accepted)).toEqual(new Set(SDW_JOURNAL_NAMESPACES));
+    expect(new Set(accepted)).toEqual(new Set(candidates.filter(isSdwNamespace)));
+  });
+
+  it.each(["CLEAN", "BUSY", "APPLIED", "RETIRED"] as const)("accepts valid %s generation records", phase => {
+    const generation = {
+      version: 1, epochs: fixtureEpochs(), phase,
+      transaction_id: phase === "CLEAN" ? null : rig.plan.body.transaction_id,
+      affected_mask: phase === "CLEAN" ? 0 : (1 << SDW_JOURNAL_NAMESPACES.length) - 1,
+    };
+    expect(parse("generation", generation)).toEqual(generation);
   });
 
   it("rejects every missing/wrong field, malformed element and unknown field at every nesting level", async () => {
@@ -124,6 +147,31 @@ describe("SDW canonical journal schema", () => {
     for (const text of samples) expect(() => parseSdwJournalRecord("page", Buffer.from(text))).toThrow(SdwStorageError);
     expect(() => parseSdwJournalRecord("page", Buffer.from([0xff]))).toThrow(SdwStorageError);
     expect(parseSdwJournalRecord("page", Buffer.from(canonical))).toEqual(rig.page);
+  });
+
+  it.each(Object.entries(SDW_RECORD_BYTE_LIMITS))("rejects oversized %s before UTF-8 decoding", (kind, limit) => {
+    // Without the pre-decode cap, invalid UTF-8 produces a wrapped TypeError instead.
+    const bytes = Buffer.alloc(limit + 1, 0xff);
+    const decode = vi.spyOn(TextDecoder.prototype, "decode");
+    let error: unknown;
+    try { parseSdwJournalRecord(kind as keyof SdwRecordTypes, bytes); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(SdwStorageError);
+    expect(error).toMatchObject({ reason: "storage_plan_invalid" });
+    expect(error).not.toHaveProperty("cause");
+    expect(decode).not.toHaveBeenCalled();
+  });
+
+  it("rejects excessive depth before JSON.parse can report malformed JSON", () => {
+    // Thirteen open containers exceed the contract's twelve-container cap;
+    // removing the pre-scan instead reaches JSON.parse and wraps a SyntaxError.
+    const bytes = Buffer.from("[".repeat(12 + 1));
+    const parseJson = vi.spyOn(JSON, "parse");
+    let error: unknown;
+    try { parseSdwJournalRecord("page", bytes); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(SdwStorageError);
+    expect(error).toMatchObject({ reason: "storage_plan_invalid" });
+    expect(error).not.toHaveProperty("cause");
+    expect(parseJson).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -307,7 +355,7 @@ describe("SDW signing evidence", () => {
       }
       await local.manager.rotate(local.primary.identity_id, "scheduled maintenance");
       await expect(verifySdwSignedRecord(local.plan, local.authority)).resolves.toBeUndefined();
-      await expect(verifySdwCertificate(await local.certificate("APPLIED"), local.plan, fixtureEpochs(), local.authority)).resolves.toBeUndefined();
+      await expect(verifySdwCertificate(await local.certificate("APPLIED"), local.plan, fixtureEpochs(), "APPLIED", local.authority)).resolves.toBeUndefined();
       const rotated = local.manager.getDefault()!;
       const history = structuredClone(rotated.rotation_history);
       rotated.rotation_history = [];
@@ -322,9 +370,46 @@ describe("SDW signing evidence", () => {
     } finally { await local.dispose(); }
   });
 
+  it("classifies an authority's signer rejection as invalid", async () => {
+    const cause = new Error("not primary");
+    const authority: SdwPrimaryVerifier = {
+      fortress_id: rig.authority.fortress_id,
+      async assertPlanSigner() { throw cause; },
+    };
+    await expect(verifySdwSignedRecord(rig.plan, authority)).rejects.toMatchObject({
+      reason: "storage_plan_invalid", decision: "none", cause,
+    });
+  });
+
+  it("preserves trust-unavailable when the authority cannot answer", async () => {
+    const authority: SdwPrimaryVerifier = {
+      fortress_id: rig.authority.fortress_id,
+      async assertPlanSigner() { throw new SdwStorageError("storage_capability_unavailable", "none"); },
+    };
+    await expect(verifySdwSignedRecord(rig.plan, authority)).rejects.toMatchObject({
+      reason: "storage_capability_unavailable", decision: "none",
+    });
+  });
+
+  it.each([
+    ["COMMIT", "APPLIED"], ["COMMIT", "RETIRED"],
+    ["APPLIED", "COMMIT"], ["APPLIED", "RETIRED"],
+    ["RETIRED", "COMMIT"], ["RETIRED", "APPLIED"],
+  ] as const)("rejects legitimately signed %s where %s is expected", async (state, expected) => {
+    const certificate = await rig.certificate(expected);
+    certificate.body.state = state;
+    certificate.attestation = sdwSigningReceipt(certificate.body, FIXTURE_TIME);
+    certificate.signature = Buffer.from(await rig.authority.signReceipt(certificate.attestation)).toString("base64url");
+    await expect(verifySdwSignedRecord(certificate, rig.authority)).resolves.toBeUndefined();
+    await expect(verifySdwCertificate(certificate, rig.plan, fixtureEpochs(), state, rig.authority)).resolves.toBeUndefined();
+    await expect(verifySdwCertificate(certificate, rig.plan, fixtureEpochs(), expected, rig.authority)).rejects.toMatchObject({
+      reason: "storage_plan_invalid", decision: "none",
+    });
+  });
+
   it.each(["COMMIT", "APPLIED", "RETIRED"] as const)("binds %s to exact root, fortress, epochs and receipt", async state => {
     const certificate = await rig.certificate(state);
-    await expect(verifySdwCertificate(certificate, rig.plan, fixtureEpochs(), rig.authority)).resolves.toBeUndefined();
+    await expect(verifySdwCertificate(certificate, rig.plan, fixtureEpochs(), state, rig.authority)).resolves.toBeUndefined();
     for (const field of ["plan_sha256", "fortress_id", "transaction_id", "receipt_sha256", "receipt_byte_length", "epochs"] as const) {
       const changed = structuredClone(certificate);
       if (field === "epochs") changed.body.epochs._sdw_catalog++;
@@ -332,7 +417,7 @@ describe("SDW signing evidence", () => {
       else changed.body[field] = field === "fortress_id" ? "foreign" : (field === "transaction_id" ? "b".repeat(32) : "b".repeat(64));
       changed.attestation = sdwSigningReceipt(changed.body, FIXTURE_TIME);
       changed.signature = Buffer.from(await rig.authority.signReceipt(changed.attestation)).toString("base64url");
-      await expect(verifySdwCertificate(changed, rig.plan, fixtureEpochs(), rig.authority)).rejects.toBeInstanceOf(SdwStorageError);
+      await expect(verifySdwCertificate(changed, rig.plan, fixtureEpochs(), state, rig.authority)).rejects.toBeInstanceOf(SdwStorageError);
     }
     for (const field of ["subject", "status", "receipt_id", "body_hash"] as const) {
       const changed = structuredClone(certificate);
@@ -349,7 +434,7 @@ describe("SDW signing evidence", () => {
     const original = structuredClone(certificate);
     const epochs = fixtureEpochs();
     const plan = structuredClone(rig.plan);
-    await expect(verifySdwCertificate(certificate, plan, epochs, {
+    await expect(verifySdwCertificate(certificate, plan, epochs, "APPLIED", {
       fortress_id: rig.authority.fortress_id,
       async assertPlanSigner(id, key) {
         await rig.authority.assertPlanSigner(id, key);
@@ -359,7 +444,7 @@ describe("SDW signing evidence", () => {
         key.fill(0);
       },
     })).resolves.toBeUndefined();
-    await expect(verifySdwCertificate(original, rig.plan, fixtureEpochs(), rig.authority)).resolves.toBeUndefined();
+    await expect(verifySdwCertificate(original, rig.plan, fixtureEpochs(), "APPLIED", rig.authority)).resolves.toBeUndefined();
   });
 
   it("actual internal helper audits without acquiring SDW, admission, corpus or master locks", async () => {
