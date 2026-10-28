@@ -11,6 +11,9 @@
 // directions by the new "transactional persistable-write recognizer" describe
 // block below (accepts 3-arg AND 4-arg compliant shapes, still rejects a
 // bypass and a missing implementation).
+import { createRequire } from "node:module";
+import type * as TypeScript from "typescript";
+const ts: typeof import("typescript") = createRequire(import.meta.url)("typescript");
 import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -844,3 +847,163 @@ function workingStateRecord(stateId: string, summary: string): SdwWorkingStateRe
     },
   };
 }
+
+
+// The complete reference inventory pins every place the receipt-capable helper
+// is constructed, passed or named. New aliases/consumers need explicit review;
+// substring searches for literal sdw-storage- subjects are not a trust boundary.
+const SIGNING_REFERENCE_NAMES = new Set([
+  "InternalIdentitySigningHelpers", "createInternalIdentitySigningHelpers",
+  "internalSigning", "internal_receipt_sign", "signingHelpers",
+]);
+const EXPECTED_SIGNING_REFERENCES: Record<string, Record<string, number>> = {
+  "cognitive/tools.ts": { InternalIdentitySigningHelpers: 3, internal_receipt_sign: 4, createInternalIdentitySigningHelpers: 2, internalSigning: 3 },
+  "index.ts": { createInternalIdentitySigningHelpers: 2, signingHelpers: 1 },
+  "cli/distress.ts": { createInternalIdentitySigningHelpers: 2, signingHelpers: 1 },
+  "distress/tools.ts": { InternalIdentitySigningHelpers: 2, signingHelpers: 2 },
+};
+
+function signingReferenceInventory(source: TypeScript.SourceFile): Record<string, number> {
+  const counts: Record<string, number> = {};
+  const visit = (node: TypeScript.Node) => {
+    if ((ts.isIdentifier(node) || ts.isStringLiteralLike(node)) && SIGNING_REFERENCE_NAMES.has(node.text)) {
+      counts[node.text] = (counts[node.text] ?? 0) + 1;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return counts;
+}
+
+/** Fail closed on receipt-capable helper aliases, including computed/dynamic selection. */
+function receiptConsumerViolations(source: TypeScript.SourceFile): string[] {
+  type Capability = "helper" | "bundle" | "factory" | "bundleFactory" | "receipt";
+  const aliases = new Map<string, Capability>([
+    ["createInternalIdentitySigningHelpers", "factory"],
+    ["createCognitiveTools", "bundleFactory"], ["createL1Tools", "bundleFactory"],
+  ]);
+  const nodes: TypeScript.Node[] = [];
+  const gather = (node: TypeScript.Node) => { nodes.push(node); ts.forEachChild(node, gather); };
+  gather(source);
+  function literal(node: TypeScript.Expression | undefined): string | undefined {
+    if (!node) return undefined;
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = literal(node.left), right = literal(node.right);
+      if (left !== undefined && right !== undefined) return left + right;
+    }
+    return undefined;
+  }
+  function access(node: TypeScript.Node): { base: TypeScript.Expression; key: string | undefined } | undefined {
+    if (ts.isPropertyAccessExpression(node)) return { base: node.expression, key: node.name.text };
+    if (ts.isElementAccessExpression(node)) return { base: node.expression, key: literal(node.argumentExpression) };
+    return undefined;
+  }
+  function selected(base: Capability | undefined, key: string | undefined): Capability | undefined {
+    if (key === "internal_receipt_sign") return "receipt";
+    if (key === "createInternalIdentitySigningHelpers") return "factory";
+    if (key === "createCognitiveTools" || key === "createL1Tools") return "bundleFactory";
+    if (key === "internalSigning" || key === "signingHelpers") return "helper";
+    // Unknown computed members on a helper/bundle may select the signing capability.
+    if (key === undefined && (base === "helper" || base === "bundle")) return "receipt";
+    return undefined;
+  }
+  function capability(node: TypeScript.Expression): Capability | undefined {
+    if (ts.isIdentifier(node)) return aliases.get(node.text);
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) return capability(node.expression);
+    const member = access(node);
+    if (member) return selected(capability(member.base), member.key);
+    if (ts.isCallExpression(node)) {
+      const called = capability(node.expression);
+      return called === "factory" ? "helper" : called === "bundleFactory" ? "bundle" : undefined;
+    }
+    return undefined;
+  }
+  // Resolve local assignments/destructuring to a fixed point. This is a source
+  // test, not a runtime parser; the finite identifier set bounds convergence.
+  for (let pass = 0; pass <= nodes.length; pass++) {
+    let changed = false;
+    const bind = (name: string, cap: Capability | undefined) => {
+      if (cap && aliases.get(name) !== cap) { aliases.set(name, cap); changed = true; }
+    };
+    for (const node of nodes) {
+      if (ts.isImportSpecifier(node)) bind(node.name.text, aliases.get(node.propertyName?.text ?? node.name.text));
+      if ((ts.isParameter(node) || ts.isVariableDeclaration(node)) && node.type?.getText(source) === "InternalIdentitySigningHelpers" && ts.isIdentifier(node.name)) bind(node.name.text, "helper");
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        const cap = capability(node.initializer);
+        if (ts.isIdentifier(node.name)) bind(node.name.text, cap);
+        else if (ts.isObjectBindingPattern(node.name)) {
+          for (const element of node.name.elements) {
+            if (ts.isIdentifier(element.name)) {
+              const key = element.propertyName && ts.isComputedPropertyName(element.propertyName)
+                ? literal(element.propertyName.expression) : element.propertyName?.getText(source) ?? element.name.text;
+              bind(element.name.text, element.dotDotDotToken ? cap : selected(cap, key));
+            }
+          }
+        }
+      }
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)) bind(node.left.text, capability(node.right));
+    }
+    if (!changed) break;
+  }
+  const violations: string[] = [];
+  for (const node of nodes) {
+    if (ts.isCallExpression(node) && capability(node.expression) === "receipt") violations.push(node.getText(source));
+    const member = access(node);
+    if (member && selected(capability(member.base), member.key) === "receipt") violations.push(node.getText(source));
+    if (ts.isBindingElement(node) && node.propertyName?.getText(source) === "internal_receipt_sign") violations.push(node.getText(source));
+  }
+  return violations;
+}
+
+describe("SDW receipt subject ownership", () => {
+  it("pins the whole reference/alias inventory and permits no production receipt consumer", async () => {
+    const root = join(process.cwd(), "src");
+    const inventory: Record<string, Record<string, number>> = {};
+    const offenders: string[] = [];
+    for (const file of await listTsFiles(root)) {
+      const path = relative(root, file).replaceAll("\\", "/");
+      const source = ts.createSourceFile(path, await readFile(file, "utf8"), ts.ScriptTarget.Latest, true);
+      const references = signingReferenceInventory(source);
+      if (Object.keys(references).length) inventory[path] = references;
+      // The defining module's exact four receipt references are pinned above;
+      // every other module is a consumer and has no SDW subject authority.
+      if (path !== "cognitive/tools.ts") offenders.push(...receiptConsumerViolations(source).map(v => `${path}: ${v}`));
+    }
+    expect(inventory).toEqual(EXPECTED_SIGNING_REFERENCES);
+    expect(offenders).toEqual([]);
+  });
+
+  it.each([
+    'helpers.internal_receipt_sign({ subject: "sdw-storage-plan" });',
+    'helpers.internal_receipt_sign({ subject: supplied });',
+    'const { internal_receipt_sign: issue } = helpers; issue(payload);',
+    'const issue = helpers["internal_" + "receipt_sign"]; issue(payload);',
+    'const helpers = createInternalIdentitySigningHelpers(manager, key); const alias = helpers; alias[method](payload);',
+    'import { createInternalIdentitySigningHelpers as factory } from "./tools.js"; const helpers = factory(manager, key); const { internal_receipt_sign: sign } = helpers; sign(payload);',
+    'const bundle = createL1Tools(store, storage, key, mode); const { internalSigning: alias } = bundle; alias[method](payload);',
+    'const bundle = createCognitiveTools(store, storage, key, mode); const helper = bundle[dynamic]; helper(payload);',
+    'function use(helper: InternalIdentitySigningHelpers) { const alias = helper; alias[method](payload); }',
+    'const helpers = namespace.createInternalIdentitySigningHelpers(manager, key); const copied = helpers; copied[dynamic](payload);',
+    'const helpers = createInternalIdentitySigningHelpers(manager, key); let copied; copied = helpers; copied[dynamic](payload);',
+  ])("rejects receipt capability escape: %s", source => {
+    const parsed = ts.createSourceFile("negative.ts", source, ts.ScriptTarget.Latest, true);
+    expect(receiptConsumerViolations(parsed).length).toBeGreaterThan(0);
+  });
+
+  it("allows the existing fixed audit-event consumer and notices a new helper reference", () => {
+    const source = ts.createSourceFile("counterpart.ts", 'const helpers = createInternalIdentitySigningHelpers(manager, key); helpers.audit_event_sign(payload);', ts.ScriptTarget.Latest, true);
+    expect(receiptConsumerViolations(source)).toEqual([]);
+    expect(signingReferenceInventory(source)).toEqual({ createInternalIdentitySigningHelpers: 1 });
+  });
+
+  it("keeps contract runtime imports below cognitive and exports no transaction/token factory", async () => {
+    const source = await readFile("src/storage/sdw-journal-contract.ts", "utf8");
+    const parsed = ts.createSourceFile("contract.ts", source, ts.ScriptTarget.Latest, true);
+    const imports = parsed.statements.filter(ts.isImportDeclaration).map(n => (n.moduleSpecifier as TypeScript.StringLiteral).text);
+    expect(imports.some(path => path.includes("cognitive"))).toBe(false);
+    const barrel = await import("../../src/storage/index.js");
+    expect(barrel).toHaveProperty("SdwStorageError");
+    for (const name of ["sdwTransaction", "withSdwWriteSet", "withSdwJournalAdmission", "sdwSigningBytes", "parseSdwJournalRecord"]) expect(barrel).not.toHaveProperty(name);
+  });
+});
