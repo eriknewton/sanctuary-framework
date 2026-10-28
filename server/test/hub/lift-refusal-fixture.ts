@@ -10,6 +10,7 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { buildV11Bindings, fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { dispatchV11Request } from "../../src/dashboard/v1_1/dispatch.js";
 import { writePersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
+import { liftAgentEgressStop } from "../../src/castle-wall/provision/agent-stop.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import type { HubInboxStore } from "../../src/hub/inbox-store.js";
 import type { HubServiceDeps } from "../../src/hub/types.js";
@@ -39,7 +40,9 @@ export async function liftFixture(lift?: Parameters<typeof buildV11Bindings>[0][
     capabilities: { can_pause: false, can_resume: false, can_restart: false, can_unwrap: false, can_lockdown: true, can_chat: false, can_change_template: false },
   };
   writePersistedLocalAgents(storagePath, [record]);
-  const bindings = buildV11Bindings({ identityId: record.identity_id, fortressId: fortressIdFromStoragePath(storagePath), storagePath, auditLog, liftAgentEgressStop: lift });
+  // The real lift refuses off darwin before reading the snapshot, so the default pins darwin to reach the snapshot arm on every CI host.
+  const realLift: NonNullable<typeof lift> = input => liftAgentEgressStop({ ...input, platform: "darwin" });
+  const bindings = buildV11Bindings({ identityId: record.identity_id, fortressId: fortressIdFromStoragePath(storagePath), storagePath, auditLog, liftAgentEgressStop: lift ?? realLift });
   const service = bindings.hubService;
   const internals = service as unknown as { inboxStore: HubInboxStore; deps: HubServiceDeps };
   const call = async (path: string, method = "POST", reply = new ApprovalReply()) => {
