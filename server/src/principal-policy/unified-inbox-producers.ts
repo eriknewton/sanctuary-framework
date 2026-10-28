@@ -1,4 +1,4 @@
-import type { ConsumerMintedBlockedEgress } from "../castle-wall/runtime/audit-consumer.js";
+import type { ConsumerMintedBlockedEgress } from "../castle-wall/runtime/blocked-egress-attribution.js";
 import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
 
 /**

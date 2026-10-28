@@ -1,4 +1,4 @@
-import { isBlockedEgressSubject, parseBlockedEgressHost, parseBlockedEgressIp, parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../../contracts/v1.1/index.js";
+import { isBlockedEgressSubject, parseBlockedEgressHost, parseBlockedEgressIp, parseBlockedEgressMetadata } from "../../contracts/v1.1/index.js";
 
 /**
  * Audit consumer: drains the daemon's WAL by accepting `audit_emit`
@@ -15,6 +15,7 @@ import { isBlockedEgressSubject, parseBlockedEgressHost, parseBlockedEgressIp, p
  */
 
 import { createHash } from "node:crypto";
+import { mintConsumerBlockedEgress, type BlockedEgressProjection, type ConsumerMintedBlockedEgress } from "./blocked-egress-attribution.js";
 
 import {
   CASTLE_WALL_AUDIT_LAYER,
@@ -1695,30 +1696,6 @@ export function buildChainAnchorSourceFromAuditLog(
   };
 }
 
-declare const blockedEgressMintBrand: unique symbol;
-/** Opaque handoff accepted only when minted by this consumer after durable persistence. */
-export interface ConsumerMintedBlockedEgress {
-  readonly [blockedEgressMintBrand]: true;
-}
-
-interface BlockedEgressProjection {
-  metadata: BlockedEgressMetadata;
-  signedFields?: { agent_id?: string; observed_at: string; source_event_id: string };
-}
-
-// Weak keys retain no event history: each bounded mint dies with its handoff token.
-const blockedEgressMints = new WeakMap<ConsumerMintedBlockedEgress, BlockedEgressProjection>();
-
-/** Bridge admission reads a detached snapshot; a shape-compatible object cannot mint credibility. */
-export function readConsumerMintedBlockedEgress(token: ConsumerMintedBlockedEgress | undefined): BlockedEgressProjection | undefined {
-  // Must match ingestBlockedEgress in principal-policy/unified-inbox-bridge.ts: only this private registry confers authority.
-  if (!token || !blockedEgressMints.has(token)) return undefined;
-  const minted = blockedEgressMints.get(token)!;
-  const parsed = parseBlockedEgressMetadata(minted.metadata);
-  if (!parsed.ok) throw new Error("Invalid consumer blocked-egress mint");
-  return { metadata: parsed.value, ...(minted.signedFields ? { signedFields: { ...minted.signedFields } } : {}) };
-}
-
 /** Mint display facts only after the consumer has accepted the signature and subject binding. */
 function blockedEgressMetadataFor(
   envelope: CriticalEventEnvelope,
@@ -1762,7 +1739,6 @@ function blockedEgressMetadataFor(
       source_event_id: `${timestamp}:${signature.seq}`,
     };
   }
-  const token = Object.freeze({}) as ConsumerMintedBlockedEgress;
-  blockedEgressMints.set(token, projection);
-  return token;
+  // Must match mintConsumerBlockedEgress in blocked-egress-attribution.ts: only this consumer registers accepted projections.
+  return mintConsumerBlockedEgress(projection);
 }

@@ -1,4 +1,4 @@
-import { readConsumerMintedBlockedEgress, type ConsumerMintedBlockedEgress } from "../castle-wall/runtime/audit-consumer.js";
+import { readConsumerMintedBlockedEgress, type ConsumerMintedBlockedEgress } from "../castle-wall/runtime/blocked-egress-attribution.js";
 import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
 
 /**
@@ -382,7 +382,7 @@ export class UnifiedInboxBridge {
   }
 
   ingestBlockedEgress(input: BlockedEgressIngest, minted?: ConsumerMintedBlockedEgress): UnifiedInboxEntry | null {
-    // Must match readConsumerMintedBlockedEgress in castle-wall/runtime/audit-consumer.ts: shape alone grants no producer credibility.
+    // Must match readConsumerMintedBlockedEgress in castle-wall/runtime/blocked-egress-attribution.ts: shape alone grants no producer credibility.
     const projection = readConsumerMintedBlockedEgress(minted);
     let metadata = parseBlockedEgressMetadata(projection?.metadata ?? input.blocked_egress);
     if (!projection && metadata.ok && metadata.value.attribution.state === "verified") {
