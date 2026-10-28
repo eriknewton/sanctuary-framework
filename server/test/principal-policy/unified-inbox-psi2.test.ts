@@ -1,5 +1,6 @@
 /**
- * Psi-2 producer wiring + encrypted persistence regressions.
+ * Producer wiring and encrypted persistence preserve accepted blocked-egress evidence.
+ * S1
  */
 
 import { describe, it, expect } from "vitest";
@@ -399,7 +400,7 @@ describe("structured blocked-egress encrypted round trip", () => {
       destination: { host: metadata.destination_host, ip: metadata.destination_ip, port: 443, protocol: "tcp" },
       details: { seq: 0, prior_sha256_hex: null } });
     const body = canonicalize({ layer: "l1", timestamp: OBSERVED_AT, operation: "egress_blocked", identity_id: "fortress/uid-1", result: "blocked",
-      details: { dest_host: metadata.destination_host, dest_ip: metadata.destination_ip } });
+      details: { agent_id: "signed-agent", dest_host: metadata.destination_host, dest_ip: metadata.destination_ip } });
     const consumer = new AuditConsumer({ append: () => {}, flush: async () => {} }, bridge,
       { now: () => now, ...(state === "verified" ? { pinnedProducerKeyB64url: Buffer.from(ed25519.getPublicKey(privateKey)).toString("base64url") } : {}) });
     await consumer.ingestCritical({ event, ack: async () => {}, producerSubjectBinding: { kind: "signed_identity_id" },

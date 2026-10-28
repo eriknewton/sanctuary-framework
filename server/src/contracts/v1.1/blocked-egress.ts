@@ -52,10 +52,12 @@ export function parseBlockedEgressIp(raw: unknown): BlockedEgressParseResult<str
 
 /**
  * Verified carries the pinned Castle Wall producer's credibility only for signed
- * destination host/IP, signed agent_id and timestamp, signature-bound seq, and
+ * destination host/IP, signed string agent_id and timestamp, signature-bound seq, and
  * the consumer subject derived from signed agent_id (local fortress scope) or
  * signed identity_id. It does not vouch for reason, reason class, severity, or
  * any other envelope field, nor does it prove operation success or enrollment.
+ * Missing/non-string signed agent_id is unverified with no subject; a contradicting
+ * envelope destination suppresses projection entirely.
  * Must match blockedEgressMetadataFor in castle-wall/runtime/audit-consumer.ts.
  */
 // Must match the attribution field in hub-events.ts; both use this shared type.

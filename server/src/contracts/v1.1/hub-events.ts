@@ -253,10 +253,8 @@ export interface HubBlockedEgressItem extends HubInboxItemHeader {
   destination_host?: string;
   /** Bounded literal IP fallback when no valid host is available. */
   destination_ip?: string;
-  /** Whether a verified subject has one same-owner enrolled agent match. */
-  agent_binding?: "bound" | "unattributed";
   /**
-   * Verified covers signed host/IP, agent_id, timestamp, signature-bound seq, and the consumer-derived subject only. Reason fields and other envelope data are unsigned; producer credibility is not operation success.
+   * Verified covers signed host/IP, string agent_id, timestamp, signature-bound seq, and the consumer-derived subject only. Reason fields and other envelope data are unsigned; producer credibility is not operation success.
    * Legacy absence is unverified. Must match BlockedEgressAttribution in blocked-egress.ts.
    */
   attribution?: BlockedEgressAttribution;

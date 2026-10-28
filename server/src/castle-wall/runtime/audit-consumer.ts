@@ -275,6 +275,8 @@ export interface AuditConsumerStats {
   persistenceFailures: number;
   /** Saturating count of failed inbox projections after durable audit persistence. */
   blockedEgressProjectionFailures: number;
+  /** Saturating count of inbox projections suppressed for contradicting destinations. */
+  blockedEgressDestinationConflicts: number;
   /**
    * Count of enforcement-evidence events rejected because their producer
    * signature was missing or did not verify against the pinned producer key
@@ -403,6 +405,7 @@ export class AuditConsumer {
     ackFailures: 0,
     persistenceFailures: 0,
     blockedEgressProjectionFailures: 0,
+    blockedEgressDestinationConflicts: 0,
     producerSignatureRejections: 0,
     producerSignatureAccepted: 0,
   };
@@ -727,11 +730,15 @@ export class AuditConsumer {
     if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
       // No blocked-egress projection is published before its primary audit receipt is durably appended and flushed; projection failure never rewrites the enforcement outcome.
       try {
-        ingestCastleWallBlockedEgress({
-          bridge: this.inboxBridge,
-          event: envelope.event,
-          minted: blockedEgressMetadataFor(envelope, sigOutcome, identityOutcome.identityId),
-        });
+        const minted = blockedEgressMetadataFor(envelope, sigOutcome, identityOutcome.identityId);
+        if (minted) {
+          ingestCastleWallBlockedEgress({ bridge: this.inboxBridge, event: envelope.event, minted });
+        } else {
+          // A contradicting envelope cannot publish a card; the durable receipt still advances ACK and chain state.
+          this.stats.blockedEgressDestinationConflicts = Math.min(Number.MAX_SAFE_INTEGER, this.stats.blockedEgressDestinationConflicts + 1);
+          // Fixed text bounds diagnostic size and reveals no payload, destination, subject or exception.
+          try { console.warn("Castle Wall blocked-egress inbox destination conflict"); } catch { /* Logging cannot undo a durable receipt. */ }
+        }
       } catch {
         // The durable audit row is the record; this inbox projection may fail without changing ACK/chain state.
         // Redelivery takes duplicate_replay and does not re-project; the pending audit marker is not a publication claim.
@@ -1696,20 +1703,32 @@ export function buildChainAnchorSourceFromAuditLog(
   };
 }
 
-/** Mint display facts only after the consumer has accepted the signature and subject binding. */
+/**
+ * Verified covers signed host/IP, string agent_id, timestamp, signature-bound seq,
+ * and the consumer subject derived from signed agent_id with local fortress scope
+ * or signed identity_id. Reason, reason class, severity and other envelope fields
+ * are unsigned. A contradicting destination suppresses the projection entirely.
+ * Must match BlockedEgressAttribution in contracts/v1.1/blocked-egress.ts.
+ */
 function blockedEgressMetadataFor(
   envelope: CriticalEventEnvelope,
   signature: SignatureOutcome,
   signedSubject: string,
-): ConsumerMintedBlockedEgress {
+): ConsumerMintedBlockedEgress | undefined {
   const signed = signature.kind === "verified";
   const details = signed ? signedDetailsFromBody(signature.signedBody) : envelope.event.details;
   const envelopeHost = envelope.event.destination?.host ?? envelope.event.details.dest_host;
   const envelopeIp = envelope.event.destination?.ip ?? envelope.event.details.dest_ip;
-  // Conflicting envelope destinations downgrade the whole projection; absence alone asserts no conflicting fact.
+  // Absence asserts no conflicting fact; a signed destination conflict must never reach inbox admission.
   const destinationsAgree = !signed ||
     ((envelopeHost == null || envelopeHost === details.dest_host) && (envelopeIp == null || envelopeIp === details.dest_ip));
-  const verified = signed && destinationsAgree && isBlockedEgressSubject(signedSubject);
+  if (!destinationsAgree) return undefined;
+  // Only a string agent_id in the signed body can support verified display attribution.
+  const signedAgentId = details.agent_id;
+  const verified = signed && typeof signedAgentId === "string" && isBlockedEgressSubject(signedSubject);
+  // Continuing paths: signed + string agent_id + displayable subject -> verified;
+  // unsigned, missing/non-string agent_id, or undisplayable subject -> unverified, no subject.
+  // Refusal paths: destination conflict -> no mint; invalid metadata/timestamp -> projection failure.
   const host = parseBlockedEgressHost(verified ? details.dest_host : envelopeHost);
   const ip = parseBlockedEgressIp(verified ? details.dest_ip : envelopeIp);
   // Must match BlockedEgressAttribution in contracts/v1.1/blocked-egress.ts: pinned producer credibility covers only
@@ -1733,7 +1752,7 @@ function blockedEgressMetadataFor(
     const timestamp = signature.signedBody.timestamp;
     if (typeof timestamp !== "string") throw new Error("Missing signed timestamp");
     projection.signedFields = {
-      ...(typeof details.agent_id === "string" ? { agent_id: details.agent_id } : {}),
+      agent_id: signedAgentId,
       observed_at: timestamp,
       // producer.seq is signature-bound even on older bodies without details.seq; evaluateProducerSignature checks parity.
       source_event_id: `${timestamp}:${signature.seq}`,

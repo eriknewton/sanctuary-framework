@@ -1,15 +1,11 @@
 /**
- * Slice L1: the audit consumer's producer-authenticity gate.
- *
- * The load-bearing safety property under test: when the consumer is configured
- * with a pinned producer public key, an enforcement-evidence event whose
- * producer signature does not verify against that key is NOT accepted as
- * enforcement evidence (fail closed). An in-process forger that can write the
- * `cw_source` marker still cannot produce a valid signature, so its event is
- * rejected and never persisted as evidence.
+ * The audit consumer verifies producer evidence before durable admission and inbox projection.
+ * S1
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { createHash } from "node:crypto";
+import { readConsumerMintedBlockedEgress } from "../../../src/castle-wall/runtime/blocked-egress-attribution.js";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import {
@@ -742,19 +738,92 @@ describe("structured blocked-egress producer evidence", () => {
     } finally { log.mockRestore(); }
   });
 
-  it.each(["host", "ip"] as const)("downgrades a disagreeing envelope %s with no subject", async (field) => {
+  it.each(["host", "ip"] as const)("suppresses a disagreeing envelope %s while preserving audit ACK and chain", async (field) => {
+    const sink = new RecordingSink();
+    const flush = vi.spyOn(sink, "flush");
     const bridge = structuredBridge();
-    const env = signedEnvelope(blockedEvent(0, null), daemonPriv);
+    const ingest = vi.spyOn(bridge, "ingestBlockedEgress");
+    const consumer = new AuditConsumer(sink, bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW });
+    const env = { ...signedEnvelope(blockedEvent(0, null), daemonPriv), ack: vi.fn(async () => {}) };
     const destination = { ...DEST, [field]: field === "host" ? "envelope.example" : "192.0.2.1" };
     env.event = { ...env.event, destination, agent: { id: "envelope-agent", template: "tpl" }, timestamp: "2026-06-14T00:00:00Z",
       details: { ...env.event.details, reason: "envelope reason" } };
-    await new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW }).ingestCritical(env);
-    const entry = bridge.list()[0]!;
-    expect(entry.blocked_egress).toEqual({ destination_host: destination.host, destination_ip: destination.ip, attribution: unsignedAttribution });
-    expect(entry.summary).toBe(`Egress to ${destination.host} blocked: envelope reason (agent envelope-agent)`);
-    expect(entry.agent_id).toBe("envelope-agent");
-    expect(entry.observed_at).toBe("2026-06-14T00:00:00Z");
-    expect(entry.source_event_id).toBe("2026-06-14T00:00:00Z:0");
+    const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await consumer.ingestCritical(env);
+      expect(bridge.list()).toEqual([]);
+      expect(ingest).not.toHaveBeenCalled();
+      expect(consumer.getStats().blockedEgressDestinationConflicts).toBe(1);
+      expect(consumer.getStats().blockedEgressProjectionFailures).toBe(0);
+      expect(log.mock.calls).toEqual([["Castle Wall blocked-egress inbox destination conflict"]]);
+      expect(env.ack).toHaveBeenCalledTimes(1);
+      expect(consumer.getWalChainState()).toMatchObject({
+        lastAckedSeq: 0,
+        lastEventChainHash: createHash("sha256").update(env.producer!.eventCanonicalJson).digest("hex"),
+      });
+      expect(sink.entries.find((entry) => entry.operation === "egress_blocked")?.result).toBe("failure");
+      expect(sink.entries.find((entry) => entry.operation === "castle_wall_blocked_egress")?.details?.projection_status).toBe("pending");
+      expect(flush).toHaveBeenCalledTimes(1);
+      await consumer.ingestCritical(env);
+      expect(env.ack).toHaveBeenCalledTimes(2);
+      expect(consumer.getStats().blockedEgressDestinationConflicts).toBe(1);
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally { log.mockRestore(); }
+  });
+
+  it.each([undefined, null, false])("mints unverified without a string signed agent_id (%s)", async (agentId) => {
+    const bridge = structuredBridge();
+    const body = JSON.parse(walBodyFor(blockedEvent(0, null)));
+    if (agentId === undefined) delete body.details.agent_id;
+    else body.details.agent_id = agentId;
+    const env = signedEnvelope(blockedEvent(0, null), daemonPriv, { bodyOverride: canonicalize(body) });
+    env.producerSubjectBinding = { kind: "signed_identity_id" };
+    const consumer = new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW });
+    await consumer.ingestCritical(env);
+    expect(consumer.getStats().producerSignatureAccepted).toBe(1);
+    expect(bridge.list()).toHaveLength(1);
+    expect(bridge.list()[0]?.blocked_egress).toEqual({
+      destination_host: DEST.host, destination_ip: DEST.ip, attribution: unsignedAttribution,
+    });
+    expect(bridge.list()[0]?.blocked_egress).not.toHaveProperty("subject");
+  });
+
+  it("consumes a consumer token on its first read", async () => {
+    const bridge = structuredBridge();
+    const reads: Array<ReturnType<typeof readConsumerMintedBlockedEgress>> = [];
+    const ingest = vi.spyOn(bridge, "ingestBlockedEgress").mockImplementation((_input, token) => {
+      reads.push(readConsumerMintedBlockedEgress(token), readConsumerMintedBlockedEgress(token));
+      return null;
+    });
+    await new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW })
+      .ingestCritical(signedEnvelope(blockedEvent(0, null), daemonPriv));
+    expect(ingest).toHaveBeenCalledTimes(1);
+    expect(reads).toHaveLength(2);
+    expect(reads[0]?.metadata).toEqual(verifiedMetadata);
+    expect(reads[1]).toBeUndefined();
+  });
+
+  it("saturates destination conflict accounting across repeated admissions even if logging throws", async () => {
+    const bridge = structuredBridge();
+    const consumer = new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: daemonPubB64, now: () => NOW });
+    // Seed just below the numeric ceiling to exercise saturation without an impractical event history.
+    (consumer as unknown as { stats: { blockedEgressDestinationConflicts: number } }).stats.blockedEgressDestinationConflicts = Number.MAX_SAFE_INTEGER - 1;
+    const log = vi.spyOn(console, "warn").mockImplementation(() => { throw new Error("isolated log failure"); });
+    let prior: string | null = null;
+    try {
+      for (const seq of [0, 1]) {
+        const env: CriticalEventEnvelope = { ...signedEnvelope(blockedEvent(seq, prior), daemonPriv), ack: vi.fn(async () => {}) };
+        env.event = { ...env.event, destination: { ...DEST, host: "envelope.example" } };
+        await consumer.ingestCritical(env);
+        expect(env.ack).toHaveBeenCalledTimes(1);
+        expect(consumer.getWalChainState().lastAckedSeq).toBe(seq);
+        expect(consumer.getStats().blockedEgressDestinationConflicts).toBe(Number.MAX_SAFE_INTEGER);
+        prior = createHash("sha256").update(env.producer!.eventCanonicalJson).digest("hex");
+      }
+      expect(bridge.list()).toEqual([]);
+      expect(consumer.getStats().blockedEgressProjectionFailures).toBe(0);
+      expect(log.mock.calls).toEqual(Array.from({ length: 2 }, () => ["Castle Wall blocked-egress inbox destination conflict"]));
+    } finally { log.mockRestore(); }
   });
 
   it("uses signed display fields but unsigned envelope reason on a verified entry", async () => {
