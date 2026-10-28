@@ -576,7 +576,13 @@ export async function withRequiredCrossProcessLock<T>(
  * different lock mechanism; a different message on the SAME
  * CrossProcessLockError shape, thrown from the SAME no-auto-break path.
  */
+// Shared by Exit owners and the private SDW admission mint; one lock domain.
+export const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
+export const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
+export const EXIT_ADMISSION_LOCK_TIMEOUT_MS = 10_000; // ten seconds to acquire, never holder expiry
+
 export class ExitAdmissionLockError extends Error {
+  readonly reason = "storage_busy" as const;
   constructor(message: string) {
     super(message);
     this.name = "ExitAdmissionLockError";
@@ -714,6 +720,7 @@ export async function withPathLock<T>(
             `some ceremonies hold it for minutes. If no other Sanctuary process is ` +
             `running, a prior holder ` +
             `crashed while holding it; clear it with: rm '${lockPath}'`,
+          "contention",
         );
       }
       await sleepLockRetry(retryMs, options.abortSignal, lockPath);

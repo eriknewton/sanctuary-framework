@@ -1,5 +1,17 @@
 /** Bounded SDW journal records; this module creates no journal or storage authority. */
 import { z } from "zod";
+import {
+  SDW_MAX_STAGED_BYTES, SDW_JOURNAL_NAMESPACES, SdwStorageError,
+  sdwGenerationSchema as generationSchema, sdwEpochsSchema as epochsSchema,
+  type SdwAdmissionToken, type SdwEpochs, type SdwGeneration,
+} from "./sdw-fence.js";
+export {
+  SDW_MAX_STAGED_BYTES, SDW_JOURNAL_NAMESPACES, SDW_MAX_PENDING_CALLS,
+  SDW_READ_RETRIES, SDW_LOCK_WAIT_MS, SDW_JOURNAL_NAMESPACE,
+  SDW_NAMESPACE_MUTATION_LOCK, SdwStorageError,
+} from "./sdw-fence.js";
+export type { SdwAdmissionToken, SdwEpochs, SdwGeneration, SdwDecision, SdwStorageReason } from "./sdw-fence.js";
+
 import { hash } from "../core/hashing.js";
 import { verify } from "../core/identity.js";
 import { INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX } from "../core/signing-domains.js";
@@ -12,7 +24,7 @@ import { encodeFilesystemStorageName, filesystemStorageNameRoundTrips } from "./
 import type { StorageBackend } from "./interface.js";
 
 // Must match the ciphertext/record import ceilings in sdw/import.ts.
-export const SDW_MAX_STAGED_BYTES = 64 * 1024 * 1024;
+
 export const SDW_MAX_RECORDS = 100_000;
 export const SDW_PAGE_RECORDS = 256;
 export const SDW_MAX_PAGES = Math.ceil(SDW_MAX_RECORDS / SDW_PAGE_RECORDS);
@@ -26,42 +38,23 @@ export const SDW_MAX_GENERATION_BYTES = 4 * 1024;
 // Five controls: PREPARED, COMMIT, APPLIED, RETIRED and generation; temps are extra.
 export const SDW_MAX_METADATA_BYTES = SDW_MAX_PAGES * SDW_MAX_PAGE_BYTES +
   SDW_MAX_PLAN_BYTES + SDW_MAX_RECEIPT_BYTES + 5 * SDW_MAX_MARKER_BYTES;
-export const SDW_MAX_PENDING_CALLS = 1;
-export const SDW_READ_RETRIES = 2;
-export const SDW_LOCK_WAIT_MS = 10_000;
+
+
+
 export const SDW_CLEANUP_BATCH_FILES = 256;
 export const SDW_MAX_JOURNAL_DEPTH = 3;
 // Layout allowance for directories, controls and the reusable temporary files.
 export const SDW_MAX_JOURNAL_ENTRIES = SDW_MAX_RECORDS + SDW_MAX_PAGES + 32;
-export const SDW_JOURNAL_NAMESPACE = "_sdw_journal_v1";
+
 export const SDW_JOURNAL_TEMP = ".tmp";
-export const SDW_NAMESPACE_MUTATION_LOCK = ".sdw-mutation.lock";
+
 /** Bit positions in affected_mask, also the canonical epoch/coverage order. */
-export const SDW_JOURNAL_NAMESPACES = Object.freeze([
-  SDW_CATALOG_NAMESPACE, SDW_DOCUMENT_CORPUS_NAMESPACE, SDW_META_NAMESPACE,
-  SDW_QUERY_HISTORY_NAMESPACE, SDW_VECTOR_MEMORY_NAMESPACE, SDW_WORKING_STATE_NAMESPACE,
-] as const);
 // Must match isSdwNamespace in sdw/write-gate.ts; pinned here only because that
 // higher-level module is outside this packet's scope. Full-set parity is tested.
-const journalNamespaces: ReadonlySet<string> = new Set(SDW_JOURNAL_NAMESPACES);
+const journalNamespaces: ReadonlySet<string> = new Set([SDW_CATALOG_NAMESPACE, SDW_DOCUMENT_CORPUS_NAMESPACE, SDW_META_NAMESPACE,
+  SDW_QUERY_HISTORY_NAMESPACE, SDW_VECTOR_MEMORY_NAMESPACE, SDW_WORKING_STATE_NAMESPACE]);
 export type SdwJournalName = "generation" | "plan.json" | "receipt.bin" |
   "PREPARED" | "COMMIT" | "APPLIED" | "RETIRED";
-export type SdwDecision = "none" | "unknown" | "committed";
-export type SdwStorageReason = "storage_busy" | "storage_capability_unavailable" |
-  "storage_limit_exceeded" | "storage_recovery_pending" | "storage_holder_lost" |
-  "storage_io_failed" | "operation_aborted" | "storage_plan_invalid" | "storage_scope_invalid";
-/** Preserve decision uncertainty through wrappers; this error never authorizes cleanup. */
-export class SdwStorageError extends Error {
-  constructor(
-    readonly reason: SdwStorageReason,
-    readonly decision: SdwDecision,
-    readonly transaction_id?: string,
-    options?: ErrorOptions,
-  ) {
-    super(reason, options);
-    this.name = "SdwStorageError";
-  }
-}
 function invalid(): never { throw new SdwStorageError("storage_plan_invalid", "none"); }
 function requireValid(condition: unknown): asserts condition { if (!condition) invalid(); }
 
@@ -74,7 +67,6 @@ const MAX_JSON_NODES = MAX_OBJECT_FIELDS * (SDW_MAX_PAGES + 1);
 const MAX_ID_BYTES = 256;
 const ED25519_KEY_BYTES = 32;
 const ED25519_SIGNATURE_BYTES = 64;
-const MAX_EPOCH = Number.MAX_SAFE_INTEGER;
 const hashSchema = z.string().regex(/^[0-9a-f]{64}$/);
 const transactionSchema = z.string().regex(/^[0-9a-f]{32}$/);
 const idSchema = z.string().min(1).max(MAX_ID_BYTES).refine(v => Buffer.byteLength(v) <= MAX_ID_BYTES);
@@ -90,14 +82,6 @@ const keySchema = z.string().min(1).max(SDW_MAX_KEY_ENCODED_BYTES).refine(v =>
 const namespaceSchema = z.custom<SdwNamespace>(v => typeof v === "string" && journalNamespaces.has(v));
 const namespacesSchema = z.array(namespaceSchema).min(1).max(SDW_JOURNAL_NAMESPACES.length)
   .refine(v => v.every((ns, i) => i === 0 || v[i - 1]! < ns));
-const epochsSchema = z.object({
-  [SDW_CATALOG_NAMESPACE]: integer(MAX_EPOCH),
-  [SDW_DOCUMENT_CORPUS_NAMESPACE]: integer(MAX_EPOCH),
-  [SDW_META_NAMESPACE]: integer(MAX_EPOCH),
-  [SDW_QUERY_HISTORY_NAMESPACE]: integer(MAX_EPOCH),
-  [SDW_VECTOR_MEMORY_NAMESPACE]: integer(MAX_EPOCH),
-  [SDW_WORKING_STATE_NAMESPACE]: integer(MAX_EPOCH),
-}).strict();
 const entrySchema = z.object({
   ordinal: integer(SDW_MAX_RECORDS - 1), namespace: namespaceSchema, key: keySchema,
   target_ciphertext_sha256: hashSchema, byte_length: integer(SDW_MAX_STAGED_BYTES).min(1),
@@ -152,12 +136,6 @@ const certificateBodySchema = z.object({
 }).strict();
 const planSchema = z.object({ body: planBodySchema, attestation: receiptSchema, signature: encodedBytes(ED25519_SIGNATURE_BYTES) }).strict();
 const certificateSchema = z.object({ body: certificateBodySchema, attestation: receiptSchema, signature: encodedBytes(ED25519_SIGNATURE_BYTES) }).strict();
-const generationSchema = z.object({
-  version: z.literal(1), epochs: epochsSchema, transaction_id: transactionSchema.nullable(),
-  affected_mask: integer((1 << SDW_JOURNAL_NAMESPACES.length) - 1),
-  phase: z.enum(["CLEAN", "BUSY", "APPLIED", "RETIRED"]),
-}).strict().refine(g => g.phase === "CLEAN" ? g.transaction_id === null && g.affected_mask === 0 : g.transaction_id !== null && g.affected_mask !== 0);
-
 /** All producers and readers use these typed parse results, never mirrored validators. */
 export type SdwPlan = z.infer<typeof planSchema>;
 export type SdwPlanBody = SdwPlan["body"];
@@ -165,8 +143,6 @@ export type SdwPlanPage = z.infer<typeof pageSchema>;
 export type SdwPlanEntry = SdwPlanPage["entries"][number];
 export type SdwCertificate = z.infer<typeof certificateSchema>;
 export type SdwPrepared = z.infer<typeof preparedSchema>;
-export type SdwGeneration = z.infer<typeof generationSchema>;
-export type SdwEpochs = z.infer<typeof epochsSchema>;
 export type SdwSigningReceipt = z.infer<typeof receiptSchema>;
 export interface SdwRecordTypes {
   plan: SdwPlan; page: SdwPlanPage; prepared: SdwPrepared;
@@ -371,9 +347,6 @@ export async function verifySdwCertificate(
     Buffer.from(sdwCanonicalBytes(certificate.body.epochs)).equals(sdwCanonicalBytes(epochs)));
 }
 
-declare const SDW_ADMISSION_BRAND: unique symbol;
-/** Engine must also validate its private WeakMap lease/root/fortress/invocation; casts confer nothing. */
-export interface SdwAdmissionToken { readonly [SDW_ADMISSION_BRAND]: true }
 /** Storage durability result, not import or audit workflow completion. */
 export interface SdwApplied<T> {
   readonly status: "applied"; readonly transaction_id: string; readonly plan_sha256: string;
