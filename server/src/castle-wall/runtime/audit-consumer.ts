@@ -737,6 +737,7 @@ export class AuditConsumer {
           // A contradicting envelope cannot publish a card; the durable receipt still advances ACK and chain state.
           this.stats.blockedEgressDestinationConflicts = Math.min(Number.MAX_SAFE_INTEGER, this.stats.blockedEgressDestinationConflicts + 1);
           // Fixed text bounds diagnostic size and reveals no payload, destination, subject or exception.
+          // SAFETY: daemon-side operator diagnostic on stderr; the consumer has no logger and the text is a fixed constant.
           try { console.warn("Castle Wall blocked-egress inbox destination conflict"); } catch { /* Logging cannot undo a durable receipt. */ }
         }
       } catch {
@@ -744,6 +745,7 @@ export class AuditConsumer {
         // Redelivery takes duplicate_replay and does not re-project; the pending audit marker is not a publication claim.
         this.stats.blockedEgressProjectionFailures = Math.min(Number.MAX_SAFE_INTEGER, this.stats.blockedEgressProjectionFailures + 1);
         // A fixed diagnostic has bounded size and reveals no payload, destination, subject or exception text.
+        // SAFETY: daemon-side operator diagnostic on stderr; the consumer has no logger and the text is a fixed constant.
         try { console.warn("Castle Wall blocked-egress inbox projection failed"); } catch { /* Logging cannot undo a durable receipt. */ }
       }
     }
