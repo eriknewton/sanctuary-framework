@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { runInNewContext } from 'node:vm';
+import { buildOperatorPreview } from '../../../src/principal-policy/gate.js';
 import { getClientScript } from '../../../src/dashboard/v1_1/client.js';
 
-function render(text: string, truncated = false, operation = 'memory_insert'): string {
+function render(text: string, truncated = false, operation = 'memory_insert', fields?: unknown[]): string {
   const script = getClientScript();
   const helpers = script.slice(script.indexOf('function escHtml('), script.indexOf('function escCssAttr('));
   const start = script.indexOf('function approvalPreviewHtml(');
   const preview = script.slice(start, script.indexOf('\n}\n', start) + 3);
   return runInNewContext(helpers + '\n' + preview + '\napprovalPreviewHtml(item)', {
     approvalHeldOperation: () => operation,
-    item: { operator_preview: [
+    item: { operator_preview: fields ?? [
       { kind: 'byte_count', field: 'memory', value: Buffer.byteLength(text) },
       { kind: 'item_count', field: 'tags', value: 2 },
       { kind: 'passage_excerpt', field: 'memory', value: text, truncated },
@@ -40,4 +41,12 @@ describe('operator memory passage rendering', () => {
     expect(html).not.toContain('\\ud83d');
     expect(render('private', false, 'state_export')).not.toContain('private');
   });
+});
+
+it('marks a producer-cut 200-character namespace as shortened', () => {
+  const fields = buildOperatorPreview('state_export', { namespace: 'n'.repeat(200) });
+  const html = render('', false, 'state_export', fields);
+  expect(html).toContain('n'.repeat(128));
+  expect(html).not.toContain('n'.repeat(129));
+  expect(html).toContain('(shortened)');
 });

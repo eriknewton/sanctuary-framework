@@ -37,6 +37,7 @@ function harness(options: { deferDeadlines?: boolean } = {}) {
     open() { this.readyState = FakeEventSource.OPEN; this.onopen?.(); }
     close() { this.readyState = 2; } // Browser CLOSED state.
     error() { this.onerror?.(); }
+    frame(name: string, data: unknown) { this.listeners[name]?.({ data: JSON.stringify(data) }); }
     addEventListener(name: string, listener: (event: { data: string }) => void) { this.listeners[name] = listener; }
   }
   const document = {
@@ -79,7 +80,7 @@ function harness(options: { deferDeadlines?: boolean } = {}) {
 // Finite boot and panel promise drain, with no observer or wall-clock wait.
 async function settle() { const MICROTASK_DRAIN_LIMIT = 100; for (let i = 0; i < MICROTASK_DRAIN_LIMIT; i++) await Promise.resolve(); }
 async function connected(options: Parameters<typeof harness>[0] = {}) {
-  const h = harness(options); await settle(); h.streams[0].open(); return h;
+  const h = harness(options); await settle(); h.streams[0].open(); h.streams[0].frame("snapshot", { server_boot_id: "a".repeat(32) }); return h;
 }
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-24T12:00:00Z")); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
@@ -98,20 +99,22 @@ it("recovers after three minutes down without a click and shows one restart bann
   await vi.advanceTimersByTimeAsync(30 * SECOND_MS);
   expect(h.streams).toHaveLength(2);
   h.streams[1].open();
+  h.streams[1].frame("snapshot", { server_boot_id: "b".repeat(32) });
   await settle();
   expect(h.read("liveUpdatesStopped")).toBe(false);
   expect(h.main.innerHTML.match(/data-stream-recovery-banner/g)).toHaveLength(1);
   expect(h.main.innerHTML).toContain("The server restarted. Requests that were waiting before the restart were denied.");
   expect(h.count("/auth/session") - before).toBeLessThanOrEqual(2);
-  // An open alone resets the budget, even with no frames between repeated gaps.
+  // A received frame resets the budget; later same-process reconnects clear the stale restart banner.
   for (let i = 0; i < REPEATED_WAVES + 1; i++) {
     const count = h.streams.length;
     h.streams.at(-1)!.error();
     await vi.advanceTimersByTimeAsync(SECOND_MS);
     expect(h.streams).toHaveLength(count + 1);
     h.streams.at(-1)!.open();
+    h.streams.at(-1)!.frame("snapshot", { server_boot_id: "b".repeat(32) });
   }
-  expect(h.main.innerHTML.match(/data-stream-recovery-banner/g)).toHaveLength(1);
+  expect(h.main.innerHTML).not.toContain("data-stream-recovery-banner");
 });
 
 it("admits only one slow probe while its fetch is outstanding", async () => {
@@ -126,4 +129,70 @@ it("admits only one slow probe while its fetch is outstanding", async () => {
   await vi.advanceTimersByTimeAsync(2 * MINUTE_MS);
   expect(h.count("/auth/session") - before).toBe(1);
   slow.resolve(response({ session_id: "up" })); await settle();
+});
+
+
+it("same-process reconnects show no restart banner and clear a stale banner", async () => {
+  const h = await connected();
+  h.streams[0].error(); await vi.advanceTimersByTimeAsync(SECOND_MS);
+  h.streams[1].open(); h.streams[1].frame("snapshot", { server_boot_id: "a".repeat(32) });
+  expect(h.main.innerHTML).not.toContain("data-stream-recovery-banner");
+  h.streams[1].error(); await vi.advanceTimersByTimeAsync(SECOND_MS);
+  h.streams[2].open(); h.streams[2].frame("snapshot", { server_boot_id: "b".repeat(32) });
+  expect(h.main.innerHTML.match(/data-stream-recovery-banner/g)).toHaveLength(1);
+  h.streams[2].error(); await vi.advanceTimersByTimeAsync(SECOND_MS);
+  h.streams[3].open(); h.streams[3].frame("snapshot", { server_boot_id: "b".repeat(32) });
+  expect(h.main.innerHTML).not.toContain("data-stream-recovery-banner");
+});
+
+it("connect-then-drop spends the backoff budget and reaches the single-flight probe", async () => {
+  const h = harness(); await settle();
+  for (const delay of [1, 2, 4, 8, 16]) {
+    h.streams.at(-1)!.open(); h.streams.at(-1)!.error();
+    const count = h.streams.length;
+    await vi.advanceTimersByTimeAsync(delay * SECOND_MS - 1);
+    expect(h.streams).toHaveLength(count);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.streams).toHaveLength(count + 1);
+  }
+  h.streams.at(-1)!.open(); h.streams.at(-1)!.error();
+  expect(h.read("liveUpdatesStopped")).toBe(true);
+  const count = h.streams.length;
+  await vi.advanceTimersByTimeAsync(30 * SECOND_MS - 1);
+  expect(h.streams).toHaveLength(count);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(h.streams).toHaveLength(count + 1);
+});
+
+it.each([-6, 6])("uses server time with a %i minute browser skew and waits for a confirmed denial", async minutes => {
+  const serverStart = Date.now(), skew = minutes * MINUTE_MS;
+  vi.setSystemTime(new Date(serverStart + skew));
+  const h = await connected();
+  const item = { item_id: "charter.approval.skew", kind: "approval_pending", tier: "tier1", operation_category: "other", operation: "memory_insert", created_at: new Date(serverStart).toISOString(), expires_at: new Date(serverStart + 10 * SECOND_MS).toISOString(), resolved: false };
+  const payload = () => ({ items: [{ ...item }], server_now: new Date(Date.now() - skew).toISOString() });
+  h.overrides["/api/hub/inbox"] = () => Promise.resolve(response({ data: payload() }));
+  h.read('applyInboxPayload(' + JSON.stringify(payload()) + '); state.approvals.selectedId = "charter.approval.skew"; scheduleApprovalDeadlineTick()');
+  expect(h.read('approvalExpired(state.inbox[0])')).toBe(false);
+  expect(h.read('approvalDecisionDisabled(state.inbox[0])')).toBe("");
+  expect(h.read('approvalCountdownHtml(state.inbox[0])')).toContain("Expires in 0:10");
+  const before = h.count("/api/hub/inbox");
+  await vi.advanceTimersByTimeAsync(10 * SECOND_MS);
+  expect(h.read('approvalExpired(state.inbox[0])')).toBe(true);
+  expect(h.read('approvalCountdownHtml(state.inbox[0])')).toContain("This request reached its time limit.");
+  await vi.advanceTimersByTimeAsync(25 * SECOND_MS);
+  expect(h.count("/api/hub/inbox") - before).toBeLessThanOrEqual(2);
+  h.streams.at(-1)!.frame("approval", { id: "skew", resolved: true, decision: "deny", decided_by: "timeout" });
+  expect(h.read('approvalCountdownHtml(state.inbox[0])')).toContain("was denied automatically. The agent was told no.");
+  h.read('applyInboxPayload(' + JSON.stringify(payload()) + ')');
+  expect(h.read('approvalCountdownHtml(state.inbox[0])')).toContain("was denied automatically. The agent was told no.");
+  // A confirmed timeout can precede the locally estimated deadline when the clock sample arrived late.
+  item.item_id = "charter.approval.early";
+  item.expires_at = new Date(Date.now() - skew + 10 * SECOND_MS).toISOString();
+  h.read('applyInboxPayload(' + JSON.stringify(payload()) + ')');
+  const earlyReads = h.count("/api/hub/inbox");
+  h.streams.at(-1)!.frame("approval", { id: "early", resolved: true, decision: "deny", decided_by: "timeout" });
+  expect(h.read('approvalCountdownHtml(state.inbox[0])')).toContain("was denied automatically.");
+  await vi.advanceTimersByTimeAsync(20 * SECOND_MS);
+  // The stream itself invalidates once; deadline processing admits at most one read and one retry.
+  expect(h.count("/api/hub/inbox") - earlyReads).toBeLessThanOrEqual(3);
 });

@@ -27,9 +27,9 @@ describe('bounded operator preview', () => {
   });
   it('emits only the closed per-operation table and host, with memory text only in its excerpt', () => {
     expect(gateModule.buildOperatorPreview('memory_insert', { text: 'private passage', tags: ['private', 'secret'] })).toEqual([{ kind: 'byte_count', field: 'memory', value: 15 }, { kind: 'item_count', field: 'tags', value: 2 }, { kind: 'passage_excerpt', field: 'memory', value: 'private passage', truncated: false }]);
-    expect(gateModule.buildOperatorPreview('state_export', { namespace: 'notes', format: 'sanctuary-v1' })).toEqual([{ kind: 'subject', field: 'namespace', value: 'notes' }, { kind: 'subject', field: 'format', value: 'sanctuary-v1' }]);
-    for (const operation of ['reputation_export', 'sanctuary_export_identity_bundle']) expect(gateModule.buildOperatorPreview(operation, { identity_id: 'operator' })).toEqual([{ kind: 'subject', field: 'identity_id', value: 'operator' }]);
-    expect(gateModule.buildOperatorPreview('reputation_publish', { type: 'shr', verascore_url: 'https://user:secret@example.com/private?token=secret' })).toEqual([{ kind: 'subject', field: 'type', value: 'shr' }, { kind: 'subject', field: 'destination_host', value: 'example.com' }]);
+    expect(gateModule.buildOperatorPreview('state_export', { namespace: 'notes', format: 'sanctuary-v1' })).toEqual([{ kind: 'subject', field: 'namespace', value: 'notes', truncated: false }, { kind: 'subject', field: 'format', value: 'sanctuary-v1', truncated: false }]);
+    for (const operation of ['reputation_export', 'sanctuary_export_identity_bundle']) expect(gateModule.buildOperatorPreview(operation, { identity_id: 'operator' })).toEqual([{ kind: 'subject', field: 'identity_id', value: 'operator', truncated: false }]);
+    expect(gateModule.buildOperatorPreview('reputation_publish', { type: 'shr', verascore_url: 'https://user:secret@example.com/private?token=secret' })).toEqual([{ kind: 'subject', field: 'type', value: 'shr', truncated: false }, { kind: 'subject', field: 'destination_host', value: 'example.com', truncated: false }]);
   });
   it.each(['denial', 'audit'])('keeps memory excerpt operator-only: %s', async (witness) => {
     const text = 'OPERATOR-ONLY-MEMORY-PASSAGE';

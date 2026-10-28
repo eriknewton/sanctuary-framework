@@ -434,10 +434,11 @@ export class HubService {
       // scan would make one operator click cost O(live holds).
       const record = this.charterApprovals.get(charterApprovalId);
       const missed = () => {
+        // Shutdown is not a decision from a human surface; retries receive the restart-aware not-found explanation.
         const closed = this.charterApprovals?.closed?.(charterApprovalId);
         return new HubApprovalRefusalError(closed?.decided_by === "timeout"
           ? { public_code: "approval_expired", expired_after_seconds: closed.expired_after_seconds }
-          : closed ? { public_code: "approval_already_decided", decided_at: closed.decided_at, decided_by: closed.decided_by }
+          : closed && closed.decided_by !== "shutdown" ? { public_code: "approval_already_decided", decided_at: closed.decided_at, decided_by: closed.decided_by }
           : { public_code: "approval_not_found" });
       };
       if (!record) throw missed();

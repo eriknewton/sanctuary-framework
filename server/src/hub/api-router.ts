@@ -453,7 +453,7 @@ export async function handleHubRoute(
         data:
           authAdmission === "loopback_position"
             ? redactApprovalPendingItemsForPositionOnly(items)
-            : { items },
+            : { items, server_now: new Date().toISOString() }, // Must match applyInboxPayload in dashboard/v1_1/client.ts: the server clock owns hold deadlines.
       });
       return true;
     }

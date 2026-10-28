@@ -3678,13 +3678,24 @@ function setInboxRedacted(marker) {
 }
 
 function applyInboxPayload(data) {
+  // server_now must match the inbox envelope in hub/api-router.ts. Client wall-clock skew never decides expiry.
+  const serverNow = parseEvidenceTimestamp(data && data.server_now);
+  if (Number.isFinite(serverNow)) {
+    approvalClockOffsetMs = serverNow - Date.now();
+    approvalClockSample = { serverNow: Date.now() + approvalClockOffsetMs, tick: approvalMonotonicNow() };
+  }
   if (isPendingApprovalsRedactedMarker(data)) {
     setInboxRedacted(data);
   } else {
     state.inboxRedacted = false;
     state.inboxRedactedCount = 0;
   }
+  const confirmedTimeoutIds = new Set(state.inbox.filter(function (item) { return item.timeoutConfirmed; }).map(function (item) { return item.item_id; }));
   state.inbox = (data && data.items) || [];
+  // An older in-flight read cannot erase a timeout frame already observed for a visible or retained selected hold.
+  state.inbox.forEach(function (item) {
+    if (confirmedTimeoutIds.has(item.item_id) || expiredApprovalSelection && expiredApprovalSelection.item_id === item.item_id && expiredApprovalSelection.timeoutConfirmed) item.timeoutConfirmed = true;
+  });
 }
 
 function inboxOption(value, bucket) {
@@ -5536,18 +5547,31 @@ function batchSelectionDisabled() {
   // The selection checkboxes pause only while a batch holds the lock; an item decision leaves them live.
   return batchSelectionLocked() ? ' disabled title="' + DECISION_BUSY_REASON + '"' : "";
 }
-// Must match HubApprovalPendingItem.expires_at in contracts/v1.1/hub-events.ts.
+// Must match HubApprovalPendingItem.expires_at in contracts/v1.1/hub-events.ts and server_now in hub/api-router.ts.
+let approvalClockOffsetMs = 0;
+let approvalClockSample = null;
+function approvalMonotonicNow() { return typeof performance !== "undefined" ? performance.now() : Date.now(); }
+function approvalServerNow() {
+  return approvalClockSample ? approvalClockSample.serverNow + Math.max(0, approvalMonotonicNow() - approvalClockSample.tick) : NaN;
+}
 function approvalExpired(item) {
-  return !!item && !item.resolved && Number.isFinite(parseEvidenceTimestamp(item.expires_at)) && Date.now() >= parseEvidenceTimestamp(item.expires_at);
+  return !!item && !item.resolved && (item.timeoutConfirmed === true || Number.isFinite(parseEvidenceTimestamp(item.expires_at)) && approvalServerNow() >= parseEvidenceTimestamp(item.expires_at));
 }
 function approvalExpirySentence(item) {
+  if (!item.timeoutConfirmed) return "This request reached its time limit.";
   const seconds = Math.max(0, Math.round((parseEvidenceTimestamp(item.expires_at) - parseEvidenceTimestamp(item.created_at)) / 1000));
   return approvalRefusalSentence({ public_code: "approval_expired", expired_after_seconds: seconds });
 }
+function approvalCountdownText(item) {
+  if (item.timeoutConfirmed) return approvalExpirySentence(item);
+  const remaining = parseEvidenceTimestamp(item.expires_at) - approvalServerNow();
+  if (!Number.isFinite(remaining)) return "Waiting for server time.";
+  const seconds = Math.max(0, Math.ceil(remaining / 1000));
+  return seconds ? 'Expires in ' + Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0') : approvalExpirySentence(item);
+}
 function approvalCountdownHtml(item) {
   if (!item || item.resolved || !Number.isFinite(parseEvidenceTimestamp(item.expires_at))) return "";
-  const seconds = Math.max(0, Math.ceil((parseEvidenceTimestamp(item.expires_at) - Date.now()) / 1000));
-  return '<p class="muted" data-approval-countdown="1">' + (seconds ? 'Expires in ' + Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0') : escHtml(approvalExpirySentence(item))) + '</p>';
+  return '<p class="muted" data-approval-countdown="' + escHtml(item.item_id) + '">' + escHtml(approvalCountdownText(item)) + '</p>';
 }
 // Must match HubApprovalPreviewArg in contracts/v1.1/hub-events.ts and buildOperatorPreview in principal-policy/gate.ts.
 function approvalPreviewHtml(item) {
@@ -5568,31 +5592,62 @@ function approvalPreviewHtml(item) {
     }
     if ((arg.kind === "byte_count" || arg.kind === "item_count") && Number.isSafeInteger(arg.value) && arg.value >= 0)
       return arg.value.toLocaleString("en-US") + " " + labels[arg.field];
-    if (arg.kind === "subject" && typeof arg.value === "string") return labels[arg.field] + " " + heldSubjectHtml(arg.value.slice(0, ${CARD_OPERATION_MAX_CHARS}), arg.value.length > ${CARD_OPERATION_MAX_CHARS});
+    if (arg.kind === "subject" && typeof arg.value === "string") return labels[arg.field] + " " + heldSubjectHtml(arg.value.slice(0, ${CARD_OPERATION_MAX_CHARS}), arg.truncated === true || arg.value.length > ${CARD_OPERATION_MAX_CHARS});
     if (arg.kind === "digest12" && arg.field === "payload" && /^[a-f0-9]{12}$/.test(arg.value)) return "SHA-256 of signed bytes " + heldSubjectHtml(arg.value, false);
     return "";
   }).filter(Boolean);
   return parts.length ? '<p class="approval-preview">' + (approvalHeldOperation(item) === "memory_insert" ? "Save a memory: " : "") + parts.join(", ") + '</p>' + excerpt : excerpt;
 }
-// One retained selected card and one timer bound local expiry feedback independently of request volume.
+// One retained selected card, one deadline watermark and two timers bound feedback and read work independently of queue size.
 let expiredApprovalSelection = null;
 let approvalDeadlineTimer = null;
+let approvalDeadlineRetryTimer = null;
+let approvalDeadlineReadThrough = -Infinity;
+const APPROVAL_DEADLINE_RETRY_MS = 5 * 1000; // One retry after the ordinary five-second read window, never a 1 Hz reread loop.
+function confirmApprovalClose(close) {
+  // Must match request-resolved projection in principal-policy/dashboard.ts; only a timeout denial permits automatic-denial wording.
+  if (!close || close.resolved !== true || close.decision !== "deny" || close.decided_by !== "timeout" || typeof close.id !== "string") return;
+  const id = "charter.approval." + close.id;
+  const item = state.inbox.find(function (entry) { return entry.item_id === id; }) || (expiredApprovalSelection && expiredApprovalSelection.item_id === id ? expiredApprovalSelection : null);
+  if (!item) return;
+  item.timeoutConfirmed = true;
+  if (state.approvals.selectedId === id) expiredApprovalSelection = item;
+  checkApprovalDeadlines();
+}
 function checkApprovalDeadlines() {
-  let changed = false;
+  let reread = false;
+  let latestDueDeadline = approvalDeadlineReadThrough;
   state.inbox.forEach(function (item) {
-    if (!approvalExpired(item) || item.deadlineObserved) return;
-    item.deadlineObserved = true;
-    changed = true;
+    if (!approvalExpired(item)) return;
+    if (parseEvidenceTimestamp(item.expires_at) > approvalDeadlineReadThrough) { reread = true; latestDueDeadline = Math.max(latestDueDeadline, parseEvidenceTimestamp(item.expires_at)); }
     if (state.approvals.selectedId === item.item_id) expiredApprovalSelection = item;
     if (state.approvals.confirmingTier1Id === item.item_id) resetApprovalConsent();
+    document.querySelectorAll('[data-item-id]').forEach(function (node) {
+      if (node.getAttribute('data-item-id') !== item.item_id) return;
+      const action = node.getAttribute('data-action');
+      if (["approval-start-tier1-allow", "approval-confirm-tier1-allow", "inbox-deny", "inbox-approve"].indexOf(action) < 0) return;
+      node.disabled = true;
+      if (action === "approval-confirm-tier1-allow") { const row = node.closest('.approval-confirm-row'); if (row) row.remove(); }
+    });
   });
-  if (changed) void queueStreamRefresh([HUB + "/inbox", HUB + "/agents"]);
+  if (reread) {
+    // The scalar watermark survives fresh inbox objects; each due cohort owns at most one read and one bounded retry.
+    approvalDeadlineReadThrough = Math.max(latestDueDeadline, Number.isFinite(approvalServerNow()) ? approvalServerNow() : latestDueDeadline);
+    void queueStreamRefresh([HUB + "/inbox"]);
+    if (approvalDeadlineRetryTimer !== null) clearTimeout(approvalDeadlineRetryTimer);
+    approvalDeadlineRetryTimer = setTimeout(function () { approvalDeadlineRetryTimer = null; void queueStreamRefresh([HUB + "/inbox"]); }, APPROVAL_DEADLINE_RETRY_MS);
+  }
+  document.querySelectorAll('[data-approval-countdown]').forEach(function (node) {
+    const id = node.getAttribute('data-approval-countdown');
+    const item = state.inbox.find(function (entry) { return entry.item_id === id; }) || (expiredApprovalSelection && expiredApprovalSelection.item_id === id ? expiredApprovalSelection : null);
+    if (item) node.textContent = approvalCountdownText(item);
+  });
 }
 function scheduleApprovalDeadlineTick() {
-  // Render churn must not postpone an admitted deadline tick.
   if (approvalDeadlineTimer !== null) return;
-  if (!state.inbox.some(function (item) { return !item.resolved && !item.deadlineObserved && Number.isFinite(parseEvidenceTimestamp(item.expires_at)); })) return;
-  approvalDeadlineTimer = setTimeout(function () { approvalDeadlineTimer = null; checkApprovalDeadlines(); rerender(); }, 1000); // One-second precision for m:ss.
+  if (!state.inbox.some(function (item) { return !item.resolved && Number.isFinite(parseEvidenceTimestamp(item.expires_at)); })) return;
+  // Only countdown text and expired controls change; replacing main.innerHTML here would steal focus and lose a mid-tick click.
+  approvalDeadlineTimer = setTimeout(function () { approvalDeadlineTimer = null; checkApprovalDeadlines(); scheduleApprovalDeadlineTick(); }, 1000); // One-second precision for m:ss.
 }
 
 function approvalDecisionDisabled(item) {
@@ -5685,10 +5740,10 @@ function renderApprovalDrawer(item, empty) {
   const allowCopyHtml = checked
     ? escHtml("Allows this request once, then requests a standing rule for every agent on this fortress. " + standingEffect)
     : item.tier === "tier1" && !item.resolved
-      ? escHtml("Allow once arms this request, and Confirm ") + opHtml + escHtml(" sends the approval; the decision is " + approvalRecordLine(item) + ".")
+      ? escHtml("Allow once… arms this request, and Yes, allow ") + opHtml + escHtml(" sends the approval; the decision is " + approvalRecordLine(item) + ".")
       : escHtml("Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".");
   const tier1Note = item.tier === "tier1" && !item.resolved
-    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + opHtml + '. Only Confirm sends the approval.</div>'
+    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once…, then Yes, allow ' + opHtml + '. Only Yes, allow sends the approval.</div>'
     : "";
   return '<aside class="card approval-drawer" aria-label="Selected approval">' +
     '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? approvalDecisionLabel(item) : approvalExpired(item) ? "EXPIRED" : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + opHtml + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
@@ -7766,10 +7821,17 @@ let connectedStream = null;
 let disposeStream = null;
 let recoveryProbeTimer = null;
 let recoveryProbeInFlight = false;
-let streamHadGap = false;
+let observedServerBootId = null;
 let restartBannerShown = false;
 const STREAM_RECOVERY_PROBE_MS = 30 * 1000; // At most two probe admissions per minute after fast retries are exhausted.
 const STREAM_RESTART_BANNER = "The server restarted. Requests that were waiting before the restart were denied.";
+// server_boot_id must match DASHBOARD_PROCESS_BOOT_ID in principal-policy/dashboard.ts: 16 random bytes encoded as 32 hex characters.
+function observeServerBoot(id) {
+  if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id)) return;
+  const changed = observedServerBootId !== null && observedServerBootId !== id;
+  observedServerBootId = id;
+  if (restartBannerShown !== changed) { restartBannerShown = changed; rerender(); }
+}
 function scheduleRecoveryProbe() {
   if (recoveryProbeTimer !== null || recoveryProbeInFlight) return;
   recoveryProbeTimer = setTimeout(async function () {
@@ -7836,7 +7898,6 @@ function connectStream() {
   disposeStream = function () { disposed = true; if (reconnectTimer !== null) clearTimeout(reconnectTimer); if (es) es.close(); };
   function reconnect() {
     if (disposed) return;
-    streamHadGap = true;
     clearSteadyRefetchTimer();
     connectedStream = null;
     try { if (es) es.close(); } catch (error) { /* Closed already. */ }
@@ -7873,15 +7934,13 @@ function connectStream() {
     } catch (e) { reconnect(); return; }
     es.onopen = function () {
       if (disposed || liveUpdatesStopped || pollingStarted) return;
-      reconnectAttempts = 0;
       connectedStream = es;
-      if (streamHadGap) {
-        streamHadGap = false;
-        if (!restartBannerShown) { restartBannerShown = true; rerender(); }
-      }
       scheduleSteadyRefetch();
     };
-    es.addEventListener("snapshot", function () { markStreamFrameReceived(); /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
+    es.addEventListener("snapshot", function (ev) {
+      markStreamFrameReceived();
+      try { observeServerBoot(JSON.parse(ev.data).server_boot_id); } catch (error) { /* No restart claim without a valid process identity. */ }
+    });
     es.addEventListener("activity", function (ev) {
       try {
         markStreamFrameReceived();
@@ -7920,14 +7979,13 @@ function connectStream() {
         void queueStreamRefresh([HUB + "/agents", HUB + "/activity"]);
       } catch (err) { /* ignore */ }
     });
-    es.addEventListener("approval", function () { markStreamFrameReceived(); void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
+    es.addEventListener("approval", function (ev) { markStreamFrameReceived(); try { confirmApprovalClose(JSON.parse(ev.data)); } catch (error) { /* No inferred decision from malformed frames. */ } void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
     es.onerror = reconnect;
   }
   void open();
 }
 
 function stopLiveUpdates() {
-  streamHadGap = true;
   scheduleRecoveryProbe();
   liveUpdatesStopped = true;
   clearSteadyRefetchTimer();
@@ -7998,6 +8056,7 @@ function bindHashRoute() {
   window.addEventListener("pagehide", function () {
     clearExitRekey();
     if (approvalDeadlineTimer !== null) clearTimeout(approvalDeadlineTimer);
+  if (approvalDeadlineRetryTimer !== null) clearTimeout(approvalDeadlineRetryTimer);
     if (disposeStream) disposeStream();
     if (recoveryProbeTimer !== null) clearTimeout(recoveryProbeTimer);
     recoveryProbeTimer = null;

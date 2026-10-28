@@ -64,7 +64,9 @@ export function buildOperatorPreview(operation: string, args: Record<string, unk
   const subject = (field: "namespace" | "format" | "identity_id" | "type" | "destination_host", value: unknown) => {
     if (typeof value !== "string") return;
     // Identifiers are untrusted display data, not authority; the client must delimit and escape them as held subjects.
-    fields.push({ kind: "subject", field, value: value.slice(0, HOLD_REASON_SUBJECT_MAX_CHARS) });
+    fields.push({ kind: "subject", field, value: value.slice(0, HOLD_REASON_SUBJECT_MAX_CHARS),
+      // Must match HubApprovalPreviewArg.subject in contracts/v1.1/hub-events.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
+      truncated: value.length > HOLD_REASON_SUBJECT_MAX_CHARS });
   };
   const count = (kind: "byte_count" | "item_count", field: "memory" | "tags", value: unknown) => {
     if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) fields.push({ kind, field, value });

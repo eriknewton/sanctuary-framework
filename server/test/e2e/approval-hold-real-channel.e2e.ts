@@ -1,3 +1,6 @@
+import { spawn, type ChildProcess } from 'node:child_process';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer, toolResult } from '../../src/router.js';
@@ -66,13 +69,17 @@ test('expired real hold drops armed Confirm, disables decisions and never posts'
   } finally { await page.close(); await rig.stop(); }
 });
 
-test('server restart with the same token reconnects without a click and explains denied holds', async ({ page }) => {
+test('in-process restart reconnects without a false process-restart banner', async ({ page }) => {
   const rig = await approvalHoldRig(30);
   try {
     await page.addInitScript(token => sessionStorage.setItem('authToken', token), rig.token);
+    await page.addInitScript(`const OriginalEventSource = window.EventSource;
+      window.__testSnapshotCount = 0;
+      window.EventSource = class extends OriginalEventSource { constructor(url) { super(url); this.addEventListener('snapshot', () => { window.__testSnapshotCount++; }); } };`);
     const firstStream = page.waitForResponse(response => new URL(response.url()).pathname === '/api/stream' && response.status() === 200);
     await page.goto(rig.url + '/v1.1#approvals');
     await firstStream;
+    await page.waitForFunction('window.__testSnapshotCount >= 1');
     const held = rig.channel.requestApproval({ operation: 'memory_insert', tier: 1, reason: 'Tier 1', context: {}, timestamp: new Date().toISOString() });
     await expect(page.locator('[data-action="approval-select"]').first()).toBeVisible();
     const offlineSession = page.waitForEvent('requestfailed', { predicate: request => new URL(request.url()).pathname === '/auth/session' });
@@ -82,9 +89,9 @@ test('server restart with the same token reconnects without a click and explains
     const reopened = page.waitForResponse(response => new URL(response.url()).pathname === '/api/stream' && response.status() === 200);
     await rig.channel.start();
     await reopened;
+    await page.waitForFunction('window.__testSnapshotCount >= 2');
     const banner = page.locator('[data-stream-recovery-banner]');
-    await expect(banner).toHaveCount(1);
-    await expect(banner).toHaveText('The server restarted. Requests that were waiting before the restart were denied.');
+    await expect(banner).toHaveCount(0);
     await expect(page.locator('[data-action="approval-select"]')).toHaveCount(0);
   } finally { await page.close(); await rig.stop(); }
 });
@@ -115,4 +122,85 @@ test('router memory excerpt reaches only the operator card through the real gate
     const audit = await rig.auditLog.query({});
     expect(JSON.stringify(audit)).not.toContain('alert(');
   } finally { await page.close(); await rig.stop(); await held; await client.close(); await server.close(); }
+});
+
+
+test('countdown preserves confirmation focus for three ticks and a mid-tick click lands', async ({ page }) => {
+  const rig = await approvalHoldRig(30);
+  const held = rig.channel.requestApproval({ operation: 'memory_insert', tier: 1, reason: 'Tier 1', context: {}, timestamp: new Date().toISOString() });
+  try {
+    await page.addInitScript(token => sessionStorage.setItem('authToken', token), rig.token);
+    await page.goto(rig.url + '/v1.1#approvals');
+    await page.locator('[data-action="approval-select"]').first().click();
+    await page.locator('[data-action="approval-start-tier1-allow"]').click();
+    const button = page.locator('[data-action="approval-confirm-tier1-allow"]');
+    await button.focus();
+    await page.waitForTimeout(3200);
+    await expect(button).toBeFocused();
+    await expect(page.locator('.approval-tier-note')).toContainText('Allow once…, then Yes, allow');
+    await expect(page.locator('.approval-tier-note')).not.toContainText('Confirm');
+    const box = (await button.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down(); await page.waitForTimeout(1100); await page.mouse.up();
+    expect(await held).toMatchObject({ decision: 'approve', decided_by: 'human' });
+  } finally { await page.close(); await rig.stop(); await held; }
+});
+
+for (const minutes of [-6, 6]) {
+  test(`browser clock ${minutes} minutes skew still permits a timely decision`, async ({ page }) => {
+    const rig = await approvalHoldRig(30);
+    const held = rig.channel.requestApproval({ operation: 'memory_insert', tier: 1, reason: 'Tier 1', context: {}, timestamp: new Date().toISOString() });
+    try {
+      await page.addInitScript(({ token, skew }) => { sessionStorage.setItem('authToken', token); const now = Date.now; Date.now = () => now() + skew; }, { token: rig.token, skew: minutes * 60 * 1000 });
+      await page.goto(rig.url + '/v1.1#approvals');
+      await page.locator('[data-action="approval-select"]').first().click();
+      await expect(page.locator('.approval-drawer')).toContainText(/Expires in 0:[123]\d/);
+      await page.locator('[data-action="approval-start-tier1-allow"]').click();
+      await page.locator('[data-action="approval-confirm-tier1-allow"]').click();
+      expect(await held).toMatchObject({ decision: 'approve', decided_by: 'human' });
+    } finally { await page.close(); await rig.stop(); await held; }
+  });
+}
+
+
+test('a new server process publishes a new boot id and shows the restart banner once', async ({ page }) => {
+  const children: ChildProcess[] = [];
+  async function start(options: { port?: number; token?: string } = {}) {
+    const moduleUrl = pathToFileURL(resolve('test/dashboard/v1_1/approval-hold-rig.ts')).href;
+    const script = `import { approvalHoldRig } from ${JSON.stringify(moduleUrl)};
+      const rig = await approvalHoldRig(30, ${JSON.stringify(options)});
+      let stopping = false;
+      process.on('SIGTERM', async () => { if (stopping) return; stopping = true; await rig.stop(); process.exit(0); });
+      process.send({ url: rig.url, token: rig.token });`;
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    children.push(child);
+    const ready = await new Promise<{ url: string; token: string }>((done, reject) => {
+      child.once('message', value => done(value as { url: string; token: string }));
+      child.once('error', reject); child.once('exit', code => reject(new Error('Server exited before ready: ' + code)));
+    });
+    return { ...ready, child };
+  }
+  async function stop(child: ChildProcess) {
+    if (child.exitCode !== null) return;
+    const stopped = new Promise<void>(done => child.once('exit', () => done())); child.kill('SIGTERM'); await stopped;
+  }
+  try {
+    const first = await start();
+    await page.addInitScript(`const OriginalEventSource = window.EventSource;
+      window.EventSource = class extends OriginalEventSource { constructor(url) { super(url); this.addEventListener('snapshot', event => { window.__testBootId = JSON.parse(event.data).server_boot_id; }); } };`);
+    await page.addInitScript(token => sessionStorage.setItem('authToken', token), first.token);
+    const initial = page.waitForResponse(response => new URL(response.url()).pathname === '/api/stream' && response.status() === 200);
+    await page.goto(first.url + '/v1.1#approvals'); await initial;
+    await expect(page.locator('#main')).toContainText('Held operations');
+    await expect.poll(() => page.evaluate('window.__testBootId')).toMatch(/^[a-f0-9]{32}$/);
+    const firstBoot = await page.evaluate('window.__testBootId');
+    const offline = page.waitForEvent('requestfailed', { predicate: request => new URL(request.url()).pathname === '/auth/session' });
+    await stop(first.child); await offline;
+    const reopened = page.waitForResponse(response => new URL(response.url()).pathname === '/api/stream' && response.status() === 200);
+    await start({ port: Number(new URL(first.url).port), token: first.token });
+    await reopened;
+    await expect(page.locator('[data-stream-recovery-banner]')).toHaveCount(1);
+    await expect(page.locator('[data-stream-recovery-banner]')).toHaveText('The server restarted. Requests that were waiting before the restart were denied.');
+    expect(await page.evaluate('window.__testBootId')).not.toBe(firstBoot);
+  } finally { await page.close(); for (const child of children) await stop(child); }
 });

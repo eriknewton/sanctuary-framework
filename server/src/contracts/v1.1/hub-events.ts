@@ -110,7 +110,8 @@ export const HUB_APPROVAL_PASSAGE_MAX_UNITS = 600;
 /** Operator-only, closed preview arguments; must match buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts. */
 export type HubApprovalPreviewArg =
   | { kind: "byte_count" | "item_count"; field: "memory" | "tags" | "payload"; value: number }
-  | { kind: "subject"; field: "namespace" | "format" | "identity_id" | "type" | "destination_host"; value: string }
+  // truncated must match the subject producer in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
+  | { kind: "subject"; field: "namespace" | "format" | "identity_id" | "type" | "destination_host"; value: string; truncated?: boolean }
   | { kind: "digest12"; field: "payload"; value: string }
   // passage_excerpt must match ApprovalRequest in principal-policy/types.ts, buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
   | { kind: "passage_excerpt"; field: "memory"; value: string; truncated: boolean };

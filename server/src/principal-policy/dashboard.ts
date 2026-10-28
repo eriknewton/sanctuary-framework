@@ -582,6 +582,10 @@ function dashboardActivityFromAuditEntry(data: unknown): Record<string, unknown>
   };
 }
 
+// 16 random bytes provide a 128-bit process identity; minted once per module load, never per connection or channel restart.
+// server_boot_id must match observeServerBoot in dashboard/v1_1/client.ts.
+const DASHBOARD_PROCESS_BOOT_ID = randomBytes(16).toString("hex");
+
 function dashboardStreamEventForLegacyEvent(
   event: string,
   data: unknown,
@@ -595,7 +599,12 @@ function dashboardStreamEventForLegacyEvent(
       return { event, data };
     case "request-resolved": {
       const id = (data as { request_id?: unknown })?.request_id;
-      return typeof id === "string" ? { event: "approval", data: { id, resolved: true } } : null;
+      // Closed attribution must match confirmApprovalClose in dashboard/v1_1/client.ts; a human close is not evidence of a timeout denial.
+      const close = data as { decision?: unknown; decided_by?: unknown };
+      return typeof id === "string" ? { event: "approval", data: { id, resolved: true,
+        ...(close.decision === "approve" || close.decision === "deny" ? { decision: close.decision } : {}),
+        ...(close.decided_by === "human" || close.decided_by === "timeout" ? { decided_by: close.decided_by } : {}),
+      } } : null;
     }
     case "pending-request": {
       const approval = dashboardApprovalFromPendingRequest(data);
@@ -5835,7 +5844,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   private async stopHttpServer(): Promise<void> {
-    // Clear all pending requests
+    // Shutdown denies pending requests and closes streams without a resolution frame; only human/timeout closes emit one.
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
       this.rememberClosedApproval(pending.id, "deny", "shutdown", new Date().toISOString());
@@ -8234,7 +8243,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const visibleSnapshot = authAdmission === "loopback_position"
           ? redactPendingApprovalsForPositionOnly(snapshot)
           : snapshot;
-        res.write(`event: snapshot\ndata: ${JSON.stringify(visibleSnapshot)}\n\n`);
+        res.write(`event: snapshot\ndata: ${JSON.stringify({ ...visibleSnapshot, server_boot_id: DASHBOARD_PROCESS_BOOT_ID })}\n\n`);
 
         this.dashboardStreamClients.set(res, authAdmission);
         const cleanup = (): void => {
