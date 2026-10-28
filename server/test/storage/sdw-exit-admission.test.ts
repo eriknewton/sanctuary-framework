@@ -53,8 +53,11 @@ async function treeSnapshot(path: string): Promise<unknown> {
   let handle;
   try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ELOOP") throw error;
-    const target = await readlink(path); const link = await lstat(path);
-    return { mode: link.mode, uid: link.uid, ino: link.ino, target };
+    // ELOOP also comes from a mid-path loop, so the node must still be a symlink, and the same one after its target is read.
+    const before = await lstat(path); if (!before.isSymbolicLink()) throw error;
+    const target = await readlink(path); const after = await lstat(path);
+    if (!after.isSymbolicLink() || after.ino !== before.ino || after.dev !== before.dev) throw new Error(`snapshot: ${path} changed while it was read`);
+    return { mode: after.mode, uid: after.uid, ino: after.ino, target };
   }
   try {
     const stat = await handle.stat();
