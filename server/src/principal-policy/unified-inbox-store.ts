@@ -1,3 +1,5 @@
+import { parseBlockedEgressMetadata } from "../contracts/v1.1/index.js";
+
 /**
  * WP-V1.3-4 Psi-2 Unified Inbox encrypted persistence.
  *
@@ -136,7 +138,12 @@ export class UnifiedInboxStore {
       ) {
         return null;
       }
-      return persisted.entry;
+      // Must match cachePersistedEntry in unified-inbox-bridge.ts: invalid or non-blocked-egress metadata reads as legacy.
+      const { blocked_egress, ...legacy } = persisted.entry;
+      const metadata = parseBlockedEgressMetadata(legacy.source_class === "blocked_egress" ? blocked_egress : undefined);
+      // The encrypted store is fortress-owned; verified entries were written only from consumer-minted values.
+      // Reads omit malformed or wrong-source metadata; resolve later rewrites that sanitized entry.
+      return metadata.ok ? { ...legacy, blocked_egress: metadata.value } : legacy;
     } catch {
       return null;
     }

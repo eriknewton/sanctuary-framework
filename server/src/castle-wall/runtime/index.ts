@@ -17,6 +17,7 @@ export * from "./detect-firewall.js";
 export * from "./installer.js";
 export * from "./manifest-publisher.js";
 export * from "./audit-consumer.js";
+export { readConsumerMintedBlockedEgress, type ConsumerMintedBlockedEgress } from "./blocked-egress-attribution.js";
 export * from "./approval-stub.js";
 export * from "./ipc-client.js";
 export * from "./lifecycle.js";

@@ -1,3 +1,6 @@
+import { readConsumerMintedBlockedEgress, type ConsumerMintedBlockedEgress } from "../castle-wall/runtime/blocked-egress-attribution.js";
+import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
+
 /**
  * Sanctuary WP-V1.3-4 Psi-1 Unified Approval Inbox Bridge.
  *
@@ -77,6 +80,8 @@ export type UnifiedInboxEntryState =
   | "dismissed";
 
 export interface UnifiedInboxEntry {
+  /** Optional structured block evidence; legacy entries have none. */
+  blocked_egress?: BlockedEgressMetadata;
   /** Stable per-fortress inbox id (UUID v4). */
   inbox_id: string;
   /** Which producer class emitted this entry. */
@@ -199,6 +204,8 @@ export interface SentinelFindingIngest {
 }
 
 export interface BlockedEgressIngest {
+  /** Raw block evidence, parsed at admission and never accepted as verified. */
+  blocked_egress?: BlockedEgressMetadata;
   source_event_id: string;
   agent_id?: string;
   destination_category: string;
@@ -374,7 +381,19 @@ export class UnifiedInboxBridge {
     });
   }
 
-  ingestBlockedEgress(input: BlockedEgressIngest): UnifiedInboxEntry | null {
+  ingestBlockedEgress(input: BlockedEgressIngest, minted?: ConsumerMintedBlockedEgress): UnifiedInboxEntry | null {
+    // Must match readConsumerMintedBlockedEgress in castle-wall/runtime/blocked-egress-attribution.ts: shape alone grants no producer credibility.
+    const projection = readConsumerMintedBlockedEgress(minted);
+    let metadata = parseBlockedEgressMetadata(projection?.metadata ?? input.blocked_egress);
+    if (!projection && metadata.ok && metadata.value.attribution.state === "verified") {
+      const { subject: _subject, ...unsigned } = metadata.value;
+      metadata = parseBlockedEgressMetadata({ ...unsigned, attribution: { ...unsigned.attribution, state: "unverified" } });
+    }
+    if (projection?.signedFields) {
+      // Display and dedup fields covered by verification come from the same signed snapshot as the metadata.
+      input = { ...input, ...projection.signedFields, agent_id: projection.signedFields.agent_id,
+        destination_category: projection.metadata.destination_host ?? projection.metadata.destination_ip ?? "unknown" };
+    }
     const summary = truncateSummary(
       `Egress to ${input.destination_category} blocked: ${input.block_reason_class}${input.agent_id ? ` (agent ${input.agent_id})` : ""}`,
     );
@@ -388,6 +407,7 @@ export class UnifiedInboxBridge {
         : "alert";
     return this.ingest({
       source_class: "blocked_egress",
+      ...(metadata.ok ? { blocked_egress: metadata.value } : {}),
       source_event_id: input.source_event_id,
       severity,
       summary,
@@ -828,6 +848,7 @@ export class UnifiedInboxBridge {
   }
 
   private ingest(input: {
+    blocked_egress?: BlockedEgressMetadata;
     source_class: UnifiedInboxSourceClass;
     source_event_id: string;
     severity: UnifiedInboxSeverity;
@@ -868,6 +889,7 @@ export class UnifiedInboxBridge {
     const inboxId = randomUUID();
     const entry: UnifiedInboxEntry = {
       inbox_id: inboxId,
+      ...(input.blocked_egress ? { blocked_egress: input.blocked_egress } : {}),
       source_class: input.source_class,
       source_event_id: input.source_event_id,
       severity: input.severity,
@@ -913,7 +935,10 @@ export class UnifiedInboxBridge {
         if (evicted) this.keyByInboxId.delete(evicted.inbox_id);
       }
     }
+    // Must match UnifiedInboxStore.get in unified-inbox-store.ts: invalid or non-blocked-egress metadata reads as legacy.
+    const metadata = parseBlockedEgressMetadata(entry.source_class === "blocked_egress" ? entry.blocked_egress : undefined);
     const cached: UnifiedInboxEntry = {
+      ...(metadata.ok ? { blocked_egress: metadata.value } : {}),
       inbox_id: entry.inbox_id,
       source_class: entry.source_class,
       source_event_id: entry.source_event_id,

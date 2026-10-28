@@ -1,3 +1,5 @@
+import { isBlockedEgressSubject, parseBlockedEgressHost, parseBlockedEgressIp, parseBlockedEgressMetadata } from "../../contracts/v1.1/index.js";
+
 /**
  * Audit consumer: drains the daemon's WAL by accepting `audit_emit`
  * notifications, validating shape, and folding into Sanctuary's existing
@@ -13,6 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { mintConsumerBlockedEgress, type BlockedEgressProjection, type ConsumerMintedBlockedEgress } from "./blocked-egress-attribution.js";
 
 import {
   CASTLE_WALL_AUDIT_LAYER,
@@ -110,7 +113,7 @@ export type PersistedChainAnchor =
        * (`cw_producer_sig` / `cw_producer_kid` / `cw_producer_captured_at_ms`).
        * The restore RE-VERIFIES the signature over these before adopting the
        * anchor, so a persisted row is never trusted because of where it sits
-       * or what marker it carries — only because the pinned producer key
+       * or what marker it carries - only because the pinned producer key
        * signed those exact bytes.
        */
       signatureB64url: string | null;
@@ -118,7 +121,7 @@ export type PersistedChainAnchor =
       capturedAtUnixMs: number | null;
       /**
        * The recorded chain basis (`cw_chain_basis`), or null for entries
-       * written before the basis was recorded — which by construction means
+       * written before the basis was recorded - which by construction means
        * the legacy `event_canonical` basis.
        */
       chainBasis: string | null;
@@ -270,6 +273,10 @@ export interface AuditConsumerStats {
   ackFailures: number;
   /** Count of critical events withheld from ACK because persistence failed. */
   persistenceFailures: number;
+  /** Saturating count of failed inbox projections after durable audit persistence. */
+  blockedEgressProjectionFailures: number;
+  /** Saturating count of inbox projections suppressed for contradicting destinations. */
+  blockedEgressDestinationConflicts: number;
   /**
    * Count of enforcement-evidence events rejected because their producer
    * signature was missing or did not verify against the pinned producer key
@@ -397,13 +404,15 @@ export class AuditConsumer {
     duplicatesDropped: 0,
     ackFailures: 0,
     persistenceFailures: 0,
+    blockedEgressProjectionFailures: 0,
+    blockedEgressDestinationConflicts: 0,
     producerSignatureRejections: 0,
     producerSignatureAccepted: 0,
   };
   private lastAckedSeq: number | null = null;
   /**
    * The chain anchor: for producer-signed entries this is
-   * `sha256(utf8(cw_producer_signed_canonical))` — the exact bytes every
+   * `sha256(utf8(cw_producer_signed_canonical))` - the exact bytes every
    * producer hashes into its own `prior_sha256_hex` (Rust `audit.rs`, macOS
    * flow + availability paths). Anchoring on a locally-reconstructed
    * `CastleWallAuditEvent` hash forked the chain on every deployment because
@@ -423,7 +432,7 @@ export class AuditConsumer {
    * Latched when local history exists but cannot anchor the chain (last
    * accepted entry unsigned, malformed anchor record, or audit-log integrity
    * findings). While latched, every critical event is refused UNSETTLED (no
-   * persist, no chain advance, no ACK — an ACK would let the daemon truncate
+   * persist, no chain advance, no ACK - an ACK would let the daemon truncate
    * its WAL through evidence we never accepted). A stuck chain an operator
    * must clear is honest; any self-healing fallback here would have to trust
    * the wire, which is exactly what the #1096 gate refuted.
@@ -487,7 +496,7 @@ export class AuditConsumer {
        * Reader for the consumer's own last persisted chain position. When set
        * (and a pinned producer key is configured), the first ingest restores
        * the anchor from LOCAL storage before any incoming event is considered
-       * — closing both the old-basis upgrade fork and the restart bootstrap
+       * - closing both the old-basis upgrade fork and the restart bootstrap
        * replay hole. When absent, the consumer bootstraps from null exactly as
        * before (path-less tests / legacy callers).
        */
@@ -497,12 +506,12 @@ export class AuditConsumer {
        *
        * `complete` (default): the consumer sees EVERY producer chain event
        * (the Linux drain walks the daemon's full WAL). A prior-hash mismatch
-       * is a hard fork — real damage, chain stops, no self-heal.
+       * is a hard fork - real damage, chain stops, no self-heal.
        *
        * `producer_subset`: the consumer receives only a SUBSET of the
        * producer's chain by construction (the macOS extension signs flow
        * decisions AND availability reports into one shared seq/prior chain,
-       * but only flow decisions arrive here — availability reports go to the
+       * but only flow decisions arrive here - availability reports go to the
        * enforcement-availability store on their own delivery path). Prior-hash
        * contiguity across a gap is therefore UNVERIFIABLE locally, not
        * evidence of damage: continuity is enforced as verified producer
@@ -511,7 +520,7 @@ export class AuditConsumer {
        * non-adjacent accept records `cw_chain_prior_unconsumed` on the
        * persisted entry so the audit trail never claims a continuity check it
        * could not perform. This is NOT the refuted fork recovery: there is no
-       * threshold, no window, no re-anchor to a wire-chosen head — an
+       * threshold, no window, no re-anchor to a wire-chosen head - an
        * unverified or seq-regressing frame is rejected identically in both
        * modes, and the macOS ACK is a no-op so acceptance destroys nothing.
        */
@@ -559,7 +568,7 @@ export class AuditConsumer {
     // The anchor must be restored from LOCAL storage before the first incoming
     // event is even looked at: an event examined against a null anchor is
     // bootstrap-accepted, which is precisely the wire-trust the restore exists
-    // to remove. A restore failure throws (unsettled — no persist, no ACK) so
+    // to remove. A restore failure throws (unsettled - no persist, no ACK) so
     // a transient storage fault fails closed and is retried.
     await this.ensureChainAnchorRestored();
     if (this.chainMigrationUnavailableReason !== null) {
@@ -627,8 +636,8 @@ export class AuditConsumer {
       return;
     }
     // Producer verification runs BEFORE the chain decision because the chain
-    // basis for a verified event is the SIGNED BODY's own hash — the exact
-    // bytes the producer hashed into its `prior_sha256_hex` — never a locally
+    // basis for a verified event is the SIGNED BODY's own hash - the exact
+    // bytes the producer hashed into its `prior_sha256_hex` - never a locally
     // reconstructed CastleWallAuditEvent (which no producer hashes; anchoring
     // on it forked the chain on every deployment, #1096 root cause).
     const sigOutcome = this.evaluateProducerSignature(envelope);
@@ -668,7 +677,7 @@ export class AuditConsumer {
     if (chainOutcome.kind === "error") {
       // A fork now means real damage (crash mid-write, force-clear, rolled-back
       // producer WAL): stop the chain LOUDLY and do not self-heal. There is
-      // deliberately no automatic recovery here — every wire-driven re-anchor
+      // deliberately no automatic recovery here - every wire-driven re-anchor
       // variant was gate-refuted as attacker-steerable (#1096 Q3/Q4), and a
       // stuck chain an operator must clear is honest where a self-healing one
       // an attacker can steer is not.
@@ -696,10 +705,6 @@ export class AuditConsumer {
         resultForSignatureOutcome(sigOutcome),
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
-        ingestCastleWallBlockedEgress({
-          bridge: this.inboxBridge,
-          event: envelope.event,
-        });
         await this.sink.append(
           CASTLE_WALL_AUDIT_LAYER,
           "castle_wall_blocked_egress",
@@ -707,6 +712,7 @@ export class AuditConsumer {
           {
             event_type: envelope.event.event_type,
             seq: envelope.event.details.seq,
+            projection_status: "pending",
           },
           "success",
         );
@@ -720,6 +726,28 @@ export class AuditConsumer {
       if (Number.isSafeInteger(failedSeq)) this.pendingUnpersistedSeq = failedSeq;
       await this.emitPersistenceFailure(err, envelope.event);
       throw err;
+    }
+    if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
+      // No blocked-egress projection is published before its primary audit receipt is durably appended and flushed; projection failure never rewrites the enforcement outcome.
+      try {
+        const minted = blockedEgressMetadataFor(envelope, sigOutcome, identityOutcome.identityId);
+        if (minted) {
+          ingestCastleWallBlockedEgress({ bridge: this.inboxBridge, event: envelope.event, minted });
+        } else {
+          // A contradicting envelope cannot publish a card; the durable receipt still advances ACK and chain state.
+          this.stats.blockedEgressDestinationConflicts = Math.min(Number.MAX_SAFE_INTEGER, this.stats.blockedEgressDestinationConflicts + 1);
+          // Fixed text bounds diagnostic size and reveals no payload, destination, subject or exception.
+          // SAFETY: daemon-side operator diagnostic on stderr; the consumer has no logger and the text is a fixed constant.
+          try { console.warn("Castle Wall blocked-egress inbox destination conflict"); } catch { /* Logging cannot undo a durable receipt. */ }
+        }
+      } catch {
+        // The durable audit row is the record; this inbox projection may fail without changing ACK/chain state.
+        // Redelivery takes duplicate_replay and does not re-project; the pending audit marker is not a publication claim.
+        this.stats.blockedEgressProjectionFailures = Math.min(Number.MAX_SAFE_INTEGER, this.stats.blockedEgressProjectionFailures + 1);
+        // A fixed diagnostic has bounded size and reveals no payload, destination, subject or exception text.
+        // SAFETY: daemon-side operator diagnostic on stderr; the consumer has no logger and the text is a fixed constant.
+        try { console.warn("Castle Wall blocked-egress inbox projection failed"); } catch { /* Logging cannot undo a durable receipt. */ }
+      }
     }
     // Update state BEFORE the ACK call. The event is now durably persisted;
     // a transport-layer ACK failure must NOT leave the consumer's chain view
@@ -827,7 +855,7 @@ export class AuditConsumer {
    * fork against the first live event (stuck chain) or blindly accept it (the
    * restart replay hole). The bridge recomputes the anchor from the last
    * accepted entry's OWN persisted signed canonical body: verification
-   * recomputes the commitment from stored, already-verified bytes — an anchor
+   * recomputes the commitment from stored, already-verified bytes - an anchor
    * claimed by an incoming frame is never trusted (every wire-driven recovery
    * variant was gate-refuted as attacker-steerable, #1096 Q3/Q4).
    *
@@ -900,7 +928,7 @@ export class AuditConsumer {
     reason: string,
   ): Promise<void> {
     this.chainMigrationUnavailableReason = reason;
-    // One durable record at latch time (not one per refused event — a
+    // One durable record at latch time (not one per refused event - a
     // per-event append would flood the log for as long as the daemon retries).
     await this.sink.append(
       CASTLE_WALL_AUDIT_LAYER,
@@ -990,7 +1018,7 @@ export class AuditConsumer {
     if (this.lastEventChainHash !== null && priorHash !== this.lastEventChainHash) {
       // Subset consumption (macOS flow): a prior referencing a producer event
       // we never received is the NORMAL shape whenever an availability report
-      // interleaved in the shared producer chain — not evidence of damage.
+      // interleaved in the shared producer chain - not evidence of damage.
       // Acceptance across the gap still requires a VERIFIED producer signature
       // (seq + prior live inside the signed bytes) and the strict seq
       // monotonicity already enforced above; an unsigned or replayed frame is
@@ -1061,7 +1089,7 @@ export class AuditConsumer {
       }
       return { kind: "rejected", reason: "producer_signature_absent" };
     }
-    // A producer block IS present: with a pinned key it must verify — for ANY
+    // A producer block IS present: with a pinned key it must verify - for ANY
     // event type. Verifying non-enforcement signed frames too is what lets
     // every producer-signed event chain on the signed-body basis, and it
     // fail-closes a stapled/broken signature instead of quietly downgrading
@@ -1083,7 +1111,7 @@ export class AuditConsumer {
     }
     // STRICT binding: the signed `operation` must map to exactly the
     // `event_type` slot the entry is filed under. An unmapped operation is a
-    // rejection, never a pass-through — accepting unknown signed operations
+    // rejection, never a pass-through - accepting unknown signed operations
     // for any event type would let a captured signature over one body be
     // stapled onto a differently-typed event (#1096 regression, reverted).
     const mappedEventType = WAL_OPERATION_TO_EVENT_TYPE[parsed.operation];
@@ -1159,6 +1187,7 @@ export class AuditConsumer {
       signatureB64url: envelope.producer.signatureB64url as string,
       keyId: envelope.producer.keyId as string,
       signedBody: parsed.body,
+      seq: envelope.producer.seq,
       // The exact signed inputs, persisted so a read-side consumer can
       // reconstruct the signed message and RE-verify (Slice R). Stored
       // verbatim - never re-canonicalized - so the reader hashes identical
@@ -1249,6 +1278,8 @@ type SignatureOutcome =
       keyId: string;
       /** The authenticated WAL body; the source of truth for persisted evidence. */
       signedBody: Record<string, unknown>;
+      /** Verified signature-bound sequence, captured before asynchronous persistence. */
+      seq: number;
       /**
        * The verbatim canonical-JSON string the daemon signed, persisted so a
        * read-side consumer can reconstruct the signed message and re-verify.
@@ -1267,7 +1298,7 @@ type SignatureOutcome =
  * the two distinct JSON shapes.
  *
  * COVERAGE CONTRACT: this map must list EVERY operation any producer signs
- * into `ingestCritical` — must match `operation_for_verdict` in
+ * into `ingestCritical` - must match `operation_for_verdict` in
  * `castle-wall-daemon/src/policy.rs` and the flow-decision operations in
  * `castle-wall-macos/Sources/CastleWallFilter/AuditProducerSigning.swift`.
  * The strict check in `evaluateProducerSignature` REJECTS any signed body
@@ -1513,7 +1544,7 @@ function computeCanonicalHash(event: CastleWallAuditEvent): string {
 /**
  * The shared chain basis: `sha256(utf8(eventCanonicalJson))` over the VERBATIM
  * signed body string. Must byte-match what every producer hashes for its own
- * `prior_sha256_hex` — `sha256_hex(canonical)` in
+ * `prior_sha256_hex` - `sha256_hex(canonical)` in
  * `castle-wall-daemon/src/audit.rs` and `sha256Hex(Data(walCanonical.utf8))`
  * in `castle-wall-macos/.../AuditProducerSigning.swift`. Never re-canonicalize
  * here: re-encoding could drift the bytes and fork the chain.
@@ -1597,7 +1628,7 @@ export interface ChainAnchorAuditLogReader {
  * chain-participating entry may sit arbitrarily deep behind non-chain entries
  * (metric batches, rejection diagnostics, lifecycle records), and a bounded
  * page that missed it would silently degrade the restore to a genesis
- * bootstrap — reopening the very wire-trust hole the restore closes (rule 5).
+ * bootstrap - reopening the very wire-trust hole the restore closes (rule 5).
  * `query` slices from the tail in memory, so the large limit costs nothing
  * beyond the read it already does.
  */
@@ -1672,4 +1703,63 @@ export function buildChainAnchorSourceFromAuditLog(
     }
     return null;
   };
+}
+
+/**
+ * Verified covers signed host/IP, string agent_id, timestamp, signature-bound seq,
+ * and the consumer subject derived from signed agent_id with local fortress scope
+ * or signed identity_id. Reason, reason class, severity and other envelope fields
+ * are unsigned. A contradicting destination suppresses the projection entirely.
+ * Must match BlockedEgressAttribution in contracts/v1.1/blocked-egress.ts.
+ */
+function blockedEgressMetadataFor(
+  envelope: CriticalEventEnvelope,
+  signature: SignatureOutcome,
+  signedSubject: string,
+): ConsumerMintedBlockedEgress | undefined {
+  const signed = signature.kind === "verified";
+  const details = signed ? signedDetailsFromBody(signature.signedBody) : envelope.event.details;
+  const envelopeHost = envelope.event.destination?.host ?? envelope.event.details.dest_host;
+  const envelopeIp = envelope.event.destination?.ip ?? envelope.event.details.dest_ip;
+  // Absence asserts no conflicting fact; a signed destination conflict must never reach inbox admission.
+  const destinationsAgree = !signed ||
+    ((envelopeHost == null || envelopeHost === details.dest_host) && (envelopeIp == null || envelopeIp === details.dest_ip));
+  if (!destinationsAgree) return undefined;
+  // Only a string agent_id in the signed body can support verified display attribution.
+  const signedAgentId = details.agent_id;
+  const verified = signed && typeof signedAgentId === "string" && isBlockedEgressSubject(signedSubject);
+  // Continuing paths: signed + string agent_id + displayable subject -> verified;
+  // unsigned, missing/non-string agent_id, or undisplayable subject -> unverified, no subject.
+  // Refusal paths: destination conflict -> no mint; invalid metadata/timestamp -> projection failure.
+  const host = parseBlockedEgressHost(verified ? details.dest_host : envelopeHost);
+  const ip = parseBlockedEgressIp(verified ? details.dest_ip : envelopeIp);
+  // Must match BlockedEgressAttribution in contracts/v1.1/blocked-egress.ts: pinned producer credibility covers only
+  // signed host/IP, agent_id, timestamp, signature-bound seq, and the subject from signed identity_id or agent_id
+  // plus local fortress scope. Reason, reason class, severity and all other envelope fields remain unsigned.
+  const metadata = parseBlockedEgressMetadata({
+    attribution: {
+      subject: "castle_wall_producer",
+      evidence_source: "producer_signature",
+      verifier: "castle_wall_audit_consumer",
+      state: verified ? "verified" : "unverified",
+    },
+    ...(host.ok ? { destination_host: host.value } : {}),
+    ...(ip.ok ? { destination_ip: ip.value } : {}),
+    ...(verified ? { subject: signedSubject } : {}),
+  });
+  // Invalid minted shapes are projection failures, never silently absent evidence.
+  if (!metadata.ok) throw new Error("Invalid blocked-egress metadata");
+  const projection: BlockedEgressProjection = { metadata: metadata.value };
+  if (verified) {
+    const timestamp = signature.signedBody.timestamp;
+    if (typeof timestamp !== "string") throw new Error("Missing signed timestamp");
+    projection.signedFields = {
+      agent_id: signedAgentId,
+      observed_at: timestamp,
+      // producer.seq is signature-bound even on older bodies without details.seq; evaluateProducerSignature checks parity.
+      source_event_id: `${timestamp}:${signature.seq}`,
+    };
+  }
+  // Must match mintConsumerBlockedEgress in blocked-egress-attribution.ts: only this consumer registers accepted projections.
+  return mintConsumerBlockedEgress(projection);
 }
