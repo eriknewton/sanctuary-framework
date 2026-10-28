@@ -36,6 +36,8 @@ import {
 import { requestPolicyReload } from "../runtime/policy-reload-client.js";
 import { protectionSubjectForUid } from "../subject-binding.js";
 
+const SUPPORTED_AGENT_STOP_PLATFORM: NodeJS.Platform = "darwin";
+
 export const AGENT_STOP_REASON_CODES = [
   "stop_unsupported_platform",
   "stop_agent_not_confined",
@@ -95,6 +97,8 @@ export interface LiftAgentEgressStopInput {
   agentId: string;
   fortressPath: string;
   storagePath: string;
+  /** Execution platform; defaults to the current process platform. */
+  platform?: NodeJS.Platform;
   reloadPolicy?: PolicyReloadTrigger;
 }
 
@@ -233,7 +237,8 @@ export async function stopAgentEgress(
   input: StopAgentEgressInput,
 ): Promise<StopAgentEgressObservation> {
   const platform = input.platform ?? process.platform;
-  if (platform !== "darwin") {
+  // A stop requires supported enforcement; must match the platform gate in liftAgentEgressStop in this file.
+  if (platform !== SUPPORTED_AGENT_STOP_PLATFORM) {
     throw new AgentEgressStopError("stop_unsupported_platform");
   }
   const agentUid = await resolveConfinedUid(input);
@@ -318,6 +323,12 @@ export async function stopAgentEgress(
 export async function liftAgentEgressStop(
   input: LiftAgentEgressStopInput,
 ): Promise<LiftAgentEgressStopObservation> {
+  const platform = input.platform ?? process.platform;
+  // The lift may only reverse what a supported stop could have engaged, so it shares the stop's platform boundary.
+  // This must match the platform gate in stopAgentEgress in this file.
+  if (platform !== SUPPORTED_AGENT_STOP_PLATFORM) {
+    throw new AgentEgressStopError("stop_unsupported_platform");
+  }
   const select = agentMatchableSelector(input.fortressPath);
   const snapshotPath = stopSnapshotPath(input.storagePath, input.agentId);
   let snapshot: ReadonlyArray<ProvisionedEgressRuleFile>;
