@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn, fork, execFile, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { lstat, readFile, readdir, writeFile, mkdir, chmod, symlink, readlink } from "node:fs/promises";
+import { lstat, open, readFile, readdir, writeFile, mkdir, chmod, symlink, readlink } from "node:fs/promises";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import { createSdwFenceFixture, sdwDeferred } from "./sdw-journal-fixtures.js";
 import {
@@ -47,12 +48,17 @@ async function journal(r: Awaited<ReturnType<typeof rig>>, value: unknown) {
 }
 // Snapshot names, modes, ownership and bytes without following a malformed root symlink.
 async function treeSnapshot(path: string): Promise<unknown> {
-  const stat = await lstat(path);
-  const identity = { mode: stat.mode, uid: stat.uid, ino: stat.ino };
-  if (stat.isSymbolicLink()) return { ...identity, target: await readlink(path) };
-  if (!stat.isDirectory()) return { ...identity, bytes: (await readFile(path)).toString("base64") };
-  const names = (await readdir(path)).sort();
-  return { ...identity, children: await Promise.all(names.map(async name => [name, await treeSnapshot(join(path, name))])) };
+  const link = await lstat(path);
+  if (link.isSymbolicLink()) return { mode: link.mode, uid: link.uid, ino: link.ino, target: await readlink(path) };
+  // Identity and bytes come from one no-follow descriptor, so they always describe the same inode (no check-then-read race).
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    const identity = { mode: stat.mode, uid: stat.uid, ino: stat.ino };
+    if (!stat.isDirectory()) return { ...identity, bytes: (await handle.readFile()).toString("base64") };
+    const names = (await readdir(path)).sort();
+    return { ...identity, children: await Promise.all(names.map(async name => [name, await treeSnapshot(join(path, name))])) };
+  } finally { await handle.close(); }
 }
 
 interface ChildEvent { event: string; namespace?: string; name?: string; reason?: string; status?: string; trace?: string[] }
