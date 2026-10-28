@@ -785,6 +785,7 @@ async function api(path, opts, deadlineAt, refreshing) {
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {
+    // Must match the approved lift-refusal detail contract in server/src/hub/api-router.ts.
     const detail = body && (body.detail || body.error) ? (body.detail || body.error) : ("HTTP " + res.status);
     const err = new Error(detail);
     err.status = res.status;
@@ -7194,6 +7195,7 @@ function decisionRefusedByServer(error) {
   const status = error && error.status;
   return typeof status === "number" && status >= 400 && status < 500;
 }
+// Must match the approved lift-refusal detail contract in server/src/hub/api-router.ts.
 function decisionOutcomeFromError(action, subject, error, item) {
   const http = error && typeof error.status === "number" ? " (HTTP " + error.status + ")" : "";
   const reason = (error && error.message) || "no answer from the server";

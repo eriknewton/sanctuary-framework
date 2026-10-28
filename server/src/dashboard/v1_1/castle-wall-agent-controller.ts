@@ -117,6 +117,7 @@ export class CastleWallAgentController implements HubAgentController {
     if (!this.deps.getAgentRecord(agentId)) throw new HubNotFoundError(`agent ${agentId}`);
     // Approval can outlive the locked state; recheck before restoring any allow rules.
     if (!this.supports("lockdown_lift", agentId)) {
+      // Suffix must match APPROVED_LIFT_REFUSALS in server/src/hub/api-router.ts so this refusal retains its reviewed detail.
       throw new HubCapabilityError("agent_control_lockdown_lift_unsupported_not_locked_down");
     }
     try {
@@ -137,6 +138,7 @@ export class CastleWallAgentController implements HubAgentController {
       };
     } catch (err) {
       if (err instanceof AgentEgressStopError) {
+        // lockdown_lift_no_snapshot must match APPROVED_LIFT_REFUSALS in server/src/hub/api-router.ts.
         // stop_snapshot_missing must match the snapshot-read reason in castle-wall/provision/agent-stop.ts.
         throw new HubCapabilityError(
           err.reasonCode === "stop_snapshot_missing" ? "lockdown_lift_no_snapshot" : err.reasonCode,

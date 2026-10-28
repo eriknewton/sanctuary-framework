@@ -1,3 +1,4 @@
+// fail-before-exempt: Export fault assertions preserve existing scrubbing on both base and fix; lift disclosure is witnessed in the controller, route and shipped-client tests.
 /** The approving dashboard alone receives an export key; reusable views remain metadata only. IC-07. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
@@ -23,6 +24,7 @@ import { handleRequest } from "../../../src/dashboard/api.js";
 import { createDashboardReadFlightMap } from "../../../src/dashboard/read-response.js";
 import { handlePostureRoute } from "../../../src/principal-policy/posture-routes.js";
 import type { HubApprovalPendingItem } from "../../../src/contracts/v1.1/hub-events.js";
+import { HubError } from "../../../src/hub/errors.js";
 import { HubInboxStore } from "../../../src/hub/inbox-store.js";
 
 const TOKEN = "synthetic-operator";
@@ -326,18 +328,21 @@ describe("response-only export delivery", () => {
   });
 
   it("post-mint-errors-never-log-secret", async () => {
-    const f = await fortress(); syntheticMint();
+    const f = await fortress(); const mint = syntheticMint();
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
     const original = bundleModule.exportExitBundle;
-    for (const phase of ["export", "sink", "audit", "store", "serializer"]) {
-      const secretError = new Error(KEY, { cause: KEY }); secretError.stack = KEY;
+    const phases = ["export", "sink", "audit", "store", "serializer"];
+    const unlabelled = "unlabelled-fixture-value-928ad";
+    for (const errorKind of ["Error", "HubError"]) for (const phase of phases) {
+      const secretError = errorKind === "HubError" ? new HubError(unlabelled, 500, unlabelled) : Object.assign(new Error(unlabelled), { publicDetail: unlabelled });
+      secretError.cause = unlabelled; secretError.stack = unlabelled;
       const restore: Array<() => void> = [];
       if (phase === "export") { const spy = vi.spyOn(bundleModule, "exportExitBundle").mockImplementation(async opts => { await original(opts); throw secretError; }); restore.push(() => spy.mockRestore()); }
       if (phase === "sink") {
         const resolve = f.bindings.hubService.resolveInboxItem.bind(f.bindings.hubService);
-        const spy = vi.spyOn(f.bindings.hubService, "resolveInboxItem").mockImplementation((id, action, receiver) => {
+        const spy = vi.spyOn(f.bindings.hubService, "resolveInboxItem").mockImplementation((id, action, receiver, observe) => {
           if (receiver) receiver.receive = () => { throw secretError; };
-          return resolve(id, action, receiver);
+          return resolve(id, action, receiver, observe);
         });
         restore.push(() => spy.mockRestore());
       }
@@ -349,8 +354,20 @@ describe("response-only export delivery", () => {
       const run = f.dispatch(`/api/hub/inbox/${id}/approve`, res); await run.done;
       secretFree(res.chunks); secretFree(diagnostic.mock.calls);
       secretFree(f.bindings.hubService.listInbox());
+      if (phase === "serializer") { expect(res.destroyed).toBe(true); expect(res.chunks).toEqual([]); }
+      else { expect(res.statusCode).toBe(500); expect(res.json()).toEqual({ error: "internal_error" }); }
+      const refetch = (await f.call("/api/hub/inbox", "GET")).json();
+      await f.auditLog.flush();
+      const audit = await f.auditLog.query({ limit: 100 }); // Bounded fixture audit page.
+      for (const value of [res.chunks, diagnostic.mock.calls, refetch, audit]) {
+        expect(JSON.stringify(value)).not.toContain(unlabelled);
+        secretFree(value);
+      }
+      expect(f.bindings.hubService.listInbox().find(item => item.item_id === id)?.resolved).toBe(true);
+      const draws = mint.mock.calls.length;
       for (const undo of restore) undo();
       expect((await f.call(`/api/hub/inbox/${id}/approve`)).statusCode).toBe(409);
+      expect(mint).toHaveBeenCalledTimes(draws);
     }
   });
 

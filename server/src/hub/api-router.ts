@@ -30,6 +30,7 @@ import {
   redactPanelPendingApprovalsForPositionOnly,
 } from "../dashboard/pending-redaction.js";
 import {
+  logCaughtError,
   publicCodeForStatus,
   sendCaughtError,
 } from "../http/error-envelope.js";
@@ -56,6 +57,7 @@ import {
   type HubInboxAction,
 } from "./constants.js";
 import {
+  HubCapabilityError,
   HubError,
   HubLocalOnlyError,
   HubValidationError,
@@ -137,6 +139,33 @@ function scrubbedDecisionError(error: unknown): HubError {
   const scrubbed = new HubError("inbox decision failed", status, "inbox decision failed");
   scrubbed.stack = `${scrubbed.name}: ${scrubbed.message}`;
   return scrubbed;
+}
+
+const LIFT_REFUSAL_STATUS = 422; // HTTP Unprocessable Content: the approval cannot be applied.
+// Only these exact stored-category/class/status/field tuples authorize disclosure; exception properties never supply output.
+// Must match api() detail precedence and decisionOutcomeFromError in server/src/dashboard/v1_1/client.ts.
+const APPROVED_LIFT_REFUSALS = new Map([
+  // Suffix must match assertCapability and enqueueTier1ControlAction in server/src/hub/hub-service.ts.
+  // It must also match liftLockdown in server/src/dashboard/v1_1/castle-wall-agent-controller.ts.
+  ["agent_control_lockdown_lift_unsupported_not_locked_down", { reason: "agent_control_lockdown_lift_unsupported_not_locked_down", detail: "capability not supported: agent_control_lockdown_lift_unsupported_not_locked_down" }],
+  // Suffix must match liftLockdown in server/src/dashboard/v1_1/castle-wall-agent-controller.ts.
+  ["lockdown_lift_no_snapshot", { reason: "lockdown_lift_no_snapshot", detail: "capability not supported: lockdown_lift_no_snapshot" }],
+]);
+
+/** Read-only runtime tuples for full-set parity checks without exposing the router's mutable Map. */
+export const APPROVED_LIFT_REFUSALS_VIEW = Object.freeze(Object.fromEntries(
+  Array.from(APPROVED_LIFT_REFUSALS, ([reason, entry]) => [reason, Object.freeze({ ...entry })]),
+));
+
+function approvedLiftRefusal(category: string | undefined, error: unknown): HubCapabilityError | undefined {
+  if (category !== "lockdown_lift" || !(error instanceof HubCapabilityError) ||
+      Object.getPrototypeOf(error) !== HubCapabilityError.prototype || error.statusCode !== LIFT_REFUSAL_STATUS) return;
+  const allowed = APPROVED_LIFT_REFUSALS.get(error.reasonCode);
+  if (allowed === undefined || error.message !== allowed.detail || error.publicDetail !== allowed.detail) return;
+  // Rebuild from router-owned constants so stack, cause, name and arbitrary properties cannot cross either output channel.
+  const canonical = new HubCapabilityError(allowed.reason);
+  canonical.stack = `${canonical.name}: ${allowed.detail}`;
+  return canonical;
 }
 
 function handleError(
@@ -436,6 +465,7 @@ export async function handleHubRoute(
         );
       }
       let slot: HubOneTimeExport | undefined;
+      let approvalCategory: string | undefined;
       let live = !res.destroyed;
       // Lost delivery clears the secret slot; fixed errors omit raw causes because diagnostics are another disclosure channel.
       const close = () => { live = false; slot = undefined; };
@@ -451,7 +481,7 @@ export async function handleHubRoute(
         },
       };
       try {
-        const item = await deps.service.resolveInboxItem(inboxMatch.itemId, inboxMatch.action, receiver);
+        const item = await deps.service.resolveInboxItem(inboxMatch.itemId, inboxMatch.action, receiver, category => { approvalCategory = category; });
         if (live && !res.destroyed) {
           // The key describes this resolved export, verified against its metadata, never another pending item.
           if (slot && (inboxMatch.action !== "approve" || item.kind !== "approval_pending" ||
@@ -470,9 +500,22 @@ export async function handleHubRoute(
           if (!res.destroyed) res.destroy();
           return true;
         }
-        // One envelope for every decision error: the route's shared caught-error path writes it, so a refused export reads
-        // exactly like any other refused decision (test/http/error-envelope-routes pins the shape). An approve may have
-        // minted a key and diagnostics are a disclosure channel, so an approve error reaches that path with its status only.
+        const refusal = inboxMatch.action === "approve" ? approvedLiftRefusal(approvalCategory, error) : undefined;
+        if (refusal) {
+          logCaughtError(refusal, { route: "hub", operation: "approve" }, { status: LIFT_REFUSAL_STATUS, publicCode: "bad_request" });
+          try {
+            writeJSON(res, LIFT_REFUSAL_STATUS, { ok: false, error: "HubCapabilityError", detail: refusal.publicDetail });
+          } catch (writeError) {
+            // A failed writer can carry transport fault text; abort a started response or scrub before the outer handler.
+            if (res.destroyed || res.headersSent) {
+              if (!res.destroyed) res.destroy();
+              return true;
+            }
+            throw scrubbedDecisionError(writeError);
+          }
+          return true;
+        }
+        // All other approve failures retain status-only diagnostics and the generic global envelope.
         throw inboxMatch.action === "approve" ? scrubbedDecisionError(error) : error;
       } finally {
         close();

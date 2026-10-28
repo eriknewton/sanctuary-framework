@@ -399,10 +399,12 @@ export class HubService {
     return projectedItems.slice(0, limit);
   }
 
+  /** Resolve the selected item; a synchronous observer lets the router bind refusal disclosure to its stored category. */
   async resolveInboxItem(
     itemId: string,
     action: HubInboxAction,
     receiver?: HubExportDeliveryReceiver,
+    observeApprovalCategory?: (category: HubApprovalPendingItem["operation_category"] | undefined) => void,
   ): Promise<HubInboxItem> {
     // A projected Charter hold is owned by the approval queue, not by the
     // inbox store, so its resolution must reach the blocked caller. Marking
@@ -455,6 +457,11 @@ export class HubService {
     // recovery, agent_error) are present in the store before we resolve.
     // Tier 1 hub-enqueued items already live in the store regardless.
     aggregateInbox(this.deps.inboxSources, this.inboxStore, this.nowIso());
+    // The router trusts only the stored approval category; observation and selection must be synchronous so a refresh cannot change its subject.
+    if (observeApprovalCategory) {
+      const selected = this.inboxStore.get(itemId);
+      observeApprovalCategory(selected?.kind === "approval_pending" ? selected.operation_category : undefined);
+    }
     return this.inboxStore.resolve(itemId, action, this.nowIso(), receiver);
   }
 
@@ -727,6 +734,7 @@ export class HubService {
         restart: "agent_control_restart_unsupported_no_process_handle",
         unwrap: "agent_control_unwrap_unsupported_operator_decision_pending",
         lockdown: "agent_control_lockdown_unsupported_no_confinement",
+        // Suffix must match APPROVED_LIFT_REFUSALS in server/src/hub/api-router.ts.
         lockdown_lift: "agent_control_lockdown_lift_unsupported_not_locked_down",
       };
       throw new HubCapabilityError(reasonByAction[action]);
@@ -794,6 +802,7 @@ export class HubService {
             // The current status re-check and claim are one serialized decision: an in-flight lift counts as
             // not locked down, including while an asynchronous capability probe was waiting to return.
             if (this.lockdownLiftsInFlight.has(record.agent_id) || this.getAgent(record.agent_id).status !== "locked_down") {
+              // Suffix must match APPROVED_LIFT_REFUSALS in server/src/hub/api-router.ts.
               throw new HubCapabilityError("agent_control_lockdown_lift_unsupported_not_locked_down");
             }
             this.lockdownLiftsInFlight.add(record.agent_id);
