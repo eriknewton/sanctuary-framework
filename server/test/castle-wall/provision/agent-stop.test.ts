@@ -116,6 +116,24 @@ describe("stop and lift share one platform boundary IC-11", () => {
       readSnapshot.mockRestore();
     }
   });
+
+  it("refuses every non-darwin host platform when the caller omits the platform", async () => {
+    const fortress = await makeFortress();
+    const hostPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    try {
+      for (const platform of ["linux", "win32", "freebsd", ""]) {
+        // Production callers omit platform, so the host platform alone must decide the refusal.
+        Object.defineProperty(process, "platform", { value: platform, configurable: true });
+        await expect(liftAgentEgressStop({
+          agentId: AGENT_ID, fortressPath: fortress, storagePath: fortress,
+        })).rejects.toMatchObject({
+          name: "AgentEgressStopError", reasonCode: "stop_unsupported_platform",
+        });
+      }
+    } finally {
+      if (hostPlatform) Object.defineProperty(process, "platform", hostPlatform);
+    }
+  });
 });
 
 async function makeFortress(): Promise<string> {
