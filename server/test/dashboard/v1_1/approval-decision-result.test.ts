@@ -489,7 +489,7 @@ describe("one retained decision result", () => {
     // The Tier 1 request is selected and armed before the lock, so Confirm is on screen while the lock holds.
     h.click({ "data-action": "approval-select", "data-item-id": "tier1-1" });
     h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "tier1-1" });
-    expect(h.main()).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1">Confirm');
+    expect(h.main()).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1">Yes, allow');
     expect(h.main()).not.toContain(BUSY);
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
@@ -849,4 +849,26 @@ it.each(["refused", "uncertain"])("real export %s retains the existing feedback 
     }
     expect(h.result()).not.toContain('data-decision-status="acknowledged"');
   } finally { await f.close(); }
+});
+
+it.each([
+  [{ public_code: "approval_expired", expired_after_seconds: 90 }, 409, "This request expired after 90 seconds and was denied automatically. The agent was told no. Ask the agent to try again."],
+  [{ public_code: "approval_not_found" }, 404, "This request is no longer waiting. If the server restarted, every request that was waiting was denied."],
+  [{ public_code: "approval_already_decided", decided_at: "2026-10-28T12:00:00.000Z", decided_by: "human" }, 409, ""],
+])("renders the typed operator refusal %j and a short inline echo", async (body, status, sentence) => {
+  vi.useFakeTimers();
+  const id = "charter.approval.refusal";
+  const h = boot({
+    "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held(id, { tier: "tier1" })] } })),
+    [`/api/hub/inbox/${id}/approve`]: () => Promise.resolve(response({ ok: false, ...body }, status)),
+  });
+  await settle();
+  h.navigate("approvals");
+  h.click({ "data-action": "approval-select", "data-item-id": id });
+  h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": id });
+  h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": id });
+  await settle();
+  const expected = sentence || "Already decided at " + h.read('shortTime("2026-10-28T12:00:00.000Z")') + ", from this dashboard or another surface.";
+  expect(h.result()).toContain(expected);
+  expect(h.main()).toContain('<p class="decision-inline" data-decision-status="refused">' + expected.split('. ')[0] + (expected.includes('. ') ? '.' : '') + '</p>');
 });

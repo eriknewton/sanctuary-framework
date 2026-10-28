@@ -17,6 +17,7 @@
  * v1.3 federation introduces a separate surface.
  */
 
+import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { HubExportDeliveryReceiver, HubOneTimeExport } from "./types.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -58,6 +59,7 @@ import {
 } from "./constants.js";
 import {
   HubCapabilityError,
+  HubApprovalRefusalError,
   HubError,
   HubLocalOnlyError,
   HubValidationError,
@@ -499,6 +501,23 @@ export async function handleHubRoute(
         if (res.destroyed || res.headersSent) {
           if (!res.destroyed) res.destroy();
           return true;
+        }
+        // Must match HubApprovalRefusalError in errors.ts and approvalRefusalSentence in dashboard/v1_1/client.ts.
+        // Only the dedicated class and validated closed fields cross this boundary; arbitrary exceptions retain the export-key scrub.
+        if ((inboxMatch.action === "approve" || inboxMatch.action === "deny") && error instanceof HubApprovalRefusalError) {
+          const fields = error.refusal;
+          let body: Record<string, unknown> | undefined;
+          if (fields.public_code === "approval_not_found") body = { ok: false, public_code: "approval_not_found" };
+          if (fields.public_code === "approval_expired" && Number.isSafeInteger(fields.expired_after_seconds) && fields.expired_after_seconds >= 0)
+            body = { ok: false, public_code: "approval_expired", expired_after_seconds: fields.expired_after_seconds };
+          if (fields.public_code === "approval_already_decided" && ["human", "timeout", "shutdown"].includes(fields.decided_by) &&
+              typeof fields.decided_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(fields.decided_at) && parseIsoInstantWithOffset(fields.decided_at) !== undefined)
+            body = { ok: false, public_code: "approval_already_decided", decided_at: fields.decided_at, decided_by: fields.decided_by };
+          if (body) {
+            try { writeJSON(res, fields.public_code === "approval_not_found" ? 404 : 409, body); }
+            catch (writeError) { throw scrubbedDecisionError(writeError); }
+            return true;
+          }
         }
         const refusal = inboxMatch.action === "approve" ? approvedLiftRefusal(approvalCategory, error) : undefined;
         if (refusal) {

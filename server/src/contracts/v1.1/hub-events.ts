@@ -102,8 +102,21 @@ export interface HubInboxItemHeader {
 /**
  * A pending Tier 1 or Tier 2 approval surfaced to the operator inbox.
  */
+/** Two metadata fields cover every closed preview operation; must match the producer bound in principal-policy/gate.ts and consumer in dashboard/v1_1/client.ts. */
+export const HUB_APPROVAL_PREVIEW_MAX_FIELDS = 2;
+
+/** Operator-only, closed preview arguments; must match buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts. */
+export type HubApprovalPreviewArg =
+  | { kind: "byte_count" | "item_count"; field: "memory" | "tags" | "payload"; value: number }
+  | { kind: "subject"; field: "namespace" | "format" | "identity_id" | "type" | "destination_host"; value: string }
+  | { kind: "digest12"; field: "payload"; value: string };
+
 export interface HubApprovalPendingItem extends HubInboxItemHeader {
   kind: "approval_pending";
+  /** Must match CharterApprovalRecord.expires_at in hub/charter-approval-bridge.ts and approvalExpired in dashboard/v1_1/client.ts. */
+  expires_at?: string;
+  /** Must match ApprovalRequest.operator_preview in principal-policy/types.ts and CharterApprovalRecord.operator_preview in hub/charter-approval-bridge.ts. */
+  operator_preview?: HubApprovalPreviewArg[];
   /** Policy tier the underlying operation falls under. */
   tier: "tier1" | "tier2";
   /**

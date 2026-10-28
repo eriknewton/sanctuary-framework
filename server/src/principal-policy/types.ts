@@ -6,6 +6,8 @@
  * configuration that gates operations through approval tiers.
  */
 
+import type { HubApprovalPreviewArg } from "../contracts/v1.1/hub-events.js";
+
 /** Tier 2 anomaly action: what to do when an anomaly is detected */
 export type AnomalyAction = "approve" | "log" | "allow";
 
@@ -123,6 +125,8 @@ export interface ApprovalRequest {
    * the request drops it. Consumers requiring correlation must reject absence.
    */
   readonly approval_audit_id?: string;
+  /** Must match HubApprovalPendingItem.operator_preview in contracts/v1.1/hub-events.ts and charterApprovalRecord in principal-policy/dashboard.ts; never agent response data. */
+  operator_preview?: HubApprovalPreviewArg[];
   operation: string;
   tier: 1 | 2;
   reason: string;

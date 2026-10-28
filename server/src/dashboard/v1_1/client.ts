@@ -27,6 +27,7 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
+import { HUB_APPROVAL_PREVIEW_MAX_FIELDS } from "../../contracts/v1.1/hub-events.js";
 import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
@@ -1777,6 +1778,7 @@ function renderMain() {
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
+  if (restartBannerShown) nextHtml = '<div class="notice" role="status" data-stream-recovery-banner="1">' + STREAM_RESTART_BANNER + '</div>' + nextHtml;
   // F is outside the route body, including stopped-updates and Talk screens.
   renderFeedback();
   renderOperatorTokenEntry();
@@ -2433,10 +2435,10 @@ function agentApprovalRows(items) {
   return items.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (item) {
     // Only an explicit Tier 2 hold is safe inline; unknown tiers must take the Approvals review path.
     const controls = item.tier === "tier2"
-      ? '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Deny</button><button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Allow once</button>' + renderDecisionInline(item)
+      ? '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled(item) + '>Deny</button><button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled(item) + '>Allow once</button>' + renderDecisionInline(item)
       : '<a class="btn" href="#approvals">Review in Approvals</a>';
     return '<div class="approval-row"><div class="what">' + overviewChip("warn", "WAITING") + ' <span>' + (item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : "Tier Unknown") + '</span> ' +
-      renderTemplateHtml(item.display_template_id, item.display_template_args, item.operation_truncated) + '<span class="muted"> · ' + escHtml(item.created_at ? relTimeFromIso(item.created_at) : "age Unknown") + '</span></div><div class="actions">' + controls + '</div></div>';
+      renderTemplateHtml(item.display_template_id, item.display_template_args, item.operation_truncated) + approvalCountdownHtml(item) + '<span class="muted"> · ' + escHtml(item.created_at ? relTimeFromIso(item.created_at) : "age Unknown") + '</span></div><div class="actions">' + controls + '</div></div>';
   }).join("");
 }
 function renderAgentApprovals(agent) {
@@ -5534,7 +5536,57 @@ function batchSelectionDisabled() {
   // The selection checkboxes pause only while a batch holds the lock; an item decision leaves them live.
   return batchSelectionLocked() ? ' disabled title="' + DECISION_BUSY_REASON + '"' : "";
 }
-function approvalDecisionDisabled() {
+// Must match HubApprovalPendingItem.expires_at in contracts/v1.1/hub-events.ts.
+function approvalExpired(item) {
+  return !!item && !item.resolved && Number.isFinite(parseEvidenceTimestamp(item.expires_at)) && Date.now() >= parseEvidenceTimestamp(item.expires_at);
+}
+function approvalExpirySentence(item) {
+  const seconds = Math.max(0, Math.round((parseEvidenceTimestamp(item.expires_at) - parseEvidenceTimestamp(item.created_at)) / 1000));
+  return approvalRefusalSentence({ public_code: "approval_expired", expired_after_seconds: seconds });
+}
+function approvalCountdownHtml(item) {
+  if (!item || item.resolved || !Number.isFinite(parseEvidenceTimestamp(item.expires_at))) return "";
+  const seconds = Math.max(0, Math.ceil((parseEvidenceTimestamp(item.expires_at) - Date.now()) / 1000));
+  return '<p class="muted" data-approval-countdown="1">' + (seconds ? 'Expires in ' + Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0') : escHtml(approvalExpirySentence(item))) + '</p>';
+}
+// Must match HubApprovalPreviewArg in contracts/v1.1/hub-events.ts and buildOperatorPreview in principal-policy/gate.ts.
+function approvalPreviewHtml(item) {
+  const fields = item.operator_preview;
+  if (!Array.isArray(fields)) return "";
+  const labels = { memory: "bytes", tags: "tags", payload: "bytes", namespace: "Namespace", format: "Format", identity_id: "Identity", type: "Type", destination_host: "Destination host" };
+  const parts = fields.slice(0, ${HUB_APPROVAL_PREVIEW_MAX_FIELDS}).map(function (arg) {
+    if (!arg || !Object.prototype.hasOwnProperty.call(labels, arg.field)) return "";
+    if ((arg.kind === "byte_count" || arg.kind === "item_count") && Number.isSafeInteger(arg.value) && arg.value >= 0)
+      return arg.value.toLocaleString("en-US") + " " + labels[arg.field];
+    if (arg.kind === "subject" && typeof arg.value === "string") return labels[arg.field] + " " + heldSubjectHtml(arg.value.slice(0, ${CARD_OPERATION_MAX_CHARS}), arg.value.length > ${CARD_OPERATION_MAX_CHARS});
+    if (arg.kind === "digest12" && arg.field === "payload" && /^[a-f0-9]{12}$/.test(arg.value)) return "SHA-256 of signed bytes " + heldSubjectHtml(arg.value, false);
+    return "";
+  }).filter(Boolean);
+  return parts.length ? '<p class="approval-preview">' + (approvalHeldOperation(item) === "memory_insert" ? "Save a memory: " : "") + parts.join(", ") + '</p>' : "";
+}
+// One retained selected card and one timer bound local expiry feedback independently of request volume.
+let expiredApprovalSelection = null;
+let approvalDeadlineTimer = null;
+function checkApprovalDeadlines() {
+  let changed = false;
+  state.inbox.forEach(function (item) {
+    if (!approvalExpired(item) || item.deadlineObserved) return;
+    item.deadlineObserved = true;
+    changed = true;
+    if (state.approvals.selectedId === item.item_id) expiredApprovalSelection = item;
+    if (state.approvals.confirmingTier1Id === item.item_id) resetApprovalConsent();
+  });
+  if (changed) void queueStreamRefresh([HUB + "/inbox", HUB + "/agents"]);
+}
+function scheduleApprovalDeadlineTick() {
+  // Render churn must not postpone an admitted deadline tick.
+  if (approvalDeadlineTimer !== null) return;
+  if (!state.inbox.some(function (item) { return !item.resolved && !item.deadlineObserved && Number.isFinite(parseEvidenceTimestamp(item.expires_at)); })) return;
+  approvalDeadlineTimer = setTimeout(function () { approvalDeadlineTimer = null; checkApprovalDeadlines(); rerender(); }, 1000); // One-second precision for m:ss.
+}
+
+function approvalDecisionDisabled(item) {
+  if (approvalExpired(item)) return ' disabled title="This request expired."';
   // Invariant: every decision control on every screen reads the one decision lock, so while a decision is in
   // flight no second request can be clicked anywhere, and each paused control says why.
   if (!decisionInFlight()) return "";
@@ -5563,7 +5615,7 @@ function renderApprovalRow(item, selectedId) {
       '<td><span class="state-chip neutral" data-approval-decision="' + escHtml(decisionLabel.toLowerCase()) + '"><i aria-hidden="true"></i>' + escHtml(decisionLabel) + '</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
     '</tr>';
   }
-  const disabled = approvalDecisionDisabled();
+  const disabled = approvalDecisionDisabled(item);
   const decisionCell = item.tier === "tier1"
     ? '<button class="btn btn-sm" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">Review in drawer</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>'
     : '<button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>';
@@ -5574,7 +5626,7 @@ function renderApprovalRow(item, selectedId) {
     '<td><strong>' + escHtml(agent) + '</strong></td>' +
     '<td class="mono">' + opHtml + '</td>' +
     '<td>' + approvalHoldReasonHtml(item) + '</td>' +
-    '<td class="mono">' + escHtml(age) + '</td>' +
+    '<td class="mono">' + escHtml(age) + approvalCountdownHtml(item) + '</td>' +
     '<td>' + decisionCell + echo + '</td>' +
   '</tr>';
 }
@@ -5596,7 +5648,7 @@ function renderApprovalDrawer(item, empty) {
   const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
   const standing = approvalStandingState(item);
   const checked = state.approvals.alwaysAllow && standing.enabled && !item.resolved;
-  const disabled = approvalDecisionDisabled();
+  const disabled = approvalDecisionDisabled(item);
   const primaryAction = checked ? "inbox-promote" : "inbox-approve";
   const primaryLabel = checked ? "Allow always" : "Allow once";
   const checkbox = item.resolved ? "" : '<label class="approval-standing"><input type="checkbox" data-action="approval-always-allow"' +
@@ -5605,7 +5657,7 @@ function renderApprovalDrawer(item, empty) {
     '<strong class="warn">' + escHtml(standing.reason) + '</strong></span></label>';
   const tier1Confirming = state.approvals.confirmingTier1Id === item.item_id;
   const tier1Cancelled = state.approvals.cancelledTier1Id === item.item_id;
-  const startButton = '<button class="btn btn-primary approval-tier1-step" data-action="approval-start-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button>';
+  const startButton = '<button class="btn btn-primary approval-tier1-step" data-action="approval-start-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once…</button>';
   const cancelButton = '<button class="btn approval-tier1-step" data-action="approval-cancel-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Cancel</button>';
   const primaryButton = item.resolved ? "" : item.tier === "tier1"
     ? (tier1Confirming || tier1Cancelled ? cancelButton : startButton)
@@ -5613,7 +5665,7 @@ function renderApprovalDrawer(item, empty) {
   const denyButton = item.resolved ? "" : '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button>';
   // Confirm occupies a separate row so the second click in the first-step slot can only cancel.
   const confirmRow = !item.resolved && tier1Confirming
-    ? '<div class="approval-confirm-row"><button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Confirm ' + opHtml + '</button></div>' : "";
+    ? '<div class="approval-confirm-row"><button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Yes, allow ' + opHtml + '</button><p>This sends the approval</p></div>' : "";
   // Keep Cancel in its original slot and focused after disarming; a new Allow step uses a separate slot.
   const restartButton = !item.resolved && tier1Cancelled ? startButton : "";
   const standingEffect = checked
@@ -5629,8 +5681,8 @@ function renderApprovalDrawer(item, empty) {
     ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + opHtml + '. Only Confirm sends the approval.</div>'
     : "";
   return '<aside class="card approval-drawer" aria-label="Selected approval">' +
-    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? approvalDecisionLabel(item) : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + opHtml + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
-    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + approvalTextHtml(item) + '</p></div>' +
+    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? approvalDecisionLabel(item) : approvalExpired(item) ? "EXPIRED" : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + opHtml + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + approvalTextHtml(item) + '</p>' + approvalPreviewHtml(item) + approvalCountdownHtml(item) + '</div>' +
     // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
     '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + approvalHoldReasonHtml(item) + '</p></div>' +
     '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + allowCopyHtml + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
@@ -5683,12 +5735,12 @@ function renderApprovalsScreen() {
     return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
   });
   const decided = capped.filter(function (i) { return !!i.resolved; });
-  const selectedId = capped.some(function (i) { return i.item_id === state.approvals.selectedId; })
+  const selectedId = (expiredApprovalSelection && expiredApprovalSelection.item_id === state.approvals.selectedId) || capped.some(function (i) { return i.item_id === state.approvals.selectedId; })
     ? state.approvals.selectedId
     : (waiting[0] || capped[0] || {}).item_id || null;
   if (state.approvals.selectedId !== selectedId) resetApprovalConsent();
   state.approvals.selectedId = selectedId;
-  const selected = capped.find(function (i) { return i.item_id === selectedId; }) || null;
+  const selected = capped.find(function (i) { return i.item_id === selectedId; }) || (expiredApprovalSelection && expiredApprovalSelection.item_id === selectedId ? expiredApprovalSelection : null);
   const oldest = waiting.length && waiting[0].created_at ? relTimeFromIso(waiting[0].created_at) : "none waiting";
   const rows = [
     waiting.length ? '<tr class="sect"><td colspan="6">Waiting on you · ' + waiting.length + ' of ' + allWaitingCount + ' · oldest wait ' + escHtml(oldest) + '</td></tr>' : "",
@@ -6515,6 +6567,11 @@ function jobsForPaths(paths) {
   });
 }
 function queueStreamRefresh(paths) {
+  // Preserve selected expiry feedback before an invalidation removes the live row.
+  if (paths.indexOf(HUB + "/inbox") >= 0) {
+    const selected = state.inbox.find(function (item) { return item.item_id === state.approvals.selectedId; });
+    if (approvalExpired(selected)) { expiredApprovalSelection = selected; resetApprovalConsent(); }
+  }
   return fetchAll(true, jobsForPaths(paths));
 }
 function retryPanel(path) {
@@ -7021,7 +7078,7 @@ function decisionNotAdmissible(ids) {
   // Invariant: a decision is sent only against a loaded inbox read in which every admitted id is still held; a
   // stale selection, a resolved row or a queue that could not be re-read sends nothing and says why.
   if (!sourceLoaded(HUB + "/inbox")) return "the queue has not been read since it last changed, so nothing was sent. Re-read the queue first.";
-  const gone = ids.filter(function (id) { const item = state.inbox.find(function (i) { return i.item_id === id; }); return !item || item.resolved; });
+  const gone = ids.filter(function (id) { const item = state.inbox.find(function (i) { return i.item_id === id; }); return !item || item.resolved || approvalExpired(item); });
   if (gone.length === 0) return "";
   return (ids.length === 1 ? "the request is no longer waiting in the loaded queue"
     : gone.length + " of the " + ids.length + " selected items " + (gone.length === 1 ? "is" : "are") + " no longer waiting in the loaded queue") + ", so nothing was sent.";
@@ -7196,7 +7253,20 @@ function decisionRefusedByServer(error) {
   return typeof status === "number" && status >= 400 && status < 500;
 }
 // Must match the approved lift-refusal detail contract in server/src/hub/api-router.ts.
+// Must match HubApprovalRefusalError codes in hub/errors.ts and the router-owned serialization in hub/api-router.ts.
+function approvalRefusalSentence(body) {
+  if (!body) return "";
+  if (body.public_code === "approval_expired" && Number.isSafeInteger(body.expired_after_seconds) && body.expired_after_seconds >= 0)
+    return "This request expired after " + body.expired_after_seconds + " seconds and was denied automatically. The agent was told no. Ask the agent to try again.";
+  if (body.public_code === "approval_already_decided" && Number.isFinite(parseEvidenceTimestamp(body.decided_at)))
+    return "Already decided at " + shortTime(body.decided_at) + ", from this dashboard or another surface.";
+  if (body.public_code === "approval_not_found")
+    return "This request is no longer waiting. If the server restarted, every request that was waiting was denied.";
+  return "";
+}
 function decisionOutcomeFromError(action, subject, error, item) {
+  const approvalSentence = approvalRefusalSentence(error && error.body);
+  if (decisionRefusedByServer(error) && approvalSentence) return { status: "refused", message: approvalSentence };
   const http = error && typeof error.status === "number" ? " (HTTP " + error.status + ")" : "";
   const reason = (error && error.message) || "no answer from the server";
   if (decisionRefusedByServer(error)) {
@@ -7262,7 +7332,7 @@ function renderDecisionBatchInline() {
   // A partly taken batch keeps its whole short message here, so the refusal is not dropped with the second sentence.
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
     : r.status === "acknowledged" ? (decisionHeadline(r) === DECISION_HEADLINE.acknowledged ? decisionFirstSentence(r.message) : r.message)
-    : r.status === "refused" ? "Refused."
+    : r.status === "refused" ? (/^(This request|Already decided)/.test(r.message) ? decisionFirstSentence(r.message) : "Refused.")
     : r.status === "not_sent" ? "Not sent."
     : "Unconfirmed.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
@@ -7273,7 +7343,7 @@ function renderDecisionInline(item) {
   if (!r || r.kind !== "item" || r.itemId !== item.item_id || item.resolved) return "";
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
     : r.status === "acknowledged" ? decisionDone(r.action) + "."
-    : r.status === "refused" ? "Refused."
+    : r.status === "refused" ? (/^(This request|Already decided)/.test(r.message) ? decisionFirstSentence(r.message) : "Refused.")
     : r.status === "not_sent" ? "Not sent."
     : "Unconfirmed.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
@@ -7295,7 +7365,7 @@ function focusTier1Cancel() {
 function state_ARMEDTier1(itemId) {
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
   // Arming binds consent to the current unresolved Tier 1 request, never a stale or in-flight row.
-  if (!item || item.resolved || item.tier !== "tier1" || state.approvals.selectedId !== itemId || decisionInFlight()) return;
+  if (!item || item.resolved || approvalExpired(item) || item.tier !== "tier1" || state.approvals.selectedId !== itemId || decisionInFlight()) return;
   state.approvals.confirmingTier1Id = itemId;
   state.approvals.cancelledTier1Id = null;
   rerender();
@@ -7683,6 +7753,28 @@ async function onTemplateBind(agentId) {
 let steadyRefetchTimer = null;
 let steadyRefetch = null;
 let connectedStream = null;
+let disposeStream = null;
+let recoveryProbeTimer = null;
+let recoveryProbeInFlight = false;
+let streamHadGap = false;
+let restartBannerShown = false;
+const STREAM_RECOVERY_PROBE_MS = 30 * 1000; // At most two probe admissions per minute after fast retries are exhausted.
+const STREAM_RESTART_BANNER = "The server restarted. Requests that were waiting before the restart were denied.";
+function scheduleRecoveryProbe() {
+  if (recoveryProbeTimer !== null || recoveryProbeInFlight) return;
+  recoveryProbeTimer = setTimeout(async function () {
+    recoveryProbeTimer = null;
+    if (!liveUpdatesStopped || recoveryProbeInFlight) return;
+    recoveryProbeInFlight = true;
+    try {
+      // A single deadline-bounded session/health read owns each probe; no parallel polling wave is admitted.
+      if (TOKEN) await createStreamSessionQuery();
+      else { const response = await readResponse("/api/health", { cache: "no-store" }); if (!response.ok) throw new Error("Server unavailable"); }
+      void retryPanel(HUB + "/inbox");
+    } catch (error) { /* Keep the stopped state visible until a probe succeeds. */ }
+    finally { recoveryProbeInFlight = false; if (liveUpdatesStopped) scheduleRecoveryProbe(); }
+  }, STREAM_RECOVERY_PROBE_MS);
+}
 function clearSteadyRefetchTimer() {
   if (steadyRefetchTimer !== null) clearTimeout(steadyRefetchTimer);
   steadyRefetchTimer = null;
@@ -7721,20 +7813,44 @@ function scheduleSteadyRefetch(delay) {
   }, delay === undefined ? DASHBOARD_STEADY_REFETCH_INTERVAL_MS : delay);
 }
 function connectStream() {
+  if (disposeStream) disposeStream();
+  if (recoveryProbeTimer !== null) clearTimeout(recoveryProbeTimer);
+  recoveryProbeTimer = null;
   clearSteadyRefetchTimer();
   connectedStream = null;
   let es = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
-  const MAX_RECONNECT_ATTEMPTS = 5; // Five repair waves, then operator Retry only.
+  const MAX_RECONNECT_ATTEMPTS = 5; // Five fast retries, then the bounded 30-second probe.
+  let disposed = false;
+  disposeStream = function () { disposed = true; if (reconnectTimer !== null) clearTimeout(reconnectTimer); if (es) es.close(); };
+  function reconnect() {
+    if (disposed) return;
+    streamHadGap = true;
+    clearSteadyRefetchTimer();
+    connectedStream = null;
+    try { if (es) es.close(); } catch (error) { /* Closed already. */ }
+    es = null;
+    if (liveUpdatesStopped || pollingStarted || reconnectTimer !== null) return;
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { stopLiveUpdates(); return; }
+    const delay = 1000 * Math.pow(2, reconnectAttempts++);
+    reconnectTimer = setTimeout(async function () {
+      reconnectTimer = null;
+      if (disposed || liveUpdatesStopped || pollingStarted) return;
+      // Preserve the existing recovery read ownership: queued mutations finish before the replacement stream opens.
+      try { await fetchAll(true); rerender(); }
+      catch (error) { /* A failed refresh must not strand stream recovery. */ }
+      finally { void open(); }
+    }, delay);
+  }
   function markStreamFrameReceived() {
     reconnectAttempts = 0;
   }
   async function open() {
-    if (liveUpdatesStopped || pollingStarted) return;
+    if (disposed || liveUpdatesStopped || pollingStarted) return;
     try {
       const sessionQuery = await createStreamSessionQuery();
-      if (liveUpdatesStopped || pollingStarted) return;
+      if (disposed || liveUpdatesStopped || pollingStarted) return;
       const url = credentialedReadUrl(STREAM + sessionQuery, "GET");
       es = new EventSource(url);
       const stream = es;
@@ -7744,10 +7860,15 @@ function connectStream() {
         if (connectedStream === stream) { clearSteadyRefetchTimer(); connectedStream = null; }
         return close.call(stream);
       };
-    } catch (e) { schedulePolling(); return; }
+    } catch (e) { reconnect(); return; }
     es.onopen = function () {
-      if (liveUpdatesStopped || pollingStarted) return;
+      if (disposed || liveUpdatesStopped || pollingStarted) return;
+      reconnectAttempts = 0;
       connectedStream = es;
+      if (streamHadGap) {
+        streamHadGap = false;
+        if (!restartBannerShown) { restartBannerShown = true; rerender(); }
+      }
       scheduleSteadyRefetch();
     };
     es.addEventListener("snapshot", function () { markStreamFrameReceived(); /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
@@ -7790,29 +7911,14 @@ function connectStream() {
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("approval", function () { markStreamFrameReceived(); void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
-    es.onerror = function () {
-      clearSteadyRefetchTimer();
-      connectedStream = null;
-      try { es && es.close(); } catch (e) { /* ignore */ }
-      es = null;
-      if (liveUpdatesStopped || pollingStarted) return;
-      // The bounded recovery budget ends visibly; no loaded clear stays current after give-up.
-      if (reconnectTimer) return;
-      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { stopLiveUpdates(); return; }
-      const delay = 1000 * Math.pow(2, reconnectAttempts++);
-      reconnectTimer = setTimeout(async function () {
-        reconnectTimer = null;
-        if (liveUpdatesStopped || pollingStarted) return;
-        try { await fetchAll(true); rerender(); }
-        catch (error) { /* A rejected restore cannot strand stream recovery. */ }
-        finally { void open(); }
-      }, delay);
-    };
+    es.onerror = reconnect;
   }
   void open();
 }
 
 function stopLiveUpdates() {
+  streamHadGap = true;
+  scheduleRecoveryProbe();
   liveUpdatesStopped = true;
   clearSteadyRefetchTimer();
   connectedStream = null;
@@ -7838,9 +7944,12 @@ function schedulePolling() {
   function poll() {
     if (failedWaves >= MAX_POLL_ATTEMPTS) { stopLiveUpdates(); return; }
     setTimeout(async function () {
-      const refreshed = await fetchAll(true);
+      if (!pollingStarted || liveUpdatesStopped) return;
+      let refreshed = false;
+      try { refreshed = await fetchAll(true); } catch (error) { /* The next bounded wave retries. */ }
       failedWaves = refreshed ? 0 : failedWaves + 1;
       rerender();
+      if (refreshed && typeof EventSource !== "undefined") { pollingStarted = false; connectStream(); return; }
       poll();
     }, Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, failedWaves)));
   }
@@ -7853,6 +7962,7 @@ function schedulePolling() {
 
 // ── Rerender ───────────────────────────────────────────────────────────
 function rerender() {
+  scheduleApprovalDeadlineTick();
   renderTopbar();
   renderMain();
   renderFortress();
@@ -7875,7 +7985,13 @@ function bindHashRoute() {
     setRoute(h.split("?")[0] || "posture");
   }
   window.addEventListener("hashchange", function () { clearExitRekey(); fromHash(); });
-  window.addEventListener("pagehide", clearExitRekey);
+  window.addEventListener("pagehide", function () {
+    clearExitRekey();
+    if (approvalDeadlineTimer !== null) clearTimeout(approvalDeadlineTimer);
+    if (disposeStream) disposeStream();
+    if (recoveryProbeTimer !== null) clearTimeout(recoveryProbeTimer);
+    recoveryProbeTimer = null;
+  });
   fromHash();
 }
 

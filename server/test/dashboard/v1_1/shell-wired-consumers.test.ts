@@ -761,7 +761,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(calls).toEqual([]);
     html = h.el.main!.innerHTML;
     expect(html).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1"');
-    expect(html).toContain("Confirm state_export");
+    expect(html).toContain("Yes, allow state_export");
     h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "tier1-1" });
     await settle();
     expect(calls).toEqual(["/api/hub/inbox/tier1-1/approve"]);
@@ -3766,7 +3766,7 @@ describe("Approvals round-one decision and evidence states", () => {
     expect(pane).toContain(`<h4>Why it is held</h4><p>Proxied tool ${chip} is configured as Tier 1, so it always asks for approval.</p>`);
     expect(pane).toContain(`Allow once arms this request, and Confirm ${chip} sends the approval`);
     expect(pane).toContain(`Tier 1 takes two steps here: Allow once, then Confirm ${chip}. Only Confirm sends the approval.`);
-    expect(pane).toContain(`>Confirm ${chip}</button>`);
+    expect(pane).toContain(`>Yes, allow ${chip}</button>`);
     const queue = approvals.split("<aside")[0]!;
     for (const item of [tier1, tier2, decided]) {
       const row = queue.split(`data-approval-row="${item.item_id}"`)[1]!.split("</tr>")[0]!;

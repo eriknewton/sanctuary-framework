@@ -126,7 +126,7 @@ describe("v1.1 launch-session read propagation", () => {
     expect(bearerStream.streams).toEqual(["/api/stream?session=bearer-minted-session"]);
   });
 
-  it("falls back to polling without opening SSE when the bearer session exchange fails", async () => {
+  it("backs off the stream without sticky polling when the bearer session exchange fails", async () => {
     for (const streamSessionFailure of ["non-ok", "throw"] as const) {
       const failed = loadClient({
         session: "launch-session",
@@ -137,7 +137,7 @@ describe("v1.1 launch-session read propagation", () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(failed.calls.map((call) => call.url)).toEqual(["/auth/session"]);
       expect(failed.streams).toEqual([]);
-      expect(failed.pollingIntervals).toEqual([5000, 5000]); // Session deadline, then bounded fallback.
+      expect(failed.pollingIntervals).toEqual([5000, 1000]); // Session deadline, then the first stream retry.
     }
   });
 });

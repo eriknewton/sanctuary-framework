@@ -116,3 +116,16 @@ export class HubCapabilityError extends HubError {
     });
   }
 }
+
+/** Closed operator refusal vocabulary; must match api-router.ts approval serialization and client.ts approvalRefusalSentence. */
+export type ApprovalRefusal =
+  | { public_code: "approval_expired"; expired_after_seconds: number }
+  | { public_code: "approval_already_decided"; decided_at: string; decided_by: "human" | "timeout" | "shutdown" }
+  | { public_code: "approval_not_found" };
+
+/** Only this class authorizes the router to expose closed approval metadata to the operator. */
+export class HubApprovalRefusalError extends HubError {
+  constructor(readonly refusal: ApprovalRefusal) {
+    super("approval decision refused", refusal.public_code === "approval_not_found" ? 404 : 409);
+  }
+}

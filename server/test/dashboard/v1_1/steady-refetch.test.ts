@@ -190,7 +190,7 @@ describe("connected dashboard bounded hub refetch", () => {
     const h = await connected(); await vi.advanceTimersByTimeAsync(INTERVAL_MS);
     TARGETS.forEach(path => expect(h.count(path)).toBe(2)); // Witness a real wave before teardown.
     if (transition === "close") h.streams[0].close();
-    if (transition === "stop") h.read("stopLiveUpdates()");
+    if (transition === "stop") { h.overrides["/api/health"] = () => Promise.reject(new Error("offline")); h.read("stopLiveUpdates()"); }
     if (transition === "flag") h.read("liveUpdatesStopped = true");
     if (transition === "hidden") h.visibility("hidden");
     if (transition === "close" || transition === "stop") {
@@ -199,7 +199,7 @@ describe("connected dashboard bounded hub refetch", () => {
     }
     const before = h.calls.length;
     await vi.advanceTimersByTimeAsync(INTERVAL_MS * REPEATED_WAVES);
-    expect(h.calls).toHaveLength(before);
+    expect(h.calls.filter(call => call.path !== "/api/health")).toHaveLength(before);
     if (transition === "hidden") {
       h.visibility("visible"); h.visibility("visible");
       await vi.advanceTimersByTimeAsync(INTERVAL_MS);
@@ -211,13 +211,14 @@ describe("connected dashboard bounded hub refetch", () => {
     h.overrides[TARGETS[0]] = () => slow.promise;
     await vi.advanceTimersByTimeAsync(INTERVAL_MS);
     expect(h.count(TARGETS[0])).toBe(2);
+    h.overrides["/api/health"] = () => Promise.reject(new Error("offline"));
     h.read("stopLiveUpdates()");
     expect(h.read("steadyRefetchTimer")).toBeNull();
     expect(h.read("connectedStream")).toBeNull();
     const before = h.calls.length;
     slow.resolve(response()); await settle();
     await vi.advanceTimersByTimeAsync(INTERVAL_MS * REPEATED_WAVES);
-    expect(h.calls).toHaveLength(before);
+    expect(h.calls.filter(call => call.path !== "/api/health")).toHaveLength(before);
     expect(h.read('sourceLoaded("/api/hub/inbox")')).toBe(false);
   });
   it("clears the old timer on error and rearms once on the replacement stream", async () => {

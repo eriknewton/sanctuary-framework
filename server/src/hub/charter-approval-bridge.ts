@@ -30,6 +30,7 @@
 
 import type {
   HubApprovalPendingItem,
+  HubApprovalPreviewArg,
   HubDisplayTemplateArg,
   HubHoldReason,
   HubHoldReasonCode,
@@ -48,6 +49,10 @@ export interface CharterApprovalRecord {
   operation: string;
   tier: 1 | 2;
   created_at: string;
+  /** Must match charterApprovalRecord in principal-policy/dashboard.ts and HubApprovalPendingItem.expires_at in contracts/v1.1/hub-events.ts. */
+  expires_at?: string;
+  /** Must match ApprovalRequest.operator_preview in principal-policy/types.ts and HubApprovalPendingItem.operator_preview in contracts/v1.1/hub-events.ts. */
+  operator_preview?: HubApprovalPreviewArg[];
   /**
    * The hub agent id of the agent this server process is configured for
    * (its wrap-time `SANCTUARY_AGENT_ID`), when the gate knew it: the agent
@@ -67,11 +72,19 @@ export interface CharterApprovalRecord {
   hold_reason?: HubHoldReason;
 }
 
+/** A recently closed hold carries only decision metadata, never request arguments. */
+export interface ClosedCharterApproval {
+  decided_by: "timeout" | "human" | "shutdown";
+  decision: "approve" | "deny";
+  decided_at: string;
+  expired_after_seconds: number;
+}
+
 /**
  * The read-through + resolve contract a Charter approval channel installs on
  * the hub. `resolve` returns false when the hold is no longer live (already
  * decided through another surface, or auto-denied on timeout), which the hub
- * reports as a not-found rather than silently marking a card resolved.
+ * reports as a typed refusal rather than silently marking a card resolved.
  *
  * Every method is bounded on purpose. The queue's population is driven by
  * agent call volume (one entry per blocked tool call) and is bounded only in
@@ -92,6 +105,8 @@ export interface CharterApprovalBridge {
   list(limit: number): CharterApprovalRecord[];
   /** One live hold by id, by direct key lookup. Null when it is not live. */
   get(approvalId: string): CharterApprovalRecord | null;
+  /** Must match DashboardApprovalChannel.closedApproval in principal-policy/dashboard.ts. Null after bounded retention. */
+  closed?(approvalId: string): ClosedCharterApproval | null;
   resolve(approvalId: string, decision: "approve" | "deny"): boolean;
 }
 
@@ -504,6 +519,8 @@ export function projectCharterApproval(
     item_id: charterApprovalItemId(record.id),
     kind: "approval_pending",
     created_at: record.created_at,
+    ...(record.expires_at ? { expires_at: record.expires_at } : {}),
+    ...(record.operator_preview ? { operator_preview: record.operator_preview } : {}),
     identity_id: identityId,
     ...(agentId ? { agent_id: agentId } : {}),
     // Template ids are `<namespace>.<tier>.<category>`; `.other` is the

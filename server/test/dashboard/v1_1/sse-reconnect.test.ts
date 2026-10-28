@@ -17,7 +17,7 @@ describe("v1.1 dashboard SSE reconnect-and-restore", () => {
   it("client encodes the disconnect-then-refetch pattern", () => {
     const src = getClientScript();
     expect(src).toContain("connectStream");
-    expect(src).toMatch(/onerror\s*=\s*function/);
+    expect(src).toContain("es.onerror = reconnect");
     expect(src).toMatch(/await fetchAll\(true\)/);
     // Reconnect timer present (no infinite-fast-loop).
     expect(src).toContain("reconnectTimer");

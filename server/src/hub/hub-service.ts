@@ -45,6 +45,7 @@ import {
 } from "./constants.js";
 import {
   HubCapabilityError,
+  HubApprovalRefusalError,
   HubConflictError,
   HubLocalOnlyError,
   HubNotFoundError,
@@ -421,6 +422,7 @@ export class HubService {
     if (isCharterApprovalItemId(itemId)) {
       const charterApprovalId = charterApprovalIdFromItemId(itemId);
       if (!charterApprovalId || !this.charterApprovals) {
+        // Without a configured hold channel this is an ordinary missing resource, preserving the router's generic scrub.
         throw new HubNotFoundError(`inbox item ${itemId}`);
       }
       if (action === "dismiss") {
@@ -431,10 +433,17 @@ export class HubService {
       // By key, never by scanning the queue: the id IS the queue's key, and a
       // scan would make one operator click cost O(live holds).
       const record = this.charterApprovals.get(charterApprovalId);
-      if (!record) throw new HubNotFoundError(`inbox item ${itemId}`);
+      const missed = () => {
+        const closed = this.charterApprovals?.closed?.(charterApprovalId);
+        return new HubApprovalRefusalError(closed?.decided_by === "timeout"
+          ? { public_code: "approval_expired", expired_after_seconds: closed.expired_after_seconds }
+          : closed ? { public_code: "approval_already_decided", decided_at: closed.decided_at, decided_by: closed.decided_by }
+          : { public_code: "approval_not_found" });
+      };
+      if (!record) throw missed();
       if (!this.charterApprovals.resolve(charterApprovalId, action)) {
         // Lost a race with another surface or with the queue's own timeout.
-        throw new HubConflictError(`inbox item ${itemId} already resolved`);
+        throw missed();
       }
       const resolvedAt = this.nowIso();
       const decided: HubApprovalPendingItem = {

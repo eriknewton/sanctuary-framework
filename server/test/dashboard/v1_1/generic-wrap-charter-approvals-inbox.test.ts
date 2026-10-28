@@ -936,7 +936,7 @@ describe("Charter cards name the requesting agent and stay listed once decided",
         .some((i) => i.item_id === card!.item_id),
     ).toBe(false);
     // A decided card cannot be decided again through its id.
-    expect((await postInboxAction(rig, card!.item_id, "approve")).status).toBe(404);
+    expect((await postInboxAction(rig, card!.item_id, "approve")).status).toBe(409);
   });
 
   it("shows an agent-chosen namespace only as escaped data, never as a sentence on the card", async () => {
