@@ -23,8 +23,7 @@ import {
 import { encodeFilesystemStorageName, filesystemStorageNameRoundTrips } from "./filesystem-name-codec.js";
 import type { StorageBackend } from "./interface.js";
 
-// Must match the ciphertext/record import ceilings in sdw/import.ts.
-
+// Must match the record import ceiling in sdw/import.ts.
 export const SDW_MAX_RECORDS = 100_000;
 export const SDW_PAGE_RECORDS = 256;
 export const SDW_MAX_PAGES = Math.ceil(SDW_MAX_RECORDS / SDW_PAGE_RECORDS);
@@ -39,8 +38,6 @@ export const SDW_MAX_GENERATION_BYTES = 4 * 1024;
 export const SDW_MAX_METADATA_BYTES = SDW_MAX_PAGES * SDW_MAX_PAGE_BYTES +
   SDW_MAX_PLAN_BYTES + SDW_MAX_RECEIPT_BYTES + 5 * SDW_MAX_MARKER_BYTES;
 
-
-
 export const SDW_CLEANUP_BATCH_FILES = 256;
 export const SDW_MAX_JOURNAL_DEPTH = 3;
 // Layout allowance for directories, controls and the reusable temporary files.
@@ -48,9 +45,9 @@ export const SDW_MAX_JOURNAL_ENTRIES = SDW_MAX_RECORDS + SDW_MAX_PAGES + 32;
 
 export const SDW_JOURNAL_TEMP = ".tmp";
 
-/** Bit positions in affected_mask, also the canonical epoch/coverage order. */
-// Must match isSdwNamespace in sdw/write-gate.ts; pinned here only because that
-// higher-level module is outside this packet's scope. Full-set parity is tested.
+// Must match SDW_JOURNAL_NAMESPACES in sdw-fence.ts and isSdwNamespace in
+// sdw/write-gate.ts; the higher-level reverse pin is outside this packet.
+// Full-set parity is tested.
 const journalNamespaces: ReadonlySet<string> = new Set([SDW_CATALOG_NAMESPACE, SDW_DOCUMENT_CORPUS_NAMESPACE, SDW_META_NAMESPACE,
   SDW_QUERY_HISTORY_NAMESPACE, SDW_VECTOR_MEMORY_NAMESPACE, SDW_WORKING_STATE_NAMESPACE]);
 export type SdwJournalName = "generation" | "plan.json" | "receipt.bin" |

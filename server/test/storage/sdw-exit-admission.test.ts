@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fork, type ChildProcess } from "node:child_process";
+import { spawn, fork, execFile, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { lstat, readFile, readdir, writeFile, mkdir } from "node:fs/promises";
+import { lstat, readFile, readdir, writeFile, mkdir, chmod, symlink, readlink } from "node:fs/promises";
 import { join } from "node:path";
 import { createSdwFenceFixture, sdwDeferred } from "./sdw-journal-fixtures.js";
 import {
@@ -9,7 +9,7 @@ import {
   EXIT_ADMISSION_LOCK_FILE, EXIT_ADMISSION_LOCK_TIMEOUT_MS, SDW_ROTATION_JOURNAL_KEY,
   ExitAdmissionLockError, type ExitAdmissionOwner,
 } from "../../src/storage/exit-import-journal.js";
-import { SDW_JOURNAL_NAMESPACES, SdwStorageError } from "../../src/storage/sdw-journal-contract.js";
+import { SDW_JOURNAL_NAMESPACES, SDW_MAX_STAGED_BYTES, SdwStorageError } from "../../src/storage/sdw-journal-contract.js";
 import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
 import { ROTATION_JOURNAL_KEY, withCustodyWriteLock } from "../../src/core/master-custody.js";
 import { isWellFormedExitImportJournalRecord, hasOversizedSnapshotsArray, MAX_EXIT_IMPORT_JOURNAL_LOCATIONS } from "../../src/storage/exit-import-journal-record.js";
@@ -17,11 +17,23 @@ import { STATE_ENVELOPE_PUBLIC_KEYS_KEY, STATE_ENVELOPE_VERSION_ANCHORS_KEY, isR
 import { KNOWN_SIGNERS_NAMESPACE } from "../../src/reputation/known-signers-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
+
+// Mock the named bindings used by production, not the builtin default object.
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn), fork: vi.fn(actual.fork), execFile: vi.fn(actual.execFile) };
+});
+
+vi.mock("../../src/storage/exit-import-journal-record.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/storage/exit-import-journal-record.js")>();
+  return { ...actual, isWellFormedExitImportJournalRecord: vi.fn(actual.isWellFormedExitImportJournalRecord) };
+});
+
 const rigs: Awaited<ReturnType<typeof createSdwFenceFixture>>[] = [];
 const children: ChildProcess[] = [];
 async function rig() { const r = await createSdwFenceFixture(); rigs.push(r); return r; }
 afterEach(async () => {
-  vi.restoreAllMocks();
+  vi.restoreAllMocks(); vi.clearAllMocks();
   await Promise.all(children.splice(0).map(async child => {
     if (child.exitCode !== null || child.signalCode !== null) return;
     const done = new Promise<void>(resolve => child.once("close", () => resolve())); child.kill("SIGKILL"); await done;
@@ -33,6 +45,16 @@ const record = (namespace: string, key = "entry") => ({ import_id: "import", ide
 async function journal(r: Awaited<ReturnType<typeof rig>>, value: unknown) {
   await r.storage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, "import", Buffer.from(JSON.stringify(value)));
 }
+// Snapshot names, modes, ownership and bytes without following a malformed root symlink.
+async function treeSnapshot(path: string): Promise<unknown> {
+  const stat = await lstat(path);
+  const identity = { mode: stat.mode, uid: stat.uid, ino: stat.ino };
+  if (stat.isSymbolicLink()) return { ...identity, target: await readlink(path) };
+  if (!stat.isDirectory()) return { ...identity, bytes: (await readFile(path)).toString("base64") };
+  const names = (await readdir(path)).sort();
+  return { ...identity, children: await Promise.all(names.map(async name => [name, await treeSnapshot(join(path, name))])) };
+}
+
 interface ChildEvent { event: string; namespace?: string; name?: string; reason?: string; status?: string; trace?: string[] }
 function childProbe(root: string, mode: "engine" | "exit", custody = false) {
   const child = fork(fileURLToPath(new URL("./sdw-fence-child.ts", import.meta.url)), [root, mode, "import", custody ? "yes" : "no"],
@@ -59,6 +81,18 @@ function childProbe(root: string, mode: "engine" | "exit", custody = false) {
 }
 
 describe("Exit per-owner SDW admission", () => {
+
+  it("child-process spies record calls through every production named binding", () => {
+    const marker = new Error("named-binding positive control");
+    vi.mocked(spawn).mockImplementationOnce(() => { throw marker; });
+    vi.mocked(fork).mockImplementationOnce(() => { throw marker; });
+    vi.mocked(execFile).mockImplementationOnce(() => { throw marker; });
+    expect(() => spawn("positive-control")).toThrow(marker);
+    expect(() => fork("positive-control")).toThrow(marker);
+    expect(() => execFile("positive-control")).toThrow(marker);
+    for (const childCall of [spawn, fork, execFile]) expect(childCall).toHaveBeenCalledExactlyOnceWith("positive-control");
+  });
+
   it.each(owners)("%s: refuses pending, permits CLEAN/APPLIED/RETIRED", async owner => {
     const r = await rig();
     for (const state of ["BUILDING", "PREPARED", "COMMIT", "INVALID"] as const) {
@@ -112,6 +146,86 @@ describe("Exit per-owner SDW admission", () => {
       await r.publish(state); await journal(r, { malformed: true });
       await expect(withExitAdmissionLock(r.storage, "recovery", async () => "existing Exit checks")).resolves.toBe("existing Exit checks");
     }
+  });
+
+  describe.each(["import", "recovery"] as const)("D1 unobserved root owner=%s", owner => {
+    it.each(["symlink", "regular file", "0755 directory"] as const)("%s refuses plan_invalid/unknown without tree changes", async shape => {
+      const r = await rig();
+      // Admission's existing namespace is outside the SDW probe's creation claim.
+      await mkdir(join(r.root, EXIT_IMPORT_JOURNAL_NAMESPACE), { mode: 0o700 });
+      if (owner === "recovery") await journal(r, { malformed: true });
+      if (shape === "symlink") {
+        const target = join(r.root, "symlink-target");
+        await mkdir(target, { mode: 0o700 });
+        await writeFile(join(target, "sentinel"), "retain", { mode: 0o600 });
+        await symlink(target, r.journal);
+      } else if (shape === "regular file") await writeFile(r.journal, "retain", { mode: 0o600 });
+      else {
+        await mkdir(r.journal, { mode: 0o700 });
+        await chmod(r.journal, 0o755); // Force the invalid mode independently of the runner's umask.
+        await writeFile(join(r.journal, "sentinel"), "retain", { mode: 0o600 });
+      }
+      const before = await treeSnapshot(r.root);
+      const callback = vi.fn(async () => "must not run");
+      await expect(withExitAdmissionLock(r.storage, owner, callback)).rejects.toMatchObject({ reason: "storage_plan_invalid", decision: "unknown" });
+      expect(callback).not.toHaveBeenCalled(); expect(r.counters.observations).toBe(0);
+      expect(await treeSnapshot(r.root)).toEqual(before);
+    });
+  });
+
+  it("D1 missing observer on 0700 root refuses capability_unavailable/unknown without tree changes", async () => {
+    const r = await rig(); await mkdir(r.journal, { mode: 0o700 });
+    await mkdir(join(r.root, EXIT_IMPORT_JOURNAL_NAMESPACE), { mode: 0o700 });
+    const { FilesystemStorage } = await import("../../src/storage/filesystem.js");
+    const before = await treeSnapshot(r.root); const callback = vi.fn(async () => "must not run");
+    await expect(withExitAdmissionLock(new FilesystemStorage(r.root), "import", callback)).rejects.toMatchObject({ reason: "storage_capability_unavailable", decision: "unknown" });
+    expect(callback).not.toHaveBeenCalled(); expect(await treeSnapshot(r.root)).toEqual(before);
+  });
+
+  describe.each(["two entries", "metadata size", "read byte size", "null read", "JSON parse failure", "oversized snapshots"] as const)("W1 classification bound: %s", kind => {
+    it.each(["absent", ...SDW_JOURNAL_NAMESPACES] as const)("root absent or pending namespace=%s", async pending => {
+      const r = await rig();
+      await journal(r, record("notes"));
+      if (kind === "two entries") await r.storage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, "second", Buffer.from(JSON.stringify(record("_sdw_document_corpus"))));
+      if (kind === "JSON parse failure") await r.storage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, "import", Buffer.from("{"));
+      if (kind === "oversized snapshots") await journal(r, {
+        ...record("notes"), snapshots: Array(MAX_EXIT_IMPORT_JOURNAL_LOCATIONS + 1).fill(record("notes").snapshots[0]),
+      });
+      const list = r.storage.list.bind(r.storage);
+      if (kind === "metadata size") vi.spyOn(r.storage, "list").mockImplementation(async ns => {
+        const entries = await list(ns);
+        return ns === EXIT_IMPORT_JOURNAL_NAMESPACE ? entries.map(entry => ({ ...entry, size_bytes: SDW_MAX_STAGED_BYTES + 1 })) : entries;
+      });
+      const read = r.storage.read.bind(r.storage);
+      const reads = vi.spyOn(r.storage, "read").mockImplementation(async (ns, key) => {
+        if (ns === EXIT_IMPORT_JOURNAL_NAMESPACE) {
+          if (kind === "null read") return null;
+          if (kind === "read byte size") {
+            // Report N+1 bytes on a small non-SDW record; no oversized allocation.
+            const bytes = Buffer.from(JSON.stringify(record("notes")));
+            Object.defineProperty(bytes, "byteLength", { value: SDW_MAX_STAGED_BYTES + 1 });
+            return bytes;
+          }
+        }
+        return read(ns, key);
+      });
+      if (pending !== "absent") await r.publish("PREPARED", 1, 1 << SDW_JOURNAL_NAMESPACES.indexOf(pending));
+      const before = await treeSnapshot(r.root);
+      vi.mocked(isWellFormedExitImportJournalRecord).mockClear();
+      const callback = vi.fn(async () => "existing Exit checks");
+      if (pending === "absent") {
+        await expect(withExitAdmissionLock(r.storage, "recovery", callback)).resolves.toBe("existing Exit checks");
+        expect(callback).toHaveBeenCalledTimes(1);
+        await expect(lstat(r.journal)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(r.counters.observations).toBe(0);
+      } else {
+        await expect(withExitAdmissionLock(r.storage, "recovery", callback)).rejects.toMatchObject({ reason: "storage_recovery_pending" });
+        expect(callback).not.toHaveBeenCalled(); expect(r.counters.observations).toBe(1);
+      }
+      if (kind === "two entries" || kind === "metadata size") expect(reads).not.toHaveBeenCalled();
+      if (kind !== "JSON parse failure") expect(isWellFormedExitImportJournalRecord).not.toHaveBeenCalled();
+      expect(r.counters.fences).toBe(0); expect(await treeSnapshot(r.root)).toEqual(before);
+    });
   });
 
   it("shared parser exact field, base64 and full namespace membership parity", () => {
@@ -221,16 +335,15 @@ describe("Exit per-owner SDW admission", () => {
     await expect(withExitAdmissionLock(memory, "import", async () => "unchanged")).resolves.toBe("unchanged");
     const r = await rig(); await mkdir(r.journal, { mode: 0o700 });
     const { FilesystemStorage } = await import("../../src/storage/filesystem.js");
-    await expect(withExitAdmissionLock(new FilesystemStorage(r.root), "import", async () => "untrusted")).rejects.toMatchObject({ reason: "storage_capability_unavailable" });
+    await expect(withExitAdmissionLock(new FilesystemStorage(r.root), "import", async () => "untrusted")).rejects.toMatchObject({ reason: "storage_capability_unavailable", decision: "unknown" });
   });
   it("present-root preflight does not create fence.lock or spawn a process", async () => {
     const r = await rig(); await r.publish("APPLIED");
     const before = await readdir(r.journal);
-    const { default: processTools } = await import("node:child_process");
-    const spawn = vi.spyOn(processTools, "spawn"); const fork = vi.spyOn(processTools, "fork");
+    for (const childCall of [spawn, fork, execFile]) vi.mocked(childCall).mockClear();
     await withExitAdmissionLock(r.storage, "rotate", async () => {});
     expect(await readdir(r.journal)).toEqual(before);
-    expect(r.counters.fences).toBe(0); expect(spawn).not.toHaveBeenCalled(); expect(fork).not.toHaveBeenCalled();
+    expect(r.counters.fences).toBe(0); expect(spawn).not.toHaveBeenCalled(); expect(fork).not.toHaveBeenCalled(); expect(execFile).not.toHaveBeenCalled();
   });
 
 });

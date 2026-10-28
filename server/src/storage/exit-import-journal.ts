@@ -8,9 +8,8 @@
  * cycle). This file has no dependency on cognitive/ or reputation/, so it
  * is safe for both to import.
  *
- * CONTRACT PIN: `EXIT_IMPORT_JOURNAL_NAMESPACE` here is the SAME literal
- * server/src/exit/bundle.ts re-exports under the same name (bundle.ts
- * imports it from here rather than defining its own copy) - "must match"
+ * CONTRACT PIN: `EXIT_IMPORT_JOURNAL_NAMESPACE` is defined once in
+ * storage/cross-process-lock.ts and re-exported here and by exit/bundle.ts - "must match"
  * is enforced by construction, not by two independent literals.
  */
 
@@ -161,15 +160,6 @@ export type ExitAdmissionOwner =
   | "memory_signer_prune";
 
 
-/**
- * Bounded wait before an admission-lock contention fails closed. This
- * bounds how long a CONTENDER waits to acquire, not how long the holder
- * may run - the holder keeps the lock for its whole operation (see the
- * doc comment above); a caller that cannot acquire within this window
- * fails closed rather than waiting indefinitely on a live or crashed
- * holder.
- */
-
 /** Existing owners enter preflight below the acquired admission lock. */
 export async function withExitAdmissionLock<T>(
   storage: StorageBackend,
@@ -212,20 +202,22 @@ async function sdwExitPreflight(storage: StorageBackend, owner: ExitAdmissionOwn
   // A1: lstat is non-creating. In particular, do not call withPathLock on an
   // absent root: its mkdir would turn a clean fortress into partial scaffold.
   const root = join(dirname(filesystem.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE)), SDW_JOURNAL_NAMESPACE);
+  // An unobserved root cannot support a nothing-committed claim, so these
+  // refusals carry unknown and never grant a later consumer discard authority.
   try {
     const stat = await lstat(root);
     if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
-      throw new SdwStorageError("storage_plan_invalid", "none");
+      throw new SdwStorageError("storage_plan_invalid", "unknown");
     }
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
     if (cause instanceof SdwStorageError) throw cause;
-    throw new SdwStorageError("storage_capability_unavailable", "none", undefined, { cause });
+    throw new SdwStorageError("storage_capability_unavailable", "unknown", undefined, { cause });
   }
   const fence = installedSdwFence(storage);
   // Slice 1 installs no production producer/observer. Existing private state
   // requires the engine's authenticated observer; pathname presence grants no trust.
-  if (!fence) throw new SdwStorageError("storage_capability_unavailable", "none");
+  if (!fence) throw new SdwStorageError("storage_capability_unavailable", "unknown");
   await fence.preflight(selected, lease);
 }
 

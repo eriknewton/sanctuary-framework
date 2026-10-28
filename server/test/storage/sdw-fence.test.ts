@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import children from "node:child_process";
+import { spawn, fork, execFile } from "node:child_process";
 import * as locks from "../../src/storage/cross-process-lock.js";
 import { readFile, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -8,13 +8,32 @@ import { withSdwJournalAdmission } from "../../src/storage/exit-import-journal.j
 import { SDW_JOURNAL_NAMESPACES, SdwStorageError, type SdwAdmissionToken } from "../../src/storage/sdw-journal-contract.js";
 import { installSdwFence } from "../../src/storage/sdw-fence.js";
 
+
+// Mock the named bindings used by production, not the builtin default object.
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn), fork: vi.fn(actual.fork), execFile: vi.fn(actual.execFile) };
+});
+
 const NS = SDW_JOURNAL_NAMESPACES[0];
 const rigs: Awaited<ReturnType<typeof createSdwFenceFixture>>[] = [];
 async function rig() { const value = await createSdwFenceFixture(); rigs.push(value); return value; }
-afterEach(async () => { vi.restoreAllMocks(); await Promise.all(rigs.splice(0).map(r => r.cleanup())); });
+afterEach(async () => { vi.restoreAllMocks(); vi.clearAllMocks(); await Promise.all(rigs.splice(0).map(r => r.cleanup())); });
 const refusal = (reason: string, decision = "none") => ({ reason, decision });
 
 describe("SDW injected guard and lifetime model", () => {
+
+  it("child-process spies record calls through every production named binding", () => {
+    const marker = new Error("named-binding positive control");
+    vi.mocked(spawn).mockImplementationOnce(() => { throw marker; });
+    vi.mocked(fork).mockImplementationOnce(() => { throw marker; });
+    vi.mocked(execFile).mockImplementationOnce(() => { throw marker; });
+    expect(() => spawn("positive-control")).toThrow(marker);
+    expect(() => fork("positive-control")).toThrow(marker);
+    expect(() => execFile("positive-control")).toThrow(marker);
+    for (const childCall of [spawn, fork, execFile]) expect(childCall).toHaveBeenCalledExactlyOnceWith("positive-control");
+  });
+
   it("held_scope_observer_refuses", async () => {
     const r = await rig();
     const held = sdwDeferred(); const release = sdwDeferred();
@@ -53,14 +72,14 @@ describe("SDW injected guard and lifetime model", () => {
 
   it("read_retries: exactly three attempts, no lock or child even for 32 concurrent reads", async () => {
     const r = await rig(); await r.publish("CLEAN");
-    const lock = vi.spyOn(locks, "withPathLock"); const spawn = vi.spyOn(children, "spawn"); const fork = vi.spyOn(children, "fork");
+    const lock = vi.spyOn(locks, "withPathLock");
     const read = vi.fn(async () => { await r.publish("CLEAN", read.mock.calls.length + 1); return "discard"; });
     await expect(r.fence.read(NS, read)).rejects.toMatchObject(refusal("storage_busy"));
     expect(read).toHaveBeenCalledTimes(3); expect(r.counters.observations).toBe(6);
     const values = await Promise.all(Array.from({ length: 32 }, () => r.fence.read(NS, async () => "stable")));
     expect(values).toEqual(Array(32).fill("stable"));
     expect(r.counters.observations).toBe(6 + 32 * 2);
-    expect(lock).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled(); expect(fork).not.toHaveBeenCalled();
+    expect(lock).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled(); expect(fork).not.toHaveBeenCalled(); expect(execFile).not.toHaveBeenCalled();
   });
 
   it("a moving read may succeed on the third attempt without retaining prior controls", async () => {
@@ -85,6 +104,42 @@ describe("SDW injected guard and lifetime model", () => {
       return "good";
     });
     const checked = expect(late).rejects.toMatchObject(refusal("storage_scope_invalid")); release.resolve(); await checked;
+  });
+
+  // Regression pins: preserve() already keeps typed error decisions on the base.
+  it.each(["committed", "unknown"] as const)("D2 regression pin: scope keeps post-callback %s observation failure", async decision => {
+    const r = await rig(); await r.publish("CLEAN");
+    const observe = r.port.observe.bind(r.port);
+    const observer = vi.spyOn(r.port, "observe");
+    observer.mockImplementationOnce(observe).mockImplementationOnce(async () => {
+      const observed = await observe();
+      expect(observed.decision).toBe(decision);
+      throw new SdwStorageError("storage_capability_unavailable", observed.decision);
+    });
+    const callback = vi.fn(async () => {
+      await r.publish("COMMIT");
+      if (decision === "unknown") {
+        const observed = JSON.parse(await readFile(r.control, "utf8"));
+        observed.state = "PREPARED"; observed.decision = decision;
+        await writeFile(r.control, JSON.stringify(observed));
+      }
+      return "must not escape";
+    });
+    await expect(r.fence.withReadScope(callback)).rejects.toMatchObject(refusal("storage_capability_unavailable", decision));
+    expect(observer).toHaveBeenCalledTimes(2); expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["committed", "unknown"] as const)("D2 regression pin: scope keeps returned after-sample %s decision", async decision => {
+    const r = await rig(); await r.publish("CLEAN");
+    await expect(r.fence.withReadScope(async () => {
+      await r.publish("COMMIT");
+      if (decision === "unknown") {
+        const observed = JSON.parse(await readFile(r.control, "utf8"));
+        observed.state = "PREPARED"; observed.decision = decision;
+        await writeFile(r.control, JSON.stringify(observed));
+      }
+    })).rejects.toMatchObject(refusal("storage_recovery_pending", decision));
+    expect(r.counters.observations).toBe(2);
   });
 
   it("forged, foreign, closed and detached invocation tokens cannot enter", async () => {

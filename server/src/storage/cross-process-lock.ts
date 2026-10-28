@@ -565,6 +565,19 @@ export async function withRequiredCrossProcessLock<T>(
   );
 }
 
+// Shared by Exit owners and the private SDW admission mint; one lock domain.
+// Must match the re-exports in exit-import-journal.ts and exit/bundle.ts.
+export const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
+export const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
+/**
+ * Bounded wait before an admission-lock contention fails closed. This
+ * bounds how long a CONTENDER waits to acquire, not how long the holder
+ * may run - the holder keeps the lock for its whole operation; a caller
+ * that cannot acquire within this window fails closed rather than waiting
+ * indefinitely on a live or crashed holder.
+ */
+export const EXIT_ADMISSION_LOCK_TIMEOUT_MS = 10_000; // ten seconds to acquire, never holder expiry
+
 /**
  * HIGH-B (Codex gate, 2026-08-22): the SAME contention error a caller sees
  * from withCrossProcessLock/withPathLock, reworded to name the exit-import
@@ -576,11 +589,6 @@ export async function withRequiredCrossProcessLock<T>(
  * different lock mechanism; a different message on the SAME
  * CrossProcessLockError shape, thrown from the SAME no-auto-break path.
  */
-// Shared by Exit owners and the private SDW admission mint; one lock domain.
-export const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
-export const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
-export const EXIT_ADMISSION_LOCK_TIMEOUT_MS = 10_000; // ten seconds to acquire, never holder expiry
-
 export class ExitAdmissionLockError extends Error {
   readonly reason = "storage_busy" as const;
   constructor(message: string) {

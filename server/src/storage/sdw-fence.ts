@@ -6,15 +6,17 @@ import { withPathLock, withCrossProcessLock, CrossProcessLockError, ExitAdmissio
 import { encodeFilesystemStorageName } from "./filesystem-name-codec.js";
 import type { StorageBackend } from "./interface.js";
 
+// Must match the ciphertext import ceiling in sdw/import.ts.
 export const SDW_MAX_STAGED_BYTES = 64 * 1024 * 1024;
 export const SDW_MAX_PENDING_CALLS = 1;
 export const SDW_READ_RETRIES = 2;
 export const SDW_LOCK_WAIT_MS = 10_000;
 export const SDW_JOURNAL_NAMESPACE = "_sdw_journal_v1";
 export const SDW_NAMESPACE_MUTATION_LOCK = ".sdw-mutation.lock";
-// Must match the six constants in sdw/records.ts and the contract's namespace
-// membership schema. sdw-journal-plan.test.ts checks full-set equality. Payload
+// Must match the six constants in sdw/records.ts and journalNamespaces in
+// sdw-journal-contract.ts. sdw-journal-plan.test.ts checks full-set equality. Payload
 // type imports would introduce a storage/custody cycle through Exit admission.
+/** Bit positions in affected_mask, also the canonical epoch/coverage order. */
 export const SDW_JOURNAL_NAMESPACES = Object.freeze([
   "_sdw_catalog", "_sdw_document_corpus", "_sdw_meta",
   "_sdw_query_history", "_sdw_vector_memory", "_sdw_working_state",
@@ -300,18 +302,24 @@ export class SdwFence {
   async withReadScope<T>(operation: () => Promise<T>): Promise<T> {
     if (readScope.getStore() || invocation.getStore()) throw failure("storage_scope_invalid");
     const before = await this.observe();
+    let decision = before.decision;
     this.assertReadable(before, SDW_JOURNAL_NAMESPACES);
     const scope: { fence: SdwFence; open: boolean; pending?: Promise<unknown> } = { fence: this, open: true };
     try {
       const value = await readScope.run(scope, operation);
       // Close immediately on callback return, before any post-observation await.
       scope.open = false;
-      if (scope.pending) throw failure("storage_scope_invalid", before.decision);
+      if (scope.pending) throw failure("storage_scope_invalid", decision);
       const after = await this.observe();
+      // Later failures cannot erase stronger evidence observed by this scope.
+      decision = strongest(decision, after.decision);
       this.assertReadable(after, SDW_JOURNAL_NAMESPACES);
-      if (!this.same(before, after, SDW_JOURNAL_NAMESPACES)) throw failure("storage_busy", after.decision);
+      if (!this.same(before, after, SDW_JOURNAL_NAMESPACES)) throw failure("storage_busy", decision);
       return value;
-    } catch (cause) { throw preserve(cause, before.decision); }
+    } catch (cause) {
+      if (cause instanceof SdwStorageError) decision = strongest(decision, cause.decision);
+      throw preserve(cause, decision);
+    }
     finally { scope.open = false; await scope.pending?.catch(() => {}); }
   }
 
