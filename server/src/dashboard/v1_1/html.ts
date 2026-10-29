@@ -1886,6 +1886,13 @@ body {
   font-family: var(--mono); font-size: 0.92em; overflow-wrap: anywhere;
   padding: 0 4px; border: 1px solid var(--rule); border-radius: 4px; background: var(--surface-2);
 }
+/* Held labels inside buttons use the button's own contrasting paint in either theme. */
+.btn .held-subject { color: inherit; background: transparent; border-color: currentColor; }
+.approval-passage { margin: 0.75rem 0; padding: 0.75rem; border: 1px solid var(--rule); border-radius: 4px; overflow-wrap: anywhere; }
+.approval-passage .held-subject { padding: 0; border: 0; background: transparent; white-space: pre-wrap; }
+.approval-confirm-row { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; margin-top: 1rem; min-width: 0; }
+.approval-confirm-row .btn { max-width: 100%; white-space: normal; flex-wrap: wrap; overflow-wrap: anywhere; }
+.approval-confirm-row p { margin: 0; }
 .approval-table th {
   text-align: left; color: var(--ink-3); font-family: var(--mono);
   font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;

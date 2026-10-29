@@ -17,6 +17,7 @@
  * v1.3 federation introduces a separate surface.
  */
 
+import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { HubExportDeliveryReceiver, HubOneTimeExport } from "./types.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -58,6 +59,7 @@ import {
 } from "./constants.js";
 import {
   HubCapabilityError,
+  HubApprovalRefusalError,
   HubError,
   HubLocalOnlyError,
   HubValidationError,
@@ -451,7 +453,7 @@ export async function handleHubRoute(
         data:
           authAdmission === "loopback_position"
             ? redactApprovalPendingItemsForPositionOnly(items)
-            : { items },
+            : { items, server_now: new Date().toISOString() }, // Must match applyInboxPayload in dashboard/v1_1/client.ts: the server clock owns hold deadlines.
       });
       return true;
     }
@@ -494,11 +496,32 @@ export async function handleHubRoute(
           // Response-only DTO must match HubOneTimeExport in hub/types.ts and consumeOneTimeExport in dashboard/v1_1/client.ts.
           writeJSON(res, 200, { ok: true, data: { item, ...(slot ? { one_time_export: slot } : {}) } });
         }
-      } catch (error) {
+      } catch (caught) {
+        // A malformed typed refusal is replaced below, so the caught value is copied rather than reassigned (no-ex-assign).
+        let error: unknown = caught;
         close();
         if (res.destroyed || res.headersSent) {
           if (!res.destroyed) res.destroy();
           return true;
+        }
+        // Must match HubApprovalRefusalError in errors.ts and approvalRefusalSentence in dashboard/v1_1/client.ts.
+        // Only the dedicated class and validated closed fields cross this boundary; arbitrary exceptions retain the export-key scrub.
+        if ((inboxMatch.action === "approve" || inboxMatch.action === "deny") && error instanceof HubApprovalRefusalError) {
+          const fields = error.refusal;
+          let body: Record<string, unknown> | undefined;
+          if (fields.public_code === "approval_not_found") body = { ok: false, public_code: "approval_not_found" };
+          if (fields.public_code === "approval_expired" && Number.isSafeInteger(fields.expired_after_seconds) && fields.expired_after_seconds >= 0)
+            body = { ok: false, public_code: "approval_expired", expired_after_seconds: fields.expired_after_seconds };
+          if (fields.public_code === "approval_already_decided" && ["human", "timeout", "shutdown"].includes(fields.decided_by) &&
+              typeof fields.decided_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(fields.decided_at) && parseIsoInstantWithOffset(fields.decided_at) !== undefined)
+            body = { ok: false, public_code: "approval_already_decided", decided_at: fields.decided_at, decided_by: fields.decided_by };
+          if (body) {
+            try { writeJSON(res, fields.public_code === "approval_not_found" ? 404 : 409, body); }
+            catch (writeError) { throw scrubbedDecisionError(writeError); }
+            return true;
+          }
+          // Invalid typed metadata is an internal failure; neither its claimed status nor its fields authorize a public refusal.
+          error = new Error("invalid approval refusal");
         }
         const refusal = inboxMatch.action === "approve" ? approvedLiftRefusal(approvalCategory, error) : undefined;
         if (refusal) {

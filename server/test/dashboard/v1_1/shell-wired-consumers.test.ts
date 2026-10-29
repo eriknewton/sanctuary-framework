@@ -761,7 +761,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(calls).toEqual([]);
     html = h.el.main!.innerHTML;
     expect(html).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1"');
-    expect(html).toContain("Confirm state_export");
+    expect(html).toContain("Yes, allow state_export");
     h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "tier1-1" });
     await settle();
     expect(calls).toEqual(["/api/hub/inbox/tier1-1/approve"]);
@@ -3764,9 +3764,9 @@ describe("Approvals round-one decision and evidence states", () => {
     expect(pane).toContain(`<div class="mono">${chip}</div>`);
     expect(pane).toContain(`<h4>What it wants to do</h4><p>Run a Tier 1 operation: ${chip}.</p>`);
     expect(pane).toContain(`<h4>Why it is held</h4><p>Proxied tool ${chip} is configured as Tier 1, so it always asks for approval.</p>`);
-    expect(pane).toContain(`Allow once arms this request, and Confirm ${chip} sends the approval`);
-    expect(pane).toContain(`Tier 1 takes two steps here: Allow once, then Confirm ${chip}. Only Confirm sends the approval.`);
-    expect(pane).toContain(`>Confirm ${chip}</button>`);
+    expect(pane).toContain(`Allow once… arms this request, and Yes, allow ${chip} sends the approval`);
+    expect(pane).toContain(`Tier 1 takes two steps here: Allow once…, then Yes, allow ${chip}. Only Yes, allow sends the approval.`);
+    expect(pane).toContain(`>Yes, allow ${chip}</button>`);
     const queue = approvals.split("<aside")[0]!;
     for (const item of [tier1, tier2, decided]) {
       const row = queue.split(`data-approval-row="${item.item_id}"`)[1]!.split("</tr>")[0]!;
@@ -4124,7 +4124,7 @@ describe("Approvals round-one decision and evidence states", () => {
     await settle();
     h.navigate("approvals");
     const html = drawer(h);
-    expect(html).toContain("Allow once arms this request, and Confirm ");
+    expect(html).toContain("Allow once… arms this request, and Yes, allow ");
     expect(html).not.toContain("Allow once sends this approval");
   });
 
@@ -4151,7 +4151,7 @@ describe("Approvals round-one decision and evidence states", () => {
     expect(drawer(h)).toContain("WAITING");
     expect(drawer(h)).not.toContain('data-action="approval-confirm-tier1-allow"');
     expect((fakeActiveElement as FakeElement).getAttribute("data-action")).toBe("approval-cancel-tier1-allow");
-    expect(drawer(h)).toContain("Only Confirm sends the approval.");
+    expect(drawer(h)).toContain("Only Yes, allow sends the approval.");
   });
 
   for (const mode of ["once", "always", "tier1"]) {

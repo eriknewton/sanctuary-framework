@@ -15,8 +15,11 @@
  * - All gate decisions (approve, deny, allow) are audit-logged.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } from "./types.js";
+import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { HOLD_REASON_SUBJECT_MAX_CHARS } from "../hub/charter-approval-bridge.js";
+import { HUB_APPROVAL_PREVIEW_MAX_FIELDS, HUB_APPROVAL_PASSAGE_MAX_UNITS, type HubApprovalPreviewArg } from "../contracts/v1.1/hub-events.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
 import {
@@ -47,6 +50,64 @@ import {
   type RiskTier,
   type SessionBinding,
 } from "../agent-native/safety-base.js";
+
+// Every allowed operation emits at most two metadata fields and one memory excerpt; subjects use the existing held-subject bound.
+export const OPERATOR_PREVIEW_MAX_FIELDS = HUB_APPROVAL_PREVIEW_MAX_FIELDS;
+// JSON needs at most six ASCII bytes per UTF-16 unit plus 128 bytes per closed field envelope.
+// Preserve the original two-field budget and add only the bounded excerpt plus its envelope; two array brackets finish the bound.
+export const OPERATOR_PREVIEW_MAX_BYTES = (OPERATOR_PREVIEW_MAX_FIELDS - 1) * (6 * HOLD_REASON_SUBJECT_MAX_CHARS + 128) + 2
+  + 6 * HUB_APPROVAL_PASSAGE_MAX_UNITS + 128;
+
+/** Build bounded operator display data from a closed per-operation field table, before summary truncation. */
+export function buildOperatorPreview(operation: string, args: Record<string, unknown>): HubApprovalPreviewArg[] | undefined {
+  const fields: HubApprovalPreviewArg[] = [];
+  const subject = (field: "namespace" | "format" | "identity_id" | "type" | "destination_host", value: unknown) => {
+    if (typeof value !== "string") return;
+    // Identifiers are untrusted display data, not authority; the client must delimit and escape them as held subjects.
+    fields.push({ kind: "subject", field, value: value.slice(0, HOLD_REASON_SUBJECT_MAX_CHARS),
+      // Must match HubApprovalPreviewArg.subject in contracts/v1.1/hub-events.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
+      truncated: value.length > HOLD_REASON_SUBJECT_MAX_CHARS });
+  };
+  const count = (kind: "byte_count" | "item_count", field: "memory" | "tags", value: unknown) => {
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) fields.push({ kind, field, value });
+  };
+  // Secret-named keys are never consulted: this exhaustive table reads only the named schema inputs.
+  switch (operation) {
+    case "memory_insert":
+      count("byte_count", "memory", typeof args.text === "string" ? Buffer.byteLength(args.text, "utf8") : args.text_bytes);
+      count("item_count", "tags", Array.isArray(args.tags) ? args.tags.length : args.tag_count);
+      if (typeof args.text === "string") {
+        let end = Math.min(args.text.length, HUB_APPROVAL_PASSAGE_MAX_UNITS);
+        // A supplementary code point straddling the cap must remain whole, never a dangling high surrogate.
+        if (end && args.text.codePointAt(end - 1)! > 0xffff) end--;
+        // passage_excerpt must match types.ts, contracts/v1.1/hub-events.ts and dashboard/v1_1/client.ts; only the schema's text argument is read.
+        fields.push({ kind: "passage_excerpt", field: "memory", value: args.text.slice(0, end), truncated: end < args.text.length });
+      }
+      break;
+    case "state_export": subject("namespace", args.namespace); subject("format", args.format); break;
+    case "reputation_export":
+    case "sanctuary_export_identity_bundle": subject("identity_id", args.identity_id); break;
+    case "reputation_publish":
+      subject("type", args.type);
+      // Only an explicitly supplied host is knowable here; server configuration may override the default destination.
+      if (typeof args.verascore_url === "string") {
+        try { subject("destination_host", new URL(args.verascore_url).hostname); } catch { /* Invalid destinations get no invented host. */ }
+      }
+      break;
+    case "identity_sign":
+      if (typeof args.payload === "string") {
+        // Uses the exact core/encoding.ts functions and fallback used by identity_sign in cognitive/tools.ts.
+        let bytes: Uint8Array;
+        try { bytes = fromBase64url(args.payload); } catch { bytes = stringToBytes(args.payload); }
+        fields.push({ kind: "byte_count", field: "payload", value: bytes.byteLength },
+          { kind: "digest12", field: "payload", value: createHash("sha256").update(bytes).digest("hex").slice(0, 12) }); // 12 hex = 48 display bits, never verification evidence.
+      }
+      break;
+    default: return undefined;
+  }
+  // Must match ApprovalRequest.operator_preview in types.ts and HubApprovalPendingItem in contracts/v1.1/hub-events.ts.
+  return fields.length ? fields : undefined;
+}
 
 /** Callback invoked when an injection is detected, for dashboard broadcasting */
 export type InjectionAlertCallback = (alert: {
@@ -240,7 +301,9 @@ export class ApprovalGate {
   async evaluate(
     toolName: string,
     args: Record<string, unknown>,
-    approval?: { approval_ref: string }
+    approval?: { approval_ref: string },
+    // Must match router.ts's server-owned operatorPreviewSource handoff. It supplies display data only, never enforcement evidence.
+    operatorPreviewSource?: { operation: string; args: Record<string, unknown> }
   ): Promise<GateResult> {
     const operation = extractOperationName(toolName);
 
@@ -350,7 +413,7 @@ export class ApprovalGate {
             },
           },
           undefined,
-          this.buildRequestBinding(operation, args)
+          this.buildRequestBinding(operation, args, operatorPreviewSource)
         );
       }
     }
@@ -364,7 +427,7 @@ export class ApprovalGate {
             operation: toolName,
             proxy: true,
             args_summary: this.summarizeArgs(args),
-          }, undefined, this.buildRequestBinding(operation, args));
+          }, undefined, this.buildRequestBinding(operation, args, operatorPreviewSource));
         }
 
         if (proxyTier === 2) {
@@ -374,7 +437,7 @@ export class ApprovalGate {
             return this.requestApproval(operation, 2, `Proxy: ${anomaly.reason}`, {
               ...anomaly.context,
               proxy: true,
-            }, anomaly.commit, this.buildRequestBinding(operation, args));
+            }, anomaly.commit, this.buildRequestBinding(operation, args, operatorPreviewSource));
           }
         }
 
@@ -417,7 +480,7 @@ export class ApprovalGate {
     // approval settled both — violating Invariant #3 (irreversible op
     // requires human approval of THAT op). The binding splits them into two
     // cards / two waiters so each is decided independently.
-    const requestBinding = this.buildRequestBinding(operation, args);
+    const requestBinding = this.buildRequestBinding(operation, args, operatorPreviewSource);
 
     // ── Tier 1: Always requires approval ──────────────────────────────
     if (classification.tier === 1) {
@@ -829,7 +892,7 @@ export class ApprovalGate {
     // the argless escalation paths (e.g. injection-escalate) keep their
     // historic `<timestamp>:<operation>` key. `targetResource` is
     // display-only (operator card disambiguation).
-    binding?: { argsHash: string; targetResource?: string }
+    binding?: { argsHash: string; targetResource?: string; operator_preview?: HubApprovalPreviewArg[] }
   ): Promise<GateResult> {
     const requestTimestamp = new Date().toISOString();
     const requestingAgentId = this.requestingAgentId();
@@ -844,6 +907,13 @@ export class ApprovalGate {
       // stand in for it; see requestingAgentId() for where the value comes from.
       ...(requestingAgentId ? { requesting_agent_id: requestingAgentId } : {}),
     };
+
+    if (binding?.operator_preview) {
+      // Non-enumerability keeps excerpts out of generic request serialization; the dashboard reads the property explicitly.
+      // Must match ApprovalRequest.operator_preview in types.ts and charterApprovalRecord in dashboard.ts.
+      Object.defineProperty(request, "operator_preview", { value: binding.operator_preview, configurable: true,
+        enumerable: !binding.operator_preview.some(arg => arg.kind === "passage_excerpt") });
+    }
 
     // Fire `requested` lifecycle to the aggregator before the channel
     // round-trip. The correlation_id pins the resolution to the same
@@ -1047,15 +1117,21 @@ export class ApprovalGate {
    */
   private buildRequestBinding(
     operation: string,
-    args: Record<string, unknown>
-  ): { argsHash: string; targetResource?: string } {
+    args: Record<string, unknown>,
+    operatorPreviewSource?: { operation: string; args: Record<string, unknown> }
+  ): { argsHash: string; targetResource?: string; operator_preview?: HubApprovalPreviewArg[] } {
     let targetResource: string | undefined;
     try {
       targetResource = deriveTargetResource(operation, args);
     } catch {
       targetResource = undefined;
     }
-    return { argsHash: normalizedArgsHash(args), targetResource };
+    // Raw handoff data is consumed only by the closed preview builder, never summarized, audited, bound into proofs or returned to the agent.
+    // Only memory_insert needs raw text; every other preview retains its existing projected-argument behavior.
+    const preview = operatorPreviewSource?.operation === "memory_insert" && operation === "memory_insert"
+      ? buildOperatorPreview("memory_insert", operatorPreviewSource.args)
+      : buildOperatorPreview(operation, args);
+    return { argsHash: normalizedArgsHash(args), targetResource, operator_preview: preview };
   }
 
   /** Get the baseline tracker for saving at session end */

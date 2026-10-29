@@ -432,6 +432,7 @@ describe("dashboard bounded independent hydration", () => {
     const sovereigntyBody = () => ({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } });
     const homeBody = () => ({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 }, agents: [] });
     const h = harness({
+      "/api/health": () => Promise.reject(new Error("offline")),
       "/api/sovereignty": () => { sovereigntyReads += 1; return response(sovereigntyBody()); },
       "/api/posture/home": () => { homeReads += 1; return response(homeBody()); },
     }, "/api/hub", { topbar: true });
@@ -475,6 +476,7 @@ describe("dashboard bounded independent hydration", () => {
       agents: [],
     });
     const h = harness({
+      "/api/health": () => Promise.reject(new Error("offline")),
       "/api/sovereignty": () => { sovereigntyReads += 1; return response(sovereigntyBody()); },
       "/api/posture/home": () => { homeReads += 1; return response(homeBody()); },
     }, "/api/hub", { topbar: true });
@@ -520,12 +522,14 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.main.innerHTML).toContain("Retry Anomaly findings");
     runInContext('state.route = "agents"; rerender()', h.context); expect(h.main.innerHTML).not.toContain("Anomaly findings");
   });
-  it("a hung stream session exchange starts bounded fallback at its deadline", async () => {
+  it("a hung stream session exchange retries through stream backoff at its deadline", async () => {
     vi.useFakeTimers(); const h = harness({ "/auth/session": pending }); await settle();
     const before = h.calls.filter(path => path === "/api/posture/home").length;
     runInContext('TOKEN = "fixture"; connectStream()', h.context);
     await vi.advanceTimersByTimeAsync(DEADLINE_MS * 2);
     expect(h.calls.filter(path => path === "/api/posture/home").length).toBe(before + 1);
+    expect(runInContext("pollingStarted", h.context)).toBe(false);
+    expect(h.calls.filter(path => path === "/auth/session")).toHaveLength(2);
   });
   it("stream-triggered rule failure is contained by the panel loader", async () => {
     vi.useFakeTimers(); const h = harness(); await settle();
@@ -687,12 +691,16 @@ describe("D5 closure", () => {
     expect(h.streams.length).toBe(before + 1); expect(h.main.innerHTML).not.toContain("Live updates stopped");
     expect(h.fortress.innerHTML).toContain("Nothing waiting on you");
   });
-  it("stops reconnecting when every reopened stream fails before a frame even if reads succeed", async () => {
+  it("uses a slow probe after fast retries exhaust even when panel reads succeed", async () => {
     vi.useFakeTimers(); const h = harness(); await settle(); const first = h.streams.length;
-    for (let i = 0; i < 6; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(60_000); await settle(); }
-    expect(h.streams.length).toBeLessThanOrEqual(first + 5);
+    for (let i = 0; i < 5; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(1000 * 2 ** i); await settle(); }
+    h.streams.at(-1)!.onerror!();
+    expect(h.streams.length).toBe(first + 5);
     expect(h.main.innerHTML).toContain("Live updates stopped");
     expect(h.main.innerHTML).toContain(">Retry</button>");
+    await vi.advanceTimersByTimeAsync(30_000); await settle();
+    expect(h.streams.length).toBe(first + 6);
+    expect(h.main.innerHTML).not.toContain("Live updates stopped");
   });
   it.each(["approval", "inbox", "reconnect", "polling"])("%s queues a fresh read behind an older read", async trigger => {
     vi.useFakeTimers(); let reads = 0; let pollingBoot = trigger === "polling"; let old!: (value: unknown) => void; let fresh!: (value: unknown) => void;
@@ -782,7 +790,7 @@ describe("D5 closure", () => {
   });
   it("Retry clears stopped-update text from saved filters and policy views", async () => {
     vi.useFakeTimers(); const h = harness(); await settle();
-    for (let i = 0; i < 6; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(60_000); }
+    runInContext("stopLiveUpdates()", h.context);
     expect(h.main.innerHTML).toContain("Live updates stopped");
     h.retry(); await settle();
     for (const route of ["activity", "policy", "posture", "agents", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill"]) {

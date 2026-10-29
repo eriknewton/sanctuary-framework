@@ -291,3 +291,15 @@ describe("layout rules the slice holds", () => {
     expect(buttonRule.get("white-space")).toBe("nowrap");
   });
 });
+
+it('held-subject text inside a primary button computes at least 4.5:1 in both themes', () => {
+  const primary = declsOf('.btn.btn-primary');
+  const subject = declsOf('.held-subject');
+  const override = declsOf('.btn .held-subject');
+  for (const theme of ['light', 'dark'] as const) {
+    const foreground = tokenOf(primary.get('color')! )!;
+    const backgroundValue = override.get('background') ?? subject.get('background')!;
+    const background = tokenOf(backgroundValue === 'transparent' ? primary.get('background')! : backgroundValue)!;
+    expect(contrast(tokens[theme][foreground]!, tokens[theme][background]!), theme).toBeGreaterThanOrEqual(4.5);
+  }
+});

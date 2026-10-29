@@ -19,6 +19,7 @@
  * - Agent cannot access the dashboard (it runs outside MCP stdin/stdout)
  */
 
+import { parseIsoInstantWithOffset } from "../core/time.js";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { readFile } from "node:fs/promises";
@@ -445,7 +446,14 @@ export interface DashboardConfig {
   shutdown_grace_ms?: number;
 }
 
+// 256 recent outcomes cover a busy operator retry window without retaining request-volume history.
+export const APPROVAL_CLOSED_LIMIT = 256;
+// Ten minutes allows delayed dashboard retries; older decisions must not remain indefinitely.
+export const APPROVAL_CLOSED_TTL_MS = 10 * 60 * 1000;
+
 interface PendingRequest {
+  /** Must match CharterApprovalRecord.expires_at in hub/charter-approval-bridge.ts. */
+  expires_at: string;
   id: string;
   request: ApprovalRequest;
   resolve: (response: ApprovalResponse) => void;
@@ -476,6 +484,10 @@ function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
     operation: pending.request.operation,
     tier: pending.request.tier,
     created_at: pending.created_at,
+    // Must match CharterApprovalRecord and HubApprovalPendingItem.expires_at in hub/charter-approval-bridge.ts and contracts/v1.1/hub-events.ts.
+    expires_at: pending.expires_at,
+    // Must match ApprovalRequest.operator_preview in principal-policy/types.ts and CharterApprovalRecord in hub/charter-approval-bridge.ts.
+    ...(pending.request.operator_preview ? { operator_preview: pending.request.operator_preview } : {}),
     ...(typeof requestingAgentId === "string" && requestingAgentId.length > 0
       ? { requesting_agent_id: requestingAgentId }
       : {}),
@@ -570,6 +582,10 @@ function dashboardActivityFromAuditEntry(data: unknown): Record<string, unknown>
   };
 }
 
+// 16 random bytes provide a 128-bit process identity; minted once per module load, never per connection or channel restart.
+// server_boot_id must match observeServerBoot in dashboard/v1_1/client.ts.
+const DASHBOARD_PROCESS_BOOT_ID = randomBytes(16).toString("hex");
+
 function dashboardStreamEventForLegacyEvent(
   event: string,
   data: unknown,
@@ -581,6 +597,15 @@ function dashboardStreamEventForLegacyEvent(
     case "inbox":
     case "agent_status":
       return { event, data };
+    case "request-resolved": {
+      const id = (data as { request_id?: unknown })?.request_id;
+      // Closed attribution must match confirmApprovalClose in dashboard/v1_1/client.ts; a human close is not evidence of a timeout denial.
+      const close = data as { decision?: unknown; decided_by?: unknown };
+      return typeof id === "string" ? { event: "approval", data: { id, resolved: true,
+        ...(close.decision === "approve" || close.decision === "deny" ? { decision: close.decision } : {}),
+        ...(close.decided_by === "human" || close.decided_by === "timeout" ? { decided_by: close.decided_by } : {}),
+      } } : null;
+    }
     case "pending-request": {
       const approval = dashboardApprovalFromPendingRequest(data);
       return approval ? { event: "approval", data: approval } : null;
@@ -1009,6 +1034,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private readonly readFlightMap: DashboardReadFlightMap =
     createDashboardReadFlightMap();
   private pending: Map<string, PendingRequest> = new Map();
+  private closedHolds = new Map<string, import("../hub/charter-approval-bridge.js").ClosedCharterApproval>();
+
+  /** Must match CharterApprovalBridge.closed in hub/charter-approval-bridge.ts; lookup never reopens a hold. */
+  closedApproval(id: string): import("../hub/charter-approval-bridge.js").ClosedCharterApproval | null {
+    this.pruneClosedApprovals();
+    return this.closedHolds.get(id) ?? null;
+  }
+
+  private pruneClosedApprovals(): void {
+    // This scans every entry; rememberClosedApproval, the only writer, caps the map at APPROVAL_CLOSED_LIMIT (at most that many plus one during insertion).
+    const cutoff = Date.now() - APPROVAL_CLOSED_TTL_MS;
+    for (const [id, closed] of this.closedHolds) {
+      if ((parseIsoInstantWithOffset(closed.decided_at) ?? 0) <= cutoff) this.closedHolds.delete(id);
+    }
+  }
+
+  private rememberClosedApproval(id: string, decision: "approve" | "deny", decided_by: "timeout" | "human" | "shutdown", decided_at: string): void {
+    this.pruneClosedApprovals();
+    // expired_after_seconds is the configured approval budget, not measured elapsed time when a delayed callback runs.
+    this.closedHolds.set(id, { decision, decided_by, decided_at, expired_after_seconds: this.config.timeout_seconds });
+    // Oldest insertion is evicted; caller-driven closes can never grow this map past the fixed cap.
+    while (this.closedHolds.size > APPROVAL_CLOSED_LIMIT) this.closedHolds.delete(this.closedHolds.keys().next().value!);
+  }
   private sseClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
   private dashboardStreamClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
   private httpServer:
@@ -1665,6 +1713,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     bindings?.hubService.setCharterApprovalBridge({
       list: (limit) => this.listCharterApprovals(limit),
       get: (approvalId) => this.getCharterApproval(approvalId),
+      closed: (approvalId) => this.closedApproval(approvalId),
       resolve: (approvalId, decision) =>
         this.resolveApprovalDecision(approvalId, decision),
     });
@@ -5796,12 +5845,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   private async stopHttpServer(): Promise<void> {
-    // Clear all pending requests
+    // Shutdown denies pending requests and closes streams without a resolution frame; only human/timeout closes emit one.
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
+      const decided_at = new Date().toISOString();
+      this.rememberClosedApproval(pending.id, "deny", "shutdown", decided_at);
       pending.resolve({
         decision: "deny",
-        decided_at: new Date().toISOString(),
+        decided_at,
         decided_by: "auto",
       });
     }
@@ -5855,30 +5906,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     );
 
     return new Promise<ApprovalResponse>((resolve) => {
-      // Set up timeout
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        const response: ApprovalResponse = {
-          // SEC-002: Timeout ALWAYS denies. No configuration can change this.
-          decision: "deny",
-          decided_at: new Date().toISOString(),
-          decided_by: "timeout",
-        };
-        this.broadcastSSE("request-resolved", {
-          request_id: id,
-          decision: response.decision,
-          decided_by: "timeout",
-        });
-        resolve(response);
-      }, this.config.timeout_seconds * 1000);
-
+      // Stamp before scheduling so timer delivery cannot precede the published deadline.
+      const createdMs = Date.now();
+      const created_at = new Date(createdMs).toISOString();
+      const timer = setTimeout(() => this.expireApproval(id), this.config.timeout_seconds * 1000);
       // Store the pending request
       const pending: PendingRequest = {
         id,
         request,
         resolve,
         timer,
-        created_at: new Date().toISOString(),
+        created_at,
+        expires_at: new Date(createdMs + this.config.timeout_seconds * 1000).toISOString(),
       };
       this.pending.set(id, pending);
 
@@ -8206,7 +8245,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const visibleSnapshot = authAdmission === "loopback_position"
           ? redactPendingApprovalsForPositionOnly(snapshot)
           : snapshot;
-        res.write(`event: snapshot\ndata: ${JSON.stringify(visibleSnapshot)}\n\n`);
+        res.write(`event: snapshot\ndata: ${JSON.stringify({ ...visibleSnapshot, server_boot_id: DASHBOARD_PROCESS_BOOT_ID })}\n\n`);
 
         this.dashboardStreamClients.set(res, authAdmission);
         const cleanup = (): void => {
@@ -8651,6 +8690,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
   }
 
+  /** Deny a hold at its server-owned deadline even if the timer callback is delayed. */
+  private expireApproval(id: string): void {
+    // This and resolveApprovalDecision are synchronous; deleting pending before resolve prevents their close paths from interleaving.
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pending.delete(id);
+    const response: ApprovalResponse = { decision: "deny", decided_by: "timeout", decided_at: new Date().toISOString() };
+    this.rememberClosedApproval(id, "deny", "timeout", response.decided_at);
+    process.stderr.write(`[Sanctuary] Approval for ${pending.request.operation} expired after ${this.config.timeout_seconds}s and was denied\n`);
+    this.broadcastSSE("request-resolved", { request_id: id, decision: "deny", decided_by: "timeout" });
+    pending.resolve(response);
+  }
+
   /**
    * Apply an operator decision to one live Charter hold, with no HTTP shape
    * attached. This is the ONE place a decision is applied, so every operator
@@ -8672,6 +8725,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   ): boolean {
     const pending = this.pending.get(id);
     if (!pending) return false;
+    // Continuing paths: only a live pre-deadline hold may approve or deny as human; delayed timers never extend consent.
+    if (Date.now() >= (parseIsoInstantWithOffset(pending.expires_at) ?? 0)) { this.expireApproval(id); return false; }
 
     // Clear timeout
     clearTimeout(pending.timer);
@@ -8686,6 +8741,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       decided_by: "human",
     };
 
+    this.rememberClosedApproval(id, decision, "human", response.decided_at);
     // Broadcast resolution to all dashboards
     this.broadcastSSE("request-resolved", {
       request_id: id,
@@ -9168,7 +9224,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (event === "inbox" || event === "agent_status") {
       return this.redactDashboardStreamDataForAdmission({ event, data }, authAdmission);
     }
-    if (event === "pending-request") {
+    if (event === "pending-request" || event === "request-resolved") {
       return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
     }
     if (event === "snapshot") {
@@ -9186,7 +9242,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       case "snapshot":
         return redactPendingApprovalsFromSnapshotPayload(dashboardEvent.data);
       case "approval":
-        return pendingApprovalsRedactedMarker(this.pendingApprovalRedactionCount());
+        return pendingApprovalsRedactedMarker(
+          this.pendingApprovalRedactionCount(),
+        );
       case "inbox":
         // Position-only admission sees approval traffic as a count marker. The marker is an invalidation the client
         // follows with a filtered refetch at once; a resolution frame must not announce a pending approval.

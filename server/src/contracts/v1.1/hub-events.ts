@@ -99,11 +99,29 @@ export interface HubInboxItemHeader {
   resolved_at?: string;
 }
 
+/** Two metadata fields plus one optional memory excerpt cover every closed preview operation; must match the producer bound in principal-policy/gate.ts and consumer in dashboard/v1_1/client.ts. */
+export const HUB_APPROVAL_PREVIEW_MAX_FIELDS = 3;
+/** 600 UTF-16 units are about eight lines of the card at its width; must match passage_excerpt in principal-policy/gate.ts and dashboard/v1_1/client.ts. */
+export const HUB_APPROVAL_PASSAGE_MAX_UNITS = 600;
+
+/** Operator-only, closed preview arguments; must match buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts. */
+export type HubApprovalPreviewArg =
+  | { kind: "byte_count" | "item_count"; field: "memory" | "tags" | "payload"; value: number }
+  // truncated must match the subject producer in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
+  | { kind: "subject"; field: "namespace" | "format" | "identity_id" | "type" | "destination_host"; value: string; truncated?: boolean }
+  | { kind: "digest12"; field: "payload"; value: string }
+  // passage_excerpt must match ApprovalRequest in principal-policy/types.ts, buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts.
+  | { kind: "passage_excerpt"; field: "memory"; value: string; truncated: boolean };
+
 /**
  * A pending Tier 1 or Tier 2 approval surfaced to the operator inbox.
  */
 export interface HubApprovalPendingItem extends HubInboxItemHeader {
   kind: "approval_pending";
+  /** Must match CharterApprovalRecord.expires_at in hub/charter-approval-bridge.ts and approvalExpired in dashboard/v1_1/client.ts. */
+  expires_at?: string;
+  /** Must match ApprovalRequest.operator_preview in principal-policy/types.ts and CharterApprovalRecord.operator_preview in hub/charter-approval-bridge.ts. */
+  operator_preview?: HubApprovalPreviewArg[];
   /** Policy tier the underlying operation falls under. */
   tier: "tier1" | "tier2";
   /**

@@ -219,14 +219,15 @@ describe("company-brain wiring: memory_insert body is redacted from the approval
 
     // Mirror src/router.ts: approvalTargetArgs runs first, then the gate sees
     // ONLY the projected args.
-    const gateArgs = insert.approvalTargetArgs!({
-      text: SECRET_BODY,
-      taint: "user_content",
-      tags: ["meeting"],
-    });
-    await gate.evaluate("memory_insert", gateArgs);
+    const handlerArgs = { text: SECRET_BODY, taint: "user_content", tags: ["meeting"] };
+    const gateArgs = insert.approvalTargetArgs!(handlerArgs);
+    // The router supplies the original validated text only through its separate operator-preview input.
+    expect(JSON.stringify(gateArgs)).not.toContain(SECRET_BODY);
+
+    await gate.evaluate("memory_insert", gateArgs, undefined, { operation: insert.name, args: handlerArgs });
 
     expect(captured).toBeDefined();
+    expect(captured!.operator_preview).toContainEqual({ kind: "passage_excerpt", field: "memory", value: SECRET_BODY, truncated: false });
     const serialized = JSON.stringify(captured);
     // The full body must appear NOWHERE in the outbound approval request,
     // including the truncated-to-100-chars summarizeArgs path.
