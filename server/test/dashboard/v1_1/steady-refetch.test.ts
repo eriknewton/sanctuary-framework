@@ -3,7 +3,7 @@
  * visible read failures, and teardown across stream and page transitions.
  * D7
  */
-// fail-before-exempt: regression guard for behaviour that already shipped; these late-fulfil cases pass on both revisions by design and pin the refusal of a superseded steady response.
+// fail-before-exempt: regression guard for behaviour that already shipped; the stop and in-flight cases now make the health probe offline and count only hub reads, because a stopped page keeps one bounded recovery probe on /api/health; the late-fulfil cases still pass on both revisions by design and pin the refusal of a superseded steady response.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";

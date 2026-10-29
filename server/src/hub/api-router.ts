@@ -496,7 +496,9 @@ export async function handleHubRoute(
           // Response-only DTO must match HubOneTimeExport in hub/types.ts and consumeOneTimeExport in dashboard/v1_1/client.ts.
           writeJSON(res, 200, { ok: true, data: { item, ...(slot ? { one_time_export: slot } : {}) } });
         }
-      } catch (error) {
+      } catch (caught) {
+        // A malformed typed refusal is replaced below, so the caught value is copied rather than reassigned (no-ex-assign).
+        let error: unknown = caught;
         close();
         if (res.destroyed || res.headersSent) {
           if (!res.destroyed) res.destroy();
