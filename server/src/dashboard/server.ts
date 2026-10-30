@@ -14,6 +14,7 @@
  * stays exported (pinned public surface + test anchors).
  */
 
+import { createPosturePanelStore } from "../principal-policy/panel-producer.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type {
@@ -193,12 +194,14 @@ export async function startDashboardServer(
   // request (the deps object below is rebuilt per request, so the map must
   // live here to make concurrent reads join one producer).
   const readFlightMap = createDashboardReadFlightMap();
+  const panelStore = createPosturePanelStore();
 
   const server: Server = createServer(async (req, res) => {
     try {
       const deps = {
         sources: options.sources,
         readFlightMap,
+        panelStore,
         authToken: options.authToken,
         sessions: sessionStore,
         approvals: options.approvals,

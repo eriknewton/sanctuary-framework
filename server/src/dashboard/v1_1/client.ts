@@ -28,6 +28,7 @@
  */
 
 import { HUB_APPROVAL_PREVIEW_MAX_FIELDS, HUB_APPROVAL_PASSAGE_MAX_UNITS } from "../../contracts/v1.1/hub-events.js";
+import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "../../principal-policy/posture-home-types.js";
 import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
@@ -80,40 +81,7 @@ const CLIENT_SCRIPT = String.raw`
 // Must match parseIsoInstantWithOffset in server/src/core/time.ts: dashboard
 // freshness is a protection claim, so offset-less or normalised timestamps
 // fail toward stale/unknown instead of borrowing the browser's local zone.
-function parseEvidenceTimestamp(value) {
-  if (typeof value !== "string") return undefined;
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
-  if (match === null) return undefined;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const writtenMs = Number((match[7] || "").padEnd(3, "0").slice(0, 3));
-  const offsetSign = match[8];
-  const offsetHours = offsetSign ? Number(match[9]) : 0;
-  const offsetMinutes = offsetSign ? Number(match[10]) : 0;
-  // Mirrors the server predicate's finite Date.parse refusal for in-shape but out-of-range offsets.
-  if (offsetHours > 23 || offsetMinutes > 59) return undefined;
-  const offsetMs = (offsetSign === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60 * 1000;
-  const wall = new Date(0);
-  // Set year/month/day together so years 0000..0099 stay proleptic instead of remapping through 1900..1999.
-  wall.setUTCFullYear(year, month - 1, day);
-  wall.setUTCHours(hour, minute, second, writtenMs);
-  const timestamp = wall.getTime() - offsetMs;
-  if (!Number.isFinite(timestamp)) return undefined;
-  const rendered = new Date(timestamp + offsetMs);
-  const calendarFieldsMatch =
-    rendered.getUTCFullYear() === year &&
-    rendered.getUTCMonth() + 1 === month &&
-    rendered.getUTCDate() === day &&
-    rendered.getUTCHours() === hour &&
-    rendered.getUTCMinutes() === minute &&
-    rendered.getUTCSeconds() === second &&
-    rendered.getUTCMilliseconds() === writtenMs;
-  return calendarFieldsMatch ? timestamp : undefined;
-}
+${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
 
 // ── Config ─────────────────────────────────────────────────────────────
 const cfgEl = document.getElementById("dashboard-config");
@@ -135,7 +103,8 @@ const URL_SESSION = (function () {
 // minutes is only an upper bound here; if the payload supplies a smaller
 // window, the smaller window wins. Missing, malformed, or non-positive
 // freshness windows are unknown, never silently widened to this maximum.
-const SEAL_FRESHNESS_MAX_MS = 10 * 60 * 1000;
+const SEAL_FRESHNESS_MAX_MS = ${AUDIT_CHAIN_VERIFIED_MAX_AGE_MS};
+// Must match AUDIT_CHAIN_VERIFIED_MAX_AGE_MS in posture-home-types.ts and both posture HTML renderers.
 // Must match windowEnd in buildAuditDigest (principal-policy/posture.ts): the verdict and window end share a build.
 const AUDIT_CHAIN_VERIFIED_MAX_AGE_MS = SEAL_FRESHNESS_MAX_MS;
 const sealFreshnessTimers = new Map();
@@ -259,6 +228,7 @@ function validateReadBody(key, body) {
   if (key === readKey(HUB + "/recognition/did-web") && typeof data.configured !== "boolean") return false;
   if (key === readKey(HUB + "/intelligence/status") && !Array.isArray(data.surfaces)) return false;
   if (key === readKey("/api/posture/home") && (!body.castle_wall || !Array.isArray(body.agents) || !body.digest)) return false;
+  if (key === readKey("/api/posture/home") && body.panels !== undefined && (!body.panels || typeof body.panels !== "object" || Array.isArray(body.panels))) return false;
   if (key === readKey("/api/posture/evidence") && (!Array.isArray(body.entries) || !Array.isArray(body.integrity_findings))) return false;
   if (key === readKey("/api/sovereignty") && (!body.live_enforcement || typeof body.live_enforcement !== "object")) return false;
   return true;
@@ -2229,7 +2199,7 @@ function renderAgentsList() {
     overviewTile("Protected of detected", count(protectedCount, denominator), escHtml("Current per-agent enforcement evidence required · posture read " + (loadedSourceReadAge("/api/posture/home") || "Unknown")), "#agents?state=active") +
     overviewTile("Ownerless", count(loaded ? state.agents.filter(function (a) { return !a.identity_id; }).length : null, total), escHtml("Of loaded registered agents; detected-only ownership Unknown · " + rosterAge), "#agents?state=ownerless") +
     overviewTile("At risk", overviewChip("unknown", "Not evaluated"), escHtml("Risk evaluation not served for " + (total === null ? "Unknown" : total) + " registered agents · " + rosterAge), "#agents");
-  if (!loaded) return '<h1>Agents</h1><div class="agents-tiles">' + tiles + '</div>' + renderOverviewAgentsTable();
+  if (!loaded) return '<h1>Agents</h1><div class="agents-tiles">' + posturePanelContent(home, "unwrapped", tiles) + '</div>' + renderOverviewAgentsTable();
   const filters = state.agentInventory;
   const rows = state.agents.filter(function (a) {
     return (!filters.harness || a.harness === filters.harness) && (!filters.status || (filters.status === "ownerless" ? !a.identity_id : agentEvidenceStatus(a) === filters.status));
@@ -2249,7 +2219,7 @@ function renderAgentsList() {
   const page = '<div class="agent-pagination"><span>Page ' + (filters.page + 1) + ' of ' + Math.max(1, Math.ceil(rows.length / AGENTS_PAGE_SIZE)) + ' · ' + escHtml(rosterAge) + '</span>' +
     '<button class="btn" data-action="agents-page" data-page="' + (filters.page - 1) + '"' + (filters.page === 0 ? ' disabled' : '') + '>Previous</button>' +
     '<button class="btn" data-action="agents-page" data-page="' + (filters.page + 1) + '"' + ((filters.page + 1) * AGENTS_PAGE_SIZE >= rows.length ? ' disabled' : '') + '>Next</button></div>';
-  return '<h1>Agents</h1><div class="agents-tiles">' + tiles + '</div><div class="agent-filters">' + controls + '</div>' +
+  return '<h1>Agents</h1><div class="agents-tiles">' + posturePanelContent(home, "unwrapped", tiles) + '</div><div class="agent-filters">' + controls + '</div>' +
     renderOverviewAgentsTable(rows, AGENTS_PAGE_SIZE, filters.page * AGENTS_PAGE_SIZE) + page +
     '<p class="muted">Inventory covers the served roster. Detection uses harness configuration presence; counts are not a process census.</p>';
 }
@@ -4551,6 +4521,7 @@ function renderEvidenceOperationsSection() {
 // decision queue, findings, and the agents table. Named layers only (no
 // L-numbers); no em-dashes in user-visible copy.
 function evidenceCurrent(evidence) {
+  if (evidence && evidence.panel_state && evidence.panel_state !== "fresh") return false;
   // Protection requires one unambiguous, valid instant; invalid or offset-less evidence fails closed.
   const timestamp = evidence && parseEvidenceTimestamp(evidence.last_enforcement_evidence_at);
   const windowMs = evidence && Number(evidence.freshness_window_ms);
@@ -4567,6 +4538,8 @@ function agentDisplayStatus(agent) {
   return STATUS_MAP[agentEvidenceStatus(agent)] || STATUS_MAP.unknown;
 }
 function postureWallLabel(armState) {
+  const panel = state.posture.home && state.posture.home.panels && state.posture.home.panels.castle_wall;
+  if (panel && panel.state !== "fresh") return { cls: "pill tone-unknown", text: "Unknown" };
   if (!sourceLoaded("/api/posture/home") || (armState === "armed" && !evidenceCurrent(state.posture.home && state.posture.home.castle_wall))) return { cls: "pill tone-unknown", text: "Unknown" };
   if (armState === "armed") return { cls: "pill tone-verified", text: "Enforcing" };
   // S5-P distinct non-green: coarse wall enforcing, fine-grained exclusive-egress
@@ -4623,8 +4596,11 @@ function servedCount(value) {
 
 function renderOverviewProtection(home) {
   const loaded = sourceLoaded("/api/posture/home") && home;
-  const requested = loaded ? home.protection_requested_count : null;
-  const detected = loaded ? home.protection_detected_count : null;
+  // A missed roster cannot establish zero protected agents, even when detection succeeded.
+  const rosterFresh = !home?.panels?.agents_roster || home.panels.agents_roster.state === "fresh";
+  const requested = loaded && rosterFresh ? home.protection_requested_count : null;
+  // An unavailable scan cannot establish a denominator for any "of detected" count.
+  const detected = loaded && rosterFresh && unprotectedHarnesses(home) !== null ? home.protection_detected_count : null;
   const known = servedCount(requested) && servedCount(detected) && requested <= detected;
   const reason = !loaded ? overviewSourceReason("/api/posture/home", "posture")
     : !servedCount(requested) || !servedCount(detected) ? "protection counts not served"
@@ -4638,9 +4614,10 @@ function auditChainEvidence(digest) {
   return { last_enforcement_evidence_at: digest && digest.window_end, freshness_window_ms: AUDIT_CHAIN_VERIFIED_MAX_AGE_MS };
 }
 
-function auditChainCheckCurrent(digest) {
-  // The chip and counts share both the accepted verdict and its evidence clock.
-  return !!digest && ((digest.chain_verdict === "verified" && digest.chain_verified === true) ||
+function auditChainCheckCurrent(digest, panel) {
+  // capped is a panel status, not a verdict flag: the producer sets chain_verified only for a fully verified chain, so a suffix-only observation is never authoritative by that flag and never capped by it.
+  const digestFresh = !!panel && panel.state === "fresh";
+  return digestFresh && !!digest && ((digest.chain_verdict === "verified" && digest.chain_verified === true) ||
     digest.chain_verdict === "verified_suffix_only") && evidenceCurrent(auditChainEvidence(digest));
 }
 
@@ -4657,16 +4634,18 @@ function windowCoverageReason(d) {
   }
 }
 
-function renderOutboundConnections(d, overview) {
+function renderOutboundConnections(d, overview, panel) {
   d = d || {};
+  // capped is a panel status, not a verdict flag: the producer sets chain_verified only for a fully verified chain, so a suffix-only observation is never authoritative by that flag and never capped by it.
+  const digestFresh = !!panel && panel.state === "fresh";
   // Counts require both a covered window and the same current verified/suffix check as the chip.
   // Continuing paths also require dated reads and safe served counts; all refusals name their missing evidence.
   // Must match the fail-honest returns in buildAuditDigest (principal-policy/posture.ts).
   // Counts and the chip must name the same missing evidence; a mismatched verdict is not a stale verification.
-  const reason = (d.chain_verdict !== "verified" && d.chain_verdict !== "verified_suffix_only") || (d.chain_verdict === "verified" && d.chain_verified !== true) ? "chain not verified"
+  const reason = (d.chain_verdict !== "verified" && d.chain_verdict !== "verified_suffix_only") || (d.chain_verdict === "verified" && d.chain_verified !== true && digestFresh) ? "chain not verified"
     : windowCoverageReason(d) ? windowCoverageReason(d)
     : !Number.isFinite(parseEvidenceTimestamp(d.window_start)) || !Number.isFinite(parseEvidenceTimestamp(d.window_end)) ? "window not stated"
-    : !auditChainCheckCurrent(d) ? "audit check not current"
+    : !auditChainCheckCurrent(d, panel) ? "audit check not current"
     : !servedCount(d.kernel_blocks) || !servedCount(d.kernel_allows) ? "count not served" : null;
   const notEvaluated = function (why) {
     const age = why === "audit check not current" ? '<span class="outbound-reason muted">last verified ' + escHtml(relTimeFromIso(d.window_end)) + '</span>' : '';
@@ -4720,7 +4699,33 @@ function postureEvidenceByAgent(home) {
   return map;
 }
 
+// Must match PosturePanelStatus.reason in principal-policy/panel-producer.ts.
+const POSTURE_PANEL_REASONS = ["budget_exceeded", "producer_failed", "never_completed", "upstream_unavailable", "observation_superseded"];
+function posturePanelNote(home, id) {
+  // Must match PosturePanelReason in principal-policy/panel-producer.ts and the HTML consumer copy tables.
+  const reasons = { budget_exceeded: "Time budget exceeded", producer_failed: "Observation failed", never_completed: "No completed observation", upstream_unavailable: "Required evidence unavailable", observation_superseded: "Newer evidence is available" };
+  const panel = home && home.panels && home.panels[id];
+  if (!panel || panel.state === "fresh") return "";
+  const note = panel.state === "unavailable" ? "Not available right now" : "Last checked " + durationLabelFromMs(panel.age_ms || 0) + " ago";
+  // Must match PostureHome.producer_keys: unresolved copy never claims a configured key.
+  const keyNote = id === "castle_wall" && home.producer_keys && home.producer_keys.message;
+  return note + (panel.reason && reasons[panel.reason] ? ". " + reasons[panel.reason] : "") + (keyNote ? ". " + keyNote : "");
+}
+function posturePanelContent(home, id, html) {
+  const note = posturePanelNote(home, id);
+  const panel = home && home.panels && home.panels[id];
+  return panel && panel.state === "unavailable" ? '<section class="card"><p>' + escHtml(note) + '</p></section>' :
+    html + (note ? '<p class="muted">' + escHtml(note) + '</p>' : '');
+}
+function auditVerificationNote(home) {
+  // Must match PostureHome.audit_verification in principal-policy/posture-home-types.ts.
+  const count = home && home.audit_verification && home.audit_verification.verified_uncached_last_pass;
+  return count > 0 ? '<p class="muted">' + escHtml(count) + ' more entries are checked in full on every pass</p>' : '';
+}
+
 function unprotectedHarnesses(home) {
+  // An unavailable scan cannot establish an empty detected roster.
+  if (home && home.panels && home.panels.unwrapped && home.panels.unwrapped.state === "unavailable") return null;
   return home && home.unwrapped && Array.isArray(home.unwrapped.unwrapped) ? home.unwrapped.unwrapped : null;
 }
 
@@ -4981,7 +4986,7 @@ function renderPostureScreen() {
     const why = state.posture.homeError
       ? 'Protection status unavailable. Overview unavailable. This dashboard could not read the latest posture check. ' + escHtml(state.posture.homeError)
       : 'Protection status unavailable. Overview unavailable. Current posture is Unknown.';
-    return '<section class="overview-page">' + head + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' +
+    return '<section class="overview-page">' + head + '<div class="overview-tiles" aria-label="At a glance">' + posturePanelContent(home, "unwrapped", renderOverviewProtection(home)) + '</div>' +
       '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
       '</section>';
   }
@@ -4993,7 +4998,7 @@ function renderPostureScreen() {
     // An empty agent roster cannot establish that a full or unrecognized inbox page has no holds.
     if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && !approvalQueueEvidence().earned) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
     if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
-    return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' + below.join("") + '</section>';
+    return '<section class="overview-page">' + head + machineLine + posturePanelContent(home, "agents_roster", overviewFirstRun(home)) + '<div class="overview-tiles" aria-label="At a glance">' + posturePanelContent(home, "unwrapped", renderOverviewProtection(home)) + '</div>' + below.join("") + '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
@@ -5027,24 +5032,32 @@ function renderPostureScreen() {
     (pendingEvidence.unknown ? pendingEvidence.unknownLine + " · " : "");
   const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
   // VERIFIED requires current evidence from this digest build; stale and future checks never remain green.
-  const checkCurrent = auditChainCheckCurrent(digest);
+  // capped is a panel status, not a verdict flag: the producer sets chain_verified only for a fully verified chain, so a suffix-only observation is never authoritative by that flag and never capped by it.
+  const digestFresh = home.panels?.digest?.state === "fresh";
+  const checkCurrent = auditChainCheckCurrent(digest, home.panels?.digest);
+  const acceptedVerdict = (digest.chain_verdict === "verified" && digest.chain_verified === true) || digest.chain_verdict === "verified_suffix_only";
   const chainVerified = digest.chain_verified === true && digest.chain_verdict === "verified" && checkCurrent;
   // The verdict covers the whole chain, so only a positive safe window count can supply a findings detail.
   const findingDetail = Number.isSafeInteger(digest.integrity_finding_count) && digest.integrity_finding_count > 0
     ? digest.integrity_finding_count + (digest.integrity_finding_count === 1 ? " finding" : " findings") : "chain not verified";
-  const chainChip = chainVerified
+  // Must match observation_superseded in panel-producer.ts: withholding evidence is not a failed verification.
+  const chainWithheld = !digestFresh && home.panels?.digest?.reason === "observation_superseded";
+  // An observed failure is never hidden by a freshness cap; must match auditChainPill in posture-home-html.ts and the audit line in posture-agent-html.ts.
+  const chainChip = digest.chain_verdict === "findings"
+    ? overviewChip("bad", "FAILED", findingDetail)
+    : chainWithheld
+    ? overviewChip("unknown", "WITHHELD", "observation superseded")
+    : chainVerified
     ? overviewChip("good", "VERIFIED", relTimeFromIso(digest.window_end))
-    : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent
+    : (!digestFresh || acceptedVerdict) && !checkCurrent
       ? overviewChip("unknown", "UNKNOWN", "last verified " + (Number.isFinite(chainWindowEnd) ? relTimeFromIso(digest.window_end) : "Unknown"))
-    : digest.chain_verdict === "findings"
-      ? overviewChip("bad", "FAILED", findingDetail)
-      : digest.chain_verdict === "verified_suffix_only" && checkCurrent
-      ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
+    : digest.chain_verdict === "verified_suffix_only" && checkCurrent
+      ? overviewChip("warn", "SUFFIX ONLY", "sealed history not re-verifiable at this privilege; " + (digest.window_end ? relTimeFromIso(digest.window_end) : ""))
       : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
   const metricCards =
     '<div class="overview-tiles" aria-label="At a glance">' +
-      renderOverviewProtection(home) +
-      overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
+      posturePanelContent(home, "unwrapped", renderOverviewProtection(home)) +
+      overviewTile("Castle Wall", posturePanelNote(home, "castle_wall") ? escHtml(posturePanelNote(home, "castle_wall")) : wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       // Two feeds, each named where it is counted. Open findings come from the anomaly detector (/api/anomaly/findings,
       // the same count as renderAnomalyFindingsCard on the Findings screen). When that answer is empty, the tile reports
@@ -5055,7 +5068,8 @@ function renderPostureScreen() {
         anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : feedUnavailable ? escHtml(overviewSourceReason(SENTINEL_FEED_PATH, "Sentinel findings")) + ' · <a href="#findings">findings</a>' : feedListed ? 'Sentinel queue returned ' + escHtml(sentinelFindingsCount(feed.total)) + '; lifecycle is not served · <a href="#findings">findings</a>'
           : feed ? "anomaly detector and Sentinel queue answered empty; oldest read " + escHtml(earnedZeroReadAge() || "now") + ' · <a href="#findings">findings</a>'
           : "anomaly detector answered " + escHtml(loadedSourceReadAge(ANOMALY_FEED_PATH) || "now") + ' · <a href="#findings">findings</a>', "#findings") +
-      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
+      // A failed chain stays visibly failed beside its stale note; a stale note never restores a verified badge.
+      overviewTile("Audit chain", chainChip + (posturePanelNote(home, "digest") ? escHtml(posturePanelNote(home, "digest")) : ""), Number.isFinite(chainWindowEnd) ? (checkCurrent ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (checkCurrent ? "" : digest.chain_verdict !== "findings" && (!digestFresh || acceptedVerdict) ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
   return [
     '<section class="overview-page">',
@@ -5065,8 +5079,9 @@ function renderPostureScreen() {
       vaultNotice,
       renderOverviewDecisionQueue(),
       renderOverviewFindingsPanel(),
-      renderOutboundConnections(digest, true),
-      renderOverviewAgentsTable(),
+      posturePanelContent(home, "digest", renderOutboundConnections(digest, true, home.panels?.digest)),
+      auditVerificationNote(home),
+      posturePanelContent(home, "agents_roster", renderOverviewAgentsTable()),
       '<p class="muted">Overview values come directly from served posture, approval, Sentinel and roster reads. Unknown remains explicit when a source has not answered.</p>',
     '</section>'
   ].join("");
@@ -5891,10 +5906,12 @@ function renderEnforcementScreen() {
         '<div class="enforcement-layers">' + layers + '</div>',
         renderSourceRead("/api/sovereignty"),
       '</section>',
-      renderOutboundConnections(home.digest, false),
+      posturePanelContent(home, "digest", renderOutboundConnections(home.digest, false, home.panels?.digest)),
+      auditVerificationNote(home),
       '<section class="card">',
-        '<h3>Per-agent enforcement (' + (home.agents || []).length + ')</h3>',
-        renderPostureAgentRows(home),
+        // A roster miss is Unknown even in the heading outside the panel wrapper.
+        '<h3>Per-agent enforcement (' + (home.panels && home.panels.agents_roster?.state !== "fresh" ? "Unknown" : (home.agents || []).length) + ')</h3>',
+        posturePanelContent(home, "agents_roster", renderPostureAgentRows(home)),
       '</section>',
     '</section>'
   ].join("");
@@ -6725,7 +6742,7 @@ async function fetchSovereignty() {
 function postureHomeExpiryAt(home) {
   if (!home) return null;
   // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
-  const expiries = [home.castle_wall, home.digest && (home.digest.chain_verified === true || home.digest.chain_verdict === "verified_suffix_only") ? auditChainEvidence(home.digest) : null].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
+  const expiries = [home.castle_wall, auditChainCheckCurrent(home.digest, home.panels?.digest) ? auditChainEvidence(home.digest) : null].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
     return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + SEAL_FRESHNESS_BOUNDARY_OFFSET_MS;
   });
   return expiries.length ? Math.min.apply(null, expiries) : null;
@@ -6752,6 +6769,10 @@ async function fetchPostureHome() {
       body.anomaly_findings = state.posture.anomalies || [];
       body.anomaly_findings_unknown = state.posture.anomaliesUnknown !== false;
       state.posture.home = body;
+      if (body.panels) {
+        if (body.castle_wall) body.castle_wall.panel_state = body.panels.castle_wall && body.panels.castle_wall.state;
+        (body.agents || []).forEach(function (agent) { agent.panel_state = body.panels.agents_roster && body.panels.agents_roster.state; });
+      }
       scheduleHomeFreshness();
       scheduleSealFreshnessRefresh("/api/posture/home", { current: true, refreshAt: postureHomeExpiryAt(body) });
       state.posture.homeError = null;

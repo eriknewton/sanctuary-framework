@@ -1,7 +1,7 @@
 /**
  * Neutral type home for the composed posture-home payload (`PostureHome`).
  *
- * This module exists ONLY to break the `posture-routes` <-> `posture-stream`
+ * This module breaks the `posture-routes` <-> `posture-stream`
  * import cycle. Both the route layer (which builds the payload) and the SSE
  * stream handler (which pushes it) need the `PostureHome` shape; if the shape
  * lived in `posture-routes.ts`, the stream's `type`-only import of it would
@@ -18,9 +18,11 @@
  * and acyclic: routes and stream both depend on this module; this module
  * depends only on the shapers.
  *
- * This is a pure type module (no runtime exports), so it adds no behavior and
- * no new green path.
+ * The shared audit display-age bound and browser timestamp parser live here
+ * so the three renderers do not depend on each other. It adds no member to the payload.
  */
+
+import type { ProducerKeyObservation, PosturePanelId, PosturePanelStatus } from "./panel-producer.js";
 
 import type {
   CastleWallPosture,
@@ -32,12 +34,60 @@ import type {
 import type { FeatureHealthPanel } from "./feature-health.js";
 import type { QueryPrivacySection } from "./posture-query-privacy.js";
 
+/** Maximum observation age accepted by the three posture audit displays. */
+// Must match AUDIT_CHAIN_VERIFIED_MAX_AGE_MS embedded by dashboard/v1_1/client.ts,
+// auditChainPill in posture-home-html.ts and the audit line in posture-agent-html.ts.
+export const AUDIT_CHAIN_VERIFIED_MAX_AGE_MS = 10 * 60 * 1000; // Ten minutes, in milliseconds.
+
+/** Strict observation parser embedded by the SPA and both posture HTML renderers. */
+// Must match parseIsoInstantWithOffset in core/time.ts; the existing client-time-parity test
+// executes this through getClientScript, and all audit consumers embed these same bytes.
+export const POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE = String.raw`function parseEvidenceTimestamp(value) {
+  if (typeof value !== "string") return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (match === null) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const writtenMs = Number((match[7] || "").padEnd(3, "0").slice(0, 3));
+  const offsetSign = match[8];
+  const offsetHours = offsetSign ? Number(match[9]) : 0;
+  const offsetMinutes = offsetSign ? Number(match[10]) : 0;
+  // Mirrors the server predicate's finite Date.parse refusal for in-shape but out-of-range offsets.
+  if (offsetHours > 23 || offsetMinutes > 59) return undefined;
+  const offsetMs = (offsetSign === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60 * 1000;
+  const wall = new Date(0);
+  // Set year/month/day together so years 0000..0099 stay proleptic instead of remapping through 1900..1999.
+  wall.setUTCFullYear(year, month - 1, day);
+  wall.setUTCHours(hour, minute, second, writtenMs);
+  const timestamp = wall.getTime() - offsetMs;
+  if (!Number.isFinite(timestamp)) return undefined;
+  const rendered = new Date(timestamp + offsetMs);
+  const calendarFieldsMatch =
+    rendered.getUTCFullYear() === year &&
+    rendered.getUTCMonth() + 1 === month &&
+    rendered.getUTCDate() === day &&
+    rendered.getUTCHours() === hour &&
+    rendered.getUTCMinutes() === minute &&
+    rendered.getUTCSeconds() === second &&
+    rendered.getUTCMilliseconds() === writtenMs;
+  return calendarFieldsMatch ? timestamp : undefined;
+}`;
+
 /**
  * One composed payload for the posture home screen, served by
  * `GET /api/posture/home` and pushed verbatim by the `/api/posture/stream` SSE
  * endpoint. Built by `buildHome` in `posture-routes.ts`.
  */
 export interface PostureHome {
+  /** Must match the key-observation copy rendered by the posture-home consumers. */
+  producer_keys?: { producer: ProducerKeyObservation; broker: ProducerKeyObservation; message: string | null };
+  panels: Record<PosturePanelId, PosturePanelStatus>;
+  /** Must match audit_verification in all three posture-home clients. */
+  audit_verification: { cached_entries: number; cache_cap: number; verified_uncached_last_pass: number };
   origin_machine: string;
   /**
    * Factual federation summary for the banner. This is not the full roster and

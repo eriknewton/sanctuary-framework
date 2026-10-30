@@ -29,11 +29,13 @@
  * `renderPostureHomeHTML`).
  */
 
+import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "./posture-home-types.js";
 import {
   AGENT_PILL_FN_SOURCE,
   CONSOLE_FONT_FACE_CSS,
   POSTURE_ROOT_TOKENS_CSS,
   STATUS_PILL_CSS,
+  REL_TIME_FN_SOURCE,
   THEME_BOOTSTRAP_SCRIPT,
 } from "./posture-html-shared.js";
 
@@ -208,6 +210,57 @@ export function renderPostureAgentHTML(): string {
     return '<span class="pill neutral">policy</span>';
   }
 
+  ${REL_TIME_FN_SOURCE}
+
+  function renderPanelStatus(home) {
+    // Freshness accepts the same strict instant as the SPA, never a browser-local date.
+    ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
+    // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.
+    var reasons = { budget_exceeded: "Time budget exceeded", producer_failed: "Observation failed", never_completed: "No completed observation", upstream_unavailable: "Required evidence unavailable", observation_superseded: "Newer evidence is available" };
+    var MILLISECONDS_PER_SECOND = 1000; // One second contains one thousand milliseconds.
+    var panel = home.panels && home.panels.agents_roster;
+    var standing = document.getElementById("standing");
+    if (panel && panel.state === "unavailable") standing.innerHTML = '<p>Not available right now</p>';
+    else if (panel && panel.state === "stale") standing.innerHTML += '<p>Last checked ' + esc(Math.floor((panel.age_ms || 0) / MILLISECONDS_PER_SECOND)) + 's ago</p>';
+    if (panel && panel.reason && reasons[panel.reason]) standing.innerHTML += '<p>' + esc(reasons[panel.reason]) + '</p>';
+    // An unavailable scan cannot establish an empty detected roster.
+    if (home.panels && home.panels.unwrapped.state === "unavailable") standing.innerHTML += '<p>Detected harnesses: Unknown. Not available right now</p>';
+    var scanPanel = home.panels && home.panels.unwrapped;
+    if (scanPanel && scanPanel.state === "stale") standing.innerHTML += '<p>Detected harnesses: Last checked ' + esc(Math.floor((scanPanel.age_ms || 0) / MILLISECONDS_PER_SECOND)) + 's ago</p>';
+    var digest = home.digest;
+    if (digest) {
+      var digestPanel = home.panels && home.panels.digest;
+      // capped is a panel status, not a verdict flag: the producer sets chain_verified only for a fully verified chain, so a suffix-only observation is never authoritative by that flag and never capped by it.
+      var digestFresh = !!digestPanel && digestPanel.state === "fresh";
+      // Must match AUDIT_CHAIN_VERIFIED_MAX_AGE_MS in dashboard/v1_1/client.ts and auditChainPill in posture-home-html.ts.
+      var maxAge = ${AUDIT_CHAIN_VERIFIED_MAX_AGE_MS};
+      var checkedAt = parseEvidenceTimestamp(digest.window_end);
+      var current = Number.isFinite(checkedAt) && Date.now() >= checkedAt && Date.now() - checkedAt <= maxAge;
+      // Keep the observation date visible even when this one-load page has been left open.
+      var checked = (relTime(digest.window_end) || 'Unknown') + (digest.window_end ? ' (' + digest.window_end + ')' : '');
+      var accepted = (digest.chain_verdict === "verified" && digest.chain_verified === true) || digest.chain_verdict === "verified_suffix_only";
+      // An observed failure is never hidden by a freshness cap; must match the SPA and home HTML badge order.
+      if (digest.chain_verdict === "findings") {
+        var detail = Number.isSafeInteger(digest.integrity_finding_count) && digest.integrity_finding_count > 0
+          ? digest.integrity_finding_count + (digest.integrity_finding_count === 1 ? " finding" : " findings") : "chain not verified";
+        standing.innerHTML += '<p>Audit chain: <span class="pill red">FAILED</span> ' + esc(detail) + '</p>';
+      } else if (!digestFresh && digestPanel && digestPanel.reason === "observation_superseded") {
+        standing.innerHTML += '<p>Audit chain: <span class="pill neutral">WITHHELD</span> observation superseded</p>';
+      } else if (!digestFresh || (accepted && !current)) {
+        standing.innerHTML += '<p>Audit chain: <span class="pill neutral">UNKNOWN</span> not current, last verified ' + esc(checked) + '</p>';
+      } else if (digest.chain_verified === true && digest.chain_verdict === "verified" && current) {
+        standing.innerHTML += '<p>Audit chain: <span class="pill green">VERIFIED</span>, checked ' + esc(checked) + '</p>';
+      } else if (digest.chain_verdict === "verified_suffix_only" && current) {
+        standing.innerHTML += '<p>Audit chain: <span class="pill amber">SUFFIX ONLY</span>, sealed history not re-verifiable at this privilege, checked ' + esc(checked) + '</p>';
+      } else {
+        standing.innerHTML += '<p>Audit chain: UNVERIFIED</p>';
+      }
+    }
+    // Must match PostureHome.audit_verification in posture-home-types.ts.
+    var uncached = home.audit_verification && home.audit_verification.verified_uncached_last_pass;
+    if (uncached > 0) standing.innerHTML += '<p>' + esc(uncached) + ' more entries are checked in full on every pass</p>';
+  }
+
   function renderStanding(row) {
     var el = document.getElementById("standing");
     document.getElementById("origin").textContent =
@@ -378,6 +431,7 @@ export function renderPostureAgentHTML(): string {
             };
           }
           renderStanding(row);
+          renderPanelStatus(home);
           // Distress channel (Phase 2): best-effort over the already-mounted,
           // durable /api/distress/inbox. A failure or absent inbox renders the
           // honest "none recorded" state, never a fabricated green.

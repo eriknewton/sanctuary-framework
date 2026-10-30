@@ -25,7 +25,7 @@ import {
   type PostureRouteDeps,
 } from "../../src/principal-policy/posture-routes.js";
 import { renderPostureEvidenceHTML } from "../../src/principal-policy/posture-evidence-html.js";
-import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js"; import { createPosturePanelStore } from "../../src/principal-policy/panel-producer.js";
 const FORTRESS = "fortress:evidence-test";
 
 const servers: Server[] = [];
@@ -57,7 +57,7 @@ async function serve(deps: PostureRouteDeps): Promise<string> {
 }
 
 function baseDeps(log: AuditLog | null): PostureRouteDeps {
-  return { readFlightMap: createDashboardReadFlightMap(),
+  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => [] as LocalAgentRecord[],

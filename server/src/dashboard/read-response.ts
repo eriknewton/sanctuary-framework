@@ -12,8 +12,7 @@ interface DashboardReadResponse<T> {
   body: T;
 }
 
-interface DashboardBoundedReadOptions<T> {
-  route: DashboardBoundedReadRoute;
+interface DashboardBoundedReadBaseOptions<T> {
   req: IncomingMessage;
   res: ServerResponse;
   operation: string;
@@ -24,9 +23,20 @@ interface DashboardBoundedReadOptions<T> {
   originMachine?: string;
 }
 
+interface DashboardReadReconciliation<T> {
+  arrivalSequence: number;
+  reconcile: (body: T, admissionSequence: number, arrivalSequence: number) => T;
+}
+// Home's hook is required at both composition roots; other routes retain their original shared body.
+type DashboardBoundedReadOptions<T> = DashboardBoundedReadBaseOptions<T> & (
+  | { route: "posture_home"; reconciliation: DashboardReadReconciliation<T> }
+  | { route: Exclude<DashboardBoundedReadRoute, "posture_home">; reconciliation?: never }
+);
+
 export interface DashboardReadFlight<T> {
   promise: Promise<DashboardReadResponse<T>>;
   deadlineAtMs: number;
+  admissionSequence?: number;
 }
 
 export type DashboardReadFlightMap = Map<
@@ -117,7 +127,7 @@ export function respondWithBoundedDashboardRead<T>(
   const { route, req, res, operation, produce, originMachine } = options;
   const { readFlights } = options;
   const existing = readFlights.get(route) as DashboardReadFlight<T> | undefined;
-  const flight = existing ?? startReadFlight(readFlights, route, produce);
+  const flight = existing ?? startReadFlight(readFlights, route, produce, options.reconciliation?.arrivalSequence);
 
   if (existing && Date.now() >= existing.deadlineAtMs) {
     res.setHeader("Retry-After", String(DASHBOARD_RETRY_AFTER_SECONDS));
@@ -174,7 +184,9 @@ export function respondWithBoundedDashboardRead<T>(
 
   void flight.promise
     .then(({ status, body }) => {
-      settleResponse(status, body);
+      // A route joiner can lower its own evidence without changing the shared flight or leader body.
+      settleResponse(status, existing && options.reconciliation && flight.admissionSequence !== undefined
+        ? options.reconciliation.reconcile(body, flight.admissionSequence, options.reconciliation.arrivalSequence) : body);
     })
     .catch(() => {
       // Invariant: a failed composition cannot be converted to an empty dashboard shape, because empty can mean healthy to the operator.
@@ -191,12 +203,14 @@ function startReadFlight<T>(
   readFlights: DashboardReadFlightMap,
   route: DashboardBoundedReadRoute,
   produce: (signal: AbortSignal) => Promise<DashboardReadResponse<T>>,
+  admissionSequence?: number,
 ): DashboardReadFlight<T> {
   const controller = new AbortController();
   // The object exists before its promise so the release below can compare
   // identity with the exact entry this call puts in the map.
   const flight = {
     deadlineAtMs: Date.now() + DASHBOARD_READ_RESPONSE_DEADLINE_MS,
+    ...(admissionSequence !== undefined ? { admissionSequence } : {}),
   } as DashboardReadFlight<T>;
   flight.promise = Promise.resolve()
     .then(() => produce(controller.signal))

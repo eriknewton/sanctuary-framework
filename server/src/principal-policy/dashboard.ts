@@ -1,3 +1,4 @@
+import { createPosturePanelStore, POSTURE_PRELUDE_BUDGET_MS } from "./panel-producer.js";
 /**
  * Sanctuary MCP Server - Principal Dashboard
  *
@@ -124,6 +125,10 @@ import {
   POSTURE_AGENT_PATH_PREFIX,
   POSTURE_EVIDENCE_PATH,
   POSTURE_STREAM_PATH,
+  withPostureProducerKeys,
+  observeInjectedProducerKey,
+  type ProducerKeyObservation,
+  reconcilePostureHomeJoiner,
   type PostureRouteDeps,
 } from "./posture-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
@@ -1031,6 +1036,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private postureStreamRegistry: PostureStreamRegistry =
     createPostureStreamRegistry();
+  private readonly panelStore = createPosturePanelStore();
   private readonly readFlightMap: DashboardReadFlightMap =
     createDashboardReadFlightMap();
   private pending: Map<string, PendingRequest> = new Map();
@@ -1101,6 +1107,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private _producerKeyLoad: ProducerKeyLoad | undefined = undefined;
   private _brokerProducerKeyLoad: BrokerProducerKeyLoad | undefined = undefined;
+  private _postureKeyLoad: Promise<void> | undefined;
+  // Timed-out request waiters are removed; the single key-load pair owns settlement.
+  private readonly postureKeyLoadWaiters = new Set<(failed: boolean) => void>();
+  private _producerKeyObservation: ProducerKeyObservation = "unknown";
+  private _brokerProducerKeyObservation: ProducerKeyObservation = "unknown";
   private dashboardHTML: string;
   private fortressHTML: string | null = null;
   private loginHTML: string;
@@ -2326,15 +2337,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       "local";
     const auditLog = this.auditLog ?? null;
     const buildDeps = async (): Promise<PostureRouteDeps> => {
-      // Slice R + P: load the pinned producer key once (cached) before serving so
-      // the readers can re-verify producer signatures. `present` → activate the
-      // signed close; `absent` → channel basis (honest macOS / pre-provision);
-      // `unreadable` → fail honestly (the readers force non-green via
-      // `producerKeyExpectedButUnavailable`), never the channel basis.
-      await this.ensureProducerKeyLoaded();
-      await this.ensureBrokerProducerKeyLoaded();
-      const load = this._producerKeyLoad;
-      const brokerLoad = this._brokerProducerKeyLoad;
       // Recognition precursor: resolve the composition render-gate flag via the
       // canonical resolver (default-off). The fortress config carries no composition
       // input today, so this resolves to the honest `false` default; when an input
@@ -2342,10 +2344,62 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // CONFIG, not evidence - the composition endpoint exposes only this boolean.
       const compositionEnabled =
         resolveCompositionConfig().composition_enabled;
+      // Start ensureProducerKeyLoaded before withPostureProducerKeys on every request; cache reuse cannot suppress a repair check.
+      // The pair keeps admission until both settle; request timeouts retain no extra reactions on these loads.
+      const startKeyLoad = () => {
+        if (!this._postureKeyLoad) {
+          this._postureKeyLoad = Promise.allSettled([
+            () => this.ensureProducerKeyLoaded(), () => this.ensureBrokerProducerKeyLoaded(),
+          ].map(load => Promise.resolve().then(load))).then(loads => {
+            if (loads.some(load => load.status === "rejected")) throw new Error("producer_key_load_failed");
+          });
+          const settle = (failed: boolean) => {
+            this._postureKeyLoad = undefined;
+            for (const finish of this.postureKeyLoadWaiters) finish(failed);
+            this.postureKeyLoadWaiters.clear();
+          };
+          void this._postureKeyLoad.then(() => settle(false), () => settle(true));
+        }
+        return this._postureKeyLoad;
+      };
+      const keyLoad = startKeyLoad();
+      const started = performance.now();
+      const loadState = await new Promise<"settled" | "failed" | "timed_out">(resolve => {
+        const finish = (failed: boolean) => {
+          clearTimeout(timer);
+          resolve(failed ? "failed" : "settled");
+        };
+        // POSTURE_PRELUDE_BUDGET_MS (aliased by POSTURE_PRODUCER_KEYS_BUDGET_MS in panel-producer.ts) bounds the current reload before capturing observations.
+        // A reload completing after this budget reports unknown for this request, never the previous absence.
+        const timer = setTimeout(() => {
+          this.postureKeyLoadWaiters.delete(finish);
+          resolve("timed_out");
+        }, POSTURE_PRELUDE_BUDGET_MS);
+        this.postureKeyLoadWaiters.add(finish);
+      });
+      const loadTimedOut = loadState === "timed_out" || performance.now() - started >= POSTURE_PRELUDE_BUDGET_MS;
       return {
+        refreshStreamDeps: buildDeps,
+        ...(loadTimedOut || loadState === "failed" ? { producerKeysStatus: {
+          state: "unavailable" as const, completed_at: null, age_ms: null, budget_ms: POSTURE_PRELUDE_BUDGET_MS,
+          reason: loadTimedOut ? "budget_exceeded" as const : "producer_failed" as const,
+        } } : {}),
         auditLog,
         originMachine,
         readFlightMap: this.readFlightMap,
+        panelStore: this.panelStore,
+        prepareProducerKeys: async () => {
+          // This frame already observed the bounded current pair; do not start another reload while shaping it.
+          await keyLoad;
+          return {
+            resolvePinnedProducerKey: this.injectedResolvePinnedProducerKey ??
+              (() => this._producerKeyLoad?.status === "present" ? this._producerKeyLoad.keyB64url : null),
+            producerKeyObservation: this.injectedResolvePinnedProducerKey
+              ? observeInjectedProducerKey(this.injectedResolvePinnedProducerKey, this.injectedProducerKeyExpectedButUnavailable) : this._producerKeyObservation,
+            resolveBrokerPinnedProducerKey: () => this._brokerProducerKeyLoad?.status === "present" ? this._brokerProducerKeyLoad.keyB64url : null,
+            brokerProducerKeyObservation: this._brokerProducerKeyObservation,
+          };
+        },
         platform: process.platform,
         compositionEnabled,
         // Recognition panel (P5) impure sources, resolved lazily per request so
@@ -2392,14 +2446,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           }),
         resolvePinnedProducerKey:
           this.injectedResolvePinnedProducerKey ??
-          (() => (load?.status === "present" ? load.keyB64url : null)),
-        producerKeyExpectedButUnavailable: this.injectedResolvePinnedProducerKey
-          ? this.injectedProducerKeyExpectedButUnavailable
-          : load?.status === "unreadable",
+          (() => (this._producerKeyLoad?.status === "present" ? this._producerKeyLoad.keyB64url : null)),
+        producerKeyObservation: loadTimedOut || loadState === "failed" ? "unknown" : this.injectedResolvePinnedProducerKey
+          ? observeInjectedProducerKey(this.injectedResolvePinnedProducerKey, this.injectedProducerKeyExpectedButUnavailable)
+          : this._producerKeyObservation,
         resolveBrokerPinnedProducerKey: () =>
-          brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
-        brokerProducerKeyExpectedButUnavailable:
-          brokerLoad?.status === "unreadable",
+          this._brokerProducerKeyLoad?.status === "present" ? this._brokerProducerKeyLoad.keyB64url : null,
+        brokerProducerKeyObservation: loadTimedOut || loadState === "failed" ? "unknown" : this._brokerProducerKeyObservation,
         resolveProtectionClaimSubject: () =>
           this.resolveProtectionClaimSubject(),
         resolveEnforcementAvailability:
@@ -2434,7 +2487,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         operation: "get_posture_home",
         readFlights: this.readFlightMap,
         originMachine,
+        reconciliation: { arrivalSequence: auditLog.currentInMemorySequence(), reconcile: reconcilePostureHomeJoiner },
         produce: async () => {
+          // Observe the budgeted ensureProducerKeyLoaded pair before withPostureProducerKeys in buildHome.
           const deps = await buildDeps();
           return {
             status: 200,
@@ -2443,7 +2498,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         },
       });
     }
-    return handlePostureRoute(await buildDeps(), req, res, url, method);
+    if (method === "GET" && url.pathname === POSTURE_STREAM_PATH) {
+      // Stream admission and disconnect cleanup precede the bounded key wait, including the first frame.
+      return handlePostureRoute({ auditLog, originMachine, readFlightMap: this.readFlightMap, panelStore: this.panelStore,
+        listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+        streamRegistry: this.postureStreamRegistry, refreshStreamDeps: buildDeps,
+      }, req, res, url, method);
+    }
+    return handlePostureRoute(await withPostureProducerKeys(await buildDeps()), req, res, url, method);
   }
 
   /**
@@ -2752,7 +2814,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *   - `present`    → cached permanently (the pinned anchor is stable).
    *   - `absent`     → transient: leave `undefined` so a post-provision request
    *                    re-attempts the load (codex MEDIUM #4). Channel basis for
-   *                    THIS request.
+   *                    THIS request; the named observation remains `absent`.
    *   - `unreadable` → transient (re-checked next request) AND surfaced to the
    *                    readers as `producerKeyExpectedButUnavailable` so this
    *                    request fails honestly (degraded, never channel-green).
@@ -2763,9 +2825,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (this._producerKeyLoad?.status === "present") return;
     const storagePath = this._sanctuaryConfig?.storage_path;
     if (typeof storagePath !== "string" || storagePath.length === 0) {
-      // No storage path to read from: treat as absent (channel basis), re-checked
-      // next request once config wiring lands.
+      // No configured path proves nothing about a pinned key; only ENOENT can establish absence.
       this._producerKeyLoad = undefined;
+      this._producerKeyObservation = "unknown";
       return;
     }
     let load: ProducerKeyLoad;
@@ -2782,9 +2844,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Only `present` is a permanent cache (the `status === "present"` guard
     // above short-circuits future loads). `unreadable` is stored so THIS request
     // fails honestly, and `absent` is stored as undefined - both are re-evaluated
-    // on the next request, so a post-provision write (or a fixed permission) is
+    // on the next request. The named observation retains absence separately from the key cache, so a post-provision write (or a fixed permission) is
     // always picked up.
     this._producerKeyLoad = load.status === "absent" ? undefined : load;
+    this._producerKeyObservation = load.status;
   }
 
   private async ensureBrokerProducerKeyLoaded(): Promise<void> {
@@ -2792,6 +2855,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const storagePath = this._sanctuaryConfig?.storage_path;
     if (typeof storagePath !== "string" || storagePath.length === 0) {
       this._brokerProducerKeyLoad = undefined;
+      // Without a configured path there is no observation establishing absence.
+      this._brokerProducerKeyObservation = "unknown";
       return;
     }
     let load: BrokerProducerKeyLoad;
@@ -2801,6 +2866,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       load = { status: "unreadable", reason: "broker_producer_key_load_threw" };
     }
     this._brokerProducerKeyLoad = load.status === "absent" ? undefined : load;
+    this._brokerProducerKeyObservation = load.status;
   }
 
   /**

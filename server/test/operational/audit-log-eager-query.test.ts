@@ -358,7 +358,7 @@ describe("AuditLog eager read - out-of-band sentinel + backstop (injectable inte
     expect(after.integrity_findings.length).toBeGreaterThan(0);
   });
 
-  it("backstop full re-verify fires after the interval for a fingerprint-PRESERVING tamper", async () => {
+  it("byte verification detects unchanged-metadata edits after one pass interval", async () => {
     const storage = new MtimeStableStorage();
     const masterKey = generateRandomKey();
     // Build the chain inside the mtime-stable store.
@@ -417,7 +417,8 @@ describe("AuditLog eager read - out-of-band sentinel + backstop (injectable inte
     const server = new AuditLog(storage, masterKey, {
       checkpointInterval: 0,
       integrityMode: "lenient",
-      eagerReverifyIntervalMs: INTERVAL,
+      eagerReverifyIntervalMs: INTERVAL * 100,
+      eagerBytePassIntervalMs: INTERVAL,
     });
     const clean = await server.queryEager({ limit: 50 });
     expect(clean.integrity_findings).toEqual([]);
@@ -440,15 +441,10 @@ describe("AuditLog eager read - out-of-band sentinel + backstop (injectable inte
     expect(tamperedBytes.length).toBe(raw!.length); // size preserved
     await storage.write("_audit", victim, tamperedBytes);
 
-    // Sanity: the fingerprint did NOT change, so an immediate read within the
-    // backstop window does NOT catch it (the documented residual).
+    // One byte-pass interval suffices even while the backstop is not due.
+    await sleep(INTERVAL + 1);
     const within = await server.queryEager({ limit: 50 });
-    expect(within.integrity_findings).toEqual([]);
-
-    // After the backstop interval elapses, the full re-verify fires and catches it.
-    await sleep(INTERVAL + 40);
-    const afterBackstop = await server.queryEager({ limit: 50 });
-    expect(afterBackstop.integrity_findings.length).toBeGreaterThan(0);
+    expect(within.integrity_findings.length).toBeGreaterThan(0);
   });
 
   it("AUDIT_EAGER_REVERIFY_INTERVAL_MS env overrides the backstop interval", async () => {

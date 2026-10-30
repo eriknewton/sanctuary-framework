@@ -250,6 +250,7 @@ export interface AuditLogConfig {
    * disk cap, and so tests can drive the in-memory trim independently of on-disk
    * rotation.
    */
+  // Must match the constructor verifyCacheMaxEntries clamp: the verification cache shares this RAM bound.
   maxInMemoryEntries?: number;
   /** Verify chain failures by throwing (strict) or surfacing findings (lenient). */
   integrityMode?: "strict" | "lenient";
@@ -388,6 +389,10 @@ export interface AuditLogConfig {
    * gated by this interval; this is only the residual same-length+mtime backstop.
    */
   eagerReverifyIntervalMs?: number;
+  /** Test-only lower byte-pass interval, positive and at most the production cadence. */
+  eagerBytePassIntervalMs?: number;
+  /** Test-only smaller cache, a positive integer at most the production cap. */
+  verifyCacheMaxEntries?: number;
   /**
    * Age bound (ms) past which an id-less (0-byte) stale audit-write lock, and an
    * orphaned `.acquire.*.tmp` acquire-temp, are considered crash litter and
@@ -1246,27 +1251,34 @@ type HeadAnchorReadResult =
 // reads per board paint and pushes the same payload on an SSE cadence; re-reading
 // + re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
 // read pegs the event loop (the #714 drill: 11-30s/paint, Node at 203% CPU). The
-// in-memory view is maintained EAGERLY on every append (the server is the sole
-// appender; `persistChainedEntry` records + chains each new entry under the write
-// lock), so an eager read is already current for everything this process wrote,
-// with NO lag for a just-appended entry. A full on-disk re-scan is therefore
-// needed ONLY to catch OUT-OF-BAND tampering (a direct file edit that bypasses
-// the server). Out-of-band edits that change the cheap listing fingerprint (entry
-// count / newest key / per-entry size+mtime aggregate) are caught EVENT-DRIVEN on
-// the NEXT eager read by the sentinel below; this full re-scan is the BACKSTOP for
-// the residual case the sentinel cannot see (a same-length, mtime-preserved byte
-// edit). The load-time full verify is unconditional (it ignores this throttle), so
-// an out-of-band edit present at boot still fails loud immediately. Injectable via
-// AuditLogConfig.eagerReverifyIntervalMs / AUDIT_EAGER_REVERIFY_INTERVAL_MS env so
-// tests can drive the backstop timing deterministically.
+// in-memory view is maintained eagerly on every local append, so locally
+// appended entries are visible immediately. The byte-pass
+// cadence below detects out-of-band changes independently of metadata; this
+// older backstop remains an additional trigger and can tighten that cadence.
 const DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS = 30_000;
-// Sentinel self-throttle. The fingerprint sentinel runs a metadata-only
-// `storage.list()` (no decrypt, no full hash) to catch out-of-band edits on the
-// hot SSE path event-driven, but a full per-read `list()` over 10k entries on a
-// ~5s SSE cadence would itself start to load the event loop, so we cap the
-// sentinel's OWN cadence to this short interval. It stays far below the backstop
-// interval, so an out-of-band fingerprint change is still caught within seconds.
-const AUDIT_EAGER_SENTINEL_INTERVAL_MS = 2_000;
+// Must match POSTURE_PANEL_REUSE_MS in principal-policy/panel-producer.ts.
+// Every surviving entry is read on the first eager read after this interval.
+export const AUDIT_EAGER_SENTINEL_INTERVAL_MS = 2_000;
+// Default retention fits in the cache; larger chains verify the excess in full.
+export const AUDIT_VERIFY_CACHE_MAX_ENTRIES = DEFAULT_MAX_ENTRIES;
+/** Retain only the newest summaries from an ascending-sequence verification pass. */
+export class BoundedVerificationEntries<T> {
+  readonly entries = new Map<string, T>();
+  evicted = 0;
+  constructor(private readonly cap: number) {}
+  get size(): number { return this.entries.size; }
+  retain(key: string, value: T): this {
+    // loadPersistedEntries walks ascending sequence; evict before insertion so even transient size stays capped.
+    if (!this.entries.has(key) && this.size >= this.cap) {
+      this.entries.delete(this.entries.keys().next().value!);
+      this.evicted++;
+    }
+    this.entries.set(key, value);
+    return this;
+  }
+}
+type VerifiedEntrySummary = Pick<PersistedAuditEnvelopeV2,
+  "sequence" | "prev_hash" | "entry_hash" | "timestamp" | "schema_version"> & { entry: AuditEntry };
 
 /** Parse the eager-reverify backstop interval from config / env, defaulting to
  * {@link DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS}. A positive finite override
@@ -2121,6 +2133,10 @@ export class AuditLog {
   private epochMacKey: Uint8Array;
   /** Lazily-loaded prior-epoch audit keys (master rotations); null = not yet loaded. */
   private epochKeysCache: Uint8Array[] | null = null;
+  private verificationCache = new Map<string, VerifiedEntrySummary>();
+  private readonly verifyCacheMaxEntries: number;
+  private readonly eagerBytePassIntervalMs: number;
+  private verifiedUncachedLastPass = 0;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
@@ -2275,6 +2291,15 @@ export class AuditLog {
   private cachedSealedVerdict: { fingerprint: string; verdict: SealedRegionVerdict } | null = null;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
+    this.verifyCacheMaxEntries = config?.verifyCacheMaxEntries ?? AUDIT_VERIFY_CACHE_MAX_ENTRIES;
+    this.eagerBytePassIntervalMs = config?.eagerBytePassIntervalMs ?? AUDIT_EAGER_SENTINEL_INTERVAL_MS;
+    // Test overrides may tighten bounds, never silently enlarge them.
+    if (!Number.isInteger(this.verifyCacheMaxEntries) || this.verifyCacheMaxEntries <= 0 || this.verifyCacheMaxEntries > AUDIT_VERIFY_CACHE_MAX_ENTRIES) {
+      throw new Error("invalid verification cache cap");
+    }
+    if (!Number.isFinite(this.eagerBytePassIntervalMs) || this.eagerBytePassIntervalMs <= 0 || this.eagerBytePassIntervalMs > AUDIT_EAGER_SENTINEL_INTERVAL_MS) {
+      throw new Error("invalid eager byte pass interval");
+    }
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "audit-log");
     // F3: derive the rotation-anchor MAC key up front and never retain the raw
@@ -2311,6 +2336,8 @@ export class AuditLog {
       config?.maxInMemoryEntries ?? this.maxEntries,
       MIN_IN_MEMORY_ENTRY_FLOOR
     );
+    // Must match AuditLogConfig.maxInMemoryEntries: cache retention cannot defeat the daemon's RAM window.
+    this.verifyCacheMaxEntries = Math.min(this.verifyCacheMaxEntries, this.maxInMemoryEntries);
     this.integrityMode = config?.integrityMode ?? "strict";
     // Absence yields the writer behavior (rule 3): only an explicit opt-in
     // makes an instance read-only, so no production composition root can be
@@ -4164,28 +4191,26 @@ export class AuditLog {
     return auditEagerReadContext.run({ eager: true }, fn);
   }
 
-  /**
-   * Bring the in-memory verified view up to date for an eager read. Drains the
-   * append queue (so every queued append is reflected, never-stale), then decides
-   * whether a full on-disk re-scan is needed:
-   *   - the backstop throttle (never loaded, or `eagerReverifyIntervalMs` elapsed
-   *     since the last full verify), AND
-   *   - the SENTINEL: a cheap metadata fingerprint of the store compared to the
-   *     expected fingerprint (refreshed after each rescan and after this process's
-   *     own appends). A mismatch is an out-of-band change and forces an IMMEDIATE
-   *     full re-scan even if the backstop has not elapsed.
-   * It then enforces the SAME strict-mode integrity contract as `query` (findings
-   * → throw unless the caller opted in). See {@link queryEager}.
-   */
+  /** This instance's current in-memory state, not a fresh disk verification; reads no disk. */
+  currentInMemorySequence(): number { return this.nextSequence - 1; }
+
+  /** Read-only cache accounting from the last completed non-streaming verification pass. */
+  verificationCacheStats(): { cached_entries: number; cache_cap: number; verified_uncached_last_pass: number } {
+    return { cached_entries: this.verificationCache.size, cache_cap: this.verifyCacheMaxEntries,
+      verified_uncached_last_pass: this.verifiedUncachedLastPass };
+  }
+
+  /** Read every surviving entry's bytes after one pass interval, regardless of metadata. */
   private async ensureFreshEagerView(): Promise<void> {
     await this.appendQueue;
     const backstopDue =
       !this.loaded ||
-      Date.now() - this.lastFullVerifyAtMs >= this.eagerReverifyIntervalMs;
+      Date.now() - this.lastFullVerifyAtMs >= Math.min(this.eagerBytePassIntervalMs, this.eagerReverifyIntervalMs);
     // SENTINEL: only worth the metadata `list()` when we are NOT already going to
     // rescan, and at most once per the sentinel self-throttle so the hot SSE path
     // does not list the whole store on every read.
     const sentinelTripped = backstopDue ? false : await this.sentinelDetectsDrift();
+    // Metadata may trigger an earlier pass, but can never skip the scheduled byte pass.
     if (backstopDue || sentinelTripped) {
       // Full disk re-scan (also stamps lastFullVerifyAtMs + refreshes findings +
       // the expected fingerprint), single-flighted so concurrent board reads share
@@ -4216,19 +4241,7 @@ export class AuditLog {
     }
   }
 
-  /**
-   * Cheap, self-throttled out-of-band drift check for the eager read path.
-   * Returns true iff the live store fingerprint differs from the expected one
-   * (an on-disk change NOT attributable to this process's own appends), which
-   * forces an immediate full re-verify in {@link ensureFreshEagerView}.
-   *
-   * Self-throttled to {@link AUDIT_EAGER_SENTINEL_INTERVAL_MS}: between checks it
-   * returns false so the hot SSE path does not run `storage.list()` on every read
-   * at 10k entries. Drift is therefore caught on the first eager read after the
-   * sentinel interval has elapsed: within seconds, far below the backstop. If no
-   * expected fingerprint has been established yet (no rescan/append since boot),
-   * it returns false: the backstop / load-time verify owns that first pass.
-   */
+  /** Metadata drift is an optional early trigger, never evidence for skipping a byte pass. */
   private async sentinelDetectsDrift(): Promise<boolean> {
     const now = Date.now();
     if (now - this.lastSentinelCheckAtMs < AUDIT_EAGER_SENTINEL_INTERVAL_MS) {
@@ -4240,15 +4253,8 @@ export class AuditLog {
     return actual !== this.expectedStoreFingerprint;
   }
 
-  /**
-   * Cheap metadata fingerprint of the audit namespace: entry count, newest key,
-   * and a per-entry size+mtime aggregate. Built from ONE `storage.list()` (no
-   * read, NO decrypt, NO full hash), so it is safe to run on the hot eager path.
-   * Any out-of-band change that adds/removes an entry (count / newest key) or
-   * rewrites one in place (its `size_bytes` and/or `modified_at` change) flips
-   * this value. The ONLY out-of-band edit it cannot see is a same-length,
-   * mtime-preserved byte rewrite, caught by the throttled backstop full re-scan.
-   */
+  /** Metadata hint only: an out-of-band byte change in any entry is caught on
+   * the first eager read after one pass interval, even with identical metadata. */
   private async auditStoreFingerprint(): Promise<string> {
     let metas;
     try {
@@ -4269,7 +4275,7 @@ export class AuditLog {
     for (const m of metas) {
       sizeSum += m.size_bytes;
       // Fold the mtime string into a small rolling integer; collisions only cost
-      // a missed event-driven catch (the backstop still covers it), never a false
+      // a missed early trigger (the byte pass still covers it), never a false
       // green for a server-written entry.
       for (let i = 0; i < m.modified_at.length; i++) {
         mtimeAgg = (mtimeAgg * 31 + m.modified_at.charCodeAt(i)) >>> 0;
@@ -4278,11 +4284,7 @@ export class AuditLog {
     return `${metas.length}:${newestKey}:${sizeSum}:${mtimeAgg}`;
   }
 
-  /** Recompute + cache the expected store fingerprint as the current on-disk
-   * state. Called after a completed full re-verify and after each of this
-   * process's own appends, so the sentinel treats only OUT-OF-BAND changes as
-   * drift. A failure to list leaves the prior expected value untouched rather
-   * than poisoning it (the next sentinel/ backstop pass re-establishes it). */
+  /** Refresh the optional early-trigger hint; this never advances the byte-pass clock. */
   private async refreshExpectedStoreFingerprint(): Promise<void> {
     try {
       this.expectedStoreFingerprint = await this.auditStoreFingerprint();
@@ -5385,6 +5387,9 @@ export class AuditLog {
       return decrypt(encrypted, this.encryptionKey);
     } catch (primaryErr) {
       if (this.epochKeysCache === null) {
+        // Source has one lazy key-set load and no reload; invalidate at that transition
+        // so any future reload here cannot reuse summaries verified under older keys.
+        this.verificationCache.clear();
         this.epochKeysCache = await readAuditEpochKeys(this.storage, {
           epochWrapKey: this.epochWrapKey,
           epochMacKey: this.epochMacKey,
@@ -5430,6 +5435,7 @@ export class AuditLog {
     consumer?: VerifiedChainConsumer
   ): Promise<void> {
     const findings: AuditIntegrityFinding[] = [];
+    const cleanThisPass = new BoundedVerificationEntries<VerifiedEntrySummary>(this.verifyCacheMaxEntries);
     // Cheap full-chain metadata only; no decrypted payloads retained here.
     const legacyRawEntries: Array<{ key: string; raw: Uint8Array }> = [];
     const chainedEntries: Array<{
@@ -5548,6 +5554,18 @@ export class AuditLog {
           continue;
         }
 
+        // Exact read bytes are the only cache key; metadata never authenticates an entry.
+        const byteKey = sha256Hex(raw);
+        const cached = consumer ? undefined : this.verificationCache.get(byteKey);
+        if (cached) {
+          cleanThisPass.retain(byteKey, cached);
+          // Must match verifyCheckpoints entries: cached envelopes have empty ciphertext and cannot be rehashed.
+          // Chain metadata must not retain decrypted entries after the bounded window evicts them.
+          const { entry, ...metadata } = cached;
+          chainedEntries.push({ key: meta.key, envelope: { ...metadata, encrypted_payload_bytes: "" } });
+          pushWindow(cached.entry, cached);
+          continue;
+        }
         let parsed: unknown;
         try {
           parsed = JSON.parse(bytesToString(raw));
@@ -5593,6 +5611,11 @@ export class AuditLog {
               message: `audit entry ${meta.key} could not be decrypted at sequence ${parsed.sequence}`,
             });
             continue;
+          }
+          // Failed hash/decrypt results are never cached: their findings must recur every pass.
+          if (!consumer && expectedHash === parsed.entry_hash) {
+            const { sequence, prev_hash, entry_hash, timestamp, schema_version } = parsed;
+            cleanThisPass.retain(byteKey, { sequence, prev_hash, entry_hash, timestamp, schema_version, entry });
           }
           // Retain only cheap envelope metadata for the full-chain verify.
           chainedEntries.push({ key: meta.key, envelope: parsed });
@@ -5766,9 +5789,17 @@ export class AuditLog {
       // so the next eager read serves from this freshly-verified view without
       // re-paying, and re-baseline the sentinel fingerprint to this verified state
       // so subsequent out-of-band edits read as drift.
+      if (!consumer) {
+        // Evict everything absent or unclean this pass, keeping only the newest capped entries.
+        this.verificationCache = cleanThisPass.entries;
+        this.verifiedUncachedLastPass = cleanThisPass.evicted;
+      }
       this.lastFullVerifyAtMs = Date.now();
       await this.refreshExpectedStoreFingerprint();
     } catch (err) {
+      // An incomplete storage pass cannot establish the cache's clean-entry subset.
+      this.verificationCache.clear();
+      this.verifiedUncachedLastPass = 0;
       // A consumer that rejected a (successfully decrypted, hash-checked) entry
       // is NOT a storage failure: propagate its original error verbatim rather
       // than mislabeling it `storage_unavailable` and swallowing it into the
@@ -6805,6 +6836,7 @@ export class AuditLog {
   private async verifyCheckpoints(
     legacyCount: number,
     legacyAnchorHash: string,
+    // Must match loadPersistedEntries: a cache hit carries encrypted_payload_bytes: ""; no verifier may recompute a hash from chainedEntries.
     entries: PersistedAuditEnvelopeV2[],
     splitBoundary: AuditStoreSplitBoundaryLoadResult,
     findings: AuditIntegrityFinding[]

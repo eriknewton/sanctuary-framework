@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- the posture home stays up when one panel is slow: each panel has its own time budget and says when it is out of date, and audit-chain re-verification reuses results for entries whose bytes have not changed
 - An SDW import refused by the import handler for an empty or non-string source key reference now leaves a denial row in the audit log, like the other refusals the import handler makes before approval.
 - Lifting a lockdown is refused on a platform where stopping is unsupported, matching the stop.
 - A refused lockdown-lift approval shows the operator the reason it was refused.

@@ -6,7 +6,7 @@ import { buildHome } from "../../../../src/principal-policy/posture-routes.js";
 import { AuditLog } from "../../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../../src/core/random.js";
-import { createDashboardReadFlightMap } from "../../../../src/dashboard/read-response.js";
+import { createDashboardReadFlightMap } from "../../../../src/dashboard/read-response.js"; import { createPosturePanelStore } from "../../../../src/principal-policy/panel-producer.js";
 import { CASTLE_WALL_AUDIT_PROVENANCE_KEY, CASTLE_WALL_AUDIT_PROVENANCE_VALUE } from "../../../../src/castle-wall/constants.js";
 
 export const OVERVIEW_MINUTE_MS = 60 * 1000;
@@ -31,14 +31,14 @@ export async function overviewScenarios(now: number) {
         dest_host: i === 0 ? null : `destination-${String(i).padStart(2, "0")}.example`, dest_port: 443,
       } });
   }
-  const deps = { auditLog, originMachine: ORIGIN, listAgents: () => records,
+  const deps = { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, auditLog, originMachine: ORIGIN, listAgents: () => records,
     detectInstalledHarnesses: async () => [{ harness: "cursor" as const, platform: "cursor" as const, config_path: "/fixture/cursor.json" }],
     resolveProtectionClaimSubject: () => SUBJECT, platform: "linux" as const, now: () => now,
-    readFlightMap: createDashboardReadFlightMap(),
+    panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
   };
   const base = await buildHome(deps);
   const healthy = { ...base } satisfies PostureHome;
-  const failHonest = { ...await buildHome({ ...deps, producerKeyExpectedButUnavailable: true }) } satisfies PostureHome;
+  const failHonest = { ...await buildHome({ ...deps, producerKeyObservation: "unreadable" }) } satisfies PostureHome;
   await auditLog.appendCritical({ layer: "l1", operation: "egress_verdict_superseded", identity_id: SUBJECT,
     result: "failure", timestamp, details: { [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE } });
   const overrides = { ...await buildHome(deps) } satisfies PostureHome;
@@ -74,4 +74,32 @@ export async function overviewScenarios(now: number) {
     } satisfies SovereigntyRoutePayload["live_enforcement"];
     return { ...sc, agents: sc.home.agents.length ? records : [], sovereignty: { live_enforcement }, inbox: [], activity: [], findings: [] };
   });
+}
+
+/** Producer-emittable observations crossed with the panel and evidence clocks. */
+export function auditConsumerAgreementMatrix(now: number) {
+  const pairs = [
+    { chain_verified: false, chain_verdict: "verified_suffix_only", integrity_finding_count: 0 },
+    { chain_verified: true, chain_verdict: "verified", integrity_finding_count: 0 },
+    { chain_verified: false, chain_verdict: "findings", integrity_finding_count: 1 },
+    { chain_verified: false, chain_verdict: "findings", integrity_finding_count: 0 },
+  ];
+  return pairs.flatMap(pair => ["current", "expired", "observation_superseded", "budget_exceeded"].map(mode => {
+    const fresh = mode === "current" || mode === "expired";
+    const digest = { ...pair, chain_verified: fresh && pair.chain_verified,
+      window_end: new Date(now - (mode === "expired" ? OVERVIEW_FRESHNESS_MS + 1 : 1)).toISOString() };
+    return { name: pair.chain_verdict + "/" + pair.integrity_finding_count + "/" + mode, digest,
+      panel: { state: fresh ? "fresh" : "stale", reason: fresh ? null : mode, age_ms: OVERVIEW_FRESHNESS_MS },
+      output: pair.chain_verdict === "findings" ? "FAILED" : mode === "observation_superseded" ? "WITHHELD"
+        : mode !== "current" ? "NEUTRAL" : pair.chain_verdict === "verified" ? "GREEN" : "AMBER" };
+  }));
+}
+/** Normalize only the audit badge, never another green claim elsewhere on the page. */
+export function auditOutputClass(output: string): string {
+  if (output.includes("FAILED")) return "FAILED";
+  if (output.includes("WITHHELD")) return "WITHHELD";
+  if (/pill green|state-chip good/.test(output)) return "GREEN";
+  if (/pill amber|state-chip warn/.test(output) && /SUFFIX[- ]ONLY/.test(output)) return "AMBER";
+  if (/UNVERIFIED|NOT YET VERIFIED|pill red/.test(output)) return "UNVERIFIED";
+  return "NEUTRAL";
 }

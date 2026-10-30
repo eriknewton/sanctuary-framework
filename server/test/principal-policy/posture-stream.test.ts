@@ -40,7 +40,7 @@ import {
 } from "../../src/principal-policy/posture-stream.js";
 import { renderPostureHomeHTML } from "../../src/principal-policy/posture-home-html.js";
 import type { DetectedHarness } from "../../src/principal-policy/posture.js";
-import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js"; import { createPosturePanelStore } from "../../src/principal-policy/panel-producer.js";
 const FORTRESS = "fortress:test";
 
 function subjectForUid(uid: number): string {
@@ -140,7 +140,7 @@ function baseDeps(
   const detected: DetectedHarness[] = [
     { platform: "cursor", harness: "cursor", config_path: "/home/u/.cursor/mcp.json" },
   ];
-  return { readFlightMap: createDashboardReadFlightMap(),
+  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => agents,
@@ -318,26 +318,26 @@ describe("posture SSE stream (server)", () => {
     expect(text).toContain(": heartbeat");
   });
 
-  it("(c) emits an honest `error` event (never stale-green) when buildHome fails", async () => {
-    // A deps whose listAgents throws makes buildHome reject; the stream must
-    // surface an explicit error frame, not a fabricated payload.
+  it("(c) isolates roster failure without error text or active-agent claims", async () => {
+    const privateMessage = "roster-private-message-847", privateStack = "roster-private-stack-847";
     const failing = baseDeps(newLog(), [], {
-      streamRegistry: createPostureStreamRegistry(),
-      streamIntervalMs: 50,
-      streamHeartbeatMs: 5000,
-      listAgents: () => {
-        throw new Error("boom");
-      },
+      streamRegistry: createPostureStreamRegistry(), streamIntervalMs: 50, streamHeartbeatMs: 5000,
+      listAgents: () => { const error = new Error(privateMessage); error.stack = privateStack; throw error; },
     });
     const base = await serve(failing);
-    const { text } = await readStreamUntil(base, POSTURE_STREAM_PATH, (buf) =>
-      buf.includes("event: error"),
-    );
-    expect(text).toContain("event: error");
-    expect(text).toContain("posture_read_failed");
-    // The error frame carries NO home payload fields - it cannot be mistaken
-    // for fresh green data.
-    expect(text).not.toContain("arm_state");
+    const { text } = await readStreamUntil(base, POSTURE_STREAM_PATH,
+      buf => buf.includes("event: home") && buf.includes("\n\n"));
+    expect(text).toContain("event: home"); expect(text).not.toContain("event: error");
+    const snapshots = text.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice("data: ".length)));
+    expect(snapshots.length).toBeGreaterThan(0);
+    for (const home of snapshots) {
+      expect(home.panels.agents_roster).toMatchObject({ state: "unavailable", reason: "producer_failed" });
+      expect(home.agents.every((agent: { enforcement_active: unknown }) => agent.enforcement_active !== true && agent.enforcement_active !== "active")).toBe(true);
+      expect(home.panels.castle_wall.state).toBe("fresh");
+      expect(home.castle_wall).toMatchObject({ arm_state: "unknown", evidence_basis: "no_evidence" });
+    }
+    expect(text).not.toMatch(/"enforcement_active"\s*:\s*(?:true|"active")/);
+    expect(text).not.toContain(privateMessage); expect(text).not.toContain(privateStack);
   });
 
   it("(c) the stream is behind the audit-null 503 guard (never opens on a locked log)", async () => {

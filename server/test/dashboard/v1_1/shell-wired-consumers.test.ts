@@ -67,6 +67,7 @@ const response = (body: unknown, status = 200, init: Record<string, unknown> = {
 });
 const never = () => new Promise<never>(() => {});
 const home = (digest: Record<string, unknown> = {}) => ({
+  panels: { digest: { state: "fresh", reason: null } },
   origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest,
   protection_requested_count: 0, enforcement_confirmed_count: 0,
 });
@@ -2583,7 +2584,8 @@ describe("slice 3 Overview wired consumers", () => {
     expect(locked.el.main!.innerHTML).toContain("LOCKED DOWN");
     const suffixOnly = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "verified_suffix_only", window_end: "2026-10-14T16:59:00.000Z" }));
     expect(suffixOnly.el.main!.innerHTML).toContain("SUFFIX ONLY");
-    expect(suffixOnly.el.main!.innerHTML).toContain("digest from 1m ago, not verified");
+    expect(suffixOnly.el.main!.innerHTML).not.toContain("NOT YET VERIFIED");
+    expect(suffixOnly.el.main!.innerHTML).toContain("sealed history not re-verifiable at this privilege");
     const keyUnavailable = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "key_unavailable", window_end: "2026-10-14T16:59:00.000Z" }));
     expect(keyUnavailable.el.main!.innerHTML).toContain("NOT YET VERIFIED");
     expect(keyUnavailable.el.main!.innerHTML).toContain("digest from 1m ago, not verified");
@@ -3353,7 +3355,7 @@ describe("slice 6a Agents wired consumers", () => {
 });
 
 // These scenarios are also imported by the untracked lane capture script.
-import { overviewScenarios, OVERVIEW_FRESHNESS_MS } from "./fixtures/overview-scenarios.js";
+import { overviewScenarios, OVERVIEW_FRESHNESS_MS, auditConsumerAgreementMatrix, auditOutputClass } from "./fixtures/overview-scenarios.js";
 async function bootOverview3b(change?: (home: Record<string, any>) => void, scenario = "healthy") {
   vi.useFakeTimers();
   const scenarios = await overviewScenarios(Date.now());
@@ -3418,6 +3420,57 @@ describe("Overview 3b served evidence", () => {
     expect(tile).toContain("chain not verified");
     expect(tile).not.toContain("0 findings");
     expect(tile).toContain("not verified");
+  });
+
+  it("withholds a superseded clean digest badge and retains a failed stale badge", async () => {
+    const { capStalePanel } = await import("../../../src/principal-policy/panel-producer.js");
+    const clean = await bootOverview3b(home => {
+      expect(home.digest.chain_verified).toBe(true);
+      home.digest = capStalePanel("digest", home.digest);
+      home.panels.digest = { ...home.panels.digest, state: "stale", reason: "observation_superseded" };
+    });
+    expect(auditTile(clean)).toContain("WITHHELD");
+    expect(auditTile(clean)).toContain("observation superseded");
+    expect(auditTile(clean)).not.toContain("FAILED");
+    expect(auditTile(clean)).not.toContain(">VERIFIED<");
+    const failed = await bootOverview3b(home => {
+      Object.assign(home.digest, { chain_verified: false, chain_verdict: "findings", integrity_finding_count: 1 });
+      home.panels.digest = { ...home.panels.digest, state: "stale", reason: "budget_exceeded" };
+    });
+    expect(auditTile(failed)).toContain("FAILED");
+    expect(auditTile(failed)).toContain("Last checked");
+    expect(auditTile(failed)).not.toContain("WITHHELD");
+  });
+
+  it("preserves observed digest verdicts across the four freshness badge combinations", async () => {
+    const { capStalePanel } = await import("../../../src/principal-policy/panel-producer.js");
+    for (const verdict of ["verified", "findings"] as const) {
+      for (const reason of ["observation_superseded", "budget_exceeded"] as const) {
+        const h = await bootOverview3b(home => {
+          Object.assign(home.digest, { chain_verdict: verdict, chain_verified: verdict === "verified", integrity_finding_count: verdict === "findings" ? 1 : 0 });
+          home.digest = capStalePanel("digest", home.digest);
+          expect(home.digest.chain_verdict).toBe(verdict);
+          home.panels.digest = { ...home.panels.digest, state: "stale", reason };
+        });
+        const tile = auditTile(h);
+        expect(tile).not.toContain(">VERIFIED<");
+        expect(tile).toContain("Last checked");
+        if (verdict === "findings") {
+          expect(tile).toContain("FAILED"); expect(tile).toContain("1 finding"); expect(tile).not.toContain("WITHHELD");
+        } else {
+          expect(tile).not.toContain("FAILED");
+          if (reason === "observation_superseded") expect(tile).toContain("WITHHELD");
+          else expect(tile).not.toContain("WITHHELD");
+        }
+      }
+    }
+    const zero = await bootOverview3b(home => {
+      Object.assign(home.digest, { chain_verdict: "findings", chain_verified: false, integrity_finding_count: 0 });
+      home.panels.digest = { ...home.panels.digest, state: "stale", reason: "observation_superseded" };
+    });
+    expect(auditTile(zero)).toContain("FAILED");
+    expect(auditTile(zero)).toContain("chain not verified");
+    expect(auditTile(zero)).not.toContain("WITHHELD");
   });
 
   it("A1 Audit chain chip uses the singular for one finding", async () => {
@@ -5528,5 +5581,56 @@ describe("Talk split draft ownership", () => {
     expect(runInContext("state.chat.concierge.sending", h.context)).toBe(false);
     expect(runInContext("state.chat.concierge.messages.length", h.context), "test premise: the history refresh landed").toBe(2);
     expect(runInContext("state.chat.concierge.badge.displayLabel", h.context)).toBe("Concierge: Local model (fixture 7B)");
+  });
+});
+
+
+describe("audit consumer structural agreement matrix", () => {
+  it("SPA agrees on every producer pair and panel clock cell", async () => {
+    for (const cell of auditConsumerAgreementMatrix(Date.now())) {
+      const h = await bootOverview3b(home => {
+        Object.assign(home.digest, cell.digest);
+        home.panels.digest = cell.panel;
+      });
+      const tile = auditTile(h);
+      expect.soft(auditOutputClass(tile), cell.name).toBe(cell.output);
+      if (cell.output === "FAILED") {
+        expect.soft(tile, cell.name).toContain(cell.digest.integrity_finding_count ? "1 finding" : "chain not verified");
+        expect.soft(tile, cell.name).not.toContain("WITHHELD");
+        expect.soft(tile, cell.name).not.toMatch(/state-chip (good|warn)/);
+      } else if (cell.output === "WITHHELD") {
+        expect.soft(tile, cell.name).toContain("observation superseded");
+        expect.soft(tile, cell.name).not.toMatch(/state-chip (good|bad)|FAILED|VERIFIED/);
+      } else if (cell.output === "GREEN") {
+        expect.soft(tile, cell.name).toContain("VERIFIED");
+        expect.soft(tile, cell.name).not.toMatch(/state-chip (bad|warn)|FAILED|UNVERIFIED/);
+      } else if (cell.output === "AMBER") {
+        expect.soft(tile, cell.name).toContain("sealed history not re-verifiable at this privilege");
+        expect.soft(tile, cell.name).not.toMatch(/state-chip (good|bad)|NOT YET VERIFIED/);
+      } else if (cell.output === "NEUTRAL") {
+        expect.soft(tile, cell.name).toContain("last verified");
+        expect.soft(tile, cell.name).not.toMatch(/state-chip (good|bad)|FAILED|VERIFIED/);
+      }
+    }
+    // Missing panel entries fail closed too, even if the body carries an old clean flag.
+    const missing = await bootOverview3b(home => { delete home.panels.digest; });
+    expect.soft(auditOutputClass(auditTile(missing)), "missing panel").toBe("NEUTRAL");
+  });
+
+  it("suffix observations keep coverage precedence and only fresh observations contribute expiry", async () => {
+    const h = await bootOverview3b(home => {
+      Object.assign(home.digest, { chain_verified: false, chain_verdict: "verified_suffix_only",
+        window_complete: false, window_incomplete_reason: "sealed_region" });
+    });
+    expect(runInContext("auditChainCheckCurrent(state.posture.home.digest, state.posture.home.panels.digest)", h.context)).toBe(true);
+    expect(runInContext("postureHomeExpiryAt({digest: state.posture.home.digest, panels: state.posture.home.panels})", h.context)).toBeTypeOf("number");
+    expect(outboundHtml(h)).toContain("sealed audit region coverage not established");
+    expect(outboundHtml(h)).not.toContain("chain not verified");
+    runInContext('state.posture.home.panels.digest.state = "stale"', h.context);
+    expect(runInContext("auditChainCheckCurrent(state.posture.home.digest, state.posture.home.panels.digest)", h.context)).toBe(false);
+    expect(runInContext("postureHomeExpiryAt({digest: state.posture.home.digest, panels: state.posture.home.panels})", h.context)).toBeNull();
+    expect(runInContext("renderOutboundConnections(state.posture.home.digest, true, state.posture.home.panels.digest)", h.context)).toContain("sealed audit region coverage not established");
+    runInContext('state.posture.home.digest.window_complete = true', h.context);
+    expect(runInContext("renderOutboundConnections(state.posture.home.digest, true, state.posture.home.panels.digest)", h.context)).toContain("audit check not current");
   });
 });
