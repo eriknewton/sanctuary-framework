@@ -248,11 +248,22 @@ interface HoldReasonTemplate {
  * Every reason template the approval gate writes. Each `render` must match,
  * byte for byte, the reason string at its site in
  * server/src/principal-policy/gate.ts (classifyOperation, detectAnomaly and the
- * proxy branch of evaluate); a drifted template only makes that reason fall
+ * proxy branch of evaluate, and ownScopeSaveHold); a drifted template only makes that reason fall
  * back to the code `unrecognized`, never to its raw text. The code list must
- * match HUB_HOLD_REASON_CODES in server/src/contracts/v1.1/hub-events.ts.
+ * match HUB_HOLD_REASON_CODES in server/src/contracts/v1.1/hub-events.ts and
+ * HOLD_REASON_SENTENCES in server/src/dashboard/v1_1/client.ts.
  */
 export const HOLD_REASON_TEMPLATES: readonly HoldReasonTemplate[] = [
+  {
+    code: "memory_save_quota_reached",
+    gateSource: "memory save quota reached",
+    render: () => ({ text: "memory save quota reached" }),
+  },
+  {
+    code: "memory_save_quota_unavailable",
+    gateSource: "memory save quota unavailable",
+    render: () => ({ text: "memory save quota unavailable" }),
+  },
   {
     code: "tier1_forced",
     gateSource: '"${operation}" is a forced Tier 1 operation (always requires approval)',

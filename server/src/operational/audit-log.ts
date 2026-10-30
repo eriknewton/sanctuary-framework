@@ -9,6 +9,7 @@
  * can inspect what their agent has done.
  */
 
+import { MEMORY_SAVE_AUDIT_OPERATIONS } from "../principal-policy/types.js";
 import { lstat, mkdir, open, readFile, readdir, rm, link, stat, unlink } from "node:fs/promises";
 import { readFileSync, type Stats } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -3977,6 +3978,8 @@ export class AuditLog {
     layer?: AuditEntry["layer"];
     operation_type?: string;
     identity_id?: string;
+    /** Operator Evidence display filter; independent of the own-signed identity authorization filter. */
+    evidence_agent?: string;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
@@ -4019,6 +4022,13 @@ export class AuditLog {
     // limit must bound the caller's OWN entries, not a global page.
     if (options.identity_id !== undefined) {
       filtered = filtered.filter((e) => e.identity_id === options.identity_id);
+    }
+
+    if (options.evidence_agent !== undefined) {
+      // Display attribution must match MEMORY_SAVE_AUDIT_OPERATIONS in principal-policy/types.ts and evidenceAgent in dashboard/v1_1/client.ts.
+      // Filter before pagination; identity_id above remains a separate session-based access constraint.
+      filtered = filtered.filter(e => e.identity_id === options.evidence_agent ||
+        (MEMORY_SAVE_AUDIT_OPERATIONS.includes(e.operation) && e.details?.agent_id === options.evidence_agent));
     }
 
     const total = filtered.length;

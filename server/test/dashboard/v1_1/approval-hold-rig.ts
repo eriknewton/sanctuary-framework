@@ -8,7 +8,7 @@ import { MemoryStorage } from '../../../src/storage/memory.js';
 import { AuditLog } from '../../../src/operational/audit-log.js';
 import { BaselineTracker } from '../../../src/principal-policy/baseline.js';
 import { ApprovalGate } from '../../../src/principal-policy/gate.js';
-import { DEFAULT_POLICY } from '../../../src/principal-policy/loader.js';
+import { DEFAULT_POLICY, parsePolicy } from '../../../src/principal-policy/loader.js';
 import { OperatorAuthorizationSpentStore } from '../../../src/v1/operator-authorization-spent-store.js';
 import { getFreePort } from '../../helpers/free-port.js';
 
@@ -22,11 +22,12 @@ export async function approvalHoldRig(timeoutSeconds = 20, options: { port?: num
   const token = options.token ?? randomBytes(32).toString('hex');
   const port = options.port ?? await getFreePort();
   const channel = new DashboardApprovalChannel({ port, host: '127.0.0.1', timeout_seconds: timeoutSeconds, auth_token: token, auto_open: false });
-  channel.setDependencies({ policy: DEFAULT_POLICY, baseline, auditLog });
+  const policy = parsePolicy(JSON.stringify({ ...DEFAULT_POLICY, memory_save_approval: "always" }));
+  channel.setDependencies({ policy, baseline, auditLog });
   await channel.setOperatorAuthorizationSpentStore(OperatorAuthorizationSpentStore.durableFromBoot(storage, masterKey));
   const bindings = buildV11Bindings({ identityId: 'approval-test', fortressId: 'approval-fortress', storage, masterKey, auditLog, storagePath, warnProducerKeyUnavailable: () => {} });
   channel.setV11Bindings(bindings);
-  const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+  const gate = new ApprovalGate(policy, baseline, channel, auditLog);
   await channel.start();
   const url = `http://127.0.0.1:${port}`;
   const request = (path: string, method = 'GET') => fetch(url + path, { method, headers: { Connection: 'close', Authorization: `Bearer ${token}`, ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}) }, ...(method === 'POST' ? { body: '{}' } : {}) });

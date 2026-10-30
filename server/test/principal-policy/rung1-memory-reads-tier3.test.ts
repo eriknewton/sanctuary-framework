@@ -1,3 +1,4 @@
+// fail-before-exempt: this change removes memory_insert from the approval-gated verb list (own-memory saves are silent by default, Erik 2026-10-29); it narrows existing assertions and adds none, so it cannot fail against pre-change source. memory-saves-policy.test.ts proves the new default.
 /**
  * Rung 1 hands-free restart read: `memory_get` and `memory_search` are
  * Tier-3 auto-allow under the default policy so the documented acceptance
@@ -6,7 +7,7 @@
  * approval channel. The vault is one operator-owned memory scope shared by
  * every agent connected to the fortress; the one-owner guard refuses a
  * second distinct wrapped identity where an identity resolver is wired.
- * Writes (`memory_insert`, `memory_delete`) and every plaintext-crossing
+ * Deletion (`memory_delete`) and every plaintext-crossing
  * verb (`memory_ingest`, `memory_emit`) stay Tier 1.
  *
  * An unattended read carries its own ceiling on the work one call can buy.
@@ -41,9 +42,8 @@ import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
 /** The two reads the Rung 1 restart acceptance step performs unattended. */
 const HANDS_FREE_MEMORY_READS = ["memory_get", "memory_search"] as const;
 
-/** Memory verbs that commit, destroy, or materialize plaintext: never unattended by default. */
+/** Memory verbs that destroy or materialize plaintext: never unattended by default. */
 const APPROVAL_GATED_MEMORY_VERBS = [
-  "memory_insert",
   "memory_delete",
   "memory_ingest",
   "memory_emit",
@@ -118,7 +118,7 @@ describe("Rung 1: memory_get / memory_search are Tier 3 under the default policy
     }
   });
 
-  it("DEFAULT_POLICY keeps the write and plaintext-crossing verbs under Tier 1, not Tier 3", () => {
+  it("DEFAULT_POLICY keeps deletion and plaintext-crossing verbs under Tier 1, not Tier 3", () => {
     for (const op of APPROVAL_GATED_MEMORY_VERBS) {
       expect(DEFAULT_POLICY.tier1_always_approve, op).toContain(op);
       expect(DEFAULT_POLICY.tier3_always_allow, op).not.toContain(op);
@@ -138,10 +138,9 @@ describe("Rung 1: memory_get / memory_search are Tier 3 under the default policy
     expect(search.allowed).toBe(true);
   });
 
-  it("the gate classifies insert, delete, ingest, and emit as Tier 1", async () => {
+  it("the gate classifies delete, ingest, and emit as Tier 1", async () => {
     const gate = defaultGate();
     const args: Record<(typeof APPROVAL_GATED_MEMORY_VERBS)[number], Record<string, unknown>> = {
-      memory_insert: { text: "marker", taint: "user_content" },
       memory_delete: { passage_id: "marker-1" },
       memory_ingest: { harness: "claude-code", dir: "/tmp/source" },
       memory_emit: { format: "markdown", out_dir: "/tmp/out" },

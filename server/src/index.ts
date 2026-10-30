@@ -1643,6 +1643,7 @@ export async function createSanctuaryServer(options?: {
     {
       currentSessionBinding,
       approvalProofStore,
+      ownScopeSaveStateDirectory: joinPath(config.storage_path, "state", "_memory_save_quota"),
       // Same server-set supplier as createServer's currentAgentId below, so a
       // held call's card names the agent the router attributes the call to.
       currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
@@ -1887,9 +1888,9 @@ export async function createSanctuaryServer(options?: {
   //
   // owner_ref scopes these passages to one engine instance under this fortress
   // (SDW identifier grammar, no '.'); a single-machine substrate uses one
-  // stable scope. memory_insert/memory_delete are Tier-1 in DEFAULT_POLICY
-  // (the delete additionally force-pinned, un-relaxable); memory_insert's body
-  // is redacted from the approval channel below (Hard Constraint #1).
+  // stable scope. Own-memory inserts are silent and audited by default;
+  // deletion stays forced Tier 1. If insert approval is enabled in policy,
+  // its body is redacted from the approval channel below (Hard Constraint #1).
   const sdwMemoryIdentity = wrappedAgentIdentityFromEnv;
   const sdwFortressId = fortressIdFromStoragePath(config.storage_path);
   const sdwMemorySigningHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);

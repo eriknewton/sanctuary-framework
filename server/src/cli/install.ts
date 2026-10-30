@@ -393,7 +393,7 @@ export interface AgentInstallPlan {
     custody_access: CustodyAccessObservation;
     custody_mutation: CustodyMutationObservation;
     recovery_factor: RecoveryFactorObservation;
-    // memory_insert and sdw_memory_provenance are Tier 1. A mechanically
+    // Provenance, deletion and export still require approval. A mechanically
     // installed memory surface is not daily-ready when its selected channel
     // is the deliberately non-interactive stderr channel, or when a dashboard
     // has no operator bearer configured for strict approve/deny routes.
@@ -1580,7 +1580,7 @@ function configureInteractiveTier1ApprovalAction(fortress: string): AgentInstall
       `${join(fortress, "sanctuary.json")} and set dashboard.auth_token to a strong ` +
       `explicit bearer that the operator retains privately; do not use "auto", because ` +
       `the MCP launch session is read-only and does not disclose its generated bearer. ` +
-      `Do not move memory_insert out of Tier 1. Quit and relaunch the selected harness, ` +
+      `Own-memory saves run without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested. Provenance, delete and export still need approval. Quit and relaunch the selected harness, ` +
       `then rerun this installer. Enter the bearer only into the local dashboard when it ` +
       `asks for the operator token.`,
     completion:

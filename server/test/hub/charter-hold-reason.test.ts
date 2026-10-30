@@ -13,10 +13,14 @@
  * reworded reason fails here instead of reaching the operator as unrecognised.
  */
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import ts from "typescript";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ApprovalGate } from "../../src/principal-policy/gate.js";
+import { ApprovalGate, OWN_SCOPE_SAVE_MAX_PER_WINDOW, OWN_SCOPE_SAVE_WINDOW_MS } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -276,6 +280,11 @@ function expectConsoleWordsOnly(prose: string): void {
 describe("structured hold reasons", () => {
   let storage: MemoryStorage;
   let masterKey: Uint8Array;
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
+  });
 
   beforeEach(() => {
     storage = new MemoryStorage();
@@ -288,6 +297,8 @@ describe("structured hold reasons", () => {
     toolName: string,
     args: Record<string, unknown>,
     setup?: (gate: ApprovalGate) => Promise<void> | void,
+    options?: ConstructorParameters<typeof ApprovalGate>[7],
+    invokedToolName?: string,
   ): Promise<{ request: ApprovalRequest; reason: HubHoldReason }> {
     const seen: ApprovalRequest[] = [];
     const gate = new ApprovalGate(
@@ -295,9 +306,10 @@ describe("structured hold reasons", () => {
       new BaselineTracker(storage, masterKey),
       capturingChannel(seen),
       new AuditLog(storage, masterKey),
+      undefined, undefined, undefined, options,
     );
     await setup?.(gate);
-    await gate.evaluate(toolName, args);
+    await gate.evaluate(toolName, args, undefined, undefined, invokedToolName);
     const request = seen.at(-1);
     expect(request, `${toolName} was held`).toBeDefined();
     return {
@@ -334,7 +346,7 @@ describe("structured hold reasons", () => {
   it("the gate reason coverage fails on a new reason in any literal form and refuses a form it does not model", () => {
     const source = readGateSource();
     // A new reason passed straight to requestApproval, in each literal form the gate could use.
-    const evaluateAnchor = "    const classification = this.classifyOperation(toolName, args);\n";
+    const evaluateAnchor = "    const classification = this.classifyOperation(toolName, args, { invokedToolName });\n";
     expect(source.split(evaluateAnchor)).toHaveLength(2);
     const withDirectReason = (reason: string) =>
       source.replace(evaluateAnchor, `    if (args.mutation) return this.requestApproval(operation, 2, ${reason}, {});\n${evaluateAnchor}`);
@@ -397,13 +409,37 @@ describe("structured hold reasons", () => {
         tier3_always_allow: [...DEFAULT_POLICY.tier3_always_allow, "identity_sign"],
       },
     );
+    const directory = await mkdtemp(join(tmpdir(), "hold-save-allowance-"));
+    directories.push(directory);
+    const caller = "hold-reason-owner";
+    // Seed the caller's exhausted window so this exercises real persisted admission without a timing-dependent fill loop.
+    await writeFile(join(directory, "own-scope-save-quota.json"), JSON.stringify([
+      [createHash("sha256").update(`agent:${caller}`).digest("hex"), Date.now(), OWN_SCOPE_SAVE_MAX_PER_WINDOW, OWN_SCOPE_SAVE_MAX_PER_WINDOW],
+    ]));
     const cases: Array<{
       expected: HubHoldReason;
       policy: PrincipalPolicy;
       tool: string;
       args: Record<string, unknown>;
       setup?: (gate: ApprovalGate) => Promise<void> | void;
+      options?: ConstructorParameters<typeof ApprovalGate>[7];
+      invokedToolName?: string;
+      sentence?: string;
+      context?: Record<string, unknown>;
     }> = [
+      {
+        expected: { code: "memory_save_quota_reached" }, policy: DEFAULT_POLICY,
+        tool: "memory_insert", args: { text_bytes: 1 }, invokedToolName: "memory_insert",
+        options: { ownScopeSaveStateDirectory: directory, currentAgentId: () => caller },
+        context: { count: OWN_SCOPE_SAVE_MAX_PER_WINDOW, bytes: OWN_SCOPE_SAVE_MAX_PER_WINDOW, window_ms: OWN_SCOPE_SAVE_WINDOW_MS },
+        sentence: "This agent has used its memory save allowance for now, so this save asks for approval.",
+      },
+      {
+        expected: { code: "memory_save_quota_unavailable" }, policy: DEFAULT_POLICY,
+        tool: "memory_insert", args: { text_bytes: 1 }, invokedToolName: "memory_insert",
+        context: { cause_class: "storage_unconfigured" },
+        sentence: "The memory save allowance could not be checked, so this save asks for approval.",
+      },
       { expected: { code: "tier1_policy" }, policy: DEFAULT_POLICY, tool: "state_export", args: {} },
       { expected: { code: "tier1_forced" }, policy: DEFAULT_POLICY, tool: "memory_delete", args: {} },
       {
@@ -489,7 +525,20 @@ describe("structured hold reasons", () => {
     ];
     const witnessed = new Set<string>();
     for (const c of cases) {
-      const { reason } = await heldThroughGate(c.policy, c.tool, c.args, c.setup);
+      const { request, reason } = await heldThroughGate(c.policy, c.tool, c.args, c.setup, c.options, c.invokedToolName);
+      if (c.context) expect(request.context).toEqual(c.context);
+      if (c.sentence) {
+        expect(request.tier).toBe(2);
+        const card = projectCharterApproval(
+          { id: "hold-save", operation: request.operation, tier: request.tier, created_at: request.timestamp, hold_reason: reason },
+          "operator-identity",
+        );
+        const { prose, subjects } = splitHeldReason(clientHoldReasonRenderer()(card));
+        expect(prose).toBe(c.sentence);
+        expect(subjects).toEqual([]);
+        expectConsoleWordsOnly(prose);
+        expect(prose).not.toMatch(/quota|admission|cause class|[0-9]|\u2014/);
+      }
       expect(reason, `${c.tool} -> ${c.expected.code}`).toEqual(c.expected);
       witnessed.add(reason.code);
     }

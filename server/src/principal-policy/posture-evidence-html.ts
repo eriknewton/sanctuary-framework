@@ -26,6 +26,7 @@
  * `renderPostureAgentHTML`.
  */
 
+import { MEMORY_SAVE_INTENT_OPERATIONS } from "./types.js";
 import {
   CONSOLE_FONT_FACE_CSS,
   POSTURE_ROOT_TOKENS_CSS,
@@ -259,7 +260,16 @@ export function renderPostureEvidenceHTML(): string {
       esc(label || raw) + "</span>";
   }
 
-  function resultPill(result) {
+  function resultPill(result, entry, entries) {
+    if (entry && ${JSON.stringify(MEMORY_SAVE_INTENT_OPERATIONS)}.includes(entry.operation)) {
+      // Intent operations must match MEMORY_SAVE_INTENT_OPERATIONS in principal-policy/types.ts.
+    // intent_audit_ref must match sdw/memory-tools.ts, agent-native/cooperative-surface.ts and dashboard/v1_1/client.ts.
+      var ref = entry.details && entry.details.audit_ref;
+      var recorded = typeof ref === "string" && entries.some(function (outcome) {
+        return outcome.operation === entry.operation.replace(/_intent$/, "") && outcome.details && outcome.details.intent_audit_ref === ref;
+      });
+      return '<span class="pill neutral">' + (recorded ? "save attempted, outcome recorded separately" : "save attempted, outcome not shown on this page") + "</span>";
+    }
     if (result === "success")
       return '<span class="pill green">success</span>';
     if (result === "failure")
@@ -343,7 +353,7 @@ export function renderPostureEvidenceHTML(): string {
         '<td class="ts">' + esc(e.timestamp) + "</td>" +
         "<td>" + layerPill(e.layer) + "</td>" +
         '<td class="op"><code>' + esc(e.operation) + "</code></td>" +
-        "<td>" + resultPill(e.result) + "</td>" +
+        "<td>" + resultPill(e.result, e, entries) + "</td>" +
         '<td style="max-width:220px;word-break:break-all;font-size:11px">' +
         esc(e.identity_id) + "</td>" +
         "<td>" + detailsHtml + "</td>" +

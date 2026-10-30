@@ -356,3 +356,26 @@ describe("GET /posture/evidence (HTML shell)", () => {
     expect(html).not.toContain('"pill green">chain verified');
   });
 });
+
+
+it.each(["sanctuary_remember", "memory_insert"])("legacy Evidence renders %s intent-only saves as attempted and preserves raw audit fields", async operation => {
+  const { runInNewContext } = await import("node:vm");
+  const elements = new Map<string, { innerHTML: string; value: string; addEventListener: () => void }>();
+  const document = { getElementById(id: string) {
+    if (!elements.has(id)) elements.set(id, { innerHTML: "", value: "", addEventListener() {} });
+    return elements.get(id)!;
+  } };
+  const intent = { operation: operation + "_intent", result: "success", identity_id: "session", details: { audit_ref: "intent:one" } };
+  const script = [...renderPostureEvidenceHTML().matchAll(/<script>([\s\S]*?)<\/script>/g)].find(match => match[1].includes("function renderEntries"))![1];
+  // Execute the shipping renderer with only its network read pending; no process or timer is retained.
+  const context = { document, window: {}, location: { search: "" }, URLSearchParams, fetch: () => new Promise(() => {}), intent };
+  runInNewContext(script.replace(/\}\)\(\);\s*$/, 'window.renderEntries = renderEntries; })();'), context);
+  const render = (context.window as { renderEntries: (data: unknown) => void }).renderEntries;
+  render({ entries: [intent], total: 1 });
+  expect(elements.get("entries-panel")!.innerHTML).toContain("save attempted, outcome not shown on this page");
+  expect(elements.get("entries-panel")!.innerHTML).not.toContain('pill green');
+  expect(intent.result).toBe("success");
+  expect(intent.operation).toBe(operation + "_intent");
+  render({ entries: [intent, { operation, result: "failure", details: { intent_audit_ref: "intent:one" } }], total: 2 });
+  expect(elements.get("entries-panel")!.innerHTML).toContain("save attempted, outcome recorded separately");
+});

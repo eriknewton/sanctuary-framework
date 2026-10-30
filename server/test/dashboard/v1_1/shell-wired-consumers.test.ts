@@ -1809,6 +1809,44 @@ describe("slice 5 Evidence wired consumers", () => {
     return h;
   };
 
+  it("names memory saves from bounded agent details and escapes the display", async () => {
+    const { CARD_OPERATION_MAX_CHARS } = await import("../../../src/hub/charter-approval-bridge.js");
+    const agent = "agent:<script>caller</script>";
+    const h = await bootEvidence(evidencePayload({ entries: [
+      { timestamp: now, layer: "l2", identity_id: "session-owner", operation: "sanctuary_remember", result: "success", details: { agent_id: agent } },
+    ] }));
+    expect(h.el.main!.innerHTML).toContain("agent:&lt;script&gt;caller&lt;/script&gt;");
+    expect(h.el.main!.innerHTML).not.toContain(agent);
+    for (const details of [{ agent_id: "untrusted" }, { agent_id: "agent:" + "x".repeat(CARD_OPERATION_MAX_CHARS) }, { agent_id: null }]) {
+      expect(runInContext("evidenceAgent(" + JSON.stringify({ operation: "sanctuary_remember", identity_id: "session-owner", details }) + ")", h.context)).toBe("session-owner");
+    }
+    expect(runInContext("evidenceAgent({})", h.context)).toBe("agent not named");
+    expect(runInContext("evidenceAgent(null)", h.context)).toBe("agent not named");
+    expect(runInContext("evidenceAgent()", h.context)).toBe("agent not named");
+    // The fix itself: a bounded agent-prefixed details.agent_id names the saving agent over the session identity.
+    expect(runInContext("evidenceAgent(" + JSON.stringify({ operation: "sanctuary_remember", identity_id: "session-owner", details: { agent_id: "agent:hermes" } }) + ")", h.context)).toBe("agent:hermes");
+  });
+
+  it("uses agent details only for the complete memory-save operation set", async () => {
+    const h = await bootEvidence(evidencePayload());
+    for (const operation of ["state_write", "memory_insert", "sanctuary_remember", "sanctuary_remember_intent", "memory_insert_intent"]) {
+      expect(runInContext("evidenceAgent(" + JSON.stringify({ operation, identity_id: "session", details: { agent_id: "agent:caller" } }) + ")", h.context)).toBe("agent:caller");
+    }
+    expect(runInContext('evidenceAgent({ operation: "state_read", identity_id: "session", details: { agent_id: "agent:caller" } })', h.context)).toBe("session");
+  });
+
+  it.each(["sanctuary_remember", "memory_insert"])("Evidence renders a %s intent as attempted until a linked outcome is served", async operation => {
+    const intent = { timestamp: now, layer: "l2", identity_id: "session", operation: operation + "_intent", result: "success", details: { agent_id: "agent:caller", audit_ref: "intent:one" } };
+    const h = await bootEvidence(evidencePayload({ entries: [intent] }));
+    const chip = runInContext("evidenceResultChip(" + JSON.stringify(intent) + ")", h.context) as string;
+    expect(chip).toContain("save attempted, outcome not shown on this page");
+    expect(chip).not.toMatch(/Success|success/);
+    expect(h.el.main!.innerHTML).toContain("save attempted, outcome not shown on this page");
+    expect(runInContext("evidenceResult(" + JSON.stringify(intent) + ")", h.context)).toBe("");
+    runInContext('state.evidence.view.entries.push(' + JSON.stringify({ operation, result: "failure", details: { intent_audit_ref: "intent:one" } }) + ')', h.context);
+    expect(runInContext("evidenceResultChip(" + JSON.stringify(intent) + ")", h.context)).toContain("save attempted, outcome recorded separately");
+  });
+
   it("renders every audit-chain verdict in its own words, plus failed and missing reads", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));

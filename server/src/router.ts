@@ -9,6 +9,7 @@
  * if the SDK API changes, only this module needs updating.
  */
 
+import { OWN_SCOPE_MEMORY_SAVES } from "./principal-policy/gate.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -160,6 +161,7 @@ export function createServer(
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as Record<string, unknown>;
     const currentAgentId = options?.currentAgentId?.();
+    // The `agent:` form must match audit writers in sdw/memory-tools.ts and agent-native/cooperative-surface.ts.
     // The `agent:` form must match requestingAgentId in
     // server/src/principal-policy/gate.ts, which attributes held calls.
     const callerIdentity = currentAgentId
@@ -261,7 +263,9 @@ export function createServer(
         approvalRef ? { approval_ref: approvalRef } : undefined,
         // Must match operatorPreviewSource in principal-policy/gate.ts. Registered identity and validated args are display-only;
         // keep enforcement target, gateArgs, proof binding, context and agent responses independent of this handoff.
-        { operation: name, args: handlerArgs }
+        { operation: name, args: handlerArgs },
+        // Registered names and target operations must match OWN_SCOPE_MEMORY_SAVES in principal-policy/gate.ts.
+        Object.hasOwn(OWN_SCOPE_MEMORY_SAVES, name) ? name : undefined
       );
       if (!result.allowed) {
         // Invariant #7: the agent-facing denial must not reveal which policy

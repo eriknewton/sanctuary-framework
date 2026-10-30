@@ -39,7 +39,6 @@
       "sdw_export",
       "sdw_import",
       "sdw_export_delete",
-      "memory_insert",
       "memory_delete",
       "memory_ingest",
       "memory_emit",
@@ -118,6 +117,7 @@
       "governor_status",
       "identity_set_primary",
       "memory_attest",
+      "memory_insert",
       "memory_get",
       "memory_search",
       "compliance_eu_ai_act_annex_iii_classify",
@@ -147,12 +147,12 @@
     "approval_redirect": {
       "enabled": false,
       "mode": "replace"
-    }
+    },
+    "memory_save_approval": "never"
   },
   "profileJson": {
     "version": 1,
     "tier1_always_approve": [
-      "memory_insert",
       "identity_sign",
       "principal_policy_view",
       "principal_baseline_view",
@@ -245,6 +245,7 @@
       "governor_status",
       "identity_set_primary",
       "memory_attest",
+      "memory_insert",
       "compliance_eu_ai_act_annex_iii_classify",
       "sanctuary_remember",
       "sanctuary_recall",
@@ -272,6 +273,7 @@
     "approval_redirect": {
       "enabled": false,
       "mode": "replace"
-    }
+    },
+    "memory_save_approval": "never"
   }
 }

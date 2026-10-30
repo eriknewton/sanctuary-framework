@@ -165,7 +165,7 @@ describe("SDW memory tools: end-to-end loop", () => {
     });
     const auditLog = {
       async appendCritical(entry: AuditCall): Promise<void> {
-        if (entry.operation === "memory_insert") currentAgent = "wrapped-agent-after";
+        if (entry.operation === "memory_insert_intent") currentAgent = "wrapped-agent-after";
       },
     } as unknown as AuditLog;
     const tools = new Map(createSdwMemoryTools({
@@ -319,7 +319,7 @@ describe("SDW memory tools: custody + denial discipline", () => {
   });
 
   it("does not insert when the pre-commit operation audit write fails (fail closed)", async () => {
-    const { tools, storage } = makeTools({ failAuditOperations: ["memory_insert"] });
+    const { tools, storage } = makeTools({ failAuditOperations: ["memory_insert_intent"] });
     const result = parse(
       await tools.get("memory_insert")!.handler({
         text: "must not persist",
@@ -340,17 +340,17 @@ describe("SDW memory tools: custody + denial discipline", () => {
       }),
     );
     const passageId = (result.passage as Record<string, unknown>).passage_id;
-    // The single durable operation record is written BEFORE the mutation
-    // (core state_write invariant); it carries the id that is actually persisted.
+    // The durable intent precedes mutation and carries the id that is actually persisted.
     const insertAudit = calls.find(
-      (c) => c.operation === "memory_insert" && c.result === "success",
+      (c) => c.operation === "memory_insert_intent" && c.result === "success",
     );
     expect(result.inserted).toBe(true);
     expect(typeof passageId).toBe("string");
     expect(insertAudit?.details?.passage_id).toBe(passageId);
+    expect(calls.find(c => c.operation === "memory_insert" && c.result === "success")?.details?.passage_id).toBe(passageId);
   });
 
-  it("records the operation audit before a failed mutation, then a denial (no double success)", async () => {
+  it("records intent and linked refusal without a completed-save success", async () => {
     const { tools, adapter, calls } = makeTools();
     await adapter.insertPassage(
       { passage_id: "duplicate-outcome", text: "already here" },
@@ -365,11 +365,12 @@ describe("SDW memory tools: custody + denial discipline", () => {
       }),
     );
     expect(result.denied).toBe(true);
-    // Exactly ONE success operation record (the pre-mutation one). The reordered
-    // handler does NOT write a second post-commit success audit, so a failed
-    // mutation leaves the pre-mutation record + a denial, never two successes.
+    // An explicit adapter refusal leaves the durable intent and a linked failure, never a completed-save success.
     const successes = calls.filter((c) => c.operation === "memory_insert" && c.result === "success");
-    expect(successes).toHaveLength(1);
+    expect(successes).toHaveLength(0);
+    const intent = calls.find(c => c.operation === "memory_insert_intent");
+    expect(intent).toBeDefined();
+    expect(calls.find(c => c.operation === "memory_insert")).toMatchObject({ result: "failure", details: { intent_audit_ref: intent!.details!.audit_ref } });
     expect(calls.find((c) => c.operation === "memory_insert_denied")).toMatchObject({
       result: "failure",
     });

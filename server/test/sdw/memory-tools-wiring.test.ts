@@ -125,8 +125,8 @@ function parseToolResult(result: {
 }
 
 describe("company-brain wiring: irreversible delete is un-relaxable at the loader", () => {
-  it("DEFAULT_POLICY pins both memory_insert and memory_delete to Tier 1", () => {
-    expect(DEFAULT_POLICY.tier1_always_approve).toContain("memory_insert");
+  it("DEFAULT_POLICY allows inserts and pins memory_delete to Tier 1", () => {
+    expect(DEFAULT_POLICY.tier3_always_allow).toContain("memory_insert");
     expect(DEFAULT_POLICY.tier1_always_approve).toContain("memory_delete");
   });
 
@@ -199,7 +199,7 @@ describe("company-brain wiring: memory_insert body is redacted from the approval
     const policy = parsePolicy(
       JSON.stringify({
         version: 1,
-        tier1_always_approve: ["memory_insert"],
+        memory_save_approval: "always", tier1_always_approve: ["memory_insert"],
         tier3_always_allow: [],
         approval_channel: {},
       }),
@@ -265,7 +265,7 @@ describe("company-brain wiring: catalog surface + classification", () => {
 describe("company-brain wiring: audit-before-commit holds against the shipped adapter", () => {
   it("memory_insert with a failing audit sink denies AND persists nothing (fail closed)", async () => {
     // Stub the durable critical-audit sink to THROW for the operation record.
-    const { tools, adapter } = buildWiredTools(["memory_insert"]);
+    const { tools, adapter } = buildWiredTools(["memory_insert_intent"]);
     const insert = tools.find((t) => t.name === "memory_insert")!;
 
     const result = parseToolResult(

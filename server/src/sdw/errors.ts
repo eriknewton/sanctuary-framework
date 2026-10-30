@@ -70,6 +70,8 @@ export function sdwClassifierReasonText(reason: string, detector: string | undef
 }
 
 export interface SdwValidationErrorOptions {
+  /** Only a write boundary that proves no mutation began may assert none. */
+  readonly persisted?: "none" | "indeterminate";
   readonly cause?: unknown;
   /** Populated only for category "classifier_reject"; see SdwClassifierDetector. */
   readonly detector?: SdwClassifierDetector;
@@ -84,6 +86,8 @@ export interface SdwValidationErrorOptions {
 }
 
 export class SdwValidationError extends Error {
+  /** Must match the insert boundary in adapters/sdw-memory-backend.ts and the outcome gate in memory-tools.ts. */
+  readonly persisted: "none" | "indeterminate";
   readonly category: string;
   readonly detector?: SdwClassifierDetector;
   readonly line?: number;
@@ -92,6 +96,8 @@ export class SdwValidationError extends Error {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "SdwValidationError";
     this.category = category;
+    // A validation category alone never proves that an earlier write did not land.
+    this.persisted = options?.persisted ?? "indeterminate";
     this.detector = options?.detector;
     this.line = options?.line;
   }
