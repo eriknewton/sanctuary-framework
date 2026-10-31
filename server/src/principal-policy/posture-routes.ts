@@ -584,7 +584,7 @@ export async function handlePostureRoute(
     //
     // Supported query params (all optional, all map to existing AuditLog.query()
     // options; any unrecognised param is silently ignored):
-    //   ?agent=<identity_id>         filter by identity_id
+    //   ?agent=<identity_id>         filter by session identity or save attribution
     //   ?since=<ISO-string>          filter entries at or after this timestamp
     //   ?operation_type=<string>     filter by operation name
     //   ?layer=<l1|l2|l3|l4>        filter by layer
@@ -955,7 +955,7 @@ async function buildCustodyExit(
  * a thin URL-param-to-query-options adapter over the existing query API.
  *
  * Supported URL params (all optional; unrecognised params are ignored):
- *   ?agent=<string>            - maps to query.identity_id
+ *   ?agent=<string>            - maps to query.evidence_agent before pagination
  *   ?since=<ISO-string>        - maps to query.since
  *   ?operation_type=<string>   - maps to query.operation_type
  *   ?layer=<l1|l2|l3|l4>      - maps to query.layer
@@ -998,7 +998,8 @@ async function buildEvidence(
     since: sinceParam,
     layer: layerParam,
     operation_type: opParam,
-    identity_id: agentParam,
+    // Must match AuditLog.query evidence_agent in operational/audit-log.ts; display filtering never substitutes for session authorization.
+    evidence_agent: agentParam,
     limit: limitParam,
   });
 

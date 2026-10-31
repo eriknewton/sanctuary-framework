@@ -1087,7 +1087,7 @@ describe("sanctuary install agent contract", () => {
     expect(plan.next_action?.description).toContain("approval_channel.type to dashboard");
     expect(plan.next_action?.description).toContain("strong explicit bearer");
     expect(plan.next_action?.description).toContain('do not use "auto"');
-    expect(plan.next_action?.description).toContain("Do not move memory_insert out of Tier 1");
+    expect(plan.next_action?.description).toContain("Own-memory saves run without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested. Provenance, delete and export still need approval");
   });
 
   it("reports memory complete once the same host has an interactive Tier-1 path", () => {

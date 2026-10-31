@@ -47,7 +47,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { access, chmod, lstat, open, readdir, realpath, rm, statfs } from "node:fs/promises";
+import { access, chmod, lstat, open, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
 import { constants, lstatSync } from "node:fs";
 import type { BigIntStats } from "node:fs";
@@ -226,7 +226,7 @@ export async function probeKernelBackedCrossProcessLockCapability(
   try {
     await access(kernelReaperCommand(host));
     const runtimeDir = await ensureKernelSocketRuntimeDirectory();
-    await assertLocalLockFilesystem(runtimeDir, host);
+    await assertCachedLocalLockFilesystem(runtimeDir, host);
     if (targetLockDirectory !== undefined) {
       await assertLocalLockFilesystemAtExistingAncestor(targetLockDirectory, host);
       await assertExistingTargetLockShape(targetLockDirectory);
@@ -1841,8 +1841,10 @@ async function withKernelPathLock<T>(
     );
   }
   const timeoutMs = options.timeoutMs ?? CROSS_PROCESS_LOCK_TIMEOUT_MS;
+  // An expired arrival cannot start custody acquisition, even before capability probing.
+  assertLockWaitNotAborted(options.abortSignal, lockDir);
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
-  await assertLocalLockFilesystem(lockDir, host);
+  await assertCachedLocalLockFilesystem(lockDir, host);
   const lockDirHandle = await open(lockDir, "r");
   let expectedIdentity: KernelDirectoryIdentity;
   try {
@@ -1868,6 +1870,7 @@ async function withKernelPathLock<T>(
     lockIdentity,
     timeoutMs,
     options,
+    options.abortSignal,
   );
   const controller = new AbortController();
   const lease: CrossProcessLockLease = {
@@ -1897,6 +1900,8 @@ async function withKernelPathLock<T>(
   let operationError: unknown;
   let releaseError: unknown;
   try {
+    // Abort after bind still releases the acquired socket through this finally block.
+    assertLockWaitNotAborted(options.abortSignal, acquired.socketPath);
     result = await operation(lease);
     lease.assertHeld();
   } catch (error) {
@@ -2056,7 +2061,9 @@ async function acquireKernelLock(
   lockIdentity: string,
   timeoutMs: number,
   options: CrossProcessLockOptions,
+  abortSignal?: AbortSignal,
 ): Promise<AcquiredKernelLock> {
+  assertLockWaitNotAborted(abortSignal, lockIdentity);
   const host = options.__testPlatform ?? platform();
   const capability = await probeKernelBackedCrossProcessLockCapability(host);
   if (!capability.available) {
@@ -2066,7 +2073,7 @@ async function acquireKernelLock(
     );
   }
   const runtimeDir = await ensureKernelSocketRuntimeDirectory();
-  await assertLocalLockFilesystem(runtimeDir);
+  await assertCachedLocalLockFilesystem(runtimeDir);
   const runtimeIdentity = await lstat(runtimeDir, { bigint: true });
   const digest = createHash("sha256").update(lockIdentity).digest("hex");
   const socketPath = join(
@@ -2090,6 +2097,8 @@ async function acquireKernelLock(
   const started = Date.now();
   let contentions = 0;
   for (;;) {
+    // Every retry observes the caller deadline before attempting another bind.
+    assertLockWaitNotAborted(abortSignal, socketPath);
     const server = createServer((socket) => socket.destroy());
     try {
       await listenOnSocket(server, socketPath);
@@ -2167,7 +2176,7 @@ async function acquireKernelLock(
             "contention",
           );
         }
-        await sleep(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS);
+        await sleepLockRetry(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS, abortSignal, socketPath);
         continue;
       }
       if (probe === "unknown") {
@@ -2182,7 +2191,7 @@ async function acquireKernelLock(
             "io",
           );
         }
-        await sleep(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS);
+        await sleepLockRetry(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS, abortSignal, socketPath);
         continue;
       }
       contentions += 1;
@@ -2193,7 +2202,7 @@ async function acquireKernelLock(
           "contention",
         );
       }
-      await sleep(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS);
+      await sleepLockRetry(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS, abortSignal, socketPath);
     }
   }
 }
@@ -2276,6 +2285,34 @@ async function darwinFilesystemType(
     .split(",")
     .map((value) => value.trim().toLowerCase());
   return { type: options[0] ?? "unknown", local: options.includes("local") };
+}
+
+// At most 4,096 identities: 64 possible custody scopes times 64 lock directories per scope.
+// This is an entry cap, not a claim about the JavaScript heap size.
+// Must match the cap witness in test/storage/kernel-lock-admission.test.ts.
+const MAX_LOCK_FILESYSTEM_VERDICTS = 64 * 64;
+const lockFilesystemVerdicts = new Map<string, Promise<void>>();
+
+async function assertCachedLocalLockFilesystem(path: string, host: NodeJS.Platform = platform()): Promise<void> {
+  // Follow descriptor links: the locality probe inspects the target directory, never the procfs link.
+  const identity = await stat(path, { bigint: true });
+  const key = `${host}:${identity.dev}:${identity.ino}`;
+  let verdict = lockFilesystemVerdicts.get(key);
+  if (!verdict) {
+    // Replacement normally changes dev/ino; remounts and device/inode recycling can outlive this process-lifetime verdict.
+    // Refuse new identities at capacity rather than growing unbounded pending or successful verdict state.
+    if (lockFilesystemVerdicts.size >= MAX_LOCK_FILESYSTEM_VERDICTS) {
+      throw new CrossProcessLockError("custody filesystem verdict capacity reached", "capability");
+    }
+    verdict = assertLocalLockFilesystem(path, host).catch(error => {
+      // A failed probe proves no stable locality verdict; evict before rethrow so later admissions can recover.
+      lockFilesystemVerdicts.delete(key);
+      throw error;
+    });
+    lockFilesystemVerdicts.set(key, verdict);
+  }
+  // Cache the pending check too, so concurrent admissions inspect each directory only once.
+  await verdict;
 }
 
 async function assertLocalLockFilesystem(

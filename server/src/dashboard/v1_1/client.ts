@@ -27,6 +27,7 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
+import { MEMORY_SAVE_AUDIT_OPERATIONS, MEMORY_SAVE_INTENT_OPERATIONS } from "../../principal-policy/types.js";
 import { HUB_APPROVAL_PREVIEW_MAX_FIELDS, HUB_APPROVAL_PASSAGE_MAX_UNITS } from "../../contracts/v1.1/hub-events.js";
 import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
@@ -3939,7 +3940,11 @@ function evidenceTimestamp(entry) {
 
 // Invariant: the Evidence read serves AuditEntry only, so every cell reads a
 // served AuditEntry field or says the value is missing.
+// Save operations must match MEMORY_SAVE_AUDIT_OPERATIONS in principal-policy/types.ts and the Evidence filter in operational/audit-log.ts.
+// agent_id must match the writers in sdw/memory-tools.ts and agent-native/cooperative-surface.ts.
 function evidenceAgent(entry) {
+  const agent = entry && entry.details && entry.details.agent_id;
+  if (${JSON.stringify(MEMORY_SAVE_AUDIT_OPERATIONS)}.includes(entry && entry.operation) && typeof agent === "string" && agent.startsWith("agent:") && agent.length <= EVIDENCE_HELD_OPERATION_MAX_CHARS) return agent;
   return entry && entry.identity_id || "agent not named";
 }
 
@@ -3964,6 +3969,8 @@ function evidenceEventHtml(entry) {
 }
 
 function evidenceResult(entry) {
+  // Intent success attests only to a durable attempt, never a committed save.
+  if (entry && ${JSON.stringify(MEMORY_SAVE_INTENT_OPERATIONS)}.includes(entry.operation)) return "";
   const raw = String(entry && entry.result || "").toLowerCase();
   if (raw === "success" || raw === "failure") return raw;
   return "";
@@ -4000,6 +4007,16 @@ function evidenceGateDecision(entry) {
 }
 
 function evidenceResultChip(entry) {
+  if (entry && ${JSON.stringify(MEMORY_SAVE_INTENT_OPERATIONS)}.includes(entry.operation)) {
+    // Intent operations must match MEMORY_SAVE_INTENT_OPERATIONS in principal-policy/types.ts.
+    // intent_audit_ref must match sdw/memory-tools.ts, agent-native/cooperative-surface.ts and posture-evidence-html.ts.
+    const ref = entry.details && entry.details.audit_ref;
+    const entries = state.evidence.view && state.evidence.view.entries || [];
+    const recorded = typeof ref === "string" && entries.some(function (outcome) {
+      return outcome.operation === entry.operation.replace(/_intent$/, "") && outcome.details && outcome.details.intent_audit_ref === ref;
+    });
+    return renderEvidenceStatusChip("unknown", recorded ? "save attempted, outcome recorded separately" : "save attempted, outcome not shown on this page");
+  }
   const decision = evidenceGateDecision(entry);
   if (decision) return renderEvidenceStatusChip(decision.kind, decision.label);
   const result = evidenceResult(entry);
@@ -5454,9 +5471,12 @@ function approvalTextHtml(item) {
 }
 
 // Why a Charter hold is held, written by this console from the card's structured hold_reason code. Must match
-// HUB_HOLD_REASON_CODES in server/src/contracts/v1.1/hub-events.ts. A sentence with a subject slot shows the
+// HUB_HOLD_REASON_CODES in server/src/contracts/v1.1/hub-events.ts and HOLD_REASON_TEMPLATES in
+// server/src/hub/charter-approval-bridge.ts. A sentence with a subject slot shows the
 // gate-quoted identifier only through heldSubjectHtml, as delimited data, never inside the sentence's own words.
 const HOLD_REASON_SENTENCES = {
+  memory_save_quota_reached: { before: "This agent has used its memory save allowance for now, so this save asks for approval." },
+  memory_save_quota_unavailable: { before: "The memory save allowance could not be checked, so this save asks for approval." },
   tier1_policy: { before: "Your operator policy lists this operation as Tier 1, so it always asks for approval." },
   tier1_forced: { before: "This operation is always Tier 1, so it always asks for approval." },
   tier1_secret_waiver: { before: "This call names a file excluded from the secret check, so it always asks for approval." },

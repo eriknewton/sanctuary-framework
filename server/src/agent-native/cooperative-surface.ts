@@ -703,23 +703,44 @@ export function createAgentNativeCooperativeTools(
         },
         required: ["key", "value"],
       },
-      handler: async (args) => {
+      handler: async (args, callerIdentity) => {
+        // Rule 13: intent failed -> deny, no write; committed -> success linked to intent;
+        // refused -> linked failure; primitive threw -> propagate, intent only, commit unknown;
+        // outcome append fails after commit -> generic denial; completion unacknowledged: the value and intent exist,
+        //   whether the outcome row exists depends on where the append failed;
+        // crash before commit -> intent only, no value;
+        // crash after commit before outcome -> value plus intent only, never evidence of a completed save.
+        let intentRef: string | undefined;
+        let primitiveRunning = false;
         try {
           const primitiveArgs = await rememberPrimitiveArgs(args);
-          const result = await callPrimitive("state_write", primitiveArgs);
-          if (result.denied || result.error) return deny("audit:sanctuary_remember", "try_lower_scope");
-          const auditRef = await audit("sanctuary_remember", {
+          intentRef = await audit("sanctuary_remember_intent", {
+            // The server-set agent: form must match callerIdentity in router.ts; preserve the session identity for own-scope search.
+            agent_id: callerIdentity,
             primitive_tool: "state_write",
             primitive_args_hash: normalizedArgsHash(primitiveArgs),
             facade_call: { key: args.key },
           });
+          // Attribution must be durable before state_write can commit; intent success proves only that the attempt was recorded.
+          primitiveRunning = true;
+          const result = await callPrimitive("state_write", primitiveArgs);
+          primitiveRunning = false;
+          if (result.denied || result.error) {
+            await audit("sanctuary_remember", { agent_id: callerIdentity, intent_audit_ref: intentRef }, "failure");
+            return deny(intentRef, "try_lower_scope");
+          }
+          // intent_audit_ref must match sdw/memory-tools.ts and the intent correlation in dashboard/v1_1/client.ts and principal-policy/posture-evidence-html.ts.
+          const auditRef = await audit("sanctuary_remember", { agent_id: callerIdentity, intent_audit_ref: intentRef });
           return toolResult({
             key: result.key,
             namespace_handle: result.namespace,
             audit_ref: auditRef,
           });
-        } catch {
-          return deny("audit:sanctuary_remember", "try_lower_scope");
+        } catch (error) {
+          // A primitive throw cannot establish non-commit: the value may precede a failed anchor write.
+          if (primitiveRunning) throw error;
+          // Intent or outcome append failure leaves no invented outcome; an acknowledged intent still names the attempt.
+          return deny(intentRef ?? "audit:sanctuary_remember", "try_lower_scope");
         }
       },
     },

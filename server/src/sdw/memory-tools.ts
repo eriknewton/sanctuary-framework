@@ -236,11 +236,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       details,
     });
 
-  const auditSuccess = (operation: string, details: Record<string, unknown>): Promise<void> =>
+  const auditSuccess = (operation: string, details: Record<string, unknown>, identity = "principal"): Promise<void> =>
     auditLog.appendCritical({
       layer: "l1",
       operation,
-      identity_id: "principal",
+      identity_id: identity,
       result: "success",
       details,
     });
@@ -288,7 +288,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       "This is a passage store: flat text plus tags, with no in-place edit " +
       "(insert and delete only). Retrieval IQ (embeddings, ranking) stays in a " +
       "swappable engine; this is the sovereign custody layer underneath it. " +
-      "Tier 1 under the default policy: requires operator approval for each insert.",
+      "Saves to your own memory run without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested. Each save is audited with the calling agent named when its identity is known, otherwise marked as unknown. " +
+      "The operator can require approval per insert in the policy.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -315,7 +316,10 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       },
       required: ["text", "taint"],
     },
-    handler: async (args) => {
+    handler: async (args, callerIdentity) => {
+      // The server-set agent: form must match callerIdentity in router.ts; tool args never supply attribution.
+      const agentId = callerIdentity?.startsWith("agent:") && callerIdentity.length > "agent:".length && callerIdentity !== "agent:unknown"
+        ? callerIdentity : "principal";
       // Snapshot before the first await. Audit latency or a later environment
       // change cannot relabel the origin that this call ultimately signs.
       const observedAgentId = currentAgentId?.();
@@ -350,19 +354,23 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         return deny("memory_insert");
       }
       const auditedPassageId = passageId ?? generateMemoryPassageId();
-      // Core invariant (mirror state_write, cognitive/tools.ts): the durable
-      // critical operation record is written BEFORE the mutation. If that audit
-      // write throws, fail CLOSED - return the fixed denial and never mutate, so
-      // there is never a persisted passage without a preceding durable record.
-      // There is no separate post-commit success audit (that ordering is exactly
-      // the residual gap: a mutation that lands but whose completion record can
-      // still fail). Adapter-side rejections still record a failure audit below.
+      // Rule 13: intent failed -> deny, no write; committed -> success linked to intent;
+      // typed pre-write refusal (persisted: none) -> linked failure; indeterminate/other throw -> router error, intent only;
+      // outcome append fails after commit -> router error; completion unacknowledged: the value and intent exist,
+      //   whether the outcome row exists depends on where the append failed;
+      // crash before commit -> intent only, no value; crash after commit -> value plus intent only.
+      // audit_ref / intent_audit_ref must match agent-native/cooperative-surface.ts,
+      // dashboard/v1_1/client.ts and principal-policy/posture-evidence-html.ts.
+      const intentRef = `audit:memory_insert_intent:${randomBytes(8).toString("hex")}`; // Eight random bytes match the facade's audit reference entropy.
+      const saveDetails = {
+        passage_id: auditedPassageId,
+        text_bytes: Buffer.byteLength(text, "utf8"),
+        tag_count: tags.length,
+        agent_id: agentId,
+      };
       try {
-        await auditSuccess("memory_insert", {
-          passage_id: auditedPassageId,
-          text_bytes: Buffer.byteLength(text, "utf8"),
-          tag_count: tags.length,
-        });
+        // Durable attribution precedes mutation; failure to record the intent cannot authorize a save.
+        await auditSuccess("memory_insert_intent", { ...saveDetails, audit_ref: intentRef }, agentId);
       } catch {
         return deny("memory_insert");
       }
@@ -378,15 +386,21 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           taint,
         );
       } catch (error) {
-        // SdwValidationError (e.g. classifier_reject, duplicate_passage,
-        // invalid identifier) -> fixed denial; category to audit only.
-        const category = error instanceof SdwValidationError ? error.category : "insert_failed";
+        // Must match SdwValidationError.persisted in sdw/errors.ts and the insert boundary in sdw/adapters/sdw-memory-backend.ts.
+        // Only a confirmed pre-write refusal proves non-commit; failed rollback can leave records behind.
+        if (!(error instanceof SdwValidationError) || error.persisted !== "none") throw error;
+        await auditLog.appendCritical({
+          layer: "l1", operation: "memory_insert", identity_id: agentId, result: "failure",
+          details: { ...saveDetails, intent_audit_ref: intentRef },
+        });
         await auditFailure("memory_insert_denied", {
-          denial_class: category,
+          denial_class: error.category,
           passage_id: auditedPassageId,
         });
         return deny("memory_insert");
       }
+      // Completion is evidence only after the adapter returns a committed passage.
+      await auditSuccess("memory_insert", { ...saveDetails, intent_audit_ref: intentRef }, agentId);
       return toolResult({ inserted: true, passage: publicPassageMetadata(passage) });
     },
   };

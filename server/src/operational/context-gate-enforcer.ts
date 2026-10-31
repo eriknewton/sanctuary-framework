@@ -156,16 +156,18 @@ export class ContextGateEnforcer {
    * 4. With a bound policy in log_only mode: runs filter, logs, passes original args
    */
   wrapHandler(toolName: string, originalHandler: ToolHandler): ToolHandler {
-    return async (args: Record<string, unknown>) => {
+    // Caller identity is server-set routing data, never filter input; inspecting,
+    // rewriting or dropping it would misattribute audited calls.
+    return async (...[args, ...routing]: Parameters<ToolHandler>) => {
       // If enforcer is disabled, pass through
       if (!this.config.enabled) {
-        return originalHandler(args);
+        return originalHandler(args, ...routing);
       }
 
       // Check if tool should be filtered
       if (!this.shouldFilter(toolName)) {
         this.stats.calls_bypassed++;
-        return originalHandler(args);
+        return originalHandler(args, ...routing);
       }
 
       this.stats.calls_inspected++;
@@ -180,7 +182,7 @@ export class ContextGateEnforcer {
         return this.filterWithPolicy(
           toolName,
           args,
-          originalHandler,
+          (filteredArgs) => originalHandler(filteredArgs, ...routing),
           policy
         );
       } else {

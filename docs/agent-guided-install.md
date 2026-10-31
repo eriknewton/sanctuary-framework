@@ -233,7 +233,10 @@ It then adds a
 survives via `memory_insert`, `memory_search`, and `memory_get` (which proves
 exact content: it decrypts and re-verifies the stored content hash, not signer
 data) with no ambient credential env. Verified provenance and signer fields come
-from `sdw_memory_provenance`, not `memory_get`.
+from `sdw_memory_provenance`, not `memory_get`. Own-memory saves run without an
+approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested. Saves appear on Evidence with the agent named when its identity is known, otherwise marked as unknown. Set
+`memory_save_approval: always` in the policy to require approval per insert.
+Provenance, delete and export still require an interactive approval channel.
 
 ## Profiles
 

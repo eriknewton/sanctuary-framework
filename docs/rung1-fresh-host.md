@@ -22,15 +22,17 @@ First-use is proven through the existing policy-enforcing MCP tools, not a
 parallel CLI. These are the same tools your agent calls every day, so the proof
 runs through the same Tier gate and the same provenance signing as real use:
 
-1. `memory_insert` stores a record. Tier-1 (human-approved); the approval prompt
-   names the memory scope and the calling agent.
+1. `memory_insert` stores a record without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested.
+   Its audit record names the calling agent on the Evidence page when known,
+   otherwise marks it as unknown. Set
+   `memory_save_approval: always` in the policy to require approval per insert.
 2. `memory_search` finds it back by content.
 3. `memory_get` reads it back byte-faithfully and proves exact content: it
    decrypts on read and re-verifies the stored `content_hash`, failing closed on
    any integrity mismatch. `memory_get` proves the bytes; it does not surface
    signer or signature fields. `memory_search` and `memory_get` are Tier 3 by
-   default: hands-free reads with no approval prompt, while `memory_insert`
-   stays Tier 1. Every agent connected to one fortress shares one memory scope
+   default: hands-free reads with no approval prompt. Own-memory saves are
+   audited and run without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested. Every agent connected to one fortress shares one memory scope
    today; per-agent memory isolation is not yet implemented. `memory_search`
    returns 10 results unless you pass `limit`, and at most 500.
    `sdw_memory_provenance`, `memory_list`, and `memory_count` require approval.
@@ -65,12 +67,38 @@ local session, and set `dashboard.auth_token` to that explicit value in
 enter it only when the local dashboard asks for the operator token; never paste
 it or a session URL into chat. Do not use `"auto"` for this MCP path: it opens a
 read-only browser session but does not disclose the generated bearer required
-by approve/deny. Do not relax `memory_insert` out of Tier 1 to work around an
-unavailable approval channel.
+by approve/deny. Provenance, delete and export still need approval; own-memory
+saves run without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested. An unavailable channel prevents those approved
+operations from completing.
 
 Both files must be regular non-symlink files. A missing, malformed, linked, or
 read-raced file makes `tier1_approval=unknown` and blocks completion rather than
 trusting a configuration the MCP server may refuse or interpret differently.
+
+### Save accounting recovery
+
+On macOS and Linux, the persistent lock file is an inert scaffold that the
+process never holds. A `lock` hold means the save could not acquire or retain the directory lock: most often another process holds it; it also covers I/O errors on the lock directory and a holder lost after acquisition.
+Process exit releases ownership. Do not remove the scaffold to resolve contention.
+A `lock_capability` hold means the custody runtime directory or fortress filesystem
+was refused. Check the invoking user's ownership and private directory permissions,
+and use a supported local filesystem. On Linux, check `/run/user/<uid>`; it can
+disappear at logout unless lingering is enabled with `loginctl enable-linger`.
+On macOS, check the custody `/tmp/<leaf>-<uid>` directory. A missing or refused
+runtime directory keeps saves held even when no other Sanctuary process runs.
+A `lock_integrity` hold requires checking scaffold ownership and integrity before
+retrying; deleting a file does not repair an unsuitable runtime directory.
+
+On O_EXCL platforms, a `deadline` or `lock` hold with no Sanctuary process running
+can indicate a stale `own-scope-save-quota.lock` under
+`<fortress>/state/_memory_save_quota/`. Stop every Sanctuary process using that
+fortress before removing that file, then restart. Removing a live process's
+lock can break shared accounting.
+
+Corrupt `own-scope-save-quota.json` accounting also fails closed: with every
+Sanctuary process stopped, delete that file in the same directory to reset
+accounting, then restart. This resets the current save budget; it does not delete
+saved memory. If holds persist, check directory ownership and write permissions.
 
 ## Restart persistence
 

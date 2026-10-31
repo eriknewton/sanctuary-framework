@@ -16,6 +16,11 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { open } from "node:fs/promises";
+import { join } from "node:path";
+import { CrossProcessLockError, withPathLock, kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
+import { writeFileCustody } from "../storage/custody-fs.js";
 import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } from "./types.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { HOLD_REASON_SUBJECT_MAX_CHARS } from "../hub/charter-approval-bridge.js";
@@ -206,7 +211,166 @@ export type ApprovalEventCallback = (event: {
   target_resource?: string;
 }) => void;
 
+/** Closed invoked-tool to gate-operation map; must match the handoff in router.ts. */
+export const OWN_SCOPE_MEMORY_SAVES: Readonly<Record<string, string>> = Object.freeze({
+  memory_insert: "memory_insert",
+  sanctuary_remember: "state_write",
+});
+// Ten minutes, one save every five seconds sustained, and one MiB per window.
+export const OWN_SCOPE_SAVE_WINDOW_MS = 10 * 60 * 1000;
+export const OWN_SCOPE_SAVE_MAX_PER_WINDOW = 120;
+export const OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW = 1024 * 1024;
+// Bound bookkeeping independently of how many caller identities are presented.
+export const OWN_SCOPE_SAVE_MAX_TRACKED_CALLERS = 256;
+
+// One second bounds admission I/O, including lock contention, without bounding a human hold.
+export const OWN_SCOPE_SAVE_ADMISSION_DEADLINE_MS = 1000;
+// The independent round-3 read reported about 22 ms per uncached macOS admission.
+// Budget 25 ms per admission (22 ms plus 3 ms scheduling headroom), even with cached filesystem checks.
+// Deadline / cost bounds queued admissions, not guaranteed completions; each arrival still has its own deadline.
+const OWN_SCOPE_SAVE_ADMISSION_BUDGET_MS = 25;
+export const OWN_SCOPE_SAVE_MAX_QUEUED_ADMISSIONS = Math.floor(OWN_SCOPE_SAVE_ADMISSION_DEADLINE_MS / OWN_SCOPE_SAVE_ADMISSION_BUDGET_MS);
+// Each tuple has a 64-hex caller digest, three safe integers and JSON punctuation;
+// 160 bytes per tuple covers their maximum representation, plus array brackets.
+export const OWN_SCOPE_SAVE_MAX_FILE_BYTES = OWN_SCOPE_SAVE_MAX_TRACKED_CALLERS * 160 + 2;
+const OWN_SCOPE_SAVE_FILE = "own-scope-save-quota.json";
+const OWN_SCOPE_SAVE_LOCK = "own-scope-save-quota.lock";
+type SaveWindow = { start: number; count: number; bytes: number };
+type SaveQuotaResult = SaveWindow | { cause_class: string; lock_kind?: CrossProcessLockError["kind"] } | null;
+
 export class ApprovalGate {
+  private ownScopeSaveStateDirectory?: string;
+  private ownScopeSaveTail: Promise<unknown> = Promise.resolve();
+  private ownScopeSavePending = 0;
+  private ownScopeSaveDiagnostics = { trackedCallers: 0, lastWork: 0, scannedEntries: 0 };
+
+  /** Admission map operations and bounded file-validation work; contains no caller data. */
+  getOwnScopeSaveQuotaDiagnostics(): { trackedCallers: number; lastWork: number; scannedEntries: number } {
+    return { ...this.ownScopeSaveDiagnostics };
+  }
+
+  private ownScopeSaveHold(quota: NonNullable<SaveQuotaResult>): { reason: string; context: Record<string, unknown> } {
+    // Literal reasons must match HOLD_REASON_TEMPLATES in hub/charter-approval-bridge.ts so every hold is recognized.
+    if ("cause_class" in quota) {
+      const context = { ...quota };
+      return { reason: "memory save quota unavailable", context };
+    }
+    const context = { count: quota.count, bytes: quota.bytes, window_ms: OWN_SCOPE_SAVE_WINDOW_MS };
+    return { reason: "memory save quota reached", context };
+  }
+
+  private async admitOwnScopeSave(caller: string, bytes: number): Promise<SaveQuotaResult> {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) return { cause_class: "invalid_bytes" };
+    // Missing persistence never grants unattended admission, including unwired constructors.
+    if (!this.ownScopeSaveStateDirectory) return { cause_class: "storage_unconfigured" };
+    // Timed-out waiters retain their bounded queue slots until the preceding I/O settles.
+    if (this.ownScopeSavePending >= OWN_SCOPE_SAVE_MAX_QUEUED_ADMISSIONS + 1) return { cause_class: "admission_queue_full" };
+    this.ownScopeSavePending++;
+    const abort = new AbortController();
+    const expires = performance.now() + OWN_SCOPE_SAVE_ADMISSION_DEADLINE_MS;
+    let deadlineTimer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<SaveQuotaResult>((resolve) => {
+      deadlineTimer = setTimeout(() => {
+        abort.abort();
+        resolve({ cause_class: "deadline" });
+      }, OWN_SCOPE_SAVE_ADMISSION_DEADLINE_MS);
+    });
+    let causeClass = "lock";
+    const checkDeadline = () => {
+      // Monotonic elapsed time also closes a busy event loop's delayed timer callback.
+      if (performance.now() >= expires) abort.abort();
+      if (abort.signal.aborted) throw new Error("quota admission expired");
+    };
+    const reservation = this.ownScopeSaveTail.then(async () => {
+      // A waiter whose arrival deadline elapsed must never start a reservation later.
+      checkDeadline();
+      return withPathLock(this.ownScopeSaveStateDirectory!, OWN_SCOPE_SAVE_LOCK, async () => {
+        checkDeadline();
+        const path = join(this.ownScopeSaveStateDirectory!, OWN_SCOPE_SAVE_FILE);
+        this.ownScopeSaveDiagnostics = { trackedCallers: 0, lastWork: 0, scannedEntries: 0 };
+        let rows: unknown = [];
+        causeClass = "read";
+        let file;
+        try {
+          file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        if (file) {
+          try {
+            const stat = await file.stat();
+            causeClass = "invalid_state";
+            if (!stat.isFile() || stat.size > OWN_SCOPE_SAVE_MAX_FILE_BYTES) throw new Error("quota file bound");
+            // The descriptor read is capped even if the file grows after stat.
+            const buffer = Buffer.alloc(OWN_SCOPE_SAVE_MAX_FILE_BYTES + 1);
+            const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+            if (bytesRead > OWN_SCOPE_SAVE_MAX_FILE_BYTES) throw new Error("quota file bound");
+            rows = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+          } finally { await file.close(); }
+        }
+        checkDeadline();
+        causeClass = "invalid_state";
+        if (!Array.isArray(rows) || rows.length > OWN_SCOPE_SAVE_MAX_TRACKED_CALLERS) throw new Error("quota entry bound");
+        const now = Date.now();
+        const windows = new Map<string, SaveWindow>();
+        const seen = new Set<string>();
+        // Four tuple fields: SHA-256 caller digest, window start, save count and byte count.
+        for (const row of rows) {
+          this.ownScopeSaveDiagnostics.scannedEntries++;
+          if (!Array.isArray(row) || row.length !== 4 || typeof row[0] !== "string" || !/^[a-f0-9]{64}$/.test(row[0])
+            || seen.has(row[0]) || !row.slice(1).every(n => Number.isSafeInteger(n) && n >= 0)
+            || row[2] > OWN_SCOPE_SAVE_MAX_PER_WINDOW || row[3] > OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW) {
+            throw new Error("invalid quota tuple");
+          }
+          seen.add(row[0]);
+          // Prune only expired windows; a backward clock step moves the start to now without refunding usage.
+          if (now - row[1] < OWN_SCOPE_SAVE_WINDOW_MS) windows.set(row[0], { start: Math.min(row[1], now), count: row[2], bytes: row[3] });
+        }
+        const key = createHash("sha256").update(caller).digest("hex");
+        let window = windows.get(key);
+        this.ownScopeSaveDiagnostics.lastWork++; // Admission lookup, excluding separately counted validation.
+        if (!window) {
+          if (windows.size >= OWN_SCOPE_SAVE_MAX_TRACKED_CALLERS) {
+            // Active callers retain their reservations; identity churn cannot refund their budget.
+            this.ownScopeSaveDiagnostics.trackedCallers = windows.size;
+            return { cause_class: "caller_table_full" };
+          }
+          window = { start: now, count: 0, bytes: 0 };
+          windows.set(key, window);
+          this.ownScopeSaveDiagnostics.lastWork++;
+        }
+        // The quota file carries no MAC, so a same-uid actor can reset it; it is flood control, not a trust boundary.
+        // A durable reservation under the shared lock precedes every unattended save;
+        // failed or late saves spend quota conservatively and never refund stale headroom.
+        const reached = window.count >= OWN_SCOPE_SAVE_MAX_PER_WINDOW || bytes > OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW - window.bytes;
+        if (!reached) { window.count++; window.bytes += bytes; }
+        const encoded = JSON.stringify([...windows].map(([id, w]) => [id, w.start, w.count, w.bytes]));
+        if (Buffer.byteLength(encoded) > OWN_SCOPE_SAVE_MAX_FILE_BYTES) throw new Error("quota file bound");
+        checkDeadline();
+        causeClass = "write";
+        await writeFileCustody(path, encoded, { mode: 0o600, createParent: false });
+        checkDeadline();
+        this.ownScopeSaveDiagnostics.trackedCallers = windows.size;
+        return reached ? { ...window } : null;
+      }, { timeoutMs: OWN_SCOPE_SAVE_ADMISSION_DEADLINE_MS, abortSignal: abort.signal,
+        // Kernel ownership dies with the process; unsupported hosts retain the O_EXCL fallback.
+        kernelBacked: kernelBackedCrossProcessLockPlatformSupported(process.platform) });
+    })
+      .catch((error): SaveQuotaResult => {
+        // Typed lock causes are operator recovery data; exception messages may contain private paths.
+        const lockKind = error instanceof CrossProcessLockError ? error.kind : undefined;
+        const lockCause = lockKind === "capability" ? "lock_capability" : lockKind === "scaffold-integrity" ? "lock_integrity" : "lock";
+        return { cause_class: abort.signal.aborted ? "deadline" : lockKind ? lockCause : causeClass,
+          ...(lockKind ? { lock_kind: lockKind } : {}) };
+      })
+      .finally(() => { this.ownScopeSavePending--; });
+    this.ownScopeSaveTail = reservation;
+    // A deadline returns a hold, but the lock and queue ordering remain until all
+    // I/O settles; a late reservation cannot race another reader or authorize a save.
+    try { return await Promise.race([reservation, deadline]); }
+    finally { clearTimeout(deadlineTimer!); }
+  }
+
   private policy: PrincipalPolicy;
   private baseline: BaselineTracker;
   private channel: ApprovalChannel;
@@ -228,17 +392,20 @@ export class ApprovalGate {
     onInjectionAlert?: InjectionAlertCallback,
     onApprovalEvent?: ApprovalEventCallback,
     options?: {
+      /** Fortress-local quota directory; absence holds every own-memory save. */
+      ownScopeSaveStateDirectory?: string;
       approvalProofStore?: ApprovalProofStore;
       currentSessionBinding?: () => SessionBinding | undefined;
       /**
        * The wrap-time agent id of the agent this server process serves
        * (`SANCTUARY_AGENT_ID`), the same supplier the router takes. Display
-       * attribution only: absence leaves holds unattributed and changes no
-       * verdict, so it is optional without weakening any security property.
+       * attribution and own-memory quota origin. Absence shares the bounded
+       * agent:unknown bucket; tool arguments can never select the quota origin.
        */
       currentAgentId?: () => string | undefined;
     }
   ) {
+    this.ownScopeSaveStateDirectory = options?.ownScopeSaveStateDirectory;
     this.policy = policy;
     this.baseline = baseline;
     this.channel = channel;
@@ -262,7 +429,7 @@ export class ApprovalGate {
    * router's `callerIdentity` in server/src/router.ts and `agent_id` in
    * `buildLocalAgentRecord` (server/src/wrap/cli.ts), so the card names the same
    * registry row the Agents screen lists. A throwing supplier yields no
-   * attribution rather than failing the gate, because attribution is display.
+   * attribution; own-memory quota accounting then uses the shared unknown bucket.
    */
   private requestingAgentId(): string | undefined {
     let raw: string | undefined;
@@ -303,7 +470,8 @@ export class ApprovalGate {
     args: Record<string, unknown>,
     approval?: { approval_ref: string },
     // Must match router.ts's server-owned operatorPreviewSource handoff. It supplies display data only, never enforcement evidence.
-    operatorPreviewSource?: { operation: string; args: Record<string, unknown> }
+    operatorPreviewSource?: { operation: string; args: Record<string, unknown> },
+    invokedToolName?: string
   ): Promise<GateResult> {
     const operation = extractOperationName(toolName);
 
@@ -463,7 +631,41 @@ export class ApprovalGate {
       }
     }
 
-    const classification = this.classifyOperation(toolName, args);
+    const classification = this.classifyOperation(toolName, args, { invokedToolName });
+    if (classification.ownScopeSave) {
+      const caller = this.requestingAgentId() ?? "agent:unknown";
+      // Insert bytes come from memoryInsertApprovalArgs in sdw/memory-tools.ts;
+      // remember's value is the unchanged string forwarded by rememberPrimitiveArgs.
+      const bytes = operation === "memory_insert"
+        ? ("text_bytes" in args ? (typeof args.text_bytes === "number" ? args.text_bytes : NaN) : Buffer.byteLength(typeof args.text === "string" ? args.text : "", "utf8"))
+        : Buffer.byteLength(typeof args.value === "string" ? args.value : "", "utf8");
+      const quota = await this.admitOwnScopeSave(caller, bytes);
+      if (quota) {
+        const unavailable = "cause_class" in quota;
+        const details = unavailable ? { ...quota } : {
+          count: quota.count, bytes: quota.bytes, requested_bytes: bytes,
+          window_start: quota.start, window_ms: OWN_SCOPE_SAVE_WINDOW_MS,
+        };
+        await this.auditLog.appendCritical({ layer: "l2", operation: unavailable ? "memory_save_quota_unavailable" : "memory_save_quota_reached",
+          identity_id: caller, result: "success", details });
+        // A quota hold remains Tier 2 on proof retry; the original silent classification grants no authority.
+        if (approval) return this.verifyApprovalProof(toolName, args, approval.approval_ref, { tier: 2 });
+        // Bind this hold to the same normalized arguments as every other redirect-inbox request.
+        const requestBinding = this.buildRequestBinding(operation, args, operatorPreviewSource);
+        const hold = this.ownScopeSaveHold(quota);
+        return this.requestApproval(operation, 2, hold.reason, hold.context, classification.observedAnomaly?.commit, requestBinding);
+      }
+      const anomaly = quota ? null : classification.observedAnomaly;
+      if (anomaly) {
+        const reasonClass = "namespace" in anomaly.context ? "new_namespace_access"
+          : "counterparty_did" in anomaly.context ? "new_counterparty"
+          : "is_first_session" in anomaly.context ? "first_session" : "frequency_spike";
+        // Keep this observation outside gate_: evidence-pack/aggregate.ts counts that prefix as decisions and dashboard/aggregator.ts treats it as recent adjudications, so pairing it with this evaluation's gate_allow would count one allow twice.
+        await this.auditLog.appendCritical({ layer: "l2", operation: `memory_save_anomaly_observed:${operation}`,
+          identity_id: "system", result: "success", details: { reason_class: reasonClass, tier: 3 } });
+        anomaly.commit?.();
+      }
+    }
 
     if (approval) {
       return this.verifyApprovalProof(toolName, args, approval.approval_ref, classification);
@@ -576,8 +778,10 @@ export class ApprovalGate {
   private classifyOperation(
     toolName: string,
     args: Record<string, unknown>,
-    options: { dryRun?: boolean } = {}
+    options: { dryRun?: boolean; invokedToolName?: string } = {}
   ): {
+    ownScopeSave?: boolean;
+    observedAnomaly?: { reason: string; context: Record<string, unknown>; commit?: () => void } | null;
     tier: RiskTier;
     reason: string;
     anomaly?: { reason: string; context: Record<string, unknown>; commit?: () => void };
@@ -606,6 +810,15 @@ export class ApprovalGate {
         tier: 1,
         reason: `"${operation}" is a Tier 1 operation (always requires approval)`,
       };
+    }
+
+    // Remember ownership was checked by facadeMemoryNamespace in approvalTargetArgs before this gate.
+    // Insert's fortress one-owner guard runs first in its handler and refuses a distinct identity before any adapter write.
+    // Policy Tier 1 precedes this branch so explicit state_write holds and memory_save_approval: always are honored.
+    if (options.invokedToolName && Object.hasOwn(OWN_SCOPE_MEMORY_SAVES, options.invokedToolName) &&
+        OWN_SCOPE_MEMORY_SAVES[options.invokedToolName] === operation && this.policy.memory_save_approval !== "always") {
+      return { tier: 3, reason: "own-scope memory save (Tier 3)", ownScopeSave: true,
+        observedAnomaly: this.detectAnomaly(operation, args, options) };
     }
 
     const anomaly = this.detectAnomaly(operation, args, options);

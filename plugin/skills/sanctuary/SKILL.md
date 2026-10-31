@@ -73,7 +73,7 @@ Run `sanctuary/sovereignty_audit` to get a scored report (0-100) across security
 
 | Tool | Purpose |
 |------|---------|
-| `sanctuary/memory_insert` | Store a memory record in the encrypted vault (Tier 1) |
+| `sanctuary/memory_insert` | Store a memory record in the encrypted vault (saves to the agent's own memory run without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; audited with the agent named when known, otherwise marked as unknown; policy can require approval per insert) |
 | `sanctuary/memory_search` | Find records by content. |
 | `sanctuary/memory_get` | Read a record back byte-faithfully (decrypts and re-verifies the stored content hash; proves exact content, not signer data). |
 | `sanctuary/sdw_memory_provenance` | Prove verified provenance for a record: per-writer signing status and the fortress-recorded origin/admission bindings (requires operator approval under the default policy (not named in a policy tier; the gate's safe default)). |

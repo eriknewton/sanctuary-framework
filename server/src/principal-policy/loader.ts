@@ -334,6 +334,7 @@ export function enforceForcedTiers(policy: PrincipalPolicy): PrincipalPolicy {
 }
 
 export type PrincipalPolicyDowngradeReason =
+  | "memory_save_approval_relaxed"
   | "policy_version_rollback"
   | "operation_tier_downgrade"
   | "tier2_action_downgrade"
@@ -379,6 +380,10 @@ export function detectPrincipalPolicyDowngrades(
   next: PrincipalPolicy
 ): PrincipalPolicyDowngrade[] {
   const downgrades: PrincipalPolicyDowngrade[] = [];
+  if (previous.memory_save_approval === "always" && next.memory_save_approval !== "always") {
+    downgrades.push({ field: "memory_save_approval", reason: "memory_save_approval_relaxed",
+      previous: "always", next: next.memory_save_approval ?? "never" });
+  }
   if (next.version < previous.version) {
     downgrades.push({
       field: "version",
@@ -583,6 +588,7 @@ export const FORCED_TIER3_OPERATIONS = ["sanctuary_distress"] as const;
 
 /** Default Principal Policy - provides meaningful protection without configuration */
 export const DEFAULT_POLICY: PrincipalPolicy = {
+  memory_save_approval: "never",
   version: 1,
   tier1_always_approve: [
     "state_export",
@@ -643,17 +649,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sdw_export",
     "sdw_import",
     "sdw_export_delete",
-    // SDW memory substrate (company-brain phase 1, wired 2026-06-18). Both the
-    // write and the irreversible delete require operator approval: a passage
-    // insert commits operator data to the sovereign vault, and the delete is a
-    // secure-overwrite (where the backend supports it) that cannot be undone.
-    // memory_delete is ALSO in FORCED_TIER1_OPERATIONS so a hand-authored
-    // policy cannot relax it (the insert MAY be relaxed to Tier 3 by an
-    // operator who wants unattended writes; the irreversible delete may not).
-    // memory_insert's body is redacted from the approval channel by the tool's
-    // approvalTargetArgs (Hard Constraint #1: no pre-approval body to an
-    // external channel).
-    "memory_insert",
+    // Irreversible memory deletion stays forced Tier 1. Own-memory inserts
+    // are Tier 3 by default; memory_save_approval: always opts into a hold.
     "memory_delete",
     // Rung-1 manual memory-file movement. Ingest writes a plaintext harness
     // snapshot into the encrypted vault; emit/transcode/restore materialize
@@ -764,9 +761,9 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // the egress wall's job, not a per-read prompt. memory_search is bounded
     // at the handler (default and maximum result count, needle and tag size).
     // memory_list / memory_count stay unclassified (Tier 1 by the safe
-    // default). The writes (memory_insert, memory_delete) and every
-    // plaintext-crossing verb stay in tier1_always_approve above;
-    // memory_delete is additionally force-pinned.
+    // default). Own-memory inserts are silent and audited under the default
+    // policy; deletion and every plaintext-crossing verb stay Tier 1.
+    "memory_insert",
     "memory_get",
     "memory_search",
     // compliance_generate_eu_ai_act_bundle re-tiered Tier-3 → Tier-1 (CISO NEW-1):
@@ -871,6 +868,7 @@ export function parsePolicy(content: string): PrincipalPolicy {
       const value = stripped.slice(colonIdx + 1).trim();
 
       if (value === "" || value === "|") {
+        if (key === "memory_save_approval") policy[key] = undefined; // A present empty scalar must still be validated.
         currentKey = key;
         currentList = null;
         currentObject = null;
@@ -954,14 +952,26 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
     ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
   ];
 
+  const memorySaveApproval = "memory_save_approval" in raw ? raw.memory_save_approval : "never";
+  if (memorySaveApproval !== "never" && memorySaveApproval !== "always") {
+    throw new Error('memory_save_approval must be "never" or "always"');
+  }
+  // Sanctuary's pre-change default wrote memory_insert into Tier 1, so that
+  // legacy entry is not operator intent; the explicit opt-in is memory_save_approval: always.
+  const insertTier1 = memorySaveApproval === "always";
+  const tier1 = [...rawTier1].filter(op => op !== "memory_insert" || insertTier1);
+  const tier3 = mergedTier3Pre.filter(op => op !== "memory_insert" || !insertTier1);
+  const insertTier = insertTier1 ? tier1 : tier3;
+  if (!insertTier.includes("memory_insert")) insertTier.push("memory_insert");
   return enforceForcedTiers({
+    memory_save_approval: memorySaveApproval,
     version: (raw.version as number) ?? 1,
-    tier1_always_approve: rawTier1,
+    tier1_always_approve: tier1,
     tier2_anomaly: {
       ...DEFAULT_TIER2,
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
     } as Tier2Config,
-    tier3_always_allow: mergedTier3Pre,
+    tier3_always_allow: tier3,
     approval_channel: parseApprovalChannel(raw.approval_channel),
     approval_redirect: parseApprovalRedirect(raw.approval_redirect),
   });
@@ -1068,6 +1078,11 @@ export function generateDefaultPolicyYaml(): string {
 #   tier2_anomaly, tier3_always_allow
 
 version: ${DEFAULT_POLICY.version}
+
+# never: an agent's save into its own memory runs without an approval prompt under the default policy within a bounded save allowance;
+#        beyond it an ordinary Tier 2 approval is requested; every save is audited
+# always: every memory_insert waits for your approval
+memory_save_approval: ${DEFAULT_POLICY.memory_save_approval}
 
 # ─── Tier 1: Always Requires Approval ────────────────────────────────────
 # These operations ALWAYS require your explicit approval.
