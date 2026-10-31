@@ -5571,7 +5571,7 @@ export class AuditLog {
           cleanThisPass.retain(byteKey, cached);
           // Must match verifyCheckpoints entries: cached envelopes have empty ciphertext and cannot be rehashed.
           // Chain metadata must not retain decrypted entries after the bounded window evicts them.
-          const { entry, ...metadata } = cached;
+          const { entry: _entry, ...metadata } = cached;
           chainedEntries.push({ key: meta.key, envelope: { ...metadata, encrypted_payload_bytes: "" } });
           pushWindow(cached.entry, cached);
           continue;
