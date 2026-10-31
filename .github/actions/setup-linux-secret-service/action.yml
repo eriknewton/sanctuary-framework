@@ -64,6 +64,29 @@ runs:
         sed -i 's/\bint_from_bytes\b/int.from_bytes/g' "$SESSION_FILE"
         sed -i 's|password = secret\[2\]|password = bytes(secret[2])|' "$SESSION_FILE"
         sed -i "s|int\.from_bytes(input, 'big')|int.from_bytes(bytes(input), 'big')|" "$SESSION_FILE"
+
+        # GLib 2.80 moved the Unix helpers out of the GLib typelib into GLibUnix, and the
+        # pinned pygobject (<3.50) carries no override for the old name. On the runner image
+        # provisioned 2026-10-21 (gir1.2-glib-2.0 2.88) pass_secret_service therefore died at
+        # startup with "AttributeError: 'gi.repository.GLib' object has no attribute
+        # 'unix_signal_add'" and the readiness loop below timed out on every Linux job
+        # (2026-10-31). Failure mode from outside: every job that uses this action fails in
+        # the "Start Secret Service backend" step with that AttributeError in
+        # /tmp/pass-secret-service.log. The shim calls the old name when it exists and the
+        # GLibUnix name otherwise; both take (priority, signum, handler, user_data).
+        # Fail closed if the upstream line changes, so the shim is never silently absent.
+        PSS_MAIN="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/pass_secret_service.py' -print -quit)"
+        if [ -z "$PSS_MAIN" ]; then
+          echo "could not locate pass_secret_service.py inside venv" >&2
+          exit 1
+        fi
+        PSS_SIGNAL_CALL='GLib\.unix_signal_add(GLib\.PRIORITY_HIGH, signal\.SIGTERM, sigterm, mainloop)'
+        if ! grep -q "$PSS_SIGNAL_CALL" "$PSS_MAIN"; then
+          echo "pass_secret_service.py no longer carries the expected unix_signal_add call; re-check the GLibUnix shim" >&2
+          exit 1
+        fi
+        sed -i "s|$PSS_SIGNAL_CALL|(getattr(GLib, \"unix_signal_add\", None) or __import__(\"gi.repository.GLibUnix\", fromlist=[\"signal_add\"]).signal_add)(GLib.PRIORITY_HIGH, signal.SIGTERM, sigterm, mainloop)|" "$PSS_MAIN"
+        grep -q 'GLibUnix' "$PSS_MAIN" || { echo "GLibUnix shim was not applied" >&2; exit 1; }
         echo "$HOME/pss-venv/bin" >> "$GITHUB_PATH"
 
     - name: Initialize ephemeral pass store
