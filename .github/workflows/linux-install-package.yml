@@ -32,7 +32,7 @@ jobs:
       - uses: ./.github/actions/apt-install-resilient
         with:
           packages: libnetfilter-queue-dev libnfnetlink-dev nftables python3-yaml
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
@@ -59,7 +59,7 @@ jobs:
       - uses: ./.github/actions/apt-install-resilient
         with:
           packages: libnetfilter-queue-dev libnfnetlink-dev nftables gcc
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.95.0
       - name: Require real-manager launch and isolation tests
@@ -109,7 +109,7 @@ jobs:
       - uses: ./.github/actions/apt-install-resilient
         with:
           packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.95.0
       - name: Build each closed variant once from the exact clean head
