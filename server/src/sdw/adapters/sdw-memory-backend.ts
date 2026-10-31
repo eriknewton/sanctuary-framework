@@ -488,89 +488,106 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     input: MemoryPassageInput,
     taint: PersistableTaint,
   ): Promise<MemoryPassage> {
-    this.assertHermesBridgeInsertAllowed();
-    const prepared = this.preparePassage(input, false, this.resolvePrimarySigningHandle());
-    const { documentId, documentRecord, chunkRecords } = prepared;
+    // Must match SdwValidationError.persisted in sdw/errors.ts and the outcome gate in sdw/memory-tools.ts.
+    // Only pre-write refusals prove non-commit; rollback failure and late validation remain indeterminate.
+    let writeStarted = false;
+    try {
+      this.assertHermesBridgeInsertAllowed();
+      const prepared = this.preparePassage(input, false, this.resolvePrimarySigningHandle());
+      const { documentId, documentRecord, chunkRecords } = prepared;
 
-    const transactional = asSdwTransactional(this.storage);
-    if (transactional !== null) {
-      if (this.mode === "hermes-bridge") {
-        // Bridge approval is bound to the non-transactional write order below;
-        // a transactional branch cannot preserve that order, so it refuses first.
-        throw new SdwValidationError(
-          "operation_refused",
-          "Hermes bridge SDW memory adapter refuses transactional storage",
-        );
-      }
-      await transactional.sdwTransaction(async (txn) => {
-        this.assertSignerStillPrimary(prepared);
-        await this.assertCandidateCapacity([prepared], txn);
-        await this.assertDocumentAbsent(documentId, txn);
-        for (const [index, chunkRecord] of chunkRecords.entries()) {
-          await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(prepared, index));
+      const transactional = asSdwTransactional(this.storage);
+      if (transactional !== null) {
+        if (this.mode === "hermes-bridge") {
+          // Bridge approval is bound to the non-transactional write order below;
+          // a transactional branch cannot preserve that order, so it refuses first.
+          throw new SdwValidationError(
+            "operation_refused",
+            "Hermes bridge SDW memory adapter refuses transactional storage",
+          );
         }
-        await this.corpus.putProvenance(prepared.provenanceRecord, taint, txn);
-        await txn.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceStatusKey(documentId));
-        await this.corpus.putDocument(documentRecord, taint, txn, documentMintOptions(prepared));
-      });
-    } else {
-      const acquireCorpusLock =
-        this.mode === "hermes-bridge" ? withHermesBridgeStorageLock : withCrossProcessLock;
-      await this.withDocumentLock(documentId, () => acquireCorpusLock(
-        this.storage,
-        MEMORY_BATCH_LOCK_NAMESPACE,
-        this.ownerScopeBatchLockFile(),
-        async () => {
-          await this.assertDocumentAbsent(documentId);
-          await this.assertCandidateCapacity([prepared]);
-          const writtenChunkKeys: string[] = [];
-          try {
-            this.assertSignerStillPrimary(prepared);
-            if (this.mode === "hermes-bridge") {
-              // A queued insert can outlive an earlier partial-scope latch; recheck
-              // inside the corpus lock immediately before the bridge commit hook.
-              this.assertHermesBridgeInsertAllowed();
-              // Hermes mode linearizes owner approval inside the corpus lock; a refusal here precedes every storage write.
-              await this.assertHermesBridgeCommitAllowed(prepared);
-            }
-            for (const [index, chunkRecord] of chunkRecords.entries()) {
-              writtenChunkKeys.push(documentChunkStorageKey(chunkRecord));
-              await this.corpus.putChunk(
-                chunkRecord,
+        await transactional.sdwTransaction(async (txn) => {
+          this.assertSignerStillPrimary(prepared);
+          await this.assertCandidateCapacity([prepared], txn);
+          await this.assertDocumentAbsent(documentId, txn);
+          // Mark before the first mutator: even a rejected write can have persisted bytes.
+          writeStarted = true;
+          for (const [index, chunkRecord] of chunkRecords.entries()) {
+            await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(prepared, index));
+          }
+          await this.corpus.putProvenance(prepared.provenanceRecord, taint, txn);
+          await txn.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceStatusKey(documentId));
+          await this.corpus.putDocument(documentRecord, taint, txn, documentMintOptions(prepared));
+        });
+      } else {
+        const acquireCorpusLock =
+          this.mode === "hermes-bridge" ? withHermesBridgeStorageLock : withCrossProcessLock;
+        await this.withDocumentLock(documentId, () => acquireCorpusLock(
+          this.storage,
+          MEMORY_BATCH_LOCK_NAMESPACE,
+          this.ownerScopeBatchLockFile(),
+          async () => {
+            await this.assertDocumentAbsent(documentId);
+            await this.assertCandidateCapacity([prepared]);
+            const writtenChunkKeys: string[] = [];
+            try {
+              this.assertSignerStillPrimary(prepared);
+              if (this.mode === "hermes-bridge") {
+                // A queued insert can outlive an earlier partial-scope latch; recheck
+                // inside the corpus lock immediately before the bridge commit hook.
+                this.assertHermesBridgeInsertAllowed();
+                // Hermes mode linearizes owner approval inside the corpus lock; a refusal here precedes every storage write.
+                await this.assertHermesBridgeCommitAllowed(prepared);
+              }
+              // Mark before the first mutator: even a rejected write can have persisted bytes.
+              writeStarted = true;
+              for (const [index, chunkRecord] of chunkRecords.entries()) {
+                writtenChunkKeys.push(documentChunkStorageKey(chunkRecord));
+                await this.corpus.putChunk(
+                  chunkRecord,
+                  taint,
+                  undefined,
+                  chunkMintOptions(prepared, index),
+                );
+              }
+              await this.corpus.putProvenance(prepared.provenanceRecord, taint, undefined);
+              await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
+                documentProvenanceStatusKey(documentId), true);
+              await this.corpus.putDocument(
+                documentRecord,
                 taint,
                 undefined,
-                chunkMintOptions(prepared, index),
+                documentMintOptions(prepared),
               );
-            }
-            await this.corpus.putProvenance(prepared.provenanceRecord, taint, undefined);
-            await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
-              documentProvenanceStatusKey(documentId), true);
-            await this.corpus.putDocument(
-              documentRecord,
-              taint,
-              undefined,
-              documentMintOptions(prepared),
-            );
-          } catch (error) {
-            if (this.mode !== "hermes-bridge" || writtenChunkKeys.length > 0) {
-              try {
-                await this.rollbackInsert(documentId, writtenChunkKeys);
-              } catch (rollbackError) {
-                this.latchHermesBridgeOnPartialScope(rollbackError);
-                throw rollbackError;
+            } catch (error) {
+              if (this.mode !== "hermes-bridge" || writtenChunkKeys.length > 0) {
+                try {
+                  // Compensating deletes also mutate state, so a failed rollback cannot certify non-commit.
+                  writeStarted = true;
+                  await this.rollbackInsert(documentId, writtenChunkKeys);
+                } catch (rollbackError) {
+                  this.latchHermesBridgeOnPartialScope(rollbackError);
+                  throw rollbackError;
+                }
               }
+              this.latchHermesBridgeOnPartialScope(error);
+              throw error;
             }
-            this.latchHermesBridgeOnPartialScope(error);
-            throw error;
-          }
-        },
-        {
-          timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS,
-          abortSignal: this.hermesBridgeCommitCheck?.abortSignal,
-        },
-      ), { abortSignal: this.hermesBridgeCommitCheck?.abortSignal });
+          },
+          {
+            timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS,
+            abortSignal: this.hermesBridgeCommitCheck?.abortSignal,
+          },
+        ), { abortSignal: this.hermesBridgeCommitCheck?.abortSignal });
+      }
+      return this.toPassage(documentRecord, prepared.text, "verified");
+    } catch (error) {
+      if (!(error instanceof SdwValidationError)) throw error;
+      throw new SdwValidationError(error.category, error.message, {
+        cause: error, detector: error.detector, line: error.line,
+        persisted: writeStarted || error.category === "partial_scope" ? "indeterminate" : "none",
+      });
     }
-    return this.toPassage(documentRecord, prepared.text, "verified");
   }
 
   screenPassage(

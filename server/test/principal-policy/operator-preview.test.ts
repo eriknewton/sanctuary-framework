@@ -1,7 +1,8 @@
+// fail-before-exempt: this change opts the existing approval-preview fixture into always; W3 proves opt-in enforcement.
 import { describe, expect, it } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
 import * as gateModule from '../../src/principal-policy/gate.js';
-import { DEFAULT_POLICY } from '../../src/principal-policy/loader.js';
+import { DEFAULT_POLICY, parsePolicy } from '../../src/principal-policy/loader.js';
 import { BaselineTracker } from '../../src/principal-policy/baseline.js';
 import { AuditLog } from '../../src/operational/audit-log.js';
 import { MemoryStorage } from '../../src/storage/memory.js';
@@ -37,7 +38,7 @@ describe('bounded operator preview', () => {
     const auditLog = new AuditLog(storage, key);
     const requests: ApprovalRequest[] = [];
     const channel = { requestApproval: async (request: ApprovalRequest) => { requests.push(request); return { decision: 'deny' as const, decided_by: 'human' as const, decided_at: '2026-10-28T00:00:00.000Z' }; } };
-    const gate = new gateModule.ApprovalGate(DEFAULT_POLICY, new BaselineTracker(storage, key), channel, auditLog);
+    const gate = new gateModule.ApprovalGate(parsePolicy(JSON.stringify({ ...DEFAULT_POLICY, memory_save_approval: "always" })), new BaselineTracker(storage, key), channel, auditLog);
     const server = createServer([{ name: 'memory_insert', description: 'test', tool_class: 'write', approvalTargetArgs: memoryInsertApprovalArgs, inputSchema: { type: 'object', properties: { text: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } } }, handler: async () => toolResult({ executed: true }) }], { gate });
     const client = new Client({ name: 'preview-denial-test', version: '1.0.0' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

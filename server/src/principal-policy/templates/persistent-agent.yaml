@@ -16,6 +16,7 @@
 #   - federation_peers with action: register (new peer trust)
 #
 # Tier 3 (auto-allow with audit logging):
+#   - Own-memory saves: memory_insert, sanctuary_remember
 #   - Everything else: state_read, state_write, state_list, identity_create,
 #     identity_verify, identity_list, identity_set_primary,
 #     all context_gate_* tools, all handshake_* tools, shr_generate, shr_verify,

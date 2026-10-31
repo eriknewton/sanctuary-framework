@@ -1,10 +1,11 @@
+// fail-before-exempt: this change opts the existing preview-binding fixture into always; W3 proves opt-in enforcement.
 import { describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer, toolResult } from '../../src/router.js';
 import { ApprovalGate } from '../../src/principal-policy/gate.js';
-import { DEFAULT_POLICY } from '../../src/principal-policy/loader.js';
+import { DEFAULT_POLICY, parsePolicy } from '../../src/principal-policy/loader.js';
 import { BaselineTracker } from '../../src/principal-policy/baseline.js';
 import { AuditLog } from '../../src/operational/audit-log.js';
 import { MemoryStorage } from '../../src/storage/memory.js';
@@ -16,7 +17,7 @@ describe('server-owned operator preview handoff', () => {
     const args = name === 'memory_insert' ? { text: 'private passage', tags: ['tag'] } : name === 'state_export' ? { namespace: 'notes', format: 'sanctuary-v1' } : {};
     const storage = new MemoryStorage(), key = randomBytes(32);
     const requests: ApprovalRequest[] = [];
-    const gate = new ApprovalGate(DEFAULT_POLICY, new BaselineTracker(storage, key), { requestApproval: async request => {
+    const gate = new ApprovalGate(parsePolicy(JSON.stringify({ ...DEFAULT_POLICY, memory_save_approval: "always" })), new BaselineTracker(storage, key), { requestApproval: async request => {
       requests.push(request); return { decision: 'deny', decided_by: 'human', decided_at: '2026-10-28T00:00:00.000Z' };
     } }, new AuditLog(storage, key));
     const evaluate = gate.evaluate.bind(gate);
@@ -24,7 +25,7 @@ describe('server-owned operator preview handoff', () => {
     const calls: unknown[][] = [];
     vi.spyOn(gate, 'evaluate').mockImplementation((...input) => {
       calls.push(input);
-      return evaluate(input[0], input[1], input[2], stripHandoff ? undefined : input[3]);
+      return evaluate(input[0], input[1], input[2], stripHandoff ? undefined : input[3], input[4]);
     });
     const server = createServer([{ name, description: 'test', tool_class: name === 'identity_list' ? 'read' : 'write', inputSchema: { type: 'object', properties: { text: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } }, namespace: { type: 'string' }, format: { type: 'string' } } },
       ...(name === 'memory_insert' ? { approvalTargetArgs: memoryInsertApprovalArgs } : {}), handler: async () => toolResult({ completed: true }) }], { gate });

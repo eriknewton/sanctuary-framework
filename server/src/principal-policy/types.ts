@@ -88,6 +88,8 @@ export interface ApprovalRedirectConfig {
 
 /** Complete Principal Policy */
 export interface PrincipalPolicy {
+  /** Own-memory saves are silent unless the operator opts into insert approval. */
+  memory_save_approval?: "never" | "always";
   version: number;
   /** Operations that always require human approval */
   tier1_always_approve: string[];
@@ -204,3 +206,16 @@ export interface SessionProfile {
   /** When the baseline was last saved */
   saved_at?: string;
 }
+
+/** Save audit operations whose displayed agent can differ from the signing session identity. */
+export const MEMORY_SAVE_AUDIT_OPERATIONS: readonly string[] = Object.freeze([
+  // state_write retains family membership for display parity; its current writer sets no details.agent_id.
+  "state_write", "memory_insert", "sanctuary_remember", "sanctuary_remember_intent", "memory_insert_intent",
+]);
+// Must match evidenceAgent in dashboard/v1_1/client.ts and evidence_agent in operational/audit-log.ts.
+
+/** Intent operations whose success records an attempt rather than a completed save. */
+export const MEMORY_SAVE_INTENT_OPERATIONS: readonly string[] = Object.freeze(
+  MEMORY_SAVE_AUDIT_OPERATIONS.filter(operation => operation.endsWith("_intent")),
+);
+// Must match the intent renderers in dashboard/v1_1/client.ts and principal-policy/posture-evidence-html.ts.

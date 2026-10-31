@@ -226,7 +226,8 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
 
 /**
  * Reason codes for a held Charter call. Each code except `unrecognized` is one
- * reason template in server/src/principal-policy/gate.ts; must match
+ * reason template sent by server/src/principal-policy/gate.ts, including the
+ * own-scope save allowance holds; must match
  * HOLD_REASON_TEMPLATES in server/src/hub/charter-approval-bridge.ts and
  * HOLD_REASON_SENTENCES in server/src/dashboard/v1_1/client.ts.
  */
@@ -243,6 +244,8 @@ export const HUB_HOLD_REASON_CODES = [
   "bulk_read",
   "frequency_spike",
   "injection_escalation",
+  "memory_save_quota_reached",
+  "memory_save_quota_unavailable",
   "unrecognized",
 ] as const;
 

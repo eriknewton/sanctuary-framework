@@ -1,3 +1,4 @@
+// fail-before-exempt: this change opts the real insert-hold fixture into always; W3 proves opt-in enforcement.
 /**
  * Sanctuary v1.1 dashboard. Live Tier 1 approval cards for a generic wrap.
  *
@@ -63,7 +64,7 @@ import { charterApprovalItemId } from "../../../src/hub/charter-approval-bridge.
 import { InMemoryLocalAgentRegistry } from "../../../src/hub/agent-registry.js";
 import { ApprovalGate } from "../../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../../src/principal-policy/baseline.js";
-import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
+import { DEFAULT_POLICY, parsePolicy } from "../../../src/principal-policy/loader.js";
 import type {
   HubDisplayTemplateArg,
   HubHoldReason,
@@ -709,7 +710,7 @@ describe("a hub-resolved hold is a real gate decision", () => {
     // rather than calling `requestApproval` directly, so the Tier 1 verdict and
     // the durable decision row are proven rather than assumed for the rail.
     const gate = new ApprovalGate(
-      DEFAULT_POLICY,
+      parsePolicy(JSON.stringify({ ...DEFAULT_POLICY, memory_save_approval: "always" })),
       rig.baseline,
       rig.dashboard,
       rig.auditLog,
