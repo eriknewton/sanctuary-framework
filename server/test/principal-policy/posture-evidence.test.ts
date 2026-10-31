@@ -366,7 +366,10 @@ it.each(["sanctuary_remember", "memory_insert"])("legacy Evidence renders %s int
     return elements.get(id)!;
   } };
   const intent = { operation: operation + "_intent", result: "success", identity_id: "session", details: { audit_ref: "intent:one" } };
-  const script = [...renderPostureEvidenceHTML().matchAll(/<script>([\s\S]*?)<\/script>/g)].find(match => match[1].includes("function renderEntries"))![1];
+  // Plain string slicing, not a regexp: this extracts the renderer's own lowercase <script> body to execute it; it filters nothing.
+  const script = renderPostureEvidenceHTML().split("<script>").slice(1)
+    .map(part => part.slice(0, part.indexOf("</script>")))
+    .find(body => body.includes("function renderEntries"))!;
   // Execute the shipping renderer with only its network read pending; no process or timer is retained.
   const context = { document, window: {}, location: { search: "" }, URLSearchParams, fetch: () => new Promise(() => {}), intent };
   runInNewContext(script.replace(/\}\)\(\);\s*$/, 'window.renderEntries = renderEntries; })();'), context);
