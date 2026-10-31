@@ -183,6 +183,9 @@ async function startDashboardWithStalledReads(options: {
     options.stallProducerKeyLoad === true
       ? vi.fn(() => new Promise<void>(() => undefined))
       : null;
+  // Independent availability tests positively establish absence; stalled-key tests retain a cold unknown observation.
+  (dashboard as any).ensureBrokerProducerKeyLoaded = async () => { (dashboard as any)._brokerProducerKeyObservation = "absent"; };
+  if (!producerKeyLoad) (dashboard as any).ensureProducerKeyLoaded = async () => { (dashboard as any)._producerKeyObservation = "absent"; };
   if (producerKeyLoad) {
     (dashboard as unknown as { ensureProducerKeyLoaded: () => Promise<void> })
       .ensureProducerKeyLoaded = producerKeyLoad;
@@ -208,7 +211,7 @@ async function startDashboardWithStalledReads(options: {
       identityManager: identityManager as never,
       masterKey,
     },
-    resolveEnforcementAvailability: enforcementRead,
+    resolveEnforcementAvailability: enforcementRead, // A stalled cold load has no prior configured-key observation.
   });
 
   const inboxStore = new UnifiedInboxStore({
@@ -328,70 +331,38 @@ describe("dashboard bounded read responses", () => {
     }
   }, TEST_HARNESS_TIMEOUT_MS);
 
-  it("GET /api/posture/home returns unavailable within the server budget and caps retry waves", async () => {
+  it("GET /api/posture/home isolates stalled availability and preserves producer admission", async () => {
     const rig = await startDashboardWithStalledReads();
     try {
-      const first = await readJson("/api/posture/home", rig.baseUrl);
-      expect(first.status, JSON.stringify(first.body)).toBe(503);
-      expect(first.body).toMatchObject({
-        ok: false,
-        error: "dashboard_read_unavailable",
-        route: "posture_home",
-        reason: "deadline_exceeded",
-      });
-      expect(first.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS + DEADLINE_SLACK_MS);
-      expect(getDashboardReadInFlightCount("posture_home", rig.readFlightMap)).toBe(1);
-
-      const retryStarted = Date.now();
-      const retryA = await readJson("/api/posture/home", rig.baseUrl);
-      const retryB = await readJson("/api/posture/home", rig.baseUrl);
-      expect(Date.now() - retryStarted).toBeLessThan(FAST_REFUSAL_HALF_SECOND_MS);
-      expect(retryA.status).toBe(503);
-      expect(retryB.status).toBe(503);
-      expect(retryA.body.reason).toBe("in_flight_limit");
-      expect(retryB.body.reason).toBe("in_flight_limit");
+      for (let wave = 0; wave < 3; wave++) {
+        const response = await readJson("/api/posture/home", rig.baseUrl);
+        expect(response.status).toBe(200);
+        expect(response.body).toMatchObject({ panels: {
+          enforcement_availability: { state: "unavailable", reason: "budget_exceeded" },
+          digest: { state: "fresh" },
+        } });
+        expect(response.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS);
+      }
+      expect(getDashboardReadInFlightCount("posture_home", rig.readFlightMap)).toBe(0);
       expect(rig.enforcementRead).toHaveBeenCalledTimes(1);
-    } finally {
-      await rig.stop();
-    }
+    } finally { await rig.stop(); }
   }, TEST_HARNESS_TIMEOUT_MS);
 
-  it("GET /api/posture/home budgets stalled producer-key loading and caps retry waves", async () => {
-    const rig = await startDashboardWithStalledReads({
-      stallProducerKeyLoad: true,
-    });
+  it("GET /api/posture/home budgets producer keys without withholding other panels", async () => {
+    const rig = await startDashboardWithStalledReads({ stallProducerKeyLoad: true });
     try {
-      const first = await readJson("/api/posture/home", rig.baseUrl);
-      expect(first.status, JSON.stringify(first.body)).toBe(503);
-      expect(first.body).toMatchObject({
-        ok: false,
-        error: "dashboard_read_unavailable",
-        route: "posture_home",
-        reason: "deadline_exceeded",
-        origin_machine: expect.any(String),
-      });
-      expect(first.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS + DEADLINE_SLACK_MS);
-      expect(getDashboardReadInFlightCount("posture_home", rig.readFlightMap)).toBe(1);
-
-      const retryStarted = Date.now();
-      const retryA = await readJson("/api/posture/home", rig.baseUrl);
-      const retryB = await readJson("/api/posture/home", rig.baseUrl);
-      expect(Date.now() - retryStarted).toBeLessThan(FAST_REFUSAL_HALF_SECOND_MS);
-      expect(retryA.status).toBe(503);
-      expect(retryB.status).toBe(503);
-      expect(retryA.body).toMatchObject({
-        reason: "in_flight_limit",
-        origin_machine: expect.any(String),
-      });
-      expect(retryB.body).toMatchObject({
-        reason: "in_flight_limit",
-        origin_machine: expect.any(String),
-      });
+      for (let wave = 0; wave < 3; wave++) {
+        const response = await readJson("/api/posture/home", rig.baseUrl);
+        expect(response.status).toBe(200);
+        expect(response.body).toMatchObject({ panels: {
+          producer_keys: { state: "unavailable", reason: "budget_exceeded" },
+        }, digest: { chain_verified: false } });
+        expect(response.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS);
+      }
+      expect(getDashboardReadInFlightCount("posture_home", rig.readFlightMap)).toBe(0);
       expect(rig.producerKeyLoad).toHaveBeenCalledTimes(1);
-      expect(rig.enforcementRead).not.toHaveBeenCalled();
-    } finally {
-      await rig.stop();
-    }
+      expect(rig.enforcementRead).toHaveBeenCalledTimes(1);
+    } finally { await rig.stop(); }
   }, TEST_HARNESS_TIMEOUT_MS);
 
   it("keeps read flights scoped to their owning dashboard instance", async () => {
@@ -694,3 +665,22 @@ describe("wrap dashboard servers keep their own bounded-read flights", () => {
   }, TEST_HARNESS_TIMEOUT_MS);
 });
 
+
+it("without a reconciliation hook shares the exact payload object", async () => {
+  let release!: (value: { status: number; body: object }) => void;
+  const held = new Promise<{ status: number; body: object }>(resolve => { release = resolve; });
+  const seen: unknown[] = [];
+  const body = { toJSON() { seen.push(this); return { shared: true }; } };
+  const produce = vi.fn(() => held);
+  const first = directBoundedRead(produce);
+  const second = directBoundedRead(produce);
+  try {
+    release({ status: 200, body });
+    await Promise.all([first.handled, second.handled]);
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBe(body); expect(seen[1]).toBe(body);
+    expect(first.res.json()).toEqual(second.res.json());
+    expect(directReadFlights.size).toBe(0);
+  } finally { release({ status: 200, body }); await Promise.all([first.handled, second.handled]); }
+});

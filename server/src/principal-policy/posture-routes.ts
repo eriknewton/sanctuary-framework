@@ -58,6 +58,8 @@ import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/conf
 import type { AgentPlatform } from "../wrap/config-reader.js";
 import { resolveCuratedRules } from "../castle-wall/runtime/curated-allowlist.js";
 import {
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  DEFAULT_DIGEST_WINDOW_MS,
   buildCastleWallPosture,
   buildAuditDigest,
   buildUnwrappedRoster,
@@ -79,6 +81,7 @@ import {
   type ExclusiveEgressStatus,
 } from "./posture.js";
 import {
+  SLICE1_FEATURE_REGISTRY,
   buildFeatureHealthPanel,
   type FeatureHealthPanel,
 } from "./feature-health.js";
@@ -107,6 +110,25 @@ import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
   type ResolvedEnforcementAvailability,
 } from "../castle-wall/runtime/enforcement-availability.js";
+
+import { type ProducerKeyObservation, NO_PANEL_INPUTS, capStalePanel, type PosturePanelStore, type PosturePanelStatus, type PanelSnapshot } from "./panel-producer.js";
+
+export type { ProducerKeyObservation } from "./panel-producer.js";
+type ProducerKeys = Pick<PostureRouteDeps, "resolvePinnedProducerKey" | "resolveBrokerPinnedProducerKey" | "producerKeyObservation" | "brokerProducerKeyObservation">;
+
+/** Only a positively absent key permits the ordinary channel-basis path. */
+export function observeInjectedProducerKey(resolve: (() => string | null) | undefined, expected = false): ProducerKeyObservation {
+  try {
+    return resolve?.() ? "present" : expected ? "unreadable" : resolve ? "absent" : "unknown";
+  } catch {
+    // A resolver exception cannot establish absence or reject the whole composition.
+    return expected ? "unreadable" : "unknown";
+  }
+}
+function keyRestricted(observation: ProducerKeyObservation | undefined): boolean {
+  // Missing observations are unknown; absence must be positively established by the loader.
+  return observation !== "present" && observation !== "absent";
+}
 
 export const POSTURE_API_PREFIX = "/api/posture";
 export const POSTURE_HOME_PATH = "/posture";
@@ -147,6 +169,13 @@ export interface PostureRouteDeps {
   // Required: each dashboard instance owns its flight map (must match the required
   // `readFlights` option in src/dashboard/read-response.ts).
   readFlightMap: DashboardReadFlightMap;
+  /** Required per-instance admission shared by HTTP and SSE. */
+  panelStore: PosturePanelStore;
+  /** Raw key-load prelude, budgeted by the same store as the home producers. */
+  prepareProducerKeys?: () => Promise<ProducerKeys>;
+  producerKeysStatus?: PosturePanelStatus;
+  /** Rebuild daemon dependencies inside each admitted stream frame so observations are current. */
+  refreshStreamDeps?: () => Promise<PostureRouteDeps>;
   /**
    * Recognition precursor: the resolved `composition_enabled` flag (default-off
    * via `resolveCompositionConfig()`). This is CONFIG, not evidence: it is the
@@ -255,19 +284,16 @@ export interface PostureRouteDeps {
   resolveEnforcementAvailability?: () =>
     | Promise<ResolvedEnforcementAvailability>
     | ResolvedEnforcementAvailability;
-  /**
-   * Slice P fail-honest signal: a producer key is EXPECTED for this fortress (the
-   * daemon published one) but the dashboard could NOT load it (present but
-   * unreadable / malformed). When true, the readers refuse to render green on the
-   * channel basis - the wall posture forces `degraded`, the digest reports an
-   * unverified chain, and feature-health rows render `unknown`. Mutually
-   * exclusive with a non-null `resolvePinnedProducerKey()`.
-   */
-  producerKeyExpectedButUnavailable?: boolean;
+  /** Named pinned-key observation: only positive absence permits channel-basis evidence. */
+  producerKeyObservation?: ProducerKeyObservation;
+  /** Derived, do not set: compatibility for shaper callers; true for unresolved or unreadable observations. */
+  readonly producerKeyExpectedButUnavailable?: boolean;
   /** Pinned public key for the broker daemon liveness producer. */
   resolveBrokerPinnedProducerKey?: () => string | null;
-  /** Broker liveness producer key exists or is expected but could not be read. */
-  brokerProducerKeyExpectedButUnavailable?: boolean;
+  /** Named broker-key observation, using the same unknown/absent distinction as the pinned key. */
+  brokerProducerKeyObservation?: ProducerKeyObservation;
+  /** Derived, do not set: compatibility for shaper callers. */
+  readonly brokerProducerKeyExpectedButUnavailable?: boolean;
   /**
    * Canonical confined-agent subject (`fortress/uid-N`) for protection claims.
    * When provided, Castle Wall green evidence must bind to this subject across
@@ -406,6 +432,7 @@ export async function handlePostureRoute(
   url: URL,
   method: string,
 ): Promise<boolean> {
+  deps = withDerivedKeyRestriction(deps);
   const path = url.pathname;
 
   // NOTE (Delta Review A3 remediation): the posture-home HTML at `/posture` is
@@ -524,7 +551,8 @@ export async function handlePostureRoute(
       return true;
     }
     await handlePostureStream(res, {
-      buildHome: () => buildHome(deps),
+      // SSE admits and registers cleanup before refreshing each frame; it never joins the HTTP flight.
+      buildHome: async () => buildHome(deps.refreshStreamDeps ? await deps.refreshStreamDeps() : deps),
       registry: deps.streamRegistry,
       ...(deps.streamIntervalMs !== undefined
         ? { intervalMs: deps.streamIntervalMs }
@@ -693,6 +721,7 @@ export async function handlePostureRoute(
         operation: "get_posture_home",
         readFlights: deps.readFlightMap,
         originMachine: om,
+        reconciliation: { arrivalSequence: deps.auditLog!.currentInMemorySequence(), reconcile: reconcilePostureHomeJoiner },
         produce: async () => ({
           status: 200,
           body: await buildHome(deps),
@@ -712,21 +741,9 @@ export async function handlePostureRoute(
 
 // ── Composition helpers ──────────────────────────────────────────────
 
-// The always-on posture surface (home board + per-panel endpoints + SSE push)
-// composes several full-window audit reads per paint. Each helper below wraps its
-// build in `AuditLog.runEagerReads` so those reads serve from the eagerly-
-// maintained verified view with an EVENT-DRIVEN out-of-band fingerprint sentinel
-// plus a throttled backstop re-verify, instead of a full chain re-scan per request.
-// On a real 10k-entry / 40MB chain the old path
-// was 11-30s and pegged the event loop, and the SSE cadence made an open board
-// recompute it continuously and wedge the server (the #714 drill). HONESTY is
-// preserved: the eager view reflects every server-written entry with NO lag (the
-// server is the sole appender and verifies each entry as it appends), and the
-// strict integrity-findings contract is unchanged, so `chain_verified` /
-// `integrity_finding_count` / feature-health can never serve stale-green. The
-// agent-facing `/api/posture/evidence` read (`buildEvidence`) deliberately stays
-// on the full per-request re-verify path, keeping per-request on-disk tamper
-// detection on the inspectable audit surface.
+// Eager reads preserve immediate local-append visibility. An out-of-band byte
+// change in any entry is caught on the first eager read after one pass interval.
+// The agent-facing evidence route retains full per-request verification.
 async function buildWallPosture(
   deps: PostureRouteDeps,
   /**
@@ -781,7 +798,8 @@ async function buildWallPosture(
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
         : null,
-      ...(deps.producerKeyExpectedButUnavailable
+      // Unknown and unreadable observations cannot admit unsigned channel-basis evidence.
+      ...(deps.producerKeyExpectedButUnavailable || deps.brokerProducerKeyExpectedButUnavailable
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
@@ -808,32 +826,16 @@ async function buildDigest(
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
         : null,
-      ...(deps.producerKeyExpectedButUnavailable
+      // Unknown and unreadable observations cannot admit unsigned channel-basis evidence.
+      ...(deps.producerKeyExpectedButUnavailable || deps.brokerProducerKeyExpectedButUnavailable
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
     }),
   );
 }
 
-/**
- * Feature-usage health panel. NEVER-STALE-GREEN rule (the new honesty argument,
- * superseding the prior "uncached by design" note): the panel reads the audit
- * chain through `buildFeatureHealthPanel`, which goes via the AuditLog's EAGER
- * read path here (wrapped in `runEagerReads`). The eager view is maintained on
- * EVERY append (the server is the sole appender and verifies each new entry as it
- * records it), so the panel always reflects the current chain head with NO lag.
- * A post-fault refresh can never show stale green. This is NOT a lazily-cached
- * value that could fall behind an append: it is the eagerly-maintained verified
- * state, and a detected integrity finding (at load, on the next eager read via the
- * fingerprint sentinel, or on the throttled backstop out-of-band re-verify) forces
- * every row to `unknown`/non-green via the existing `audit_integrity_ok=false`
- * lever. What the eager path changes versus the old code is ONLY the cadence of the
- * OUT-OF-BAND on-disk re-scan (a direct file edit that bypasses the server): a
- * fingerprint-changing edit (count / newest key / per-entry size or mtime) is
- * caught EVENT-DRIVEN on the next eager read, and only the residual same-length,
- * mtime-preserved edit waits for the throttled backstop re-verify, instead of
- * re-verifying the whole chain on every paint (the #714 wedge).
- */
+/** Feature health uses the verified eager view: an out-of-band byte change in
+ * any entry is caught on the first eager read after one pass interval. */
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
   /**
@@ -879,6 +881,7 @@ async function buildFeatureHealth(
       brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
         ? deps.resolveBrokerPinnedProducerKey()
         : null,
+      // Unknown and unreadable observations cannot admit unsigned channel-basis evidence.
       ...(deps.producerKeyExpectedButUnavailable
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
@@ -902,7 +905,7 @@ async function buildQueryPrivacy(
 ): Promise<QueryPrivacySection> {
   let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null;
   try {
-    // Eager read (posture surface): bounded-cost, throttled out-of-band re-verify.
+    // An out-of-band byte change is caught on the first eager read after one pass interval.
     const computed = await (deps.auditLog as AuditLog).runEagerReads(() =>
       computeQueryAnonymityStats({
         auditLog: deps.auditLog as AuditLog,
@@ -1139,68 +1142,215 @@ function buildReach(
 // site (`import type { PostureHome } from "./posture-routes.js"`).
 export type { PostureHome };
 
-export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
-  const records = deps.listAgents();
-  // S5-P (codex BLOCKER fix): resolve the exclusive-egress provider EXACTLY
-  // ONCE for the whole home payload, then thread the SAME snapshot into both
-  // the wall posture and the feature-health panel. Resolving per-builder would
-  // let an intermittent provider cap one surface (wall pill) while the other
-  // (feature-health row) still rendered green from a second, luckier read.
-  const exclusiveEgress = await resolveExclusiveEgress(deps);
-  const protectionClaimSubject = await resolveProtectionClaimSubject(deps);
-  const enforcementAvailability = await resolveEnforcementAvailability(deps);
-  const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
-    await Promise.all([
-      buildWallPosture(
-        deps,
-        exclusiveEgress,
-        protectionClaimSubject,
-        enforcementAvailability,
-      ),
-      buildDigest(deps, protectionClaimSubject),
-      buildUnwrapped(deps, records),
-      buildFeatureHealth(
-        deps,
-        exclusiveEgress,
-        protectionClaimSubject,
-        enforcementAvailability,
-      ),
-      buildCustodyExit(deps),
-      buildFederationSummary(deps),
-    ]);
-  // Derive the honest agent rows from the roster ALONE. Deliberately not passed
-  // the wall posture: there is no path by which the machine-level arm-state can
-  // leak into a per-agent enforcement claim (the #634 fake-green).
-  const agents = buildPostureAgentRows({
-    originMachine: deps.originMachine,
-    records,
-  });
-  const protectionRequestedCount = agents.filter(
-    (a) => a.policy_protected,
-  ).length;
-  const enforcementConfirmedCount = agents.filter(
-    (a) => a.enforcement_active === "active",
-  ).length;
-  // Query-privacy depends on the feature-health panel (it carries the Tier B
-  // `privacy_strips` row through verbatim), so it is computed after the parallel
-  // block rather than inside it.
-  const queryPrivacy = await buildQueryPrivacy(deps, featureHealth);
+/** Load the key pair under the producer budget before composing any dependent panels. */
+export async function loadPostureProducerKeys(deps: PostureRouteDeps): Promise<PostureRouteDeps> {
+  const producer = deps.producerKeyObservation ?? observeInjectedProducerKey(deps.resolvePinnedProducerKey);
+  const broker = deps.brokerProducerKeyObservation ?? observeInjectedProducerKey(deps.resolveBrokerPinnedProducerKey);
+  // Negative observations are transient: retaining one must never delay a repaired key's first request.
+  if (keyRestricted(producer) || keyRestricted(broker)) deps.panelStore.invalidate("producer_keys");
+  // Must match the inputKey check in panel-producer.ts: both named observation states invalidate reuse on transition.
+  const producerKeysInputKey = JSON.stringify([producer, broker]);
+  const readKeys = () => deps.panelStore.read("producer_keys", deps.auditLog?.currentInMemorySequence() ?? 0,
+    () => deps.prepareProducerKeys ? deps.prepareProducerKeys() : Promise.resolve({
+      resolvePinnedProducerKey: deps.resolvePinnedProducerKey,
+      resolveBrokerPinnedProducerKey: deps.resolveBrokerPinnedProducerKey,
+      producerKeyObservation: producer, brokerProducerKeyObservation: broker,
+    }), producerKeysInputKey);
+  const retainedKeys = deps.panelStore.snapshot<ProducerKeys>("producer_keys").value;
+  let keys = await readKeys();
+  if (keys.status.state === "fresh" && keys.value === retainedKeys &&
+      !keyRestricted(producer) && !keyRestricted(broker) && keys.value &&
+      (keyRestricted(keys.value.producerKeyObservation) || keyRestricted(keys.value.brokerProducerKeyObservation))) {
+    // Only a reused completed negative gets one retry; a timed-out or newly completed read cannot spend a second budget.
+    deps.panelStore.invalidate("producer_keys");
+    keys = await readKeys();
+  }
+  // A timed-out first load cannot establish absence, even if no key has ever been cached.
+  const ready = { ...deps, ...(keys.status.state === "fresh" ? keys.value : {}), producerKeysStatus: keys.status };
+  ready.producerKeyObservation = keys.status.state === "fresh" ? keys.value?.producerKeyObservation ?? producer : producer === "present" ? producer : "unknown";
+  ready.brokerProducerKeyObservation = keys.status.state === "fresh" ? keys.value?.brokerProducerKeyObservation ?? broker : broker === "present" ? broker : "unknown";
+  const observations = [ready.producerKeyObservation, ready.brokerProducerKeyObservation];
+  if (observations.some(keyRestricted)) {
+    // Unknown and unreadable are unavailable observations, never a successfully established no-key state.
+    ready.producerKeysStatus = { ...keys.status, state: "unavailable", completed_at: null, age_ms: null,
+      reason: keys.status.reason ?? (observations.includes("unreadable") ? "producer_failed" : "never_completed") };
+  }
+  return ready;
+}
+
+/** Apply the post-load observations; the loader runs before this shaping boundary. */
+export async function withPostureProducerKeys(initial: PostureRouteDeps): Promise<PostureRouteDeps> {
+  const deps = initial.producerKeysStatus ? initial : await loadPostureProducerKeys(initial);
+  return withDerivedKeyRestriction(deps);
+}
+
+function withDerivedKeyRestriction(deps: PostureRouteDeps): PostureRouteDeps {
+  return { ...deps,
+    // Every root derives these flags here; a caller cannot omit the named observation's restriction.
+    // Derived, do not set: absence alone admits channel-basis evidence at each shaper below.
+    get producerKeyExpectedButUnavailable() { return keyRestricted(deps.producerKeyObservation ?? observeInjectedProducerKey(deps.resolvePinnedProducerKey)); },
+    get brokerProducerKeyExpectedButUnavailable() { return keyRestricted(deps.brokerProducerKeyObservation ?? observeInjectedProducerKey(deps.resolveBrokerPinnedProducerKey)); },
+  };
+}
+
+// Must match the audit readers in buildHome's producer table below; query_privacy reads header-strip evidence and federation enters runEagerReads through buildFleet.
+export const AUDIT_READING_HOME_PANELS = ["castle_wall", "digest", "feature_health", "query_privacy", "custody_exit", "federation"] as const;
+
+/** Reconcile a route-flight follower against the audit state at its own arrival. */
+export function reconcilePostureHomeJoiner(home: PostureHome, admissionSequence: number, arrivalSequence: number): PostureHome {
+  if (arrivalSequence <= admissionSequence || !home.panels) return home;
+  const result = { ...home, panels: { ...home.panels } };
+  // A flight proves its admission sequence only; a newer caller gets a private capped copy.
+  for (const id of AUDIT_READING_HOME_PANELS) {
+    Object.assign(result, { [id]: capStalePanel(id, home[id]) });
+    result.panels[id] = { ...home.panels[id], state: home.panels[id].state === "unavailable" ? "unavailable" : "stale",
+      reason: home.panels[id].reason ?? "observation_superseded" };
+  }
+  return result;
+}
+
+/** Existing fail-closed wire shapes, assembled synchronously with no producer work. */
+function unavailableHomeValues(deps: PostureRouteDeps): Pick<PostureHome, "castle_wall" | "digest" | "feature_health" | "custody_exit" | "unwrapped" | "federation" | "query_privacy"> {
+  const origin_machine = deps.originMachine;
+  const now = deps.now?.() ?? Date.now();
+  const window_start = new Date(now - DEFAULT_DIGEST_WINDOW_MS).toISOString();
+  const window_end = new Date(now).toISOString();
+  const castle_wall: CastleWallPosture = {
+    origin_machine, arm_state: "unknown", evidence_basis: "no_evidence",
+    platform: (deps.platform ?? process.platform) === "darwin" ? "macos" : (deps.platform ?? process.platform) === "linux" ? "linux" : "other",
+    last_enforcement_evidence_at: null, freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+    verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 }, audit_integrity_ok: false,
+    sealed_region_unverified_at_privilege: false, producer_authenticity: "not_applicable",
+  };
+  const digest: AuditDigest = {
+    origin_machine, window_start, window_end, window_complete: false, window_incomplete_reason: "coverage_unknown",
+    kernel_allow_overrides: 0, blocked_destinations: [], blocked_destination_count: 0,
+    total_operations: 0, failures: 0, kernel_blocks: 0, kernel_allows: 0, approvals_granted: 0,
+    approvals_denied: 0, by_agent: [], chain_verified: false, chain_verdict: "findings", integrity_finding_count: 0,
+  };
+  const feature_health: FeatureHealthPanel = {
+    origin_machine, window_start, window_end, audit_integrity_ok: false, sealed_region_unverified_at_privilege: false,
+    rows: SLICE1_FEATURE_REGISTRY.map(feature => ({ origin_machine, feature_id: feature.id, label: feature.label,
+      liveness: feature.liveness, status: "unknown", basis: "stale_evidence", invocation_count: 0,
+      last_evidence_at: null, broken_zero_detectable: feature.brokenZeroDetectable,
+      expectation_floor: null, trailing_window_volume: null, audit_integrity_ok: false,
+      freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS })),
+    plugin_rows: [], disclosure: { broken_zero_undetectable_for_event_driven: true,
+      castle_wall_silent_death_is_unknown_not_green: true, silent_death_distinguished_from_intentional_stop: false,
+      broker_daemon_silent_death_detectable: false },
+  };
+  const custody_exit: CustodyExitPanel = {
+    origin_machine, custody_state: "unconfirmed", custody_basis: "no_negative_evidence_unconfirmed",
+    rollback_freeze_suspected: false, pin_custody_mismatch: false, establishment: null, last_damage_evidence_at: null,
+    freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS, audit_integrity_ok: false,
+    exit_state: "export_available", exit_command: "sanctuary exit export", clean_exit_guaranteed: false,
+  };
+  return { castle_wall, digest, feature_health, custody_exit,
+    unwrapped: buildUnwrappedRoster({ originMachine: origin_machine, wrappedAgents: [], detectedHarnesses: [] }),
+    federation: { available: false, enabled: false, fleet_node_count: 0 },
+    query_privacy: buildQueryPrivacySection({ originMachine: origin_machine, headerStripStats: null, tierBRow: null }),
+  };
+}
+
+export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureHome> {
+  const deps = await withPostureProducerKeys(initialDeps);
+  const store = deps.panelStore;
+  const sequence = () => deps.auditLog!.currentInMemorySequence();
+  const fallback = unavailableHomeValues(deps);
+  // Either unresolved key keeps dependent claims restrictive; only positive absence permits the no-key path.
+  const keysRestricted = keyRestricted(deps.producerKeyObservation) || keyRestricted(deps.brokerProducerKeyObservation);
+  // S5-P: one fresh-or-capped snapshot is shared by wall and feature health.
+  const [roster, exclusive, subject, availability, provision] = await Promise.all([
+    store.read("agents_roster", sequence(), () => deps.listAgents(), NO_PANEL_INPUTS), // Roster has no shared resolver inputs.
+    store.read("exclusive_egress", sequence(), () => deps.exclusiveEgressPosture?.() ?? null, NO_PANEL_INPUTS), // Egress is an independent resolver.
+    store.read("protection_subject", sequence(), () => deps.resolveProtectionClaimSubject?.() ?? null, NO_PANEL_INPUTS), // Subject is an independent resolver.
+    store.read("enforcement_availability", sequence(), () => deps.resolveEnforcementAvailability
+      ? deps.resolveEnforcementAvailability() : resolveEnforcementAvailability(deps), NO_PANEL_INPUTS), // Availability has no shared inputs.
+    store.read("vault_provision_claim", sequence(), () => deps.resolveVaultProvisionClaimed?.() ?? false, NO_PANEL_INPUTS), // Provision is an independent resolver.
+  ]);
+  // Missed exclusive-egress observations cannot mean no fine-grained agent exists.
+  const exclusiveValue = exclusive.status.state === "fresh" ? exclusive.value! : failedExclusiveEgressStatus("budget_exceeded");
+  // Availability absence cannot prove current enforcement, even if old evidence was green.
+  const availabilityValue = availability.status.state === "fresh" ? availability.value! : {
+    status: "undetermined" as const, reason: "availability_budget_exceeded", observed_at: null,
+    freshness_window_ms: DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS, active_connection_count: 0,
+  };
+  // An unread claim must retain the not-yet-walled restriction.
+  const provisionValue = provision.status.state === "fresh" ? provision.value! : true;
+  // A previous identity binding is reusable; no binding observation means no dependent green.
+  const subjectMissing = subject.status.state !== "fresh" && subject.value === undefined;
+  const subjectValue = subject.value ?? null;
+  const records = roster.value ?? [];
+  const snapshotDeps = { ...deps, resolveVaultProvisionClaimed: async () => provisionValue };
+  // Must match the inputKey reuse check in panel-producer.ts: resolver values can change without an append.
+  // observed_at is part of this key, so live resolver timestamps usually prevent dependent reuse; this is fail-safe.
+  const evidenceInputKey = JSON.stringify([exclusiveValue, subjectValue, availabilityValue, provisionValue,
+    deps.producerKeyObservation, deps.brokerProducerKeyObservation]);
+  // Audit-reading producers must match AUDIT_READING_HOME_PANELS above.
+  const [wall, digest, unwrapped, health, custody, federation] = await Promise.all([
+    subjectMissing ? Promise.resolve(store.snapshot<CastleWallPosture>("castle_wall", "upstream_unavailable")) :
+      store.read("castle_wall", sequence(), () => buildWallPosture(snapshotDeps, exclusiveValue, subjectValue, availabilityValue), evidenceInputKey),
+    store.read("digest", sequence(), () => buildDigest(deps, subjectValue), JSON.stringify([subjectValue, deps.producerKeyObservation, deps.brokerProducerKeyObservation])),
+    store.read("unwrapped", sequence(), () => buildUnwrapped(deps, records), JSON.stringify(records)),
+    subjectMissing ? Promise.resolve(store.snapshot<FeatureHealthPanel>("feature_health", "upstream_unavailable")) :
+      store.read("feature_health", sequence(), () => buildFeatureHealth(deps, exclusiveValue, subjectValue, availabilityValue), evidenceInputKey),
+    store.read("custody_exit", sequence(), () => buildCustodyExit(deps), NO_PANEL_INPUTS), // Custody depends on the audit sequence alone.
+    store.read("federation", sequence(), () => buildFederationSummary(deps), NO_PANEL_INPUTS), // Federation has no shared resolver inputs.
+  ]);
+  function value<K extends keyof typeof fallback>(id: K, result: PanelSnapshot<PostureHome[K]>): PostureHome[K] {
+    // An unavailable panel has no complete observation; stale observations must lose green.
+    return result.value === undefined ? fallback[id] as PostureHome[K] : result.status.state === "fresh" ? result.value : capStalePanel(id, result.value) as PostureHome[K];
+  }
+  function lowerForUpstream(result: PanelSnapshot<unknown>): void {
+    // Upstream caps cannot hide the panel's own timeout or failure reason.
+    result.status = { ...result.status, state: result.value === undefined ? "unavailable" : "stale",
+      reason: result.status.reason ?? "upstream_unavailable" };
+  }
+  let castleWall = value("castle_wall", wall);
+  let featureHealth = value("feature_health", health);
+  // Even a reused completed panel must respect this payload's shared resolver snapshot.
+  if (exclusive.status.state !== "fresh" || availability.status.state !== "fresh" || subjectMissing ||
+      keysRestricted || provision.status.state !== "fresh") {
+    // A body capped for a missed upstream cannot advertise a fresh panel status.
+    for (const result of [wall, health]) {
+      lowerForUpstream(result);
+    }
+    castleWall = capStalePanel("castle_wall", castleWall);
+    featureHealth = capStalePanel("feature_health", featureHealth);
+  }
+  const query = await store.read("query_privacy", sequence(), () => buildQueryPrivacy(deps, featureHealth), JSON.stringify(featureHealth));
+  let queryPrivacy = value("query_privacy", query);
+  if (health.status.state !== "fresh" || !featureHealth.audit_integrity_ok) {
+    // The query body and its freshness status describe the same restricted observation.
+    queryPrivacy = capStalePanel("query_privacy", queryPrivacy);
+    lowerForUpstream(query);
+  }
+  if (keysRestricted) {
+    // The zero fallback is no completed observation, so it cannot carry the discarded digest's age.
+    digest.status = { ...digest.status, state: "unavailable", completed_at: null, age_ms: null,
+      reason: digest.status.reason ?? "upstream_unavailable" };
+  }
+  const agentsRaw = buildPostureAgentRows({ originMachine: deps.originMachine, records });
+  const agents = roster.status.state === "fresh" ? agentsRaw : capStalePanel("agents", agentsRaw);
+  const unwrappedValue = value("unwrapped", unwrapped);
   return {
-    origin_machine: deps.originMachine,
-    federation,
-    stream_available: deps.streamRegistry !== undefined,
-    castle_wall: castleWall,
-    digest,
-    unwrapped,
-    feature_health: featureHealth,
-    custody_exit: custodyExit,
-    query_privacy: queryPrivacy,
-    protection_requested_count: protectionRequestedCount,
-    // Requested is a subset of records, and records of detected: requested <= detected.
-    // buildUnwrappedRoster drops registered harness kinds, so no kind counts twice.
-    protection_detected_count: records.length + unwrapped.unwrapped.length,
-    enforcement_confirmed_count: enforcementConfirmedCount,
-    agents,
+    origin_machine: deps.originMachine, stream_available: deps.streamRegistry !== undefined,
+    producer_keys: { producer: deps.producerKeyObservation!, broker: deps.brokerProducerKeyObservation!,
+      message: [deps.producerKeyObservation, deps.brokerProducerKeyObservation].includes("unknown")
+        ? "Producer key state is not yet determined."
+        : [deps.producerKeyObservation, deps.brokerProducerKeyObservation].includes("unreadable")
+          ? "A producer key is expected and unavailable." : null },
+    panels: { producer_keys: deps.producerKeysStatus!, agents_roster: roster.status,
+      exclusive_egress: exclusive.status, protection_subject: subject.status, enforcement_availability: availability.status,
+      vault_provision_claim: provision.status, castle_wall: wall.status, digest: digest.status, unwrapped: unwrapped.status,
+      feature_health: health.status, custody_exit: custody.status, federation: federation.status, query_privacy: query.status },
+    audit_verification: deps.auditLog!.verificationCacheStats(),
+    castle_wall: castleWall, digest: keysRestricted ? fallback.digest : value("digest", digest),
+    unwrapped: unwrappedValue, feature_health: featureHealth, custody_exit: value("custody_exit", custody),
+    federation: value("federation", federation), query_privacy: queryPrivacy, agents,
+    protection_requested_count: agents.filter(a => a.policy_protected).length,
+    protection_detected_count: records.length + unwrappedValue.unwrapped.length,
+    enforcement_confirmed_count: agents.filter(a => a.enforcement_active === "active").length,
   };
 }
 

@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - An agent's memory save into its own memory (`memory_insert`, `sanctuary_remember`) runs without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; every save is audited with the agent named when its identity is known, otherwise marked as unknown, and shows on the dashboard's Evidence page. Set `memory_save_approval: always` in the policy to require approval per insert. Export, delete, signing and reading the policy still ask.
-
+- the posture home stays up when one panel is slow: each panel has its own time budget and says when it is out of date, and audit-chain re-verification reuses results for entries whose bytes have not changed
 - An SDW import refused by the import handler for an empty or non-string source key reference now leaves a denial row in the audit log, like the other refusals the import handler makes before approval.
 - Lifting a lockdown is refused on a platform where stopping is unsupported, matching the stop.
 - A refused lockdown-lift approval shows the operator the reason it was refused.

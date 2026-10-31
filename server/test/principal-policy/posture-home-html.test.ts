@@ -23,11 +23,13 @@ type StoryDigestFixture = {
   approvals_denied: number;
   approvals_granted: number;
   chain_verified: boolean;
+  chain_verdict?: string;
+  window_end?: string;
   integrity_finding_count: number;
 };
 
 type StoryHarness = {
-  renderStory: (digest: StoryDigestFixture) => void;
+  renderStory: (digest: StoryDigestFixture, panel?: { state: string; reason?: string }) => void;
   wireStoryToggle: () => void;
   storyEl: { innerHTML: string };
   toggle: {
@@ -106,13 +108,16 @@ function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
     "\n" +
     REL_TIME_FN_SOURCE +
     "\n" +
+    html.slice(html.indexOf("function auditChainPill("), html.indexOf("  // S3 evidence spine tile.")) +
     html.slice(storyStart, storyEnd) +
     "\nreturn { renderStory: renderStory, wireStoryToggle: wireStoryToggle };";
   const helpers = new Function("document", "sessionStorage", source)(
     document,
     sessionStorage,
   ) as Pick<StoryHarness, "renderStory" | "wireStoryToggle">;
-  return { ...helpers, storyEl, toggle, store };
+  // Story fixtures carry the panel and observation time supplied by the production home.
+  return { ...helpers, storyEl, toggle, store, renderStory: (digest, panel = { state: "fresh" }) =>
+    helpers.renderStory({ window_end: new Date().toISOString(), ...digest }, panel) };
 }
 
 function fleetNode(
@@ -365,6 +370,7 @@ describe("posture home - Today's story plain summary toggle", () => {
     approvals_denied: 1,
     approvals_granted: 3,
     chain_verified: true,
+    chain_verdict: "verified",
     integrity_finding_count: 0,
   };
 
@@ -414,6 +420,9 @@ describe("posture home - Today's story plain summary toggle", () => {
     );
     expect(h.storyEl.innerHTML).not.toContain("—");
     expect(h.storyEl.innerHTML.toLowerCase()).not.toContain("sovereignty");
+    h.renderStory(digest, { state: "stale", reason: "budget_exceeded" });
+    expect(h.storyEl.innerHTML).toContain("not current");
+    expect(h.storyEl.innerHTML).not.toContain("verified clean");
   });
 
   it("restores the session preference, says zero counts plainly, and toggles back to factual rows", () => {
@@ -426,6 +435,7 @@ describe("posture home - Today's story plain summary toggle", () => {
       approvals_denied: 0,
       approvals_granted: 0,
       chain_verified: false,
+      chain_verdict: "findings",
       integrity_finding_count: 2,
     });
 
@@ -449,6 +459,12 @@ describe("posture home - Today's story plain summary toggle", () => {
       '<div class="story-line"><strong>0</strong> operations in the last 24h.</div>',
     );
     expect(h.storyEl.innerHTML).not.toContain("story-summary");
+    h.toggle.checked = true;
+    h.toggle.listeners.change!();
+    h.renderStory(digest, { state: "stale", reason: "observation_superseded" });
+    expect(h.storyEl.innerHTML).toContain("check is withheld");
+    expect(h.storyEl.innerHTML).not.toContain("integrity finding(s)");
+
   });
 });
 
@@ -1788,4 +1804,13 @@ describe("posture home - the approval review link carries the page credential", 
     expect(html).toContain("review");
     expect(html).toContain("state export");
   });
+});
+
+
+it("story never verifies an authoritative flag without its matching observed verdict", () => {
+  const h = storyHarness();
+  h.renderStory({ total_operations: 0, kernel_blocks: 0, kernel_allows: 0, approvals_denied: 0, approvals_granted: 0,
+    chain_verified: true, chain_verdict: "findings", integrity_finding_count: 1 });
+  expect(h.storyEl.innerHTML).toContain("FAILED");
+  expect(h.storyEl.innerHTML).not.toContain('pill green');
 });

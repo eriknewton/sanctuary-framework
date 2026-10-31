@@ -10,6 +10,7 @@ import { generateDefaultPolicyYaml } from "../../src/principal-policy/loader.js"
 import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
 import { handlePostureRoute } from "../../src/principal-policy/posture-routes.js";
 import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
+import { createPosturePanelStore } from "../../src/principal-policy/panel-producer.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 
 const WRAPPED_AGENT_ID = "hermes:fortress-0123456789abcdef";
@@ -78,7 +79,8 @@ async function evidence(booted: Awaited<ReturnType<typeof createSanctuaryServer>
   // to its caller; this exercises the exported route's unlocked-log data source.
   const server: Server = createServer(async (req, res) => {
     await handlePostureRoute({
-      readFlightMap: createDashboardReadFlightMap(), auditLog: booted.auditLog,
+      // The route requires its per-instance panel store (fails closed at the type level); same rig as posture-evidence.test.ts.
+      panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(), auditLog: booted.auditLog,
       originMachine: "fortress:memory-saves", listAgents: () => [], detectInstalledHarnesses: async () => [],
     }, req, res, new URL(req.url ?? "/", `http://${req.headers.host}`), req.method ?? "GET");
   });
