@@ -211,11 +211,17 @@ describe("listing and accounting fault schedules", () => {
   it("finds same-size mtime-preserving tamper after an own append and one sentinel interval", async () => {
     const { raw, log, path } = await setup();
     const key = (await raw.listKeys("_audit"))[0]!;
-    const file = join(path, "_audit", `${key}.enc`); const before = await fs.stat(file);
-    const rawBytes = await fs.readFile(file, "utf8"); const envelope = JSON.parse(rawBytes);
-    envelope.entry_hash = (envelope.entry_hash[0] === "a" ? "b" : "a") + envelope.entry_hash.slice(1);
-    await fs.writeFile(file, JSON.stringify(envelope)); await fs.utimes(file, before.atime, before.mtime);
-    expect((await fs.stat(file)).size).toBe(before.size);
+    // One handle for the whole tamper, so the stat, rewrite and timestamp restore all address the same file.
+    const handle = await fs.open(join(path, "_audit", `${key}.enc`), "r+");
+    try {
+      const before = await handle.stat(); const envelope = JSON.parse(await handle.readFile("utf8"));
+      envelope.entry_hash = (envelope.entry_hash[0] === "a" ? "b" : "a") + envelope.entry_hash.slice(1);
+      const tampered = Buffer.from(JSON.stringify(envelope));
+      await handle.truncate(0); await handle.write(tampered, 0, tampered.length, 0); await handle.utimes(before.atime, before.mtime);
+      expect((await handle.stat()).size).toBe(before.size);
+    } finally {
+      await handle.close();
+    }
     let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
     const verifiedAt = (log as any).lastFullVerifyAtMs;
     for (let index = 0; index < 3; index++) {
