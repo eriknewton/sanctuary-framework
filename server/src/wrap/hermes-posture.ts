@@ -153,6 +153,7 @@ export async function runHermesPosture(
   const root = await hermesPostureHome();
   for (const path of [CONFIG, SOUL, "plugins", "skills", RECORD, BACKUP, ...recordedPaths]) await safePath(join(root, path));
   const recordBytes = await readOptional(join(root, RECORD));
+  // SAFETY: stdout is the operator-facing CLI channel for this fixed removal status.
   if (options.unwrap && !recordBytes) { console.log("nothing to remove"); return; }
   const record = recordBytes ? parseRecord(recordBytes) : null;
   const configBytes = await readOptional(join(root, CONFIG));
@@ -227,6 +228,7 @@ export async function runHermesPosture(
     reportPosture = installed => {
       const view = installed ? plan.after : plan.before;
       const field = (key: string, fallback: string) => view.raw[key]?.trim().replace(/^[^:]+:\s*/, "") ?? fallback;
+      // SAFETY: stdout reports local Hermes configuration and install paths to the operator.
       console.log(`Read from Hermes's files in ${root}; Hermes's running state is not checked.`);
       console.log(`Memory provider: ${field("memory.provider", "builtin")}${installed && plan.before.raw["memory.provider"] && plan.before.raw["memory.provider"] !== plan.after.raw["memory.provider"] ? " (replaces another provider)" : ""}`);
       console.log(`Built-in memory: memory_enabled=${field("memory.memory_enabled", "true (default)")}, user_profile_enabled=${field("memory.user_profile_enabled", "true (default)")}`);
@@ -235,6 +237,7 @@ export async function runHermesPosture(
       console.log(`Plugin files: ${installed || [...pluginPaths, SHIM].every(path => existingPlugins.includes(path)) ? "installed" : "missing"}`);
       console.log(`Relay socket: ${socket} (present)`);
       const others = view.enabled.filter(name => name !== HERMES_TOOLS_PLUGIN_NAME);
+      // SAFETY: stdout reports enabled plugin names and fixed installation guidance to the operator.
       if (others.length) console.log(`Other enabled plugins: ${others.join(", ")}; on Hermes 0.19 another enabled plugin can approve a call before the Sanctuary guard sees it, and the guard is not the lock.`);
       if (!installed) console.log("Planned: select sanctuary_memory, turn built-in memory off, enable sanctuary, install plugin files and remove the Sanctuary MCP entry.");
       console.log("MEMORY.md and USER.md stay on disk unread while this is installed. Restart Hermes.");
@@ -251,6 +254,7 @@ export async function runHermesPosture(
     const stat = await statOptional(join(root, path));
     if (stat) modes.set(path, stat.mode);
   }
+  // SAFETY: stdout is the operator-facing CLI channel for these fixed installation statuses.
   if (!changes.size) { reportPosture?.(true); console.log("already installed"); return; }
   if (options.dryRun) { reportPosture?.(false); console.log("Dry run: no files written."); return; }
   const createdDirs = new Set<string>();
@@ -299,6 +303,7 @@ export async function runHermesPosture(
     throw error;
   }
   if (options.unwrap) {
+    // SAFETY: stdout reports removal status and the local backup path to the operator.
     console.log(changedRemoval ? `Removed recorded files; kept subsequent edits. Original config backup: ${join(root, BACKUP)}` : "Removed Sanctuary memory configuration; original files restored.");
   } else { reportPosture?.(true); console.log("Sanctuary memory installed. Restart Hermes."); }
 }
