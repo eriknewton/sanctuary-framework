@@ -38,7 +38,7 @@ Names-only enumeration still allocates and sorts the retained key set. Checkpoin
 collection reads every entry body above the sealed tip, and predecessor discovery
 reads every checkpoint record. Checkpoint retention remains unbounded over the
 fortress lifetime. Retention growth remains unbounded in a headless writer under
-a persistent metadata fault (<REGISTER-ID>).
+a persistent metadata fault (defect.audit-retention-unbounded-under-persistent-metadata-fault-headless-01).
 
 ## Measurement method
 
