@@ -74,6 +74,9 @@ index. Means divide totals by recorded append count.
 Measured candidate `audit-log.ts` SHA-256:
 `75f213b31eadcd3cdea3e53e33228b30b2a91dab0c588d4483aa41346ee60dac`.
 
+A later commit changes only comments in this file; its SHA-256 after that commit is
+`b1c83a206770a5cb7b51f4396236ef43803db39d06a5bfaa19b8ec3cffa1bbca`. The runtime code is the measured source.
+
 ## Measured results
 
 All six growth samples are complete at 100 appends each. The base cap row is a
