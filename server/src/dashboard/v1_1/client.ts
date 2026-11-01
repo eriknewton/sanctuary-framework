@@ -7034,6 +7034,15 @@ function layerDotClass(l) {
 function postureLayerLines() {
   const d = state.posture.data;
   const seal = deriveSeal();
+  var wallV;
+  if (seal.arm === "armed" && seal.freshness.current) wallV = "enforcing";
+  else if (seal.arm === "armed") wallV = "evidence not current";
+  else if (seal.arm === "coarse_only") wallV = "coarse-only (exclusive egress not live)";
+  else if (seal.arm === "degraded") wallV = "degraded";
+  else if (seal.arm === "locked_down") wallV = "locked down";
+  else if (seal.arm) wallV = "not enforcing";
+  else wallV = "unknown";
+  const wallWarn = !(seal.arm === "armed" && seal.freshness.current);
   const home = sourceLoaded("/api/posture/home") ? state.posture.home : null;
   // Must match protection_layers in principal-policy/posture-home-types.ts.
   const inventory = home && Array.isArray(home.protection_layers)
@@ -7056,6 +7065,8 @@ function postureLayerLines() {
     { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
+    // The shared inventory supplements the live seal's boundary observation.
+    { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
     // Every value short of earned clear keeps the warning; unknown values retain the shared Unknown dot.
     { k: "Charter approvals", v: approvalsValue, warn: approvalsValue !== "clear" },
     // A Heralds layer that is configured but not active is not signing: it

@@ -1,6 +1,7 @@
 import type { AuditChainVerdictStatus } from "../operational/audit-log.js";
 import type { FeatureHealthPanel } from "../principal-policy/feature-health.js";
-import type { CustodyExitPanel } from "../principal-policy/posture.js";
+import { DEFAULT_ENFORCEMENT_FRESHNESS_MS, ENFORCEMENT_FUTURE_SKEW_MS, type CustodyExitPanel } from "../principal-policy/posture.js";
+import type { PosturePanelStatus } from "../principal-policy/panel-producer.js";
 
 /** A layer's observed state; unknown includes unavailable or inconclusive evidence. */
 export type ProtectionLayerStatus = "on" | "off" | "not_built" | "unknown";
@@ -18,8 +19,12 @@ export interface ProtectionEvidence {
   identityLoaded?: boolean;
   encryptedStateStoreConstructed?: boolean;
   auditChain?: AuditChainVerdictStatus;
-  featureHealth?: Pick<FeatureHealthPanel, "rows" | "audit_integrity_ok">;
+  featureHealth?: Pick<FeatureHealthPanel, "rows" | "audit_integrity_ok" | "window_end">;
   custodyExit?: CustodyExitPanel;
+  /** Must match the custody producer observation in cooperative-surface.ts and posture-routes.ts. */
+  custodyObservation?: Pick<PosturePanelStatus, "state" | "completed_at">;
+  /** Evaluation time for current evidence, injectable for deterministic consumers. */
+  now?: number;
   toolOutputScreenReady?: boolean;
 }
 
@@ -27,6 +32,13 @@ const NO_SOURCE = "no evidence source wired";
 
 /** Compose all layers without I/O. Missing evidence never earns an on state. */
 export function composeProtectionLayers(evidence: ProtectionEvidence): ProtectionLayerRow[] {
+  const now = evidence.now ?? Date.now();
+  function current(timestamp: string | null | undefined, windowMs = DEFAULT_ENFORCEMENT_FRESHNESS_MS): boolean {
+    const at = timestamp ? Date.parse(timestamp) : NaN;
+    // Consumers bound both age and future skew using the same window as feature health.
+    return Number.isFinite(at) && Number.isFinite(windowMs) && windowMs > 0 &&
+      at <= now + ENFORCEMENT_FUTURE_SKEW_MS && now - at <= Math.min(windowMs, DEFAULT_ENFORCEMENT_FRESHNESS_MS);
+  }
   function row(id: string, name: string, status: ProtectionLayerStatus = "unknown", basis = NO_SOURCE): ProtectionLayerRow {
     return { id, name, status, basis };
   }
@@ -37,12 +49,28 @@ export function composeProtectionLayers(evidence: ProtectionEvidence): Protectio
     const health = evidence.featureHealth;
     const source = health?.rows.find(r => r.feature_id === featureId);
     if (!source) return row(id, name);
-    // Feature-health verifies the observed feature's evidence; a tainted read cannot support any verdict.
-    const status: ProtectionLayerStatus = !health?.audit_integrity_ok || !source.audit_integrity_ok
-      ? "unknown"
-      : source.status === "active" ? "on"
-      : source.status === "fault" || source.basis === "intentionally_stopped" ? "off" : "unknown";
-    return row(id, name, status, `feature health: ${featureId}`);
+    const basis = `feature health: ${featureId}`;
+    // Feature-health verifies this feature's evidence; unreadable or stale panels cannot support a current verdict.
+    if (!health?.audit_integrity_ok || !source.audit_integrity_ok) return row(id, name, "unknown", `${basis}; integrity not verified`);
+    if (!current(health.window_end)) return row(id, name, "unknown", `${basis}; stale observation`);
+    if (source.status === "fault" || source.basis === "intentionally_stopped") return row(id, name, "off", basis);
+    if (source.status === "active" && !current(source.last_evidence_at, source.freshness_window_ms)) {
+      return row(id, name, "unknown", `${basis}; ${source.liveness === "event_driven"
+        ? "activity in the last 24 hours, not current" : "stale evidence"}`);
+    }
+    return row(id, name, source.status === "active" ? "on" : "unknown", basis);
+  }
+  function exit(): ProtectionLayerRow {
+    const panel = evidence.custodyExit;
+    const observation = evidence.custodyObservation;
+    if (!panel) return row("exit", "Exit", "unknown", observation ? "custody exit: audit read unavailable" : NO_SOURCE);
+    if (!observation || observation.state === "unavailable") return row("exit", "Exit", "unknown", "custody exit: fallback or unavailable observation");
+    if (observation.state !== "fresh" || !current(observation.completed_at, panel.freshness_window_ms)) {
+      return row("exit", "Exit", "unknown", "custody exit: stale observation");
+    }
+    // The custody read's integrity and producer freshness qualify availability; the capability label alone does not.
+    if (!panel.audit_integrity_ok) return row("exit", "Exit", "unknown", "custody exit: audit read unavailable or integrity not verified");
+    return row("exit", "Exit", panel.exit_state === "export_available" ? "on" : "unknown", "custody exit: gated export available");
   }
   const privacy = row("query_privacy", "Query privacy");
   const headers = feature("header_strip", "Headers", "header_strip");
@@ -54,7 +82,9 @@ export function composeProtectionLayers(evidence: ProtectionEvidence): Protectio
   const broker = feature("credential_stand_ins", "Credential stand-ins", "secret_broker");
   const daemon = feature("secret_broker_daemon", "Broker daemon", "secret_broker_daemon");
   if (daemon.basis !== NO_SOURCE) {
-    // Daemon liveness is separate from the broker's observed token decisions.
+    // A down daemon precludes current credential service even after a recent token decision.
+    if (daemon.status === "off") broker.status = "off";
+    else if (daemon.status !== "on" && broker.status === "on") broker.status = "unknown";
     broker.basis += `; feature health: secret_broker_daemon ${daemon.status}`;
   }
   return [
@@ -72,8 +102,7 @@ export function composeProtectionLayers(evidence: ProtectionEvidence): Protectio
     privacy,
     broker,
     // Export availability describes the gated export capability, never a clean-exit guarantee.
-    row("exit", "Exit", evidence.custodyExit?.exit_state === "export_available" ? "on" : "unknown",
-      evidence.custodyExit ? "custody exit: gated export available" : NO_SOURCE),
+    exit(),
     row("inbound_protection", "Inbound protection", "not_built", evidence.toolOutputScreenReady === undefined
       ? "capability: not built"
       : `capability: not built; tool-output screening readiness: ${observed(evidence.toolOutputScreenReady)}`),

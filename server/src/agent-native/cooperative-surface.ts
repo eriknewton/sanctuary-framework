@@ -969,6 +969,8 @@ export function createAgentNativeCooperativeTools(
             try { options.responseScreen.assertReady(); toolOutputScreenReady = true; }
             catch { toolOutputScreenReady = false; }
           }
+          // Must match custodyObservation in protection-layers.ts: age starts before the audit read.
+          const custodyObservation = { state: "fresh" as const, completed_at: new Date(Date.now()).toISOString() };
           const [health, custody, chain] = await Promise.allSettled([
             buildFeatureHealthPanel({
               auditLog: options.auditLog,
@@ -981,6 +983,7 @@ export function createAgentNativeCooperativeTools(
             options.auditLog.getAuditChainVerdict(),
           ]);
           const layers = composeProtectionLayers({
+            custodyObservation,
             ...(toolOutputScreenReady === undefined ? {} : { toolOutputScreenReady }),
             identityLoaded: options.identityManager.get(identity.identity_id) !== undefined,
             ...(options.stateStore ? { encryptedStateStoreConstructed: true } : {}),
