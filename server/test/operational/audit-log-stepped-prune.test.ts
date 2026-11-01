@@ -262,3 +262,91 @@ it("clears a step-three already-gone false delete on the next append", async () 
   await exactRetention(raw, log);
   expect((log as any).unconfirmedPruneCutKey, "already-completed cut cleared by next recount").toBeNull();
 });
+
+async function warmWritersWithSurvivor(cap: number, faultStep: number, mode: "throw" | "false") {
+  const path = join(root, "state"); await prepopulateAudit(path, cap);
+  const raw = new FilesystemStorage(path);
+  const config = { ...MEASURE_CONFIG, maxEntries: cap };
+  const writerA = new AuditLog(raw, MEASURE_MASTER_KEY, config);
+  const writerB = new AuditLog(raw, MEASURE_MASTER_KEY, config);
+  await writerA.query({ limit: 1 }); await writerB.query({ limit: 1 });
+  const remove = raw.delete.bind(raw); let calls = 0; let survivor = "";
+  const fault = vi.spyOn(raw, "delete").mockImplementation(async (...args) => {
+    if (args[0] === "_audit" && ++calls === faultStep) {
+      survivor = args[1];
+      if (mode === "throw") throw new Error("scheduled delete fault");
+      return false;
+    }
+    return remove(...args);
+  });
+  await writerA.appendCritical(measureEntry(cap));
+  expect(calls).toBe(faultStep);
+  expect(await belowCut(raw)).toEqual([faultStep]);
+  expect(await raw.exists("_audit", survivor)).toBe(true);
+  fault.mockRestore();
+  return { raw, writerB, survivor };
+}
+
+it.each([
+  { cap: CAP, faultStep: 3, mode: "throw" as const },
+  { cap: CAP, faultStep: 3, mode: "false" as const },
+  // Two thousand entries give a twenty-entry margin, allowing the tenth delete.
+  { cap: 2_000, faultStep: 10, mode: "throw" as const },
+])("any writer repairs the durable cut: cap $cap, step $faultStep, $mode", async ({ cap, faultStep, mode }) => {
+  const { raw, writerB, survivor } = await warmWritersWithSurvivor(cap, faultStep, mode);
+  await writerB.appendCritical(measureEntry(cap + 1));
+  await strict(raw);
+  expect(await raw.exists("_audit", survivor)).toBe(false);
+  expect(await belowCut(raw)).toEqual([]);
+  // Prepopulation starts at one; A and B each allocate the next sequence.
+  expect(writerB.currentInMemorySequence()).toBe(cap + 2);
+  await exactRetention(raw, writerB);
+});
+
+it("does not raise the count cut for an invalid durable anchor", async () => {
+  const { raw, writerB, survivor } = await warmWritersWithSurvivor(CAP, 3, "throw");
+  const anchorBytes = (await raw.read("_audit_checkpoints", "__rotation_anchor"))!;
+  const anchor = JSON.parse(new TextDecoder().decode(anchorBytes));
+  anchor.mac = (anchor.mac[0] === "A" ? "B" : "A") + anchor.mac.slice(1);
+  const corruptBytes = new TextEncoder().encode(JSON.stringify(anchor));
+  await raw.writeDurable("_audit_checkpoints", "__rotation_anchor", corruptBytes);
+  const remove = vi.spyOn(raw, "delete");
+  const read = vi.spyOn(raw, "read");
+  await writerB.appendCritical(measureEntry(CAP + 1));
+  expect(writerB.currentInMemorySequence()).toBe(CAP + 2);
+  expect(read).toHaveBeenCalledWith("_audit_checkpoints", "__rotation_anchor");
+  // Two completed deletes offset the two appends, so the count rule requires none.
+  expect(await raw.list("_audit")).toHaveLength(CAP);
+  expect(remove).not.toHaveBeenCalled();
+  expect(await raw.exists("_audit", survivor)).toBe(true);
+  expect(await raw.read("_audit_checkpoints", "__rotation_anchor")).toEqual(corruptBytes);
+  const reader = new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+  await expect(reader.query({ limit: 1 })).rejects.toMatchObject({ name: "AuditIntegrityError",
+    findings: [expect.objectContaining({ kind: "rotation_anchor_invalid" })] });
+});
+
+it("leaves a never-rotated store below the cap unchanged when the anchor is absent", async () => {
+  const path = join(root, "state");
+  // One initial entry and two appends stay strictly below the small cap.
+  const initialCount = 1; const cap = 5;
+  await prepopulateAudit(path, initialCount);
+  const raw = new FilesystemStorage(path);
+  const config = { ...MEASURE_CONFIG, maxEntries: cap };
+  const writerA = new AuditLog(raw, MEASURE_MASTER_KEY, config);
+  const writerB = new AuditLog(raw, MEASURE_MASTER_KEY, config);
+  await writerA.query({ limit: 1 }); await writerB.query({ limit: 1 });
+  await writerA.appendCritical(measureEntry(initialCount));
+  const originalKeys = (await raw.list("_audit")).map((meta) => meta.key);
+  const remove = vi.spyOn(raw, "delete");
+  const read = vi.spyOn(raw, "read");
+  await writerB.appendCritical(measureEntry(initialCount + 1));
+  expect(writerB.currentInMemorySequence()).toBe(initialCount + 2);
+  expect(read).toHaveBeenCalledWith("_audit_checkpoints", "__rotation_anchor");
+  expect(remove).not.toHaveBeenCalled();
+  const keys = (await raw.list("_audit")).map((meta) => meta.key);
+  expect(keys).toHaveLength(initialCount + 2);
+  expect(keys).toEqual(expect.arrayContaining(originalKeys));
+  expect(await raw.read("_audit_checkpoints", "__rotation_anchor")).toBeNull();
+  await strict(raw);
+  await exactRetention(raw, writerB);
+});

@@ -64,14 +64,16 @@ sealed boundary protects them, and including the append's own durable write
 exactly once. The byte estimate is seeded from sized metadata. Unknown provenance
 or a changed count, lowest key, or highest key requires an authoritative sized
 listing before the decision. Pruning runs under the audit write lock and seeds
-only confirmed survivors. Each step authenticates the next survivor before deleting one entry. An episode
-stops between steps after a budget of at most one third of its configured hold
-deadline, capped at four seconds to reserve one second of the five-second lock
-acquisition timeout. Rotation takes its own hold after the append releases its
-lock; later over-cap appends continue toward the low target. The budget
-starts when the rotation hold begins and includes recount time. At least one
-step is attempted when pruning is due. A partial failure leaves provenance unknown. A load
-cannot publish an older seed across an own append or rotation.
+only confirmed survivors. Each step authenticates the next survivor before deleting
+one entry. An episode uses a budget of `floor(configured hold / 3)`, 10 seconds at
+the default hold, checked between steps. This does not guarantee that a contending
+writer acquires within the five-second timeout. Rotation takes its own hold after
+the append releases its lock; later over-cap appends continue toward the low target.
+The budget starts when the rotation hold begins and includes recount time. The
+recount and an in-flight step can overrun the budget. At least one step is attempted
+when pruning is due. The next rotation hold of any writer deletes an entry left
+below the authenticated rotation anchor. A partial failure leaves provenance
+unknown. A load cannot publish an older seed across an own append or rotation.
 
 On a backend without `listKeys`, legacy non-entry records make the entry-only
 discovery signature differ from the full recount population on every append.

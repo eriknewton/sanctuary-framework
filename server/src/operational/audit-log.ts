@@ -1159,12 +1159,12 @@ export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
 /** Rotation runs in its own hold after the append unlocks. The episode budget is a third
- * of the configured hold, counted from hold entry, so the in-lock recount and the steps
- * together leave two thirds of the deadline unused. It cannot be held under the 5 s
- * acquisition timeout: at the 100,000-entry cap the in-lock sized recount alone takes
- * about 5.5 s on box 1, so a smaller budget runs one step per append at cap (measured,
- * job 873). A writer in another process can time out during an at-cap episode, about
- * once per episode, as at the base where every at-cap hold took about 21 s. */
+ * of the configured hold, counted from hold entry, with an intended two-thirds reserve.
+ * It is checked only between steps, so the in-lock recount and an in-flight step can
+ * overrun it. It cannot be held under the 5 s acquisition timeout: at the 100,000-entry
+ * cap the in-lock sized recount alone took about 5.5 s in measurement, and a smaller
+ * budget ran one step per append at the cap. A contending writer can time out about
+ * once per at-cap episode; at the base every at-cap hold took about 21 s. */
 export const AUDIT_PRUNE_EPISODE_BUDGET_MS = Math.floor(DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS / 3);
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
@@ -2220,9 +2220,9 @@ export class AuditLog {
   private readonly auditWriteLockPath?: string;
   private lastIntegrityAlertSignature: string | null = null;
   private rotationInFlight = false;
-  // One scalar preserves the base's bound: this instance repairs a delete fault
-  // on its next rotation hold. Process death between anchor and delete retains
-  // the base's residual because a fresh process strict-loads first.
+  // The durable anchor lets any writer's next rotation hold repair a survivor
+  // below the authenticated cut; this scalar also covers an anchor issued but
+  // not yet confirmed by this instance.
   private unconfirmedPruneCutKey: string | null = null;
   private readonly pruneEpisodeBudgetMs: number;
   private retainedBytesEstimate = 0;
@@ -3143,6 +3143,16 @@ export class AuditLog {
           this.recountFaultLatched = false;
         }
         metas.sort((a, b) => compareAuditKeys(a.key, b.key));
+        // Only an authenticated durable cut lets any writer's next rotation hold
+        // repair a lower survivor; the scalar also covers this instance's issued
+        // but unconfirmed anchor. Invalid or absent anchors cannot raise the cut.
+        const rotationAnchor = await this.loadRotationAnchor([]);
+        this.assertAuditWriteLockActive(signal);
+        const anchorIndex = rotationAnchor.status === "valid"
+          ? metas.findIndex((meta) => {
+            const sequence = parseEntryKeySequence(meta.key);
+            return sequence !== null && sequence >= rotationAnchor.base_sequence;
+          }) : -1;
         // Always keep at least one entry as the surviving anchor base — even
         // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than
         // a single entry, where rotationDeleteCount would otherwise return
@@ -3154,7 +3164,7 @@ export class AuditLog {
         // first, or when a foreign prune has moved past it; no lower survivor remains.
         if (cutIndex <= 0) this.unconfirmedPruneCutKey = null;
         const toDelete = Math.min(
-          Math.max(this.rotationDeleteCount(metas), cutIndex > 0 ? cutIndex : 0),
+          Math.max(this.rotationDeleteCount(metas), cutIndex > 0 ? cutIndex : 0, anchorIndex > 0 ? anchorIndex : 0),
           metas.length - 1
         );
         if (toDelete <= 0) this.seedRetention(metas);
