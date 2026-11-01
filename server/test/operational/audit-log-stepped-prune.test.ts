@@ -34,7 +34,12 @@ async function setup(deadline?: number) {
 }
 async function strict(raw: FilesystemStorage) {
   const reader = new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG);
-  expect((await reader.query({ limit: 1 })).integrity_findings).toEqual([]);
+  try {
+    expect((await reader.query({ limit: 1 })).integrity_findings).toEqual([]);
+  } catch (error) {
+    expect((error as { findings?: unknown }).findings, "fresh strict reader findings").toEqual([]);
+    throw error;
+  }
 }
 async function belowCut(raw: FilesystemStorage) {
   const anchor = JSON.parse(new TextDecoder().decode((await raw.read("_audit_checkpoints", "__rotation_anchor"))!));
@@ -105,7 +110,7 @@ it("leaves a clean cut and unknown provenance when a foreign delete returns fals
 it("seeds exact survivors at the episode budget and later appends reach the low target", async () => {
   const { raw, log } = await setup(); const remove = raw.delete.bind(raw);
   const realNow = performance.now.bind(performance); let offset = 0; let slow = true;
-  // Virtual elapsed I/O time avoids a ten-second wall wait without changing timers.
+  // Virtual elapsed I/O time avoids a full-budget wall wait without changing timers.
   vi.spyOn(performance, "now").mockImplementation(() => realNow() + offset);
   vi.spyOn(raw, "delete").mockImplementation(async (...args) => {
     const result = await remove(...args); if (slow) offset += AUDIT_PRUNE_EPISODE_BUDGET_MS; return result;
@@ -140,4 +145,120 @@ it("reloads clean after SIGKILL between steps and a fresh writer finishes prunin
   await fresh.appendCritical(measureEntry(CAP + 1));
   expect(((await raw.list("_audit")).map((meta) => meta.key)).length).toBe(CAP - 2);
   await strict(raw);
+});
+
+async function exactRetention(raw: FilesystemStorage, log: AuditLog) {
+  const metas = await raw.list("_audit");
+  expect((log as any).bytesProvenance).toBe("seeded");
+  expect((log as any).retainedCountExpected).toBe(metas.length);
+  expect((log as any).retainedBytesEstimate).toBe(metas.reduce((sum, meta) => sum + meta.size_bytes, 0));
+}
+
+it("repairs a step-three throwing delete on the very next append below the cap", async () => {
+  const { raw, log } = await setup(); const remove = raw.delete.bind(raw); let calls = 0;
+  let survivor = "";
+  vi.spyOn(raw, "delete").mockImplementation(async (...args) => {
+    if (++calls === 3) { survivor = args[1]; throw new Error("step three delete fault"); }
+    return remove(...args);
+  });
+  await log.appendCritical(measureEntry(CAP));
+  expect((log as any).bytesProvenance).toBe("unknown");
+  expect(await belowCut(raw)).toEqual([3]);
+  expect((log as any).unconfirmedPruneCutKey).toContain("00000000000000000004");
+  await log.appendCritical(measureEntry(CAP + 1));
+  // Keep this first: ignoring the recorded cut must fail with rotation_anchor_invalid.
+  await strict(raw);
+  expect(await raw.exists("_audit", survivor)).toBe(false);
+  expect(await belowCut(raw)).toEqual([]);
+  expect((log as any).unconfirmedPruneCutKey).toBeNull();
+  await exactRetention(raw, log);
+});
+
+it("repairs a step-three anchor that lands after the hold deadline on the next append", async () => {
+  // A one-second hold allows three fast steps before the deliberately blocked anchor.
+  const { raw, log } = await setup(1_000);
+  const write = raw.writeDurable.bind(raw); const entered = gate(); const release = gate(); const finished = gate();
+  let anchors = 0;
+  vi.spyOn(raw, "writeDurable").mockImplementation(async (...args) => {
+    if (args[0] === "_audit_checkpoints" && args[1] === "__rotation_anchor" && ++anchors === 3) {
+      entered.release(); await release.wait;
+    }
+    return write(...args);
+  });
+  const withLock = (log as any).withAuditWriteLock.bind(log);
+  vi.spyOn(log as any, "withAuditWriteLock").mockImplementation((callback: any) => withLock(async (signal: unknown) => {
+    try { return await callback(signal); }
+    finally { if (anchors === 3) finished.release(); }
+  }));
+  const append = log.appendCritical(measureEntry(CAP));
+  try {
+    await Promise.race([entered.wait, append.then(() => { throw new Error("third anchor not reached"); })]);
+    await append;
+    expect((log as any).bytesProvenance).toBe("unknown");
+    expect((log as any).unconfirmedPruneCutKey).not.toBeNull();
+  } finally {
+    release.release();
+    if (anchors === 3) await finished.wait;
+  }
+  expect(await belowCut(raw)).toEqual([3]);
+  await log.appendCritical(measureEntry(CAP + 1));
+  await strict(raw);
+  expect(await belowCut(raw)).toEqual([]);
+  expect((log as any).unconfirmedPruneCutKey).toBeNull();
+  await exactRetention(raw, log);
+});
+
+it("clears the recorded cut after a foreign prune moves past its key", async () => {
+  const { raw, log } = await setup();
+  // Warm the foreign writer before the fault; five entries below the cap moves its cut past ours.
+  const foreign = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, maxEntries: CAP - 5 });
+  await foreign.query({ limit: 1 });
+  const remove = raw.delete.bind(raw); let calls = 0;
+  const fault = vi.spyOn(raw, "delete").mockImplementation(async (...args) => {
+    if (++calls === 3) throw new Error("step three delete fault");
+    return remove(...args);
+  });
+  await log.appendCritical(measureEntry(CAP));
+  const cut = (log as any).unconfirmedPruneCutKey;
+  expect(cut).not.toBeNull(); fault.mockRestore();
+  await foreign.appendCritical(measureEntry(CAP + 1));
+  expect(await raw.exists("_audit", cut)).toBe(false);
+  await log.appendCritical(measureEntry(CAP + 2));
+  expect((log as any).unconfirmedPruneCutKey).toBeNull();
+  await exactRetention(raw, log);
+  await strict(raw);
+});
+
+it("limits a configured 300 ms hold episode to 100 ms plus one step", async () => {
+  const { raw, log } = await setup(300);
+  const remove = raw.delete.bind(raw); const realNow = performance.now.bind(performance);
+  // Two sixty-millisecond steps cross the one-third budget, so no third step may start.
+  const stepMs = 60; const budgetMs = 100; let elapsed = 0; let steps = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => realNow() + elapsed);
+  vi.spyOn(raw, "delete").mockImplementation(async (...args) => {
+    const result = await remove(...args); elapsed += stepMs; steps++; return result;
+  });
+  await log.appendCritical(measureEntry(CAP));
+  expect(steps).toBeGreaterThan(0);
+  expect(elapsed, "configured episode budget plus one step").toBeLessThanOrEqual(budgetMs + stepMs);
+  expect((log as any).unconfirmedPruneCutKey).toBeNull();
+  await exactRetention(raw, log);
+  expect((log as any).retainedCountExpected).toBeLessThanOrEqual(CAP);
+  await strict(raw);
+});
+
+it("clears a step-three already-gone false delete on the next append", async () => {
+  const { raw, log } = await setup(); const remove = raw.delete.bind(raw); let calls = 0;
+  vi.spyOn(raw, "delete").mockImplementation(async (...args) => {
+    const deleted = await remove(...args);
+    return ++calls === 3 ? false : deleted;
+  });
+  await log.appendCritical(measureEntry(CAP));
+  expect((log as any).bytesProvenance).toBe("unknown");
+  expect((log as any).unconfirmedPruneCutKey).not.toBeNull();
+  expect(await belowCut(raw)).toEqual([]);
+  await log.appendCritical(measureEntry(CAP + 1));
+  await strict(raw);
+  await exactRetention(raw, log);
+  expect((log as any).unconfirmedPruneCutKey, "already-completed cut cleared by next recount").toBeNull();
 });

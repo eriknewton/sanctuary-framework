@@ -330,6 +330,45 @@ it("latches incomplete range stderr and reports recovery without signing-control
   ]);
 });
 
+it.each(["fallback forward", "fallback reverse", "reversed listKeys"])(
+  "discriminates discovery and collector collation ties through %s", async (mode) => {
+    const source = new MemoryStorage(); const generator = new AuditLog(source, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+    for (let i = 0; i < 3; i++) await generator.appendCritical(measureEntry(i));
+    const canonical = (await source.list("_audit")).map((meta) => meta.key);
+    const envelopes = await Promise.all(canonical.map(async (key) => (await source.read("_audit", key))!));
+    // Filename sequence nine lies beyond the three genuine envelope sequences.
+    const prefix = `entry-${String(9).padStart(20, "0")}-`;
+    // Soft hyphen is collation-ignorable but has a distinct code-unit order.
+    const ties = [`${prefix}z\u00ad`, `${prefix}z`];
+    expect(ties[0]!.localeCompare(ties[1]!)).toBe(0);
+    const raw = new MemoryStorage();
+    const storage = new Proxy(raw, { get(target, key) {
+      if (key === "listKeys") return mode.startsWith("fallback") ? undefined
+        : async (namespace: string, prefix?: string) => (await target.listKeys(namespace, prefix)).reverse();
+      const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    await raw.write("_audit", canonical[0]!, envelopes[0]!);
+    const log = new AuditLog(storage, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+    await (log as any).writeHeadAnchor(1, decode(envelopes[0]!).entry_hash);
+    await log.query({ limit: 1 });
+    for (const i of mode === "fallback reverse" ? [1, 0] : [0, 1]) {
+      await raw.write("_audit", ties[i]!, envelopes[i === 0 ? 2 : 1]!);
+    }
+    const discovered = await (log as any).withAuditWriteLock((signal: unknown) => (log as any).readLatestPersistedChainState(signal));
+    expect((discovered.latest ?? discovered).nextSequence, "discovery total-order tail").toBe(4);
+    // Exercise the collector's own ordering with backend order, independent of discovery's sort.
+    const keys = storage.listKeys ? await storage.listKeys("_audit") : (await storage.list("_audit")).map((meta) => meta.key);
+    const read = vi.spyOn(raw, "read");
+    const collected = await (log as any).collectPersistedEntryHashes(1, 3, 0, keys);
+    expect(read.mock.calls.filter(([ns]) => ns === "_audit").map(([, key]) => key),
+      "collector total-order body traversal").toEqual([canonical[0], ties[1], ties[0]]);
+    expect(collected.status).toBe("complete");
+    read.mockRestore();
+    await log.appendCritical(measureEntry(3));
+    expect(log.currentInMemorySequence(), "allocated sequence after total-order discovery").toBe(4);
+  },
+);
+
 it("uses a total order for collation ties across memory insertion orders and filesystem", async () => {
   const source = new MemoryStorage(); const generator = new AuditLog(source, MEASURE_MASTER_KEY, MEASURE_CONFIG);
   for (let i = 0; i < 3; i++) await generator.appendCritical(measureEntry(i));

@@ -65,8 +65,10 @@ exactly once. The byte estimate is seeded from sized metadata. Unknown provenanc
 or a changed count, lowest key, or highest key requires an authoritative sized
 listing before the decision. Pruning runs under the audit write lock and seeds
 only confirmed survivors. Each step authenticates the next survivor before deleting one entry. An episode
-stops between steps after its 10-second budget, one third of the 30-second hold
-deadline; later over-cap appends continue toward the low target. The budget
+stops between steps after a budget of at most one third of its configured hold
+deadline, capped at four seconds to reserve one second of the five-second lock
+acquisition timeout. Rotation takes its own hold after the append releases its
+lock; later over-cap appends continue toward the low target. The budget
 starts when the rotation hold begins and includes recount time. At least one
 step is attempted when pruning is due. A partial failure leaves provenance unknown. A load
 cannot publish an older seed across an own append or rotation.

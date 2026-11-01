@@ -87,10 +87,12 @@ describe("listing and accounting fault schedules", () => {
   it("reports a recount deadline immediately and ignores abandoned recount cleanup", async () => {
     const { raw } = await setup();
     const log = new AuditLog(raw, MEASURE_MASTER_KEY, {
-      ...MEASURE_CONFIG, maxEntries: 3,
+      ...MEASURE_CONFIG, maxEntries: 5, // Three initial entries plus two appends fit without prune I/O.
       writeLockHoldDeadlineMs: 100, // Short bound isolates the delayed recount after a cold load.
     });
     await log.query({ limit: 1 });
+    // Force the recount under test without spending its short hold on pruning.
+    (log as any).bytesProvenance = "unknown";
     const hold = gate(); const entered = gate(); const finished = gate();
     const list = raw.list.bind(raw); let delay = true;
     vi.spyOn(raw, "list").mockImplementation(async (...args) => {

@@ -1158,8 +1158,14 @@ const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
-/** One third of the 30 s hold leaves two thirds for append and due checkpoint work. */
-export const AUDIT_PRUNE_EPISODE_BUDGET_MS = DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS / 3;
+/** Reserve one second of the five-second acquisition timeout for contention overhead. */
+const AUDIT_PRUNE_CONTENTION_MARGIN_MS = 1_000;
+/** Rotation has its own hold after append unlocks; budget for a waiting writer's
+ * 5 s acquisition timeout with a 1 s margin, never above a third of the hold. */
+export const AUDIT_PRUNE_EPISODE_BUDGET_MS = Math.min(
+  Math.floor(DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS / 3),
+  AUDIT_WRITE_LOCK_TIMEOUT_MS - AUDIT_PRUNE_CONTENTION_MARGIN_MS,
+);
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two
@@ -2214,6 +2220,11 @@ export class AuditLog {
   private readonly auditWriteLockPath?: string;
   private lastIntegrityAlertSignature: string | null = null;
   private rotationInFlight = false;
+  // One scalar preserves the base's bound: this instance repairs a delete fault
+  // on its next rotation hold. Process death between anchor and delete retains
+  // the base's residual because a fresh process strict-loads first.
+  private unconfirmedPruneCutKey: string | null = null;
+  private readonly pruneEpisodeBudgetMs: number;
   private retainedBytesEstimate = 0;
   private retainedCountExpected = 0;
   private retainedSignatureExpected = "0";
@@ -2420,6 +2431,10 @@ export class AuditLog {
     this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
     this.writeLockHoldDeadlineMs = resolveWriteLockHoldDeadlineMs(
       config?.writeLockHoldDeadlineMs
+    );
+    this.pruneEpisodeBudgetMs = Math.min(
+      Math.floor(this.writeLockHoldDeadlineMs / 3),
+      AUDIT_WRITE_LOCK_TIMEOUT_MS - AUDIT_PRUNE_CONTENTION_MARGIN_MS,
     );
     this.selfHeldStaleLockMs = resolveSelfHeldStaleLockMs(
       config?.selfHeldStaleLockMs,
@@ -3090,7 +3105,7 @@ export class AuditLog {
       const disagrees = this.retentionSignature(aboveFloorKeys) !== this.retainedSignatureExpected;
       // A same-key byte rewrite is out-of-band tamper, never a writer operation:
       // names cannot see it; detecting it belongs to the byte pass, not rotation.
-      if (!disagrees && this.bytesProvenance === "seeded" &&
+      if (this.unconfirmedPruneCutKey === null && !disagrees && this.bytesProvenance === "seeded" &&
           aboveFloorKeys.length <= this.maxEntries &&
           this.retainedBytesEstimate <= this.maxTotalSizeBytes) return;
 
@@ -3136,8 +3151,13 @@ export class AuditLog {
         // a single entry, where rotationDeleteCount would otherwise return
         // metas.length). Capping rather than aborting lets rotation still make
         // progress (prune as much as possible) instead of growing without bound.
+        const cutIndex = this.unconfirmedPruneCutKey === null ? -1
+          : metas.findIndex((meta) => meta.key === this.unconfirmedPruneCutKey);
+        // The authoritative hold confirms completion when the recorded base is
+        // first, or when a foreign prune has moved past it; no lower survivor remains.
+        if (cutIndex <= 0) this.unconfirmedPruneCutKey = null;
         const toDelete = Math.min(
-          this.rotationDeleteCount(metas),
+          Math.max(this.rotationDeleteCount(metas), cutIndex > 0 ? cutIndex : 0),
           metas.length - 1
         );
         if (toDelete <= 0) this.seedRetention(metas);
@@ -3149,7 +3169,7 @@ export class AuditLog {
         // Never batch deletes behind one anchor.
         for (let k = 0; k < toDelete; k++) {
           this.assertAuditWriteLockActive(signal);
-          if (k > 0 && performance.now() - episodeStarted >= AUDIT_PRUNE_EPISODE_BUDGET_MS) break;
+          if (k > 0 && performance.now() - episodeStarted >= this.pruneEpisodeBudgetMs) break;
           const newBaseRaw = await this.storage.read(AUDIT_NAMESPACE, metas[k + 1]!.key);
           if (!newBaseRaw) return;
           const parsed = JSON.parse(bytesToString(newBaseRaw));
@@ -3157,6 +3177,8 @@ export class AuditLog {
             // Check before publication: an expired hold cannot move the cut
             // past a survivor when its delete will never be issued.
             this.assertAuditWriteLockActive(signal);
+            // Record before issuing I/O: an abandoned anchor write can still land.
+            this.unconfirmedPruneCutKey = metas[k + 1]!.key;
             await this.writeRotationAnchor(parsed.sequence, parsed.prev_hash);
           }
           // Legacy/non-v2 cuts retain the base's no-chained-anchor rule.
@@ -3165,6 +3187,7 @@ export class AuditLog {
           this.assertAuditWriteLockActive(signal);
           // A refused delete leaves the surviving population uncertain.
           if (!deleted) return;
+          this.unconfirmedPruneCutKey = null;
           deletedCount++;
         }
         // Budget exits happen between steps and seed only confirmed survivors.
@@ -5430,7 +5453,8 @@ export class AuditLog {
    * writes with `AuditLockContentionError`.
    *
    * The consumer sorts the complete names-only snapshot with compareAuditKeys,
-   * preserving the prior list order even for noncanonical suffixes. Entry keys
+   * preserving prior list order except for the total-order tie break on
+   * noncanonical suffixes described at compareAuditKeys. Entry keys
    * embed fixed-width sequence prefixes; legacy keys are skipped in memory.
    * Walking backward from the tail and stopping at the first
    * entry that parses as a valid envelope makes the common case O(1) instead

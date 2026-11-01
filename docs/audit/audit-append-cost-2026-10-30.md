@@ -42,6 +42,8 @@ a persistent metadata fault (<REGISTER-ID>).
 
 ## Measurement method
 
+Candidate rows will be re-measured on the final source after the round-2 fix commit.
+
 The measurement script generates entries through the real audit log using a
 fixture wrapper that exposes only the current tail and performs durable writes.
 It requires a strict cold load over the full filesystem store before measuring
