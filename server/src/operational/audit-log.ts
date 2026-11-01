@@ -3143,15 +3143,15 @@ export class AuditLog {
           this.recountFaultLatched = false;
         }
         metas.sort((a, b) => compareAuditKeys(a.key, b.key));
-        // Only an authenticated durable cut lets any writer's next rotation hold
-        // repair a lower survivor; the scalar also covers this instance's issued
-        // but unconfirmed anchor. Invalid or absent anchors cannot raise the cut.
+        // The raise applies only when the entry named by the authenticated anchor
+        // is present; the scalar also covers this instance's issued but unconfirmed
+        // anchor. Invalid or absent anchors cannot raise the cut.
         const rotationAnchor = await this.loadRotationAnchor([]);
         this.assertAuditWriteLockActive(signal);
         const anchorIndex = rotationAnchor.status === "valid"
           ? metas.findIndex((meta) => {
             const sequence = parseEntryKeySequence(meta.key);
-            return sequence !== null && sequence >= rotationAnchor.base_sequence;
+            return sequence !== null && sequence === rotationAnchor.base_sequence;
           }) : -1;
         // Always keep at least one entry as the surviving anchor base — even
         // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than

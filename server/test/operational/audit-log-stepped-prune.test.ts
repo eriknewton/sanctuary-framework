@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -294,13 +294,53 @@ it.each([
   { cap: 2_000, faultStep: 10, mode: "throw" as const },
 ])("any writer repairs the durable cut: cap $cap, step $faultStep, $mode", async ({ cap, faultStep, mode }) => {
   const { raw, writerB, survivor } = await warmWritersWithSurvivor(cap, faultStep, mode);
+  const retainedBefore = (await raw.list("_audit")).length;
+  // A appends once and completes faultStep minus one deletes.
+  expect(retainedBefore).toBe(cap + 1 - (faultStep - 1));
   await writerB.appendCritical(measureEntry(cap + 1));
   await strict(raw);
+  expect(await raw.list("_audit")).toHaveLength(retainedBefore);
   expect(await raw.exists("_audit", survivor)).toBe(false);
   expect(await belowCut(raw)).toEqual([]);
   // Prepopulation starts at one; A and B each allocate the next sequence.
   expect(writerB.currentInMemorySequence()).toBe(cap + 2);
   await exactRetention(raw, writerB);
+});
+
+it("keeps every retained entry on a second writer's below-cap append after clean rotation", async () => {
+  const { raw, log: writerA } = await setup();
+  const writerB = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, maxEntries: CAP });
+  await writerB.query({ limit: 1 });
+  await writerA.appendCritical(measureEntry(CAP));
+  const retainedBefore = (await raw.list("_audit")).length;
+  // A completes all three steps, leaving the two-entry retention margin.
+  expect(retainedBefore).toBe(CAP - 2);
+  const remove = vi.spyOn(raw, "delete");
+  await writerB.appendCritical(measureEntry(CAP + 1));
+  expect(remove).not.toHaveBeenCalled();
+  expect(await raw.list("_audit")).toHaveLength(retainedBefore + 1);
+  await strict(raw);
+});
+
+it("does not raise the cut when the anchored base entry is absent", async () => {
+  const { raw, writerB, survivor } = await warmWritersWithSurvivor(CAP, 3, "throw");
+  const anchor = JSON.parse(new TextDecoder().decode((await raw.read("_audit_checkpoints", "__rotation_anchor"))!));
+  const base = (await raw.list("_audit")).find((meta) => Number(meta.key.split("-")[1]) === anchor.data.base_sequence)!;
+  await unlink(join(root, "state", "_audit", `${base.key}.enc`));
+  const retainedBefore = (await raw.list("_audit")).length;
+  const beforeReader = new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+  const finding = { kind: "rotation_anchor_invalid" };
+  await expect(beforeReader.query({ limit: 1 })).rejects.toMatchObject({ name: "AuditIntegrityError",
+    findings: expect.arrayContaining([expect.objectContaining(finding)]) });
+  const remove = vi.spyOn(raw, "delete");
+  await writerB.appendCritical(measureEntry(CAP + 1));
+  // The absent base leaves the cut unchanged, preserving the survivor and finding.
+  expect(remove).not.toHaveBeenCalled();
+  expect(await raw.exists("_audit", survivor)).toBe(true);
+  expect(await raw.list("_audit")).toHaveLength(retainedBefore + 1);
+  const afterReader = new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+  await expect(afterReader.query({ limit: 1 })).rejects.toMatchObject({ name: "AuditIntegrityError",
+    findings: expect.arrayContaining([expect.objectContaining(finding)]) });
 });
 
 it("does not raise the count cut for an invalid durable anchor", async () => {
