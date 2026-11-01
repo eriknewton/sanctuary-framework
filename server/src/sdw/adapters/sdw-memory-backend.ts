@@ -1,3 +1,5 @@
+import { recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
+import { MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
 /**
  * SDW implementation of the memory-backend adapter contract.
  *
@@ -109,6 +111,7 @@ const MEMORY_PASSAGE_ID_MAC_DOMAIN = "sanctuary.sdw-memory-passage-id.v1";
 const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
 export const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
 export const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
+// Must match MEMORY_BATCH_LOCK_TIMEOUT_MS in hermes-memory-bridge/constants.ts.
 export const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
 // Exported: `sdw/memory-tools.ts` derives the memory_search needle byte cap
 // from this so the tool boundary and the store agree on "one chunk of text".
@@ -131,7 +134,7 @@ export const MEMORY_SEARCH_DEFAULT_LIMIT = 10;
  * that same low-seconds order of magnitude regardless of how large the vault
  * grows, instead of scaling with it.
  */
-const MEMORY_CORPUS_SCAN_CAP = 2000;
+export { MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
 
 /**
  * Hard ceiling on the caller-supplied `limit` for search/list, and the
@@ -499,7 +502,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       const transactional = asSdwTransactional(this.storage);
       if (transactional !== null) {
         if (this.mode === "hermes-bridge") {
-          // Bridge approval is bound to the non-transactional write order below;
+          // Bridge admission is bound to the non-transactional write order below;
           // a transactional branch cannot preserve that order, so it refuses first.
           throw new SdwValidationError(
             "operation_refused",
@@ -536,7 +539,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                 // A queued insert can outlive an earlier partial-scope latch; recheck
                 // inside the corpus lock immediately before the bridge commit hook.
                 this.assertHermesBridgeInsertAllowed();
-                // Hermes mode linearizes owner approval inside the corpus lock; a refusal here precedes every storage write.
+                // Hermes mode linearizes own-scope admission inside the corpus lock; a refusal here precedes every storage write.
                 await this.assertHermesBridgeCommitAllowed(prepared);
               }
               // Mark before the first mutator: even a rejected write can have persisted bytes.
@@ -948,6 +951,43 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         a.passage.passage_id.localeCompare(b.passage.passage_id),
     );
     return results.slice(0, limit);
+  }
+
+  /** Recall shares search provenance checks while retaining only bounded, verified excerpts. */
+  async recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult> {
+    if (budget.terms.length === 0) return budget.result();
+    const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
+    for (const entry of entries) {
+      if (!budget.candidate()) break;
+      const document = await this.corpus.getDocument(entry.key.slice("doc.".length));
+      if (!budget.active()) break;
+      if (document === null || recallTimestamp(document.created_at) === null) continue;
+      if (document.chunk_count > budget.limits.passageUnits) { budget.truncated = true; continue; }
+      const provenance = await this.verifyOrQuarantineProvenance(document);
+      if (!budget.active()) break;
+      if (provenance === "quarantined") continue;
+      await this.assertUnsignedCompatibilityAllowed(provenance);
+      const parts: string[] = [];
+      let units = 0;
+      let complete = true;
+      for (let ordinal = 0; ordinal < document.chunk_count; ordinal++) {
+        if (!budget.active()) { complete = false; break; }
+        const chunk = await this.corpus.getChunk(document.document_id, ordinal, chunkId(ordinal));
+        if (chunk === null) throw new SdwValidationError("passage_incomplete", "SDW memory passage chunk missing");
+        if (!budget.active() || !budget.scan(chunk.text.length)) { complete = false; break; }
+        units += chunk.text.length;
+        if (units > budget.limits.passageUnits) { budget.truncated = true; complete = false; break; }
+        parts.push(chunk.text);
+      }
+      // Skipped text is never scored: a prefix has not established the stored full-content commitment.
+      if (!complete) continue;
+      const text = parts.join("");
+      if (passageContentHash(text) !== document.content_hash) {
+        throw new SdwValidationError("identity_mismatch", "SDW memory passage content hash mismatch");
+      }
+      budget.retain(this.toPassage(document, text, provenance));
+    }
+    return budget.result();
   }
 
   async listPassages(options: MemoryListOptions = {}): Promise<readonly MemoryPassage[]> {

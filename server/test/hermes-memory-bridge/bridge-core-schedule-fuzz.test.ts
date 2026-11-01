@@ -2,9 +2,10 @@ import { Buffer } from "node:buffer";
 import { describe, expect, it } from "vitest";
 
 import {
-  HERMES_APPROVAL_DEADLINE_MS,
+  HERMES_INSERT_DEADLINE_MS,
   HermesBridgeCore,
   type HermesBridgeAuditRecord,
+  type HermesApprovalTerminalState,
   type HermesBridgeCorePorts,
   type HermesTimerHandle,
   parsePublicFrame,
@@ -171,7 +172,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (requestId !== undefined && request.requestId !== requestId) return;
     if (reason === "peer_shutdown") {
       if (locks.some((lock) => !lock.done)) coverage.interleavings.add("shutdown_while_lock_parked");
-      if (audits.some((audit) => audit.kind === "commit_intent" && audit.entryId === entry.id && !audit.cell.done)) {
+      if (audits.some((audit) => audit.kind === "insert_admitted" && audit.entryId === entry.id && !audit.cell.done)) {
         coverage.interleavings.add("shutdown_while_durability_wait");
       }
     }
@@ -214,7 +215,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     },
     appendAudit(record: HermesBridgeAuditRecord) {
       coverage.dispatchRows.add("audit");
-      if (record.kind === "terminal" && record.state !== undefined) coverage.terminals.add(record.state);
+
       const cell = deferred<void>();
       const audit: {
         readonly kind: HermesBridgeAuditRecord["kind"];
@@ -258,17 +259,18 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       timers.set(handle, {
         ms,
         fire,
-        ...(ms === HERMES_APPROVAL_DEADLINE_MS && core !== undefined && core.snapshot().slot?.entryId !== undefined
+        ...(ms === HERMES_INSERT_DEADLINE_MS && core !== undefined && core.snapshot().slot?.entryId !== undefined
           ? { entryId: core.snapshot().slot?.entryId }
           : {}),
       });
-      coverage.dispatchRows.add(ms === HERMES_APPROVAL_DEADLINE_MS ? "approval_timer_armed" : "probe_timer_armed");
+      coverage.dispatchRows.add(ms === HERMES_INSERT_DEADLINE_MS ? "insert_timer_armed" : "probe_timer_armed");
       return handle;
     },
     clearTimer(handle) {
       timers.delete(handle);
     },
     adapter: {
+      recallPassages: async budget => budget.result(),
       async insertPassage(input: MemoryPassageInput): Promise<MemoryPassage> {
         coverage.dispatchRows.add("adapter_insert");
         const lock = deferred<void>();
@@ -316,12 +318,16 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
           .map((entry) => ({ passage: entry, match_count: 1 }));
       },
     },
-    ownerSurface: { promptOwner: () => {
-      coverage.dispatchRows.add("prompt_owner");
-    } },
+    agentId: "fixture-agent",
     abort,
   };
   core = new HermesBridgeCore(ports);
+  const observedLedger = (core as any).ledger;
+  const finish = observedLedger.finish.bind(observedLedger);
+  observedLedger.finish = (entry: unknown, state: HermesApprovalTerminalState, ...rest: unknown[]) => {
+    coverage.terminals.add(state);
+    return finish(entry, state, ...rest);
+  };
   const ledger = (core as unknown as {
     ledger: {
       commitCheck: (entryId: string, input: {
@@ -337,11 +343,10 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     const dispatched = dispatchedRefusals.get(entryId) ?? new Set<string>();
     const pendingAudit = audits.some((audit) => audit.entryId === entryId && audit.state !== "fulfilled");
     const allowedNow = entry !== undefined &&
-      entry.state === "APPROVED" &&
+      entry.state === "INSERT_STARTED" &&
       entry.started &&
       !entry.seen.cancel &&
       !entry.seen.deadline &&
-      !entry.seen.deny &&
       !entry.seen.gone &&
       !entry.seen.stop &&
       !entry.seen.latch &&
@@ -460,12 +465,12 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     const entry = core.snapshot().ledger.entry;
     if (entry !== undefined && !stopped) {
       actions.push(() => {
-        core.ownerApprove(entry.id, entry.textSha256);
+
         observeStop();
       });
       actions.push(() => {
-        markRefusal(entry.id, "deny");
-        core.ownerDeny(entry.id);
+        markRefusal(entry.id, "cancel");
+        send(publicFrame(entry.connectionId, { type: "cancel", mcp_request_id: core.snapshot().lifecycle.records.find(record => record.id === entry.recordId)!.requestId }));
         observeStop();
       });
     }
@@ -473,9 +478,9 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       actions.push(() => {
         const [handle, timer] = pick([...timers.entries()]);
         timers.delete(handle);
-        if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
-          if (random() < 0.8) now += HERMES_APPROVAL_DEADLINE_MS + 1;
-          coverage.dispatchRows.add("approval_timer_fire");
+        if (timer.ms === HERMES_INSERT_DEADLINE_MS) {
+          if (random() < 0.8) now += HERMES_INSERT_DEADLINE_MS + 1;
+          coverage.dispatchRows.add("insert_timer_fire");
           markRefusal(timer.entryId, "deadline");
         } else {
           coverage.dispatchRows.add("probe_timer_fire");
@@ -535,7 +540,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (entry === undefined) return;
     entryRequests.set(entry.id, { connectionId, requestId });
     await flush(4);
-    core.ownerApprove(entry.id, entry.textSha256);
+
     observeStop();
     for (let pass = 0; pass < 20; pass += 1) {
       await flush(4);
@@ -591,16 +596,16 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       }
     }
     const entry = core.snapshot().ledger.entry;
-    if (entry !== undefined && entry.state === "PENDING" && !stopped) {
-      markRefusal(entry.id, "deny");
-      core.ownerDeny(entry.id);
+    if (entry !== undefined && entry.state === "INSERT_STARTED" && !stopped) {
+      markRefusal(entry.id, "cancel");
+      send(publicFrame(entry.connectionId, { type: "cancel", mcp_request_id: core.snapshot().lifecycle.records.find(record => record.id === entry.recordId)!.requestId }));
       changed = true;
     }
     for (const [handle, timer] of [...timers.entries()]) {
       timers.delete(handle);
-      if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
-        if (random() < 0.8) now += HERMES_APPROVAL_DEADLINE_MS + 1;
-        coverage.dispatchRows.add("approval_timer_fire");
+      if (timer.ms === HERMES_INSERT_DEADLINE_MS) {
+        if (random() < 0.8) now += HERMES_INSERT_DEADLINE_MS + 1;
+        coverage.dispatchRows.add("insert_timer_fire");
         markRefusal(timer.entryId, "deadline");
       } else {
         coverage.dispatchRows.add("probe_timer_fire");
@@ -616,9 +621,11 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   await continueAfterCommit();
   insertCoveragePhase = "random";
   await flush(30);
+  // A probe write can stop the core during the final microtask drain; observe that event before checking response obligations.
+  observeStop();
   for (const connection of connections.values()) {
     if (connection.state === "busy" && connection.requestId !== undefined && !stopped) {
-      violations.push(`unanswered request ${connection.requestId}`);
+      violations.push(`unanswered request ${connection.requestId} ${JSON.stringify({ snapshot: core.snapshot(), reads: reads.filter(read => !read.done).length, locks: locks.filter(lock => !lock.done).length, audits: audits.filter(audit => !audit.cell.done).map(audit => audit.kind), probes })}`);
     }
   }
   if (!stopped) {
@@ -636,9 +643,9 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   await flush(40);
   observeStop();
   for (const [, timer] of [...timers.entries()]) {
-    if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
-      if (random() < 0.8) now += HERMES_APPROVAL_DEADLINE_MS + 1;
-      coverage.dispatchRows.add("approval_timer_fire");
+    if (timer.ms === HERMES_INSERT_DEADLINE_MS) {
+      if (random() < 0.8) now += HERMES_INSERT_DEADLINE_MS + 1;
+      coverage.dispatchRows.add("insert_timer_fire");
       markRefusal(timer.entryId, "deadline");
     } else {
       coverage.dispatchRows.add("probe_timer_fire");
@@ -658,6 +665,12 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
 }
 
 describe("HermesBridgeCore schedule fuzz", () => {
+  it("observes the probe write stop during seed 863's final microtask drain", async () => {
+    const result = await runSchedule(863);
+    expect(result.violations).toEqual([]);
+    expect(result.coverage.stopCauses).toContain("write_failure");
+  });
+
   it("preserves response, commit and cleanup invariants across generated schedules", async () => {
     const coverage: Coverage = {
       terminals: new Set(),
@@ -684,7 +697,7 @@ describe("HermesBridgeCore schedule fuzz", () => {
     }
 
     expect(failures).toEqual([]);
-    expect(coverage.terminals).toEqual(new Set(["CANCELED", "COMMITTED", "DENIED", "DISCONNECTED", "INDETERMINATE", "REFUSED", "TIMED_OUT"]));
+    expect(coverage.terminals).toEqual(new Set(["CANCELED", "COMMITTED", "DISCONNECTED", "INDETERMINATE", "REFUSED", "TIMED_OUT"]));
     expect(coverage.stopCauses).toEqual(new Set(["relay_eof", "relay_fatal", "relay_shutdown", "write_failure"]));
     expect(coverage.auditOutcomes).toEqual(new Set(["deferred", "fulfilled", "rejected"]));
     expect(coverage.adapterOutcomes).toEqual(new Set(["partial", "success", "throw_after_allow"]));
@@ -693,10 +706,9 @@ describe("HermesBridgeCore schedule fuzz", () => {
       "adapter_get",
       "adapter_insert",
       "adapter_search",
-      "approval_timer_armed",
-      "approval_timer_fire",
+      "insert_timer_armed",
+      "insert_timer_fire",
       "audit",
-      "prompt_owner",
       "probe_timer_armed",
       "probe_timer_fire",
       "send_probe",

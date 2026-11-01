@@ -2,7 +2,7 @@
 
 This file is the relay-to-Node contract for the Hermes memory bridge. The Node bridge must consume `Tests/HermesMemoryRelayCoreTests/Fixtures/relay-frames.json`; the Swift tests consume that same file now. Any change to this contract updates both this document and the fixture in the same change. Stream vectors carry literal `bytes_hex`; recipe names are not part of the slice-2 contract.
 
-Slice status: this package implements the relay runtime. Installed-platform acceptance is not established. The Node capability is scoped memory search and get; writes not yet available. `ready` does not establish policy pinning; `state_POLICY_PINNED` is `not_provided`.
+Slice status: this package implements the relay runtime. Installed-platform acceptance is not established. The Node capability is catalog v2: scoped memory save, get, search and bounded recall. Each write is an own-scope save audited with the agent named. `ready` does not establish policy pinning; `state_POLICY_PINNED` is `not_provided`.
 
 ## Transport
 
@@ -133,7 +133,7 @@ The relay mints `connection_id` values. The format is the string `c` followed by
 
 Any malformed relay-to-Node private frame is `fatal_bridge`: malformed JSON, an unknown `type`, missing or wrongly typed required fields, duplicate top-level keys, over-cap length, duplicate lifecycle frames, `probe_reply` for a connection id Node never saw in `accepted`, `probe_reply` with a nonce Node never issued, and frames for unknown or impossible connection ids all make Node refuse every waiting entry and exit nonzero within `RELAY_CHILD_EXIT_BOUND_MS`. What Node would do with a disallowed public id is irrelevant to this relay seam because the relay never forwards one; Node's own private encoder only emits ids it received from the relay.
 
-If Node's parser or validator rejects a forwarded public call frame whose top-level `type` is `hello`, `tools_list`, or `tools_call`, Node sends a private `response { connection_id, request_id, result_b64 }`; `result_b64` is the base64 of the public `error { request_id, message: "Memory request denied." }` payload bytes for that call's request id. A call never waits forever because Node refused the bytes it was asked to parse. If Node rejects a forwarded `cancel` or `shutdown`, Node sends nothing. If Node cannot parse the bytes well enough to recover a request id, or if its response would exceed `MAX_PRIVATE_FRAME_BYTES`, Node sends `close { connection_id }`; the relay closes only that public connection. The relay derives the private response budget as the measured 70-byte empty response envelope, plus the 21-byte longest relay-minted `connection_id`, plus the 128-byte longest allowed `request_id`, plus 256 bytes of named headroom; the product assertion and fixture test build that longest-id, longest-connection, full-65536-byte-result response through the real encoder.
+If Node's parser or validator rejects a forwarded catalogued `tools_call` with a recoverable request id, Node sends a private `response` carrying an ordinary public `result`. Catalogued-tool refusals use the fixed outcomes below. A non-catalogued name, invalid `hello` or `tools_list`, or an unrecoverable frame remains a protocol fault and keeps the fixed public `error { request_id, message: "Memory request denied." }` contract where an id can be recovered. If Node rejects a forwarded `cancel` or `shutdown`, Node sends nothing. If Node cannot parse the bytes well enough to recover a request id, or if its response would exceed `MAX_PRIVATE_FRAME_BYTES`, Node sends `close { connection_id }`; the relay closes only that public connection. The relay derives the private response budget as the measured 70-byte empty response envelope, plus the 21-byte longest relay-minted `connection_id`, plus the 128-byte longest allowed `request_id`, plus 256 bytes of named headroom; the product assertion and fixture test build that longest-id, longest-connection, full-65536-byte-result response through the real encoder.
 
 Public `cancel` does not remove the relay's in-flight state: every forwarded `hello`, `tools_list`, or `tools_call` has exactly one `response` or one `close` for that connection, including after any later `cancel`. A `response` for a connection with nothing in flight, or a second `response` after the relay already accepted or denied the call, is a fatal relay error.
 
@@ -197,19 +197,23 @@ In flight means any forwarded request awaiting its `response`: `tools_call`, `to
 
 ## Stdio client contract
 
-`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory search and get are available through the bridge; writes are not yet available. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; the shim code reads no environment selector for socket, identity, write flag, or boot mode. The agent account can reach the socket directly, so inherited environment is not a security boundary here.
+`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory save, get, search and bounded recall are available through the bridge. A save into the agent's own memory runs without a human prompt and is audited with the agent named. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; the shim code reads no environment selector for socket, identity, write flag, or boot mode. The agent account can reach the socket directly, so inherited environment is not a security boundary here.
 
 The client constants in `server/src/hermes-memory-client/protocol.ts` must match `RelayProtocolConstants` in `Sources/HermesMemoryRelayCore/Core.swift`: public payload 65536 bytes excluding the 4-byte prefix, retained socket frame 65540 bytes, 64 composite levels below the public root, two outstanding pongs, and eight queued/reserved forwarded controls. The client cannot observe `markNodeFrameWritten`, so its `CONTROL_CAP` conservatively limits controls over the connection lifetime, reserving the eighth credit for shutdown. A socket write never refunds credit.
 
 `MAX_STDIO_LINE_BYTES` must match `server/src/hermes-memory-client/protocol.ts`: 65536 payload + 35 fixed MCP envelope bytes + 128 ID bytes + 2 CRLF bytes = 65701. The maximum compact call overhead is 222 MCP bytes versus 127 relay bytes: 65536 - 127 + 222 = 65631, within the 65699 JSON ceiling. The 128-character ASCII ID rule is client-local; integer IDs remain typed. The client mints unrelated wire IDs using 128 random bits and a non-wrapping UInt64 counter.
 
-`SHIM_CALL_DEADLINE_MS` is 120000 minus the 2000 response delivery reserve = 118000, measured from shim admission. The Hermes clock starts earlier; this is not a guarantee of delivery before its deadline. Call reply stalls use the remainder of that 120000 window. Other replies use the 2000 delivery reserve. CD1a allows 5000 for connect/hello; CD1b allows 5000 in each initialization waiting/output state. Ping waits are 30000 minus 2000 = 28000 through parsing pong. Cancel settlement allows 30000 lock wait + 2000 probe = 32000 without a durable-completion guarantee. EOF and non-EOF drains allow 2000 Python process grace minus 500 scheduler/exit margin = 1500. The bridge approval constant remains 83000.
+`SHIM_CALL_DEADLINE_MS` is 120000 minus the 2000 response delivery reserve = 118000, measured from shim admission. The Hermes clock starts earlier; this is not a guarantee of delivery before its deadline. Call reply stalls use the remainder of that 120000 window. Other replies use the 2000 delivery reserve. CD1a allows 5000 for connect/hello; CD1b allows 5000 in each initialization waiting/output state. Ping waits are 30000 minus 2000 = 28000 through parsing pong. Cancel settlement allows 30000 lock wait + 2000 probe = 32000 without a durable-completion guarantee. EOF and non-EOF drains allow 2000 Python process grace minus 500 scheduler/exit margin = 1500. HERMES_INSERT_DEADLINE_MS is 83000, the deadline for an admitted insert to pass its commit check before any effect.
 
-MCP call results must match `CallToolResultSchema` with an actual content array; list results must match `ListToolsResultSchema` after tool-level `input_schema` becomes `inputSchema`. The exact three names are memory_insert, memory_get, memory_search, with no cursor. Payload bytes are spliced without re-encoding. Unknown call param fields are ignored; only the tool name and object arguments cross the seam. The bridge remains the argument-allowlist and effective-taint authority.
+MCP call results must match `CallToolResultSchema` with an actual content array; list results must match `ListToolsResultSchema` after tool-level `input_schema` becomes `inputSchema`. The exact seven names are memory_insert, memory_get, memory_search, memory_recall, sign_statement, export_memory, protection_rules, with no cursor. Payload bytes are spliced without re-encoding. Unknown call param fields are ignored; only the tool name and object arguments cross the seam. The bridge remains the argument-allowlist and effective-taint authority.
 
 | Refusing event | Client disposition |
 |---|---|
-| Denial or unknown tool | Fixed -32002, continue |
+| Catalogued-tool denial or malformed tool arguments | Ordinary `result`, outcome `denied`, continue |
+| Sign or export | Ordinary `result`, outcome `unavailable`; not available yet |
+| Capacity, admission or audit unavailable | Ordinary `result`, outcome `unavailable` |
+| Insert completion unconfirmed | Ordinary `result`, outcome `unconfirmed` |
+| Unknown tool or relay-generated denial | Fixed -32002, continue |
 | Occupied primary or third ping | Fixed -32003, no call queue |
 | Relay unavailable | Fixed -32004, insert outcome unknown, continue |
 | Admission deadline | Fixed -32005, outcome unknown, at most one eligible cancel |
@@ -237,4 +241,19 @@ MCP call results must match `CallToolResultSchema` with an actual content array;
 
 Retained state is one primary, one local refusal, two ping records, a dedicated initialize output slot during startup, and one terminal-only refusal slot. Each slot is retired on delivery/suppression and, where applicable, wire settlement. Input processing yields between lines. Output never queues without its record reservation. The primary may retain one encoded frame, at most 65540 bytes including its prefix, behind a completing control write; cancellation or drain discards an unwritten frame locally. Oversized input scanning retains only bounded key/ID tokens and nesting counters. Wire and stdout buffers are disposed on close.
 
-The client emits no -32000 or -32001 and only fixed errors. A process crash, SIGKILL, dead stdout, or keepalive-triggered teardown during an admitted call can still leave the SDK to synthesize a transport error. Production writes remain held. Hermes must be configured with timeout 120 and must not mark this server parallel-safe. A dead client is noticed on the next call or keepalive. Consecutive denied inserts can trip Hermes's three-error, 60-second circuit breaker and temporarily block reads. Installed uid and SDK parity evidence remains separate from fixture acceptance.
+The client emits no -32000 or -32001 and only fixed errors. A process crash, SIGKILL, dead stdout, or keepalive-triggered teardown during an admitted call can still leave the SDK to synthesize a transport error. Hermes must be configured with timeout 120 and must not mark this server parallel-safe. A dead client is noticed on the next call or keepalive. Installed uid and SDK parity evidence remains separate from fixture acceptance.
+
+### Catalog v2 ordinary outcomes
+
+Must match `HERMES_TOOL_OUTCOMES` in `server/src/hermes-memory-bridge/public-results.ts`. These tool results carry content without `isError`; the fixed wording is part of the client contract.
+
+| Outcome | Message |
+|---|---|
+| denied | Request denied. |
+| unavailable, signing or export not built | This is not available yet; nothing was done. |
+| unavailable | Sanctuary could not take this request right now; nothing was done. |
+| unconfirmed | I could not confirm whether this completed. |
+
+`sign_statement` and `export_memory` validate arguments but perform no operation. `protection_rules` is refused. No owner channel, socket, frame, hold protocol or evidence frame is provided by this slice.
+
+The shim passes validated bridge results through unchanged. Its own transport and protocol faults remain JSON-RPC errors: busy (-32003), unavailable (-32004), deadline (-32005), parse and params faults, and the relay's own busy or invalid-response error frames. A later plugin slice owns their mapping. Bridge refusals do not produce those transport faults.

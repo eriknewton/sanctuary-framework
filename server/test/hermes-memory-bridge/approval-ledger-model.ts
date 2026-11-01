@@ -1,11 +1,8 @@
 import {
-  HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE,
   HERMES_MEMORY_DENIAL,
   HERMES_MEMORY_UNAVAILABLE,
-  HERMES_RATE_WINDOW_MS,
   type HermesApprovalAction,
   type HermesApprovalLedger,
-  HERMES_APPROVAL_DEADLINE_MS,
   type HermesApprovalCommitCheckInput,
   type HermesApprovalDecision,
   type HermesApprovalEntryState,
@@ -43,7 +40,6 @@ export interface ModelResult {
 
 const TERMINAL = new Set<HermesApprovalEntryState>([
   "COMMITTED",
-  "DENIED",
   "CANCELED",
   "TIMED_OUT",
   "DISCONNECTED",
@@ -56,7 +52,6 @@ export class ApprovalLedgerModel {
   private stopped = false;
   private latched = false;
   private largestNowMs = Number.NEGATIVE_INFINITY;
-  private readonly promptTimes: number[] = [];
 
   constructor(
     private readonly deadlineMs: number,
@@ -69,17 +64,12 @@ export class ApprovalLedgerModel {
     if (this.stopped) return { actions: [], refusal: "stopped" };
     if (this.latched) return { actions: [], refusal: "latched" };
     if (this.entry !== undefined) return { actions: [], refusal: "busy" };
-    this.prunePrompts(now);
-    if (this.promptTimes.length >= HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE) {
-      return { actions: [], refusal: "prompt_rate" };
-    }
-    this.promptTimes.push(now);
     this.entry = {
       id: entryId,
       connectionId,
       recordId,
       textSha256,
-      state: "PENDING",
+      state: "INSERT_STARTED",
       started: false,
       settled: false,
       responded: false,
@@ -87,47 +77,29 @@ export class ApprovalLedgerModel {
       seen: this.emptySeen(),
       lateEvents: new Set(),
     };
-    return {
-      actions: [
-        { kind: "audit", entryId, event: "created" },
-        { kind: "prompt_owner", entryId },
-      ],
-    };
-  }
-
-  ownerApprove(entryId: string, textSha256: string): ModelResult {
-    const entry = this.find(entryId);
-    if (entry === undefined) return { actions: [], refusal: "unknown_entry" };
-    if (entry.state !== "PENDING") return { actions: [], refusal: "not_pending" };
-    if (entry.textSha256 !== textSha256) return { actions: [], refusal: "hash_mismatch" };
-    entry.state = "APPROVED";
-    return { actions: [{ kind: "audit", entryId, event: "approved" }] };
-  }
-
-  ownerDeny(entryId: string): ModelResult {
-    return this.control(entryId, "deny", "DENIED", "owner_denied", "denial");
+    return { actions: [] };
   }
 
   deadline(entryId: string): ModelResult {
-    return this.control(entryId, "deadline", "TIMED_OUT", "deadline", "denial");
+    return this.control(entryId, "deadline", "TIMED_OUT", "deadline", "unavailable");
   }
 
   cancel(entryId: string): ModelResult {
-    return this.control(entryId, "cancel", "CANCELED", "cancel", "denial");
+    return this.control(entryId, "cancel", "CANCELED", "cancel", "unavailable");
   }
 
   peerShutdown(entryId: string): ModelResult {
-    return this.control(entryId, "cancel", "CANCELED", "peer_shutdown", "denial");
+    return this.control(entryId, "cancel", "CANCELED", "peer_shutdown", "unavailable");
   }
 
   connectionGone(entryId: string): ModelResult {
     const entry = this.find(entryId);
     if (entry === undefined) return { actions: [] };
-    if (entry.state === "PENDING" || (entry.state === "APPROVED" && !entry.started)) {
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       entry.seen.gone = true;
       return this.finish(entry, "DISCONNECTED", "connection_gone", undefined, true, false);
     }
-    if (entry.state === "APPROVED" || entry.state === "COMMITTING") {
+    if (entry.state === "INSERT_STARTED" || entry.state === "COMMITTING") {
       this.recordSeen(entry, "gone");
       return { actions: [] };
     }
@@ -152,8 +124,7 @@ export class ApprovalLedgerModel {
   insertStarted(entryId: string): ModelResult {
     const entry = this.find(entryId);
     if (entry === undefined) return { actions: [], refusal: "unknown_entry" };
-    if (entry.state === "PENDING") return { actions: [], refusal: "not_approved" };
-    if (entry.state === "APPROVED" && !entry.started) {
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       entry.started = true;
       return { actions: [] };
     }
@@ -162,7 +133,7 @@ export class ApprovalLedgerModel {
 
   commitCheck(entryId: string, input: HermesApprovalCommitCheckInput): ModelResult & { readonly decision: HermesApprovalDecision } {
     const entry = this.find(entryId);
-    if (entry === undefined || entry.state !== "APPROVED" || !entry.started) return this.fatal("refuse");
+    if (entry === undefined || entry.state !== "INSERT_STARTED" || !entry.started) return this.fatal("refuse");
     if (!Number.isFinite(input.nowMs)) return this.fatal("refuse");
     const terminal = this.decideCommit(entry, input, this.clampNow(input.nowMs));
     if (terminal === undefined) {
@@ -183,22 +154,23 @@ export class ApprovalLedgerModel {
       this.latched = true;
       return this.finish(entry, "INDETERMINATE", "write_indeterminate", "unavailable", false, false);
     }
-    return this.finish(entry, "REFUSED", "write_failed", "denial", false, false);
+    return this.finish(entry, "REFUSED", "write_failed", "unavailable", false, false);
   }
 
   settled(entryId: string): ModelResult {
     const entry = this.find(entryId);
     if (entry === undefined) return this.fatal();
-    if (entry.state === "APPROVED" && entry.started) {
+    if (entry.state === "INSERT_STARTED" && entry.started) {
       const terminal = this.decideCommit(entry, {
         probe: "resolved",
+        admitDurable: false,
         nowMs: this.largestNowMs,
         recordCurrent: true,
         passageTextSha256: entry.textSha256,
         getFrameUtf8Bytes: 0,
       }, this.largestNowMs);
       if (terminal === undefined) {
-        return this.finish(entry, "REFUSED", "insert_returned_before_commit_check", "denial", true, true);
+        return this.finish(entry, "REFUSED", "insert_returned_before_commit_check", "unavailable", true, true);
       }
       return this.finish(entry, terminal.state, terminal.reason, terminal.responseClass, true, true);
     }
@@ -214,7 +186,6 @@ export class ApprovalLedgerModel {
       stopped: this.stopped,
       latched: this.latched,
       largestNowMs: this.largestNowMs,
-      promptWindowCount: this.promptTimes.length,
       entry: this.entry === undefined ? undefined : {
         id: this.entry.id,
         connectionId: this.entry.connectionId,
@@ -241,11 +212,11 @@ export class ApprovalLedgerModel {
     responseClass: HermesApprovalResponseClass,
   ): ModelResult {
     const entry = this.find(entryId);
-    if (entry === undefined) return flag === "deny" ? { actions: [], refusal: "unknown_entry" } : { actions: [] };
-    if (entry.state === "PENDING" || (entry.state === "APPROVED" && !entry.started)) {
+    if (entry === undefined) return { actions: [] };
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       return this.finish(entry, terminalState, reason, responseClass, true, true);
     }
-    if (entry.state === "APPROVED" && entry.started) {
+    if (entry.state === "INSERT_STARTED" && entry.started) {
       this.recordSeen(entry, flag);
       return { actions: [] };
     }
@@ -253,7 +224,7 @@ export class ApprovalLedgerModel {
       this.recordSeen(entry, flag);
       return { actions: [] };
     }
-    return flag === "deny" ? { actions: [], refusal: "not_pending" } : { actions: [] };
+    return { actions: [] };
   }
 
   private applyGlobal(
@@ -263,10 +234,10 @@ export class ApprovalLedgerModel {
   ): ModelResult {
     const entry = this.entry;
     if (entry === undefined) return { actions: [] };
-    if (entry.state === "PENDING" || (entry.state === "APPROVED" && !entry.started)) {
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       return this.finish(entry, "REFUSED", reason, responseClass, true, true);
     }
-    if (entry.state === "APPROVED" || entry.state === "COMMITTING") {
+    if (entry.state === "INSERT_STARTED" || entry.state === "COMMITTING") {
       this.recordSeen(entry, flag, flag === "latch" ? reason : undefined);
     }
     return { actions: [] };
@@ -284,15 +255,15 @@ export class ApprovalLedgerModel {
       input.getFrameUtf8Bytes < 0 ||
       !(input.getFrameUtf8Bytes <= this.resultCapBytes)
     ) {
-      return { state: "REFUSED", reason: "commit_binding_mismatch", responseClass: "denial" };
+      return { state: "REFUSED", reason: "commit_binding_mismatch", responseClass: "unavailable" };
     }
-    if (input.probe === "refused") return { state: "REFUSED", reason: "probe_refused", responseClass: "denial" };
     if (entry.seen.stop || entry.seen.latch || this.stopped || this.latched) {
       return { state: "REFUSED", reason: entry.latchReason ?? "service_unavailable", responseClass: "unavailable" };
     }
-    if (entry.seen.cancel) return { state: "CANCELED", reason: "cancel", responseClass: "denial" };
-    if (entry.seen.deny) return { state: "DENIED", reason: "owner_denied", responseClass: "denial" };
-    if (entry.seen.deadline || nowMs >= entry.deadlineAt) return { state: "TIMED_OUT", reason: "deadline", responseClass: "denial" };
+    if (entry.seen.cancel) return { state: "CANCELED", reason: "cancel", responseClass: "unavailable" };
+    if (entry.seen.deadline || nowMs >= entry.deadlineAt) return { state: "TIMED_OUT", reason: "deadline", responseClass: "unavailable" };
+    if (input.probe === "refused") return { state: "REFUSED", reason: "probe_refused", responseClass: "unavailable" };
+    if (!input.admitDurable) return { state: "REFUSED", reason: "audit_unavailable", responseClass: "unavailable" };
     return undefined;
   }
 
@@ -308,14 +279,7 @@ export class ApprovalLedgerModel {
     entry.terminalReason = reason;
     entry.responseClass = state === "DISCONNECTED" ? undefined : responseClass;
     if (settle) entry.settled = true;
-    const actions: HermesApprovalAction[] = [{
-      kind: "audit",
-      entryId: entry.id,
-      event: "terminal",
-      state,
-      reason,
-      lateEvents: [...entry.lateEvents],
-    }];
+    const actions: HermesApprovalAction[] = [];
     if (respondNow) actions.push(...this.respond(entry));
     this.deleteIfComplete(entry);
     return { actions };
@@ -358,88 +322,8 @@ export class ApprovalLedgerModel {
     return this.largestNowMs;
   }
 
-  private prunePrompts(nowMs: number): void {
-    if (!Number.isFinite(nowMs)) return;
-    while (this.promptTimes.length > 0 && nowMs - this.promptTimes[0]! >= HERMES_RATE_WINDOW_MS) {
-      this.promptTimes.shift();
-    }
-  }
 
   private emptySeen(): Record<HermesApprovalLateEvent, boolean> {
-    return { deny: false, deadline: false, cancel: false, gone: false, stop: false, latch: false };
-  }
-}
-
-export type PendingTermination = "cancel" | "deadline" | "connectionGone" | "peerShutdown" | "stop" | "latch";
-
-const PENDING_TERMINALS = {
-  cancel: ["CANCELED", "cancel", "denial"],
-  deadline: ["TIMED_OUT", "deadline", "denial"],
-  connectionGone: ["DISCONNECTED", "connection_gone", undefined],
-  peerShutdown: ["CANCELED", "peer_shutdown", "denial"],
-  stop: ["REFUSED", "stopped", "unavailable"],
-  latch: ["REFUSED", "audit", "unavailable"],
-} as const;
-
-/** A pending-only table and filtered prompt history keep the reachable oracle independent of ledger control branches. */
-export class PendingApprovalModel {
-  private pending: { id: string; connectionId: string; recordId: string; textSha256: string; admittedAt: number } | undefined;
-  private readonly gates = new Set<"stop" | "latch">();
-  private prompts: number[] = [];
-  private clock = Number.NEGATIVE_INFINITY;
-
-  admit(id: string, connectionId: string, recordId: string, textSha256: string, now: number): ModelResult {
-    if (!Number.isFinite(now)) return { actions: [], refusal: "invalid_clock" };
-    this.clock = Math.max(this.clock, now);
-    const refusal = this.gates.has("stop") ? "stopped"
-      : this.gates.has("latch") ? "latched"
-        : this.pending !== undefined ? "busy" : undefined;
-    if (refusal !== undefined) return { actions: [], refusal };
-    this.prompts = this.prompts.filter((at) => this.clock - at < HERMES_RATE_WINDOW_MS);
-    if (this.prompts.length === HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE) {
-      return { actions: [], refusal: "prompt_rate" };
-    }
-    this.prompts.push(this.clock);
-    this.pending = { id, connectionId, recordId, textSha256, admittedAt: this.clock };
-    return { actions: [{ kind: "audit", entryId: id, event: "created" }, { kind: "prompt_owner", entryId: id }] };
-  }
-
-  terminate(event: PendingTermination, id: string): ModelResult {
-    const global = event === "stop" || event === "latch";
-    if (global) {
-      if (this.gates.has(event)) return { actions: [] };
-      this.gates.add(event);
-    }
-    const entry = this.pending;
-    if (entry === undefined || (!global && entry.id !== id)) return { actions: [] };
-    const [state, reason, response] = PENDING_TERMINALS[event];
-    this.pending = undefined;
-    const actions: HermesApprovalAction[] = [{
-      kind: "audit", entryId: entry.id, event: "terminal", state, reason, lateEvents: [],
-    }];
-    if (response !== undefined) {
-      actions.push({
-        kind: "respond", entryId: entry.id, response,
-        message: response === "denial" ? HERMES_MEMORY_DENIAL : HERMES_MEMORY_UNAVAILABLE,
-      });
-    }
-    return { actions };
-  }
-
-  snapshot(): ReturnType<HermesApprovalLedger["snapshot"]> {
-    const entry = this.pending;
-    return {
-      stopped: this.gates.has("stop"),
-      latched: this.gates.has("latch"),
-      largestNowMs: this.clock,
-      promptWindowCount: this.prompts.length,
-      entry: entry === undefined ? undefined : {
-        id: entry.id, connectionId: entry.connectionId, recordId: entry.recordId, textSha256: entry.textSha256,
-        state: "PENDING", started: false, settled: false, responded: false,
-        deadlineAt: entry.admittedAt + HERMES_APPROVAL_DEADLINE_MS,
-        seen: { deny: false, deadline: false, cancel: false, gone: false, stop: false, latch: false },
-        responseClass: undefined, terminalReason: undefined, lateEvents: [],
-      },
-    };
+    return { deadline: false, cancel: false, gone: false, stop: false, latch: false };
   }
 }

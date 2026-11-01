@@ -1,3 +1,4 @@
+import { RECALL_MAX_PASSAGES, RECALL_PASSAGE_MAX_UNITS, RECALL_CREATED_AT_UNITS, RECALL_DATE_UNITS } from "./recall.js";
 import { Buffer } from "node:buffer";
 
 import { toolResult } from "../router.js";
@@ -9,7 +10,7 @@ import {
   MAX_REQUEST_ID_BYTES,
   MAX_RESULT_FRAME_BYTES,
 } from "./constants.js";
-import { HERMES_MEMORY_WIRE_SCHEMAS } from "./envelopes.js";
+import { HERMES_MEMORY_TOOL_NAMES, HERMES_MEMORY_WIRE_SCHEMAS, type HermesMemoryToolName } from "./envelopes.js";
 import { parseStrictJsonObject } from "./strict-json.js";
 
 export const HERMES_HELLO_PAYLOAD = Object.freeze({
@@ -17,10 +18,8 @@ export const HERMES_HELLO_PAYLOAD = Object.freeze({
   server_name: "sanctuary-hermes-memory-bridge",
 });
 
-export const HERMES_TOOLS_LIST_PAYLOAD = Object.freeze({
-  tools: Object.freeze([
-    Object.freeze({
-      name: "memory_insert",
+const TOOL_CATALOG = Object.freeze({
+    memory_insert: Object.freeze({
       input_schema: Object.freeze({
         type: "object",
         required: Object.freeze(["text", "taint"]),
@@ -35,16 +34,14 @@ export const HERMES_TOOLS_LIST_PAYLOAD = Object.freeze({
         }),
       }),
     }),
-    Object.freeze({
-      name: "memory_get",
+    memory_get: Object.freeze({
       input_schema: Object.freeze({
         type: "object",
         required: Object.freeze(["passage_id"]),
         properties: Object.freeze({ passage_id: Object.freeze({ type: "string" }) }),
       }),
     }),
-    Object.freeze({
-      name: "memory_search",
+    memory_search: Object.freeze({
       input_schema: Object.freeze({
         type: "object",
         properties: Object.freeze({
@@ -55,8 +52,34 @@ export const HERMES_TOOLS_LIST_PAYLOAD = Object.freeze({
         }),
       }),
     }),
-  ]),
+    memory_recall: Object.freeze({ description: "Return a bounded context of matching saved passages.",
+      input_schema: { type: "object", required: ["query"], properties: { query: { type: "string" } }, additionalProperties: false } }),
+    sign_statement: Object.freeze({ description: "Not available yet; nothing is signed.",
+      input_schema: { type: "object", required: ["statement"], properties: { statement: { type: "string" } }, additionalProperties: false } }),
+    export_memory: Object.freeze({ description: "Not available yet; nothing is exported.",
+      input_schema: { type: "object", required: ["scope"], properties: { scope: { type: "string", enum: ["all"] } }, additionalProperties: false } }),
+    protection_rules: Object.freeze({ description: "Requests are refused.",
+      input_schema: { type: "object", properties: {}, additionalProperties: false } }),
+} satisfies Record<HermesMemoryToolName, object>);
+export const HERMES_TOOLS_LIST_PAYLOAD = Object.freeze({
+  tools: Object.freeze(HERMES_MEMORY_TOOL_NAMES.map(name => Object.freeze({ name, ...TOOL_CATALOG[name] }))),
 });
+
+// Must match the ordinary refusal outcomes in hermes-memory-relay/SEAM.md.
+export const HERMES_TOOL_OUTCOMES = Object.freeze({
+  denied: Object.freeze(toolResult({ outcome: "denied", message: "Request denied." })),
+  unavailable_not_built: Object.freeze(toolResult({ outcome: "unavailable", message: "This is not available yet; nothing was done." })),
+  unavailable: Object.freeze(toolResult({ outcome: "unavailable", message: "Sanctuary could not take this request right now; nothing was done." })),
+  unconfirmed: Object.freeze(toolResult({ outcome: "unconfirmed", message: "I could not confirm whether this completed." })),
+});
+// Hermes counts a tool result containing these words as a failure, and three refusals must never look like three failures.
+for (const result of Object.values(HERMES_TOOL_OUTCOMES)) {
+  if (/error|failed/i.test(JSON.stringify(result))) throw new TypeError("Hermes outcome wording is invalid");
+}
+export type HermesToolOutcome = keyof typeof HERMES_TOOL_OUTCOMES;
+export function buildToolOutcomeBytes(requestId: string, outcome: HermesToolOutcome): Uint8Array {
+  return buildPublicResultFrameBytes(requestId, HERMES_TOOL_OUTCOMES[outcome]);
+}
 
 export const MAX_PUBLIC_RESULT_REQUEST_ID = "r".repeat(MAX_REQUEST_ID_BYTES);
 // Must match the public `result { request_id, payload }` frame in hermes-memory-relay/SEAM.md.
@@ -90,6 +113,7 @@ export function buildMemoryInsertSuccessBytes(
   ids: { readonly passageId: string; readonly documentId: string },
 ): HermesPublicResultBuild {
   return checkedResult(requestId, toolResult({
+    outcome: "saved",
     inserted: true,
     passage: {
       passage_id: ids.passageId,
@@ -99,7 +123,7 @@ export function buildMemoryInsertSuccessBytes(
 }
 
 export function buildMemoryGetResultBytes(requestId: string, passage: MemoryPassage | null): HermesPublicResultBuild {
-  if (passage === null) return checkedResult(requestId, toolResult({ found: false }));
+  if (passage === null) return { ok: true, bytes: buildToolOutcomeBytes(requestId, "denied") };
   if (!isExactMemoryPassage(passage)) return { ok: false, reason: "unexpected_passage_shape" };
   // Must match memoryGetSuccessToolResult in ../sdw/memory-tool-projection.ts.
   return checkedResult(requestId, memoryGetSuccessToolResult(passage));
@@ -122,7 +146,7 @@ export function buildMemorySearchResultBytes(
   return checkedResult(requestId, toolResult({ results: projected }));
 }
 
-function checkedResult(requestId: string, payload: Record<string, unknown>): HermesPublicResultBuild {
+export function checkedResult(requestId: string, payload: Record<string, unknown>): HermesPublicResultBuild {
   const bytes = buildPublicResultFrameBytes(requestId, payload);
   if (bytes.byteLength > MAX_RESULT_FRAME_BYTES) return { ok: false, reason: "result_over_cap" };
   if (!isValidPublicFrame(bytes, "result", requestId)) return { ok: false, reason: "invalid_result_frame" };
@@ -195,3 +219,45 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   const keys = Object.keys(value);
   return keys.length === expected.length && expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
+
+/** Encode only the bounded canonical projection, never full passage objects. */
+export function buildMemoryRecallResultBytes(requestId: string, result: import("./recall.js").HermesRecallResult): HermesPublicResultBuild {
+  return checkedResult(requestId, toolResult(result));
+}
+
+// SDW identifier grammar permits at most 256 ASCII units, with no JSON escapes.
+export const HERMES_RESULT_IDENTIFIER_MAX_UNITS = 256;
+// A control unit is six inner JSON characters; the outer frame escapes its backslash once more.
+// Three UTF-8 bytes per unescaped BMP unit is smaller, so seven bounds both cases.
+export const HERMES_RESULT_TEXT_BYTES_PER_UNIT = 7;
+const maximumIdentifier = "p".repeat(HERMES_RESULT_IDENTIFIER_MAX_UNITS);
+const canonicalTimestamp = "2000-01-01T00:00:00.000Z";
+if (canonicalTimestamp.length !== RECALL_CREATED_AT_UNITS) throw new TypeError("Recall timestamp derivation mismatch");
+const recallSkeleton = { outcome: "recalled", context: Array.from({ length: RECALL_MAX_PASSAGES },
+  () => `- (saved ${canonicalTimestamp.slice(0, RECALL_DATE_UNITS)}) \n`).join(""),
+  passages: Array.from({ length: RECALL_MAX_PASSAGES }, () => ({ passage_id: maximumIdentifier, created_at: canonicalTimestamp })),
+  truncated: false };
+const fixedMaximum = Math.max(...Object.values(HERMES_TOOL_OUTCOMES).map(result =>
+  buildPublicResultFrameBytes(MAX_PUBLIC_RESULT_REQUEST_ID, result).byteLength));
+const insertMaximum = buildMemoryInsertSuccessBytes(MAX_PUBLIC_RESULT_REQUEST_ID,
+  { passageId: maximumIdentifier, documentId: maximumIdentifier });
+if (!insertMaximum.ok) throw new TypeError("Insert result derivation mismatch");
+/**
+ * Maximum serialized result bytes, including toolResult's two-space indentation and outer JSON encoding.
+ * Get is capped at insert and read. Search emits the unbounded stored created_at unchanged,
+ * so its bound is enforced by checkedResult's fixed refusal, not a metadata size derivation.
+ */
+export const HERMES_RESULT_MAX_BYTES_BY_KIND = Object.freeze({
+  hello: buildPublicResultFrameBytes(MAX_PUBLIC_RESULT_REQUEST_ID, HERMES_HELLO_PAYLOAD).byteLength,
+  tools_list: buildPublicResultFrameBytes(MAX_PUBLIC_RESULT_REQUEST_ID, HERMES_TOOLS_LIST_PAYLOAD).byteLength,
+  memory_insert: Math.max(fixedMaximum, insertMaximum.bytes.byteLength),
+  memory_get: MAX_RESULT_FRAME_BYTES,
+  memory_search: MAX_RESULT_FRAME_BYTES,
+  memory_recall: Math.max(fixedMaximum, buildPublicResultFrameBytes(MAX_PUBLIC_RESULT_REQUEST_ID, toolResult(recallSkeleton)).byteLength +
+    RECALL_MAX_PASSAGES * RECALL_PASSAGE_MAX_UNITS * HERMES_RESULT_TEXT_BYTES_PER_UNIT),
+  sign_statement: fixedMaximum,
+  export_memory: fixedMaximum,
+  protection_rules: fixedMaximum,
+} satisfies Record<HermesMemoryToolName | "hello" | "tools_list", number>);
+export const HERMES_MAX_VALID_RESULT_FRAME_BYTES = Math.max(...Object.values(HERMES_RESULT_MAX_BYTES_BY_KIND));
+if (HERMES_MAX_VALID_RESULT_FRAME_BYTES > MAX_RESULT_FRAME_BYTES) throw new RangeError("Hermes result exceeds relay frame cap");

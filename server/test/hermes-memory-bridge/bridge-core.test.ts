@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   HERMES_MEMORY_DENIAL,
+  HermesAuditBackpressureError,
+  HERMES_MAX_CALL_RECORDS,
+  HERMES_MAX_CALLS_PER_MINUTE,
   HERMES_MEMORY_UNAVAILABLE,
   MAX_RESULT_FRAME_BYTES,
   PUBLIC_RESULT_ENVELOPE_MAX_BYTES,
@@ -104,6 +107,7 @@ function makeHarness(options: {
   readonly stalledAudit?: boolean;
   readonly deferredAudit?: boolean;
   readonly rejectAudit?: boolean;
+  readonly auditBackpressure?: boolean;
   readonly writeProbeThrows?: boolean;
   readonly ownerPromptApproves?: boolean;
   readonly throwPort?: "insert" | "get" | "search" | "setTimer" | "clearTimer" | "nowMs";
@@ -111,6 +115,7 @@ function makeHarness(options: {
   readonly nowMsFailureCall?: number;
   readonly getExtraField?: boolean;
   readonly parkInsertLock?: boolean;
+  readonly parkAfterAllow?: boolean;
   readonly deferredSearch?: boolean;
 } = {}) {
   const timers = new ManualTimers();
@@ -123,6 +128,7 @@ function makeHarness(options: {
   const pendingGets: Deferred<MemoryPassage | null>[] = [];
   const pendingSearches: Deferred<readonly MemorySearchResult[]>[] = [];
   const insertLocks: Deferred<void>[] = [];
+  const insertSettlements: Deferred<void>[] = [];
   const abort = new AbortController();
   let now = 1_000;
   let nowCalls = 0;
@@ -132,6 +138,7 @@ function makeHarness(options: {
   const releasedRecordIds: string[] = [];
   const routedRecordIdsByRequest = new Map<string, string>();
   const adapter: HermesBridgeMemoryAdapter = {
+    recallPassages: async budget => budget.result(),
     insertPassage(input: MemoryPassageInput, taint: PersistableTaint): Promise<MemoryPassage> {
       if (options.throwPort === "insert") throw new Error("insert port stopped");
       return (async () => {
@@ -150,6 +157,9 @@ function makeHarness(options: {
           passageTextSha256: hermesBridgePassageTextDigest(input.text),
           getFrameUtf8Bytes: memoryGetSuccessFrameUtf8Bytes(inserted),
         });
+        if (options.parkAfterAllow) {
+          const parked = new Deferred<void>(); insertSettlements.push(parked); await parked.promise;
+        }
         store.set(id, inserted);
         return inserted;
       })();
@@ -187,6 +197,7 @@ function makeHarness(options: {
       writes.push(input);
     },
     appendAudit(record) {
+      if (options.auditBackpressure) throw new HermesAuditBackpressureError();
       audits.push(record);
       if (options.rejectAudit === true) return Promise.reject(new Error("audit failed"));
       if (options.deferredAudit === true) {
@@ -216,18 +227,17 @@ function makeHarness(options: {
       timers.clearTimer(handle);
     },
     adapter,
-    ownerSurface: {
-      promptOwner(entryId) {
-        ownerPrompts.push(entryId);
-        if (options.ownerPromptApproves === true) {
-          const textSha256 = core.snapshot().ledger.entry?.textSha256 ?? "";
-          core.ownerApprove(entryId, textSha256);
-        }
-      },
-    },
+    agentId: "fixture-agent",
     abort,
   };
   core = new HermesBridgeCore(ports);
+  const terminalEvents: string[] = [];
+  const ledger = (core as any).ledger;
+  const finish = ledger.finish.bind(ledger);
+  ledger.finish = (entry: unknown, state: string, reason: string, ...rest: unknown[]) => {
+    terminalEvents.push(`${state}/${reason}`);
+    return finish(entry, state, reason, ...rest);
+  };
   const lifecycle = (core as unknown as {
     readonly lifecycle: {
       apply(event: unknown): { readonly actions?: readonly unknown[] };
@@ -265,11 +275,13 @@ function makeHarness(options: {
     audits,
     pendingAudits,
     ownerPrompts,
+    terminalEvents,
     insertTaints,
     store,
     pendingGets,
     pendingSearches,
     insertLocks,
+    insertSettlements,
     abort,
     clearTimerAttempts: () => clearTimerAttempts,
     recordIdForRequest: (requestId: string) => routedRecordIdsByRequest.get(requestId),
@@ -278,7 +290,7 @@ function makeHarness(options: {
       for (const audit of pendingAudits.splice(0)) audit.resolve();
     },
     tick: async (count = 1) => {
-      for (let index = 0; index < count; index += 1) await Promise.resolve();
+      for (let index = 0; index < count; index += 1) await new Promise<void>(resolve => queueMicrotask(resolve));
     },
     advance(ms: number) {
       now += ms;
@@ -360,11 +372,7 @@ function toolResultBody(response: Record<string, unknown> | undefined): Record<s
   return JSON.parse(payload?.content?.[0]?.text ?? "{}") as Record<string, unknown>;
 }
 
-function terminalStates(audits: readonly HermesBridgeAuditRecord[]): string[] {
-  return audits
-    .filter((audit) => audit.kind === "terminal" && audit.state !== undefined)
-    .map((audit) => `${audit.state}/${audit.reason}`);
-}
+function terminalStates(h: ReturnType<typeof makeHarness>): string[] { return h.terminalEvents; }
 
 function findNearCapText(): string {
   let low = 1;
@@ -491,7 +499,7 @@ describe("HermesBridgeCore", () => {
       insert(h.core, "c1", "insert-release", "bridge text");
       await h.tick();
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerApprove(entry.id, entry.textSha256);
+
       await h.tick(2);
       const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
       h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
@@ -506,7 +514,9 @@ describe("HermesBridgeCore", () => {
     ["memory_insert admission latched", "latched-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core, "c1");
       insert(h.core, "c1", "latch-source-release", "bridge text");
-      await h.tick(2);
+      const probe = h.writes.find(frame => frame.type === "probe")!;
+      if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: probe.connectionId, nonce: probe.nonce });
+      await h.tick(12);
       accept(h.core, "c2");
       insert(h.core, "c2", "latched-release", "later text");
     }, { rejectAudit: true }],
@@ -517,7 +527,7 @@ describe("HermesBridgeCore", () => {
       await h.tick();
       insert(h.core, "c2", "busy-release", "later text");
       await h.tick();
-      h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
+      cancelInsert(h.core);
       await h.tick(4);
     }],
   ] as const).map(([name, requestId, run, options]) => [name, requestId, run, options ?? {}] as const))(
@@ -543,7 +553,7 @@ describe("HermesBridgeCore", () => {
     accept(h.core);
     memoryGet(h.core, "c1", "get-bad", { passage_id: "../not-allowed" });
 
-    expect(responseFor(h.writes, "get-bad")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "get-bad"))).toMatchObject({ outcome: "denied" });
     expect(h.core.snapshot().stopped).toBe(false);
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
@@ -572,16 +582,15 @@ describe("HermesBridgeCore", () => {
     expect(resultPayload(h.writes.at(-1)!).request_id).toBe("h9");
   });
 
-  it("commits an approved insert only after the probe reply and durable audits", async () => {
+  it("commits an admitted insert only after the probe reply and durable audits", async () => {
     const h = makeHarness();
     accept(h.core);
     insert(h.core);
     await h.tick();
-    expect(h.ownerPrompts).toEqual(["hermes-entry-1"]);
+    expect(h.ownerPrompts).toEqual([]);
     const entry = h.core.snapshot().ledger.entry;
-    expect(entry?.state).toBe("PENDING");
+    expect(entry?.state).toBe("INSERT_STARTED");
 
-    h.core.ownerApprove(entry!.id, entry!.textSha256);
     await h.tick(2);
     const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe");
     expect(probe).toBeDefined();
@@ -609,7 +618,7 @@ describe("HermesBridgeCore", () => {
     });
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
@@ -625,15 +634,15 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c1", "big", findNearCapText());
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
     await h.tick(10);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "big")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
-    expect(terminalStates(h.audits)).toContain("REFUSED/commit_binding_mismatch");
+    expect(toolResultBody(responseFor(h.writes, "big"))).toMatchObject({ outcome: "unavailable" });
+    expect(terminalStates(h)).toContain("REFUSED/commit_binding_mismatch");
   });
 
   it("records public shutdown on a waiting insert with the peer shutdown reason", async () => {
@@ -645,8 +654,8 @@ describe("HermesBridgeCore", () => {
     await h.tick(6);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "shutdown-before-start")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
-    expect(terminalStates(h.audits)).toContain("CANCELED/peer_shutdown");
+    expect(toolResultBody(responseFor(h.writes, "shutdown-before-start"))).toMatchObject({ outcome: "unavailable" });
+    expect(terminalStates(h)).toContain("CANCELED/cancel");
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
@@ -659,7 +668,7 @@ describe("HermesBridgeCore", () => {
     memoryGet(h.core, "c2", "read-cancel", { passage_id: "missing" });
     h.core.relayFrame(relayFrame("c2", { type: "cancel", mcp_request_id: "read-cancel" }));
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
@@ -670,13 +679,13 @@ describe("HermesBridgeCore", () => {
     expect(responseFor(h.writes, "insert-live")).toMatchObject({ type: "result" });
   });
 
-  it("serves committed reads while a later approved insert waits on durability", async () => {
+  it("serves committed reads while a later admitted insert waits on durability", async () => {
     const h = makeHarness({ deferredAudit: true });
     accept(h.core, "c1");
     insert(h.core, "c1", "first-visible", "first bridge passage");
     await h.tick();
     const firstEntry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(firstEntry.id, firstEntry.textSha256);
+
     await h.tick(2);
     const firstProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: firstProbe.nonce });
@@ -690,7 +699,7 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c2", "second-visible", "second bridge passage");
     await h.tick();
     const secondEntry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(secondEntry.id, secondEntry.textSha256);
+
     await h.tick(2);
     const secondProbe = h.writes
       .filter((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")
@@ -734,7 +743,7 @@ describe("HermesBridgeCore", () => {
     h.pendingGets[0]!.resolve(null);
     await h.tick(4);
 
-    expect(responseFor(h.writes, "get-extra")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "get-extra"))).toMatchObject({ outcome: "denied" });
   });
 
   it("returns only public search result keys", async () => {
@@ -762,7 +771,7 @@ describe("HermesBridgeCore", () => {
     ]);
   });
 
-  it("keeps the live insert slot when a second insert is busy-denied and then owner-denied", async () => {
+  it("keeps the live insert slot when a second insert is busy-denied and then canceled", async () => {
     const h = makeHarness();
     accept(h.core, "c1");
     accept(h.core, "c2");
@@ -772,14 +781,14 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c2", "second", "second text");
     await h.tick();
 
-    expect(responseFor(h.writes, "second")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "second"))).toMatchObject({ outcome: "unavailable" });
     expect(h.core.snapshot().slot?.entryId).toBe(entry.id);
-    h.core.ownerDeny(entry.id);
+    cancelInsert(h.core);
     await h.tick(4);
     h.core.relayFrame({ kind: "relay_shutdown" });
     await h.tick(4);
 
-    expect(responseFor(h.writes, "first")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "first"))).toMatchObject({ outcome: "unavailable" });
     expect(h.core.snapshot().slot).toBeUndefined();
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
     expect(h.timers.live.size).toBe(0);
@@ -798,21 +807,21 @@ describe("HermesBridgeCore", () => {
     h.core.relayFrame({ kind: "relay_shutdown" });
     await h.tick(4);
 
-    expect(responseFor(h.writes, "first-timeout")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
-    expect(responseFor(h.writes, "second-timeout")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "first-timeout"))).toMatchObject({ outcome: "unavailable" });
+    expect(toolResultBody(responseFor(h.writes, "second-timeout"))).toMatchObject({ outcome: "unavailable" });
     expect(h.core.snapshot().slot).toBeUndefined();
     expect(h.timers.live.size).toBe(0);
     expect(h.core.drained).toBe(true);
   });
 
-  it("keeps an approved insert live when a second insert is refused during the probe wait", async () => {
+  it("keeps an admitted insert live when a second insert is refused during the probe wait", async () => {
     const h = makeHarness();
     accept(h.core, "c1");
     accept(h.core, "c2");
     insert(h.core, "c1", "first-probe", "first text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     insert(h.core, "c2", "second-probe", "second text");
@@ -822,7 +831,7 @@ describe("HermesBridgeCore", () => {
     h.core.relayFrame({ kind: "relay_shutdown" });
     await h.tick(4);
 
-    expect(responseFor(h.writes, "second-probe")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "second-probe"))).toMatchObject({ outcome: "unavailable" });
     expect(responseFor(h.writes, "first-probe")).toMatchObject({ type: "result" });
     expect(h.store.get("p-first-probe")?.text).toBe("first text");
     expect(h.core.snapshot().slot).toBeUndefined();
@@ -830,57 +839,54 @@ describe("HermesBridgeCore", () => {
     expect(h.core.drained).toBe(true);
   });
 
-  it("refuses an approved insert parked behind peer shutdown before probing", async () => {
+  it("refuses an admitted insert parked behind peer shutdown before probing", async () => {
     const h = makeHarness({ parkInsertLock: true });
     accept(h.core);
     insert(h.core, "c1", "peer-shutdown", "bridge text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(4);
     h.core.relayFrame(relayFrame("c1", { type: "shutdown" }));
     h.insertLocks[0]!.resolve();
     await h.tick(12);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "peer-shutdown")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "peer-shutdown"))).toMatchObject({ outcome: "unavailable" });
     expect(h.writes.filter((frame) => frame.type === "probe")).toHaveLength(0);
-    expect(terminalStates(h.audits)).toContain("REFUSED/probe_refused");
+    expect(terminalStates(h)).toContain("CANCELED/cancel");
   });
 
-  it("denies an insert when approval deadline fires before the clock reaches its boundary", async () => {
+  it("denies an insert when insert deadline fires before the clock reaches its boundary", async () => {
     const h = makeHarness({ deferredAudit: true, parkInsertLock: true });
     accept(h.core);
     insert(h.core, "c1", "deadline-before-clock", "bridge text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(4);
 
     expect(h.core.snapshot().slot?.insertInFlight).toBe(true);
     h.timers.fireFirst();
     h.insertLocks[0]!.resolve();
     await h.tick(4);
-    const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
-    h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
-    h.resolveAudits();
-    await h.tick(4);
-    h.resolveAudits();
+    expect(h.writes.some(frame => frame.type === "probe")).toBe(false);
+    expect(h.audits).toEqual([]);
     await h.tick(12);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "deadline-before-clock")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
-    expect(terminalStates(h.audits)).toContain("TIMED_OUT/deadline");
+    expect(toolResultBody(responseFor(h.writes, "deadline-before-clock"))).toMatchObject({ outcome: "unavailable" });
+    expect(terminalStates(h)).toContain("TIMED_OUT/deadline");
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
-  it("denies an insert when the approval deadline is seen during parked audit durability", async () => {
+  it("denies an insert when the insert deadline is seen during parked audit durability", async () => {
     const h = makeHarness({ deferredAudit: true });
     accept(h.core);
     insert(h.core, "c1", "deadline-during-durability", "bridge text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
@@ -896,8 +902,8 @@ describe("HermesBridgeCore", () => {
     expect(h.pendingAudits.length).toBe(h.audits.length);
     expect(h.pendingAudits.length).toBeGreaterThan(0);
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "deadline-during-durability")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
-    expect(terminalStates(h.audits)).toContain("TIMED_OUT/deadline");
+    expect(toolResultBody(responseFor(h.writes, "deadline-during-durability"))).toMatchObject({ outcome: "unavailable" });
+    expect(terminalStates(h)).toContain("TIMED_OUT/deadline");
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
@@ -907,7 +913,7 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c1", "shutdown-during-audit", "bridge text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(4);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
@@ -921,9 +927,9 @@ describe("HermesBridgeCore", () => {
     await h.tick(4);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "shutdown-during-audit")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "shutdown-during-audit"))).toMatchObject({ outcome: "unavailable" });
     expect(h.writes.filter((frame) => frame.type === "response" && resultPayload(frame).request_id === "shutdown-during-audit")).toHaveLength(1);
-    expect(terminalStates(h.audits)).toContain("CANCELED/cancel");
+    expect(terminalStates(h)).toContain("CANCELED/cancel");
   });
 
   it("denies an insert when peer shutdown arrives before the probe reply", async () => {
@@ -932,7 +938,7 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c1", "shutdown-before-reply", "bridge text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(4);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame(relayFrame("c1", { type: "shutdown" }));
@@ -940,7 +946,7 @@ describe("HermesBridgeCore", () => {
     await h.tick(12);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "shutdown-before-reply")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "shutdown-before-reply"))).toMatchObject({ outcome: "unavailable" });
   });
 
   it("denies an insert when peer shutdown arrives after the probe reply while audit is stalled", async () => {
@@ -949,7 +955,7 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c1", "shutdown-after-reply", "bridge text");
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(4);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
@@ -961,10 +967,10 @@ describe("HermesBridgeCore", () => {
     await h.tick(12);
 
     expect(h.store.size).toBe(0);
-    expect(responseFor(h.writes, "shutdown-after-reply")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(toolResultBody(responseFor(h.writes, "shutdown-after-reply"))).toMatchObject({ outcome: "unavailable" });
   });
 
-  it("fires the approval deadline and clears the one-slot resources", async () => {
+  it("fires the insert deadline and clears the one-slot resources", async () => {
     const h = makeHarness();
     accept(h.core);
     insert(h.core);
@@ -973,7 +979,7 @@ describe("HermesBridgeCore", () => {
 
     const response = h.writes.find((frame) => frame.type === "response");
     expect(response).toBeDefined();
-    expect(resultPayload(response!).message).toBe(HERMES_MEMORY_DENIAL);
+    expect(toolResultBody(resultPayload(response!)).outcome).toBe("unavailable");
     expect(h.core.snapshot().slot).toBeUndefined();
     expect(h.timers.live.size).toBe(0);
   });
@@ -987,17 +993,17 @@ describe("HermesBridgeCore", () => {
     accept(h.core, "c2");
     insert(h.core, "c2", "i2", "later");
 
-    const messages = h.writes.filter((frame) => frame.type === "response").map((frame) => resultPayload(frame).message);
-    expect(messages).toContain(HERMES_MEMORY_UNAVAILABLE);
+    const outcomes = h.writes.filter((frame) => frame.type === "response").map((frame) => toolResultBody(resultPayload(frame)).outcome);
+    expect(outcomes).toContain("unavailable");
   });
 
-  it("delivers promptOwner outside the admitting turn", async () => {
+  it("starts an own-scope insert in the admitting turn without an owner callback", async () => {
     const h = makeHarness({ ownerPromptApproves: true });
     accept(h.core);
     insert(h.core);
-    expect(h.core.snapshot().ledger.entry?.state).toBe("PENDING");
+    expect(h.core.snapshot().ledger.entry?.state).toBe("INSERT_STARTED");
     await h.tick(2);
-    expect(h.core.snapshot().ledger.entry?.state).toBe("APPROVED");
+    expect(h.core.snapshot().ledger.entry?.state).toBe("INSERT_STARTED");
   });
 
   it("treats a never-issued probe reply as a fatal bridge stop", async () => {
@@ -1015,7 +1021,7 @@ describe("HermesBridgeCore", () => {
     accept(h.core);
     insert(h.core);
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
 
@@ -1034,7 +1040,7 @@ describe("HermesBridgeCore", () => {
     accept(h.core);
     insert(h.core);
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(2);
     const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
@@ -1045,7 +1051,7 @@ describe("HermesBridgeCore", () => {
 
     expect(h.core.drained).toBe(true);
     expect(h.store.size).toBe(0);
-    expect(terminalStates(h.audits)).toContain("DISCONNECTED/connection_gone");
+    expect(terminalStates(h)).toContain("DISCONNECTED/connection_gone");
   });
 
   it("stops and drains when the probe write fails", async () => {
@@ -1053,13 +1059,13 @@ describe("HermesBridgeCore", () => {
     accept(h.core);
     insert(h.core);
     const entry = h.core.snapshot().ledger.entry!;
-    h.core.ownerApprove(entry.id, entry.textSha256);
+
     await h.tick(6);
 
     expect(h.abort.signal.aborted).toBe(true);
     expect(h.core.drained).toBe(true);
     expect(h.store.size).toBe(0);
-    expect(terminalStates(h.audits)).toContain("DISCONNECTED/connection_gone");
+    expect(terminalStates(h)).toContain("DISCONNECTED/connection_gone");
   });
 
   it.each([
@@ -1068,7 +1074,7 @@ describe("HermesBridgeCore", () => {
       insert(h.core, "c1", "throw-insert", "bridge text");
       await h.tick();
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerApprove(entry.id, entry.textSha256);
+
     }],
     ["get", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
@@ -1091,8 +1097,8 @@ describe("HermesBridgeCore", () => {
     await run(h);
     await h.tick(12);
 
-    expect(h.core.snapshot().stopped).toBe(true);
-    expect(h.core.drained).toBe(true);
+    expect(h.core.snapshot().stopped).toBe(port !== "get" && port !== "search");
+    expect(h.core.drained).toBe(port !== "get" && port !== "search");
     expect(h.core.snapshot().slot).toBeUndefined();
     expect(h.core.snapshot().waiter.live).toBeUndefined();
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
@@ -1104,8 +1110,8 @@ describe("HermesBridgeCore", () => {
     insert(h.core, "c1", "timer-audit", "bridge text");
     await h.tick(8);
 
-    expect(h.audits.map((audit) => audit.kind)).toEqual(["created", "terminal"]);
-    expect(terminalStates(h.audits)).toContain("REFUSED/stopped");
+    expect(h.audits.map((audit) => audit.kind)).toEqual([]);
+    expect(terminalStates(h)).toContain("REFUSED/stopped");
     expect(h.ownerPrompts).toEqual([]);
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
@@ -1128,10 +1134,10 @@ describe("HermesBridgeCore", () => {
     await h.tick();
     const entry = h.core.snapshot().ledger.entry!;
     const lateFire = [...h.timers.live.values()][0]!.fire;
-    h.core.ownerDeny(entry.id);
+    cancelInsert(h.core);
     await h.tick(8);
 
-    expect(h.clearTimerAttempts()).toBe(3);
+    expect(h.clearTimerAttempts()).toBe(4); // Three attempts for the refused clear, plus the live probe timer.
     expect(h.timers.live.size).toBe(0);
     expect(h.core.snapshot().stopped).toBe(true);
     expect(h.core.snapshot().slot).toBeUndefined();
@@ -1146,7 +1152,7 @@ describe("HermesBridgeCore", () => {
     accept(h.core);
     insert(h.core, "c1", "clear-retained", "bridge text");
     await h.tick();
-    h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
+    cancelInsert(h.core);
     await h.tick(8);
 
     expect(h.clearTimerAttempts()).toBeGreaterThan(1);
@@ -1161,7 +1167,7 @@ describe("HermesBridgeCore", () => {
     const schedules = 600;
     for (let seed = 1; seed <= schedules; seed += 1) {
       const random = rng(seed * 2_654_435_761);
-      const h = makeHarness();
+      const h = makeHarness({ rejectAudit: seed % 9 === 8 });
       const requestId = `i${seed}`;
       const violations: string[] = [];
       let forbiddenForEntry = false;
@@ -1183,9 +1189,10 @@ describe("HermesBridgeCore", () => {
       const entry = h.core.snapshot().ledger.entry;
       if (entry === undefined) throw new Error(`seed ${seed} did not create an entry`);
 
-      switch (seed % 8) {
+      switch (seed % 9) {
+        case 8: // An admission append rejection keeps the refusal branch live in this schedule family.
         case 0:
-          h.core.ownerApprove(entry.id, entry.textSha256);
+
           await randomAwait();
           {
             const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe");
@@ -1194,7 +1201,7 @@ describe("HermesBridgeCore", () => {
           break;
         case 1:
           forbiddenForEntry = true;
-          h.core.ownerDeny(entry.id);
+          cancelInsert(h.core);
           break;
         case 2:
           forbiddenForEntry = true;
@@ -1215,7 +1222,7 @@ describe("HermesBridgeCore", () => {
         case 6:
           insert(h.core, "c2", `second-${seed}`, "second text");
           await randomAwait();
-          h.core.ownerApprove(entry.id, entry.textSha256);
+
           await randomAwait();
           {
             const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe");
@@ -1225,7 +1232,7 @@ describe("HermesBridgeCore", () => {
         case 7:
           memoryGet(h.core, "c2", `read-${seed}`, { passage_id: "absent" });
           if (random() < 0.5) h.core.relayFrame(relayFrame("c2", { type: "cancel", mcp_request_id: `read-${seed}` }));
-          h.core.ownerApprove(entry.id, entry.textSha256);
+
           await randomAwait();
           {
             const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe");
@@ -1237,9 +1244,7 @@ describe("HermesBridgeCore", () => {
 
       await h.tick(12);
       for (const pending of h.pendingGets) pending.resolve(null);
-      for (const audit of h.audits) {
-        if (audit.kind === "terminal" && audit.state !== undefined) terminalStates.add(audit.state);
-      }
+      for (const state of h.terminalEvents) terminalStates.add(state.split("/")[0]!);
       const responses = h.writes.filter((frame) => frame.type === "response");
       const seenResponseIds = new Set<string>();
       for (const response of responses) {
@@ -1247,7 +1252,7 @@ describe("HermesBridgeCore", () => {
         expect(seenResponseIds.has(payload.request_id as string), `seed ${seed} duplicate response ${String(payload.request_id)}`).toBe(false);
         seenResponseIds.add(payload.request_id as string);
       }
-      if ([1, 2, 3, 4, 5].includes(seed % 8)) expect(h.store.size, `seed ${seed} store`).toBe(0);
+      if ([1, 2, 3, 4, 5, 8].includes(seed % 9)) expect(h.store.size, `seed ${seed} store`).toBe(0);
       expect(violations, `seed ${seed} allow oracle`).toEqual([]);
       if (!h.core.drained) h.core.relayFrame({ kind: "relay_shutdown" });
       await h.tick(12);
@@ -1256,6 +1261,121 @@ describe("HermesBridgeCore", () => {
       expect(h.timers.live.size, `seed ${seed} timers`).toBe(0);
       expect(h.core.drained, `seed ${seed} drained`).toBe(true);
     }
-    expect(terminalStates).toEqual(new Set(["COMMITTED", "DENIED", "TIMED_OUT", "DISCONNECTED", "CANCELED", "REFUSED"]));
+    expect(terminalStates).toEqual(new Set(["COMMITTED", "TIMED_OUT", "DISCONNECTED", "CANCELED", "REFUSED"]));
   });
+});
+
+function cancelInsert(core: HermesBridgeCore): void {
+  const entry = core.snapshot().ledger.entry;
+  if (entry === undefined) return;
+  const requestId = core.snapshot().lifecycle.records.find(record => record.id === entry.recordId)!.requestId;
+  core.relayFrame(relayFrame(entry.connectionId, { type: "cancel", mcp_request_id: requestId }));
+}
+
+// Catalogued refusals preserve an ordinary result across parser, reader, admission and audit boundaries.
+describe("catalogued refusal mapping", () => {
+  it.each(["rate window", "malformed recall", "not owned or quarantined", "read throw", "get over cap", "record capacity", "recall audit rejection", "insert audit backpressure"] as const)(
+    "returns the fixed outcome for %s", async refusal => {
+      const h = makeHarness({ throwPort: refusal === "read throw" ? "get" : undefined,
+        rejectAudit: refusal === "recall audit rejection", auditBackpressure: refusal === "insert audit backpressure" });
+      accept(h.core);
+      let expected = "denied";
+      const call = (name: string, args: unknown, id = "refused", connectionId = "c1") => h.core.relayFrame(relayFrame(connectionId,
+        { type: "tools_call", request_id: id, name, arguments: args }));
+      try {
+        switch (refusal) {
+          case "rate window":
+            for (let n = 0; n < HERMES_MAX_CALLS_PER_MINUTE; n++) call("protection_rules", {}, `rate-${n}`);
+            call("protection_rules", {}); break;
+          case "malformed recall": call("memory_recall", { query: 7 }); break;
+          case "not owned or quarantined":
+            call("memory_get", { passage_id: "absent" }); h.pendingGets[0]!.resolve(null); break;
+          case "read throw": call("memory_get", { passage_id: "absent" }); break;
+          case "get over cap":
+            call("memory_get", { passage_id: "huge" });
+            h.pendingGets[0]!.resolve(passage("huge", "x".repeat(MAX_RESULT_FRAME_BYTES))); break;
+          case "record capacity":
+            for (let n = 1; n <= HERMES_MAX_CALL_RECORDS; n++) {
+              if (n !== 1) accept(h.core, `c${n}`);
+              call("memory_get", { passage_id: "absent" }, `pending-${n}`, `c${n}`);
+              h.core.relayFrame({ kind: "closed", connectionId: `c${n}` });
+            }
+            accept(h.core, `c${HERMES_MAX_CALL_RECORDS + 1}`);
+            call("memory_get", { passage_id: "absent" }, "refused", `c${HERMES_MAX_CALL_RECORDS + 1}`);
+            expected = "unavailable"; break;
+          case "recall audit rejection":
+            call("memory_recall", { query: "the" }); expected = "unavailable"; break;
+          case "insert audit backpressure": {
+            call("memory_insert", { text: "own memory", taint: "user_content" });
+            const probe = h.writes.find(frame => frame.type === "probe")!;
+            if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+            expected = "unavailable"; break;
+          }
+        }
+        await h.tick(16);
+        const response = responseFor(h.writes, "refused");
+        expect(response?.type).toBe("result");
+        expect(JSON.stringify(response)).not.toMatch(/error|failed/i);
+        expect(toolResultBody(response)).toMatchObject({ outcome: expected });
+        if (refusal === "recall audit rejection") {
+          expect(toolResultBody(response)).not.toHaveProperty("context");
+          expect(h.core.snapshot().ledger.latched).toBe(true);
+        }
+        if (refusal === "insert audit backpressure") {
+          expect(h.store.size).toBe(0); expect(h.audits).toEqual([]);
+          expect(h.core.snapshot().ledger.latched).toBe(false);
+        }
+      } finally {
+        h.core.relayEof();
+        for (const pending of h.pendingGets) pending.resolve(null);
+        await h.tick(16);
+      }
+    });
+});
+
+it("keeps a released read unavailable while another record owns an allowed insert", async () => {
+  const h = makeHarness({ parkAfterAllow: true });
+  try {
+    accept(h.core);
+    insert(h.core, "c1", "inserting", "memory text");
+    const probe = h.writes.find(frame => frame.type === "probe")!;
+    if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+    await h.tick(16);
+    expect(h.insertSettlements).toHaveLength(1);
+    accept(h.core, "c2");
+    h.core.relayFrame(relayFrame("c2", { type: "tools_call", request_id: "reading", name: "memory_get", arguments: { passage_id: "absent" } }));
+    const record = h.core.snapshot().lifecycle.records.find(record => record.requestId === "reading")!;
+    (h.core as unknown as { releaseRecord(id: string): void }).releaseRecord(record.id);
+    expect(toolResultBody(responseFor(h.writes, "reading"))).toEqual({
+      outcome: "unavailable", message: "Sanctuary could not take this request right now; nothing was done.",
+    });
+    expect(h.audits.filter(row => row.kind === "insert_unconfirmed")).toHaveLength(0);
+  } finally {
+    h.core.relayEof();
+    for (const pending of h.pendingGets) pending.resolve(null);
+    for (const pending of h.insertSettlements) pending.resolve();
+    await h.tick(16);
+  }
+});
+
+it.each([false, true])("maps lifecycle release without a response afterAllow=%s", async afterAllow => {
+  const h = makeHarness({ parkInsertLock: !afterAllow, parkAfterAllow: afterAllow });
+  accept(h.core);
+  insert(h.core, "c1", "release-without-response", "memory text");
+  if (afterAllow) {
+    const probe = h.writes.find(frame => frame.type === "probe")!;
+    if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+    await h.tick(16);
+    expect(h.insertSettlements).toHaveLength(1);
+  }
+  const recordId = h.core.snapshot().slot!.recordId;
+  // Release is an internal cleanup boundary; force that boundary while the adapter remains unsettled.
+  (h.core as unknown as { releaseRecord(id: string): void }).releaseRecord(recordId);
+  const response = responseFor(h.writes, "release-without-response");
+  expect(response?.type).toBe("result");
+  expect(toolResultBody(response)).toMatchObject({ outcome: afterAllow ? "unconfirmed" : "unavailable" });
+  expect(h.audits.filter(row => row.kind === "insert_unconfirmed")).toHaveLength(afterAllow ? 1 : 0);
+  h.core.relayEof();
+  for (const pending of [...h.insertLocks, ...h.insertSettlements]) pending.resolve();
+  await h.tick(16);
 });

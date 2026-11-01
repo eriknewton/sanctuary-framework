@@ -1,0 +1,77 @@
+// The real encrypted adapter bounds per-call scan work and retained context.
+import { expect, it } from "vitest";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { HermesRecallBudget, RECALL_WALL_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
+
+class CountingStorage extends MemoryStorage {
+  chunkReads = 0;
+  now = 0;
+  step = 0;
+  override async read(namespace: string, key: string) {
+    this.now += this.step;
+    if (key.startsWith("chunk.")) this.chunkReads++;
+    return super.read(namespace, key);
+  }
+}
+async function fixture() {
+  const storage = new CountingStorage();
+  const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: new Uint8Array(32).fill(17),
+    fortressId: "recall-fixture", ownerRef: "agent", maxChunkChars: 8 }); // Eight-unit chunks make the read bound measurable.
+  for (let n = 0; n < 15; n++) await adapter.insertPassage({ passage_id: `p${String(n).padStart(2, "0")}`,
+    text: n === 0 ? "board meeting ".repeat(100) : "board meeting" }, "user_content");
+  storage.chunkReads = 0;
+  return { storage, adapter };
+}
+it("stops at the scanned-unit cap and retains at most three candidates", async () => {
+  const { storage, adapter } = await fixture();
+  const limits = { candidates: 10, passageUnits: 64, scannedUnits: 64 };
+  const budget = new HermesRecallBudget("board meeting", () => 0, new AbortController().signal, limits);
+  const result = await adapter.recallPassages(budget);
+  expect(budget.maximumRetained).toBeLessThanOrEqual(3);
+  expect(budget.unitsScanned).toBeLessThanOrEqual(limits.scannedUnits);
+  expect(budget.candidatesScanned).toBeLessThanOrEqual(limits.candidates);
+  expect(budget.candidatesScanned).toBeLessThan(limits.candidates);
+  expect(storage.chunkReads).toBeLessThanOrEqual(Math.ceil(limits.scannedUnits / 8) + limits.candidates);
+  expect(result.truncated).toBe(true);
+  expect(result.passages.some(p => p.passage_id === "p00")).toBe(false);
+});
+it("stops at the candidate cap", async () => {
+  const { adapter } = await fixture();
+  const budget = new HermesRecallBudget("board meeting", () => 0, new AbortController().signal, { candidates: 4, passageUnits: 64 });
+  expect((await adapter.recallPassages(budget)).truncated).toBe(true);
+  expect(budget.candidatesScanned).toBe(4);
+});
+it("stops when storage reads advance the wall clock", async () => {
+  const { storage, adapter } = await fixture();
+  storage.step = RECALL_WALL_BUDGET_MS / 2; // Two reads consume the production wall budget.
+  const budget = new HermesRecallBudget("board meeting", () => storage.now, new AbortController().signal);
+  expect((await adapter.recallPassages(budget)).truncated).toBe(true);
+  expect(budget.candidatesScanned).toBeLessThan(15);
+  expect(storage.chunkReads).toBe(0);
+});
+it("returns bounded partial context on abort and skips scanning with no terms", async () => {
+  const { storage, adapter } = await fixture();
+  const abort = new AbortController(); abort.abort();
+  const budget = new HermesRecallBudget("board meeting", () => 0, abort.signal);
+  expect((await adapter.recallPassages(budget)).truncated).toBe(true);
+  expect(budget.candidatesScanned).toBe(0);
+  expect(await adapter.recallPassages(new HermesRecallBudget("when is the", () => 0, abort.signal)))
+    .toEqual({ outcome: "recalled", context: "", passages: [], truncated: false });
+  expect(storage.chunkReads).toBe(0);
+});
+
+it("skips an oversized passage during chunk reads without scoring its prefix", async () => {
+  const storage = new CountingStorage();
+  const perPassage = 64; // Tightened unit ceiling; two chunks prove the incremental skip path.
+  const adapter = new TestSdwMemoryBackendAdapter({ storage, masterKey: new Uint8Array(32).fill(17),
+    fortressId: "incremental-skip", ownerRef: "agent", maxChunkChars: perPassage });
+  await adapter.insertPassage({ passage_id: "oversized", text: "board ".repeat(perPassage) }, "user_content");
+  await adapter.insertPassage({ passage_id: "small", text: "board meeting" }, "user_content");
+  storage.chunkReads = 0;
+  const budget = new HermesRecallBudget("board meeting", () => 0, new AbortController().signal, { passageUnits: perPassage });
+  const result = await adapter.recallPassages(budget);
+  expect(result.passages.map(p => p.passage_id)).toEqual(["small"]);
+  expect(result.truncated).toBe(true);
+  expect(storage.chunkReads).toBe(3); // Two reads establish oversize, one reads the small passage.
+});

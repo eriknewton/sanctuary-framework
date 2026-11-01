@@ -1,3 +1,6 @@
+// must match OWN_SCOPE_MEMORY_SAVES in server/src/principal-policy/gate.ts.
+import { OWN_SCOPE_MEMORY_SAVES } from "../principal-policy/gate.js";
+import { HermesRecallBudget, type HermesRecallResult } from "./recall.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type {
@@ -16,10 +19,11 @@ import { isSdwIdentifier } from "../sdw/grammar.js";
 import { memoryInsertIngress } from "../sdw/memory-provenance-ingress.js";
 import type { PersistableTaint } from "../sdw/provenance.js";
 import {
-  HERMES_APPROVAL_DEADLINE_MS,
+  HERMES_INSERT_DEADLINE_MS,
+  HermesAuditBackpressureError,
+  MAX_RESULT_FRAME_BYTES,
   HERMES_MAX_CALLS_PER_MINUTE,
   HERMES_MEMORY_DENIAL,
-  HERMES_MEMORY_UNAVAILABLE,
   HERMES_RATE_WINDOW_MS,
   PROBE_REPLY_BOUND_MS,
 } from "./constants.js";
@@ -28,8 +32,6 @@ import {
   type HermesApprovalAction,
   type HermesApprovalLedgerResult,
   type HermesApprovalProbeVerdict,
-  type HermesApprovalRefusalReason,
-  type HermesApprovalTerminalState,
 } from "./approval-ledger.js";
 import {
   classifyHermesPublicFrameSummary,
@@ -58,6 +60,8 @@ import { HermesRateWindow } from "./rate-window.js";
 import {
   PUBLIC_RESULT_ENVELOPE_MAX_BYTES,
   buildHelloResultBytes,
+  buildToolOutcomeBytes,
+  buildMemoryRecallResultBytes,
   buildMemoryGetResultBytes,
   buildMemoryInsertSuccessBytes,
   buildMemorySearchResultBytes,
@@ -72,25 +76,22 @@ export type HermesTimerHandle = object;
 const BRIDGE_PINNED_MEMORY_TAINT: PersistableTaint = "user_content";
 const TIMER_CLEAR_STOP_RETRY_ATTEMPTS = 2; // Two stop-path retries cover the cleanup pass and one retained-handle confirmation after the first clear failure.
 
-export interface HermesApprovalPromptSummary {
-  readonly entryId: string;
-  readonly connectionId: string;
-  readonly recordId: string;
-  readonly textSha256: string;
-  readonly passageText: string;
-  readonly passageId?: string;
-  readonly tags: readonly string[];
-}
-
 export interface HermesBridgeAuditRecord {
-  readonly kind: "created" | "approved" | "terminal" | "commit_intent" | "latch";
+  readonly kind: "insert_admitted" | "insert_unconfirmed" | "memory_recall" | "latch";
   readonly entryId?: string;
-  readonly connectionId?: string;
-  readonly recordId?: string;
-  readonly state?: HermesApprovalTerminalState;
+  readonly operation?: string;
+  readonly tier?: number;
+  readonly agent_id?: string;
+  readonly requester_verified?: false;
+  readonly passage_id?: string;
+  readonly document_id?: string;
+  readonly text_sha256?: string;
+  readonly bytes?: number;
+  readonly term_count?: number;
+  readonly passage_ids?: readonly string[];
+  readonly query_sha256?: string;
+  readonly truncated?: boolean;
   readonly reason?: string;
-  readonly textSha256?: string;
-  readonly lateEvents?: readonly string[];
 }
 
 export interface HermesBridgeCorePorts {
@@ -103,8 +104,8 @@ export interface HermesBridgeCorePorts {
   readonly nowMs: () => number;
   readonly setTimer: (ms: number, fire: () => void) => HermesTimerHandle;
   readonly clearTimer: (handle: HermesTimerHandle) => void;
-  readonly adapter: Pick<HermesBridgeMemoryAdapter, "insertPassage" | "getPassage" | "searchPassages">;
-  readonly ownerSurface: { readonly promptOwner: (entryId: string, summary: HermesApprovalPromptSummary) => void };
+  readonly adapter: Pick<HermesBridgeMemoryAdapter, "insertPassage" | "getPassage" | "searchPassages" | "recallPassages">;
+  readonly agentId: string;
   readonly abort: AbortController;
 }
 
@@ -112,6 +113,7 @@ export interface HermesBridgeMemoryAdapter {
   insertPassage(input: MemoryPassageInput, taint: PersistableTaint): Promise<MemoryPassage>;
   getPassage(passageId: string): Promise<MemoryPassage | null>;
   searchPassages(query: MemorySearchQuery): Promise<readonly MemorySearchResult[]>;
+  recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult>;
 }
 
 export type HermesBridgeStopCause = "relay_shutdown" | "relay_eof" | "relay_fatal" | "write_failure";
@@ -142,6 +144,7 @@ interface InsertSlot {
   verdict?: HermesApprovalProbeVerdict;
   insertInFlight: boolean;
   hookAllowed: boolean;
+  unconfirmedAudited: boolean;
   commitIds?: { readonly passageId: string; readonly documentId: string };
   successBytes?: Uint8Array;
   released: boolean;
@@ -191,7 +194,7 @@ export class HermesBridgeCore {
   private drainQueued = false;
 
   constructor(private readonly ports: HermesBridgeCorePorts) {
-    if (ports.abort === undefined || ports.adapter === undefined) {
+    if (ports.abort === undefined || ports.adapter === undefined || !ports.agentId) {
       throw new TypeError("HermesBridgeCore requires abort and adapter ports");
     }
     this.commitCheckObject = {
@@ -252,29 +255,6 @@ export class HermesBridgeCore {
     this.endStep();
   }
 
-  ownerApprove(entryId: string, textSha256: string): HermesApprovalRefusalReason | undefined {
-    if (this.stopped) return undefined;
-    const result = this.ledger.ownerApprove(entryId, textSha256);
-    if (result.refusal !== undefined) return result.refusal;
-    this.performLedgerResult(result);
-    const entry = this.ledger.snapshot().entry;
-    if (entry?.id === entryId && entry.state === "APPROVED" && !entry.started) {
-      this.startInsert(entryId);
-    }
-    this.endStep();
-    return undefined;
-  }
-
-  ownerDeny(entryId: string): HermesApprovalRefusalReason | undefined {
-    if (this.stopped) return undefined;
-    const result = this.ledger.ownerDeny(entryId);
-    if (result.refusal !== undefined) return result.refusal;
-    this.performLedgerResult(result);
-    this.notifyHookWaiters();
-    this.endStep();
-    return undefined;
-  }
-
   snapshot() {
     return {
       stopped: this.stopped,
@@ -309,6 +289,7 @@ export class HermesBridgeCore {
           requestId: classified.requestId,
           kind: classified.kind,
           valid: classified.valid,
+          toolName: classified.toolName,
         }
       : classified.type === "cancel"
         ? { type: "cancel" as const, connectionId: frame.connectionId, mcpRequestId: classified.mcpRequestId }
@@ -344,7 +325,7 @@ export class HermesBridgeCore {
           this.deliverControl(action);
           break;
         case "send_fixed_denial":
-          this.writeDirectResponse(action.connectionId, action.requestId, buildDeniedPublicResponseBytes(action.requestId));
+          this.writeDirectResponse(action.connectionId, action.requestId, this.lifecycleRefusalBytes(action));
           break;
         case "send_close":
           this.writeOrStop({ type: "close", connectionId: action.connectionId });
@@ -364,7 +345,8 @@ export class HermesBridgeCore {
     }
     const admission = this.callWindow.admit(nowMs);
     if (!admission.allowed) {
-      this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+      this.writeResponse(action.connectionId, action.recordId, action.kind === "tools_call"
+        ? buildToolOutcomeBytes(action.requestId, "denied") : checkedError(action.requestId, HERMES_MEMORY_DENIAL));
       this.releaseRecord(action.recordId);
       return;
     }
@@ -380,11 +362,22 @@ export class HermesBridgeCore {
       return;
     }
     if (frame?.kind !== "tools_call") {
-      this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+      this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "denied"));
       this.releaseRecord(action.recordId);
       return;
     }
     switch (frame.name) {
+      case "sign_statement":
+      case "export_memory":
+      case "protection_rules":
+        // No hold protocol is reachable from this slice; a later reviewed slice owns signing and export.
+        this.writeResponse(action.connectionId, action.recordId,
+          buildToolOutcomeBytes(action.requestId, frame.name === "protection_rules" ? "denied" : "unavailable_not_built"));
+        this.releaseRecord(action.recordId);
+        return;
+      case "memory_recall":
+        this.startRecall(action, frame.arguments);
+        return;
       case "memory_get":
         this.startGet(action, frame.arguments);
         return;
@@ -396,7 +389,7 @@ export class HermesBridgeCore {
         return;
       default:
         frame.name satisfies never;
-        this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+        this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "denied"));
         this.releaseRecord(action.recordId);
         return;
     }
@@ -408,7 +401,7 @@ export class HermesBridgeCore {
   ): void {
     const passageId = normalizeGetArgs(args);
     if (passageId === null) {
-      this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+      this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "denied"));
       this.releaseRecord(action.recordId);
       return;
     }
@@ -424,7 +417,7 @@ export class HermesBridgeCore {
     try {
       readPromise = run();
     } catch {
-      this.stop("write_failure");
+      this.writeResponse(operation.connectionId, operation.recordId, buildToolOutcomeBytes(operation.requestId, "denied"));
       this.releaseRecord(operation.recordId);
       this.endStep();
       return;
@@ -439,7 +432,7 @@ export class HermesBridgeCore {
         );
       })
       .catch(() => {
-        this.writeResponse(operation.connectionId, operation.recordId, checkedError(operation.requestId, HERMES_MEMORY_DENIAL));
+        this.writeResponse(operation.connectionId, operation.recordId, buildToolOutcomeBytes(operation.requestId, "denied"));
       })
       .finally(() => {
         this.releaseRecord(operation.recordId);
@@ -454,7 +447,7 @@ export class HermesBridgeCore {
     const operation: ReadOperation = { connectionId: action.connectionId, recordId: action.recordId, requestId: action.requestId };
     const query = normalizeSearchQuery(args);
     if (query === null) {
-      this.writeResponse(operation.connectionId, operation.recordId, checkedError(operation.requestId, HERMES_MEMORY_DENIAL));
+      this.writeResponse(operation.connectionId, operation.recordId, buildToolOutcomeBytes(operation.requestId, "denied"));
       this.releaseRecord(operation.recordId);
       return;
     }
@@ -462,7 +455,7 @@ export class HermesBridgeCore {
     try {
       searchPromise = this.ports.adapter.searchPassages(query);
     } catch {
-      this.stop("write_failure");
+      this.writeResponse(operation.connectionId, operation.recordId, buildToolOutcomeBytes(operation.requestId, "denied"));
       this.releaseRecord(operation.recordId);
       this.endStep();
       return;
@@ -477,7 +470,7 @@ export class HermesBridgeCore {
         );
       })
       .catch(() => {
-        this.writeResponse(operation.connectionId, operation.recordId, checkedError(operation.requestId, HERMES_MEMORY_DENIAL));
+        this.writeResponse(operation.connectionId, operation.recordId, buildToolOutcomeBytes(operation.requestId, "denied"));
       })
       .finally(() => {
         this.releaseRecord(operation.recordId);
@@ -491,7 +484,7 @@ export class HermesBridgeCore {
   ): void {
     const insert = normalizeInsertArgs(args);
     if (insert === null) {
-      this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+      this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "denied"));
       this.releaseRecord(action.recordId);
       return;
     }
@@ -511,6 +504,7 @@ export class HermesBridgeCore {
       hookWaiters: new Set(),
       insertInFlight: false,
       hookAllowed: false,
+      unconfirmedAudited: false,
       released: false,
     };
     const nowMs = this.nowMsOrStop();
@@ -520,25 +514,24 @@ export class HermesBridgeCore {
     }
     const admitted = this.ledger.admit(entryId, action.connectionId, action.recordId, textSha256, nowMs);
     if (admitted.refusal !== undefined) {
-      const message = admitted.refusal === "latched" || admitted.refusal === "stopped"
-        ? HERMES_MEMORY_UNAVAILABLE
-        : HERMES_MEMORY_DENIAL;
-      this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, message));
+      this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "unavailable"));
       this.releaseRecord(action.recordId);
       return;
     }
     this.slot = slot;
     this.performLedgerResult(admitted);
-    const timer = this.setTimerOrStop(HERMES_APPROVAL_DEADLINE_MS, () => this.fireApprovalDeadline(entryId));
+    const timer = this.setTimerOrStop(HERMES_INSERT_DEADLINE_MS, () => this.fireInsertDeadline(entryId));
     if (timer === undefined) return;
     slot.deadlineTimer = timer;
+    this.startInsert(entryId);
   }
 
-  private fireApprovalDeadline(entryId: string): void {
+  private fireInsertDeadline(entryId: string): void {
     const slot = this.slot;
     if (slot?.entryId !== entryId) return;
     slot.deadlineTimer = undefined;
     this.performLedgerResult(this.ledger.deadline(entryId));
+    this.refuseLiveProbe(entryId);
     this.notifyHookWaiters();
     this.endStep();
   }
@@ -578,11 +571,13 @@ export class HermesBridgeCore {
       this.performLedgerResult(this.ledger.writeFinished(slot.entryId, "committed"));
       if (slot.commitIds !== undefined) {
         const success = buildMemoryInsertSuccessBytes(slot.requestId, slot.commitIds);
-        slot.successBytes = success.ok ? success.bytes : checkedError(slot.requestId, HERMES_MEMORY_UNAVAILABLE);
+        slot.successBytes = success.ok ? success.bytes : buildToolOutcomeBytes(slot.requestId, slot.hookAllowed ? "unconfirmed" : "unavailable");
       }
     } else if (slot.hookAllowed) {
+      this.auditUnconfirmed(slot);
       // Every throw after allow is indeterminate; this core never reports the storage layer's failed outcome.
-      if (isPartialScopeError(error)) this.performLedgerResult(this.ledger.latch("partial_scope"));
+      if (isPartialScopeError(error)) this.latch("partial_scope");
+      this.latch("indeterminate");
       this.performLedgerResult(this.ledger.writeFinished(slot.entryId, "indeterminate"));
     }
     this.performLedgerResult(this.ledger.settled(slot.entryId));
@@ -597,8 +592,22 @@ export class HermesBridgeCore {
     slot.commitIds = { passageId: context.passageId, documentId: context.documentId };
     const probe = this.startProbeOrRefuse(slot);
     const verdict = probe === "pending" ? await this.awaitProbeVerdict(slot) : probe;
-    if (verdict === "resolved") {
-      await this.awaitDurabilityForAllow(slot);
+    // Live call, no partial-scope latch, then durable admission: none of these checks may follow a chunk write.
+    if (verdict === "resolved" && !this.shouldRefuseDurabilityWait(slot)) {
+      const beforeAppend = this.nowMsOrStop();
+      const entry = this.ledger.snapshot().entry;
+      if (beforeAppend !== undefined && entry !== undefined && beforeAppend < entry.deadlineAt &&
+          this.recordSnapshot(slot.recordId)?.state === "IN_FLIGHT" &&
+          context.passageTextSha256 === slot.textSha256 &&
+          context.getFrameUtf8Bytes + PUBLIC_RESULT_ENVELOPE_MAX_BYTES <= MAX_RESULT_FRAME_BYTES) {
+        // The fortress is single-owner (ownerRef = HERMES_MEMORY_AGENT_ID); every insert saves into the agent's own memory.
+        // An own-scope save never waits for a human, per the operator's 10-29 decision carried by M1.
+        this.addAuditDurability({ kind: "insert_admitted", entryId: slot.entryId,
+          operation: OWN_SCOPE_MEMORY_SAVES.memory_insert, tier: 3, // Tier 3 is M1's own-scope save tier.
+          ...this.auditPrincipal(), passage_id: context.passageId, document_id: context.documentId,
+          text_sha256: context.passageTextSha256, bytes: context.passageTextUtf8.byteLength });
+        await this.awaitDurabilityForAllow(slot);
+      }
     }
     const entry = this.ledger.snapshot().entry;
     const record = this.recordSnapshot(slot.recordId);
@@ -609,13 +618,14 @@ export class HermesBridgeCore {
     if (nowMs === undefined) throw new HermesBridgeCommitRefusedError();
     const checked = this.ledger.commitCheck(slot.entryId, {
       probe: verdict,
+      admitDurable: slot.durability.size === 1 && [...slot.durability].every(audit => audit.state === "fulfilled"),
       nowMs,
       recordCurrent,
       passageTextSha256: context.passageTextSha256,
       getFrameUtf8Bytes: context.getFrameUtf8Bytes + PUBLIC_RESULT_ENVELOPE_MAX_BYTES,
     });
     this.performLedgerResult(checked);
-    if (checked.decision === "allow") {
+    if (checked.decision === "allow" && slot.durability.size === 1 && [...slot.durability].every(audit => audit.state === "fulfilled")) {
       slot.hookAllowed = true;
       return;
     }
@@ -623,6 +633,7 @@ export class HermesBridgeCore {
   }
 
   private startProbeOrRefuse(slot: InsertSlot): HermesApprovalProbeVerdict | "pending" {
+    if (this.shouldRefuseDurabilityWait(slot)) return "refused";
     const record = this.recordSnapshot(slot.recordId);
     const state = this.lifecycle.stateOf(slot.connectionId);
     const canProbe = state === "OPEN_BUSY" && record?.state === "IN_FLIGHT" && !this.lifecycle.stopped;
@@ -649,6 +660,11 @@ export class HermesBridgeCore {
     return slot.verdict ?? "pending";
   }
 
+  private refuseLiveProbe(entryId: string): void {
+    const live = this.waiter.snapshot().live;
+    if (live?.entryRef === entryId) this.performWaiterResult(this.waiter.timeout(entryId, live.nonce));
+  }
+
   private awaitProbeVerdict(slot: InsertSlot): Promise<HermesApprovalProbeVerdict> {
     if (slot.verdict !== undefined) return Promise.resolve(slot.verdict);
     return new Promise((resolve) => {
@@ -657,7 +673,6 @@ export class HermesBridgeCore {
   }
 
   private async awaitDurabilityForAllow(slot: InsertSlot): Promise<boolean> {
-    this.addAuditDurability({ kind: "commit_intent", entryId: slot.entryId, connectionId: slot.connectionId, recordId: slot.recordId });
     for (;;) {
       if (this.shouldRefuseDurabilityWait(slot)) return false;
       const pending = [...slot.durability].filter((audit) => audit.state === "pending");
@@ -675,7 +690,6 @@ export class HermesBridgeCore {
     return entry?.id !== slot.entryId ||
       entry.seen.cancel ||
       entry.seen.deadline ||
-      entry.seen.deny ||
       entry.seen.gone ||
       entry.seen.stop ||
       entry.seen.latch ||
@@ -692,6 +706,7 @@ export class HermesBridgeCore {
       ? this.ledger.peerShutdown(entry.id)
       : this.ledger.cancel(entry.id);
     this.performLedgerResult(result);
+    this.refuseLiveProbe(entry.id);
     this.notifyHookWaiters();
   }
 
@@ -707,17 +722,7 @@ export class HermesBridgeCore {
 
   private performLedgerActions(actions: readonly HermesApprovalAction[]): void {
     for (const action of actions) {
-      switch (action.kind) {
-        case "audit":
-          this.addAuditDurability(auditRecordFromAction(action, this.slot));
-          break;
-        case "prompt_owner":
-          this.promptOwnerLater(action.entryId);
-          break;
-        case "respond":
-          this.respondFromLedger(action);
-          break;
-      }
+      this.respondFromLedger(action);
     }
   }
 
@@ -736,38 +741,74 @@ export class HermesBridgeCore {
         audit.state = "fulfilled";
         this.notifyHookWaiters();
       },
-      () => {
+      (reason: unknown) => {
         audit.state = "rejected";
-        this.performLedgerResult(this.ledger.latch("audit"));
+        // Backpressure refuses before effect; it is capacity exhaustion, not a failed durable audit append, so it does not latch.
+        if (!(reason instanceof HermesAuditBackpressureError)) this.latch("audit");
         this.notifyHookWaiters();
         this.endStep();
       },
     );
   }
 
-  private promptOwnerLater(entryId: string): void {
-    const slot = this.slot;
-    if (slot?.entryId !== entryId) return;
-    const summary: HermesApprovalPromptSummary = {
-      entryId,
-      connectionId: slot.connectionId,
-      recordId: slot.recordId,
-      textSha256: slot.textSha256,
-      passageText: slot.text,
-      ...(slot.passageId === undefined ? {} : { passageId: slot.passageId }),
-      tags: slot.tags,
+  private auditUnconfirmed(slot: InsertSlot): void {
+    if (slot.unconfirmedAudited) return;
+    slot.unconfirmedAudited = true;
+    this.addAuditDurability({ kind: "insert_unconfirmed", entryId: slot.entryId,
+      passage_id: slot.commitIds?.passageId, ...this.auditPrincipal() });
+  }
+
+  private auditPrincipal(): { agent_id: string; requester_verified: false } {
+    return {
+      // Must match the agent: form of callerIdentity in server/src/router.ts.
+      agent_id: `agent:${this.ports.agentId}`,
+      // The agent id is relay-pinned and uid-checked; the calling process, session and turn are not verified.
+      requester_verified: false,
     };
-    queueMicrotask(() => {
-      const liveEntry = this.ledger.snapshot().entry;
-      if (this.stopped || this.slot?.entryId !== entryId || liveEntry?.id !== entryId || liveEntry.state !== "PENDING") {
-        return;
-      }
+  }
+
+  private latch(reason: string): void {
+    if (this.ledger.snapshot().latched) return;
+    this.performLedgerResult(this.ledger.latch(reason));
+    this.addAuditDurability({ kind: "latch", reason });
+  }
+
+  private startRecall(action: Extract<HermesLifecycleAction, { type: "route_call" }>, args: HermesMemoryToolArguments): void {
+    if (!("query" in args) || typeof args.query !== "string") {
+      this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "denied"));
+      this.releaseRecord(action.recordId);
+      return;
+    }
+    const query = args.query;
+    const budget = new HermesRecallBudget(query, this.ports.nowMs, this.ports.abort.signal);
+    void (async () => {
+      let appendingAudit = false;
       try {
-        this.ports.ownerSurface.promptOwner(entryId, summary);
-      } catch {
-        // Owner notification is bounded by the approval deadline, not by the prompt transport.
+        const result = budget.terms.length === 0 ? budget.result() : await this.ports.adapter.recallPassages(budget);
+        appendingAudit = true;
+        await this.ports.appendAudit({ kind: "memory_recall", term_count: budget.terms.length,
+          passage_ids: result.passages.map(p => p.passage_id), query_sha256: hermesBridgePassageTextDigest(query),
+          truncated: result.truncated, ...this.auditPrincipal() });
+        this.writeResultOrDenial(action.connectionId, action.recordId, action.requestId, buildMemoryRecallResultBytes(action.requestId, result));
+      } catch (reason) {
+        // Backpressure is a capacity refusal and must not disable future admission.
+        if (appendingAudit && !(reason instanceof HermesAuditBackpressureError)) this.latch("audit");
+        this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "unavailable"));
+      } finally {
+        this.releaseRecord(action.recordId);
+        this.endStep();
       }
-    });
+    })();
+  }
+
+  private lifecycleRefusalBytes(action: Extract<HermesLifecycleAction, { type: "send_fixed_denial" }>): Uint8Array {
+    if (action.toolName !== undefined) {
+      // Only the record owning the allowed insert can have an unconfirmed write; another call cannot inherit its outcome.
+      return buildToolOutcomeBytes(action.requestId, action.responseClass === "release" && this.slot?.recordId === action.recordId && this.slot.hookAllowed
+        ? "unconfirmed" : action.responseClass === "release" || action.capacity ? "unavailable" : "denied");
+    }
+    // A non-catalogued name or hello/list fault is a protocol fault, not a tool refusal.
+    return buildDeniedPublicResponseBytes(action.requestId);
   }
 
   private respondFromLedger(action: Extract<HermesApprovalAction, { readonly kind: "respond" }>): void {
@@ -777,11 +818,11 @@ export class HermesBridgeCore {
       this.writeResponse(
         slot.connectionId,
         slot.recordId,
-        slot.successBytes ?? checkedError(slot.requestId, HERMES_MEMORY_UNAVAILABLE),
+        slot.successBytes ?? buildToolOutcomeBytes(slot.requestId, slot.hookAllowed ? "unconfirmed" : "unavailable"),
       );
       return;
     }
-    this.writeResponse(slot.connectionId, slot.recordId, checkedError(slot.requestId, action.message));
+    this.writeResponse(slot.connectionId, slot.recordId, buildToolOutcomeBytes(slot.requestId, slot.hookAllowed ? "unconfirmed" : "unavailable"));
   }
 
   private performWaiterResult(result: HermesProbeWaiterResult): void {
@@ -846,7 +887,7 @@ export class HermesBridgeCore {
     requestId: string,
     result: HermesPublicResultBuild,
   ): void {
-    this.writeResponse(connectionId, recordId, result.ok ? result.bytes : checkedError(requestId, HERMES_MEMORY_DENIAL));
+    this.writeResponse(connectionId, recordId, result.ok ? result.bytes : buildToolOutcomeBytes(requestId, "denied"));
   }
 
   private writeResponse(connectionId: string, recordId: string, publicPayloadBytes: Uint8Array): void {
@@ -873,9 +914,12 @@ export class HermesBridgeCore {
 
   private releaseRecord(recordId: string): void {
     const result = this.lifecycle.release(recordId);
+    if (this.slot?.recordId === recordId && this.slot.hookAllowed && result.actions.some(action => action.type === "send_fixed_denial")) {
+      this.auditUnconfirmed(this.slot);
+    }
     for (const action of result.actions) {
       if (action.type === "send_fixed_denial") {
-        this.writeDirectResponse(action.connectionId, action.requestId, buildDeniedPublicResponseBytes(action.requestId));
+        this.writeDirectResponse(action.connectionId, action.requestId, this.lifecycleRefusalBytes(action));
       }
     }
   }
@@ -987,7 +1031,7 @@ function publicSummary(result: PublicFrameParseResult): HermesPublicFrameSummary
       case "tools_list":
         return { topLevelType: frame.kind, requestId: frame.requestId, strictValid: true };
       case "tools_call":
-        return { topLevelType: "tools_call", requestId: frame.requestId, strictValid: true };
+        return { topLevelType: "tools_call", requestId: frame.requestId, strictValid: true, toolName: frame.name };
       case "cancel":
         return { topLevelType: "cancel", mcpRequestId: frame.mcpRequestId, strictValid: true };
       case "shutdown":
@@ -999,7 +1043,7 @@ function publicSummary(result: PublicFrameParseResult): HermesPublicFrameSummary
     result.frameType === "tools_list" ||
     result.frameType === "tools_call"
   ) {
-    return { topLevelType: result.frameType, requestId: result.requestId, strictValid: false };
+    return { topLevelType: result.frameType, requestId: result.requestId, strictValid: false, toolName: result.toolName };
   }
   return { topLevelType: result.frameType, strictValid: false };
 }
@@ -1043,19 +1087,6 @@ function normalizeSearchQuery(args: HermesMemoryToolArguments): MemorySearchQuer
 
 function isTaint(value: string): value is PersistableTaint {
   return value === "user_content" || value === "agent_derived_clean" || value === "system_generated";
-}
-
-function auditRecordFromAction(action: Extract<HermesApprovalAction, { readonly kind: "audit" }>, slot: InsertSlot | undefined): HermesBridgeAuditRecord {
-  return {
-    kind: action.event,
-    entryId: action.entryId,
-    connectionId: slot?.entryId === action.entryId ? slot.connectionId : undefined,
-    recordId: slot?.entryId === action.entryId ? slot.recordId : undefined,
-    state: action.state,
-    reason: action.reason,
-    textSha256: slot?.entryId === action.entryId ? slot.textSha256 : undefined,
-    lateEvents: action.lateEvents,
-  };
 }
 
 function isPartialScopeError(error: unknown): boolean {

@@ -102,6 +102,7 @@ export interface HubInboxItemHeader {
 /** Two metadata fields plus one optional memory excerpt cover every closed preview operation; must match the producer bound in principal-policy/gate.ts and consumer in dashboard/v1_1/client.ts. */
 export const HUB_APPROVAL_PREVIEW_MAX_FIELDS = 3;
 /** 600 UTF-16 units are about eight lines of the card at its width; must match passage_excerpt in principal-policy/gate.ts and dashboard/v1_1/client.ts. */
+// Must match RECALL_PASSAGE_MAX_UNITS in hermes-memory-bridge/recall.ts.
 export const HUB_APPROVAL_PASSAGE_MAX_UNITS = 600;
 
 /** Operator-only, closed preview arguments; must match buildOperatorPreview in principal-policy/gate.ts and approvalPreviewHtml in dashboard/v1_1/client.ts. */

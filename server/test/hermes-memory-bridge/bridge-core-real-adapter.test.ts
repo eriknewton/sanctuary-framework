@@ -1,3 +1,4 @@
+import { HERMES_TOOL_OUTCOMES } from "../../src/hermes-memory-bridge/public-results.js";
 import { Buffer } from "node:buffer";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -152,7 +153,7 @@ async function makeHarness(options: {
     },
     appendAudit(record) {
       audits.push(record);
-      if (options.rejectCommitIntentAudit === true && record.kind === "commit_intent") {
+      if (options.rejectCommitIntentAudit === true && record.kind === "insert_admitted") {
         return Promise.reject(new Error("audit failed"));
       }
       return Promise.resolve();
@@ -161,18 +162,22 @@ async function makeHarness(options: {
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
     adapter: {
+      recallPassages: async budget => budget.result(),
       insertPassage: (input, taint) => adapter.insertPassage(input, taint),
       getPassage: (passageId) => adapter.getPassage(passageId),
       searchPassages: (query) => adapter.searchPassages(query),
     },
-    ownerSurface: {
-      promptOwner(entryId) {
-        ownerPrompts.push(entryId);
-      },
-    },
+    agentId: "fixture-agent",
     abort,
   };
   const core = new HermesBridgeCore(ports);
+  const terminalEvents: string[] = [];
+  const ledger = (core as any).ledger;
+  const finish = ledger.finish.bind(ledger);
+  ledger.finish = (entry: unknown, state: string, ...rest: unknown[]) => {
+    terminalEvents.push(state);
+    return finish(entry, state, ...rest);
+  };
   adapter = makeAdapter(storage, core.commitCheck);
   return {
     core,
@@ -182,6 +187,7 @@ async function makeHarness(options: {
     writes,
     audits,
     ownerPrompts,
+    terminalEvents,
     abort,
     cleanup: ownedStorage?.cleanup ?? (async () => undefined),
   };
@@ -254,10 +260,10 @@ async function waitForProbe(writes: readonly NodeToRelayInput[], connectionId = 
   return probe(writes, connectionId);
 }
 
-async function approveAndReply(h: Awaited<ReturnType<typeof makeHarness>>, connectionId = "c1"): Promise<void> {
+async function replyToProbe(h: Awaited<ReturnType<typeof makeHarness>>, connectionId = "c1"): Promise<void> {
   const entry = h.core.snapshot().ledger.entry;
   if (entry === undefined) throw new Error("missing approval entry");
-  h.core.ownerApprove(entry.id, entry.textSha256);
+
   const sentProbe = await waitForProbe(h.writes, connectionId);
   h.core.relayFrame({ kind: "probe_reply", connectionId, nonce: sentProbe.nonce });
   await flush(20);
@@ -267,14 +273,9 @@ async function documentCount(storage: Pick<StorageBackend, "list">): Promise<num
   return (await storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, `doc.mem.${OWNER_REF}.`)).length;
 }
 
-function terminalStates(audits: readonly HermesBridgeAuditRecord[]): readonly string[] {
-  return audits
-    .filter((audit) => audit.kind === "terminal" && audit.state !== undefined)
-    .map((audit) => audit.state!);
-}
-
-async function waitForTerminal(audits: readonly HermesBridgeAuditRecord[], state: string): Promise<void> {
-  await waitUntil(() => terminalStates(audits).includes(state));
+function terminalStates(h: Awaited<ReturnType<typeof makeHarness>>): readonly string[] { return h.terminalEvents; }
+async function waitForTerminal(h: Awaited<ReturnType<typeof makeHarness>>, state: string): Promise<void> {
+  await waitUntil(() => terminalStates(h).includes(state));
 }
 
 async function shortOutcome(promise: Promise<void>): Promise<"resolved" | "rejected" | "timeout"> {
@@ -297,15 +298,38 @@ async function withHarness<T>(
 }
 
 describe("HermesBridgeCore with real SDW adapter", () => {
-  it("commits an approved passage and reads back byte-equal text", async () => {
+  it("persists admission before the first encrypted chunk", async () => {
+    let admitted = () => false;
+    let chunks = 0;
+    class ObservedStorage extends MemoryStorage {
+      override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        if (namespace === SDW_DOCUMENT_CORPUS_NAMESPACE && key.startsWith("chunk.")) {
+          chunks++;
+          expect(admitted(), "admission must be durable before any chunk write").toBe(true);
+        }
+        return super.write(namespace, key, data);
+      }
+    }
+    await withHarness({ storage: new ObservedStorage() }, async h => {
+      admitted = () => h.audits.filter(row => row.kind === "insert_admitted").length === 1;
+      accept(h.core);
+      insert(h.core, "c1", "ordered", "ordered", "ordered durable memory");
+      await replyToProbe(h);
+      expect(await waitForResponse(h.writes, "ordered")).toMatchObject({ type: "result" });
+      expect(chunks).toBeGreaterThan(0);
+      expect(await documentCount(h.storage)).toBe(1);
+    });
+  });
+
+  it("commits an admitted passage and reads back byte-equal text", async () => {
     await withHarness({}, async (h) => {
       accept(h.core);
       h.core.relayFrame(publicFrame("c1", { type: "hello", request_id: "hello-1", protocol_version: "2026-10-12", client_name: "client" }));
       insert(h.core, "c1", "insert-1", "passage-full", "the passage bytes");
       await flush();
-      expect(h.ownerPrompts).toEqual(["hermes-entry-1"]);
+      expect(h.ownerPrompts).toEqual([]);
 
-      await approveAndReply(h);
+      await replyToProbe(h);
       const success = await waitForResponse(h.writes, "insert-1");
       expect(success?.type).toBe("result");
       expect(await documentCount(h.storage)).toBe(1);
@@ -334,7 +358,7 @@ describe("HermesBridgeCore with real SDW adapter", () => {
         },
       }));
       await flush();
-      await approveAndReply(h);
+      await replyToProbe(h);
       expect(await waitForResponse(h.writes, "insert-system-taint")).toMatchObject({ type: "result" });
       expect(await documentCount(h.storage)).toBe(1);
 
@@ -351,11 +375,11 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       insert(h.core, "c1", "insert-cancel", "passage-cancel", "cancel me");
       await flush();
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerApprove(entry.id, entry.textSha256);
+
       const sentProbe = await waitForProbe(h.writes);
       h.core.relayFrame(publicFrame("c1", { type: "cancel", mcp_request_id: "insert-cancel" }));
       h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
-      expect(await waitForResponse(h.writes, "insert-cancel")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+      expect(await waitForResponse(h.writes, "insert-cancel")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
     }],
     ["closed during approval", "DISCONNECTED", async (h: Awaited<ReturnType<typeof makeHarness>>) => {
       accept(h.core);
@@ -369,22 +393,22 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       insert(h.core, "c1", "insert-deadline", "passage-deadline", "time me out");
       h.timers.fireFirst();
       await flush();
-      expect(responses(h.writes).at(-1)).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+      expect(await waitForResponse(h.writes)).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
     }],
-    ["owner deny", "DENIED", async (h: Awaited<ReturnType<typeof makeHarness>>) => {
+    ["cancel before lock acquisition", "CANCELED", async (h: Awaited<ReturnType<typeof makeHarness>>) => {
       accept(h.core);
       insert(h.core, "c1", "insert-deny", "passage-deny", "deny me");
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerDeny(entry.id);
+      cancelInsert(h.core);
       await flush();
-      expect(responses(h.writes).at(-1)).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+      expect(await waitForResponse(h.writes)).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
       expect(h.timers.live.size).toBe(0);
     }],
   ])("refuses with the real adapter: %s", async (_name, terminal, run) => {
     await withHarness({}, async (h) => {
       await run(h);
       expect(await documentCount(h.storage)).toBe(0);
-      expect(terminalStates(h.audits)).toContain(terminal);
+      await waitForTerminal(h, terminal);
     });
   });
 
@@ -395,15 +419,15 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       insert(h.core, "c1", "insert-stop", "passage-stop", "stop in lock");
       await flush();
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerApprove(entry.id, entry.textSha256);
+
       await flush();
       h.core.relayFrame({ kind: "relay_shutdown" });
-      await waitForTerminal(h.audits, "REFUSED");
+      await waitForTerminal(h, "REFUSED");
 
       expect(storage.receivedAbortSignal).toBe(true);
       expect(h.abort.signal.aborted).toBe(true);
       expect(await documentCount(h.storage)).toBe(0);
-      expect(terminalStates(h.audits)).toContain("REFUSED");
+      expect(terminalStates(h)).toContain("REFUSED");
       expect(responses(h.writes).find((payload) => payload.request_id === "insert-stop")).toBeUndefined();
       expect(h.core.drained).toBe(true);
     });
@@ -416,7 +440,7 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       insert(h.core, "c1", "insert-direct", "passage-direct", "direct hook");
       await flush();
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerApprove(entry.id, entry.textSha256);
+
       await waitUntil(() => storage.receivedAbortSignal);
 
       const direct = h.core.commitCheck.assertAllowedToCommit({
@@ -440,12 +464,12 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       expect(await shortOutcome(direct)).toBe("rejected");
       expect(h.writes.some((write) => write.type === "probe")).toBe(false);
       h.core.relayFrame({ kind: "relay_shutdown" });
-      await waitForTerminal(h.audits, "REFUSED");
+      await waitForTerminal(h, "REFUSED");
       expect(await documentCount(h.storage)).toBe(0);
     });
   });
 
-  it("busy-denies a second insert while one approval is pending", async () => {
+  it("busy-denies a second insert while one insert is in flight", async () => {
     await withHarness({}, async (h) => {
       accept(h.core, "c1");
       insert(h.core, "c1", "insert-one", "passage-one", "first");
@@ -454,9 +478,9 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       await flush();
 
       expect(await documentCount(h.storage)).toBe(0);
-      expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "insert-two", type: "error", message: HERMES_MEMORY_DENIAL });
-      expect(h.core.snapshot().ledger.entry?.state).toBe("PENDING");
-      h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
+      expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "insert-two", type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
+      expect(h.core.snapshot().ledger.entry?.state).toBe("INSERT_STARTED");
+      cancelInsert(h.core);
       await flush();
     });
   });
@@ -480,7 +504,7 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       insert(h.core, "c1", "insert-late", "passage-late", "late reply");
       await flush();
       const entry = h.core.snapshot().ledger.entry!;
-      h.core.ownerApprove(entry.id, entry.textSha256);
+
       const sentProbe = await waitForProbe(h.writes, "c1");
       h.core.relayFrame({ kind: "closed", connectionId: "c1" });
       h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
@@ -492,27 +516,27 @@ describe("HermesBridgeCore with real SDW adapter", () => {
 
       expect(h.core.fatalBridge).toBe(false);
       expect(await documentCount(h.storage)).toBe(0);
-      expect(terminalStates(h.audits)).toContain("DISCONNECTED");
+      expect(terminalStates(h)).toContain("DISCONNECTED");
       expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "hello-2", type: "result" });
     });
   });
 
-  it("latches when commit-intent audit rejects before storage writes", async () => {
+  it("latches when admission audit rejects before storage writes", async () => {
     await withHarness({ rejectCommitIntentAudit: true }, async (h) => {
       accept(h.core);
       insert(h.core, "c1", "insert-audit", "passage-audit", "audit refusal");
       await flush();
-      await approveAndReply(h);
-      await waitForTerminal(h.audits, "REFUSED");
+      await replyToProbe(h);
+      await waitForTerminal(h, "REFUSED");
 
       expect(await documentCount(h.storage)).toBe(0);
-      expect(terminalStates(h.audits)).toContain("REFUSED");
-      expect(await waitForResponse(h.writes, "insert-audit")).toMatchObject({ type: "error", message: HERMES_MEMORY_UNAVAILABLE });
+      expect(terminalStates(h)).toContain("REFUSED");
+      expect(await waitForResponse(h.writes, "insert-audit")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
 
       accept(h.core, "c2");
       insert(h.core, "c2", "insert-after-audit", "passage-after-audit", "later");
       await flush();
-      expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "insert-after-audit", type: "error", message: HERMES_MEMORY_UNAVAILABLE });
+      expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "insert-after-audit", type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
       expect(await documentCount(h.storage)).toBe(0);
     });
   });
@@ -527,20 +551,26 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       accept(h.core);
       insert(h.core, "c1", "insert-partial", "passage-partial", "abcd");
       await flush();
-      await approveAndReply(h);
-      await waitForTerminal(h.audits, "INDETERMINATE");
+      await replyToProbe(h);
+      await waitForTerminal(h, "INDETERMINATE");
 
       expect(await documentCount(h.storage)).toBe(0);
-      expect(terminalStates(h.audits)).toContain("INDETERMINATE");
-      const terminal = h.audits.find((audit) => audit.kind === "terminal" && audit.state === "INDETERMINATE");
-      expect(terminal?.lateEvents).toContain("latch");
-      expect(await waitForResponse(h.writes, "insert-partial")).toMatchObject({ type: "error", message: HERMES_MEMORY_UNAVAILABLE });
+      expect(terminalStates(h)).toContain("INDETERMINATE");
+      expect(h.audits.filter(audit => audit.kind === "insert_unconfirmed")).toHaveLength(1);
+      expect(h.audits.filter(audit => audit.kind === "latch")).toHaveLength(1);
+      expect(await waitForResponse(h.writes, "insert-partial")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unconfirmed });
 
       accept(h.core, "c2");
       insert(h.core, "c2", "insert-after-partial", "passage-after-partial", "later");
       await flush();
-      expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "insert-after-partial", type: "error", message: HERMES_MEMORY_UNAVAILABLE });
+      expect(responses(h.writes).at(-1)).toMatchObject({ request_id: "insert-after-partial", type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
       expect(await documentCount(h.storage)).toBe(0);
     });
   });
 });
+
+function cancelInsert(core: HermesBridgeCore): void {
+  const entry = core.snapshot().ledger.entry!;
+  const record = core.snapshot().lifecycle.records.find(record => record.id === entry.recordId)!;
+  core.relayFrame(publicFrame(entry.connectionId, { type: "cancel", mcp_request_id: record.requestId }));
+}

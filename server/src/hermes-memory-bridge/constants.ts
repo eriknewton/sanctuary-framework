@@ -1,4 +1,5 @@
-import { MEMORY_BATCH_LOCK_TIMEOUT_MS } from "../sdw/adapters/sdw-memory-backend.js";
+// Must match MEMORY_BATCH_LOCK_TIMEOUT_MS in sdw/adapters/sdw-memory-backend.ts.
+const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000; // Corpus lock wait budget, pinned by the catalog structure test.
 
 // Must match the fixed denial text in hermes-memory-relay/SEAM.md.
 export const HERMES_MEMORY_DENIAL = "Memory request denied.";
@@ -47,15 +48,16 @@ export const MAX_SEARCH_LIMIT = 20; // Node-local policy bound; oversized result
 
 export const HERMES_TOOL_TIMEOUT_MS = 120_000; // Node-local: Hermes client tool timeout budget.
 export const HERMES_RESPONSE_MARGIN_MS = 5_000; // Node-local: room for shim cancel and response delivery.
-export const HERMES_APPROVAL_DEADLINE_MS =
+export const HERMES_INSERT_DEADLINE_MS =
   HERMES_TOOL_TIMEOUT_MS -
   MEMORY_BATCH_LOCK_TIMEOUT_MS -
   PROBE_REPLY_BOUND_MS -
   HERMES_RESPONSE_MARGIN_MS;
+// Deprecated alias only for principal-policy/authority-profile.ts; remove when that consumer is next edited under its own brief.
+// Nothing in the bridge or client may import this alias.
+export const HERMES_APPROVAL_DEADLINE_MS = HERMES_INSERT_DEADLINE_MS;
 export const HERMES_RATE_WINDOW_MS = 60_000; // Node-local: one-minute rolling admission window.
 export const HERMES_MAX_CALLS_PER_MINUTE = 60; // 60 = one call per second in HERMES_RATE_WINDOW_MS.
-export const HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE = 6; // 6 = one owner prompt per ten seconds in HERMES_RATE_WINDOW_MS.
-export const HERMES_MAX_PENDING_APPROVALS = 1; // Node-local: the approval ledger owns one global slot.
 
 // Must match the decoded request_id and cancel.mcp_request_id pattern in hermes-memory-relay/SEAM.md.
 export const REQUEST_ID_PATTERN = new RegExp(`^[A-Za-z0-9._:-]{1,${MAX_REQUEST_ID_BYTES}}$`, "u");
@@ -65,3 +67,15 @@ export const CONNECTION_ID_PATTERN = new RegExp(`^c[0-9]{1,${MAX_CONNECTION_ID_B
 export const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${PROBE_NONCE_BYTES}}$`, "u");
 // Must match standard base64 with required padding in hermes-memory-relay/SEAM.md.
 export const STANDARD_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+
+// One admitted row and at most one unconfirmed row per call, plus one process latch row.
+export const HERMES_AUDIT_ROWS_PER_CALL = 2;
+export const HERMES_AUDIT_PROCESS_ROWS = 1;
+export const HERMES_AUDIT_WAITING_CAP = HERMES_MAX_CALL_RECORDS * HERMES_AUDIT_ROWS_PER_CALL + HERMES_AUDIT_PROCESS_ROWS;
+/** Capacity refusal is distinct from failure to persist an admitted audit row. */
+export class HermesAuditBackpressureError extends Error {
+  constructor() { super("Hermes audit capacity exhausted"); this.name = "HermesAuditBackpressureError"; }
+}
+
+// Shared document scan ceiling: 2000 bounds decrypt work near the measured 413-file, 7184 ms ingest order of magnitude.
+export const MEMORY_CORPUS_SCAN_CAP = 2000;

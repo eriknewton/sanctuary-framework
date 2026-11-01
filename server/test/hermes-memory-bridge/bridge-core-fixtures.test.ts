@@ -1,3 +1,4 @@
+import { HERMES_TOOL_OUTCOMES } from "../../src/hermes-memory-bridge/public-results.js";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
@@ -128,7 +129,7 @@ const FIXTURE_EXPECTATIONS = Object.freeze({
   "relay frame envelope": {
     precondition: "accepted",
     reason: "the forwarded call has invalid memory_search arguments and receives the fixed denial",
-    reaction: { kind: "writes", writes: [{ type: "response", connection_id: "c1", request_id: "mcp-1", payload: denied("mcp-1") }] },
+    reaction: { kind: "writes", writes: [{ type: "response", connection_id: "c1", request_id: "mcp-1", payload: result("mcp-1", HERMES_TOOL_OUTCOMES.denied) }] },
   },
   "relay closed": {
     precondition: "accepted",
@@ -138,7 +139,7 @@ const FIXTURE_EXPECTATIONS = Object.freeze({
   "relay probe reply": {
     precondition: "probe_live",
     reason: "the issued nonce resolves the waiting probe and permits the insert",
-    reaction: { kind: "writes", writes: [{ type: "response", connection_id: "c1", request_id: "mcp-1", payload: result("mcp-1", { content: [{ type: "text", text: "{\n  \"inserted\": true,\n  \"passage\": {\n    \"passage_id\": \"fixture-passage\",\n    \"document_id\": \"mem.fixture-passage\"\n  }\n}" }] }) }] },
+    reaction: { kind: "writes", writes: [{ type: "response", connection_id: "c1", request_id: "mcp-1", payload: result("mcp-1", { content: [{ type: "text", text: "{\n  \"outcome\": \"saved\",\n  \"inserted\": true,\n  \"passage\": {\n    \"passage_id\": \"fixture-passage\",\n    \"document_id\": \"mem.fixture-passage\"\n  }\n}" }] }) }] },
   },
   "relay shutdown": {
     precondition: "accepted",
@@ -168,7 +169,7 @@ const FIXTURE_EXPECTATIONS = Object.freeze({
   "relay probe reply bytes": {
     precondition: "probe_live",
     reason: "byte fixture probe reply resolves the waiting insert",
-    reaction: { kind: "writes", writes: [{ type: "response", connection_id: "c1", request_id: "mcp-1", payload: result("mcp-1", { content: [{ type: "text", text: "{\n  \"inserted\": true,\n  \"passage\": {\n    \"passage_id\": \"fixture-passage\",\n    \"document_id\": \"mem.fixture-passage\"\n  }\n}" }] }) }] },
+    reaction: { kind: "writes", writes: [{ type: "response", connection_id: "c1", request_id: "mcp-1", payload: result("mcp-1", { content: [{ type: "text", text: "{\n  \"outcome\": \"saved\",\n  \"inserted\": true,\n  \"passage\": {\n    \"passage_id\": \"fixture-passage\",\n    \"document_id\": \"mem.fixture-passage\"\n  }\n}" }] }) }] },
   },
   "relay closed then late probe reply": {
     precondition: "probe_live",
@@ -239,7 +240,7 @@ const LABEL_EQUIVALENCES = Object.freeze([
     reason: "each authorizes the same close frame for c1",
   },
   {
-    labels: ["missing required field", "relay frame envelope"],
+    labels: ["missing required field"],
     reason: "each authorizes the same fixed denial for mcp-1",
   },
   {
@@ -285,6 +286,7 @@ function makeHarness() {
   const store = new Map<string, MemoryPassage>();
   let core!: HermesBridgeCore;
   const adapter: HermesBridgeMemoryAdapter = {
+    recallPassages: async budget => budget.result(),
     async insertPassage(input: MemoryPassageInput, _taint: PersistableTaint): Promise<MemoryPassage> {
       const passage = makePassage(input.passage_id ?? "fixture-passage", input.text);
       await core.commitCheck.assertAllowedToCommit({
@@ -316,7 +318,7 @@ function makeHarness() {
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
     adapter,
-    ownerSurface: { promptOwner() {} },
+    agentId: "fixture-agent",
     abort: new AbortController(),
   } satisfies HermesBridgeCorePorts);
   return { core, timers, writes, audits };
@@ -431,7 +433,7 @@ async function applyPrecondition(h: ReturnType<typeof makeHarness>, precondition
   await Promise.resolve();
   const entry = h.core.snapshot().ledger.entry;
   if (entry === undefined) throw new Error("probe precondition did not create an entry");
-  h.core.ownerApprove(entry.id, entry.textSha256);
+
   await Promise.resolve();
   h.writes.splice(0, h.writes.length);
   if (precondition === "probe_closed") {

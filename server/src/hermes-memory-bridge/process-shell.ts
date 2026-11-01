@@ -1,3 +1,4 @@
+import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP } from "./constants.js";
 import { Buffer } from "node:buffer";
 import { fstatSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
@@ -42,7 +43,6 @@ import { encodeNodeToRelay, parseRelayToNode, type NodeToRelayInput } from "./en
 import { PrivateFrameDecoder } from "./framing.js";
 import {
   HermesBridgeCore,
-  type HermesApprovalPromptSummary,
   type HermesBridgeAuditRecord,
   type HermesBridgeMemoryAdapter,
 } from "./bridge-core.js";
@@ -274,9 +274,12 @@ class AdapterForwarder extends SingleBindForwarder<HermesBridgeMemoryAdapter> im
     this.requireTarget().getPassage(passageId);
   searchPassages: HermesBridgeMemoryAdapter["searchPassages"] = (query) =>
     this.requireTarget().searchPassages(query);
+  recallPassages: HermesBridgeMemoryAdapter["recallPassages"] = budget =>
+    this.requireTarget().recallPassages(budget);
 }
 
-class AuditForwarder extends SingleBindForwarder<AuditLog> {
+/** Serialize critical audit appends with a bounded waiting queue and explicit exit refusal. */
+export class AuditForwarder extends SingleBindForwarder<AuditLog> {
   readonly pending = new Set<Promise<void>>();
   // Records reach the audit log one at a time. The log serializes appends itself, so this changes no
   // ordering; it exists so that every record still waiting its turn at close can be refused at once,
@@ -289,6 +292,8 @@ class AuditForwarder extends SingleBindForwarder<AuditLog> {
 
   append(record: HermesBridgeAuditRecord): Promise<void> {
     const target = this.requireTarget();
+    // Refuse before retaining a row so canceled admission waves cannot grow the waiting queue.
+    if (this.waiting.length >= HERMES_AUDIT_WAITING_CAP) throw new HermesAuditBackpressureError();
     if (this.refuseAtExit !== undefined) return this.track(this.refuse(record));
     const turn = new Promise<void>((resolve, reject) => {
       this.waiting.push({ record, settle: (outcome) => { outcome.then(resolve, reject); } });
@@ -993,13 +998,7 @@ async function composeHermesBridge(input: {
       timers.delete(timer);
     },
     adapter: adapterForwarder,
-    ownerSurface: {
-      promptOwner(_entryId: string, _summary: HermesApprovalPromptSummary) {
-        // The production CLI has no approval channel and cannot authorize writes.
-        // Enabling approval requires restart-recovery handling for process-local latches.
-        input.stderr.write("hermes-memory-bridge owner approval is deferred in this release\n");
-      },
-    },
+    agentId: input.env.HERMES_MEMORY_AGENT_ID!,
     abort,
   });
   const identityManager = new IdentityManager(input.storage, input.masterKey);

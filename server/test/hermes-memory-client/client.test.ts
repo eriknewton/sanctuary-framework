@@ -332,8 +332,9 @@ it("callerCannotSelectEffectiveTaint", async () => {
   const core = new HermesBridgeCore({
     writeFrame() {}, appendAudit: async () => {}, nowMs: () => 0,
     setTimer: () => ({}), clearTimer() {}, abort: new AbortController(),
-    ownerSurface: { promptOwner(id, summary) { core.ownerApprove(id, summary.textSha256); } },
+    agentId: "fixture-agent",
     adapter: {
+      recallPassages: async budget => budget.result(),
       async insertPassage(_input, taint) {
         // The fixture observes the consumer argument and refuses before any storage effect.
         taints.push(taint); throw new Error("fixture storage unavailable");

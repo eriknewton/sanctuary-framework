@@ -14,6 +14,7 @@ export const STDIO_DEPTH = MAX_JSON_NESTING_DEPTH + 1; // params adds one compos
 export const SHIM_DELIVERY_MARGIN_MS = 2_000; // Reserved response delivery interval inside the Hermes tool wait.
 export const SHIM_WRITE_STALL_MS = SHIM_DELIVERY_MARGIN_MS;
 export const SHIM_CALL_DEADLINE_MS = HERMES_TOOL_TIMEOUT_MS - SHIM_DELIVERY_MARGIN_MS;
+// Must match RECALL_PREFETCH_BUDGET_MS in hermes-memory-bridge/recall.ts.
 export const SHIM_CONNECT_HELLO_TIMEOUT_MS = 5_000; // CD1a: one bounded local readiness attempt.
 export const SHIM_INITIALIZATION_TIMEOUT_MS = 5_000; // CD1b: each abandoned initialization state.
 export const HERMES_PROBE_WAIT_MS = 30_000; // Hermes ping request wait, separate from its scheduling interval.
@@ -29,7 +30,8 @@ export const CLIENT_NAME = "sanctuary-hermes-memory-client";
 export const RELAY_VERSION = "2026-10-12";
 export const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"] as const;
 export const FIXED_SOCKET_PATH = "/Library/Application Support/Sanctuary/HermesMemoryBridge/sockets/memory.sock";
-export const TOOL_NAMES = ["memory_insert", "memory_get", "memory_search"] as const;
+import { HERMES_MEMORY_TOOL_NAMES as TOOL_NAMES } from "../hermes-memory-bridge/envelopes.js";
+export { TOOL_NAMES };
 export const ERRORS = Object.freeze({
   denied: [-32002, "Memory request denied."], busy: [-32003, "Memory request denied."],
   unavailable: [-32004, "Memory service unavailable."], unknown: [-32004, "Memory service unavailable. Outcome unknown."],
