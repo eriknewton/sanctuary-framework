@@ -72,7 +72,7 @@ sorted sample at index floor(sample count times percentile), capped at the last
 index. Means divide totals by recorded append count.
 
 Measured candidate `audit-log.ts` SHA-256:
-`c43b0bb71a69a90a3dbfe8d56db32d760f38f45d99a4c3782221ca8ecba42870`.
+`75f213b31eadcd3cdea3e53e33228b30b2a91dab0c588d4483aa41346ee60dac`.
 
 ## Measured results
 
@@ -86,15 +86,15 @@ none are extrapolated to 2,100 appends.
 | Scenario | Version | Appends | Status | p50 ms | p99 ms | Maximum ms | Mean ms | Strict cold load ms |
 |---|---|---:|---|---:|---:|---:|---:|---:|
 | 1,000 growth | Base | 100 | complete | 181.86 | 207.78 | 207.78 | 182.16 | 457.75 |
-| 1,000 growth | Candidate | 100 | complete | 20.11 | 25.60 | 25.60 | 19.39 | 464.07 |
+| 1,000 growth | Candidate | 100 | complete | 12.84 | 27.54 | 27.54 | 13.69 | 474.73 |
 | 10,000 growth | Base | 100 | complete | 1,624.04 | 1,843.62 | 1,843.62 | 1,631.89 | 4,547.32 |
-| 10,000 growth | Candidate | 100 | complete | 30.87 | 56.99 | 56.99 | 32.11 | 4,336.81 |
+| 10,000 growth | Candidate | 100 | complete | 37.51 | 60.23 | 60.23 | 37.69 | 4,301.35 |
 | 100,000 growth | Base | 100 | complete | 16,423.41 | 17,724.80 | 17,724.80 | 16,284.43 | 47,535.02 |
-| 100,000 growth | Candidate | 100 | complete | 223.42 | 357.61 | 357.61 | 224.70 | 42,729.26 |
+| 100,000 growth | Candidate | 100 | complete | 223.25 | 369.15 | 369.15 | 226.83 | 43,104.88 |
 | 100,000 cap | Base | 655 | sample | 21,760.22 | 23,431.26 | 23,949.45 | 21,729.62 | 45,225.53 |
-| 100,000 cap | Candidate | 2,100 | complete | 220.11 | 279.82 | 10,366.71 | 242.06 | 44,945.22 |
-| 100,000 prune-episode | Candidate | 1 | complete | 10,415.98 | 10,415.98 | 10,415.98 | 10,415.98 | 44,847.37 |
-| 100,000 checkpoint-due | Candidate | 1 | complete | 23,422.93 | 23,422.93 | 23,422.93 | 23,422.93 | 42,556.43 |
+| 100,000 cap | Candidate | 2,100 | complete | 218.82 | 286.20 | 10,385.17 | 241.38 | 43,488.77 |
+| 100,000 prune-episode | Candidate | 1 | complete | 10,354.35 | 10,354.35 | 10,354.35 | 10,354.35 | 45,564.47 |
+| 100,000 checkpoint-due | Candidate | 1 | complete | 23,696.32 | 23,696.32 | 23,696.32 | 23,696.32 | 45,214.53 |
 
 Phase values below are means per append, including prune appends. Decode/list
 processing excludes awaited stat time and includes the base's metadata construction.
@@ -103,15 +103,15 @@ The key-array column gives the range of the largest array returned in each appen
 | Scenario | Version | Directory read ms | Decode/list ms | Sort ms | Stat ms | GC ms | Key-array length |
 |---|---|---:|---:|---:|---:|---:|---|
 | 1,000 growth | Base | 3.11 | 24.59 | 0.41 | 141.60 | 1.20 | 1,001 to 1,100 |
-| 1,000 growth | Candidate | 1.49 | 0.93 | 0.24 | 0.10 | 0.26 | 1,000 to 1,099 |
+| 1,000 growth | Candidate | 0.98 | 0.63 | 0.16 | 0.07 | 0.22 | 1,000 to 1,099 |
 | 10,000 growth | Base | 23.23 | 249.98 | 5.08 | 1,336.83 | 11.26 | 10,001 to 10,100 |
-| 10,000 growth | Candidate | 8.81 | 5.33 | 1.41 | 0.06 | 1.11 | 10,000 to 10,099 |
+| 10,000 growth | Candidate | 11.53 | 5.54 | 1.59 | 0.07 | 1.29 | 10,000 to 10,099 |
 | 100,000 growth | Base | 282.90 | 2,417.44 | 32.97 | 13,510.61 | 132.65 | 100,001 to 100,100 |
-| 100,000 growth | Candidate | 94.94 | 58.01 | 13.59 | 0.06 | 19.81 | 100,000 to 100,099 |
+| 100,000 growth | Candidate | 95.22 | 57.54 | 13.62 | 0.07 | 21.08 | 100,000 to 100,099 |
 | 100,000 cap | Base | 377.49 | 3,169.39 | 48.39 | 18,056.51 | 167.40 | 100,001 to 100,001 |
-| 100,000 cap | Candidate | 92.99 | 60.12 | 13.40 | 8.53 | 19.95 | 99,263 to 100,001 |
-| 100,000 prune-episode | Candidate | 298.72 | 854.70 | 29.96 | 4,755.93 | 95.67 | 100,001 to 100,001 |
-| 100,000 checkpoint-due | Candidate | 174.75 | 62.24 | 20.04 | 0.09 | 182.69 | 100,000 to 100,000 |
+| 100,000 cap | Candidate | 94.85 | 57.38 | 13.50 | 8.73 | 20.75 | 99,254 to 100,001 |
+| 100,000 prune-episode | Candidate | 246.34 | 870.78 | 34.68 | 5,181.43 | 93.33 | 100,001 to 100,001 |
+| 100,000 checkpoint-due | Candidate | 196.42 | 57.61 | 26.23 | 0.08 | 193.35 | 100,000 to 100,000 |
 
 Listing and prune totals cover the recorded appends in each row. Sync counts
 include FileHandle syncs; the callback-style fsync count was zero. The first
@@ -127,18 +127,18 @@ the rotation call, including its recount and anchor work, when it removed entrie
 | 100,000 growth | Base | 300 | 3.000000 | 0 | 9.000 | 0.00 | 0.00 |
 | 100,000 growth | Candidate | 0 | 0.000000 | 100 | 9.000 | 0.00 | 0.00 |
 | 100,000 cap | Base | 2,620 | 4.000000 | 0 | 17.000 | 7,127,048.37 | 10,880.99 |
-| 100,000 cap | Candidate | 4 | 0.001905 | 2,100 | 18.245 | 40,118.81 | 19.10 |
-| 100,000 prune-episode | Candidate | 1 | 1.000000 | 1 | 4,490.000 | 10,041.94 | 10,041.94 |
+| 100,000 cap | Candidate | 4 | 0.001905 | 2,100 | 17.342 | 40,122.14 | 19.11 |
+| 100,000 prune-episode | Candidate | 1 | 1.000000 | 1 | 3,790.000 | 10,029.57 | 10,029.57 |
 | 100,000 checkpoint-due | Candidate | 0 | 0.000000 | 1 | 11.000 | 0.00 | 0.00 |
 
 The base cap sample removed 655 entries over its 655 recorded appends and
 held 100,000 entries after the last recorded append. This is the sample boundary.
-The candidate cap run made four prunes at zero-based append indices 0, 696,
-1,372 and 2,035. It removed 2,773 entries in total and ended with 99,327 retained
-entries (100,000 + 2,100 - 2,773), below the 100,000 cap. The standalone prune
-removed 640 entries and ended with 99,361 (100,000 + 1 - 640). Candidate growth
+The candidate cap run made four prunes at zero-based append indices 0, 513,
+1,260 and 1,842. It removed 2,502 entries in total and ended with 99,598 retained
+entries (100,000 + 2,100 - 2,502), below the 100,000 cap. The standalone prune
+removed 540 entries and ended with 99,461 (100,000 + 1 - 540). Candidate growth
 runs retained 1,100, 10,100 and 100,100 entries respectively. FileHandle sync totals
-were 900 for each growth run, 38,315 for the cap run, 4,490 for the standalone
+were 900 for each growth run, 36,418 for the cap run, 3,790 for the standalone
 prune and 11 for the checkpoint-due append.
 
 The prune table reports the rotation hold separately from total append time and
@@ -153,11 +153,11 @@ for a contending writer.
 
 | Candidate scenario | Append index (zero-based) | Episode hold ms | Steps | Anchors | Planned steps | Budget stopped |
 |---|---:|---:|---:|---:|---:|---|
-| 100,000 cap | 0 | 10,005.64 | 696 | 696 | 1,001 | yes |
-| 100,000 cap | 696 | 10,006.62 | 676 | 676 | 1,001 | yes |
-| 100,000 cap | 1,372 | 10,010.23 | 663 | 663 | 1,001 | yes |
-| 100,000 cap | 2,035 | 10,008.21 | 738 | 738 | 1,001 | yes |
-| 100,000 prune-episode | 0 | 10,008.59 | 640 | 640 | 1,001 | yes |
+| 100,000 cap | 0 | 10,007.93 | 513 | 513 | 1,001 | yes |
+| 100,000 cap | 513 | 10,007.12 | 747 | 747 | 1,001 | yes |
+| 100,000 cap | 1,260 | 10,007.92 | 582 | 582 | 1,001 | yes |
+| 100,000 cap | 1,842 | 10,012.28 | 660 | 660 | 1,001 | yes |
+| 100,000 prune-episode | 0 | 10,009.88 | 540 | 540 | 1,001 | yes |
 
 The separate checkpoint-due append after 100,000 entries completed with the
 following hold and collection timings. Its final retained count was 100,001.
@@ -165,7 +165,7 @@ This single observation does not establish an availability or latency guarantee.
 
 | Candidate scenario | Appends | Append ms | Held-lock ms | Collection ms | Sized listings | Names listings | Syncs |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 100,000 checkpoint-due | 1 | 23,422.93 | 23,299.73 | 23,022.74 | 0 | 1 | 11 |
+| 100,000 checkpoint-due | 1 | 23,696.32 | 23,554.67 | 23,268.73 | 0 | 1 | 11 |
 
 Linux measurements do not establish a Darwin directory-capability latency bound.
 APFS measurements and worker error-class validation remain separate platform work.
