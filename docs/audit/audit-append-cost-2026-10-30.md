@@ -48,17 +48,29 @@ It requires a strict cold load over the full filesystem store before measuring
 unwrapped durable appends. A cold load uses a fresh audit-log instance with the
 existing OS page cache. Cold-load time is recorded separately. Both versions
 use Node v22.23.3 on Linux x86_64 and ext4 with `UV_THREADPOOL_SIZE=1`.
-The runs overlapped on the same host. Validation checks also overlapped early
-base samples at 100,000 entries. These timings include that shared load. Measured appends include
+The original base measurements overlapped other work on the same host, including
+validation checks during early base samples at 100,000 entries. Those timings
+retain that shared load. Candidate figures come from the separate final-source
+run for job 869. Measured appends include
 entry readback, durable entry and anchor writes, and the production write lock.
-Interval checkpoints are disabled. Growth samples use nonbinding retention caps;
-the cap sample sets the entry cap to 100,000 with a nonbinding byte cap.
+Interval checkpoints are disabled except for the separate checkpoint-due sample.
+Growth and checkpoint-due samples use nonbinding retention caps; cap and
+prune-episode samples set the entry cap to 100,000 with a nonbinding byte cap.
 
 Each growth sample contains 100 appends after 1,000, 10,000 or 100,000 entries.
 Both cap scenarios start with 100,000 entries. The base records a sample of
 655 appends; the candidate records all 2,100 appends, including pruning.
-Per-append records include directory-read, decode, sort and GC time, key-array length, sized-listing counts, sync counts and prune time.
-Fixture generation is not an append-throughput measurement.
+Two additional candidate scenarios each measure one append after 100,000 entries:
+a standalone prune episode and an interval-checkpoint-due append. Per-append
+records include directory-read, decode, sort and GC time, key-array length,
+listing counts, sync counts, prune time, held-lock time and collection time.
+Fixture generation is not an append-throughput measurement. Single-append rows
+have identical p50, p99, maximum and mean values. Percentiles use the recorded
+sorted sample at index floor(sample count times percentile), capped at the last
+index. Means divide totals by recorded append count.
+
+Measured candidate `audit-log.ts` SHA-256:
+`9b89dd7287bcc7b4e41bac142d7e07c3515b4a4199745d5a8c892d8eca2063b3`.
 
 ## Measured results
 
@@ -72,13 +84,15 @@ none are extrapolated to 2,100 appends.
 | Scenario | Version | Appends | Status | p50 ms | p99 ms | Maximum ms | Mean ms | Strict cold load ms |
 |---|---|---:|---|---:|---:|---:|---:|---:|
 | 1,000 growth | Base | 100 | complete | 181.86 | 207.78 | 207.78 | 182.16 | 457.75 |
-| 1,000 growth | Candidate | 100 | complete | 11.48 | 22.78 | 22.78 | 11.83 | 448.50 |
+| 1,000 growth | Candidate | 100 | complete | 18.14 | 30.49 | 30.49 | 17.45 | 450.65 |
 | 10,000 growth | Base | 100 | complete | 1,624.04 | 1,843.62 | 1,843.62 | 1,631.89 | 4,547.32 |
-| 10,000 growth | Candidate | 100 | complete | 29.53 | 44.16 | 44.16 | 30.60 | 4,401.91 |
+| 10,000 growth | Candidate | 100 | complete | 32.42 | 53.87 | 53.87 | 35.05 | 4,683.95 |
 | 100,000 growth | Base | 100 | complete | 16,423.41 | 17,724.80 | 17,724.80 | 16,284.43 | 47,535.02 |
-| 100,000 growth | Candidate | 100 | complete | 222.93 | 340.57 | 340.57 | 226.19 | 43,076.28 |
+| 100,000 growth | Candidate | 100 | complete | 222.71 | 368.96 | 368.96 | 228.30 | 43,744.85 |
 | 100,000 cap | Base | 655 | sample | 21,760.22 | 23,431.26 | 23,949.45 | 21,729.62 | 45,225.53 |
-| 100,000 cap | Candidate | 2,100 | complete | 218.07 | 269.54 | 9,136.82 | 232.32 | 42,023.14 |
+| 100,000 cap | Candidate | 2,100 | complete | 221.71 | 281.69 | 10,365.91 | 243.56 | 43,840.30 |
+| 100,000 prune-episode | Candidate | 1 | complete | 10,316.58 | 10,316.58 | 10,316.58 | 10,316.58 | 44,362.00 |
+| 100,000 checkpoint-due | Candidate | 1 | complete | 24,156.60 | 24,156.60 | 24,156.60 | 24,156.60 | 45,077.76 |
 
 Phase values below are means per append, including prune appends. Decode/list
 processing excludes awaited stat time and includes the base's metadata construction.
@@ -87,13 +101,15 @@ The key-array column gives the range of the largest array returned in each appen
 | Scenario | Version | Directory read ms | Decode/list ms | Sort ms | Stat ms | GC ms | Key-array length |
 |---|---|---:|---:|---:|---:|---:|---|
 | 1,000 growth | Base | 3.11 | 24.59 | 0.41 | 141.60 | 1.20 | 1,001 to 1,100 |
-| 1,000 growth | Candidate | 0.84 | 0.46 | 0.14 | 0.06 | 0.20 | 1,000 to 1,099 |
+| 1,000 growth | Candidate | 1.31 | 0.81 | 0.23 | 0.09 | 0.26 | 1,000 to 1,099 |
 | 10,000 growth | Base | 23.23 | 249.98 | 5.08 | 1,336.83 | 11.26 | 10,001 to 10,100 |
-| 10,000 growth | Candidate | 8.16 | 4.39 | 1.37 | 0.06 | 1.24 | 10,000 to 10,099 |
+| 10,000 growth | Candidate | 10.95 | 4.57 | 1.37 | 0.07 | 1.26 | 10,000 to 10,099 |
 | 100,000 growth | Base | 282.90 | 2,417.44 | 32.97 | 13,510.61 | 132.65 | 100,001 to 100,100 |
-| 100,000 growth | Candidate | 95.77 | 55.53 | 13.34 | 0.07 | 22.45 | 100,000 to 100,099 |
+| 100,000 growth | Candidate | 95.15 | 57.66 | 13.69 | 0.07 | 21.19 | 100,000 to 100,099 |
 | 100,000 cap | Base | 377.49 | 3,169.39 | 48.39 | 18,056.51 | 167.40 | 100,001 to 100,001 |
-| 100,000 cap | Candidate | 92.56 | 56.06 | 13.43 | 6.35 | 20.85 | 99,000 to 100,001 |
+| 100,000 cap | Candidate | 95.03 | 57.79 | 13.52 | 8.97 | 20.88 | 99,315 to 100,001 |
+| 100,000 prune-episode | Candidate | 235.09 | 833.39 | 31.50 | 4,128.39 | 78.58 | 100,001 to 100,001 |
+| 100,000 checkpoint-due | Candidate | 175.82 | 58.19 | 20.42 | 0.16 | 189.25 | 100,000 to 100,000 |
 
 Listing and prune totals cover the recorded appends in each row. Sync counts
 include FileHandle syncs; the callback-style fsync count was zero. The first
@@ -109,15 +125,42 @@ the rotation call, including its recount and anchor work, when it removed entrie
 | 100,000 growth | Base | 300 | 3.000000 | 0 | 9.000 | 0.00 | 0.00 |
 | 100,000 growth | Candidate | 0 | 0.000000 | 100 | 9.000 | 0.00 | 0.00 |
 | 100,000 cap | Base | 2,620 | 4.000000 | 0 | 17.000 | 7,127,048.37 | 10,880.99 |
-| 100,000 cap | Candidate | 3 | 0.001429 | 2,100 | 14.726 | 26,284.25 | 12.52 |
+| 100,000 cap | Candidate | 4 | 0.001905 | 2,100 | 17.545 | 40,136.18 | 19.11 |
+| 100,000 prune-episode | Candidate | 1 | 1.000000 | 1 | 4,588.000 | 10,026.88 | 10,026.88 |
+| 100,000 checkpoint-due | Candidate | 0 | 0.000000 | 1 | 11.000 | 0.00 | 0.00 |
 
 The base cap sample removed 655 entries over its 655 recorded appends and
 held 100,000 entries after the last recorded append. This is the sample boundary.
-The candidate cap run made three prunes: the initial over-cap prune and two
-later hysteresis crossings. It removed 3,003 entries in total and ended
-with 99,097 retained entries, below the 100,000 cap.
+The candidate cap run made four prunes at zero-based append indices 0, 663,
+1,216 and 1,902. It removed 2,563 entries in total and ended with 99,537 retained
+entries (100,000 + 2,100 - 2,563), below the 100,000 cap. The standalone prune
+removed 654 entries and ended with 99,347 (100,000 + 1 - 654). Candidate growth
+runs retained 1,100, 10,100 and 100,100 entries respectively. FileHandle sync totals
+were 900 for each growth run, 36,845 for the cap run, 4,588 for the standalone
+prune and 11 for the checkpoint-due append.
+
+The prune table reports the rotation hold separately from total append time and
+rotation-call time above. Every observed episode stopped at the 10,000 ms budget
+before its planned 1,001 steps were complete. The budget is checked between steps;
+these observed hold times are measurements, not a hard latency bound.
+
+| Candidate scenario | Append index (zero-based) | Episode hold ms | Steps | Anchors | Planned steps | Budget stopped |
+|---|---:|---:|---:|---:|---:|---|
+| 100,000 cap | 0 | 10,017.07 | 663 | 663 | 1,001 | yes |
+| 100,000 cap | 663 | 10,006.73 | 553 | 553 | 1,001 | yes |
+| 100,000 cap | 1,216 | 10,011.64 | 686 | 686 | 1,001 | yes |
+| 100,000 cap | 1,902 | 10,006.28 | 661 | 661 | 1,001 | yes |
+| 100,000 prune-episode | 0 | 10,006.63 | 654 | 654 | 1,001 | yes |
+
+The separate checkpoint-due append after 100,000 entries completed with the
+following hold and collection timings. Its final retained count was 100,001.
+This single observation does not establish an availability or latency guarantee.
+
+| Candidate scenario | Appends | Append ms | Held-lock ms | Collection ms | Sized listings | Names listings | Syncs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 100,000 checkpoint-due | 1 | 24,156.60 | 24,024.83 | 23,766.30 | 0 | 1 | 11 |
 
 Linux measurements do not establish a Darwin directory-capability latency bound.
 APFS measurements and worker error-class validation remain separate platform work.
 
-Candidate rows are re-measured on the final source.
+All six candidate scenarios completed on the measured final source.
