@@ -4,7 +4,7 @@
  * npm artifact. tsup only bundles TypeScript; these non-TS assets need an
  * explicit copy step.
  */
-import { cpSync, existsSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, copyFileSync, readdirSync, unlinkSync, rmdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -50,4 +50,23 @@ for (const name of REFERENCE_PLUGIN_BUNDLES) {
   const dest = join(distRefPlugins, name);
   cpSync(src, dest, { recursive: true });
   console.log(`copy-templates: reference-plugin ${name} -> dist/reference-plugin/${name}`);
+}
+
+// Must match HERMES_PLUGIN_FILES in src/wrap/hermes-posture.ts; read the sole manifest.
+const postureSource = readFileSync(join(__dirname, "..", "src/wrap/hermes-posture.ts"), "utf8");
+const pluginManifest = JSON.parse(postureSource.match(/export const HERMES_PLUGIN_FILES = (\[[^;]+\]) as const;/)[1]);
+const distHermesPlugins = join(__dirname, "..", "dist", "hermes-plugin");
+function clearPluginOutput(dir) {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) { clearPluginOutput(path); rmdirSync(path); }
+    else unlinkSync(path);
+  }
+}
+clearPluginOutput(distHermesPlugins);
+for (const file of pluginManifest) {
+  const target = join(distHermesPlugins, file);
+  mkdirSync(dirname(target), { recursive: true });
+  copyFileSync(join(__dirname, "../..", "hermes-plugin", file), target);
 }

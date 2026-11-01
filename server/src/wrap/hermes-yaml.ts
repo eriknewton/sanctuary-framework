@@ -492,3 +492,222 @@ export function scannerMcpServersView(
     unsupported: false,
   };
 }
+
+/** Raw managed fields are retained so removal can restore the operator's spelling. */
+export interface HermesPostureView {
+  top: string[];
+  children: Record<string, string[]>;
+  raw: Record<string, string | null>;
+  enabled: string[];
+  disabled: string[];
+  mcp: string[];
+}
+interface PostureField { key: string; start: number; end: number; prefix: string; token: string; suffix: string }
+interface PostureBlock { start: number; end: number; fields: PostureField[]; indent: number }
+const POSTURE_INDENT = 2; // Hermes's default YAML indentation is two spaces.
+const POSTURE_KEYS = ["memory", "plugins", "tool_loop_guardrails"];
+const MANAGED_FIELDS = ["memory.provider", "memory.memory_enabled", "memory.user_profile_enabled", "plugins.enabled"];
+
+function postureRefuse(): never {
+  throw new HermesYamlUnsupportedError("Hermes config has an unsupported managed YAML shape; refusing to edit.");
+}
+function splitPostureLine(line: string): Omit<PostureField, "start" | "end"> {
+  const match = /^(\s*(?:"([\w-]+)"|'([\w-]+)'|([\w-]+))\s*:\s*)(.*)$/.exec(line);
+  if (!match) return postureRefuse();
+  const value = match[5]!;
+  // Quoted tokens may contain #; a comment starts only after a complete token.
+  const parts = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^#]*?)(\s+#.*|#.*|\s*)$/.exec(value);
+  if (!parts) return postureRefuse();
+  const token = parts[1]!.trimEnd();
+  return { key: match[2] ?? match[3] ?? match[4]!, prefix: match[1]!, token, suffix: parts[1]!.slice(token.length) + parts[2]! };
+}
+function postureBlocks(lines: string[]): Map<string, PostureBlock> {
+  const blocks = new Map<string, PostureBlock>();
+  for (let start = 0; start < lines.length; start++) {
+    const line = lines[start]!;
+    if (isBlankOrComment(line) || indentOf(line) !== 0) continue;
+    const head = splitPostureLine(line);
+    if (blocks.has(head.key)) return postureRefuse();
+    let end = start + 1;
+    while (end < lines.length && (isBlankOrComment(lines[end]!) || indentOf(lines[end]!) > 0)) end++;
+    const block: PostureBlock = { start, end, fields: [], indent: POSTURE_INDENT };
+    blocks.set(head.key, block);
+    if (!POSTURE_KEYS.includes(head.key)) continue;
+    if (head.token !== "" && !/^\{\s*\}$/.test(head.token)) return postureRefuse();
+    const content = lines.slice(start + 1, end).filter(line => !isBlankOrComment(line));
+    if (content.length) block.indent = indentOf(content[0]!);
+    for (let at = start + 1; at < end; at++) {
+      if (isBlankOrComment(lines[at]!) || indentOf(lines[at]!) !== block.indent) continue;
+      const previous = block.fields.at(-1);
+      if (lines[at]!.trimStart().startsWith("-") && previous?.token === "" &&
+          head.key === "plugins" && ["enabled", "disabled"].includes(previous.key)) {
+        previous.end = entryEnd(lines, at, block.indent, end);
+        continue;
+      }
+      const field = splitPostureLine(lines[at]!);
+      if (block.fields.some(item => item.key === field.key)) return postureRefuse();
+      block.fields.push({ ...field, start: at, end: entryEnd(lines, at, block.indent, end) });
+    }
+  }
+  return blocks;
+}
+function simplePostureScalar(token: string): string {
+  if (/^[A-Za-z0-9_.\/-]+$/.test(token)) return token;
+  if (/^"[^"\\]*"$/.test(token)) return token.slice(1, -1);
+  if (/^'[^']*'$/.test(token)) return token.slice(1, -1);
+  return postureRefuse();
+}
+function postureList(field: PostureField | undefined, lines: string[]): string[] {
+  if (!field) return [];
+  if (field.token.startsWith("[")) {
+    if (field.end !== field.start + 1 || !field.token.endsWith("]")) return postureRefuse();
+    const body = field.token.slice(1, -1).trim();
+    return body ? body.split(",").map(value => simplePostureScalar(value.trim())) : [];
+  }
+  if (field.token !== "") return postureRefuse();
+  const items: string[] = [];
+  for (const line of lines.slice(field.start + 1, field.end)) {
+    if (isBlankOrComment(line)) continue;
+    const match = /^\s+-\s+([^#]*?)(?:\s+#.*)?$/.exec(line);
+    if (!match) return postureRefuse();
+    items.push(simplePostureScalar(match[1]!.trim()));
+  }
+  return items;
+}
+
+/** Scanner facts are checked against PyYAML before either install or removal writes. */
+export function scanHermesPosture(content: string | null): HermesPostureView {
+  const lines = (content ?? "").split("\n");
+  const blocks = postureBlocks(lines);
+  const mcp = scanMcpServersBlock(lines);
+  const raw: Record<string, string | null> = {};
+  const children: Record<string, string[]> = {};
+  for (const name of POSTURE_KEYS) {
+    const block = blocks.get(name);
+    if (block) children[name] = block.fields.map(field => field.key);
+  }
+  for (const path of MANAGED_FIELDS) {
+    const [name, key] = path.split(".");
+    const field = blocks.get(name!)?.fields.find(field => field.key === key);
+    raw[path] = field ? lines.slice(field.start, field.end).join("\n") : null;
+    if (field && path !== "plugins.enabled") {
+      if (field.end !== field.start + 1) return postureRefuse();
+      simplePostureScalar(field.token);
+    }
+  }
+  const enabled = postureList(blocks.get("plugins")?.fields.find(field => field.key === "enabled"), lines);
+  const disabled = postureList(blocks.get("plugins")?.fields.find(field => field.key === "disabled"), lines);
+  const hardStop = blocks.get("tool_loop_guardrails")?.fields.find(field => field.key === "hard_stop_enabled");
+  if (hardStop && (hardStop.end !== hardStop.start + 1 || !/^(false|False|FALSE|no|No|NO|off|Off|OFF)$/.test(hardStop.token))) return postureRefuse();
+  if (disabled.includes("sanctuary")) throw new HermesYamlUnsupportedError("sanctuary is in plugins.disabled; refusing to edit.");
+  return { top: [...blocks.keys()], children, raw, enabled, disabled, mcp: mcp?.entries.map(entry => entry.name) ?? [] };
+}
+
+function renderPostureValue(field: Pick<PostureField, "prefix" | "suffix">, value: string): string {
+  const prefix = value && field.prefix.endsWith(":") ? field.prefix + " " : field.prefix;
+  const suffix = value && field.suffix.startsWith("#") ? " " + field.suffix : field.suffix;
+  return prefix + value + suffix;
+}
+
+/** Replace one direct child without reserializing the surrounding document. */
+function setPostureField(content: string, name: string, key: string, value: string | null, raw = false): string {
+  const lines = content.split("\n");
+  const block = postureBlocks(lines).get(name);
+  if (!block) {
+    if (value === null) return content;
+    const head = content && !content.endsWith("\n") ? content + "\n" : content;
+    return head + name + ":\n" + (raw ? value : `  ${key}: ${value}`) + "\n";
+  }
+  const field = block.fields.find(field => field.key === key);
+  if (field) {
+    const replacement = value === null ? [] : raw ? value.split("\n") : [renderPostureValue(field, value)];
+    lines.splice(field.start, field.end - field.start, ...replacement);
+  } else if (value !== null) {
+    const head = splitPostureLine(lines[block.start]!);
+    if (head.token) lines[block.start] = renderPostureValue(head, "");
+    const at = block.fields.at(-1)?.end ?? block.start + 1;
+    lines.splice(at, 0, ...(raw ? value.split("\n") : [`${" ".repeat(block.indent)}${key}: ${value}`]));
+  }
+  return lines.join("\n");
+}
+
+/** Exact planned bytes and prior raw values form the install record's reversible edit. */
+export interface HermesPosturePlan {
+  content: string;
+  before: HermesPostureView;
+  after: HermesPostureView;
+  removedMcp: string | null;
+}
+
+/** Plan the memory-provider configuration; the caller supplies the shared settings. */
+export function planHermesMemoryPosture(
+  existing: string | null,
+  settings: readonly { block: string; key: string; value: string }[],
+): HermesPosturePlan {
+  const before = scanHermesPosture(existing);
+  let content = existing ?? "";
+  for (const setting of settings) content = setPostureField(content, setting.block, setting.key, setting.value);
+  if (!before.enabled.includes("sanctuary")) {
+    const lines = content.split("\n");
+    const field = postureBlocks(lines).get("plugins")?.fields.find(field => field.key === "enabled");
+    if (field?.token.startsWith("[")) {
+      const token = field.token.slice(0, -1) + (before.enabled.length ? ", " : "") + "sanctuary]";
+      content = setPostureField(content, "plugins", "enabled", token);
+    } else if (field) {
+      const old = lines.slice(field.start, field.end);
+      const first = old.slice(1).find(line => /^\s+-/.test(line));
+      const indent = first ? indentOf(first) : indentOf(lines[field.start]!) + POSTURE_INDENT;
+      old.push(" ".repeat(indent) + "- sanctuary");
+      content = setPostureField(content, "plugins", "enabled", old.join("\n"), true);
+    } else content = setPostureField(content, "plugins", "enabled", "[sanctuary]");
+  }
+  const lines = content.split("\n");
+  const mcp = scanMcpServersBlock(lines);
+  const entry = mcp?.entries.find(entry => entry.name === "sanctuary");
+  const removedMcp = entry ? lines.slice(entry.start, entry.end).join("\n") + (entry.end < lines.length ? "\n" : "") : null;
+  if (entry && mcp) {
+    lines.splice(entry.start, entry.end - entry.start);
+    if (mcp.entries.length === 1) {
+      const head = splitPostureLine(lines[mcp.keyLine]!);
+      lines[mcp.keyLine] = renderPostureValue(head, "{}");
+    }
+    content = lines.join("\n");
+  }
+  return { content, before, after: scanHermesPosture(content), removedMcp };
+}
+
+/** Changed files restore matching managed values while retaining current line comments. */
+export function planHermesMemoryRevert(live: string, original: string | null, installed: string): HermesPosturePlan {
+  const before = scanHermesPosture(live);
+  scanHermesPosture(original);
+  const expected = scanHermesPosture(installed);
+  const liveBlocks = postureBlocks(live.split("\n"));
+  const originalLines = (original ?? "").split("\n");
+  const priorBlocks = postureBlocks(originalLines);
+  const installedBlocks = postureBlocks(installed.split("\n"));
+  let content = live;
+  // A changed managed value belongs to the operator; a comment does not change that value.
+  for (const path of MANAGED_FIELDS) {
+    const [name, key] = path.split(".");
+    const field = liveBlocks.get(name!)?.fields.find(field => field.key === key);
+    const selected = installedBlocks.get(name!)?.fields.find(field => field.key === key);
+    if (!field || !selected) continue;
+    const comparable = (token: string) => key === "provider" ? simplePostureScalar(token) :
+      /^(false|no|off)$/i.test(token) ? "false" : token;
+    const same = path === "plugins.enabled" ? JSON.stringify(before.enabled) === JSON.stringify(expected.enabled) :
+      comparable(field.token) === comparable(selected.token);
+    if (!same) continue;
+    const prior = priorBlocks.get(name!)?.fields.find(field => field.key === key);
+    if (!prior) content = setPostureField(content, name!, key!, null);
+    else if (prior.end === prior.start + 1) content = setPostureField(content, name!, key!, prior.token);
+    else {
+      const oldIndent = indentOf(originalLines[prior.start]!);
+      const newIndent = indentOf(field.prefix);
+      const body = originalLines.slice(prior.start + 1, prior.end).map(line =>
+        line.trim() ? " ".repeat(newIndent) + line.slice(oldIndent) : line);
+      const raw = [field.prefix + prior.token + field.suffix, ...body].join("\n");
+      content = setPostureField(content, name!, key!, raw, true);
+    }
+  }
+  return { content, before, after: scanHermesPosture(content), removedMcp: null };
+}

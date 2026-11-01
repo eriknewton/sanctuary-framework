@@ -39,6 +39,8 @@ import { fileURLToPath } from "node:url";
  * merging in a named PR; see isPendingSealedCliRuntimeEntry.
  */
 export const SEALED_CLI_RUNTIME_DIST_ENTRIES = Object.freeze([
+  // Must match the hermes-plugin output in copy-templates.js.
+  Object.freeze({ path: "hermes-plugin", kind: "dir", source: "copy-templates.js", sentinel: "sanctuary/sanctuary_client.py" }),
   // tsup entries (server/tsup.config.ts `entry`): the ESM output of each.
   Object.freeze({ path: "cli.js", kind: "file", source: "tsup" }),
   Object.freeze({ path: "directory-capability-worker.js", kind: "file", source: "tsup" }),
