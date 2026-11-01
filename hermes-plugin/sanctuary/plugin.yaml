@@ -1,0 +1,5 @@
+name: sanctuary
+kind: standalone
+description: Sanctuary tools and native-call guard.
+version: 1.0.0
+author: Erik Newton

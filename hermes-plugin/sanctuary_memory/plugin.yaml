@@ -1,0 +1,5 @@
+name: sanctuary_memory
+kind: exclusive
+description: Persistent memory through Sanctuary.
+version: 1.0.0
+author: Erik Newton
