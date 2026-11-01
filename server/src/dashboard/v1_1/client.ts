@@ -35,6 +35,7 @@ import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-stat
 import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
 import { ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE } from "./templates.js";
 import { CARD_OPERATION_MAX_CHARS } from "../../hub/charter-approval-bridge.js";
+import { composeProtectionLayers } from "../../agent-native/protection-layers.js";
 
 /**
  * Returns the inline client script body. The HTML shell wraps this in
@@ -7033,17 +7034,19 @@ function layerDotClass(l) {
 function postureLayerLines() {
   const d = state.posture.data;
   const seal = deriveSeal();
-  var wallV;
-  if (seal.arm === "armed" && seal.freshness.current) wallV = "enforcing";
-  else if (seal.arm === "armed") wallV = "evidence not current";
-  // S5-P: honest coarse-only line - the coarse wall IS enforcing, the
-  // fine-grained exclusive-egress stack is not live. Non-green (warn) below.
-  else if (seal.arm === "coarse_only") wallV = "coarse-only (exclusive egress not live)";
-  else if (seal.arm === "degraded") wallV = "degraded";
-  else if (seal.arm === "locked_down") wallV = "locked down";
-  else if (seal.arm) wallV = "not enforcing";
-  else wallV = "unknown";
-  const wallWarn = !(seal.arm === "armed" && seal.freshness.current);
+  const home = sourceLoaded("/api/posture/home") ? state.posture.home : null;
+  // Must match protection_layers in principal-policy/posture-home-types.ts.
+  const inventory = home && Array.isArray(home.protection_layers)
+    ? home.protection_layers : ${JSON.stringify(composeProtectionLayers({}))};
+  const layers = inventory.map(function (row) {
+    // The shared observation may lose freshness while the page remains open.
+    const status = row.id === "castle_wall" && row.status === "on" && !evidenceCurrent(home && home.castle_wall)
+      ? "unknown" : row.status;
+    const detail = row.id === "castle_wall" && home && home.castle_wall && home.castle_wall.arm_state === "coarse_only"
+      ? "; coarse-only (exclusive egress not live)" : "";
+    return { k: row.name, v: (status === "unknown" ? "Unknown" : status.replace("_", " ")) + detail,
+      unknown: status === "unknown", off: status === "off" || status === "not_built" };
+  });
   const pending = heldApprovalItems(null).length;
   const approvalsEvidence = approvalQueueEvidence();
   // Only a complete, readable queue without recognized or unknown holds can earn a clear Charter row.
@@ -7053,17 +7056,12 @@ function postureLayerLines() {
     { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
-    { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
-    // No read this page makes carries a Sentinel report, and a roster of
-    // protected agents is not evidence that a Sentinel is watching them, so
-    // this line is Unknown until a Sentinel report is part of a read.
-    { k: "Sentinels watching agents", v: "Unknown", unknown: true },
     // Every value short of earned clear keeps the warning; unknown values retain the shared Unknown dot.
     { k: "Charter approvals", v: approvalsValue, warn: approvalsValue !== "clear" },
     // A Heralds layer that is configured but not active is not signing: it
     // reads "configured" with the warn dot, never the pass dot.
     { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 || d.layers.l4.status !== "active" }
-  ];
+  ].concat(layers);
 }
 
 async function onAutoTriggerRecommendation(ruleId, action) {

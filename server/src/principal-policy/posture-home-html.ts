@@ -359,6 +359,7 @@ export function renderPostureHomeHTML(): string {
 
   <section>
     <h2>Security features</h2>
+    <div class="panel" id="protection-layers"><span class="empty">Loading layers…</span></div>
     <div class="panel" id="features"><span class="empty">Loading…</span></div>
   </section>
 
@@ -638,6 +639,19 @@ export function renderPostureHomeHTML(): string {
       default:
         return "";
     }
+  }
+
+  function renderProtectionLayers(rows) {
+    var el = document.getElementById("protection-layers");
+    if (!Array.isArray(rows)) {
+      el.innerHTML = '<span class="empty">Layer evidence unavailable.</span>';
+      return;
+    }
+    el.innerHTML = rows.map(function (r) {
+      return '<div class="fh-row"><span class="pill ' + (r.status === "on" ? "green" : "amber") + '">' +
+        esc(r.status.replace("_", " ")) + '</span><span class="name">' + esc(r.name) +
+        '</span><span class="why">' + esc(r.basis) + '</span></div>';
+    }).join("");
   }
 
   function renderFeatures(panel) {
@@ -1803,6 +1817,8 @@ export function renderPostureHomeHTML(): string {
     renderAnomalies(findings);
     renderWall(home.castle_wall);
     renderFeatures(home.feature_health);
+    // Must match protection_layers in posture-home-types.ts.
+    renderProtectionLayers(home.protection_layers);
     renderCustodyExit(home.custody_exit);
     renderQueryPrivacy(home.query_privacy);
     renderPanelStatus(home);

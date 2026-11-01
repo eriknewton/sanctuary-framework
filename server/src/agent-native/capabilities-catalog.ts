@@ -56,7 +56,7 @@ export const COOPERATIVE_CAPABILITIES: readonly CapabilityEntry[] = [
   },
   {
     tool: COOPERATIVE_TOOL_NAMES.activeProtections,
-    does: "Lists the security guarantees currently in force (encrypted-at-rest state, approval-gate mediation, append-only audit, opaque memory handles).",
+    does: "Lists every layer with its evidence-based status, including off, not built, and unknown, alongside the legacy guarantee flags.",
     when: "You need to tell a counterparty, or yourself, what protections apply right now.",
   },
   {
@@ -309,7 +309,7 @@ export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
     matches: /\bprotect(s|ed|ion|ions)?\b|\bguarantees?\b|\bsafeguards?\b/,
     tool: EVALUATE_ROUTE_TOOLS.activeProtections,
     example: {},
-    why_sanctuary: "sanctuary_active_protections reports only what is active; absence of a flag is not a claim.",
+    why_sanctuary: "sanctuary_active_protections names every layer and reports its evidence-based status, including off, not built, and unknown.",
     guidance: buildBoundsParagraph(),
   },
   {

@@ -1597,7 +1597,7 @@ describe("slice 2b shell wired consumers", () => {
     });
     await settle();
     h.navigate("enforcement");
-    const m = h.el.main!.innerHTML.match(/<span class="(pp-dot[^"]*)"><\/span><span class="pp-k">Sentinels watching agents<\/span><span class="pp-v">([^<]*)<\/span>/);
+    const m = h.el.main!.innerHTML.match(/<span class="(pp-dot[^"]*)"><\/span><span class="pp-k">Sentinels<\/span><span class="pp-v">([^<]*)<\/span>/);
     expect(m, "Sentinels line").toBeTruthy();
     expect(m![1]).toBe("pp-dot unknown");
     expect(m![2]).toBe("Unknown");

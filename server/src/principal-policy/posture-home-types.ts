@@ -23,6 +23,7 @@
  */
 
 import type { ProducerKeyObservation, PosturePanelId, PosturePanelStatus } from "./panel-producer.js";
+import type { ProtectionLayerRow } from "../agent-native/protection-layers.js";
 
 import type {
   CastleWallPosture,
@@ -83,6 +84,8 @@ export const POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE = String.raw`function parseEv
  * endpoint. Built by `buildHome` in `posture-routes.ts`.
  */
 export interface PostureHome {
+  /** Shared inventory; must match protection_layers in posture-home-html.ts and dashboard/v1_1/client.ts. Older producers may omit it. */
+  protection_layers?: ProtectionLayerRow[];
   /** Must match the key-observation copy rendered by the posture-home consumers. */
   producer_keys?: { producer: ProducerKeyObservation; broker: ProducerKeyObservation; message: string | null };
   panels: Record<PosturePanelId, PosturePanelStatus>;

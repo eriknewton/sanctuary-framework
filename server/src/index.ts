@@ -2190,6 +2190,8 @@ export async function createSanctuaryServer(options?: {
     currentSessionBinding,
     primitiveTools: l1Tools,
     storage,
+    stateStore,
+    responseScreen,
     approvalProofStore,
   });
 
