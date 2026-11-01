@@ -459,7 +459,13 @@ export const AUDIT_ROTATION_HYSTERESIS = Math.max(1, Math.floor(DEFAULT_MAX_ENTR
 
 // Raw stderr must remain usable when the audit store itself cannot be reconciled.
 export const AUDIT_RECOUNT_DIAGNOSTIC_PREFIX = "[audit-log] AUDIT-RECOUNT";
-const AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_CONTEXT = "AUDIT-CHECKPOINT-RANGE";
+export const AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_PREFIX = "[audit-log] AUDIT-CHECKPOINT-RANGE";
+
+// The base preserved backend listing order among collation ties. Noncanonical
+// names can tie, so code-unit order is the only backend-independent tie break.
+function compareAuditKeys(a: string, b: string): number {
+  return a.localeCompare(b) || (a < b ? -1 : a > b ? 1 : 0);
+}
 
 type PersistedEntryHashCollection =
   | { status: "complete"; hashes: string[] }
@@ -1152,6 +1158,8 @@ const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
+/** One third of the 30 s hold leaves two thirds for append and due checkpoint work. */
+export const AUDIT_PRUNE_EPISODE_BUDGET_MS = DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS / 3;
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two
@@ -2213,6 +2221,7 @@ export class AuditLog {
   private retainedHighestKey = "";
   private bytesProvenance: "seeded" | "unknown" = "unknown";
   private recountFaultLatched = false;
+  private checkpointRangeFaultLatched = false;
   private readonly rotationHysteresis: number;
   // A load may publish its sized observation only while this mutation generation matches.
   private retentionGeneration = 0;
@@ -2654,7 +2663,7 @@ export class AuditLog {
       const seq = parseEntryKeySequence(m.key);
       return seq !== null && seq <= tip;
     });
-    sealed.sort((a, b) => a.key.localeCompare(b.key));
+    sealed.sort((a, b) => compareAuditKeys(a.key, b.key));
     // Fold the actual stored bytes of every sealed entry into the digest. Any
     // in-place tamper flips a per-entry hash; a deletion drops a key from the
     // run (marked "<absent>" if it vanishes between list and read). A read
@@ -2815,9 +2824,9 @@ export class AuditLog {
           // An own entry need not sort after a foreign non-entry key; keep the
           // actual extrema so an unchanged population does not force a recount.
           const empty = this.retainedSignatureExpected === "0";
-          const lowest = empty || key.localeCompare(this.retainedLowestKey) < 0
+          const lowest = empty || compareAuditKeys(key, this.retainedLowestKey) < 0
             ? key : this.retainedLowestKey;
-          const highest = empty || key.localeCompare(this.retainedHighestKey) > 0
+          const highest = empty || compareAuditKeys(key, this.retainedHighestKey) > 0
             ? key : this.retainedHighestKey;
           this.retainedLowestKey = lowest;
           this.retainedHighestKey = highest;
@@ -3018,7 +3027,7 @@ export class AuditLog {
     return seq === null ? sealedTipSequence <= 0 : seq > sealedTipSequence;
   }
 
-  /** Same count/ends shape as auditEntryListingSignature; keys use localeCompare. */
+  /** Same count/ends shape as auditEntryListingSignature; keys use compareAuditKeys. */
   private retentionSignature(keys: readonly string[]): string {
     if (keys.length === 0) return "0";
     // Discovery sorts the snapshot once; only the appended own key can be out
@@ -3027,8 +3036,8 @@ export class AuditLog {
     const first = keys[0]!;
     const last = keys[keys.length - 1]!;
     const priorLast = keys.at(-2) ?? first; // Penultimate item is the old sorted maximum after an own append.
-    const lowest = first.localeCompare(last) <= 0 ? first : last;
-    const highest = priorLast.localeCompare(last) > 0 ? priorLast : last;
+    const lowest = compareAuditKeys(first, last) <= 0 ? first : last;
+    const highest = compareAuditKeys(priorLast, last) > 0 ? priorLast : last;
     return `${keys.length}:${lowest}:${highest}`;
   }
 
@@ -3095,6 +3104,7 @@ export class AuditLog {
       // persistChainedEntry AFTER its own lock has been released, so this
       // re-acquisition cannot deadlock; interval checkpoints use the append lock.
       await this.withAuditWriteLock(async (signal) => {
+        const episodeStarted = performance.now();
         // Re-list INSIDE the lock: another rotator may have pruned since the
         // pre-check, so recompute the cut against the authoritative state.
         this.assertAuditWriteLockActive(signal);
@@ -3120,7 +3130,7 @@ export class AuditLog {
           console.error(`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} recovered`);
           this.recountFaultLatched = false;
         }
-        metas.sort((a, b) => a.key.localeCompare(b.key));
+        metas.sort((a, b) => compareAuditKeys(a.key, b.key));
         // Always keep at least one entry as the surviving anchor base — even
         // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than
         // a single entry, where rotationDeleteCount would otherwise return
@@ -3133,48 +3143,32 @@ export class AuditLog {
         if (toDelete <= 0) this.seedRetention(metas);
         if (toDelete <= 0) return;
 
-        // Authenticate the cut BEFORE pruning. The new lowest-surviving entry is
-        // metas[toDelete] (v2 keys are zero-padded by sequence; legacy v1 keys —
-        // `${epochMs}-${n}` — are digit-prefixed and sort BEFORE `entry-`, so
-        // they prune first and never interleave). Only prune once we have either
-        // (a) written a MAC anchor for a v2 cut, or (b) confirmed the cut lands on
-        // a legacy/non-v2 entry (the legacy-anchor path covers that prefix). If we
-        // cannot read/parse the new base, or the anchor write fails, ABORT the
-        // prune: deleting without an authenticated anchor would let the next load
-        // silently TOFU-re-anchor an unauthenticated cut, defeating the
-        // fail-closed guarantee. Rotation retries on the next append.
-        let safeToPrune = false;
-        try {
+        let deletedCount = 0;
+        // The anchor always names the lowest survivor after the next delete:
+        // interruption leaves at most one entry below the cut, as at the base.
+        // Never batch deletes behind one anchor.
+        for (let k = 0; k < toDelete; k++) {
           this.assertAuditWriteLockActive(signal);
-          const newBaseRaw = await this.storage.read(
-            AUDIT_NAMESPACE,
-            metas[toDelete]!.key
-          );
-          this.assertAuditWriteLockActive(signal);
-          if (newBaseRaw) {
-            const parsed = JSON.parse(bytesToString(newBaseRaw));
-            if (isPersistedAuditEnvelopeV2(parsed)) {
-              this.assertAuditWriteLockActive(signal);
-              await this.writeRotationAnchor(parsed.sequence, parsed.prev_hash);
-              this.assertAuditWriteLockActive(signal);
-            }
-            // Reached only if the v2 anchor was written, or the cut is legacy/
-            // non-v2 (no chained anchor needed) — both are safe to prune.
-            safeToPrune = true;
+          if (k > 0 && performance.now() - episodeStarted >= AUDIT_PRUNE_EPISODE_BUDGET_MS) break;
+          const newBaseRaw = await this.storage.read(AUDIT_NAMESPACE, metas[k + 1]!.key);
+          if (!newBaseRaw) return;
+          const parsed = JSON.parse(bytesToString(newBaseRaw));
+          if (isPersistedAuditEnvelopeV2(parsed)) {
+            // Check before publication: an expired hold cannot move the cut
+            // past a survivor when its delete will never be issued.
+            this.assertAuditWriteLockActive(signal);
+            await this.writeRotationAnchor(parsed.sequence, parsed.prev_hash);
           }
-        } catch {
-          safeToPrune = false;
-        }
-        if (!safeToPrune) return;
-
-        for (let i = 0; i < toDelete; i++) {
+          // Legacy/non-v2 cuts retain the base's no-chained-anchor rule.
           this.assertAuditWriteLockActive(signal);
-          const deleted = await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
+          const deleted = await this.storage.delete(AUDIT_NAMESPACE, metas[k]!.key);
           this.assertAuditWriteLockActive(signal);
-          // A refused delete cannot be subtracted from the surviving byte seed.
+          // A refused delete leaves the surviving population uncertain.
           if (!deleted) return;
+          deletedCount++;
         }
-        this.seedRetention(metas.slice(toDelete));
+        // Budget exits happen between steps and seed only confirmed survivors.
+        this.seedRetention(metas.slice(deletedCount));
       });
     } catch (err) {
       this.bytesProvenance = "unknown";
@@ -4388,7 +4382,7 @@ export class AuditLog {
       return "list-error";
     }
     if (metas.length === 0) return "0";
-    metas.sort((a, b) => a.key.localeCompare(b.key));
+    metas.sort((a, b) => compareAuditKeys(a.key, b.key));
     const newestKey = metas[metas.length - 1]!.key;
     // Order-independent aggregate of per-entry size+mtime: catches an in-place
     // rewrite (size or mtime changes) without paying a per-read full sort/hash
@@ -4593,7 +4587,7 @@ export class AuditLog {
     try {
       const metas = await this.storage.list(AUDIT_NAMESPACE);
       if (metas.length === 0) return "0";
-      metas.sort((a, b) => a.key.localeCompare(b.key));
+      metas.sort((a, b) => compareAuditKeys(a.key, b.key));
       return `${metas.length}:${metas[0]!.key}:${metas[metas.length - 1]!.key}`;
     } catch {
       // A listing error is itself a sign of concurrent mutation; return a
@@ -5435,7 +5429,7 @@ export class AuditLog {
    * exactly the contention window the drill observed, starving flow-decision
    * writes with `AuditLockContentionError`.
    *
-   * The consumer sorts the complete names-only snapshot with localeCompare,
+   * The consumer sorts the complete names-only snapshot with compareAuditKeys,
    * preserving the prior list order even for noncanonical suffixes. Entry keys
    * embed fixed-width sequence prefixes; legacy keys are skipped in memory.
    * Walking backward from the tail and stopping at the first
@@ -5482,8 +5476,8 @@ export class AuditLog {
       this.cachedSealedTip = sealedTipSequence;
     }
     // Must match listKeys' order contract in storage/interface.ts: the consumer
-    // restores today's comparator, including noncanonical duplicate suffixes.
-    keys.sort((a, b) => a.localeCompare(b));
+    // applies locale collation with a total tie break for noncanonical names.
+    keys.sort(compareAuditKeys);
     for (let i = keys.length - 1; i >= 0; i--) {
       const key = keys[i]!;
       if (!key.startsWith("entry-")) continue;
@@ -5950,7 +5944,7 @@ export class AuditLog {
       if (this.retentionGeneration === seedGeneration) {
         if (!consumer && findings.length === 0) {
           const surviving = storedEntriesRaw.filter((meta) => this.aboveSealedFloor(meta.key, effectiveSealedTip));
-          surviving.sort((a, b) => a.key.localeCompare(b.key));
+          surviving.sort((a, b) => compareAuditKeys(a.key, b.key));
           this.seedRetention(surviving);
         } else {
           this.bytesProvenance = "unknown";
@@ -7436,7 +7430,6 @@ export class AuditLog {
           previousCheckpointSequence + 1,
           sealedTipSequence + 1
         );
-        if (fromSequence > checkpointSequence) return;
         const collected = await this.collectPersistedEntryHashes(
           fromSequence,
           checkpointSequence,
@@ -7447,12 +7440,21 @@ export class AuditLog {
         // Only complete, unique occupancy can authorize signing control writes;
         // a nonempty prefix is not evidence for the declared complete range.
         if (collected.status === "incomplete") {
-          this.notifySigningControlWriteFailure(
-            `${AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_CONTEXT} incomplete (${collected.reason} at sequence ${collected.atSequence})`,
-            new Error(collected.reason),
-          );
+          // Range occupancy is not signing-control evidence: stderr only, once
+          // per incomplete episode, with no subscriber, finding or durable write.
+          if (!this.checkpointRangeFaultLatched) {
+            this.checkpointRangeFaultLatched = true;
+            console.error(`${AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_PREFIX} incomplete (${collected.reason} at sequence ${collected.atSequence})`);
+          }
           return;
         }
+        if (this.checkpointRangeFaultLatched) {
+          this.checkpointRangeFaultLatched = false;
+          console.error(`${AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_PREFIX} recovered`);
+        }
+        // Even an already-covered range must observe every above-floor body
+        // fault before resolving, as the base's collector did.
+        if (fromSequence > checkpointSequence) return;
         const hashes = collected.hashes;
         await this.writeCheckpointRecord({
           checkpoint_kind: "audit-checkpoint",
@@ -7498,9 +7500,9 @@ export class AuditLog {
     const keys = typeof this.storage.listKeys === "function"
       ? await this.storage.listKeys(AUDIT_CHECKPOINT_NAMESPACE, "audit-checkpoint-")
       : (await this.storage.list(AUDIT_CHECKPOINT_NAMESPACE, "audit-checkpoint-")).map((meta) => meta.key);
-    // Preserve list's comparator and all-record traversal: filenames neither
+    // Preserve all-record traversal in total key order: filenames neither
     // establish the parsed maximum nor excuse an earlier record's read fault.
-    keys.sort((a, b) => a.localeCompare(b));
+    keys.sort(compareAuditKeys);
     let highest = 0;
     for (const key of keys) {
       // F2 Option A: the operator's own checkpoints are always ABOVE the sealed
@@ -7547,7 +7549,7 @@ export class AuditLog {
     // every entry body above the sealed tip is read, as before. Reusing keys
     // saves one listing; body reads are unchanged, amortized over the checkpoint
     // interval. A cheaper collector needs authenticated key/envelope agreement.
-    for (const key of keys) {
+    for (const key of [...keys].sort(compareAuditKeys)) {
       if (!key.startsWith("entry-")) continue;
       const seq = parseEntryKeySequence(key);
       if (seq !== null && seq <= sealedTipSequence) continue;

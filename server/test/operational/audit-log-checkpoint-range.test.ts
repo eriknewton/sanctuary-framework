@@ -3,7 +3,7 @@ import fs, { mkdtemp, rm } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, writeAuditStoreSplitBoundary, deriveAuditStoreSplitBoundaryMacKey } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { computeAuditRoot } from "../../src/audit/chain.js";
@@ -98,7 +98,7 @@ describe("complete persisted checkpoint ranges", () => {
       expect(await storage.listKeys("_audit_checkpoints", "audit-checkpoint-")).toEqual([]);
       expect((log as any).hashesSinceCheckpoint).toHaveLength(pending + 1);
       expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining(reason));
-      expect(JSON.stringify(events)).toContain(reason);
+      expect(events).toEqual([]);
     });
   }
 
@@ -135,7 +135,7 @@ async function checkpointSetup(deadline = 500) {
 async function anchored(raw: FilesystemStorage, sequence: number) {
   const anchor = decode((await raw.read("_audit_checkpoints", "__head_anchor"))!);
   expect(anchor.data.highest_sequence).toBe(sequence);
-  const tailKey = (await raw.listKeys("_audit")).find((key) => key.startsWith(`entry-${String(sequence).padStart(20, "0")}-`))!;
+  const tailKey = (await raw.list("_audit")).map((meta) => meta.key).find((key) => key.startsWith(`entry-${String(sequence).padStart(20, "0")}-`))!;
   expect(decode((await raw.read("_audit", tailKey))!).entry_hash).toBe(anchor.data.head_hash);
 }
 
@@ -287,4 +287,136 @@ it("does not issue checkpoint persistence after a signer outlives the hold", asy
   finally { hold.release(); await settled.wait; await new Promise((resolve) => setImmediate(resolve)); }
   expect(write.mock.calls.filter(([ns, key]) => ns === "_audit_checkpoints" && key.startsWith("audit-checkpoint-"))).toEqual([]);
   expect(await raw.read("_audit_checkpoints", checkpointKey(4))).toBeNull();
+});
+
+for (const fault of [false, true]) {
+  it(`reads older unsealed bodies even when another writer covered the range, EIO=${fault}`, async () => {
+    const { raw, log: a } = await checkpointSetup();
+    const b = new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+    await b.query({ limit: 1 }); await b.flush();
+    const oldest = ((await raw.list("_audit")).map((meta) => meta.key))[0]!;
+    const read = raw.read.bind(raw); const error = Object.assign(new Error("covered-range body EIO"), { code: "EIO" });
+    const reads = vi.spyOn(raw, "read").mockImplementation(async (ns, key) => {
+      if (fault && ns === "_audit" && key === oldest) throw error;
+      return read(ns, key);
+    });
+    const writes = vi.spyOn(raw, "write");
+    if (fault) await expect(a.flush()).rejects.toBe(error);
+    else await a.flush();
+    expect(reads.mock.calls).toContainEqual(["_audit", oldest]);
+    expect(writes.mock.calls.filter(([ns, key]) => ns === "_audit_checkpoints" && key.startsWith("audit-checkpoint-"))).toEqual([]);
+  });
+}
+
+it("latches incomplete range stderr and reports recovery without signing-control events", async () => {
+  const raw = new MemoryStorage(); const events: unknown[] = [];
+  const log = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, checkpointInterval: 4,
+    integrityAnomalySubscribers: [(event) => { events.push(event); }] });
+  for (let i = 0; i < 3; i++) await log.appendCritical(measureEntry(i));
+  const key = ((await raw.list("_audit")).map((meta) => meta.key))[1]!; const bytes = (await raw.read("_audit", key))!;
+  await raw.delete("_audit", key);
+  const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+  const writes = vi.spyOn(raw, "write");
+  for (let i = 0; i < 4; i++) await log.appendCritical(measureEntry(i));
+  expect(diagnostic.mock.calls.filter(([line]) => String(line).includes("AUDIT-CHECKPOINT-RANGE"))).toEqual([
+    [expect.stringContaining("incomplete (gap")],
+  ]);
+  expect(events).toEqual([]);
+  expect((log as any).integrityFindings).toEqual([]);
+  expect(writes.mock.calls.filter(([ns, key]) => ns !== "_audit" && key !== "__head_anchor" && key !== "audit-head-anchor-established-v1")).toEqual([]);
+  await raw.write("_audit", key, bytes); await log.appendCritical(measureEntry(7));
+  expect(diagnostic.mock.calls.filter(([line]) => String(line).includes("AUDIT-CHECKPOINT-RANGE"))).toEqual([
+    [expect.stringContaining("incomplete (gap")], ["[audit-log] AUDIT-CHECKPOINT-RANGE recovered"],
+  ]);
+});
+
+it("uses a total order for collation ties across memory insertion orders and filesystem", async () => {
+  const source = new MemoryStorage(); const generator = new AuditLog(source, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+  for (let i = 0; i < 3; i++) await generator.appendCritical(measureEntry(i));
+  const canonical = (await source.list("_audit")).map((meta) => meta.key);
+  const first = (await source.read("_audit", canonical[0]!))!;
+  const second = (await source.read("_audit", canonical[1]!))!;
+  const third = (await source.read("_audit", canonical[2]!))!;
+  const prefix = `entry-${String(9).padStart(20, "0")}-`;
+  // Soft hyphen is collation-ignorable and round-trips through the byte-sized filesystem codec.
+  const ties = [`${prefix}z\u00ad`, `${prefix}z`];
+  expect(ties[0]!.localeCompare(ties[1]!)).toBe(0);
+  const outcomes: number[] = [];
+  for (const [index, storage] of [new MemoryStorage(), new MemoryStorage(), new FilesystemStorage(join(root, "ties"))].entries()) {
+    await storage.write("_audit", canonical[0]!, first);
+    const log = new AuditLog(storage, MEASURE_MASTER_KEY, MEASURE_CONFIG);
+    await (log as any).writeHeadAnchor(1, decode(first).entry_hash);
+    await log.query({ limit: 1 });
+    for (const i of index === 1 ? [1, 0] : [0, 1]) await storage.write("_audit", ties[i]!, i === 0 ? third : second);
+    const discovered = await (log as any).withAuditWriteLock((signal: unknown) => (log as any).readLatestPersistedChainState(signal));
+    // The base returned the chain state directly; the candidate also returns its held keys.
+    expect((discovered.latest ?? discovered).nextSequence).toBe(4);
+    await log.appendCritical(measureEntry(3)); outcomes.push(log.currentInMemorySequence());
+  }
+  expect(outcomes).toEqual([4, 4, 4]);
+});
+
+it("accepts both records sharing a predecessor when the successor persists before an abandoned write", async () => {
+  const { raw, log } = await checkpointSetup();
+  const write = raw.write.bind(raw); const hold = gate(); const entered = gate(); const settled = gate();
+  vi.spyOn(raw, "write").mockImplementation(async (ns, key, bytes) => {
+    if (ns === "_audit_checkpoints" && key === checkpointKey(4)) {
+      entered.release(); await hold.wait;
+      try { await write(ns, key, bytes); } finally { settled.release(); }
+      return;
+    }
+    await write(ns, key, bytes);
+  });
+  const append = log.appendCritical(measureEntry(3));
+  const rejected = expect(append).rejects.toMatchObject({ name: "AuditLockHoldDeadlineError" });
+  try {
+    await entered.wait; await rejected;
+    await log.appendCritical(measureEntry(4));
+    expect(await raw.read("_audit_checkpoints", checkpointKey(4))).toBeNull();
+  } finally { hold.release(); await settled.wait; await new Promise((resolve) => setImmediate(resolve)); }
+  const records = await Promise.all([4, 5].map(async (seq) => decode((await raw.read("_audit_checkpoints", checkpointKey(seq)))!)));
+  expect(records.map((record) => record.previous_checkpoint_sequence)).toEqual([0, 0]);
+  expect((await new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG).query({ limit: 1 })).integrity_findings).toEqual([]);
+});
+
+async function sealFixture(raw: FilesystemStorage, path: string, log: AuditLog) {
+  const head = await log.getChainHead();
+  await writeAuditStoreSplitBoundary(path, deriveAuditStoreSplitBoundaryMacKey(MEASURE_MASTER_KEY), {
+    sealed_tip_sequence: head.sequence, sealed_base_sequence: 1,
+    sealed_tip_entry_hash: head.entry_hash, daemon_namespace: "_audit-daemon",
+  });
+}
+
+it("refuses sealed checkpoint non-permission EIO on the real checkpoint append path", async () => {
+  const { raw, path, log: original } = await checkpointSetup();
+  await original.flush(); await sealFixture(raw, path, original);
+  const log = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, checkpointInterval: 1, consultSplitBoundary: true });
+  await log.query({ limit: 1 });
+  const read = raw.read.bind(raw); const error = Object.assign(new Error("sealed checkpoint EIO"), { code: "EIO" });
+  vi.spyOn(raw, "read").mockImplementation(async (ns, key) => {
+    if (ns === "_audit_checkpoints" && key === checkpointKey(3)) throw error;
+    return read(ns, key);
+  });
+  await expect(log.appendCritical(measureEntry(3))).rejects.toBe(error);
+  expect(await read("_audit_checkpoints", checkpointKey(4))).toBeNull();
+  await anchored(raw, 4);
+});
+
+it("continues after a suffix-marker write failure and retries on the next append", async () => {
+  const { raw, path, log: original } = await checkpointSetup();
+  await sealFixture(raw, path, original);
+  const log = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, consultSplitBoundary: true });
+  await log.query({ limit: 1 });
+  const write = raw.write.bind(raw); let failedKey = "";
+  const writes = vi.spyOn(raw, "write").mockImplementation(async (ns, key, bytes) => {
+    if (ns === "_meta" && key === "audit-post-split-suffix-established-v1" && !failedKey) { failedKey = key; throw new Error("suffix marker fault"); }
+    await write(ns, key, bytes);
+  });
+  await log.appendCritical(measureEntry(3));
+  expect(failedKey).not.toBe(""); expect((log as any).postSplitSuffixMarkerEnsured).toBe(false);
+  await anchored(raw, 4);
+  await log.appendCritical(measureEntry(4));
+  expect((log as any).postSplitSuffixMarkerEnsured).toBe(true);
+  expect(writes.mock.calls.filter(([ns, key]) => ns === "_meta" && key === failedKey)).toHaveLength(2);
+  expect(await raw.read("_meta", failedKey)).not.toBeNull();
 });

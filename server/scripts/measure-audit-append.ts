@@ -2,7 +2,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import { AuditLog, type AuditLogConfig, type AuditEntryInput } from "../src/operational/audit-log.js";
+import { AuditLog, AUDIT_PRUNE_EPISODE_BUDGET_MS, type AuditLogConfig, type AuditEntryInput } from "../src/operational/audit-log.js";
 import { FilesystemStorage } from "../src/storage/filesystem.js";
 import type { StorageBackend, StorageEntryMeta } from "../src/storage/interface.js";
 
@@ -108,11 +108,11 @@ async function main(): Promise<void> {
     ms: number; readdir_ms: number; decode_ms: number; sort_ms: number;
     key_strings: number; key_array_length: number; gc_ms: number; fsync: number; filehandle_sync: number;
     sized_listings: number; names_listings: number; readdirs: number;
-    stat_ms: number; prune_ms: number; deleted: number;
+    stat_ms: number; prune_ms: number; deleted: number; hold_ms: number; collection_ms: number;
   };
   const empty = (): Sample => ({ key_array_length: 0, ms: 0, readdir_ms: 0, decode_ms: 0, sort_ms: 0, key_strings: 0,
     gc_ms: 0, fsync: 0, filehandle_sync: 0, sized_listings: 0, names_listings: 0,
-    readdirs: 0, stat_ms: 0, prune_ms: 0, deleted: 0 });
+    readdirs: 0, stat_ms: 0, prune_ms: 0, deleted: 0, hold_ms: 0, collection_ms: 0 });
   let sample: Sample | undefined;
   let listing = false;
   const original = { readdir: fs.readdir, stat: fs.stat, open: fs.open, fsync: fsCallback.fsync, sort: Array.prototype.sort };
@@ -184,15 +184,65 @@ async function main(): Promise<void> {
     }
     const remove = Storage.prototype.delete;
     Storage.prototype.delete = async function (...args) {
+      const active = sample;
       const result = await remove.apply(this, args);
-      if (sample && args[0] === "_audit" && result) sample.deleted++;
+      if (active && args[0] === "_audit" && result) active.deleted++;
+      return result;
+    };
+    let episode: { hold_ms: number; steps: number; anchors: number; planned: number } | undefined;
+    const hold = (Log.prototype as any).withAuditWriteLock;
+    (Log.prototype as any).withAuditWriteLock = async function (callback: (...args: any[]) => Promise<any>) {
+      let began: number | undefined;
+      const active = sample; const pruning = episode;
+      try {
+        return await hold.call(this, async (...args: any[]) => {
+          began = performance.now();
+          return callback(...args);
+        });
+      } finally {
+        // Measure the owning hold's settlement, even if its callback outlives
+        // the deadline; abandoned callback cleanup is not another live hold.
+        if (began !== undefined) {
+          const elapsed = performance.now() - began;
+          if (active) active.hold_ms += elapsed;
+          if (pruning) pruning.hold_ms += elapsed;
+        }
+      }
+    };
+    const collect = (Log.prototype as any).collectPersistedEntryHashes;
+    (Log.prototype as any).collectPersistedEntryHashes = async function (...args: any[]) {
+      const began = performance.now(); const active = sample;
+      try { return await collect.apply(this, args); }
+      finally { if (active) active.collection_ms += performance.now() - began; }
+    };
+    const anchor = (Log.prototype as any).writeRotationAnchor;
+    (Log.prototype as any).writeRotationAnchor = async function (...args: any[]) {
+      const pruning = episode;
+      await anchor.apply(this, args); if (pruning) pruning.anchors++;
+    };
+    const count = (Log.prototype as any).rotationDeleteCount;
+    (Log.prototype as any).rotationDeleteCount = function (...args: any[]) {
+      const result = count.apply(this, args);
+      if (episode) episode.planned = Math.min(result, args[0].length - 1);
       return result;
     };
     const rotate = (Log.prototype as any).maybeRotate;
     (Log.prototype as any).maybeRotate = async function (...args: any[]) {
       const start = performance.now(); const active = sample; const deletedBefore = active?.deleted ?? 0;
+      if (active) episode = { hold_ms: 0, steps: 0, anchors: 0, planned: 0 };
       try { return await rotate.apply(this, args); }
-      finally { if (active && active.deleted > deletedBefore) active.prune_ms += performance.now() - start; }
+      finally {
+        if (active && episode) {
+          episode.steps = active.deleted - deletedBefore;
+          if (episode.planned > 0) {
+            active.prune_ms += performance.now() - start;
+            process.stdout.write(JSON.stringify({ type: "prune-episode", label, ...episode,
+              budget_stopped: episode.steps < episode.planned && this.bytesProvenance === "seeded",
+              budget_ms: AUDIT_PRUNE_EPISODE_BUDGET_MS }) + "\n");
+          }
+        }
+        episode = undefined;
+      }
     };
     const quantile = (values: number[], fraction: number) => [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * fraction))]!;
     // Three growth-phase samples and 2,100 durable cap appends cross the
@@ -202,16 +252,20 @@ async function main(): Promise<void> {
       { population: 10_000, appends: 100, cap: false },
       { population: 100_000, appends: 100, cap: false },
       { population: 100_000, appends: 2_100, cap: true },
+      { population: 100_000, appends: 1, cap: true, name: "prune-episode" },
+      { population: 100_000, appends: 1, cap: false, name: "checkpoint-due", checkpoint: true },
     ];
     process.stdout.write(JSON.stringify({ type: "method", label, sourceServer, node: process.version,
       platform: process.platform, sandbox, synthetic: true, durability: true, synthetic_durable_writes: true,
       uv_threadpool_size: process.env.UV_THREADPOOL_SIZE ?? "default", expose_gc: typeof global.gc === "function" }) + "\n");
     for (const scenario of scenarios) {
-      const path = join(sandbox, `${scenario.population}-${scenario.cap ? "cap" : "growth"}`);
+      const path = join(sandbox, `${scenario.population}-${scenario.name ?? (scenario.cap ? "cap" : "growth")}`);
       const generatedAt = performance.now();
       const generated = await prepopulateAudit(path, scenario.population, Log, Storage, true);
       const writer = new Log(generated.storage, MEASURE_MASTER_KEY, {
         ...MEASURE_CONFIG, ...(scenario.cap ? { maxEntries: scenario.population } : {}),
+        // Cold load has no critical appends; interval one makes exactly the measured append due.
+        ...(scenario.checkpoint ? { checkpointInterval: 1 } : {}),
       });
       await writer.query({ limit: 1 });
       global.gc?.();
@@ -225,7 +279,7 @@ async function main(): Promise<void> {
         sample.ms = performance.now() - started;
         await new Promise((resolve) => setImmediate(resolve));
         samples.push(sample);
-        process.stdout.write(JSON.stringify({ type: "append", label, population: scenario.population, cap: scenario.cap, index, ...sample }) + "\n");
+        process.stdout.write(JSON.stringify({ type: "append", label, ...scenario, index, ...sample }) + "\n");
         sample = undefined;
       }
       const times = samples.map((value) => value.ms);
@@ -235,6 +289,7 @@ async function main(): Promise<void> {
       }) + "\n");
       await fs.rm(path, { recursive: true, force: true });
     }
+    process.stdout.write(JSON.stringify({ type: "complete", label, scenarios: scenarios.length }) + "\n");
   } finally {
     sample = undefined; observer.disconnect();
     Object.assign(fs, { readdir: original.readdir, stat: original.stat, open: original.open });

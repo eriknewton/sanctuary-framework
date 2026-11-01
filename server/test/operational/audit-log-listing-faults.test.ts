@@ -595,3 +595,68 @@ for (const faultKind of ["readdir", "raw-name"] as const) {
     expect(write).not.toHaveBeenCalled();
   });
 }
+
+it("lets the original writer continue after a separate strict reader detects a metadata fault", async () => {
+  const { raw, log, path } = await setup();
+  const oldest = ((await raw.list("_audit")).map((meta) => meta.key))[0]!;
+  const fault = injectFsFault("stat", join(path, "_audit", `${oldest}.enc`));
+  const separate = new AuditLog(new FilesystemStorage(path), MEASURE_MASTER_KEY, MEASURE_CONFIG);
+  await expect(separate.query({ limit: 1 })).rejects.toMatchObject({ name: "AuditIntegrityError",
+    findings: expect.arrayContaining([expect.objectContaining({ kind: "storage_unavailable" })]) });
+  await log.appendCritical(measureEntry(3));
+  expect(log.currentInMemorySequence()).toBe(4);
+  expect((log as any).integrityFindings).toEqual([]);
+  fault.restore();
+});
+
+it("marks a timed-out entry write unknown after its late landing and recounts next append", async () => {
+  const { raw } = await setup();
+  const counted = countedStorage(raw);
+  const log = new AuditLog(counted.storage, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, writeLockHoldDeadlineMs: 200 });
+  await log.query({ limit: 1 });
+  const write = raw.writeDurable.bind(raw); const hold = gate(); const entered = gate(); const settled = gate();
+  let pause = true;
+  vi.spyOn(raw, "writeDurable").mockImplementation(async (ns, key, bytes) => {
+    if (pause && ns === "_audit") {
+      pause = false; entered.release(); await hold.wait;
+      try { await write(ns, key, bytes); } finally { settled.release(); }
+      return;
+    }
+    await write(ns, key, bytes);
+  });
+  const append = log.appendCritical(measureEntry(3));
+  const rejected = expect(append).rejects.toMatchObject({ name: "AuditLockHoldDeadlineError" });
+  try { await entered.wait; await rejected; }
+  finally { hold.release(); await settled.wait; await new Promise((resolve) => setImmediate(resolve)); }
+  expect((log as any).bytesProvenance).toBe("unknown");
+  expect((await raw.list("_audit")).map((meta) => meta.key)).toHaveLength(4);
+  counted.reset(); await log.appendCritical(measureEntry(4));
+  expect(counted.calls.get("list:_audit")).toBe(1);
+  expect((log as any).bytesProvenance).toBe("seeded");
+  expect(log.currentInMemorySequence()).toBe(5);
+});
+
+it("crosses the fallback cap twice with full E plus L accounting and surviving legacy records", async () => {
+  const raw = new MemoryStorage(); const legacy = ["z-legacy-0", "z-legacy-1"];
+  const encryptionKey = derivePurposeKey(MEASURE_MASTER_KEY, "audit-log");
+  for (const key of legacy) await raw.write("_audit", key,
+    encode(encrypt(encode({ ...measureEntry(0), timestamp: new Date().toISOString() }), encryptionKey)));
+  const wrapper = new Proxy(raw, { get(target, key) {
+    if (key === "listKeys") return undefined;
+    const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+  } });
+  // A cap of five and a one-entry margin gives two deletes at each crossing.
+  const log = new AuditLog(wrapper, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, maxEntries: 5 });
+  const remove = vi.spyOn(raw, "delete");
+  const anchors = vi.spyOn(log as any, "writeRotationAnchor");
+  for (let i = 0; i < 6; i++) {
+    await log.appendCritical(measureEntry(i));
+    const metas = await raw.list("_audit");
+    expect((log as any).retainedCountExpected).toBe(metas.length);
+    expect((log as any).retainedBytesEstimate).toBe(metas.reduce((sum, meta) => sum + meta.size_bytes, 0));
+    for (const key of legacy) expect(await raw.exists("_audit", key)).toBe(true);
+  }
+  expect(remove).toHaveBeenCalledTimes(4);
+  expect(anchors.mock.calls.map(([seq]) => seq)).toEqual([4, 5, 6, 7]);
+  expect((await new AuditLog(wrapper, MEASURE_MASTER_KEY, MEASURE_CONFIG).query({ limit: 10 })).integrity_findings).toEqual([]);
+});

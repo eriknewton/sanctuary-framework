@@ -119,3 +119,5 @@ with 99,097 retained entries, below the 100,000 cap.
 
 Linux measurements do not establish a Darwin directory-capability latency bound.
 APFS measurements and worker error-class validation remain separate platform work.
+
+Candidate rows are re-measured on the final source.

@@ -13,7 +13,7 @@ are unchanged by names-only enumeration.
 The append queue serializes each instance's writes. Filesystem writers acquire
 the shared audit write lock before discovering the durable tail and allocating
 a sequence. Discovery takes one complete `listKeys("_audit")` snapshot, sorts it
-with `localeCompare`, and walks backward over entry keys. The sealed-region floor
+with `localeCompare` and a code-unit tie break, and walks backward over entry keys. The sealed-region floor
 and malformed-tail handling remain part of discovery. A backend without
 `listKeys` uses its sized listing with the `entry-` prefix to preserve discovery's refusal boundary.
 
@@ -64,7 +64,11 @@ sealed boundary protects them, and including the append's own durable write
 exactly once. The byte estimate is seeded from sized metadata. Unknown provenance
 or a changed count, lowest key, or highest key requires an authoritative sized
 listing before the decision. Pruning runs under the audit write lock and seeds
-only confirmed survivors. A partial failure leaves provenance unknown. A load
+only confirmed survivors. Each step authenticates the next survivor before deleting one entry. An episode
+stops between steps after its 10-second budget, one third of the 30-second hold
+deadline; later over-cap appends continue toward the low target. The budget
+starts when the rotation hold begins and includes recount time. At least one
+step is attempted when pruning is due. A partial failure leaves provenance unknown. A load
 cannot publish an older seed across an own append or rotation.
 
 On a backend without `listKeys`, legacy non-entry records make the entry-only
@@ -108,3 +112,82 @@ successor's flight.
 The performance measurement uses synthetic pre-population followed by a strict
 cold load and real durable filesystem appends. It does not establish a Darwin
 capability-path latency bound; that requires a separate platform run.
+
+## 6. Tamper Model
+
+AES-GCM authenticates encrypted entry contents. The V2 hash chain, authenticated
+head and rotation anchors, and checkpoint verification also report chain and
+retention inconsistencies. Strict reads refuse hard findings; lenient reads
+retain the findings for inspection. These mechanisms do not establish an
+independent append-only proof against an actor holding the fortress master key.
+
+Plain filenames expose timing metadata because entry keys include timestamps and sequences. Multi-fortress correlation from directory names and modification times is therefore outside the encryption boundary.
+
+Castle Wall Phase 1 complements this model at the egress boundary. It is not an audit-log cryptographic proof system; it reduces the chance that encrypted audit blobs or unlocked data leave the machine without operator authorization. A master key from another fortress does not decrypt this fortress's audit entries unless the key material matches.
+
+## 7. PQ Migration Implications
+
+Local entries use symmetric encryption and a hash chain, rather than per-entry
+asymmetric signatures. Signed checkpoints use Ed25519 and are a separate
+asymmetric migration surface; they need explicit versioned migration guidance.
+
+The entry-encryption path uses:
+
+- Argon2id derives the 32-byte master key from the fortress passphrase.
+- HKDF-SHA256 derives the `audit-log` purpose key.
+- AES-256-GCM encrypts each entry.
+
+HKDF-SHA256 and AES-256-GCM remain the relevant symmetric primitives in the post-quantum threat model. The more sensitive migration surfaces are passphrase strength and KDF parameters, envelope versioning for encrypted payloads, and any future asymmetric wrapping layer added around fortress-master material. If the mantle binding later introduces asymmetric master-key wrapping, that wrapping layer is where ML-KEM-768 belongs. It is not an audit-entry migration and should not be implemented as local audit-entry signatures.
+
+Because the current encrypted payload schema has `v: 1` and `alg: "aes-256-gcm"` but no key-wrap metadata, a crypto-agility pass should design explicit envelope metadata before changing algorithms or adding KEM-wrapped key material.
+
+## 8. Comparison To V1.x Federation Envelope Signing
+
+The federation protocol is a separate audit surface. `server/docs/federation-protocol-v0.1-spec.md` section 5 defines canonical audit nodes, streamed audit batches, per-node signatures, HMAC chain proofs, and previous-batch hash continuity. In that path, wire events and audit batches are signed by per-node keys and verified against the fortress-master-anchored trust chain.
+
+Local `AuditLog` does not use that federation envelope format. It writes encrypted local entries through the storage backend. The federation path has a signature-scheme and batch-chain migration problem; the local audit log has entry-encryption, checkpoint-signature, retention, and storage-integrity migration concerns.
+
+## 9. Operator-Facing Implications
+
+The audit log is unreadable while the fortress is locked because reads require the same master key used to derive the audit purpose key. Unlock through the normal passphrase path, recovery key path, or guardian recovery cascade restores access to the encrypted entries as long as the recovered master key matches the key used to write them.
+
+Operators should inspect the log through `monitor_audit_log`, `audit_export_siem`, dashboard views that bind an unlocked `AuditLog`, or purpose-specific CLIs such as `secrets audit`. Direct `cat` or `grep` of `_audit/*.enc` shows envelopes containing encrypted payloads and chain metadata.
+
+Retention is operator-policy-driven only through `AuditLogConfig` at construction today; defaults are 100 MiB and 100,000 entries. Existing multi-tenancy documentation states that cross-tenant or cross-fortress audit aggregation is not performed by the multi-agent dashboard. Each fortress storage path owns its own `_audit` namespace and master-key-derived audit key.
+
+## 10. Open Questions And Future Work
+
+- Explicit AAD binding: local audit entries currently pass no AES-GCM AAD. A future envelope could bind `fortress_id`, namespace, and key into authentication.
+- Durability: filesystem entry and anchor writes use durable barriers. Platform drills remain necessary to establish interruption behavior on each supported filesystem.
+- Cross-process contention: filesystem writers share an audit lock. Lockless backends retain their multi-writer coordination bound.
+- Rollback evidence: chain and authenticated anchor checks cover retained-history consistency; independent evidence outside the fortress remains a separate design question.
+- Memory hygiene: the audit purpose key is held in the `AuditLog` instance as `encryptionKey`; zeroization on fortress lock or shutdown is not implemented in this class.
+- Corruption visibility: integrity findings accompany lenient reads, and strict reads refuse hard findings. Operator workflows must preserve those verdicts when exporting or aggregating results.
+- Envelope agility: encrypted payloads expose algorithm and version, but no KDF parameters, key id, fortress id, or wrapping metadata for future PQ or rotation migrations.
+
+## Source Verification
+
+Primary implementation files inspected:
+
+- `server/src/operational/audit-log.ts`
+- `server/src/core/key-derivation.ts`
+- `server/src/core/encryption.ts`
+- `server/src/storage/interface.ts`
+- `server/src/storage/filesystem.ts`
+- `server/src/index.ts`
+- `server/src/config.ts`
+- `server/src/paths.ts`
+- `server/src/wrap/passphrase.ts`
+- `server/src/wrap/cli.ts`
+- `server/src/disclosure/broker/open.ts`
+- `server/src/cli/secrets.ts`
+- `server/src/audit/siem-tools.ts`
+- `server/src/dashboard/v1_1/wiring.ts`
+- `server/src/dashboard/v1_1/dispatch.ts`
+- `server/src/console/view-aggregator.ts`
+- `server/docs/DEPLOYMENT.md`
+- `server/docs/multi-tenancy.md`
+- `server/docs/hkdf-info-string-registry.md`
+- `server/docs/federation-protocol-v0.1-spec.md`
+
+Discrepancy recorded: the dispatch framing described a whole-log master-key-wrapped encrypted blob. The source implements individually encrypted per-entry files under `_audit`, using the `audit-log` HKDF purpose key. The migration guidance above follows the implementation rather than the dispatch assumption.
