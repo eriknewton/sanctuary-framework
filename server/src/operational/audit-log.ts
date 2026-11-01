@@ -1158,14 +1158,14 @@ const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 export const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 export const DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS = 30_000;
-/** Reserve one second of the five-second acquisition timeout for contention overhead. */
-const AUDIT_PRUNE_CONTENTION_MARGIN_MS = 1_000;
-/** Rotation has its own hold after append unlocks; budget for a waiting writer's
- * 5 s acquisition timeout with a 1 s margin, never above a third of the hold. */
-export const AUDIT_PRUNE_EPISODE_BUDGET_MS = Math.min(
-  Math.floor(DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS / 3),
-  AUDIT_WRITE_LOCK_TIMEOUT_MS - AUDIT_PRUNE_CONTENTION_MARGIN_MS,
-);
+/** Rotation runs in its own hold after the append unlocks. The episode budget is a third
+ * of the configured hold, counted from hold entry, so the in-lock recount and the steps
+ * together leave two thirds of the deadline unused. It cannot be held under the 5 s
+ * acquisition timeout: at the 100,000-entry cap the in-lock sized recount alone takes
+ * about 5.5 s on box 1, so a smaller budget runs one step per append at cap (measured,
+ * job 873). A writer in another process can time out during an at-cap episode, about
+ * once per episode, as at the base where every at-cap hold took about 21 s. */
+export const AUDIT_PRUNE_EPISODE_BUDGET_MS = Math.floor(DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS / 3);
 const DEFAULT_AUDIT_SELF_HELD_STALE_LOCK_MS = 60_000;
 // Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
 // carries neither `pid` nor `acquired_at` cannot be proven stale by the two
@@ -2432,10 +2432,7 @@ export class AuditLog {
     this.writeLockHoldDeadlineMs = resolveWriteLockHoldDeadlineMs(
       config?.writeLockHoldDeadlineMs
     );
-    this.pruneEpisodeBudgetMs = Math.min(
-      Math.floor(this.writeLockHoldDeadlineMs / 3),
-      AUDIT_WRITE_LOCK_TIMEOUT_MS - AUDIT_PRUNE_CONTENTION_MARGIN_MS,
-    );
+    this.pruneEpisodeBudgetMs = Math.floor(this.writeLockHoldDeadlineMs / 3);
     this.selfHeldStaleLockMs = resolveSelfHeldStaleLockMs(
       config?.selfHeldStaleLockMs,
       this.writeLockHoldDeadlineMs
