@@ -72,7 +72,8 @@ the append releases its lock; later over-cap appends continue toward the low tar
 The budget starts when the rotation hold begins and includes recount time. The
 recount and an in-flight step can overrun the budget. At least one step is attempted
 when pruning is due. The next rotation hold of any writer deletes an entry left
-below the authenticated rotation anchor. A partial failure leaves provenance
+below the authenticated rotation anchor when the entry the anchor names is present.
+A partial failure leaves provenance
 unknown. A load cannot publish an older seed across an own append or rotation.
 
 On a backend without `listKeys`, legacy non-entry records make the entry-only
