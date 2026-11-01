@@ -17,6 +17,10 @@ const digest = (text: string) => createHash("sha256").update(text).digest("hex")
 const refusal = { outcome: "unavailable", message: "This is not available yet; nothing was done." };
 const denied = { outcome: "denied", message: "Request denied." };
 const runsRequired = 5; // Five independent cold processes are the timing sample.
+const assertNoSessionSearch = (report: Record<string, unknown>) => {
+  expect(Array.isArray(report.executed_tools)).toBe(true);
+  expect(report.executed_tools).not.toContain("session_search");
+};
 
 describe.skipIf(!python)("Hermes persistent memory through the installed plugin pair", () => {
   let fixture: Fixture;
@@ -25,11 +29,15 @@ describe.skipIf(!python)("Hermes persistent memory through the installed plugin 
 
   it("loads, saves, recalls, preserves refusals, guards native calls and settles transport loss", async () => {
     // Keep every session in this case so the temporary credential store survives until teardown.
-    const loading = await fixture.session(python!, "loading");
+    const loading = await fixture.session(python!, "recall-session-search");
     expect(loading.provider).toBe("sanctuary_memory");
     expect(loading.plugin_loaded).toBe(true);
     expect(loading.memory_store_none).toBe(true);
     expect(loading.spawns).toBe(1);
+
+    // The same recall assertion must reject an actual inline search in the driver process.
+    expect(loading.executed_tools.filter((name: string) => name === "session_search")).toHaveLength(1);
+    expect(() => assertNoSessionSearch(loading)).toThrow();
 
     const saved = await fixture.session(python!, "save");
     expect(saved.executed_tools).toContain("remember");
@@ -51,11 +59,12 @@ describe.skipIf(!python)("Hermes persistent memory through the installed plugin 
     expect(JSON.stringify(await fixture.audit())).not.toContain(query);
     expect(recalled.shim_log).not.toContain(query);
     expect(recalled.hermes_log).not.toContain(query);
-    expect(recalled.executed_tools).not.toContain("session_search");
+    assertNoSessionSearch(recalled);
 
     const runs = [];
     for (let run = 0; run < runsRequired; run++) {
       const report = await fixture.session(python!, "recall");
+      assertNoSessionSearch(report);
       const measured = { prefetch_ms: report.prefetch_ms, ready_ms: report.ready_ms,
         within_budget: report.prefetch_ms <= RECALL_PREFETCH_BUDGET_MS,
         context_has_answer: report.context.includes("Thursday 3pm") };

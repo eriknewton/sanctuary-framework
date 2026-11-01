@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 from collections import deque
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -93,10 +94,14 @@ def resolve_command():
         return None
 
 
-def normalize(text):
+def lexical_form(text):
     text = re.sub(r"/+", "/", text.casefold().replace("\\", "/"))
     # A run of dot components is removed in one pass, preserving linear work.
-    return posixpath.normpath(re.sub(r"/(?:\./)+", "/", text))
+    return re.sub(r"/(?:\./)+", "/", text)
+
+
+def normalize(text):
+    return posixpath.normpath(lexical_form(text))
 
 
 def guard(tool_name=None, args=None, **kwargs):
@@ -109,8 +114,10 @@ def guard(tool_name=None, args=None, **kwargs):
         while pending:
             value = pending.pop()
             if isinstance(value, str):
-                normalized = normalize(value)
-                if root + "/" in normalized or normalized.endswith(root):
+                literal = lexical_form(value)
+                normalized = posixpath.normpath(literal)
+                # Match both forms because a whole command can contain more than one path.
+                if any(root + "/" in form or form.endswith(root) for form in (literal, normalized)):
                     return {"action": "block", "message": OUTCOMES["denied"]["message"]}
             elif isinstance(value, (dict, list, tuple)) and id(value) not in seen:
                 seen.add(id(value))
@@ -446,7 +453,9 @@ class Client:
             except Exception:
                 if call is not None:
                     call.result = uncertain(call.name, call.sent)
-                self._end_process()
+                # Cleanup must not terminate the worker that settles queued callers.
+                with suppress(Exception):
+                    self._end_process()
             finally:
                 reply = None
                 if call is not None:
@@ -469,12 +478,25 @@ class Client:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
                 return True
+            except PermissionError:
+                pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             pause.wait(min(remaining, self.exit_seconds / 10))  # Ten bounded group-exit checks per grace period.
 
     def _end_process(self):
+        # Teardown is bounded and never raises; on macOS a group whose leader is an unreaped zombie answers EPERM, which means still present.
+        try:
+            self._end_process_locked()
+        except Exception:
+            # An indeterminate teardown cannot authorize a replacement generation.
+            with self.condition:
+                self.stopped = True
+                self.ready.clear()
+                self.condition.notify_all()
+
+    def _end_process_locked(self):
         with self.reap_lock:
             with self.condition:
                 self.ready.clear()
@@ -487,6 +509,7 @@ class Client:
                 if self.pending is not None:
                     self.pending["event"].set()
                     self.pending = None
+            group_settled = False
             try:
                 try:
                     process.stdin.close()
@@ -499,35 +522,52 @@ class Client:
                 # The group owns the lifetime even when its leader has already exited.
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
+                except OSError:
                     pass
-                if not self._group_gone(process):
+                group_settled = self._group_gone(process)
+            except Exception:
+                # Any interrupted grace period still reaches SIGKILL and the bounded leader wait.
+                pass
+            finally:
+                if not group_settled:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
+                        group_settled = True
                     except ProcessLookupError:
+                        group_settled = True
+                    except Exception:
                         pass
-                    self._group_gone(process)
+                    with suppress(Exception):
+                        self._group_gone(process)
                 try:
                     process.wait(timeout=self.exit_seconds)
-                except subprocess.TimeoutExpired:
-                    # A replacement needs a reaped leader; an unsettled generation stops admission.
+                except Exception:
+                    group_settled = False
+                # Replacement requires an absent group or SIGKILL plus a reaped leader.
+                if not group_settled:
                     with self.condition:
                         self.stopped = True
-            finally:
-                if reader is not None and reader is not threading.current_thread():
-                    reader.join(self.exit_seconds)
-                process.stdout.close()
+                with suppress(Exception):
+                    if reader is not None and reader is not threading.current_thread():
+                        reader.join(self.exit_seconds)
+                with suppress(Exception):
+                    process.stdout.close()
 
     def close(self):
-        with self.condition:
-            self.stopped = True
-            for call in self.queue:
-                call.done.set()
-            self.queue.clear()
-            self.condition.notify_all()
-        self._end_process()
-        if self.worker is not None and self.worker is not threading.current_thread():
-            self.worker.join(self.exit_seconds)
+        try:
+            with self.condition:
+                self.stopped = True
+                for call in self.queue:
+                    call.done.set()
+                self.queue.clear()
+                self.condition.notify_all()
+            self._end_process()
+        except Exception:
+            pass
+        finally:
+            with suppress(Exception):
+                if self.worker is not None and self.worker is not threading.current_thread():
+                    self.worker.join(self.exit_seconds)
 
 
 _client = None

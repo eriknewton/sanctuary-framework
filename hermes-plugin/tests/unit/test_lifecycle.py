@@ -215,6 +215,109 @@ class LifecycleTests(unittest.TestCase):
     def test_close_kills_group_that_ignores_term(self):
         self.group_case(False, ignore_term=True)
 
+    def permission_probe_case(self, always):
+        self.data["hold_reply"] = True
+        client = self.client()
+        client.connect_background()
+        self.assertTrue(client.ready.wait(WAIT_SECONDS))
+        leader = client.process
+        original_killpg = os.killpg
+        probes, signals = {}, []
+        transient_probes = 2  # Two EPERM answers precede the absent-group answer.
+
+        def killpg(pgid, signum):
+            if signum == 0:
+                probes[pgid] = probes.get(pgid, 0) + 1
+                if always or probes[pgid] <= transient_probes:
+                    raise PermissionError("group still present")
+                raise ProcessLookupError("group gone")
+            if pgid == leader.pid:
+                signals.append(signum)
+            return original_killpg(pgid, signum)
+
+        with patch.object(c.os, "killpg", side_effect=killpg), patch.object(leader, "wait", wraps=leader.wait) as waited:
+            started = time.monotonic()
+            self.assertEqual(client.call("memory_insert", fixture.INSERT), c.OUTCOMES["unconfirmed"])
+            with client.condition:
+                self.assertTrue(client.condition.wait_for(lambda: client.active is None, WAIT_SECONDS))
+            self.assertLess(time.monotonic() - started, WAIT_SECONDS)
+            self.assertGreater(probes[leader.pid], transient_probes)
+            self.assertIsNotNone(leader.returncode, "teardown must reap the leader itself")
+            self.assertTrue(waited.call_args_list)
+            self.assertTrue(all(call.kwargs.get("timeout") == client.exit_seconds for call in waited.call_args_list))
+            self.assertIn(signal.SIGTERM, signals)
+            if always:
+                self.assertIn(signal.SIGKILL, signals)
+            self.assertTrue(client.worker.is_alive())
+            self.data["hold_reply"] = False
+            self.scenario.write_text(fixture.json.dumps(self.data))
+            self.assertEqual(client.call("memory_insert", fixture.INSERT), {"outcome": "saved", "message": "Saved."})
+            self.assertNotEqual(client.process.pid, leader.pid)
+            replacement = client.process
+            started = time.monotonic()
+            client.close()
+            self.assertLess(time.monotonic() - started, WAIT_SECONDS)
+            self.assertIsNotNone(replacement.returncode)
+            self.assertGreater(probes[replacement.pid], transient_probes)
+        self.assertFalse(client.worker.is_alive())
+
+    def test_teardown_transient_permission_probe_respawns(self):
+        self.permission_probe_case(False)
+
+    def test_teardown_persistent_permission_probe_respawns(self):
+        self.permission_probe_case(True)
+
+    def test_worker_survives_teardown_exception(self):
+        self.data["hold_reply"] = True
+        client = self.client()
+        client.connect_background()
+        self.assertTrue(client.ready.wait(WAIT_SECONDS))
+        original = client._end_process
+
+        def end_then_raise():
+            original()
+            raise RuntimeError("teardown fixture")
+
+        with patch.object(client, "_end_process", side_effect=end_then_raise):
+            # Force a sent-call fault without relying on a reader or deadline race.
+            with patch.object(client, "_connect", return_value=True):
+                self.assertEqual(client.call("memory_insert", fixture.INSERT), c.OUTCOMES["unconfirmed"])
+                with client.condition:
+                    self.assertTrue(client.condition.wait_for(lambda: client.active is None, WAIT_SECONDS))
+        self.data["hold_reply"] = False
+        self.scenario.write_text(fixture.json.dumps(self.data))
+        self.assertEqual(client.call("memory_insert", fixture.INSERT), {"outcome": "saved", "message": "Saved."})
+        self.assertTrue(client.worker.is_alive())
+        with patch.object(client, "_end_process", side_effect=end_then_raise):
+            client.close()
+        self.assertFalse(client.worker.is_alive())
+
+    def test_teardown_unexpected_probe_exception_reaps_and_closes(self):
+        client = self.client()
+        client.connect_background()
+        self.assertTrue(client.ready.wait(WAIT_SECONDS))
+        leader = client.process
+        with patch.object(client, "_group_gone", side_effect=RuntimeError("probe fixture")):
+            client._end_process()
+        self.assertIsNotNone(leader.returncode)
+        self.assertTrue(leader.stdin.closed)
+        self.assertTrue(leader.stdout.closed)
+        self.assertFalse(client.stopped, "SIGKILL and leader reap permit replacement")
+        self.assertEqual(client.call("memory_insert", fixture.INSERT), {"outcome": "saved", "message": "Saved."})
+        client.close()
+
+    def test_teardown_unsettled_group_stops_admission(self):
+        client = self.client()
+        client.connect_background()
+        self.assertTrue(client.ready.wait(WAIT_SECONDS))
+        leader = client.process
+        with patch.object(c.os, "killpg", side_effect=PermissionError("group still present")):
+            client._end_process()
+        self.assertIsNotNone(leader.returncode)
+        self.assertTrue(client.stopped)
+        self.assertEqual(client.call("memory_insert", fixture.INSERT), c.OUTCOMES["unavailable"])
+        client.close()
+
     def test_descriptors_above_select_limit(self):
         required = 1100  # Exceeds select's 1024 descriptor ceiling with room for shim pipes.
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

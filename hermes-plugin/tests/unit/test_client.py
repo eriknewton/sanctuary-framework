@@ -415,6 +415,15 @@ class EntryTests(unittest.TestCase):
         for path in ("/Library/Application Support/Other/../Sanctuary/state", c.SANCTUARY_INSTALL_ROOT.rstrip("/")):
             self.assertEqual(c.guard("read_file", {"path": path}), {"action": "block", "message": "Request denied."})
 
+    def test_guard_literal_and_normalized_command_paths(self):
+        for command in ("cat /../Library/Application Support/Sanctuary/key",
+                        "cat x/../Library/Application Support/Sanctuary/key",
+                        "cat '/Library/Application Support/Sanctuary/file' /../../tmp/ordinary"):
+            with self.subTest(command=command):
+                self.assertEqual(c.guard("terminal", {"command": command}),
+                                 {"action": "block", "message": "Request denied."})
+        self.assertIsNone(c.guard("terminal", {"command": "cat /tmp/ordinary"}))
+
     def test_guard_exception_blocks_and_never_approves(self):
         with patch.object(c, "normalize", side_effect=RuntimeError()):
             self.assertEqual(c.guard("read_file", {}), {"action": "block", "message": c.OUTCOMES["denied"]["message"]})

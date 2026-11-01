@@ -74,13 +74,14 @@ def main():
         from agent.tool_guardrails import classify_tool_failure
         from agent.memory_manager import build_memory_context_block
         from tools.registry import registry
+        from tools import session_search_tool
         agent = AIAgent(base_url="http://127.0.0.1:9/v1", api_key="offline-fixture", model="offline-fixture",
                         provider="custom", enabled_toolsets=["sanctuary", "file"], quiet_mode=True,
                         tool_progress_mode="off", skip_context_files=True, tool_delay=0)
         shared = sys.modules["sanctuary_hermes_client"]
         client = shared.get_client()
         observers = contextlib.ExitStack()
-        # Record actual registry and provider dispatch throughout the session, including prefetch.
+        # Observe registry and provider dispatch plus the executor's inline session search throughout the session.
         def observe(original):
             def dispatched(name, *values, **kwargs):
                 report["executed_tools"].append(name)
@@ -90,6 +91,11 @@ def main():
         if agent._memory_manager is not None:
             observers.enter_context(patch.object(agent._memory_manager, "handle_tool_call",
                                                  side_effect=observe(agent._memory_manager.handle_tool_call)))
+        original_session_search = session_search_tool.session_search
+        def observed_session_search(*values, **kwargs):
+            report["executed_tools"].append("session_search")
+            return original_session_search(*values, **kwargs)
+        observers.enter_context(patch.object(session_search_tool, "session_search", side_effect=observed_session_search))
         try:
             report["memory_store_none"] = agent._memory_store is None
             report["plugin_loaded"] = "sign_statement" in manager._plugin_tool_names
@@ -116,18 +122,7 @@ def main():
                 report["raw_results"] = [message["content"] for message in tool_messages]
                 return [json.loads(message["content"]) for message in tool_messages]
 
-            if args.scenario == "loading":
-                report["results"] = execute([("sign_statement", {"statement": "hello"})])
-                provider.prefetch("empty")
-            elif args.scenario in ("save", "fault-insert", "no-shim"):
-                start = time.monotonic()
-                report["results"] = execute([("remember", {"text": TEXT})])
-                tool_ms = (time.monotonic() - start) * MS_PER_SECOND
-                if args.scenario == "no-shim":
-                    start = time.monotonic()
-                    report["context"] = agent._memory_manager.prefetch_all(QUERY)
-                    report["within_budgets"] = tool_ms < shared.HERMES_TOOL_TIMEOUT_MS and (time.monotonic() - start) * MS_PER_SECOND < shared.RECALL_PREFETCH_BUDGET_MS
-            elif args.scenario == "recall":
+            def recall():
                 returned = []
                 original = provider.prefetch
                 def observed(query, **kwargs):
@@ -140,6 +135,26 @@ def main():
                     report["prefetch_ms"] = (time.monotonic() - start) * MS_PER_SECOND
                 report["context"] = build_memory_context_block(context)
                 report["provider_sha256"] = hashlib.sha256(returned[0].encode()).hexdigest()
+                if args.scenario == "recall-session-search":
+                    execute([("session_search", {"query": "observer fixture"})])
+
+            if args.scenario in ("loading", "recall-session-search"):
+                report["results"] = execute([("sign_statement", {"statement": "hello"})])
+                if args.scenario == "loading":
+                    provider.prefetch("empty")
+                else:
+                    # Reuse the loading prefetch so the observer check adds no bridge requests.
+                    recall()
+            elif args.scenario in ("save", "fault-insert", "no-shim"):
+                start = time.monotonic()
+                report["results"] = execute([("remember", {"text": TEXT})])
+                tool_ms = (time.monotonic() - start) * MS_PER_SECOND
+                if args.scenario == "no-shim":
+                    start = time.monotonic()
+                    report["context"] = agent._memory_manager.prefetch_all(QUERY)
+                    report["within_budgets"] = tool_ms < shared.HERMES_TOOL_TIMEOUT_MS and (time.monotonic() - start) * MS_PER_SECOND < shared.RECALL_PREFETCH_BUDGET_MS
+            elif args.scenario == "recall":
+                recall()
             elif args.scenario.startswith("refusals"):
                 report["results"] = execute([("sign_statement", {"statement": "I approve the Q3 plan."}),
                                              ("protection_rules", {}), ("export_memory", {"scope": "all"})], args.scenario.endswith("concurrent"))
