@@ -26,7 +26,7 @@ async function fixture() {
   await adapter.insertPassage({ passage_id: "a", text: "board meeting" }, "user_content");
   const corpus = new SdwDocumentCorpusStore({ storage, masterKey, fortressId });
   const writes: NodeToRelayInput[] = [], audits: HermesBridgeAuditRecord[] = [];
-  const core = new HermesBridgeCore({ agentId: "agent", abort: new AbortController(), adapter,
+  const core = new HermesBridgeCore({ completeAuditInsert() {}, agentId: "agent", abort: new AbortController(), adapter,
     writeFrame: frame => writes.push(frame), appendAudit: async row => {
       audits.push(row); if (rejectAudit) throw new Error("audit fixture");
     }, nowMs: () => now, setTimer: () => ({}), clearTimer() {} });

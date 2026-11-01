@@ -191,6 +191,7 @@ function makeHarness(options: {
     },
   };
   const ports: HermesBridgeCorePorts = {
+    completeAuditInsert() {},
     writeFrame(input) {
       if (input.type === "probe" && options.writeProbeThrows === true) {
         throw new Error("writer stopped");

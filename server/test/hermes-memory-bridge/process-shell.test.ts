@@ -35,6 +35,9 @@ import {
   runHermesBridgeProcess as runProductionHermesBridgeProcess,
 } from "../../src/hermes-memory-bridge/index.js";
 import { HermesBridgeCore } from "../../src/hermes-memory-bridge/bridge-core.js";
+import * as bridgeCoreModule from "../../src/hermes-memory-bridge/bridge-core.js";
+import { AuditForwarder } from "../../src/hermes-memory-bridge/process-shell.js";
+import { HERMES_AUDIT_WAITING_CAP, HERMES_AUDIT_PROCESS_ROWS } from "../../src/hermes-memory-bridge/constants.js";
 import { HermesApprovalLedger } from "../../src/hermes-memory-bridge/approval-ledger.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { TRAP_STORE_KEY_PREFIX, TRAP_STORE_NAMESPACE } from "../../src/honeypot/trap-store.js";
@@ -1581,9 +1584,95 @@ describe("Hermes memory process shell", () => {
     }
   });
 
+  // The production forwarder retains terminal capacity through the shutdown handoff deadline.
+  it("names every cancelled admission at full capacity across the handoff deadline", async () => {
+    const fixture = await seededFortress("terminal-exit");
+    const pair = await socketPair();
+    let stderrText = "";
+    let release!: () => void;
+    const stalled = new Promise<void>(resolve => { release = resolve; });
+    let deadline: number | undefined;
+    let waitingAtStop = 0;
+    let closeSnapshot: { durableAdmissions: number; afterDeadline: boolean; terminalRows: number } | undefined;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    const originalAppend = AuditLog.prototype.appendCritical;
+    const durable: Array<{ kind?: unknown; entryId?: unknown }> = [];
+    const append = vi.spyOn(AuditLog.prototype, "appendCritical").mockImplementation(async function (this: AuditLog, row) {
+      if (row.details?.kind === "insert_admitted" && durable.length === 0) await stalled;
+      if (deadline !== undefined && clock === undefined) {
+        // The tail timer is armed before this continuation; real storage now commits after the handoff deadline.
+        clock = vi.spyOn(performance, "now").mockReturnValue(deadline + 1);
+      }
+      await originalAppend.call(this, row);
+      durable.push(row.details ?? {});
+    });
+    const accepted: string[] = [];
+    const originalForward = AuditForwarder.prototype.append;
+    const forward = vi.spyOn(AuditForwarder.prototype, "append").mockImplementation(function (this: AuditForwarder, row) {
+      if (row.kind === "insert_admitted") accepted.push(row.entryId!);
+      return originalForward.call(this, row);
+    });
+    const originalStop = AuditForwarder.prototype.stopHandOffAt;
+    const stop = vi.spyOn(AuditForwarder.prototype, "stopHandOffAt").mockImplementation(function (this: AuditForwarder, at) {
+      waitingAtStop = (this as unknown as { waiting: unknown[] }).waiting.length;
+      deadline = at;
+      originalStop.call(this, at);
+      release();
+    });
+    const originalClose = AuditForwarder.prototype.close;
+    const close = vi.spyOn(AuditForwarder.prototype, "close").mockImplementation(function (this: AuditForwarder, ...args) {
+      closeSnapshot = {
+        durableAdmissions: durable.filter(row => row.kind === "insert_admitted").length,
+        afterDeadline: performance.now() > deadline!,
+        terminalRows: (this as unknown as { waiting: Array<{ record: { kind: string } }> }).waiting
+          .filter(entry => entry.record.kind === "insert_refused").length,
+      };
+      return originalClose.apply(this, args);
+    });
+    let shell: Awaited<ReturnType<typeof runHermesBridgeProcess>> | undefined;
+    try {
+      shell = await runHermesBridgeProcess({ env: fixture.env, relaySocketFactory: () => pair.shell,
+        storageFor: dir => new FilesystemStorage(join(dir, "state")), uid: process.getuid?.() ?? 0,
+        stderr: { write: chunk => { stderrText += String(chunk); return true; } } });
+      expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+      pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      // One handed-off admission plus the entire call waiting share; latch space stays separate.
+      const admissions = HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS + 1;
+      for (let n = 0; n < admissions; n++) {
+        const request_id = `cancel-${n}`;
+        pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id, name: "memory_insert",
+          arguments: { text: "private terminal fixture", taint: "user_content", passage_id: request_id } }));
+        const probe = await readNodeFrame(pair.relay);
+        expect(probe.type).toBe("probe");
+        pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+        await waitUntil(() => accepted.length === n + 1);
+        pair.relay.write(relayPublicFrame("c1", { type: "cancel", mcp_request_id: request_id }));
+        await readPublicResponse(pair.relay, request_id);
+        await waitUntil(() => shell!.core.snapshot().slot === undefined);
+      }
+      expect(durable).toHaveLength(0);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await shell.exited).toBe(EXIT_CLEAN);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(waitingAtStop).toBe(HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS);
+      expect(closeSnapshot).toEqual({ durableAdmissions: 1, afterDeadline: true, terminalRows: 1 });
+      const terminal = durable.filter(row => row.kind === "insert_refused" || row.kind === "insert_unconfirmed");
+      for (const id of accepted) expect(terminal.filter(row => row.entryId === id).length).toBeLessThanOrEqual(1);
+      const diagnostics = [...stderrText.matchAll(/terminal_audit_unconfirmed count=(\d+) reason=(shutdown_deadline)\n/g)];
+      expect(diagnostics).toHaveLength(1);
+      expect(terminal.length + Number(diagnostics[0]![1])).toBe(accepted.length);
+      expect(stderrText).not.toContain("private terminal fixture");
+    } finally {
+      release(); clock?.mockRestore();
+      shell?.signalStop("SIGTERM"); if (shell !== undefined) await shell.exited;
+      append.mockRestore(); forward.mockRestore(); stop.mockRestore(); close.mockRestore(); pair.close();
+    }
+  });
+
   // A normal process exit preserves unfinished-save refusal across the production boot path.
   it.each([false, true])("restarts only after a finished save, unfinished=%s", async unfinished => {
     const fixture = await seededFortress("insert-restart");
+    const completeAudit = vi.spyOn(AuditForwarder.prototype, "completeInsert");
     class InsertFaultStorage extends FilesystemStorage {
       corpusWrites = 0;
       chunkWritten = false;
@@ -1614,8 +1703,9 @@ describe("Hermes memory process shell", () => {
       pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
       const response = await readPublicResponse(pair.relay, "save");
       expect(JSON.parse((response.payload as { content: Array<{ text: string }> }).content[0]!.text).outcome)
-        .toBe(unfinished ? "unavailable" : "saved");
+        .toBe(unfinished ? "unconfirmed" : "saved");
       expect(storage.chunkWritten).toBe(true);
+      expect(completeAudit).toHaveBeenCalledTimes(unfinished ? 0 : 1);
       expect(shell.core.snapshot().ledger.latched).toBe(unfinished);
       pair.relay.write(privateFrame({ type: "relay_shutdown" }));
       expect(await shell.exited).toBe(EXIT_CLEAN);
@@ -1638,7 +1728,8 @@ describe("Hermes memory process shell", () => {
       const factory = vi.fn(() => nextPair.shell);
       const nextStorage = new InsertFaultStorage(join(fixture.fortressDir, "state"));
       const restartOptions = { ...options, storageFor: () => nextStorage, relaySocketFactory: factory };
-      const constructCore = vi.spyOn(HermesBridgeCore.prototype, "onDrained");
+      const CoreConstructor = HermesBridgeCore;
+      const constructCore = vi.spyOn(bridgeCoreModule, "HermesBridgeCore").mockImplementation(function (...args) { return new CoreConstructor(...args); });
       let nextHandle: Awaited<ReturnType<typeof runProductionHermesBridgeProcess>> | undefined;
       try {
         if (unfinished) {
@@ -1648,6 +1739,7 @@ describe("Hermes memory process shell", () => {
           expect(constructCore).not.toHaveBeenCalled();
         } else {
           const restarted = nextHandle = await runProductionHermesBridgeProcess(restartOptions);
+          expect(constructCore).toHaveBeenCalledTimes(1);
           expect(await readNodeFrame(nextPair.relay)).toEqual({ type: "ready" });
           nextPair.relay.write(privateFrame({ type: "relay_shutdown" }));
           expect(await restarted.exited).toBe(EXIT_CLEAN);
@@ -1658,7 +1750,7 @@ describe("Hermes memory process shell", () => {
         nextHandle?.signalStop("SIGTERM"); if (nextHandle !== undefined) await nextHandle.exited;
         constructCore.mockRestore(); nextPair.close();
       }
-    } finally { shell.signalStop("SIGTERM"); await shell.exited; pair.close(); }
+    } finally { shell.signalStop("SIGTERM"); await shell.exited; pair.close(); completeAudit.mockRestore(); }
   });
 
   it("commits an admitted passage and reads it back over the process socket", async () => {

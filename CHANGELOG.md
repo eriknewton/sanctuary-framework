@@ -6,9 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
 - The Hermes memory bridge serves seven tools: a save into the agent's own memory runs without an approval prompt within the save allowance and is audited with the agent named, `memory_recall` returns a bounded context of matching saved passages with per-call scan work bounded after the key listing, `sign_statement` and `export_memory` answer that they are not available yet, and `protection_rules` is refused; every catalogued refusal is an ordinary tool result.
+
+### Fixed
 
 - An agent's memory save into its own memory (`memory_insert`, `sanctuary_remember`) runs without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; every save is audited with the agent named when its identity is known, otherwise marked as unknown, and shows on the dashboard's Evidence page. Set `memory_save_approval: always` in the policy to require approval per insert. Export, delete, signing and reading the policy still ask.
 

@@ -1,4 +1,4 @@
-import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP, HERMES_AUDIT_PROCESS_ROWS } from "./constants.js";
+import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP, HERMES_AUDIT_PROCESS_ROWS, HERMES_AUDIT_TERMINAL_RESERVE } from "./constants.js";
 import { Buffer } from "node:buffer";
 import { fstatSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
@@ -289,15 +289,35 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
   // fortress whose master write barrier this process is giving up.
   private readonly waiting: Array<{ record: HermesBridgeAuditRecord; settle: (outcome: Promise<void>) => void }> = [];
   private handedOff = 0;
+  private readonly terminalSlots = new Map<string, "reserved" | "accepted">();
+  private terminalFailures = 0;
   private refuseAtExit: ((record: HermesBridgeAuditRecord) => void) | undefined;
   private handOffDeadline: number | undefined;
 
   append(record: HermesBridgeAuditRecord): Promise<void> {
     const target = this.requireTarget();
-    // Rows outlive calls: reserve the process share so stalled call rows cannot displace the latch evidence.
-    const cap = HERMES_AUDIT_WAITING_CAP - (record.kind === "latch" ? 0 : HERMES_AUDIT_PROCESS_ROWS);
-    if (this.waiting.length >= cap) return Promise.reject(new HermesAuditBackpressureError());
     if (this.refuseAtExit !== undefined) return this.track(this.refuse(record));
+    const terminal = record.kind === "insert_refused" || record.kind === "insert_unconfirmed";
+    const callRows = this.waiting.filter(entry => entry.record.kind !== "latch" &&
+      entry.record.kind !== "insert_refused" && entry.record.kind !== "insert_unconfirmed").length;
+    if (terminal) {
+      if (record.entryId === undefined || this.terminalSlots.get(record.entryId) !== "reserved") {
+        return Promise.reject(new HermesAuditBackpressureError());
+      }
+      // Acceptance consumes this insert's reserve, independently of the call and latch shares.
+      this.terminalSlots.set(record.entryId, "accepted");
+    } else if (record.kind === "latch") {
+      if (this.waiting.some(entry => entry.record.kind === "latch")) return Promise.reject(new HermesAuditBackpressureError());
+    } else {
+      // Latch and terminal rows never consume the call share, even when they arrived first.
+      if (callRows >= HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS) return Promise.reject(new HermesAuditBackpressureError());
+      if (record.kind === "insert_admitted") {
+        if (record.entryId === undefined || this.terminalSlots.has(record.entryId) ||
+            this.terminalSlots.size >= HERMES_AUDIT_TERMINAL_RESERVE) return Promise.reject(new HermesAuditBackpressureError());
+        // Every admitted insert has a reserved slot for its terminal row; at shutdown a terminal row that cannot be written is named in the exit report, never lost.
+        this.terminalSlots.set(record.entryId, "reserved");
+      }
+    }
     const turn = new Promise<void>((resolve, reject) => {
       this.waiting.push({ record, settle: (outcome) => { outcome.then(resolve, reject); } });
     });
@@ -312,12 +332,23 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
   // silently. A record already handed to the log is not interrupted: the log serializes it under the
   // audit lock, and once the barrier below is released the fortress storage refuses whatever it has
   // not yet written. Its count is what the caller reports as unconfirmed.
-  close(refuse: (record: HermesBridgeAuditRecord) => void): number {
+  close(refuse: (record: HermesBridgeAuditRecord) => void,
+    reportTerminal: (count: number, reason: "shutdown_deadline" | "append_failure") => void): number {
     if (this.refuseAtExit === undefined) {
       this.refuseAtExit = refuse;
+      // Includes a handed-off admission whose late completion could still require a terminal row.
+      if (this.terminalSlots.size > 0) reportTerminal(this.terminalSlots.size, "shutdown_deadline");
+      if (this.terminalFailures > 0) reportTerminal(this.terminalFailures, "append_failure");
+      this.terminalSlots.clear();
+      this.terminalFailures = 0;
       for (const entry of this.waiting.splice(0)) entry.settle(this.refuse(entry.record));
     }
     return this.handedOff;
+  }
+
+  /** A confirmed save needs no correction row; release its unused terminal capacity. */
+  completeInsert(entryId: string): void {
+    if (this.terminalSlots.get(entryId) === "reserved") this.terminalSlots.delete(entryId);
   }
 
   // Set at the start of shutdown to the drain-tail deadline. A record whose turn comes after it stays
@@ -342,7 +373,17 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
     // The async arrow calls into the log synchronously and turns a synchronous throw into a rejection.
     const outcome = (async () => this.appendCritical(target, entry.record))();
     // Free the next waiting slot before notifying durability consumers, which may append a terminal refusal row.
-    entry.settle(outcome.finally(() => {
+    entry.settle(outcome.then(() => {
+      if (entry.record.kind === "insert_refused" || entry.record.kind === "insert_unconfirmed") {
+        this.terminalSlots.delete(entry.record.entryId!);
+      }
+    }, error => {
+      if (entry.record.entryId !== undefined && this.terminalSlots.delete(entry.record.entryId) &&
+          (entry.record.kind === "insert_refused" || entry.record.kind === "insert_unconfirmed")) {
+        this.terminalFailures += 1;
+      }
+      throw error;
+    }).finally(() => {
       this.handedOff -= 1;
       this.handOffNext(target);
     }));
@@ -591,6 +632,8 @@ class ShellController {
     // refused by the storage anyway, and must not touch the fortress tree while the process tears down.
     const unconfirmedAuditRecords = this.audit.close((record) => {
       this.stderr.write(`hermes-memory-bridge audit: refused ${record.kind} record at exit\n`);
+    }, (count, reason) => {
+      this.stderr.write(`hermes-memory-bridge audit: terminal_audit_unconfirmed count=${count} reason=${reason}\n`);
     });
     if (unconfirmedAuditRecords > 0) {
       this.stderr.write(`hermes-memory-bridge audit: ${unconfirmedAuditRecords} record(s) unconfirmed at exit\n`);
@@ -1006,6 +1049,7 @@ async function composeHermesBridge(input: {
   const core = new HermesBridgeCore({
     writeFrame: (input) => writerForwarder.write(input),
     appendAudit: (record) => auditForwarder.append(record),
+    completeAuditInsert: (entryId) => auditForwarder.completeInsert(entryId),
     nowMs: () => performance.now(),
     setTimer: (ms, fire) => {
       const handle = setTimeout(fire, ms);

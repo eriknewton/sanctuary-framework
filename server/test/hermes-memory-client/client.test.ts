@@ -329,7 +329,7 @@ it("repeatedAdmissionRetiresAllBuffersAndRecords", async () => {
 
 it("callerCannotSelectEffectiveTaint", async () => {
   const f = fixture(); const taints: string[] = [];
-  const core = new HermesBridgeCore({
+  const core = new HermesBridgeCore({ completeAuditInsert() {},
     writeFrame() {}, appendAudit: async () => {}, nowMs: () => 0,
     setTimer: () => ({}), clearTimer() {}, abort: new AbortController(),
     agentId: "fixture-agent",

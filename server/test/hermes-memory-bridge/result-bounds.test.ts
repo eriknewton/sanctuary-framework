@@ -52,7 +52,7 @@ it("bounds search at limit twenty while recall projects long stored timestamps",
   const run = async (name: "memory_search" | "memory_recall", args: Record<string, unknown>) => {
     let deliver!: (frame: Extract<NodeToRelayInput, { type: "response" }>) => void;
     const response = new Promise<Extract<NodeToRelayInput, { type: "response" }>>(resolve => { deliver = resolve; });
-    const core = new HermesBridgeCore({ agentId: "agent", adapter, appendAudit: async () => undefined,
+    const core = new HermesBridgeCore({ completeAuditInsert() {}, agentId: "agent", adapter, appendAudit: async () => undefined,
       writeFrame: frame => { if (frame.type === "response") deliver(frame); }, nowMs: () => 0,
       setTimer: () => ({}), clearTimer() {}, abort: new AbortController() });
     try {

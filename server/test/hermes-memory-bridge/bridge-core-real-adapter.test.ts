@@ -154,6 +154,7 @@ async function makeHarness(options: {
   const abort = new AbortController();
   let adapter!: SdwMemoryBackendAdapter;
   const ports: HermesBridgeCorePorts = {
+    completeAuditInsert() {},
     writeFrame(input) {
       writes.push(input);
     },
@@ -564,7 +565,7 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       expect(terminalStates(h)).toContain("INDETERMINATE");
       expect(h.audits.filter(audit => audit.kind === "insert_unconfirmed")).toHaveLength(1);
       expect(h.audits.filter(audit => audit.kind === "latch")).toHaveLength(1);
-      expect(await waitForResponse(h.writes, "insert-partial")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
+      expect(await waitForResponse(h.writes, "insert-partial")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unconfirmed });
 
       accept(h.core, "c2");
       insert(h.core, "c2", "insert-after-partial", "passage-after-partial", "later");
@@ -620,7 +621,7 @@ it.each(["intent_write", "publish", "intent_delete"] as const)("preserves save r
     accept(h.core); insert(h.core, "c1", "intent-save", "intent-save", "board meeting");
     await replyToProbe(h);
     const response = await waitForResponse(h.writes, "intent-save");
-    expect(response).toMatchObject({ payload: fault === "publish" ? HERMES_TOOL_OUTCOMES.unconfirmed : HERMES_TOOL_OUTCOMES.unavailable });
+    expect(response).toMatchObject({ payload: fault === "intent_write" ? HERMES_TOOL_OUTCOMES.unavailable : HERMES_TOOL_OUTCOMES.unconfirmed });
     expect(await storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY) === null).toBe(fault !== "intent_delete");
     expect(await documentCount(storage)).toBe(fault === "intent_delete" ? 1 : 0);
     if (fault === "intent_write") expect(storage.corpusWrites).toBe(0);

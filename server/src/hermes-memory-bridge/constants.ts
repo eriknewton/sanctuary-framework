@@ -68,11 +68,14 @@ export const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${PROBE_NONCE_BYTES}}$`, "u")
 // Must match standard base64 with required padding in hermes-memory-relay/SEAM.md.
 export const STANDARD_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 
-// One admitted row plus one terminal row (refused before allow or unconfirmed after allow), or one recall row.
-// Rows are bounded by the cap, not by live records; call rows cannot use the one process latch reserve.
+// Call waiting share: 8 call records times 2 rows = 16, plus one independent process latch slot.
+// Rows can outlive calls. At most 16 waiting admissions plus one handed-off admission reserve 17 terminal slots.
+// Reserved and accepted terminal rows share that 17-slot bound; saved or rejected admissions release unused slots.
+// Total waiting rows <= 17 + 17 = 34; one handed-off row makes at most 35 retained rows, including reservations.
 export const HERMES_AUDIT_ROWS_PER_CALL = 2;
 export const HERMES_AUDIT_PROCESS_ROWS = 1;
 export const HERMES_AUDIT_WAITING_CAP = HERMES_MAX_CALL_RECORDS * HERMES_AUDIT_ROWS_PER_CALL + HERMES_AUDIT_PROCESS_ROWS;
+export const HERMES_AUDIT_TERMINAL_RESERVE = HERMES_MAX_CALL_RECORDS * HERMES_AUDIT_ROWS_PER_CALL + 1;
 /** Capacity refusal is distinct from failure to persist an admitted audit row. */
 export class HermesAuditBackpressureError extends Error {
   constructor() { super("Hermes audit capacity exhausted"); this.name = "HermesAuditBackpressureError"; }

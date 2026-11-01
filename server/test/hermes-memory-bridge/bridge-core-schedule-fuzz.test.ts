@@ -180,6 +180,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   };
 
   const ports: HermesBridgeCorePorts = {
+    completeAuditInsert() {},
     writeFrame(input) {
       if (input.type === "probe") {
         coverage.dispatchRows.add("send_probe");

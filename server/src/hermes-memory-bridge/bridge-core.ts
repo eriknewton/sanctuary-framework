@@ -102,6 +102,8 @@ export interface HermesBridgeCorePorts {
    * the memory adapter or take the corpus lock that the hook already holds.
    */
   readonly appendAudit: (record: HermesBridgeAuditRecord) => Promise<void>;
+  /** Release the reserved correction row only after storage confirms a completed save. */
+  readonly completeAuditInsert: (entryId: string) => void;
   readonly nowMs: () => number;
   readonly setTimer: (ms: number, fire: () => void) => HermesTimerHandle;
   readonly clearTimer: (handle: HermesTimerHandle) => void;
@@ -523,7 +525,8 @@ export class HermesBridgeCore {
     }
     this.saveAdmissions = this.saveAdmissions.filter(row => nowMs - row.at < OWN_SCOPE_SAVE_WINDOW_MS);
     const bytes = Buffer.byteLength(insert.text, "utf8");
-    // Silent own-scope admission carries M1's count and byte allowance; exceeding either refuses before adapter or audit access.
+    // The save allowance is per bridge process and starts fresh at each start; MEMORY_CORPUS_SCAN_CAP bounds total growth across restarts.
+    // Exceeding the count or byte allowance refuses before adapter or audit access.
     if (this.saveAdmissions.length >= OWN_SCOPE_SAVE_MAX_PER_WINDOW ||
         this.saveAdmissions.reduce((sum, row) => sum + row.bytes, 0) + bytes > OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW) {
       this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "unavailable"));
@@ -587,15 +590,16 @@ export class HermesBridgeCore {
   private finishInsert(slot: InsertSlot, outcome: "committed" | "threw", error?: unknown): void {
     slot.insertInFlight = false;
     if (outcome === "committed" && slot.hookAllowed) {
+      this.ports.completeAuditInsert(slot.entryId);
       this.performLedgerResult(this.ledger.writeFinished(slot.entryId, "committed"));
       if (slot.commitIds !== undefined) {
         const success = buildMemoryInsertSuccessBytes(slot.requestId, slot.commitIds);
         slot.successBytes = success.ok ? success.bytes : buildToolOutcomeBytes(slot.requestId, slot.hookAllowed && !slot.recoveryRequired ? "unconfirmed" : "unavailable");
       }
     } else if (slot.hookAllowed) {
-      slot.recoveryRequired = isPartialScopeError(error) || (error instanceof SdwValidationError && error.persisted === "none");
+      slot.recoveryRequired = error instanceof SdwValidationError && error.persisted === "none";
       this.auditUnconfirmed(slot);
-      // Every throw after allow is indeterminate; this core never reports the storage layer's failed outcome.
+      // Partial corpus effects answer unconfirmed; only a certified no-effect refusal may say nothing was done.
       if (isPartialScopeError(error)) this.latch("partial_scope");
       this.latch("indeterminate");
       this.performLedgerResult(this.ledger.writeFinished(slot.entryId, "indeterminate"));

@@ -306,7 +306,7 @@ function makeHarness() {
       return [];
     },
   };
-  core = new HermesBridgeCore({
+  core = new HermesBridgeCore({ completeAuditInsert() {},
     writeFrame(input) {
       writes.push(input);
     },

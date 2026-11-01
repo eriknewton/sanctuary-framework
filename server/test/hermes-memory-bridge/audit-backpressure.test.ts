@@ -17,6 +17,7 @@ it("caps the waiting forwarder under admission waves and repeated recalls withou
   const pending: Promise<void>[] = [];
   const writes: NodeToRelayInput[] = [];
   const core = new HermesBridgeCore({ agentId: "fixture-agent", abort: new AbortController(),
+    completeAuditInsert: id => forwarder.completeInsert(id),
     appendAudit: record => { const result = forwarder.append(record); pending.push(result); return result; }, writeFrame: frame => writes.push(frame),
     nowMs: () => 0, setTimer: () => ({}), clearTimer() {}, adapter: {
       insertPassage: async input => {
@@ -97,4 +98,54 @@ it("records the latch row after a stall fills the call share", async () => {
     await Promise.all(rows);
     expect(append.mock.calls.filter(([row]) => row.details?.kind === "latch")).toHaveLength(1);
   } finally { release(); await Promise.allSettled(rows); append.mockRestore(); }
+});
+
+// A latch queued first leaves the whole call share available.
+it("keeps a queued latch outside the call share", async () => {
+  const target = new AuditLog(new MemoryStorage(), new Uint8Array(32).fill(17));
+  let release!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const append = vi.spyOn(target, "appendCritical").mockImplementationOnce(() => stalled).mockResolvedValue(undefined);
+  const forwarder = new AuditForwarder(); forwarder.bind(target);
+  const rows = [forwarder.append({ kind: "memory_recall" }), forwarder.append({ kind: "latch", reason: "audit" })];
+  try {
+    for (let n = 0; n < HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS; n++) rows.push(forwarder.append({ kind: "memory_recall" }));
+    await expect(forwarder.append({ kind: "memory_recall" })).rejects.toBeInstanceOf(HermesAuditBackpressureError);
+    release(); await Promise.all(rows);
+    expect(append).toHaveBeenCalledTimes(HERMES_AUDIT_WAITING_CAP + 1);
+  } finally { release(); await Promise.allSettled(rows); append.mockRestore(); }
+});
+
+// Confirmed saves and rejected admissions release capacity across repeated admission waves.
+it("reuses terminal reserves after confirmed saves and rejected admissions", async () => {
+  const target = new AuditLog(new MemoryStorage(), new Uint8Array(32).fill(17));
+  const append = vi.spyOn(target, "appendCritical").mockResolvedValue(undefined);
+  const forwarder = new AuditForwarder(); forwarder.bind(target);
+  try {
+    // Two full waiting-cap waves require reuse rather than a lifetime allowance.
+    for (let n = 0; n < HERMES_AUDIT_WAITING_CAP * 2; n++) {
+      const entryId = `saved-${n}`;
+      await forwarder.append({ kind: "insert_admitted", entryId });
+      forwarder.completeInsert(entryId);
+      append.mockRejectedValueOnce(new Error("admission fixture"));
+      await expect(forwarder.append({ kind: "insert_admitted", entryId: `rejected-${n}` })).rejects.toThrow("admission fixture");
+    }
+    const report = vi.fn();
+    forwarder.close(vi.fn(), report);
+    expect(report).not.toHaveBeenCalled();
+  } finally { append.mockRestore(); }
+});
+
+// Terminal durability failures are counted without exposing record contents.
+it("names terminal append failure once at close", async () => {
+  const target = new AuditLog(new MemoryStorage(), new Uint8Array(32).fill(17));
+  const append = vi.spyOn(target, "appendCritical").mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("private fixture"));
+  const forwarder = new AuditForwarder(); forwarder.bind(target);
+  try {
+    await forwarder.append({ kind: "insert_admitted", entryId: "insert" });
+    await expect(forwarder.append({ kind: "insert_unconfirmed", entryId: "insert" })).rejects.toThrow("private fixture");
+    const report = vi.fn();
+    forwarder.close(vi.fn(), report); forwarder.close(vi.fn(), report);
+    expect(report.mock.calls).toEqual([[1, "append_failure"]]);
+  } finally { append.mockRestore(); }
 });
