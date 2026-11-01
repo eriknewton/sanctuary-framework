@@ -1,6 +1,6 @@
 import { SdwWorkingStateStore } from "../working-state-store.js";
 import { recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
-import { MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
+import { MAX_PUBLIC_FRAME_BYTES, MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
 /**
  * SDW implementation of the memory-backend adapter contract.
  *
@@ -945,6 +945,30 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return assertSdwIdentifier(id, "passage_id");
   }
 
+  /** Classify a validated intent with the adapter's readers, without quarantining or writing. */
+  async classifyHermesSave(intent: HermesSaveIntent): Promise<"completed" | "not_completed"> {
+    if (intent.ownerRef !== this.ownerRef || this.documentId(this.passageIdOf(intent.documentId)) !== intent.documentId) {
+      throw new SdwValidationError("identity_mismatch", "Hermes save owner mismatch");
+    }
+    const document = await this.corpus.getDocument(intent.documentId);
+    if (document === null) return "not_completed";
+    // A published record is kept only when its full content and local provenance verify against this exact intent.
+    const provenance = await this.corpus.getProvenanceRaw(intent.documentId);
+    if (document.chunk_count !== intent.chunkKeys.length || provenance === null ||
+        await this.corpus.getProvenanceStatusRaw(intent.documentId) !== null ||
+        !this.verifyCompanion(document, provenance.record.companion).ok) {
+      throw new SdwValidationError("auth_failed", "Hermes save verification failed");
+    }
+    const eligibility = await evaluateMemoryProvenanceSignerEligibility({
+      companion: provenance.record.companion,
+      resolveSignerPublicKey: this.resolveSignerPublicKey,
+      badSignerAuthority: this.badSignerAuthority,
+    });
+    if (!eligibility.eligible) throw new SdwValidationError("auth_failed", "Hermes save signer refused");
+    await this.readPassageText(document);
+    return "completed";
+  }
+
   async getPassage(passageId: string): Promise<MemoryPassage | null> {
     assertSdwIdentifier(passageId, "passage_id");
     const document = await this.corpus.getDocument(this.documentId(passageId));
@@ -1883,29 +1907,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   private async rollbackInsert(documentId: string, writtenChunkKeys: readonly string[]): Promise<void> {
-    const failures: unknown[] = [];
-    for (const key of [documentProvenanceStatusKey(documentId), documentProvenanceKey(documentId)]) {
-      try {
-        await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true);
-      } catch (error) {
-        failures.push(error);
-      }
-    }
-    for (const key of [...writtenChunkKeys].reverse()) {
-      try {
-        await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true);
-      } catch (error) {
-        failures.push(error);
-      }
-    }
-    try {
-      await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId), true);
-    } catch (error) {
-      failures.push(error);
-    }
-    if (failures.length > 0) {
-      throw partialScopeError(rollbackFailureCause(failures));
-    }
+    await rollbackHermesSaveRecords(this.storage, documentId, writtenChunkKeys);
   }
 
   /**
@@ -2330,4 +2332,65 @@ function hasUnpairedSurrogate(value: string): boolean {
     }
   }
   return false;
+}
+
+/** Delete only one insert's possible records, preserving the backend rollback order. */
+export async function rollbackHermesSaveRecords(
+  storage: StorageBackend, documentId: string, writtenChunkKeys: readonly string[],
+): Promise<number> {
+  let removed = 0;
+  const failures: unknown[] = [];
+  for (const key of [documentProvenanceStatusKey(documentId), documentProvenanceKey(documentId)]) {
+    try {
+      if (await storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true)) removed++;
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const key of [...writtenChunkKeys].reverse()) {
+    try {
+      if (await storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true)) removed++;
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  try {
+    if (await storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId), true)) removed++;
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length > 0) {
+    throw partialScopeError(rollbackFailureCause(failures));
+  }
+  return removed;
+}
+
+/** Authenticated, bounded insert scope for operator recovery; no corpus enumeration. */
+export interface HermesSaveIntent {
+  readonly ownerRef: string;
+  readonly documentId: string;
+  readonly chunkKeys: readonly string[];
+}
+
+/** Read the same encrypted checkpoint the Hermes adapter writes and bind every key to its subject. */
+export async function readHermesSaveIntent(options: {
+  storage: StorageBackend; masterKey: Uint8Array; fortressId: string;
+}): Promise<HermesSaveIntent | null> {
+  const record = await new SdwWorkingStateStore(options).get("tool", HERMES_INSERT_INTENT_STATE_ID);
+  if (record === null) return null;
+  const invalid = () => new SdwValidationError("schema_mismatch", "Invalid Hermes save intent");
+  if (record.status !== "active" || record.content_type !== "application/json" ||
+      record.state.kind !== "task_checkpoint" || typeof record.owner_ref !== "string" || !isSdwIdentifier(record.owner_ref) || record.owner_ref.includes(".")) throw invalid();
+  const documentId = record.state.task_ref;
+  const prefix = `${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${record.owner_ref}.`;
+  if (typeof documentId !== "string" || !isSdwIdentifier(documentId) || !documentId.startsWith(prefix) || !isSdwIdentifier(documentId.slice(prefix.length))) throw invalid();
+  const chunkKeys = record.state.next_steps;
+  // A shipped save fits one public frame and uses DEFAULT_MAX_CHUNK_CHARS; recovery work cannot exceed that bound.
+  const maxChunks = Math.ceil(MAX_PUBLIC_FRAME_BYTES / DEFAULT_MAX_CHUNK_CHARS);
+  if (!Array.isArray(chunkKeys) || chunkKeys.length < 1 || chunkKeys.length > maxChunks) throw invalid();
+  // Authenticated intent bytes authorize only this document's contiguous chunk keys, never arbitrary storage keys.
+  for (const [ordinal, key] of chunkKeys.entries()) {
+    if (key !== documentChunkKey(documentId, padChunkOrdinal(ordinal), chunkId(ordinal))) throw invalid();
+  }
+  return { ownerRef: record.owner_ref, documentId, chunkKeys: [...chunkKeys] };
 }

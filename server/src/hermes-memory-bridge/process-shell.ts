@@ -997,7 +997,7 @@ async function assertNoLeftoverCorpusLock(storage: FilesystemStorage): Promise<v
 
 class UnfinishedInsertRefusal extends StartupRefusal {
   constructor() {
-    super(STATE_CONFIG_CHECKED, "An earlier save did not finish; recovery is an operator action.");
+    super(STATE_CONFIG_CHECKED, "An earlier save did not finish; run `sanctuary hermes recover-save --fortress <dir>` to recover it.");
     this.name = "UnfinishedInsertRefusal";
   }
 }
