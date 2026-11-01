@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, PassThrough } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
-import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
+import { createHash } from "node:crypto";
 import { IdentityManager } from "../../src/cognitive/tools.js";
 import { fromBase64url } from "../../src/core/encoding.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -181,14 +181,16 @@ async function runScenario(scenario: "full" | "catalog" | "recall" | "refusals" 
       const inserted = entries.filter(entry => entry.details?.kind === "insert_admitted");
       expect(inserted).toHaveLength(1);
       expect(inserted[0]!.details).toMatchObject({ operation: OWN_SCOPE_MEMORY_SAVES.memory_insert,
-        agent_id: `agent:${fixture.env.HERMES_MEMORY_AGENT_ID}`, requester_verified: false, passage_id: passageId });
+        agent_id: `agent:${fixture.env.HERMES_MEMORY_AGENT_ID}`, requester_verified: false, passage_id: passageId,
+        tier: 3, text_sha256: createHash("sha256").update(savedText, "utf8").digest("base64url"),
+        bytes: Buffer.byteLength(savedText, "utf8") });
       const recalls = entries.filter(entry => entry.details?.kind === "memory_recall");
       expect(recalls).toHaveLength(1);
       expect(recalls[0]!.details).toMatchObject({ term_count: 2, passage_ids: [passageId], query_sha256: expect.any(String),
         agent_id: `agent:${fixture.env.HERMES_MEMORY_AGENT_ID}`, requester_verified: false });
       expect(JSON.stringify(all)).not.toContain(savedText);
       expect(JSON.stringify(all)).not.toContain(query);
-      const corpus = new SdwDocumentCorpusStore({ storage, masterKey: custody.masterKey, fortressId: fortressIdFromStoragePath(fixture.fortressDir) });
+      const corpus = new SdwDocumentCorpusStore({ storage, masterKey: custody.masterKey, fortressId: shell.report.fortressId });
       expect(await corpus.getDocument(String(inserted[0]!.details!.document_id))).not.toBeNull();
     } finally {
       await custody.masterWriteBarrier?.release();

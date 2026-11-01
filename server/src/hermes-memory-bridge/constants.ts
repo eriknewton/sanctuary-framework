@@ -68,7 +68,8 @@ export const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${PROBE_NONCE_BYTES}}$`, "u")
 // Must match standard base64 with required padding in hermes-memory-relay/SEAM.md.
 export const STANDARD_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 
-// One admitted row and at most one unconfirmed row per call, plus one process latch row.
+// One admitted row plus one terminal row (refused before allow or unconfirmed after allow), or one recall row.
+// Rows are bounded by the cap, not by live records; call rows cannot use the one process latch reserve.
 export const HERMES_AUDIT_ROWS_PER_CALL = 2;
 export const HERMES_AUDIT_PROCESS_ROWS = 1;
 export const HERMES_AUDIT_WAITING_CAP = HERMES_MAX_CALL_RECORDS * HERMES_AUDIT_ROWS_PER_CALL + HERMES_AUDIT_PROCESS_ROWS;

@@ -1,7 +1,7 @@
 // Stalled audit appends retain a bounded queue and capacity refusals preserve service admission.
 import { expect, it, vi } from "vitest";
 import { AuditForwarder } from "../../src/hermes-memory-bridge/process-shell.js";
-import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP, HERMES_MAX_CALL_RECORDS } from "../../src/hermes-memory-bridge/constants.js";
+import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP, HERMES_AUDIT_PROCESS_ROWS, HERMES_MAX_CALL_RECORDS } from "../../src/hermes-memory-bridge/constants.js";
 import { HermesBridgeCore } from "../../src/hermes-memory-bridge/bridge-core.js";
 import { hermesBridgePassageTextDigest } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { parsePublicFrame, type NodeToRelayInput } from "../../src/hermes-memory-bridge/envelopes.js";
@@ -49,9 +49,9 @@ it("caps the waiting forwarder under admission waves and repeated recalls withou
       await settle(() => core.snapshot().slot === undefined);
       expect(core.snapshot().ledger.latched).toBe(false);
     }
-    expect(() => forwarder.append({ kind: "insert_admitted" })).toThrow(HermesAuditBackpressureError);
+    await expect(forwarder.append({ kind: "insert_admitted" })).rejects.toBeInstanceOf(HermesAuditBackpressureError);
     const queue = forwarder as unknown as { waiting: unknown[] };
-    expect(queue.waiting).toHaveLength(HERMES_AUDIT_WAITING_CAP);
+    expect(queue.waiting).toHaveLength(HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS);
     writes.length = 0;
     for (let n = 0; n < HERMES_MAX_CALL_RECORDS; n++) {
       const publicBytes = Buffer.from(JSON.stringify({ type: "tools_call", request_id: `recall-${n}`, name: "memory_recall", arguments: { query: "the" } }));
@@ -69,7 +69,32 @@ it("caps the waiting forwarder under admission waves and repeated recalls withou
         expect(JSON.parse(payload.payload.content[0].text).outcome).toBe("unavailable");
       }
     }
+    release();
+    await Promise.allSettled(pending);
+    while (forwarder.pending.size > 0) await Promise.allSettled([...forwarder.pending]);
+    const recorded = append.mock.calls.map(([row]) => row.details?.kind);
+    expect(recorded.filter(kind => kind === "insert_refused")).toHaveLength(recorded.filter(kind => kind === "insert_admitted").length);
   } finally {
-    core.relayEof(); release(); await Promise.all(pending); append.mockRestore();
+    core.relayEof(); release(); await Promise.allSettled(pending);
+    while (forwarder.pending.size > 0) await Promise.allSettled([...forwarder.pending]);
+    append.mockRestore();
   }
+});
+
+// The process latch has reserved space even when cancelled call rows fill their entire share.
+it("records the latch row after a stall fills the call share", async () => {
+  const target = new AuditLog(new MemoryStorage(), new Uint8Array(32).fill(17));
+  let release!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  const append = vi.spyOn(target, "appendCritical").mockImplementationOnce(() => stalled).mockResolvedValue(undefined);
+  const forwarder = new AuditForwarder(); forwarder.bind(target);
+  const rows = [forwarder.append({ kind: "memory_recall" })]; // One handed-off row is outside the waiting cap.
+  try {
+    for (let n = 0; n < HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS; n++) rows.push(forwarder.append({ kind: "memory_recall" }));
+    await expect(forwarder.append({ kind: "memory_recall" })).rejects.toBeInstanceOf(HermesAuditBackpressureError);
+    rows.push(forwarder.append({ kind: "latch", reason: "audit" }));
+    release();
+    await Promise.all(rows);
+    expect(append.mock.calls.filter(([row]) => row.details?.kind === "latch")).toHaveLength(1);
+  } finally { release(); await Promise.allSettled(rows); append.mockRestore(); }
 });

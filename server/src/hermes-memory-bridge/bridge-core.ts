@@ -1,5 +1,6 @@
 // must match OWN_SCOPE_MEMORY_SAVES in server/src/principal-policy/gate.ts.
-import { OWN_SCOPE_MEMORY_SAVES } from "../principal-policy/gate.js";
+// The allowance must match OWN_SCOPE_SAVE_* in server/src/principal-policy/gate.ts.
+import { OWN_SCOPE_MEMORY_SAVES, OWN_SCOPE_SAVE_WINDOW_MS, OWN_SCOPE_SAVE_MAX_PER_WINDOW, OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW } from "../principal-policy/gate.js";
 import { HermesRecallBudget, type HermesRecallResult } from "./recall.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -77,7 +78,7 @@ const BRIDGE_PINNED_MEMORY_TAINT: PersistableTaint = "user_content";
 const TIMER_CLEAR_STOP_RETRY_ATTEMPTS = 2; // Two stop-path retries cover the cleanup pass and one retained-handle confirmation after the first clear failure.
 
 export interface HermesBridgeAuditRecord {
-  readonly kind: "insert_admitted" | "insert_unconfirmed" | "memory_recall" | "latch";
+  readonly kind: "insert_admitted" | "insert_refused" | "insert_unconfirmed" | "memory_recall" | "latch";
   readonly entryId?: string;
   readonly operation?: string;
   readonly tier?: number;
@@ -145,10 +146,16 @@ interface InsertSlot {
   insertInFlight: boolean;
   hookAllowed: boolean;
   unconfirmedAudited: boolean;
+  refusedAfterAdmission?: InsertRefusalReason;
+  refusalAudited?: boolean;
+  admissionDurable?: boolean;
+  recoveryRequired?: boolean;
   commitIds?: { readonly passageId: string; readonly documentId: string };
   successBytes?: Uint8Array;
   released: boolean;
 }
+
+type InsertRefusalReason = "cancel" | "peer_close" | "deadline" | "latch" | "stopped" | "connection_gone" | "commit_refused";
 
 interface ReadOperation {
   readonly connectionId: string;
@@ -178,6 +185,8 @@ export class HermesBridgeCommitRefusedError extends Error {
  * acquisition, and the later shell builds exactly one bridge adapter.
  */
 export class HermesBridgeCore {
+  // One single-owner rolling window retains at most OWN_SCOPE_SAVE_MAX_PER_WINDOW admissions; expired rows are pruned on each attempt.
+  private saveAdmissions: Array<{ at: number; bytes: number }> = [];
   private readonly lifecycle = new HermesConnectionLifecycle();
   private readonly waiter = new HermesProbeWaiter(createNodeCryptoHermesProbeNonceSource());
   private readonly ledger = new HermesApprovalLedger();
@@ -512,12 +521,22 @@ export class HermesBridgeCore {
       this.releaseRecord(action.recordId);
       return;
     }
+    this.saveAdmissions = this.saveAdmissions.filter(row => nowMs - row.at < OWN_SCOPE_SAVE_WINDOW_MS);
+    const bytes = Buffer.byteLength(insert.text, "utf8");
+    // Silent own-scope admission carries M1's count and byte allowance; exceeding either refuses before adapter or audit access.
+    if (this.saveAdmissions.length >= OWN_SCOPE_SAVE_MAX_PER_WINDOW ||
+        this.saveAdmissions.reduce((sum, row) => sum + row.bytes, 0) + bytes > OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW) {
+      this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "unavailable"));
+      this.releaseRecord(action.recordId);
+      return;
+    }
     const admitted = this.ledger.admit(entryId, action.connectionId, action.recordId, textSha256, nowMs);
     if (admitted.refusal !== undefined) {
       this.writeResponse(action.connectionId, action.recordId, buildToolOutcomeBytes(action.requestId, "unavailable"));
       this.releaseRecord(action.recordId);
       return;
     }
+    this.saveAdmissions.push({ at: nowMs, bytes });
     this.slot = slot;
     this.performLedgerResult(admitted);
     const timer = this.setTimerOrStop(HERMES_INSERT_DEADLINE_MS, () => this.fireInsertDeadline(entryId));
@@ -571,9 +590,10 @@ export class HermesBridgeCore {
       this.performLedgerResult(this.ledger.writeFinished(slot.entryId, "committed"));
       if (slot.commitIds !== undefined) {
         const success = buildMemoryInsertSuccessBytes(slot.requestId, slot.commitIds);
-        slot.successBytes = success.ok ? success.bytes : buildToolOutcomeBytes(slot.requestId, slot.hookAllowed ? "unconfirmed" : "unavailable");
+        slot.successBytes = success.ok ? success.bytes : buildToolOutcomeBytes(slot.requestId, slot.hookAllowed && !slot.recoveryRequired ? "unconfirmed" : "unavailable");
       }
     } else if (slot.hookAllowed) {
+      slot.recoveryRequired = isPartialScopeError(error) || (error instanceof SdwValidationError && error.persisted === "none");
       this.auditUnconfirmed(slot);
       // Every throw after allow is indeterminate; this core never reports the storage layer's failed outcome.
       if (isPartialScopeError(error)) this.latch("partial_scope");
@@ -601,7 +621,7 @@ export class HermesBridgeCore {
           context.passageTextSha256 === slot.textSha256 &&
           context.getFrameUtf8Bytes + PUBLIC_RESULT_ENVELOPE_MAX_BYTES <= MAX_RESULT_FRAME_BYTES) {
         // The fortress is single-owner (ownerRef = HERMES_MEMORY_AGENT_ID); every insert saves into the agent's own memory.
-        // An own-scope save never waits for a human, per the operator's 10-29 decision carried by M1.
+        // Silent admission stays within M1's rolling count/byte allowance and the adapter's corpus scan ceiling.
         this.addAuditDurability({ kind: "insert_admitted", entryId: slot.entryId,
           operation: OWN_SCOPE_MEMORY_SAVES.memory_insert, tier: 3, // Tier 3 is M1's own-scope save tier.
           ...this.auditPrincipal(), passage_id: context.passageId, document_id: context.documentId,
@@ -629,6 +649,10 @@ export class HermesBridgeCore {
       slot.hookAllowed = true;
       return;
     }
+    const seen = this.ledger.snapshot().entry?.seen;
+    slot.refusedAfterAdmission = seen?.cancel ? "cancel" : seen?.deadline ? "deadline" : seen?.gone ? "peer_close"
+      : this.ledger.snapshot().latched ? "latch" : this.stopped ? "stopped" : !recordCurrent ? "connection_gone" : "commit_refused";
+    this.auditRefusedAdmission(slot);
     throw new HermesBridgeCommitRefusedError();
   }
 
@@ -739,6 +763,7 @@ export class HermesBridgeCore {
     promise.then(
       () => {
         audit.state = "fulfilled";
+        if (record.kind === "insert_admitted" && slot !== undefined) { slot.admissionDurable = true; this.auditRefusedAdmission(slot); }
         this.notifyHookWaiters();
       },
       (reason: unknown) => {
@@ -749,6 +774,14 @@ export class HermesBridgeCore {
         this.endStep();
       },
     );
+  }
+
+  private auditRefusedAdmission(slot: InsertSlot): void {
+    if (slot.refusedAfterAdmission === undefined || slot.refusalAudited ||
+        !slot.admissionDurable) return;
+    slot.refusalAudited = true;
+    this.addAuditDurability({ kind: "insert_refused", entryId: slot.entryId,
+      passage_id: slot.commitIds?.passageId, reason: slot.refusedAfterAdmission, ...this.auditPrincipal() });
   }
 
   private auditUnconfirmed(slot: InsertSlot): void {
@@ -818,11 +851,11 @@ export class HermesBridgeCore {
       this.writeResponse(
         slot.connectionId,
         slot.recordId,
-        slot.successBytes ?? buildToolOutcomeBytes(slot.requestId, slot.hookAllowed ? "unconfirmed" : "unavailable"),
+        slot.successBytes ?? buildToolOutcomeBytes(slot.requestId, slot.hookAllowed && !slot.recoveryRequired ? "unconfirmed" : "unavailable"),
       );
       return;
     }
-    this.writeResponse(slot.connectionId, slot.recordId, buildToolOutcomeBytes(slot.requestId, slot.hookAllowed ? "unconfirmed" : "unavailable"));
+    this.writeResponse(slot.connectionId, slot.recordId, buildToolOutcomeBytes(slot.requestId, slot.hookAllowed && !slot.recoveryRequired ? "unconfirmed" : "unavailable"));
   }
 
   private performWaiterResult(result: HermesProbeWaiterResult): void {

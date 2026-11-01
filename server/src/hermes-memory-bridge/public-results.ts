@@ -226,6 +226,7 @@ export function buildMemoryRecallResultBytes(requestId: string, result: import("
 }
 
 // SDW identifier grammar permits at most 256 ASCII units, with no JSON escapes.
+// Must match SDW_IDENTIFIER_PATTERN in server/src/sdw/grammar.ts; this round permits the bridge-side pin only.
 export const HERMES_RESULT_IDENTIFIER_MAX_UNITS = 256;
 // A control unit is six inner JSON characters; the outer frame escapes its backslash once more.
 // Three UTF-8 bytes per unescaped BMP unit is smaller, so seven bounds both cases.

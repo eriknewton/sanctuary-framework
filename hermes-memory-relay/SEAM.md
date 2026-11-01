@@ -197,7 +197,7 @@ In flight means any forwarded request awaiting its `response`: `tools_call`, `to
 
 ## Stdio client contract
 
-`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory save, get, search and bounded recall are available through the bridge. A save into the agent's own memory runs without a human prompt and is audited with the agent named. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; the shim code reads no environment selector for socket, identity, write flag, or boot mode. The agent account can reach the socket directly, so inherited environment is not a security boundary here.
+`sanctuary hermes-memory-client` adapts the public socket to MCP stdio. Scoped memory save, get, search and bounded recall are available through the bridge. A save into the agent's own memory runs without a human prompt and is audited with the agent named. Silent saves are limited to 120 admissions and 1 MiB of UTF-8 text in a rolling ten-minute window; excess saves return `unavailable`. Admission also refuses at 2000 owner documents, the search and recall scan ceiling. It connects once and never launches the bridge or ordinary Sanctuary. The socket location is fixed by the installation contract; the shim code reads no environment selector for socket, identity, write flag, or boot mode. The agent account can reach the socket directly, so inherited environment is not a security boundary here.
 
 The client constants in `server/src/hermes-memory-client/protocol.ts` must match `RelayProtocolConstants` in `Sources/HermesMemoryRelayCore/Core.swift`: public payload 65536 bytes excluding the 4-byte prefix, retained socket frame 65540 bytes, 64 composite levels below the public root, two outstanding pongs, and eight queued/reserved forwarded controls. The client cannot observe `markNodeFrameWritten`, so its `CONTROL_CAP` conservatively limits controls over the connection lifetime, reserving the eighth credit for shutdown. A socket write never refunds credit.
 
@@ -253,6 +253,10 @@ Must match `HERMES_TOOL_OUTCOMES` in `server/src/hermes-memory-bridge/public-res
 | unavailable, signing or export not built | This is not available yet; nothing was done. |
 | unavailable | Sanctuary could not take this request right now; nothing was done. |
 | unconfirmed | I could not confirm whether this completed. |
+
+`memory_get` returns `denied` when the passage is not found, including an id outside the owner scope.
+
+Recall bounds per-call work after the key listing: candidate and text-unit ceilings, three retained passages and a four-second wall budget. Abort and wall budget are checked before listing, but the key enumeration itself is not bounded by those ceilings. A stalled storage read can outlast the wall budget. Per-call cancellation does not abort the scan; the wall budget still applies.
 
 `sign_statement` and `export_memory` validate arguments but perform no operation. `protection_rules` is refused. No owner channel, socket, frame, hold protocol or evidence frame is provided by this slice.
 

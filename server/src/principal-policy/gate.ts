@@ -212,7 +212,7 @@ export type ApprovalEventCallback = (event: {
 }) => void;
 
 /** Closed invoked-tool to gate-operation map; must match the handoff in router.ts. */
-// Must match the own-scope classification in hermes-memory-bridge/bridge-core.ts.
+// OWN_SCOPE_MEMORY_SAVES and OWN_SCOPE_SAVE_* must match the classification and allowance in hermes-memory-bridge/bridge-core.ts.
 export const OWN_SCOPE_MEMORY_SAVES: Readonly<Record<string, string>> = Object.freeze({
   memory_insert: "memory_insert",
   sanctuary_remember: "state_write",

@@ -1,3 +1,4 @@
+import { OWN_SCOPE_SAVE_WINDOW_MS, OWN_SCOPE_SAVE_MAX_PER_WINDOW, OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW } from "../../src/principal-policy/gate.js";
 import { Buffer } from "node:buffer";
 import { describe, expect, it } from "vitest";
 
@@ -1376,6 +1377,79 @@ it.each([false, true])("maps lifecycle release without a response afterAllow=%s"
   expect(toolResultBody(response)).toMatchObject({ outcome: afterAllow ? "unconfirmed" : "unavailable" });
   expect(h.audits.filter(row => row.kind === "insert_unconfirmed")).toHaveLength(afterAllow ? 1 : 0);
   h.core.relayEof();
-  for (const pending of [...h.insertLocks, ...h.insertSettlements]) pending.resolve();
+  for (const pending of h.insertLocks) pending.resolve();
+  for (const pending of h.insertSettlements) pending.reject(new Error("storage fixture after release"));
   await h.tick(16);
+  expect(h.audits.filter(row => row.kind === "insert_unconfirmed")).toHaveLength(afterAllow ? 1 : 0);
+});
+
+// Probe completion must observe a latch raised by another naturally admitted call.
+it("refuses a latch during the probe wait without an insert row", async () => {
+  const h = makeHarness({ deferredAudit: true });
+  accept(h.core); accept(h.core, "c2");
+  insert(h.core, "c1", "probe-latch", "memory text");
+  const probe = h.writes.find(frame => frame.type === "probe")!;
+  h.core.relayFrame(relayFrame("c2", { type: "tools_call", request_id: "recall-latch", name: "memory_recall", arguments: { query: "the" } }));
+  await h.tick(8);
+  h.pendingAudits[0]!.reject(new Error("audit fixture"));
+  await h.tick(8);
+  expect(h.core.snapshot().ledger.latched).toBe(true);
+  if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+  await h.tick(16);
+  expect(h.audits.filter(row => row.kind.startsWith("insert_"))).toEqual([]);
+  expect(toolResultBody(responseFor(h.writes, "probe-latch"))).toMatchObject({ outcome: "unavailable" });
+  h.resolveAudits(); h.core.relayEof(); await h.tick(8);
+});
+
+it.each(["cancel", "peer_close", "deadline", "latch"] as const)("records one terminal refusal after late admission durability: %s", async reason => {
+  const h = makeHarness({ deferredAudit: true });
+  accept(h.core); accept(h.core, "c2");
+  insert(h.core, "c1", "late-admit", "memory text");
+  const probe = h.writes.find(frame => frame.type === "probe")!;
+  if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+  await h.tick(8);
+  expect(h.audits.filter(row => row.kind === "insert_admitted")).toHaveLength(1);
+  if (reason === "cancel") h.core.relayFrame(relayFrame("c1", { type: "cancel", mcp_request_id: "late-admit" }));
+  if (reason === "peer_close") h.core.relayFrame({ kind: "closed", connectionId: "c1" });
+  if (reason === "deadline") h.timers.fireFirst();
+  if (reason === "latch") {
+    h.core.relayFrame(relayFrame("c2", { type: "tools_call", request_id: "recall-latch", name: "memory_recall", arguments: { query: "the" } }));
+    await h.tick(8); h.pendingAudits[1]!.reject(new Error("audit fixture"));
+  }
+  await h.tick(16);
+  expect(h.store.size).toBe(0);
+  h.pendingAudits[0]!.resolve();
+  await h.tick(16);
+  expect(h.audits.filter(row => row.kind === "insert_refused")).toEqual([
+    expect.objectContaining({ passage_id: "p-late-admit", reason }),
+  ]);
+  expect(h.audits.filter(row => row.kind === "insert_unconfirmed")).toEqual([]);
+  h.resolveAudits(); h.core.relayEof(); await h.tick(8);
+});
+
+// Silent saves share M1's rolling count and UTF-8 byte allowance before any adapter access.
+it.each(["count", "bytes"] as const)("bounds own-scope saves by %s and prunes expired admissions", async bound => {
+  const h = makeHarness(); accept(h.core);
+  const perSaveBytes = OWN_SCOPE_SAVE_MAX_BYTES_PER_WINDOW / 32; // Thirty-two equal saves consume the byte allowance exactly.
+  const text = bound === "bytes" ? "é".repeat(perSaveBytes / 2) : "memory text";
+  const count = bound === "count" ? OWN_SCOPE_SAVE_MAX_PER_WINDOW : 32;
+  const save = async (id: string) => {
+    insert(h.core, "c1", id, text);
+    const probe = h.writes.filter(frame => frame.type === "probe").at(-1)!;
+    if (probe.type === "probe") h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+    await h.tick(16);
+    expect(toolResultBody(responseFor(h.writes, id))).toMatchObject({ outcome: "saved" });
+    h.advance(1001); // More than one second per call stays below the independent sixty-call minute limit.
+  };
+  try {
+    for (let n = 0; n < count; n++) await save(`allowance-${n}`);
+    const audits = h.audits.length, accesses = h.insertTaints.length, probes = h.writes.filter(frame => frame.type === "probe").length;
+    insert(h.core, "c1", "over-allowance", text);
+    await h.tick(8);
+    expect(toolResultBody(responseFor(h.writes, "over-allowance"))).toMatchObject({ outcome: "unavailable" });
+    expect(h.audits).toHaveLength(audits); expect(h.insertTaints).toHaveLength(accesses);
+    expect(h.writes.filter(frame => frame.type === "probe")).toHaveLength(probes);
+    h.advance(OWN_SCOPE_SAVE_WINDOW_MS);
+    await save("new-window");
+  } finally { h.core.relayEof(); await h.tick(8); }
 });

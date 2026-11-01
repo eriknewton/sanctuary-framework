@@ -1,3 +1,4 @@
+import { SdwWorkingStateStore } from "../working-state-store.js";
 import { recallTimestamp, type HermesRecallBudget, type HermesRecallResult } from "../../hermes-memory-bridge/recall.js";
 import { MEMORY_CORPUS_SCAN_CAP } from "../../hermes-memory-bridge/constants.js";
 /**
@@ -47,9 +48,11 @@ import {
   documentProvenanceStatusKey,
   isSdwIdentifier,
   lengthPrefixedUtf8,
+  stateKey,
 } from "../grammar.js";
 import {
   SDW_DOCUMENT_CORPUS_NAMESPACE,
+  SDW_WORKING_STATE_NAMESPACE,
   type SdwMemoryIntegrityState,
   type SdwDocumentChunkRecord,
   type SdwDocumentRecord,
@@ -93,6 +96,12 @@ export function hermesBridgePassageTextDigest(passageText: string): string {
   // Must match the approval-ledger comparison in ../../hermes-memory-bridge/approval-ledger.ts.
   return toBase64url(hash(stringToBytes(passageText)));
 }
+
+// The dedicated bridge fortress is one owner scope; its corpus lock linearizes all inserts,
+// so one fixed checkpoint key suffices and cannot grow with the number of saves.
+export const HERMES_INSERT_INTENT_NAMESPACE = SDW_WORKING_STATE_NAMESPACE;
+export const HERMES_INSERT_INTENT_STATE_ID = "hermes-insert-intent";
+export const HERMES_INSERT_INTENT_KEY = stateKey("tool", HERMES_INSERT_INTENT_STATE_ID);
 
 /** Document ids minted by this adapter are namespaced under this prefix. */
 export const MEMORY_PASSAGE_DOCUMENT_PREFIX = "mem";
@@ -360,6 +369,7 @@ export type SdwMemoryBackendAdapterOptions =
 export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly storage: StorageBackend;
   private readonly corpus: SdwDocumentCorpusStore;
+  private readonly insertIntents: SdwWorkingStateStore;
   readonly ownerRef: string;
   private readonly passageIdKey: Uint8Array;
   private readonly maxChunkChars: number;
@@ -441,6 +451,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       masterKey: options.masterKey,
       fortressId: options.fortressId,
     });
+    this.insertIntents = new SdwWorkingStateStore(options);
     this.ownerRef = options.ownerRef;
     this.passageIdKey = derivePurposeKey(options.masterKey, MEMORY_PASSAGE_ID_HKDF_INFO);
     this.maxChunkChars = maxChunkChars;
@@ -533,14 +544,35 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             await this.assertDocumentAbsent(documentId);
             await this.assertCandidateCapacity([prepared]);
             const writtenChunkKeys: string[] = [];
+            let intentWritten = false;
+            let published = false;
             try {
               this.assertSignerStillPrimary(prepared);
               if (this.mode === "hermes-bridge") {
                 // A queued insert can outlive an earlier partial-scope latch; recheck
                 // inside the corpus lock immediately before the bridge commit hook.
                 this.assertHermesBridgeInsertAllowed();
+                if (await this.storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY) !== null) {
+                  this.hermesBridgeLatchReason = "insert_intent";
+                  throw new SdwValidationError("partial_scope", "An earlier Hermes save requires operator recovery");
+                }
                 // Hermes mode linearizes own-scope admission inside the corpus lock; a refusal here precedes every storage write.
                 await this.assertHermesBridgeCommitAllowed(prepared);
+                // No Hermes save writes a corpus byte before its intent is durable; a restart refuses while an intent remains, so an unfinished save is never resumed over.
+                try {
+                  await this.insertIntents.put({
+                    kind: "working_state", version: 1, state_id: HERMES_INSERT_INTENT_STATE_ID,
+                    scope: "tool", owner_ref: this.ownerRef, status: "active",
+                    created_at: documentRecord.created_at, updated_at: documentRecord.created_at,
+                    content_type: "application/json",
+                    state: { kind: "task_checkpoint", task_ref: documentId,
+                      summary: "Hermes save awaiting completion", next_steps: chunkRecords.map(documentChunkStorageKey) },
+                  }, "system_generated");
+                } catch (cause) {
+                  this.hermesBridgeLatchReason = "insert_intent";
+                  throw new SdwValidationError("operation_refused", "Hermes save intent unavailable", { cause, persisted: "none" });
+                }
+                intentWritten = true;
               }
               // Mark before the first mutator: even a rejected write can have persisted bytes.
               writeStarted = true;
@@ -562,7 +594,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                 undefined,
                 documentMintOptions(prepared),
               );
+              published = true;
+              if (intentWritten) await this.deleteInsertIntent();
             } catch (error) {
+              if (published) throw error; // A failed intent deletion preserves the published save and requires operator recovery.
               if (this.mode !== "hermes-bridge" || writtenChunkKeys.length > 0) {
                 try {
                   // Compensating deletes also mutate state, so a failed rollback cannot certify non-commit.
@@ -573,6 +608,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                   throw rollbackError;
                 }
               }
+              if (intentWritten) await this.deleteInsertIntent();
               this.latchHermesBridgeOnPartialScope(error);
               throw error;
             }
@@ -590,6 +626,16 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         cause: error, detector: error.detector, line: error.line,
         persisted: writeStarted || error.category === "partial_scope" ? "indeterminate" : "none",
       });
+    }
+  }
+
+  private async deleteInsertIntent(): Promise<void> {
+    try {
+      await this.storage.delete(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY, true);
+    } catch (cause) {
+      const error = new SdwValidationError("partial_scope", "Hermes save completion requires operator recovery", { cause });
+      this.latchHermesBridgeOnPartialScope(error);
+      throw error;
     }
   }
 
@@ -955,7 +1001,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   /** Recall shares search provenance checks while retaining only bounded, verified excerpts. */
   async recallPassages(budget: HermesRecallBudget): Promise<HermesRecallResult> {
-    if (budget.terms.length === 0) return budget.result();
+    if (budget.terms.length === 0 || !budget.active()) return budget.result();
     const entries = await this.storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE, this.documentKeyPrefix());
     for (const entry of entries) {
       if (!budget.candidate()) break;
@@ -1762,6 +1808,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       SDW_DOCUMENT_CORPUS_NAMESPACE,
       `doc.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.`,
     );
+    if (this.mode === "hermes-bridge" && candidates.filter(entry => entry.key.startsWith(this.documentKeyPrefix())).length >= this.corpusScanCap) {
+      // Admission stops at the scan ceiling so every bridge-saved document remains eligible for complete search and recall.
+      throw new SdwValidationError("candidate_cap", "Hermes memory corpus capacity reached");
+    }
     let newCandidates = 0;
     for (const item of prepared) {
       if (await this.corpus.getDocument(item.documentId, txn) === null) newCandidates += 1;

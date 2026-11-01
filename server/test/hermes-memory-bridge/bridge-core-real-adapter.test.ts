@@ -22,8 +22,11 @@ import {
 import { documentChunkKey, documentKey } from "../../src/sdw/grammar.js";
 import {
   MEMORY_BATCH_LOCK_NAMESPACE,
+  HERMES_INSERT_INTENT_KEY,
+  HERMES_INSERT_INTENT_NAMESPACE,
   hermesBridgePassageTextDigest,
-  type SdwMemoryBackendAdapter,
+  SdwMemoryBackendAdapter,
+  type SdwMemoryBackendAdapterOptions,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { memoryGetSuccessFrameUtf8Bytes } from "../../src/sdw/memory-tool-projection.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
@@ -119,10 +122,12 @@ async function makeStorage(): Promise<{ readonly storage: StorageBackend; readon
   };
 }
 
-function makeAdapter(storage: StorageBackend, commitCheck: HermesBridgeCore["commitCheck"]): SdwMemoryBackendAdapter {
+function makeAdapter(storage: StorageBackend, commitCheck: HermesBridgeCore["commitCheck"], corpusScanCap?: number): SdwMemoryBackendAdapter {
   const deps = testMemoryProvenanceDependencies(MASTER_KEY);
-  return createSdwMemoryAdapter({
+  const build = corpusScanCap === undefined ? createSdwMemoryAdapter : (options: SdwMemoryBackendAdapterOptions) => new SdwMemoryBackendAdapter(options);
+  return build({
     mode: "hermes-bridge",
+    ...(corpusScanCap === undefined ? {} : { corpusScanCap, listMaxLimit: corpusScanCap }),
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS_ID,
@@ -138,6 +143,7 @@ function makeAdapter(storage: StorageBackend, commitCheck: HermesBridgeCore["com
 async function makeHarness(options: {
   readonly storage?: StorageBackend;
   readonly rejectCommitIntentAudit?: boolean;
+  readonly corpusScanCap?: number;
 } = {}) {
   const ownedStorage = options.storage === undefined ? await makeStorage() : undefined;
   const storage = options.storage ?? ownedStorage!.storage;
@@ -178,7 +184,7 @@ async function makeHarness(options: {
     terminalEvents.push(state);
     return finish(entry, state, ...rest);
   };
-  adapter = makeAdapter(storage, core.commitCheck);
+  adapter = makeAdapter(storage, core.commitCheck, options.corpusScanCap);
   return {
     core,
     adapter,
@@ -558,7 +564,7 @@ describe("HermesBridgeCore with real SDW adapter", () => {
       expect(terminalStates(h)).toContain("INDETERMINATE");
       expect(h.audits.filter(audit => audit.kind === "insert_unconfirmed")).toHaveLength(1);
       expect(h.audits.filter(audit => audit.kind === "latch")).toHaveLength(1);
-      expect(await waitForResponse(h.writes, "insert-partial")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unconfirmed });
+      expect(await waitForResponse(h.writes, "insert-partial")).toMatchObject({ type: "result", payload: HERMES_TOOL_OUTCOMES.unavailable });
 
       accept(h.core, "c2");
       insert(h.core, "c2", "insert-after-partial", "passage-after-partial", "later");
@@ -574,3 +580,50 @@ function cancelInsert(core: HermesBridgeCore): void {
   const record = core.snapshot().lifecycle.records.find(record => record.id === entry.recordId)!;
   core.relayFrame(publicFrame(entry.connectionId, { type: "cancel", mcp_request_id: record.requestId }));
 }
+
+// Corpus capacity refuses before admission audit and keeps already saved passages searchable.
+it("refuses bridge inserts at the owner corpus scan ceiling", async () => {
+  const h = await makeHarness({ storage: new MemoryStorage(), corpusScanCap: 1 });
+  try {
+    accept(h.core);
+    insert(h.core, "c1", "first", "first", "board meeting");
+    await replyToProbe(h); await waitForResponse(h.writes, "first");
+    const audits = h.audits.length;
+    insert(h.core, "c1", "second", "second", "board meeting later");
+    expect(await waitForResponse(h.writes, "second")).toMatchObject({ payload: HERMES_TOOL_OUTCOMES.unavailable });
+    expect(h.audits).toHaveLength(audits);
+    expect(await documentCount(h.storage)).toBe(1);
+    expect((await h.adapter.searchPassages({ text: "board" })).map(row => row.passage.passage_id)).toEqual(["first"]);
+  } finally { h.core.relayEof(); await flush(); await h.cleanup(); }
+});
+
+// Intent creation and deletion use the real adapter's encrypted checkpoint and rollback path.
+it.each(["intent_write", "publish", "intent_delete"] as const)("preserves save recovery state on %s", async fault => {
+  class FaultStorage extends MemoryStorage {
+    corpusWrites = 0;
+    override async write(namespace: string, key: string, data: Uint8Array) {
+      if (fault === "intent_write" && namespace === HERMES_INSERT_INTENT_NAMESPACE) throw new Error("intent fixture");
+      if (namespace === SDW_DOCUMENT_CORPUS_NAMESPACE) {
+        this.corpusWrites++;
+        if (fault === "publish" && key.startsWith("doc.")) throw new Error("publish fixture");
+      }
+      return super.write(namespace, key, data);
+    }
+    override async delete(namespace: string, key: string, secure?: boolean) {
+      if (fault === "intent_delete" && namespace === HERMES_INSERT_INTENT_NAMESPACE) throw new Error("intent delete fixture");
+      return super.delete(namespace, key, secure);
+    }
+  }
+  const storage = new FaultStorage();
+  const h = await makeHarness({ storage });
+  try {
+    accept(h.core); insert(h.core, "c1", "intent-save", "intent-save", "board meeting");
+    await replyToProbe(h);
+    const response = await waitForResponse(h.writes, "intent-save");
+    expect(response).toMatchObject({ payload: fault === "publish" ? HERMES_TOOL_OUTCOMES.unconfirmed : HERMES_TOOL_OUTCOMES.unavailable });
+    expect(await storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY) === null).toBe(fault !== "intent_delete");
+    expect(await documentCount(storage)).toBe(fault === "intent_delete" ? 1 : 0);
+    if (fault === "intent_write") expect(storage.corpusWrites).toBe(0);
+    if (fault === "intent_delete") expect(h.core.snapshot().ledger.latched).toBe(true);
+  } finally { h.core.relayEof(); await flush(); await h.cleanup(); }
+});

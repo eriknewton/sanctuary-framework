@@ -1,4 +1,4 @@
-import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP } from "./constants.js";
+import { HermesAuditBackpressureError, HERMES_AUDIT_WAITING_CAP, HERMES_AUDIT_PROCESS_ROWS } from "./constants.js";
 import { Buffer } from "node:buffer";
 import { fstatSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
@@ -16,6 +16,8 @@ import { KnownSignersStore } from "../reputation/known-signers-store.js";
 import { createSdwMemoryAdapter } from "../index.js";
 import {
   MEMORY_BATCH_LOCK_NAMESPACE,
+  HERMES_INSERT_INTENT_KEY,
+  HERMES_INSERT_INTENT_NAMESPACE,
   type HermesBridgeCommitCheck,
   type SdwMemoryBackendAdapter,
   sdwMemoryCorpusBatchLockFile,
@@ -292,8 +294,9 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
 
   append(record: HermesBridgeAuditRecord): Promise<void> {
     const target = this.requireTarget();
-    // Refuse before retaining a row so canceled admission waves cannot grow the waiting queue.
-    if (this.waiting.length >= HERMES_AUDIT_WAITING_CAP) throw new HermesAuditBackpressureError();
+    // Rows outlive calls: reserve the process share so stalled call rows cannot displace the latch evidence.
+    const cap = HERMES_AUDIT_WAITING_CAP - (record.kind === "latch" ? 0 : HERMES_AUDIT_PROCESS_ROWS);
+    if (this.waiting.length >= cap) return Promise.reject(new HermesAuditBackpressureError());
     if (this.refuseAtExit !== undefined) return this.track(this.refuse(record));
     const turn = new Promise<void>((resolve, reject) => {
       this.waiting.push({ record, settle: (outcome) => { outcome.then(resolve, reject); } });
@@ -338,11 +341,11 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
     this.handedOff += 1;
     // The async arrow calls into the log synchronously and turns a synchronous throw into a rejection.
     const outcome = (async () => this.appendCritical(target, entry.record))();
-    entry.settle(outcome);
-    void outcome.then(() => undefined, () => undefined).then(() => {
+    // Free the next waiting slot before notifying durability consumers, which may append a terminal refusal row.
+    entry.settle(outcome.finally(() => {
       this.handedOff -= 1;
       this.handOffNext(target);
-    });
+    }));
   }
 
   private appendCritical(target: AuditLog, record: HermesBridgeAuditRecord): Promise<void> {
@@ -709,6 +712,10 @@ export async function runHermesBridgeProcess(options: HermesBridgeProcessOptions
     // Recheck in the caller's continuation: a successful callback cannot mask a stop or failure queued before custody.
     if (options.startupStopRequested?.() !== undefined) throw new StartupRefusal(STATE_CONFIG_CHECKED, "process stopped before ready");
     startupTransport.assertLive(STATE_CONFIG_CHECKED);
+    await assertNoUnfinishedInsert(storage);
+    // The intent read is asynchronous; a stop or transport failure during it still refuses before custody.
+    if (options.startupStopRequested?.() !== undefined) throw new StartupRefusal(STATE_CONFIG_CHECKED, "process stopped before ready");
+    startupTransport.assertLive(STATE_CONFIG_CHECKED);
     enter(STATE_CUSTODY_PRESENT);
     custody = await state_CUSTODY_PRESENT(storage, resolved.storagePath, env.HOME!);
     await refusePreReadyStop(options.startupStopRequested?.(), custody, STATE_CUSTODY_PRESENT);
@@ -752,8 +759,7 @@ export async function runHermesBridgeProcess(options: HermesBridgeProcessOptions
     state_CHILD_READY();
     // Ready is the first output; only now may the reader consume bytes parked during admission and custody.
     startReader();
-    // This process handle intentionally grants no owner decision capability.
-    // Adding one requires restart-recovery handling before any write can be authorized.
+    // Every save first persists an insert intent; startup refuses until an unfinished intent is recovered by the operator.
     return {
       report: composition.report,
       exited: controller.exited,
@@ -938,6 +944,20 @@ async function assertNoLeftoverCorpusLock(storage: FilesystemStorage): Promise<v
   );
   if (exists) {
     throw new CorpusLockRefusal(lockPath);
+  }
+}
+
+class UnfinishedInsertRefusal extends StartupRefusal {
+  constructor() {
+    super(STATE_CONFIG_CHECKED, "An earlier save did not finish; recovery is an operator action.");
+    this.name = "UnfinishedInsertRefusal";
+  }
+}
+
+async function assertNoUnfinishedInsert(storage: StorageBackend): Promise<void> {
+  // Presence alone refuses before core construction: neither unreadable nor unfinished intent can authorize a new save.
+  if (await storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY) !== null) {
+    throw new UnfinishedInsertRefusal();
   }
 }
 

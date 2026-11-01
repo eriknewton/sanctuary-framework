@@ -1,3 +1,4 @@
+import { SdwWorkingStateStore } from "../../src/sdw/working-state-store.js";
 import { Buffer } from "node:buffer";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { closeSync, constants as fsConstants, openSync, readSync } from "node:fs";
@@ -44,6 +45,8 @@ import { passageContentHash } from "../../src/sdw/write-gate.js";
 import { memoryProvenancePublicKeyFingerprint } from "../../src/sdw/memory-provenance-bad-signers.js";
 import {
   MEMORY_BATCH_LOCK_NAMESPACE,
+  HERMES_INSERT_INTENT_KEY,
+  HERMES_INSERT_INTENT_NAMESPACE,
   hermesBridgePassageTextDigest,
   sdwMemoryCorpusBatchLockFile,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
@@ -408,7 +411,7 @@ describe("Hermes memory process shell", () => {
     const coreEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/bridge-core.ts", import.meta.url));
     const constantsEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/constants.ts", import.meta.url));
     // Seed the actual composed waiter's retained state; a real fixture-admitted insert consumes that cap.
-    // Approval exists only in this subprocess fixture, never in the installed CLI.
+    // The production save path reaches the probe without a human decision.
     const instrument = `
       const { HermesBridgeCore } = await import(pathToFileURL(${JSON.stringify(coreEntry)}).href);
       const { ABANDONED_PROBE_NONCE_CAP } = await import(pathToFileURL(${JSON.stringify(constantsEntry)}).href);
@@ -1576,6 +1579,86 @@ describe("Hermes memory process shell", () => {
       parkedStorage.release();
       pair.close();
     }
+  });
+
+  // A normal process exit preserves unfinished-save refusal across the production boot path.
+  it.each([false, true])("restarts only after a finished save, unfinished=%s", async unfinished => {
+    const fixture = await seededFortress("insert-restart");
+    class InsertFaultStorage extends FilesystemStorage {
+      corpusWrites = 0;
+      chunkWritten = false;
+      override async write(namespace: string, key: string, bytes: Uint8Array) {
+        if (namespace === SDW_DOCUMENT_CORPUS_NAMESPACE) {
+          this.corpusWrites++;
+          if (unfinished && key.startsWith("doc.mem.")) throw new Error("publish fixture");
+        }
+        await super.write(namespace, key, bytes);
+        if (namespace === SDW_DOCUMENT_CORPUS_NAMESPACE && key.startsWith("chunk.")) this.chunkWritten = true;
+      }
+      override async delete(namespace: string, key: string, secure?: boolean) {
+        if (unfinished && namespace === SDW_DOCUMENT_CORPUS_NAMESPACE && key.startsWith("chunk.")) throw new Error("rollback fixture");
+        return super.delete(namespace, key, secure);
+      }
+    }
+    const storage = new InsertFaultStorage(join(fixture.fortressDir, "state"));
+    const pair = await socketPair();
+    const options = { env: fixture.env, storageFor: () => storage, uid: process.getuid?.() ?? 0 };
+    const shell = await runHermesBridgeProcess({ ...options, relaySocketFactory: () => pair.shell });
+    try {
+      expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+      pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "save", name: "memory_insert",
+        arguments: { text: "A durable restart memory", taint: "user_content", passage_id: "restart" } }));
+      const probe = await readNodeFrame(pair.relay);
+      expect(probe.type).toBe("probe");
+      pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+      const response = await readPublicResponse(pair.relay, "save");
+      expect(JSON.parse((response.payload as { content: Array<{ text: string }> }).content[0]!.text).outcome)
+        .toBe(unfinished ? "unavailable" : "saved");
+      expect(storage.chunkWritten).toBe(true);
+      expect(shell.core.snapshot().ledger.latched).toBe(unfinished);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await shell.exited).toBe(EXIT_CLEAN);
+      const intent = await storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY);
+      expect(intent === null).toBe(!unfinished);
+      if (unfinished) {
+        expect(Buffer.from(intent!).toString("utf8")).not.toContain("A durable restart memory");
+        const custody = await establishMaster({ storage: new FilesystemStorage(join(fixture.fortressDir, "state")), passphrase: PASS });
+        try {
+          const checkpoint = new SdwWorkingStateStore({ storage, masterKey: custody.masterKey, fortressId: shell.report.fortressId });
+          expect(await checkpoint.get("tool", "hermes-insert-intent")).toMatchObject({
+            version: 1, owner_ref: shell.report.adapterOwnerRef, created_at: expect.any(String),
+            state: { kind: "task_checkpoint", task_ref: `mem.${shell.report.adapterOwnerRef}.restart`,
+              next_steps: [expect.stringContaining(`chunk.mem.${shell.report.adapterOwnerRef}.restart.`)] },
+          });
+        } finally { await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0); }
+      }
+      const writes = storage.corpusWrites;
+      const nextPair = await socketPair();
+      const factory = vi.fn(() => nextPair.shell);
+      const nextStorage = new InsertFaultStorage(join(fixture.fortressDir, "state"));
+      const restartOptions = { ...options, storageFor: () => nextStorage, relaySocketFactory: factory };
+      const constructCore = vi.spyOn(HermesBridgeCore.prototype, "onDrained");
+      let nextHandle: Awaited<ReturnType<typeof runProductionHermesBridgeProcess>> | undefined;
+      try {
+        if (unfinished) {
+          await expect(runProductionHermesBridgeProcess(restartOptions).then(handle => { nextHandle = handle; return handle; }))
+            .rejects.toMatchObject({ name: "UnfinishedInsertRefusal" });
+          expect(factory).toHaveBeenCalledTimes(1);
+          expect(constructCore).not.toHaveBeenCalled();
+        } else {
+          const restarted = nextHandle = await runProductionHermesBridgeProcess(restartOptions);
+          expect(await readNodeFrame(nextPair.relay)).toEqual({ type: "ready" });
+          nextPair.relay.write(privateFrame({ type: "relay_shutdown" }));
+          expect(await restarted.exited).toBe(EXIT_CLEAN);
+        }
+        expect(storage.corpusWrites).toBe(writes);
+        expect(nextStorage.corpusWrites).toBe(0);
+      } finally {
+        nextHandle?.signalStop("SIGTERM"); if (nextHandle !== undefined) await nextHandle.exited;
+        constructCore.mockRestore(); nextPair.close();
+      }
+    } finally { shell.signalStop("SIGTERM"); await shell.exited; pair.close(); }
   });
 
   it("commits an admitted passage and reads it back over the process socket", async () => {
