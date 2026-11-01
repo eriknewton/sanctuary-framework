@@ -3139,6 +3139,7 @@ export class AuditLog {
         recountPending = false;
         const metas = rawMetas.filter(abovesSealedFloor);
         if (this.recountFaultLatched) {
+          // SAFETY: stderr reports recount recovery without entry content or audit-backed logging.
           console.error(`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} recovered`);
           this.recountFaultLatched = false;
         }
@@ -3208,6 +3209,7 @@ export class AuditLog {
       // audit-backed logger, signing incident, finding, subscriber or storage write.
       if (recountPending && !this.recountFaultLatched) {
         this.recountFaultLatched = true;
+        // SAFETY: stderr reports recount failure without entry content or audit-backed logging.
         console.error(`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} failed`);
       }
       throw err;
@@ -7475,12 +7477,14 @@ export class AuditLog {
           // per incomplete episode, with no subscriber, finding or durable write.
           if (!this.checkpointRangeFaultLatched) {
             this.checkpointRangeFaultLatched = true;
+            // SAFETY: stderr reports range status without entry content or audit-backed logging.
             console.error(`${AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_PREFIX} incomplete (${collected.reason} at sequence ${collected.atSequence})`);
           }
           return;
         }
         if (this.checkpointRangeFaultLatched) {
           this.checkpointRangeFaultLatched = false;
+          // SAFETY: stderr reports range recovery without entry content or audit-backed logging.
           console.error(`${AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_PREFIX} recovered`);
         }
         // Even an already-covered range must observe every above-floor body
