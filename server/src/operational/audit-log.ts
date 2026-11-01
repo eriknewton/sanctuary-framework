@@ -452,6 +452,18 @@ interface AuditWriteLockAbortSignal {
 
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
+// One percent amortizes the sized listing; the count margin is 1,000 at the
+// default cap and scales with configured retention, with a one-entry floor.
+export const AUDIT_ROTATION_MARGIN_FRACTION = 1 / 100;
+export const AUDIT_ROTATION_HYSTERESIS = Math.max(1, Math.floor(DEFAULT_MAX_ENTRIES * AUDIT_ROTATION_MARGIN_FRACTION));
+
+// Raw stderr must remain usable when the audit store itself cannot be reconciled.
+export const AUDIT_RECOUNT_DIAGNOSTIC_PREFIX = "[audit-log] AUDIT-RECOUNT";
+const AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_CONTEXT = "AUDIT-CHECKPOINT-RANGE";
+
+type PersistedEntryHashCollection =
+  | { status: "complete"; hashes: string[] }
+  | { status: "incomplete"; reason: "gap" | "duplicate"; atSequence: number };
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
 // In-memory retention bound for the decrypted recent-entry window the instance
 // holds in `this.entries` / `this.chainEntries`. On-disk rotation prunes the
@@ -2194,6 +2206,16 @@ export class AuditLog {
   private readonly auditWriteLockPath?: string;
   private lastIntegrityAlertSignature: string | null = null;
   private rotationInFlight = false;
+  private retainedBytesEstimate = 0;
+  private retainedCountExpected = 0;
+  private retainedSignatureExpected = "0";
+  private retainedLowestKey = "";
+  private retainedHighestKey = "";
+  private bytesProvenance: "seeded" | "unknown" = "unknown";
+  private recountFaultLatched = false;
+  private readonly rotationHysteresis: number;
+  // A load may publish its sized observation only while this mutation generation matches.
+  private retentionGeneration = 0;
   private readonly pendingWrites = new Set<Promise<void>>();
   private pendingVisibleEntries = 0;
   private appendQueue: Promise<void> = Promise.resolve();
@@ -2204,7 +2226,11 @@ export class AuditLog {
   private hashesSinceCheckpoint: string[] = [];
   private lastCheckpointSequence = 0;
   private criticalAppendsSinceCheckpoint = 0;
+  // The flag is a per-hold ownership token, not a process-wide latch: an
+  // abandoned flight must not suppress its successor or clear it on late cleanup.
   private checkpointInFlight = false;
+  private checkpointFlightGeneration = 0;
+  private checkpointFlightSignal: AuditWriteLockAbortSignal | undefined;
   /**
    * Wall-clock of the most recent FULL on-disk re-verification (a complete
    * `loadPersistedEntries` pass that re-read, re-decrypted, re-hashed and
@@ -2229,9 +2255,9 @@ export class AuditLog {
   /**
    * Cheap metadata fingerprint of the audit store (entry count + newest key +
    * per-entry size/mtime aggregate; see {@link auditStoreFingerprint}) as it
-   * stood at the last point this process KNOWS the store was consistent: refreshed
-   * after every completed full re-verify AND after each of THIS process's own
-   * appends. On each eager read the sentinel recomputes the live fingerprint and
+   * stood at the last completed full re-verification. Own writes clear this
+   * optional hint; they never stand in for the eager byte pass.
+   * On each eager read the sentinel recomputes the live fingerprint and
    * compares it to this expected value; a mismatch means an on-disk change NOT
    * attributable to this process (out-of-band tamper) and forces an IMMEDIATE full
    * re-verify regardless of the backstop throttle. Null until first computed.
@@ -2327,6 +2353,7 @@ export class AuditLog {
     this.epochMacKey = epochKeys.epochMacKey;
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    this.rotationHysteresis = Math.max(1, Math.floor(this.maxEntries * AUDIT_ROTATION_MARGIN_FRACTION));
     // In-memory window cap, decoupled from the on-disk cap: defaults to
     // `maxEntries` so behavior is unchanged unless a caller sets it explicitly,
     // but is independently configurable so the daemon can keep less in RAM than
@@ -2728,6 +2755,7 @@ export class AuditLog {
       const encrypted = encrypt(serialized, this.encryptionKey);
       const encryptedBytes = stringToBytes(JSON.stringify(encrypted));
       const encryptedPayloadBytes = toBase64url(encryptedBytes);
+      let appendKeys: string[] = [];
       await this.withAuditWriteLock(async (signal) => {
         this.assertAuditWriteLockActive(signal);
         // Incremental re-check of only the unstable tail (O(1) backward walk;
@@ -2742,8 +2770,12 @@ export class AuditLog {
         // relies on this same freshen step today, never a per-append full
         // reload, so this is the existing steady-state guarantee, not a
         // weaker one.
-        await this.freshenChainStateFromDisk();
+        appendKeys = await this.freshenChainStateFromDisk(signal);
         this.assertAuditWriteLockActive(signal);
+        const observed = appendKeys.filter((key) => this.aboveSealedFloor(key, this.cachedSealedTip));
+        if (this.retentionSignature(observed) !== this.retainedSignatureExpected) {
+          this.bytesProvenance = "unknown";
+        }
         const sequence = this.nextSequence;
         const prevHash = this.lastEntryHash;
         // Hash-chain invariant: the entry hash covers the previous hash and the
@@ -2769,7 +2801,28 @@ export class AuditLog {
         try {
           this.assertAuditWriteLockActive(signal);
           await this.writeAuditEntryBytes(key, persistedBytes);
+          // An own write makes the metadata hint unknown, including failed-anchor
+          // paths. sentinelDetectsDrift returns false on null; detection is the
+          // byte pass on the first eager read after its interval, the 30 s
+          // backstop, and unconditional load, which re-establishes the hint.
+          this.expectedStoreFingerprint = null;
+          this.retentionGeneration++;
           this.assertAuditWriteLockActive(signal);
+          // Publish the exact durable delta under the lock before any later
+          // anchor or rotation failure; a failed continuation cannot lose it.
+          this.retainedBytesEstimate += persistedBytes.length;
+          this.retainedCountExpected++;
+          // An own entry need not sort after a foreign non-entry key; keep the
+          // actual extrema so an unchanged population does not force a recount.
+          const empty = this.retainedSignatureExpected === "0";
+          const lowest = empty || key.localeCompare(this.retainedLowestKey) < 0
+            ? key : this.retainedLowestKey;
+          const highest = empty || key.localeCompare(this.retainedHighestKey) > 0
+            ? key : this.retainedHighestKey;
+          this.retainedLowestKey = lowest;
+          this.retainedHighestKey = highest;
+          this.retainedSignatureExpected = `${this.retainedCountExpected}:${lowest}:${highest}`;
+          appendKeys.push(key);
 
           if (options.verifyDurability) {
             this.assertAuditWriteLockActive(signal);
@@ -2817,6 +2870,9 @@ export class AuditLog {
             }
           }
         } catch (err) {
+          // A timed-out durable write may finish after its lease: no stale
+          // continuation can establish accounting for a later lock holder.
+          if (signal?.aborted) this.bytesProvenance = "unknown";
           throw toAuditPersistenceError(err);
         }
 
@@ -2833,29 +2889,24 @@ export class AuditLog {
         if (options.critical) {
           this.criticalAppendsSinceCheckpoint++;
         }
+
+        if (
+          options.critical &&
+          this.checkpointInterval > 0 &&
+          this.criticalAppendsSinceCheckpoint >= this.checkpointInterval
+        ) {
+          // Reuse this lock's complete snapshot; a second lock would require
+          // another discovery listing to include intervening writers.
+          await this.writeCheckpointIfNeeded("critical-interval", { keys: appendKeys, signal });
+        }
       });
 
-      if (
-        options.critical &&
-        this.checkpointInterval > 0 &&
-        this.criticalAppendsSinceCheckpoint >= this.checkpointInterval
-      ) {
-        await this.writeCheckpointIfNeeded("critical-interval");
-      }
-
-      // Rotation runs as part of the same tracked promise so flush() also
-      // covers any prune-driven deletes.
-      await this.maybeRotate().catch(() => {
-        // Rotation failure is non-fatal
+      // A foreign entry landing after lock release is reflected at most one own
+      // append late: the next append's names-only listing observes it.
+      await this.maybeRotate(appendKeys).catch(() => {
+        // Rotation remains non-fatal, but uncertain bytes force the next recount.
+        this.bytesProvenance = "unknown";
       });
-
-      // Re-baseline the eager-read sentinel fingerprint to the post-append (and
-      // post-rotation) on-disk state. This is what keeps the server's OWN appends
-      // from tripping the sentinel into a redundant full re-verify (which would
-      // kill the perf win); only out-of-band edits (NOT attributable to this
-      // process) change the fingerprint away from this baseline. Cheap metadata
-      // list, no decrypt. Best-effort: a list failure leaves the prior baseline.
-      await this.refreshExpectedStoreFingerprint();
     } finally {
       if (!options.critical && this.pendingVisibleEntries > 0) {
         this.pendingVisibleEntries--;
@@ -2944,31 +2995,61 @@ export class AuditLog {
    * back under the count and size limits. 0 when within budget. */
   private rotationDeleteCount(metas: readonly { size_bytes: number }[]): number {
     const totalSize = metas.reduce((sum, m) => sum + m.size_bytes, 0);
-    let toDelete = 0;
-    if (metas.length > this.maxEntries) {
-      toDelete = metas.length - this.maxEntries;
-    }
-    if (totalSize > this.maxTotalSizeBytes) {
-      let runningSize = totalSize;
-      for (
-        let i = toDelete;
-        i < metas.length && runningSize > this.maxTotalSizeBytes;
-        i++
-      ) {
-        runningSize -= metas[i]!.size_bytes;
-        toDelete = i + 1;
-      }
+    if (metas.length <= this.maxEntries && totalSize <= this.maxTotalSizeBytes) return 0;
+    const byteMargin = Math.max(1, Math.floor(this.maxTotalSizeBytes * AUDIT_ROTATION_MARGIN_FRACTION));
+    // A due prune targets the configured count minus its one-percent margin,
+    // and the byte cap minus the same proportion, subject to one survivor.
+    // This deliberate retention change amortizes recounts; it must match the
+    // retention contract in server/docs/audit-log-architecture.md.
+    const targetCount = Math.max(1, this.maxEntries - this.rotationHysteresis);
+    const targetBytes = this.maxTotalSizeBytes - byteMargin;
+    let toDelete = Math.max(0, metas.length - targetCount);
+    let runningSize = totalSize;
+    for (let i = 0; i < toDelete; i++) runningSize -= metas[i]!.size_bytes;
+    while (toDelete < metas.length && runningSize > targetBytes) {
+      runningSize -= metas[toDelete++]!.size_bytes;
     }
     return toDelete;
+  }
+
+  /** The retention population includes legacy keys only when no floor seals them. */
+  private aboveSealedFloor(key: string, sealedTipSequence: number): boolean {
+    const seq = parseEntryKeySequence(key);
+    return seq === null ? sealedTipSequence <= 0 : seq > sealedTipSequence;
+  }
+
+  /** Same count/ends shape as auditEntryListingSignature; keys use localeCompare. */
+  private retentionSignature(keys: readonly string[]): string {
+    if (keys.length === 0) return "0";
+    // Discovery sorts the snapshot once; only the appended own key can be out
+    // of order. Comparing it with both existing ends preserves true extrema
+    // without another sort, even when foreign non-entry keys sort after it.
+    const first = keys[0]!;
+    const last = keys[keys.length - 1]!;
+    const priorLast = keys.at(-2) ?? first; // Penultimate item is the old sorted maximum after an own append.
+    const lowest = first.localeCompare(last) <= 0 ? first : last;
+    const highest = priorLast.localeCompare(last) > 0 ? priorLast : last;
+    return `${keys.length}:${lowest}:${highest}`;
+  }
+
+  /** Publish only an authoritative sized observation of the surviving population. */
+  private seedRetention(metas: readonly { key: string; size_bytes: number }[]): void {
+    this.retainedBytesEstimate = metas.reduce((sum, meta) => sum + meta.size_bytes, 0);
+    this.retainedCountExpected = metas.length;
+    this.retainedLowestKey = metas[0]?.key ?? "";
+    this.retainedHighestKey = metas.at(-1)?.key ?? "";
+    this.retainedSignatureExpected = this.retentionSignature(metas.map((meta) => meta.key));
+    this.bytesProvenance = "seeded";
   }
 
   /**
    * Prune oldest audit entries when storage exceeds configured limits.
    * Entries are sorted by key (timestamp-based) so oldest are pruned first.
    */
-  private async maybeRotate(): Promise<void> {
+  private async maybeRotate(appendKeys: readonly string[]): Promise<void> {
     if (this.rotationInFlight) return;
     this.rotationInFlight = true;
+    let recountPending = false;
     try {
       // F2 Option A: a valid split boundary is an UNPRUNABLE floor. Rotation
       // sorts oldest-first and deletes from the bottom, so without this an
@@ -2993,19 +3074,16 @@ export class AuditLog {
       // before the boundary is deleted" promise. When there is no boundary
       // (sealedTipSequence === 0), preserve the pre-F2 behavior exactly: legacy
       // keys are prunable oldest-first as they always were.
-      const boundaryInForce = sealedTipSequence > 0;
-      const abovesSealedFloor = (meta: { key: string }): boolean => {
-        const seq = parseEntryKeySequence(meta.key);
-        if (seq === null) return !boundaryInForce;
-        return seq > sealedTipSequence;
-      };
-
-      // Cheap lock-free pre-check: only pay the cross-process lock cost when a
-      // prune is actually due. storage.list() returns key-sorted entries.
-      const preMetas = (await this.storage.list(AUDIT_NAMESPACE)).filter(
-        abovesSealedFloor
-      );
-      if (this.rotationDeleteCount(preMetas) <= 0) return;
+      // Must match the load seed's aboveSealedFloor filter in loadPersistedEntries.
+      const abovesSealedFloor = (meta: { key: string }): boolean =>
+        this.aboveSealedFloor(meta.key, sealedTipSequence);
+      const aboveFloorKeys = appendKeys.filter((key) => this.aboveSealedFloor(key, sealedTipSequence));
+      const disagrees = this.retentionSignature(aboveFloorKeys) !== this.retainedSignatureExpected;
+      // A same-key byte rewrite is out-of-band tamper, never a writer operation:
+      // names cannot see it; detecting it belongs to the byte pass, not rotation.
+      if (!disagrees && this.bytesProvenance === "seeded" &&
+          aboveFloorKeys.length <= this.maxEntries &&
+          this.retainedBytesEstimate <= this.maxTotalSizeBytes) return;
 
       // F3: serialize the anchor write + prune under the SAME cross-process lock
       // the append path uses. Without this, two AuditLog instances rotating the
@@ -3015,15 +3093,33 @@ export class AuditLog {
       // readers would then throw on a legitimate concurrent rotation. The lock is
       // a no-op for non-filesystem backends. maybeRotate is called from
       // persistChainedEntry AFTER its own lock has been released, so this
-      // re-acquisition cannot deadlock (mirrors writeCheckpointIfNeeded).
+      // re-acquisition cannot deadlock; interval checkpoints use the append lock.
       await this.withAuditWriteLock(async (signal) => {
         // Re-list INSIDE the lock: another rotator may have pruned since the
         // pre-check, so recompute the cut against the authoritative state.
         this.assertAuditWriteLockActive(signal);
-        const metas = (await this.storage.list(AUDIT_NAMESPACE)).filter(
-          abovesSealedFloor
-        );
+        // Unknown provenance and foreign activity share this one authoritative
+        // in-lock recount with pruning; no second sized pre-check is needed.
+        this.retentionGeneration++;
+        this.bytesProvenance = "unknown";
+        // Hold the raw sized array, assert the lease, check raw-empty against
+        // the append hold's raw snapshot, then filter by the floor. Cooperating
+        // pruning keeps one survivor; a boundary transition empties only the
+        // filtered population. Empty here is a listing fault, not an empty store;
+        // list can collapse on directory or per-file stat ENOENT, without telling
+        // us which. A shorter nonempty view is an ordinary cross-hold prune.
+        recountPending = true;
+        const rawMetas = await this.storage.list(AUDIT_NAMESPACE);
         this.assertAuditWriteLockActive(signal);
+        if (rawMetas.length === 0 && appendKeys.some((key) => key.startsWith("entry-"))) {
+          throw new Error("audit recount returned an inconsistent empty listing");
+        }
+        recountPending = false;
+        const metas = rawMetas.filter(abovesSealedFloor);
+        if (this.recountFaultLatched) {
+          console.error(`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} recovered`);
+          this.recountFaultLatched = false;
+        }
         metas.sort((a, b) => a.key.localeCompare(b.key));
         // Always keep at least one entry as the surviving anchor base — even
         // under degenerate caps (maxEntries: 0, or maxTotalSizeBytes smaller than
@@ -3034,6 +3130,7 @@ export class AuditLog {
           this.rotationDeleteCount(metas),
           metas.length - 1
         );
+        if (toDelete <= 0) this.seedRetention(metas);
         if (toDelete <= 0) return;
 
         // Authenticate the cut BEFORE pruning. The new lowest-surviving entry is
@@ -3072,10 +3169,24 @@ export class AuditLog {
 
         for (let i = 0; i < toDelete; i++) {
           this.assertAuditWriteLockActive(signal);
-          await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
+          const deleted = await this.storage.delete(AUDIT_NAMESPACE, metas[i]!.key);
           this.assertAuditWriteLockActive(signal);
+          // A refused delete cannot be subtracted from the surviving byte seed.
+          if (!deleted) return;
         }
+        this.seedRetention(metas.slice(toDelete));
       });
+    } catch (err) {
+      this.bytesProvenance = "unknown";
+      // The rejecting hold owns this diagnostic, including a listing that never
+      // settles; an abandoned callback must not re-latch after a successor recovers.
+      // A recount failure has no integrity meaning. Raw stderr only: never an
+      // audit-backed logger, signing incident, finding, subscriber or storage write.
+      if (recountPending && !this.recountFaultLatched) {
+        this.recountFaultLatched = true;
+        console.error(`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} failed`);
+      }
+      throw err;
     } finally {
       this.rotationInFlight = false;
     }
@@ -4213,6 +4324,8 @@ export class AuditLog {
   /** Read every surviving entry's bytes after one pass interval, regardless of metadata. */
   private async ensureFreshEagerView(): Promise<void> {
     await this.appendQueue;
+    // Must match the Math.min pin in test/structure/audit-eager-byte-pass-backstop.test.ts:
+    // clearing the optional metadata hint must never widen the byte-pass interval.
     const backstopDue =
       !this.loaded ||
       Date.now() - this.lastFullVerifyAtMs >= Math.min(this.eagerBytePassIntervalMs, this.eagerReverifyIntervalMs);
@@ -4753,6 +4866,12 @@ export class AuditLog {
         const deadlinePromise = new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => {
             signal.aborted = true;
+            // Release this hold's checkpoint token on rejection, even if its
+            // callback never settles. Generation guards its eventual cleanup.
+            if (this.checkpointFlightSignal === signal) {
+              this.checkpointInFlight = false;
+              this.checkpointFlightSignal = undefined;
+            }
             // SAFETY: forced lock recovery must be loud on operator-facing
             // stderr BEFORE any other handling (AGENTS.md constraint 5).
             console.error(
@@ -5287,18 +5406,23 @@ export class AuditLog {
     return false;
   }
 
-  private async freshenChainStateFromDisk(): Promise<void> {
-    const latest = await this.readLatestPersistedChainState();
-    if (!latest) return;
-    if (latest.nextSequence > this.nextSequence) {
-      this.nextSequence = latest.nextSequence;
-      this.lastEntryHash = latest.lastEntryHash;
-    } else if (
-      latest.nextSequence === this.nextSequence &&
-      this.lastEntryHash !== latest.lastEntryHash
-    ) {
-      this.lastEntryHash = latest.lastEntryHash;
+  private async freshenChainStateFromDisk(signal: AuditWriteLockAbortSignal): Promise<string[]> {
+    const { keys, latest } = await this.readLatestPersistedChainState(signal);
+    // A listing that outlives the hold deadline is discarded before sequence
+    // state can change or an entry can be allocated.
+    this.assertAuditWriteLockActive(signal);
+    if (latest) {
+      if (latest.nextSequence > this.nextSequence) {
+        this.nextSequence = latest.nextSequence;
+        this.lastEntryHash = latest.lastEntryHash;
+      } else if (
+        latest.nextSequence === this.nextSequence &&
+        this.lastEntryHash !== latest.lastEntryHash
+      ) {
+        this.lastEntryHash = latest.lastEntryHash;
+      }
     }
+    return keys;
   }
 
   /**
@@ -5311,20 +5435,20 @@ export class AuditLog {
    * exactly the contention window the drill observed, starving flow-decision
    * writes with `AuditLockContentionError`.
    *
-   * `storage.list()` returns keys sorted ascending, and the `entry-` key
-   * embeds the sequence zero-padded to a fixed width (see the `key` built in
-   * `persistChainedEntry`), so the highest-sequence entry is ALWAYS the tail
-   * of `metas`. Walking backward from the tail and stopping at the first
+   * The consumer sorts the complete names-only snapshot with localeCompare,
+   * preserving the prior list order even for noncanonical suffixes. Entry keys
+   * embed fixed-width sequence prefixes; legacy keys are skipped in memory.
+   * Walking backward from the tail and stopping at the first
    * entry that parses as a valid envelope makes the common case O(1) instead
    * of O(n); a run of malformed/torn trailing entries costs more, but never
    * more than the prior full scan (fail-safe: this can never see fewer
    * candidates than necessary to find a valid one, matching the previous
    * "scan until you find a real entry" behavior exactly).
    */
-  private async readLatestPersistedChainState(): Promise<{
-    nextSequence: number;
-    lastEntryHash: string;
-  } | null> {
+  private async readLatestPersistedChainState(signal: AuditWriteLockAbortSignal): Promise<{
+    keys: string[];
+    latest: { nextSequence: number; lastEntryHash: string } | null;
+  }> {
     // F2 Option A: exactly like `loadPersistedEntries`, never attempt a read
     // on an entry at or below a valid split boundary's sealed tip: those are
     // the legacy, possibly-permission-denied entries this instance's routine
@@ -5338,6 +5462,16 @@ export class AuditLog {
     const splitBoundary = await this.loadSplitBoundary();
     const sealedTipSequence =
       splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
+    // A warm write does not observe metadata-only faults: a later sized load
+    // or recount observes them; healed faults need no report because no written
+    // bytes depended on them. A headless writer has no wall-clock detector.
+    // The fallback prefix is part of discovery's refusal contract: widening it
+    // would make a foreign key's stat fault refuse an append that never reads it.
+    const keys = typeof this.storage.listKeys === "function"
+      ? await this.storage.listKeys(AUDIT_NAMESPACE)
+      : (await this.storage.list(AUDIT_NAMESPACE, "entry-")).map((meta) => meta.key);
+    // A detached directory read has no authority after its hold deadline.
+    this.assertAuditWriteLockActive(signal);
     // F2 Finding 1 (Codex re-gate MED): refresh the cached sealed tip from this
     // fresh boundary read. `freshenChainStateFromDisk` runs on every append, so
     // this keeps `cachedSealedTip` current even for a long-lived instance that
@@ -5347,24 +5481,28 @@ export class AuditLog {
     if (sealedTipSequence > this.cachedSealedTip) {
       this.cachedSealedTip = sealedTipSequence;
     }
-    const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
-    for (let i = metas.length - 1; i >= 0; i--) {
-      const seq = parseEntryKeySequence(metas[i]!.key);
+    // Must match listKeys' order contract in storage/interface.ts: the consumer
+    // restores today's comparator, including noncanonical duplicate suffixes.
+    keys.sort((a, b) => a.localeCompare(b));
+    for (let i = keys.length - 1; i >= 0; i--) {
+      const key = keys[i]!;
+      if (!key.startsWith("entry-")) continue;
+      const seq = parseEntryKeySequence(key);
       if (seq !== null && seq <= sealedTipSequence) break;
-      const raw = await this.storage.read(AUDIT_NAMESPACE, metas[i]!.key);
+      const raw = await this.storage.read(AUDIT_NAMESPACE, key);
       if (!raw) continue;
       try {
         const parsed = JSON.parse(bytesToString(raw));
         if (!isPersistedAuditEnvelopeV2(parsed)) continue;
-        return {
+        return { keys, latest: {
           nextSequence: parsed.sequence + 1,
           lastEntryHash: parsed.entry_hash,
-        };
+        } };
       } catch {
         // Full integrity verification reports malformed entries separately.
       }
     }
-    return null;
+    return { keys, latest: null };
   }
 
   private async writeAuditEntryBytes(
@@ -5522,6 +5660,7 @@ export class AuditLog {
         findings,
         splitBoundary.status === "valid"
       );
+      const seedGeneration = this.retentionGeneration;
       const storedEntriesRaw = await this.storage.list(AUDIT_NAMESPACE);
       // BLOCKER-1: with a valid boundary, prove from the LISTING that the sealed
       // region is complete (gap-free run ending at the tip). This catches
@@ -5806,7 +5945,19 @@ export class AuditLog {
       }
       this.lastFullVerifyAtMs = Date.now();
       await this.refreshExpectedStoreFingerprint();
+      // Must match maybeRotate's aboveSealedFloor population; discard a load
+      // seed if an own append or rotation has advanced since its listing began.
+      if (this.retentionGeneration === seedGeneration) {
+        if (!consumer && findings.length === 0) {
+          const surviving = storedEntriesRaw.filter((meta) => this.aboveSealedFloor(meta.key, effectiveSealedTip));
+          surviving.sort((a, b) => a.key.localeCompare(b.key));
+          this.seedRetention(surviving);
+        } else {
+          this.bytesProvenance = "unknown";
+        }
+      }
     } catch (err) {
+      this.bytesProvenance = "unknown";
       // An incomplete storage pass cannot establish the cache's clean-entry subset.
       this.verificationCache.clear();
       this.verifiedUncachedLastPass = 0;
@@ -7250,14 +7401,17 @@ export class AuditLog {
       .map((entry) => entry.entry_hash);
   }
 
-  private async writeCheckpointIfNeeded(_reason: string): Promise<void> {
+  private async writeCheckpointIfNeeded(
+    _reason: string,
+    held?: { keys: string[]; signal: AuditWriteLockAbortSignal },
+  ): Promise<void> {
     if (this.checkpointInFlight || this.hashesSinceCheckpoint.length === 0) return;
     this.checkpointInFlight = true;
+    const generation = ++this.checkpointFlightGeneration;
     try {
-      await this.withAuditWriteLock(async (signal) => {
+      const write = async (keys: string[], signal: AuditWriteLockAbortSignal): Promise<void> => {
         this.assertAuditWriteLockActive(signal);
-        await this.freshenChainStateFromDisk();
-        this.assertAuditWriteLockActive(signal);
+        this.checkpointFlightSignal = signal;
         // F2 Option A: never ask for hashes at or below a valid split
         // boundary's sealed tip, since those entries are the legacy region
         // this instance's routine paths must never attempt to read. A checkpoint
@@ -7282,13 +7436,24 @@ export class AuditLog {
           previousCheckpointSequence + 1,
           sealedTipSequence + 1
         );
-        const hashes = await this.collectPersistedEntryHashes(
+        if (fromSequence > checkpointSequence) return;
+        const collected = await this.collectPersistedEntryHashes(
           fromSequence,
           checkpointSequence,
-          sealedTipSequence
+          sealedTipSequence,
+          keys,
         );
         this.assertAuditWriteLockActive(signal);
-        if (hashes.length === 0) return;
+        // Only complete, unique occupancy can authorize signing control writes;
+        // a nonempty prefix is not evidence for the declared complete range.
+        if (collected.status === "incomplete") {
+          this.notifySigningControlWriteFailure(
+            `${AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_CONTEXT} incomplete (${collected.reason} at sequence ${collected.atSequence})`,
+            new Error(collected.reason),
+          );
+          return;
+        }
+        const hashes = collected.hashes;
         await this.writeCheckpointRecord({
           checkpoint_kind: "audit-checkpoint",
           checkpoint_sequence: checkpointSequence,
@@ -7304,33 +7469,52 @@ export class AuditLog {
         this.lastCheckpointSequence = checkpointSequence;
         this.hashesSinceCheckpoint = [];
         this.criticalAppendsSinceCheckpoint = 0;
-      });
+      };
+      if (held) {
+        await write(held.keys, held.signal);
+      } else {
+        await this.withAuditWriteLock(async (signal) => {
+          const keys = await this.freshenChainStateFromDisk(signal);
+          await write(keys, signal);
+        });
+      }
     } finally {
-      this.checkpointInFlight = false;
+      // An abandoned callback can settle during a newer hold's collection.
+      if (this.checkpointFlightGeneration === generation) {
+        this.checkpointInFlight = false;
+        this.checkpointFlightSignal = undefined;
+      }
     }
   }
 
   private async readHighestAuditCheckpointSequence(
     sealedTipSequence = 0
   ): Promise<number> {
-    const metas = await this.storage.list(
-      AUDIT_CHECKPOINT_NAMESPACE,
-      "audit-checkpoint-"
-    );
+    // DEBT(AUDIT-CHECKPOINT-LIFETIME-GROWTH): checkpoints are never pruned;
+    // one record per checkpointInterval critical appends accumulates for the
+    // fortress lifetime. Each checkpoint write retains O(checkpoints) names and
+    // body reads, amortized over checkpointInterval critical appends; every
+    // unsealed read fault must still refuse the append, including older records.
+    const keys = typeof this.storage.listKeys === "function"
+      ? await this.storage.listKeys(AUDIT_CHECKPOINT_NAMESPACE, "audit-checkpoint-")
+      : (await this.storage.list(AUDIT_CHECKPOINT_NAMESPACE, "audit-checkpoint-")).map((meta) => meta.key);
+    // Preserve list's comparator and all-record traversal: filenames neither
+    // establish the parsed maximum nor excuse an earlier record's read fault.
+    keys.sort((a, b) => a.localeCompare(b));
     let highest = 0;
-    for (const meta of metas) {
+    for (const key of keys) {
       // F2 Option A: the operator's own checkpoints are always ABOVE the sealed
       // tip, so a sealed-region checkpoint the operator uid cannot open on an
       // armed box (root-owned legacy file) is never the highest and can be
       // skipped silently. A non-permission fault, or an unreadable checkpoint
       // above the tip, still surfaces (rethrown to the append/checkpoint caller,
       // which fails closed rather than under-counting the checkpoint floor).
-      const keySeq = parseCheckpointKeySequence(meta.key);
+      const keySeq = parseCheckpointKeySequence(key);
       const inSealedRegion =
         sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
       let raw: Uint8Array | null;
       try {
-        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, key);
       } catch (err) {
         if (inSealedRegion && isPermissionError(err)) continue;
         throw err;
@@ -7340,10 +7524,9 @@ export class AuditLog {
         const parsed = JSON.parse(bytesToString(raw));
         if (
           isAuditCheckpointRecord(parsed) &&
-          parsed.checkpoint_kind === "audit-checkpoint" &&
-          parsed.checkpoint_sequence > highest
+          parsed.checkpoint_kind === "audit-checkpoint"
         ) {
-          highest = parsed.checkpoint_sequence;
+          highest = Math.max(highest, parsed.checkpoint_sequence);
         }
       } catch {
         // Full verification reports malformed checkpoints.
@@ -7355,34 +7538,44 @@ export class AuditLog {
   private async collectPersistedEntryHashes(
     fromSequence: number,
     toSequence: number,
-    sealedTipSequence = 0
-  ): Promise<string[]> {
-    const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
+    sealedTipSequence: number,
+    keys: readonly string[],
+  ): Promise<PersistedEntryHashCollection> {
     const bySequence = new Map<number, string>();
-    for (const meta of metas) {
-      // F2 Option A: same guard as `readLatestPersistedChainState`; never
-      // attempt a read at or below the sealed tip.
-      const seq = parseEntryKeySequence(meta.key);
+    let duplicate: number | undefined;
+    // Accepted residual: filenames do not authenticate envelope sequences, so
+    // every entry body above the sealed tip is read, as before. Reusing keys
+    // saves one listing; body reads are unchanged, amortized over the checkpoint
+    // interval. A cheaper collector needs authenticated key/envelope agreement.
+    for (const key of keys) {
+      if (!key.startsWith("entry-")) continue;
+      const seq = parseEntryKeySequence(key);
       if (seq !== null && seq <= sealedTipSequence) continue;
-      const raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
+      const raw = await this.storage.read(AUDIT_NAMESPACE, key);
       if (!raw) continue;
       try {
         const parsed = JSON.parse(bytesToString(raw));
         if (isPersistedAuditEnvelopeV2(parsed)) {
+          // Envelope sequence is authoritative, including identical copies
+          // under out-of-range filenames; never collapse duplicate occupancy.
+          if (bySequence.has(parsed.sequence) &&
+              parsed.sequence >= fromSequence && parsed.sequence <= toSequence) {
+            duplicate = duplicate === undefined ? parsed.sequence : Math.min(duplicate, parsed.sequence);
+          }
           bySequence.set(parsed.sequence, parsed.entry_hash);
         }
       } catch {
-        // Full verification reports malformed entries.
+        // Full verification reports malformed entries; missing occupancy is a gap.
       }
     }
-
+    if (duplicate !== undefined) return { status: "incomplete", reason: "duplicate", atSequence: duplicate };
     const hashes: string[] = [];
     for (let sequence = fromSequence; sequence <= toSequence; sequence++) {
       const hash = bySequence.get(sequence);
-      if (!hash) break;
+      if (!hash) return { status: "incomplete", reason: "gap", atSequence: sequence };
       hashes.push(hash);
     }
-    return hashes;
+    return { status: "complete", hashes };
   }
 
   private async writeCheckpointRecord(
@@ -7544,6 +7737,9 @@ export class AuditLog {
         : {}),
     };
     const key = `${payload.checkpoint_kind}-${String(payload.checkpoint_sequence).padStart(20, "0")}`;
+    // Signing can outlive the hold too: expiry before persistence is issued
+    // must leave no checkpoint, even when the signer eventually returns.
+    if (signal) this.assertAuditWriteLockActive(signal);
     await this.storage.write(
       AUDIT_CHECKPOINT_NAMESPACE,
       key,

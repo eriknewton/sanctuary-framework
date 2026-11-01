@@ -127,3 +127,10 @@ describe("ReadOnlyStorageGuard interface parity", () => {
     expect(missing).toEqual([]);
   });
 });
+
+it("classifies names-only enumeration and preserves its optional capability", async () => {
+  expect(READ_ONLY_STORAGE_DELEGATED_METHODS).toContain("listKeys");
+  const storage = new MemoryStorage();
+  await storage.write("fixture", "key", new Uint8Array([1]));
+  expect(await new ReadOnlyStorageGuard(storage).listKeys!("fixture")).toEqual(["key"]);
+});
