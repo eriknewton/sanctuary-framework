@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 import re
-import select
+import selectors
+import posixpath
 import shutil
 import signal
 import subprocess
@@ -50,7 +51,8 @@ OUTCOMES = {
     "unavailable": {"outcome": "unavailable", "message": "Sanctuary could not take this request right now; nothing was done."},
     "unconfirmed": {"outcome": "unconfirmed", "message": "I could not confirm whether this completed."},
 }
-assert all(not re.search(r"error|failed", value["message"] + json.dumps(value), re.I) for value in OUTCOMES.values())
+if any(re.search(r"error|failed", value["message"] + json.dumps(value), re.I) for value in OUTCOMES.values()):
+    raise ValueError("tool result messages must remain ordinary results")
 # Must match HERMES_TOOLS_LIST_PAYLOAD in server/src/hermes-memory-bridge/public-results.ts.
 TOOL_SCHEMAS = [
     {"name": "sign_statement", "description": "Not available yet; nothing is signed.", "parameters": {
@@ -94,12 +96,12 @@ def resolve_command():
 def normalize(text):
     text = re.sub(r"/+", "/", text.casefold().replace("\\", "/"))
     # A run of dot components is removed in one pass, preserving linear work.
-    return re.sub(r"/(?:\./)+", "/", text)
+    return posixpath.normpath(re.sub(r"/(?:\./)+", "/", text))
 
 
 def guard(tool_name=None, args=None, **kwargs):
     try:
-        # This narrows native tool reach; custody in the operator's account is the lock.
+        # The guard is not the lock; relative paths, symlinks, paths built at run time and encoded strings are not resolved.
         if tool_name in ("remember", "sign_statement", "export_memory", "protection_rules"):
             return None
         root = normalize(SANCTUARY_INSTALL_ROOT)
@@ -107,7 +109,8 @@ def guard(tool_name=None, args=None, **kwargs):
         while pending:
             value = pending.pop()
             if isinstance(value, str):
-                if root in normalize(value):
+                normalized = normalize(value)
+                if root + "/" in normalized or normalized.endswith(root):
                     return {"action": "block", "message": OUTCOMES["denied"]["message"]}
             elif isinstance(value, (dict, list, tuple)) and id(value) not in seen:
                 seen.add(id(value))
@@ -132,7 +135,9 @@ def map_reply(name, reply):
             return uncertain(name, True)
         if "error" in reply:
             fault = reply["error"]
-            if fault.get("code") in (-32002, -32602):
+            if not isinstance(fault, dict) or type(fault.get("code")) is not int or not isinstance(fault.get("message"), str):
+                return uncertain(name, True)
+            if fault["code"] in (-32002, -32602):
                 return OUTCOMES["denied"]
             if "Outcome unknown" in fault.get("message", ""):
                 return uncertain(name, True)
@@ -163,6 +168,8 @@ class _Call:
     def __init__(self, name, args, deadline):
         self.name, self.args, self.deadline = name, args, deadline
         self.done = threading.Event()
+        self.state = "waiting"
+        self.accepted_bytes = 0
         self.sent = False
         self.sent_at = None
         self.abandoned = False
@@ -195,7 +202,7 @@ class Client:
         self.ready = threading.Event()
         self.connecting = False
         self.transport_fault = False
-        self.reap_lock = threading.Lock()
+        self.reap_lock = threading.RLock()
 
     def _start_worker(self):
         if self.worker is None:
@@ -235,6 +242,10 @@ class Client:
             with self.condition:
                 if call.done.is_set():
                     return call.result
+                # A claimed send settles its byte accounting before the caller can classify it.
+                self.condition.wait_for(lambda: call.state != "sending")
+                if call.done.is_set():
+                    return call.result
                 call.abandoned = True
                 if call in self.queue:
                     self.queue.remove(call)
@@ -262,25 +273,43 @@ class Client:
     def _write(self, data, deadline, call=None):
         fd = self.process.stdin.fileno()
         offset = 0
-        while offset < len(data):
-            remaining = deadline - time.monotonic()
-            if self.stopped or remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
-                raise OSError("unavailable")
-            try:
-                written = os.write(fd, data[offset:])
-            except BlockingIOError:
-                continue
-            if written <= 0:
-                raise OSError("unavailable")
-            # The first accepted byte makes an effect's completion uncertain on transport loss.
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(fd, selectors.EVENT_WRITE)
+                while offset < len(data):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise OSError("unavailable")
+                    with self.condition:
+                        if self.stopped:
+                            raise OSError("unavailable")
+                        if call is not None and call.state == "waiting":
+                            # A call is written only after it is claimed under the lock; an abandoned call is never written, and an insert with any accepted byte is never reported as not done.
+                            if call.abandoned or time.monotonic() >= call.deadline:
+                                raise OSError("unavailable")
+                            call.state = "sending"
+                        elif time.monotonic() >= deadline:
+                            raise OSError("unavailable")
+                        try:
+                            # Nonblocking write and accepted-byte accounting share the caller's classification lock.
+                            written = os.write(fd, data[offset:])
+                        except BlockingIOError:
+                            continue
+                        if written <= 0:
+                            raise OSError("unavailable")
+                        offset += written
+                        if call is not None:
+                            call.accepted_bytes += written
+                            if not call.sent:
+                                call.sent_at = time.monotonic()
+                            call.sent = True
+                            self.condition.notify_all()
+        finally:
             if call is not None:
                 with self.condition:
-                    if not call.sent:
-                        call.sent_at = time.monotonic()
-                        deadline = call.sent_at + self.tool_seconds
-                    call.sent = True
+                    if call.state == "sending":
+                        call.state = "sent" if call.sent else "unsent"
                     self.condition.notify_all()
-            offset += written
 
     def _exchange(self, method, params, deadline, call=None):
         self.serial += 1
@@ -298,38 +327,64 @@ class Client:
 
     def _read(self, process):
         try:
-            while True:
-                line = process.stdout.readline(MAX_STDIO_LINE_BYTES + 1)
-                if not line or len(line) > MAX_STDIO_LINE_BYTES or not line.endswith(b"\n"):
-                    raise OSError("unavailable")
-                reply = json.loads(line)
-                with self.condition:
-                    pending = self.pending
-                    if not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0" or type(reply.get("id")) is not int or pending is None or reply["id"] != pending["id"]:
+            with selectors.DefaultSelector() as selector:
+                fd = process.stdout.fileno()
+                selector.register(fd, selectors.EVENT_READ)
+                line = bytearray()
+                while True:
+                    with self.condition:
+                        if self.process is not process:
+                            return
+                    if not selector.select(self.exit_seconds):
+                        continue
+                    with self.condition:
+                        if self.process is not process:
+                            return
+                        try:
+                            data = os.read(fd, 1)
+                        except BlockingIOError:
+                            continue
+                    if not data or len(line) >= MAX_STDIO_LINE_BYTES:
                         raise OSError("unavailable")
-                    self.pending = None
-                    pending["reply"] = reply
-                    pending["event"].set()
-                    # Completed bytes belong only to their caller, never to an idle reader.
-                    reply, pending, line = None, None, None
+                    line.extend(data)
+                    if data != b"\n":
+                        continue
+                    reply = json.loads(line)
+                    with self.condition:
+                        # A reader belongs to one process generation and cannot deliver into its replacement.
+                        if self.process is not process:
+                            return
+                        pending = self.pending
+                        if not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0" or type(reply.get("id")) is not int or pending is None or reply["id"] != pending["id"]:
+                            raise OSError("unavailable")
+                        self.pending = None
+                        pending["reply"] = reply
+                        pending["event"].set()
+                        reply, pending = None, None
+                        line.clear()
         except Exception:
             with self.condition:
+                if self.process is not process:
+                    return
                 self.ready.clear()
                 self.transport_fault = True
                 self.condition.notify_all()
                 if self.pending is not None:
                     self.pending["event"].set()
                     self.pending = None
-            # Wake the owning worker even for an unsolicited response while idle.
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except OSError:
-                pass
 
     def _connect(self):
+        with self.reap_lock:
+            if self.stopped:
+                return False
+            return self._connect_locked()
+
+    def _connect_locked(self):
         if self.ready.is_set() and self.process is not None and self.process.poll() is None:
             return True
         self._end_process()
+        if self.stopped:
+            return False
         command = resolve_command()
         if command is None:
             return False
@@ -338,6 +393,7 @@ class Client:
             self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0)
             os.set_blocking(self.process.stdin.fileno(), False)
+            os.set_blocking(self.process.stdout.fileno(), False)
             self.reader = threading.Thread(target=self._read, args=(self.process,), name="sanctuary-reader", daemon=True)
             self.reader.start()
             reply = self._exchange("initialize", {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
@@ -385,8 +441,7 @@ class Client:
                 if time.monotonic() >= call.deadline or call.abandoned:
                     continue
                 # No request is retried or resent, including an insert with a lost reply.
-                hard_deadline = time.monotonic() + self.tool_seconds
-                reply = self._exchange("tools/call", {"name": call.name, "arguments": call.args}, hard_deadline, call)
+                reply = self._exchange("tools/call", {"name": call.name, "arguments": call.args}, call.deadline, call)
                 call.result = map_reply(call.name, reply)
             except Exception:
                 if call is not None:
@@ -397,39 +452,71 @@ class Client:
                 if call is not None:
                     with self.condition:
                         if call.abandoned:
-                            call.result = OUTCOMES["unavailable"]
+                            call.result = uncertain(call.name, call.sent)
+                        call.state = "done"
                         call.args = None
                         self.active = None
                         call.done.set()
                         self.condition.notify_all()
                 call = None
 
+    def _group_gone(self, process):
+        deadline = time.monotonic() + self.exit_seconds
+        pause = threading.Event()
+        while True:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            pause.wait(min(remaining, self.exit_seconds / 10))  # Ten bounded group-exit checks per grace period.
+
     def _end_process(self):
         with self.reap_lock:
-            self.ready.clear()
-            process, reader = self.process, self.reader
-            if process is None:
-                return
+            with self.condition:
+                self.ready.clear()
+                process, reader = self.process, self.reader
+                if process is None:
+                    return
+                # End the reader generation before closing descriptors or allowing another process.
+                self.process, self.reader = None, None
+                self.transport_fault = False
+                if self.pending is not None:
+                    self.pending["event"].set()
+                    self.pending = None
             try:
-                process.stdin.close()
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
                 try:
                     process.wait(timeout=self.exit_seconds)
                 except subprocess.TimeoutExpired:
+                    pass
+                # The group owns the lifetime even when its leader has already exited.
+                try:
                     os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                if not self._group_gone(process):
                     try:
-                        process.wait(timeout=self.exit_seconds)
-                    except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-            except OSError:
-                process.wait()
+                    except ProcessLookupError:
+                        pass
+                    self._group_gone(process)
+                try:
+                    process.wait(timeout=self.exit_seconds)
+                except subprocess.TimeoutExpired:
+                    # A replacement needs a reaped leader; an unsettled generation stops admission.
+                    with self.condition:
+                        self.stopped = True
             finally:
                 if reader is not None and reader is not threading.current_thread():
                     reader.join(self.exit_seconds)
                 process.stdout.close()
-                self.process, self.reader = None, None
-                with self.condition:
-                    self.transport_fault = False
 
     def close(self):
         with self.condition:

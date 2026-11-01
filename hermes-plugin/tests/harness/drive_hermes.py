@@ -79,6 +79,17 @@ def main():
                         tool_progress_mode="off", skip_context_files=True, tool_delay=0)
         shared = sys.modules["sanctuary_hermes_client"]
         client = shared.get_client()
+        observers = contextlib.ExitStack()
+        # Record actual registry and provider dispatch throughout the session, including prefetch.
+        def observe(original):
+            def dispatched(name, *values, **kwargs):
+                report["executed_tools"].append(name)
+                return original(name, *values, **kwargs)
+            return dispatched
+        observers.enter_context(patch.object(registry, "dispatch", side_effect=observe(registry.dispatch)))
+        if agent._memory_manager is not None:
+            observers.enter_context(patch.object(agent._memory_manager, "handle_tool_call",
+                                                 side_effect=observe(agent._memory_manager.handle_tool_call)))
         try:
             report["memory_store_none"] = agent._memory_store is None
             report["plugin_loaded"] = "sign_statement" in manager._plugin_tool_names
@@ -100,8 +111,6 @@ def main():
                                       function=SimpleNamespace(name=name, arguments=json.dumps(arguments))))
                 assistant = SimpleNamespace(tool_calls=tool_calls, content=None)
                 executor = execute_tool_calls_concurrent if concurrent else execute_tool_calls_sequential
-                # Record requests at the real executor boundary, including provider calls.
-                report["executed_tools"].extend(name for name, _ in calls)
                 executor(agent, assistant, messages, "fixture")
                 tool_messages = [message for message in messages if message["role"] == "tool"]
                 report["raw_results"] = [message["content"] for message in tool_messages]
@@ -165,6 +174,7 @@ def main():
                 else:
                     report["directive"] = {"action": "block", "message": hooks.get_pre_tool_call_block_message("read_file", {"path": shared.SANCTUARY_INSTALL_ROOT})}
         finally:
+            observers.close()
             agent.close()
             client.close()
     report["hermes_log"] = captured.getvalue()

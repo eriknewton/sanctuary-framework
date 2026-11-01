@@ -32,6 +32,7 @@ describe.skipIf(!python)("Hermes persistent memory through the installed plugin 
     expect(loading.spawns).toBe(1);
 
     const saved = await fixture.session(python!, "save");
+    expect(saved.executed_tools).toContain("remember");
     expect(saved.results).toEqual([{ outcome: "saved", message: "Saved." }]);
     const rows = await fixture.audit();
     const inserts = rows.filter(row => row.details?.kind === "insert_admitted");

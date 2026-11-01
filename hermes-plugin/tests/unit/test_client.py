@@ -82,7 +82,28 @@ class ClientTests(unittest.TestCase):
 
     def test_recalled_context_exact(self):
         client = self.client([{"value": RECALLED}])
+        client.connect_background()
+        self.assertTrue(client.ready.wait(WAIT_SECONDS))
         self.assertEqual(client.prefetch("private query"), RECALLED["context"])
+
+    def test_cold_prefetch_past_budget_empty(self):
+        client = self.client([{"value": RECALLED}])
+        entered, release = threading.Event(), threading.Event()
+        original = client._connect
+        def connect():
+            entered.set()
+            if not release.wait(WAIT_SECONDS):
+                raise OSError("coordination expired")
+            return original()
+        with patch.object(client, "_connect", side_effect=connect):
+            try:
+                self.assertEqual(client.prefetch("query"), "")
+                self.assertTrue(entered.is_set())
+            finally:
+                release.set()
+                with client.condition:
+                    self.assertTrue(client.condition.wait_for(lambda: client.active is None, WAIT_SECONDS))
+        self.assertEqual(self.insert_count(), 0)
 
     def test_fixed_pairs_verbatim(self):
         for key in ("denied", "unavailable", "unavailable_not_built", "unconfirmed"):
@@ -263,7 +284,8 @@ class ClientTests(unittest.TestCase):
         client.process = types.SimpleNamespace(stdin=types.SimpleNamespace(fileno=lambda: 0))
         call = c._Call("memory_insert", INSERT, time.monotonic() + TOOL_MS / 1000)
         try:
-            with patch.object(c.select, "select", return_value=([], [0], [])), patch.object(c.os, "write", side_effect=[2, BlockingIOError(), 2]) as write:
+            with patch.object(c.selectors, "DefaultSelector") as selector, patch.object(c.os, "write", side_effect=[2, BlockingIOError(), 2]) as write:
+                selector.return_value.__enter__.return_value.select.return_value = [True]
                 client._write(b"abcd", call.deadline, call)
                 self.assertEqual([args.args[1] for args in write.call_args_list], [b"abcd", b"cd", b"cd"])
                 self.assertTrue(call.sent)
@@ -277,9 +299,10 @@ class ClientTests(unittest.TestCase):
             client = c.Client(tool_timeout_ms=TOOL_MS)
             client.process = types.SimpleNamespace(stdin=types.SimpleNamespace(fileno=lambda: 0))
             call = c._Call("memory_insert", INSERT, time.monotonic() + TOOL_MS / 1000)
-            readiness = [([], [0], []), ([], [], [])] if first_write else [([], [], [])]
+            readiness = [[True], []] if first_write else [[]]
             try:
-                with patch.object(c.select, "select", side_effect=readiness), patch.object(c.os, "write", return_value=1) as write:
+                with patch.object(c.selectors, "DefaultSelector") as selector, patch.object(c.os, "write", return_value=1) as write:
+                    selector.return_value.__enter__.return_value.select.side_effect = readiness
                     with self.assertRaises(OSError):
                         client._write(b"ab", call.deadline, call)
                     self.assertEqual(write.call_count, int(first_write))
@@ -320,6 +343,16 @@ class EntryTests(unittest.TestCase):
     def test_loader_identity(self):
         self.assertIs(self.provider_module._shared, self.tools_module._shared)
         self.assertIs(self.provider_module._client_module(), self.tools_module._client_module())
+
+    def test_message_validation_survives_optimized_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = (ROOT / "sanctuary/sanctuary_client.py").read_text()
+            path = Path(directory) / "client.py"
+            path.write_text(source.replace("Request denied.", "Request failed."))
+            result = c.subprocess.run([sys.executable, "-I", "-B", "-O", str(path)],
+                                      capture_output=True, text=True, timeout=WAIT_SECONDS)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ValueError: tool result messages must remain ordinary results", result.stderr)
 
     def test_import_has_no_process_or_thread(self):
         with patch.object(c.subprocess, "Popen", side_effect=AssertionError("spawn")), patch.object(c.threading.Thread, "start", side_effect=AssertionError("thread")):
@@ -377,6 +410,10 @@ class EntryTests(unittest.TestCase):
         for name in ("remember", "sign_statement", "export_memory", "protection_rules"):
             self.assertIsNone(c.guard(name, {"path": c.SANCTUARY_INSTALL_ROOT}))
         self.assertIsNone(c.guard("read_file", {}))
+
+    def test_guard_parent_components_and_bare_root(self):
+        for path in ("/Library/Application Support/Other/../Sanctuary/state", c.SANCTUARY_INSTALL_ROOT.rstrip("/")):
+            self.assertEqual(c.guard("read_file", {"path": path}), {"action": "block", "message": "Request denied."})
 
     def test_guard_exception_blocks_and_never_approves(self):
         with patch.object(c, "normalize", side_effect=RuntimeError()):
