@@ -302,6 +302,8 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
       entry.record.kind !== "insert_refused" && entry.record.kind !== "insert_unconfirmed").length;
     if (terminal) {
       if (record.entryId === undefined || this.terminalSlots.get(record.entryId) !== "reserved") {
+        // A terminal row without usable capacity still needs a content-free exit count.
+        this.terminalFailures += 1;
         return Promise.reject(new HermesAuditBackpressureError());
       }
       // Acceptance consumes this insert's reserve, independently of the call and latch shares.
@@ -314,7 +316,7 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
       if (record.kind === "insert_admitted") {
         if (record.entryId === undefined || this.terminalSlots.has(record.entryId) ||
             this.terminalSlots.size >= HERMES_AUDIT_TERMINAL_RESERVE) return Promise.reject(new HermesAuditBackpressureError());
-        // Every admitted insert has a reserved slot for its terminal row; at shutdown a terminal row that cannot be written is named in the exit report, never lost.
+        // Each admission reserves terminal capacity; an uncertain admission append or an unwritten terminal is counted at exit, including a terminal without a usable reserve.
         this.terminalSlots.set(record.entryId, "reserved");
       }
     }
@@ -378,9 +380,12 @@ export class AuditForwarder extends SingleBindForwarder<AuditLog> {
         this.terminalSlots.delete(entry.record.entryId!);
       }
     }, error => {
-      if (entry.record.entryId !== undefined && this.terminalSlots.delete(entry.record.entryId) &&
-          (entry.record.kind === "insert_refused" || entry.record.kind === "insert_unconfirmed")) {
-        this.terminalFailures += 1;
+      if (entry.record.entryId !== undefined && this.terminalSlots.has(entry.record.entryId)) {
+        // Count uncertainty before releasing capacity; slots cleared by close were already reported.
+        if (entry.record.kind === "insert_admitted" || entry.record.kind === "insert_refused" || entry.record.kind === "insert_unconfirmed") {
+          this.terminalFailures += 1;
+        }
+        this.terminalSlots.delete(entry.record.entryId);
       }
       throw error;
     }).finally(() => {

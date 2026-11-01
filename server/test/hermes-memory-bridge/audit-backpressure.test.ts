@@ -132,7 +132,7 @@ it("reuses terminal reserves after confirmed saves and rejected admissions", asy
     }
     const report = vi.fn();
     forwarder.close(vi.fn(), report);
-    expect(report).not.toHaveBeenCalled();
+    expect(report.mock.calls).toEqual([[HERMES_AUDIT_WAITING_CAP * 2, "append_failure"]]);
   } finally { append.mockRestore(); }
 });
 
@@ -148,4 +148,41 @@ it("names terminal append failure once at close", async () => {
     forwarder.close(vi.fn(), report); forwarder.close(vi.fn(), report);
     expect(report.mock.calls).toEqual([[1, "append_failure"]]);
   } finally { append.mockRestore(); }
+});
+
+// Terminal rows without a usable reserve are refused and counted without retaining their contents.
+it.each(["insert_refused", "insert_unconfirmed"] as const)("names %s without a reserved slot once at close", async kind => {
+  const target = new AuditLog(new MemoryStorage(), new Uint8Array(32).fill(17));
+  const append = vi.spyOn(target, "appendCritical").mockResolvedValue(undefined);
+  const forwarder = new AuditForwarder(); forwarder.bind(target);
+  try {
+    await forwarder.append({ kind: "insert_admitted", entryId: "private fixture" });
+    forwarder.completeInsert("private fixture");
+    await expect(forwarder.append({ kind, entryId: "private fixture" })).rejects.toBeInstanceOf(HermesAuditBackpressureError);
+    expect(append).toHaveBeenCalledTimes(1);
+    const report = vi.fn();
+    forwarder.close(vi.fn(), report); forwarder.close(vi.fn(), report);
+    expect(report.mock.calls).toEqual([[1, "append_failure"]]);
+  } finally { append.mockRestore(); }
+});
+
+// A rejection after close remains covered by the reservation already reported at shutdown.
+it("counts an admission rejected after close only in the shutdown report", async () => {
+  const target = new AuditLog(new MemoryStorage(), new Uint8Array(32).fill(17));
+  let reject!: (error: Error) => void;
+  const stalled = new Promise<void>((_resolve, fail) => { reject = fail; });
+  const append = vi.spyOn(target, "appendCritical").mockReturnValue(stalled);
+  const forwarder = new AuditForwarder(); forwarder.bind(target);
+  const admission = forwarder.append({ kind: "insert_admitted", entryId: "private fixture" });
+  const rejected = expect(admission).rejects.toThrow("private fixture");
+  try {
+    const report = vi.fn();
+    expect(forwarder.close(vi.fn(), report)).toBe(1);
+    reject(new Error("private fixture"));
+    await rejected;
+    expect(forwarder.close(vi.fn(), report)).toBe(0);
+    expect(report.mock.calls).toEqual([[1, "shutdown_deadline"]]);
+  } finally {
+    reject(new Error("private fixture")); await Promise.allSettled([admission]); append.mockRestore();
+  }
 });

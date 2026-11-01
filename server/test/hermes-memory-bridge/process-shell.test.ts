@@ -1584,6 +1584,77 @@ describe("Hermes memory process shell", () => {
     }
   });
 
+  // The production exit report counts an admission whose persisted bytes cannot be confirmed.
+  it("names a rejected admission append after persistence in the exit report", async () => {
+    const fixture = await seededFortress("admission-exit");
+    const pair = await socketPair();
+    let stderrText = "";
+    class AdmissionReadbackStorage extends FilesystemStorage {
+      armed = false;
+      persistedKey: string | undefined;
+      readbackFailures = 0;
+      override async writeDurable(namespace: string, key: string, bytes: Uint8Array): Promise<void> {
+        await super.writeDurable(namespace, key, bytes);
+        if (this.armed && namespace === "_audit" && key.startsWith("entry-")) this.persistedKey = key;
+      }
+      override async read(namespace: string, key: string): Promise<Uint8Array | null> {
+        const bytes = await super.read(namespace, key);
+        if (this.armed && namespace === "_audit" && key === this.persistedKey) {
+          expect(bytes).not.toBeNull();
+          this.armed = false;
+          this.readbackFailures++;
+          throw new Error("private admission readback fixture");
+        }
+        return bytes;
+      }
+    }
+    const storage = new AdmissionReadbackStorage(join(fixture.fortressDir, "state"));
+    let forwarder: AuditForwarder | undefined;
+    let admissionId: string | undefined;
+    const originalForward = AuditForwarder.prototype.append;
+    const forward = vi.spyOn(AuditForwarder.prototype, "append").mockImplementation(function (this: AuditForwarder, row) {
+      forwarder = this;
+      return originalForward.call(this, row);
+    });
+    const originalAppend = AuditLog.prototype.appendCritical;
+    const append = vi.spyOn(AuditLog.prototype, "appendCritical").mockImplementation(function (this: AuditLog, row) {
+      if (row.details?.kind === "insert_admitted") {
+        admissionId = row.details.entryId as string;
+        expect((forwarder as unknown as { terminalSlots: Map<string, string> }).terminalSlots.get(admissionId)).toBe("reserved");
+        storage.armed = true;
+      }
+      return originalAppend.call(this, row);
+    });
+    let shell: Awaited<ReturnType<typeof runHermesBridgeProcess>> | undefined;
+    try {
+      shell = await runHermesBridgeProcess({ env: fixture.env, relaySocketFactory: () => pair.shell,
+        storageFor: () => storage, uid: process.getuid?.() ?? 0,
+        stderr: { write: chunk => { stderrText += String(chunk); return true; } } });
+      expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+      pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "uncertain-admission", name: "memory_insert",
+        arguments: { text: "private admission passage", taint: "user_content" } }));
+      const probe = await readNodeFrame(pair.relay);
+      expect(probe.type).toBe("probe");
+      pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+      const response = await readPublicResponse(pair.relay, "uncertain-admission");
+      expect(response.type).toBe("result");
+      expect(storage.readbackFailures).toBe(1);
+      expect(await storage.read("_audit", storage.persistedKey!)).not.toBeNull();
+      expect((forwarder as unknown as { terminalSlots: Map<string, string> }).terminalSlots.has(admissionId!)).toBe(false);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await shell.exited).toBe(EXIT_CLEAN);
+      const diagnostics = stderrText.split("\n").filter(line => line.includes("terminal_audit_unconfirmed"));
+      expect(diagnostics).toEqual(["hermes-memory-bridge audit: terminal_audit_unconfirmed count=1 reason=append_failure"]);
+      expect(stderrText).not.toContain("private admission");
+      expect(stderrText).not.toContain(admissionId!);
+    } finally {
+      storage.armed = false;
+      shell?.signalStop("SIGTERM"); if (shell !== undefined) await shell.exited;
+      append.mockRestore(); forward.mockRestore(); pair.close();
+    }
+  });
+
   // The production forwarder retains terminal capacity through the shutdown handoff deadline.
   it("names every cancelled admission at full capacity across the handoff deadline", async () => {
     const fixture = await seededFortress("terminal-exit");
