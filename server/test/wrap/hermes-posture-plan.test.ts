@@ -60,17 +60,17 @@ describe("Hermes memory YAML planner", () => {
     const installed = plan(original).content;
     const live = installed.replace("sanctuary_memory # original", '\"sanctuary_memory\" # edited').replace("false # original", "false # edited");
     expect(planHermesMemoryRevert(live, original, installed).content).toBe(
-      "memory:\n  provider: old # edited\n  memory_enabled: true # edited\nplugins:\n");
+      "memory:\n  provider: old # edited\n  memory_enabled: true # edited\n");
   });
   it("removal restores a prior flow list after equivalent block formatting", () => {
     const original = "plugins:\n  enabled: [other]\n";
     const installed = plan(original).content;
     const live = installed.replace("  enabled: [other, sanctuary]", "  enabled: # edited\n    - other\n    - sanctuary");
     expect(planHermesMemoryRevert(live, original, installed).content).toBe(
-      "plugins:\n  enabled: [other] # edited\nmemory:\n");
+      "plugins:\n  enabled: [other] # edited\n");
   });
   it("changed managed value remains the operator's value", () => {
     expect(planHermesMemoryRevert(fresh.replace("provider: sanctuary_memory", "provider: chosen"), null, fresh).content)
-      .toBe("memory:\n  provider: chosen\nplugins:\n");
+      .toBe("memory:\n  provider: chosen\n");
   });
 });

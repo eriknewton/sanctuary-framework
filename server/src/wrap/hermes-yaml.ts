@@ -709,5 +709,15 @@ export function planHermesMemoryRevert(live: string, original: string | null, in
       content = setPostureField(content, name!, key!, raw, true);
     }
   }
+  for (const name of ["memory", "plugins"]) {
+    const lines = content.split("\n");
+    const block = postureBlocks(lines).get(name);
+    // Removing a created empty block lets Hermes apply its defaults for an absent key.
+    if (block && !priorBlocks.has(name) && block.fields.length === 0) {
+      const comment = splitPostureLine(lines[block.start]!).suffix.trim();
+      lines.splice(block.start, 1, ...(comment ? [comment] : []));
+      content = lines.join("\n");
+    }
+  }
   return { content, before, after: scanHermesPosture(content), removedMcp: null };
 }

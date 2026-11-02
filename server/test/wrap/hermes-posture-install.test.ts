@@ -5,8 +5,11 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import net from "node:net";
+import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __hermesParityTestHook, __hermesPostureTestHook, parseWrapArgs, runWrap } from "../../src/wrap/cli.js";
+import { assertHermesPostureParseParity } from "../../src/wrap/hermes-yaml-parse-parity.js";
+import { scanHermesPosture } from "../../src/wrap/hermes-yaml.js";
 import { HERMES_PLUGIN_FILES } from "../../src/wrap/hermes-posture.js";
 vi.mock("node:fs/promises", async original => ({ ...await original<typeof import("node:fs/promises")>() }));
 const python = process.env.SANCTUARY_HERMES_PYTHON;
@@ -60,6 +63,7 @@ afterEach(async () => {
   delete __hermesPostureTestHook.shimCommand;
   delete __hermesPostureTestHook.relaySocketPath;
   delete __hermesPostureTestHook.failAfterStep;
+  delete (__hermesPostureTestHook as { interruptAfterStep?: string }).interruptAfterStep;
   __hermesParityTestHook.parity = undefined;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -108,14 +112,52 @@ describe("Hermes installer controlled-parser paths", () => {
     expect(await fs.readFile(file)).toEqual(await fs.readFile(resolve("../hermes-plugin/sanctuary/__init__.py")));
     expect(await fs.readFile(join(root, "sanctuary-install/config.yaml.before"), "utf8")).toBe("model: old\n");
   });
+  it("removes an earlier record after refreshing its installed files", async () => {
+    await seed("model: original\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
+    await install();
+    const path = join(root, "sanctuary-install/record.json");
+    const record = JSON.parse(await fs.readFile(path, "utf8"));
+    delete record.state;
+    delete record.originals;
+    await fs.writeFile(path, JSON.stringify(record));
+    await install();
+    await uninstall();
+    expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toBe("model: original\n");
+    expect(await fs.readFile(join(root, "SOUL.md"), "utf8")).toBe("Identity.\n");
+    expect(await fs.stat(join(root, "plugins/sanctuary")).catch(() => null)).toBeNull();
+    expect(await fs.stat(join(root, "sanctuary-install")).catch(() => null)).toBeNull();
+  });
+  it("publishes complete config bytes and mode through rename", async () => {
+    await seed("model: original\n");
+    await fs.chmod(join(root, "config.yaml"), 0o644);
+    const rename = fs.rename;
+    let published = false;
+    vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+      if (String(args[1]) === join(root, "config.yaml")) {
+        expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toBe("model: original\n");
+        expect(await fs.readFile(String(args[0]), "utf8")).toBe("model: original\n" + fresh);
+        expect((await fs.stat(String(args[0]))).mode & 0o777).toBe(0o644);
+        const record = JSON.parse(await fs.readFile(join(root, "sanctuary-install/record.json"), "utf8"));
+        expect(record.state).toBe("intent");
+        expect(record.originals["config.yaml"]).toEqual({ bytes: Buffer.from("model: original\n").toString("base64"), mode: 0o644 });
+        published = true;
+      }
+      return rename(...args);
+    });
+    await install();
+    expect(published).toBe(true);
+  });
   it("writes provider files before the selected configuration", async () => {
     await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
     const paths: string[] = [];
-    const open = fs.open;
-    vi.spyOn(fs, "open").mockImplementation(async (...args) => { paths.push(String(args[0])); return open(...args); });
+    const rename = fs.rename;
+    vi.spyOn(fs, "rename").mockImplementation(async (...args) => { paths.push(String(args[1])); return rename(...args); });
     await install();
     const writes = paths.filter(path => path.startsWith(root));
-    expect(writes.at(-1)).toBe(join(root, "config.yaml"));
+    expect(writes[0]).toBe(join(root, "sanctuary-install/record.json"));
+    expect(writes.at(-2)).toBe(join(root, "config.yaml"));
+    expect(writes.at(-1)).toBe(join(root, "sanctuary-install/record.json"));
     expect(writes.indexOf(join(root, "plugins/sanctuary/shim-command.json"))).toBeLessThan(writes.indexOf(join(root, "skills/sanctuary/SKILL.md")));
     expect(writes.indexOf(join(root, "skills/sanctuary/SKILL.md"))).toBeLessThan(writes.indexOf(join(root, "SOUL.md")));
   });
@@ -222,6 +264,34 @@ describe("Hermes installer controlled-parser paths", () => {
     });
     await refuses("Incomplete Hermes plugin source");
   });
+  it("requires packaged plugin assets in the package", async () => {
+    const before = await snapshot();
+    const reads: string[] = [];
+    const read = fs.readFile;
+    vi.spyOn(fs, "readFile").mockImplementation((...args: Parameters<typeof fs.readFile>) => {
+      reads.push(String(args[0]));
+      return read(...args);
+    });
+    vi.doMock("node:url", async original => {
+      const url = await original<typeof import("node:url")>();
+      return { ...url, fileURLToPath: (value: string | URL, options?: Parameters<typeof url.fileURLToPath>[1]) =>
+        String(value).endsWith("/wrap/hermes-posture.ts") ? join(home, "package/dist/cli.js") : url.fileURLToPath(value, options) };
+    });
+    vi.resetModules();
+    try {
+      const dispatcher = await import("../../src/wrap/cli.js");
+      dispatcher.__hermesParityTestHook.parity = { exec: successfulParser };
+      dispatcher.__hermesPostureTestHook.shimCommand = [process.execPath, "fixture"];
+      dispatcher.__hermesPostureTestHook.relaySocketPath = join(home, "relay");
+      await expect(dispatcher.runWrap(dispatcher.parseWrapArgs(["--hermes-memory"])))
+        .rejects.toThrow("packaged Hermes plugin directory is missing");
+      expect(reads.some(path => path.includes("/hermes-plugin/"))).toBe(false);
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      vi.doUnmock("node:url");
+      vi.resetModules();
+    }
+  });
   it.each(["missing", "_npx"])("refuses %s CLI", async kind => {
     delete __hermesPostureTestHook.shimCommand;
     const real = fs.realpath;
@@ -276,7 +346,7 @@ describe.skipIf(!python)("Hermes installer real-parser continuing paths", () => 
     await install();
     await fs.appendFile(join(root, "config.yaml"), "unrelated: kept\n");
     await uninstall();
-    expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toBe("memory:\nplugins:\nunrelated: kept\n");
+    expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toBe("unrelated: kept\n");
     expect(output.mock.calls.flat().join()).toContain(join(root, "sanctuary-install/config.yaml.before"));
   });
   it("uninstall changed restores a value after a comment-only edit", async () => {
@@ -286,7 +356,140 @@ describe.skipIf(!python)("Hermes installer real-parser continuing paths", () => 
     await seed(config.replace("false # original", "false # edited"));
     await uninstall();
     expect(await fs.readFile(join(root, "config.yaml"), "utf8"))
-      .toBe("memory:\n  memory_enabled: true # edited\nplugins:\n");
+      .toBe("memory:\n  memory_enabled: true # edited\n");
+  });
+  it("reinstall and removal retain operator comments and unrelated keys", async () => {
+    const original = "model: fixture\nmemory:\n  memory_enabled: true\nplugins:\n  enabled: [other]\n";
+    await seed(original);
+    await install();
+    await fs.appendFile(join(root, "config.yaml"), "# operator note\nunrelated: kept\n");
+    await install();
+    output.mockClear();
+    await uninstall();
+    expect(await fs.readFile(join(root, "config.yaml"), "utf8"))
+      .toBe(original + "# operator note\nunrelated: kept\n");
+    expect(output.mock.calls.flat().join()).toContain("kept subsequent edits");
+    expect(output.mock.calls.flat().join()).not.toContain("original files restored");
+  });
+  it("removal of a created memory block restores Hermes default memory", async () => {
+    await seed("model:\n  default: fixture\n");
+    await install();
+    await seed((await fs.readFile(join(root, "config.yaml"), "utf8")).replace("fixture", "chosen"));
+    await uninstall();
+    expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toBe("model:\n  default: chosen\n");
+    const result = JSON.parse(execFileSync(python!, ["-c", `
+import json, yaml
+from hermes_cli.config import load_config, DEFAULT_CONFIG
+from hermes_constants import get_hermes_home
+from pathlib import Path
+raw = yaml.safe_load((Path(get_hermes_home()) / 'config.yaml').read_text())
+memory = load_config()['memory']
+print(json.dumps({'has_memory': 'memory' in raw, 'defaults': memory == DEFAULT_CONFIG['memory'],
+                  'memory_enabled': memory['memory_enabled'], 'user_profile_enabled': memory['user_profile_enabled']}))
+`], { env: { ...process.env, HOME: home, HERMES_HOME: root }, encoding: "utf8" }));
+    expect(result).toEqual({ has_memory: false, defaults: true, memory_enabled: true, user_profile_enabled: true });
+  });
+  it.each(["memory:\n", "memory: {}\n"])("real parser requires an absent created block for %s", async empty => {
+    await expect(assertHermesPostureParseParity(fresh, empty, scanHermesPosture(fresh),
+      scanHermesPosture(empty), false, null, { pythonPath: python! })).rejects.toThrow("planned bytes");
+    await expect(assertHermesPostureParseParity(fresh, "", scanHermesPosture(fresh),
+      scanHermesPosture(""), false, null, { pythonPath: python! })).resolves.toBeUndefined();
+  });
+  it("install and removal preserve existing config and identity modes", async () => {
+    await seed("model: fixture\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
+    await fs.chmod(join(root, "config.yaml"), 0o644); // Owner write, public read.
+    await fs.chmod(join(root, "SOUL.md"), 0o640); // Owner write, group read.
+    for (const action of [install, uninstall]) {
+      await action();
+      expect((await fs.stat(join(root, "config.yaml"))).mode & 0o777).toBe(0o644);
+      expect((await fs.stat(join(root, "SOUL.md"))).mode & 0o777).toBe(0o640);
+    }
+  });
+  const writeSteps = ["intent", "backup", ...HERMES_PLUGIN_FILES.map(file => "plugins/" + file),
+    "plugins/sanctuary/shim-command.json", "skill", "soul", "config", "complete"];
+  async function fileState() {
+    const files: Record<string, { bytes: string; mode: number }> = {};
+    for (const path of Object.keys(await snapshot()).filter(path => path.startsWith("/hermes/"))) {
+      const stat = await fs.lstat(home + path);
+      if (stat.isFile()) files[path] = { bytes: (await fs.readFile(home + path)).toString("base64"), mode: stat.mode };
+    }
+    return files;
+  }
+  async function interrupt(step: string) {
+    // The guarded hook models process exit after a completed write, without cleanup.
+    (__hermesPostureTestHook as { interruptAfterStep?: string }).interruptAfterStep = step;
+    await expect(install()).rejects.toThrow("Interrupted install");
+    delete (__hermesPostureTestHook as { interruptAfterStep?: string }).interruptAfterStep;
+  }
+  it.each(writeSteps)("removal restores bytes and modes after interruption at %s", async step => {
+    await seed("model: fixture\n");
+    await fs.chmod(join(root, "config.yaml"), 0o644);
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n", { mode: 0o640 });
+    const before = await fileState();
+    await interrupt(step);
+    expect(await fs.stat(join(root, "sanctuary-install/record.json"))).toBeDefined();
+    await uninstall();
+    expect(await fileState()).toEqual(before);
+    await install();
+    expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toContain("provider: sanctuary_memory");
+  });
+  it.each(writeSteps)("reinstall accounts for files after interruption at %s", async step => {
+    await seed("model: fixture\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
+    const before = await fileState();
+    await interrupt(step);
+    const interrupted = await snapshot();
+    try { await install(); }
+    catch (error) {
+      expect((error as Error).message).toBe("Hermes installation is incomplete; unwrap it before installing again.");
+      expect(await snapshot()).toEqual(interrupted);
+    }
+    await uninstall();
+    expect(await fileState()).toEqual(before);
+  });
+  it("removal clears partial staged bytes using the intent", async () => {
+    await seed("model: fixture\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n", { mode: 0o640 });
+    const before = await fileState();
+    await interrupt("intent");
+    for (const path of ["config.yaml", "SOUL.md", "plugins/sanctuary/__init__.py", "sanctuary-install/record.json"]) {
+      await fs.mkdir(join(root, path, ".."), { recursive: true });
+      await fs.writeFile(join(root, path + ".sanctuary-install-tmp"), "partial bytes");
+    }
+    await uninstall();
+    expect(await fileState()).toEqual(before);
+    await install();
+  });
+  it("removal after an interrupted refresh retains operator edits", async () => {
+    await seed("model: fixture\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n", { mode: 0o640 });
+    await install();
+    await fs.appendFile(join(root, "config.yaml"), "# operator note\nunrelated: kept\n");
+    const path = join(root, "plugins/sanctuary/__init__.py");
+    const old = "# previous version\n";
+    await fs.writeFile(path, old);
+    const recordPath = join(root, "sanctuary-install/record.json");
+    const record = JSON.parse(await fs.readFile(recordPath, "utf8"));
+    const { createHash } = await import("node:crypto");
+    record.files["plugins/sanctuary/__init__.py"] = createHash("sha256").update(old).digest("hex");
+    await fs.writeFile(recordPath, JSON.stringify(record));
+    await interrupt("intent");
+    await uninstall();
+    expect(await fs.readFile(join(root, "config.yaml"), "utf8")).toBe("model: fixture\n# operator note\nunrelated: kept\n");
+    expect(await fs.readFile(join(root, "SOUL.md"), "utf8")).toBe("Identity.\n");
+  });
+  it("uses a home beneath a symlinked temporary root", async () => {
+    const actual = join(home, "actual-root");
+    const linked = join(home, "linked-root");
+    await fs.mkdir(join(actual, "account/hermes"), { recursive: true });
+    await fs.symlink(actual, linked);
+    vi.stubEnv("HOME", join(linked, "account"));
+    vi.stubEnv("HERMES_HOME", join(linked, "account/hermes"));
+    await install();
+    expect(await fs.readFile(join(actual, "account/hermes/config.yaml"), "utf8")).toBe(fresh);
+    await uninstall();
+    expect(await fs.stat(join(actual, "account/hermes/config.yaml")).catch(() => null)).toBeNull();
   });
   it("default HOME resolution and absent SOUL leave identity creation to Hermes", async () => {
     vi.stubEnv("HERMES_HOME", "");

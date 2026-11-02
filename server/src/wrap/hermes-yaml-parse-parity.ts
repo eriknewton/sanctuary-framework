@@ -709,6 +709,12 @@ try:
         return value
     before = check(request['before'], request['beforeFacts'])
     after = check(request['after'], request['afterFacts'])
+    if not request['install']:
+        original = document(request['original'])
+        for name in ['memory', 'plugins']:
+            # Presence is meaningful: Hermes defaults apply only when a created block is removed.
+            if name not in original and name in after and (after[name] is None or after[name] == {}):
+                raise ValueError('created empty block remains')
     if request['install']:
         memory = after.get('memory') or {}
         if memory.get('provider') != 'sanctuary_memory' or memory.get('memory_enabled') is not False or memory.get('user_profile_enabled') is not False: raise ValueError('planned settings')
@@ -737,13 +743,14 @@ export async function assertHermesPostureParseParity(
   beforeFacts: import("./hermes-yaml.js").HermesPostureView,
   afterFacts: import("./hermes-yaml.js").HermesPostureView,
   install: boolean,
+  original: string | null,
   options: ParseParityOptions = {},
 ): Promise<void> {
   const candidates = options.pythonPath !== undefined ? [options.pythonPath] : hermesParityPythonCandidates();
   const timeoutMs = options.timeoutMs ?? 5000; // Same five-second parser deadline as MCP parity.
   const exec = options.exec ?? defaultSidecarExec;
   for (const candidate of candidates) {
-    const result = await exec(candidate, ["-E", "-c", PYYAML_POSTURE_PROGRAM], JSON.stringify({ before, after, beforeFacts, afterFacts, install }), timeoutMs);
+    const result = await exec(candidate, ["-E", "-c", PYYAML_POSTURE_PROGRAM], JSON.stringify({ before, after, beforeFacts, afterFacts, install, original }), timeoutMs);
     if (result.code === null || result.code === PYYAML_EXIT.IMPORT_MISSING) continue;
     if (result.code !== 0 || result.stdout.trim() !== '{"ok": true}') {
       throw new HermesYamlParityRefusedError("disagreement", "memory posture or planned bytes do not agree with PyYAML");
