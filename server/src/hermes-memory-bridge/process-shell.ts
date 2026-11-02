@@ -716,6 +716,7 @@ export async function hermesBridgeMain(options: HermesBridgeMainOptions): Promis
   } catch (error) {
     if (error instanceof StartupRefusal) {
       stderr.write(`hermes-memory-bridge ${error.state}: startup refused\n`);
+      if (error instanceof UnfinishedInsertRefusal) stderr.write(UNFINISHED_SAVE_RECOVERY + "\n");
       if (error instanceof CorpusLockRefusal) {
         // Only the locally derived lock path is disclosed; raw storage errors and custody values are never logged.
         stderr.write(`corpus_lock=${JSON.stringify(error.lockPath)}; recovery: stop the relay and all fortress writers, verify none remain, then explicitly remove only this exact lock and restart; never auto-delete\n`);
@@ -933,6 +934,20 @@ export async function resolveHermesBridgeFortress(input: {
     throw new StartupRefusal(STATE_FORTRESS_UNLOCKED, "HERMES_MEMORY_FORTRESS_ID is malformed");
   }
   const fortressDir = join(home, "Library", "Application Support", "Sanctuary", "Fortresses", fortressId);
+  const storagePath = await canonicalHermesFortressPath({ home, fortressDir, uid: input.uid });
+  return { fortressDir: storagePath, storagePath };
+}
+
+/** Resolve the bridge and recovery command to one storage identity, refusing unsafe paths before any storage opens. */
+export async function canonicalHermesFortressPath(input: {
+  readonly home: string | undefined;
+  readonly fortressDir: string;
+  readonly uid: number;
+}): Promise<string> {
+  const { home, fortressDir } = input;
+  if (home === undefined || !isAbsolute(home)) {
+    throw new StartupRefusal(STATE_FORTRESS_UNLOCKED, "HOME must be absolute");
+  }
   await assertOwnedNoSymlinkChain(home, fortressDir, input.uid);
   const defaultFortress = join(home, ".sanctuary");
   const realFortress = await realpath(fortressDir);
@@ -940,7 +955,7 @@ export async function resolveHermesBridgeFortress(input: {
   if (isInsideOrEqual(realFortress, realDefault) || isInsideOrEqual(realDefault, realFortress)) {
     throw new StartupRefusal(STATE_FORTRESS_UNLOCKED, "dedicated fortress path must be separate from the default fortress");
   }
-  return { fortressDir: realFortress, storagePath: realFortress };
+  return realFortress;
 }
 
 async function assertOwnedNoSymlinkChain(home: string, target: string, uid: number): Promise<void> {
@@ -995,9 +1010,11 @@ async function assertNoLeftoverCorpusLock(storage: FilesystemStorage): Promise<v
   }
 }
 
+const UNFINISHED_SAVE_RECOVERY = "An earlier save did not finish; run `sanctuary hermes recover-save --fortress <dir>` to recover it.";
+
 class UnfinishedInsertRefusal extends StartupRefusal {
   constructor() {
-    super(STATE_CONFIG_CHECKED, "An earlier save did not finish; recovery is an operator action.");
+    super(STATE_CONFIG_CHECKED, UNFINISHED_SAVE_RECOVERY);
     this.name = "UnfinishedInsertRefusal";
   }
 }
