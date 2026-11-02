@@ -4,6 +4,7 @@ import { lstat, readFile, readdir, realpath, rmdir, chmod, mkdir, rename } from 
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FIXED_SOCKET_PATH } from "../hermes-memory-client/protocol.js";
+import { CrossProcessLockError, withPathLock } from "../storage/cross-process-lock.js";
 import { writeFileSafeUnderRoot, unlinkSafeUnderRoot, mkdirSafeUnderRoot } from "./config-reader.js";
 import { planHermesMemoryPosture, planHermesMemoryRevert, scanHermesPosture } from "./hermes-yaml.js";
 import { assertHermesPostureParseParity, type ParseParityOptions } from "./hermes-yaml-parse-parity.js";
@@ -23,6 +24,13 @@ export const HERMES_SOUL_BLOCK = `<!-- sanctuary memory begin -->\n${INSTRUCTION
 const MODE_MASK = 0o7777; // Permission and special mode bits, without the file type.
 const FILE_MODE = 0o600; // Owner read and write only.
 const DIR_MODE = 0o700; // Owner traversal, read and write only.
+// 32 hex characters retain 128 bits of the SHA-256 home-path digest.
+const LOCK_DIGEST_HEX_CHARS = 32;
+/** Two seconds bounds operator waiting without expiring or stealing a live holder's lock. */
+export const HERMES_POSTURE_LOCK_TIMEOUT_MS = 2_000;
+// Must match BUSY and UNAVAILABLE in server/test/wrap/hermes-posture-run-lock.test.ts.
+const LOCK_BUSY = "Another Hermes memory install or removal is running for this Hermes home; wait for it to finish, then run the command again.";
+const LOCK_UNAVAILABLE = "Hermes memory changes need a private lock directory under ~/.sanctuary/locks; fix its owner and permissions, then run the command again.";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const CONFIG = "config.yaml";
 const SOUL = "SOUL.md";
@@ -88,6 +96,32 @@ export async function hermesPostureHome(): Promise<string> {
     if (profile && profile !== "default") throw new Error("Select the default Hermes profile or set HERMES_HOME explicitly.");
   }
   return resolve(root);
+}
+
+/** Locate the external run lock for a resolved home returned by hermesPostureHome(). */
+export function hermesPostureLockPaths(root: string): { lockDir: string; lockFileName: string } {
+  return {
+    lockDir: join(resolve(process.env.HOME!), ".sanctuary", "locks", "hermes-posture"),
+    lockFileName: hash(root).slice(0, LOCK_DIGEST_HEX_CHARS) + ".lock",
+  };
+}
+
+async function prepareLockDirectory(lockDir: string): Promise<void> {
+  const home = resolve(process.env.HOME!);
+  await safePath(lockDir, home);
+  let path = home;
+  for (const part of lockDir.slice(home.length + sep.length).split(sep)) {
+    path = join(path, part);
+    await safePath(path, home);
+    try { await mkdir(path, { mode: DIR_MODE }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    await safePath(path, home);
+    const stat = await lstat(path);
+    // Shared or foreign ancestors could substitute the per-home lock directory.
+    if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & MODE_MASK) !== DIR_MODE) {
+      throw new CrossProcessLockError(LOCK_UNAVAILABLE, "capability");
+    }
+  }
 }
 
 /** The older MCP setup must not coexist with a recorded memory-provider install. */
@@ -232,6 +266,32 @@ export async function runHermesPosture(
   // Root would place this configuration in a different account from the running Hermes process.
   if (process.geteuid?.() === 0) throw new Error("run this as the account that runs Hermes");
   const root = await hermesPostureHome();
+  if (options.dryRun) return planAndApplyHermesPosture(root, options, hooks, parity);
+  const { lockDir, lockFileName } = hermesPostureLockPaths(root);
+  let entered = false;
+  try {
+    // The persistent scaffold must stay outside Hermes even when an explicit home overlaps Sanctuary's directories.
+    if (lockDir === root || lockDir.startsWith(root + sep)) throw new CrossProcessLockError(LOCK_UNAVAILABLE, "capability");
+    await prepareLockDirectory(lockDir);
+    // The plan and every write share one per-home lock so runs cannot act on each other's partial state, and process ownership releases it when a run is killed.
+    await withPathLock(lockDir, lockFileName, async () => {
+      entered = true;
+      await planAndApplyHermesPosture(root, options, hooks, parity);
+    }, { kernelBacked: true, timeoutMs: HERMES_POSTURE_LOCK_TIMEOUT_MS });
+  } catch (error) {
+    if (error instanceof CrossProcessLockError || !entered) {
+      throw new Error(error instanceof CrossProcessLockError && error.kind === "contention" ? LOCK_BUSY : LOCK_UNAVAILABLE);
+    }
+    throw error;
+  }
+}
+
+async function planAndApplyHermesPosture(
+  root: string,
+  options: { unwrap?: boolean; dryRun?: boolean },
+  hooks: HermesPostureHooks,
+  parity?: ParseParityOptions,
+): Promise<void> {
   for (const path of [CONFIG, SOUL, "plugins", "skills", RECORD, BACKUP, ...recordedPaths, ...temporaryPaths]) await safePath(join(root, path));
   const recordBytes = await readOptional(join(root, RECORD));
   if (!recordBytes && !options.dryRun) await clearUnpublishedStaging(root);

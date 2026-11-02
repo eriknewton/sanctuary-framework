@@ -34,6 +34,11 @@ async function snapshot(): Promise<Record<string, string>> {
     }
   }
   await walk(home);
+  // Run-lock scaffolds use 32 hex characters (128 digest bits); preserve every other path in HOME.
+  for (const path of Object.keys(result)) {
+    if (["/.sanctuary", "/.sanctuary/locks", "/.sanctuary/locks/hermes-posture"].includes(path) ||
+        /^\/\.sanctuary\/locks\/hermes-posture\/[a-f0-9]{32}\.lock$/.test(path)) delete result[path];
+  }
   return result;
 }
 async function refuses(pattern?: string | RegExp) {
@@ -76,6 +81,7 @@ describe("Hermes installer controlled-parser paths", () => {
     const before = await snapshot();
     await uninstall();
     expect(await snapshot()).toEqual(before);
+    expect(await fs.readdir(join(home, ".sanctuary/locks/hermes-posture"))).toHaveLength(1);
     expect(output.mock.calls.flat().join()).toContain("nothing to remove");
   });
   it("dry run makes no write and reports the planned posture", async () => {
@@ -93,7 +99,8 @@ describe("Hermes installer controlled-parser paths", () => {
     const before = await snapshot();
     const writer = vi.spyOn(fs, "open");
     await install();
-    expect(writer).not.toHaveBeenCalled();
+    // Lock acquisition opens its external directory and scaffold even for an unchanged install.
+    expect(writer.mock.calls.filter(([path]) => String(path).startsWith(root))).toEqual([]);
     expect(await snapshot()).toEqual(before);
     expect(output.mock.calls.flat().join()).toContain("already installed");
   });
