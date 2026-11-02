@@ -171,6 +171,7 @@ describe("Psi-2 - UnifiedInboxStore encrypted persistence", () => {
 describe("Psi-2 - producer wiring", () => {
   it("Castle Wall AuditConsumer emits blocked egress into the bridge", async () => {
     const { auditLog, bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const consumer = new AuditConsumer(auditLog, bridge);
     const event: CastleWallAuditEvent = {
       schema_version: 1,
@@ -388,6 +389,7 @@ import { CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } from "../../src/castle-wall/consta
 describe("structured blocked-egress encrypted round trip", () => {
   it.each(["verified", "unverified"] as const)("retains %s evidence through cache, encryption and restart", async (state) => {
     const { storage, masterKey, store, bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const metadata = {
       destination_host: "bounded.example", destination_ip: "2001:db8::1",
       attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state } as const,
@@ -422,6 +424,7 @@ describe("structured blocked-egress encrypted round trip", () => {
 
   it("reads legacy and malformed stored metadata as legacy without rewriting storage", async () => {
     const { storage, masterKey, store, bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const entry = bridge.ingestBlockedEgress({ source_event_id: "legacy", destination_category: "legacy.example", block_reason_class: "other", observed_at: OBSERVED_AT })!;
     await bridge.flushPersistence();
     const legacy = (await store.get(entry.inbox_id))!;
@@ -465,4 +468,35 @@ describe("structured blocked-egress encrypted round trip", () => {
     expect(next.bridge.get(entry.inbox_id)).not.toHaveProperty("blocked_egress");
   });
 
+});
+
+describe("bounded blocked-egress encrypted index", () => {
+  it("keeps the maximum validated index in one encrypted record outside entry scans", async () => {
+    const { storage, store, bridge } = rig();
+    const INDEX_LIMIT = 1000; // design fortress limit
+    const MAX_ID_CHARS = 128; // validated index id ceiling
+    const ids = Array.from({ length: INDEX_LIMIT }, (_, i) => `${i}`.padStart(MAX_ID_CHARS, "x"));
+    await store.writeBlockedEgressIndex(ids);
+    expect(await store.readBlockedEgressIndex()).toEqual(ids);
+    const raw = await storage.read(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1");
+    expect(raw!.length).toBeLessThan(256 * 1024); // encrypted store record ceiling
+    expect(await store.list()).toEqual([]);
+    expect(await store.pruneExpired()).toEqual({ pruned: 0 });
+    await expect(store.writeBlockedEgressIndex([...ids, "extra"])).rejects.toThrow();
+    await expect(store.writeBlockedEgressIndex(["a", "a"])).rejects.toThrow();
+    await expect(store.writeBlockedEgressIndex(["../entry"])).rejects.toThrow();
+    expect(bridge.size()).toBe(0);
+  });
+});
+
+it("keeps a pre-admission blocked record directly readable without adding it to the restored cache", async () => {
+  const { storage, masterKey, store } = rig();
+  const legacy = await store.upsert({ inbox_id: "pre-admission", source_class: "blocked_egress", source_event_id: "legacy-receipt",
+    severity: "alert", summary: "Legacy blocked event", details_url: "/inbox", observed_at: OBSERVED_AT, fortress_id: FORTRESS });
+  const before = await storage.read(UNIFIED_INBOX_NAMESPACE, `${UNIFIED_INBOX_KEY_PREFIX}${legacy.inbox_id}`);
+  const next = rig({ storage, masterKey });
+  expect(await next.bridge.rehydratePendingFromStore()).toBe(0);
+  expect(next.bridge.get(legacy.inbox_id)).toBeNull();
+  expect(await store.get(legacy.inbox_id)).toEqual(legacy);
+  expect(await storage.read(UNIFIED_INBOX_NAMESPACE, `${UNIFIED_INBOX_KEY_PREFIX}${legacy.inbox_id}`)).toEqual(before);
 });

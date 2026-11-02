@@ -9,7 +9,8 @@ export interface ConsumerMintedBlockedEgress {
 /** Display fields read by bridge admission from the consumer-owned handoff. */
 export interface BlockedEgressProjection {
   metadata: BlockedEgressMetadata;
-  signedFields?: { agent_id: string; observed_at: string; source_event_id: string };
+  // Must match blockedEgressMetadataFor in audit-consumer.ts: all identity fields derive from the verified producer snapshot.
+  signedFields?: { agent_id: string; observed_at: string; source_event_id: string; seq: number; producer_key_digest: string; body_digest: string };
 }
 
 // Weak keys retain no event history: each bounded mint dies with its handoff token.
@@ -30,7 +31,7 @@ export function readConsumerMintedBlockedEgress(token: ConsumerMintedBlockedEgre
 /**
  * Register a single-use consumer projection. Verified covers signed host/IP,
  * string agent_id, timestamp, signature-bound seq, and the consumer subject from
- * signed agent_id with local fortress scope or signed identity_id. Reason, reason
+ * the signed agent id within the local fortress namespace, or signed identity_id. Reason, reason
  * class, severity and other envelope fields remain unsigned.
  */
 export function mintConsumerBlockedEgress(projection: BlockedEgressProjection): ConsumerMintedBlockedEgress {

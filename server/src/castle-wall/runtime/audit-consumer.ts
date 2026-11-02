@@ -531,6 +531,7 @@ export class AuditConsumer {
     this.producerSigMaxAgeMs = options?.producerSigMaxAgeMs ?? 5 * 60 * 1000;
     this.producerWalRetentionMs =
       options?.producerWalRetentionMs ?? 24 * 60 * 60 * 1000;
+    // Default must match BLOCKED_EGRESS_FUTURE_SKEW_MS in principal-policy/blocked-egress-projection.ts.
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
     this.chainAnchorSource = options?.chainAnchorSource;
@@ -730,7 +731,7 @@ export class AuditConsumer {
     if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
       // No blocked-egress projection is published before its primary audit receipt is durably appended and flushed; projection failure never rewrites the enforcement outcome.
       try {
-        const minted = blockedEgressMetadataFor(envelope, sigOutcome, identityOutcome.identityId);
+        const minted = blockedEgressMetadataFor(envelope, sigOutcome, identityOutcome.identityId, this.pinnedProducerKeyB64url);
         if (minted) {
           ingestCastleWallBlockedEgress({ bridge: this.inboxBridge, event: envelope.event, minted });
         } else {
@@ -1707,7 +1708,7 @@ export function buildChainAnchorSourceFromAuditLog(
 
 /**
  * Verified covers signed host/IP, string agent_id, timestamp, signature-bound seq,
- * and the consumer subject derived from signed agent_id with local fortress scope
+ * and the subject is the signed agent id within the local fortress namespace,
  * or signed identity_id. Reason, reason class, severity and other envelope fields
  * are unsigned. A contradicting destination suppresses the projection entirely.
  * Must match BlockedEgressAttribution in contracts/v1.1/blocked-egress.ts.
@@ -1716,6 +1717,7 @@ function blockedEgressMetadataFor(
   envelope: CriticalEventEnvelope,
   signature: SignatureOutcome,
   signedSubject: string,
+  pinnedProducerKeyB64url: string | null,
 ): ConsumerMintedBlockedEgress | undefined {
   const signed = signature.kind === "verified";
   const details = signed ? signedDetailsFromBody(signature.signedBody) : envelope.event.details;
@@ -1751,10 +1753,17 @@ function blockedEgressMetadataFor(
   if (!metadata.ok) throw new Error("Invalid blocked-egress metadata");
   const projection: BlockedEgressProjection = { metadata: metadata.value };
   if (verified) {
+    // evaluateProducerSignature returns unsigned without a pinned key, so this assertion guards the mint contract.
+    if (pinnedProducerKeyB64url === null) throw new Error("Missing verified producer key");
+    // Must match BLOCKED_EGRESS_FUTURE_SKEW_MS in principal-policy/blocked-egress-projection.ts: producerSigMaxSkewMs defaults to one minute.
+    // Must match BlockedEgressProjection.signedFields in blocked-egress-attribution.ts: identity binds the enrolled key, sequence and exact signed body.
     const timestamp = signature.signedBody.timestamp;
     if (typeof timestamp !== "string") throw new Error("Missing signed timestamp");
     projection.signedFields = {
       agent_id: signedAgentId,
+      seq: signature.seq,
+      producer_key_digest: createHash("sha256").update(pinnedProducerKeyB64url).digest("hex"),
+      body_digest: computeSignedBodyHash(signature.eventCanonicalJson),
       observed_at: timestamp,
       // producer.seq is signature-bound even on older bodies without details.seq; evaluateProducerSignature checks parity.
       source_event_id: `${timestamp}:${signature.seq}`,

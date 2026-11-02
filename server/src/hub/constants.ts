@@ -227,3 +227,8 @@ export const HUB_ACTIVITY_TEMPLATE_NAMESPACES = {
  * second import path.
  */
 export type { LocalHarnessKind };
+
+/** Design ceiling of 1000 incidents per fortress; must match imports in principal-policy/blocked-egress-projection.ts, principal-policy/unified-inbox-store.ts and hub/inbox-store.ts. */
+export const HUB_BLOCKED_EGRESS_FORTRESS_MAX = 1000;
+/** One default inbox page; must match the import in principal-policy/blocked-egress-projection.ts. */
+export const HUB_BLOCKED_EGRESS_EMITTED_MAX = HUB_INBOX_DEFAULT_LIMIT;

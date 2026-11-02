@@ -1,3 +1,5 @@
+import { DEFAULT_UNIFIED_INBOX_RETENTION_DAYS, parseBlockedEgressAdmissionRecord } from "./blocked-egress-projection.js";
+import { HUB_BLOCKED_EGRESS_FORTRESS_MAX } from "../hub/constants.js";
 import { parseBlockedEgressMetadata } from "../contracts/v1.1/index.js";
 
 /**
@@ -29,7 +31,8 @@ import type {
 
 export const UNIFIED_INBOX_NAMESPACE = "_unified_inbox";
 export const UNIFIED_INBOX_KEY_PREFIX = "entry.";
-export const DEFAULT_UNIFIED_INBOX_RETENTION_DAYS = 30;
+// Must match DEFAULT_UNIFIED_INBOX_RETENTION_DAYS in blocked-egress-projection.ts; the public store export retains its value.
+export { DEFAULT_UNIFIED_INBOX_RETENTION_DAYS } from "./blocked-egress-projection.js";
 
 const HKDF_INFO = "principal-policy-unified-inbox-v1";
 const MAX_ENTRY_BYTES = 256 * 1024;
@@ -58,7 +61,7 @@ export class UnifiedInboxStore {
   private readonly storage: StorageBackend;
   private readonly encryptionKey: Uint8Array;
   private readonly fortressId: string | null;
-  private readonly retentionDays: number;
+  readonly retentionDays: number;
   private readonly now: () => Date;
 
   constructor(opts: UnifiedInboxStoreOptions) {
@@ -79,8 +82,12 @@ export class UnifiedInboxStore {
 
   async upsert(entry: UnifiedInboxEntry): Promise<PersistedInboxEntry> {
     const existing = await this.get(entry.inbox_id);
-    const retentionUntil =
-      existing?.retention_until ?? this.defaultRetentionUntil();
+    let retentionUntil = existing?.retention_until ?? this.defaultRetentionUntil();
+    const admission = parseBlockedEgressAdmissionRecord(entry.blocked_egress_admission);
+    if (entry.source_class === "blocked_egress" && admission.ok) {
+      // Admission expiry is an immutable upper bound; an upsert can never extend it.
+      retentionUntil = retentionUntil < admission.value.expires_at ? retentionUntil : admission.value.expires_at;
+    }
     const persisted: PersistedInboxEntry = {
       ...entry,
       encrypted_at_rest: true,
@@ -93,6 +100,7 @@ export class UnifiedInboxStore {
   async list(opts?: {
     since?: string;
     source_class?: UnifiedInboxSourceClass;
+    exclude_source_class?: UnifiedInboxSourceClass;
     status?: "pending" | "resolved";
     limit?: number;
   }): Promise<PersistedInboxEntry[]> {
@@ -101,11 +109,23 @@ export class UnifiedInboxStore {
       UNIFIED_INBOX_KEY_PREFIX,
     );
     const entries: PersistedInboxEntry[] = [];
+    let excludedBlockedIds: Set<string> | undefined;
     for (const meta of metas) {
       const inboxId = stripKeyPrefix(meta.key);
       if (inboxId === null) continue;
-      const entry = await this.get(inboxId);
+      let entry: PersistedInboxEntry | null;
+      try {
+        entry = await this.get(inboxId);
+      } catch (error) {
+        // Only an authenticated blocked index reference may isolate a read failure from other sources at startup.
+        // Must match the strict restore reader in blocked-egress-projection.ts, which still fails the blocked generation.
+        if (opts?.exclude_source_class !== "blocked_egress") throw error;
+        excludedBlockedIds ??= new Set(await this.readBlockedEgressIndex());
+        if (!excludedBlockedIds.has(inboxId)) throw error;
+        continue;
+      }
       if (!entry) continue;
+      if (entry.source_class === opts?.exclude_source_class) continue;
       if (opts?.since && entry.observed_at < opts.since) continue;
       if (opts?.source_class && entry.source_class !== opts.source_class) {
         continue;
@@ -118,12 +138,18 @@ export class UnifiedInboxStore {
     return entries.slice(0, opts?.limit ?? entries.length);
   }
 
-  async get(inbox_id: string): Promise<PersistedInboxEntry | null> {
+  /** Restore requests strict reads so unreadable ciphertext cannot be mistaken for an absent projection record. */
+  async get(inbox_id: string, options?: { strict: true }): Promise<PersistedInboxEntry | null> {
     const raw = await this.storage.read(
       UNIFIED_INBOX_NAMESPACE,
       entryKey(inbox_id),
     );
-    if (!raw || raw.length > MAX_ENTRY_BYTES) return null;
+    if (!raw) return null;
+    // Strict projection restore must distinguish unreadable ciphertext from a missing record; ordinary inbox reads keep their legacy contract.
+    if (raw.length > MAX_ENTRY_BYTES) {
+      if (options?.strict) throw new Error("Invalid blocked-egress entry size");
+      return null;
+    }
     try {
       const envelope: EncryptedPayload = JSON.parse(bytesToString(raw));
       const aad = this.aadFor(this.fortressIdForRead(), inbox_id);
@@ -139,14 +165,39 @@ export class UnifiedInboxStore {
         return null;
       }
       // Must match cachePersistedEntry in unified-inbox-bridge.ts: invalid or non-blocked-egress metadata reads as legacy.
-      const { blocked_egress, ...legacy } = persisted.entry;
+      const { blocked_egress, blocked_egress_admission, ...legacy } = persisted.entry;
       const metadata = parseBlockedEgressMetadata(legacy.source_class === "blocked_egress" ? blocked_egress : undefined);
       // The encrypted store is fortress-owned; verified entries were written only from consumer-minted values.
       // Reads omit malformed or wrong-source metadata; resolve later rewrites that sanitized entry.
-      return metadata.ok ? { ...legacy, blocked_egress: metadata.value } : legacy;
-    } catch {
+      // Must match cachePersistedEntry in unified-inbox-bridge.ts: both consume parseBlockedEgressAdmissionRecord and omit wrong-source records.
+      const admission = parseBlockedEgressAdmissionRecord(legacy.source_class === "blocked_egress" ? blocked_egress_admission : undefined);
+      return { ...legacy, ...(metadata.ok ? { blocked_egress: metadata.value } : {}), ...(admission.ok ? { blocked_egress_admission: admission.value } : {}) };
+    } catch (error) {
+      if (options?.strict) throw error;
       return null;
     }
+  }
+
+  /** Read the bounded encrypted projection index without enumerating entry keys. */
+  async readBlockedEgressIndex(): Promise<string[]> {
+    const raw = await this.storage.read(UNIFIED_INBOX_NAMESPACE, BLOCKED_EGRESS_INDEX_KEY);
+    if (!raw) return [];
+    if (raw.length > MAX_ENTRY_BYTES) throw new Error("Invalid blocked-egress index size");
+    const plaintext = decrypt(JSON.parse(bytesToString(raw)) as EncryptedPayload, this.encryptionKey,
+      this.aadFor(this.fortressIdForRead(), BLOCKED_EGRESS_INDEX_KEY));
+    if (plaintext.length > MAX_ENTRY_BYTES) throw new Error("Invalid blocked-egress index size");
+    const value: unknown = JSON.parse(bytesToString(plaintext));
+    return validateBlockedEgressIndex(value);
+  }
+
+  /** Replace the single index record; ids refer only to bounded blocked-egress admissions. */
+  async writeBlockedEgressIndex(ids: string[]): Promise<void> {
+    const checked = validateBlockedEgressIndex(ids);
+    const plaintext = stringToBytes(JSON.stringify(checked));
+    const envelope = encrypt(plaintext, this.encryptionKey, this.aadFor(this.fortressIdForRead(), BLOCKED_EGRESS_INDEX_KEY));
+    const bytes = stringToBytes(JSON.stringify(envelope));
+    if (bytes.length > MAX_ENTRY_BYTES) throw new Error("Invalid blocked-egress index size");
+    await this.storage.write(UNIFIED_INBOX_NAMESPACE, BLOCKED_EGRESS_INDEX_KEY, bytes);
   }
 
   async resolve(inbox_id: string, resolved_by: string): Promise<void> {
@@ -225,4 +276,17 @@ function entryKey(inboxId: string): string {
 function stripKeyPrefix(key: string): string | null {
   if (!key.startsWith(UNIFIED_INBOX_KEY_PREFIX)) return null;
   return key.slice(UNIFIED_INBOX_KEY_PREFIX.length);
+}
+
+// A separate key keeps projection bookkeeping out of legacy entry scans and pruning.
+const BLOCKED_EGRESS_INDEX_KEY = "blocked_egress.index.v1";
+function validateBlockedEgressIndex(value: unknown): string[] {
+  // Must match HUB_BLOCKED_EGRESS_FORTRESS_MAX in hub/constants.ts and restore in blocked-egress-projection.ts.
+  // 128 ASCII characters per id leaves 1000 JSON strings plus encryption/base64 overhead below 256 KiB.
+  const MAX_INDEX_ID_CHARS = 128;
+  if (!Array.isArray(value) || value.length > HUB_BLOCKED_EGRESS_FORTRESS_MAX ||
+      value.some(id => typeof id !== "string" || id.length === 0 || id.length > MAX_INDEX_ID_CHARS || !/^[a-zA-Z0-9_-]+$/.test(id)) || new Set(value).size !== value.length) {
+    throw new Error("Invalid blocked-egress index");
+  }
+  return [...value] as string[];
 }
