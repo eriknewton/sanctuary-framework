@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs/promises";
+import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog, AuditPersistenceError } from "../../src/operational/audit-log.js";
@@ -30,9 +31,20 @@ async function snapshot(path: string): Promise<Record<string, string>> {
     for (const name of (await fs.readdir(dir)).sort()) {
       const key = `${prefix}/${name}`;
       const child = join(dir, name);
-      const metadata = await fs.lstat(child);
-      result[key] = metadata.isSymbolicLink() ? `link:${await fs.readlink(child)}` : metadata.isDirectory() ? "directory" : (await fs.readFile(child)).toString("base64");
-      if (metadata.isDirectory()) await walk(child, key);
+      // One no-follow handle classifies and reads each entry, so the bytes recorded are the entry that was classified.
+      const handle = await fs.open(child, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ELOOP") return null;
+        throw error;
+      });
+      if (handle === null) { result[key] = `link:${await fs.readlink(child)}`; continue; }
+      let isDirectory = false;
+      try {
+        isDirectory = (await handle.stat()).isDirectory();
+        result[key] = isDirectory ? "directory" : (await handle.readFile()).toString("base64");
+      } finally {
+        await handle.close();
+      }
+      if (isDirectory) await walk(child, key);
     }
   }
   await walk(path, "");
