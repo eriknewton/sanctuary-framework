@@ -2131,6 +2131,7 @@ async function acquireKernelLock(
   for (;;) {
     // A zero local wait retains its one nonblocking probe, but an expired caller deadline never starts a probe.
     if (!firstAttempt || timeoutMs > 0 || options.monotonicDeadlineMs !== undefined) assertBudget();
+    const nonblockingFirstAttempt = firstAttempt && timeoutMs === 0 && options.monotonicDeadlineMs === undefined;
     firstAttempt = false;
     // Every retry observes the caller deadline before attempting another bind.
     assertLockWaitNotAborted(abortSignal, socketPath);
@@ -2153,7 +2154,8 @@ async function acquireKernelLock(
       // The hook is test-only scheduling control; no hook means no await and no yield.
       const hook = options.__testAfterKernelSocketAcquired;
       if (hook !== undefined) await hook(socketPath);
-      assertBudget();
+      // A zero local timeout permits its single free bind; explicit caller deadlines always fence admission.
+      if (!nonblockingFirstAttempt) assertBudget();
       let testHelper: ChildProcessWithoutNullStreams | undefined;
       if (options.__testAfterKernelHolderAcquired) {
         testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
@@ -2579,13 +2581,17 @@ export function resolveAuditGuardRuntimeRoot(realUid: number, host: NodeJS.Platf
 /** One second bounds the environment-free Darwin directory query. */
 export const AUDIT_GUARD_GETCONF_TIMEOUT_MS = 1000;
 let darwinAuditTemp: Promise<string> | undefined;
-/** Read this real uid's OS-selected directory once; a failed query never selects a fallback. */
+/** Cache this real uid's successful OS directory query; failures remain retryable without selecting a fallback. */
 export function auditGuardDarwinUserTempDir(): Promise<string> {
-  return darwinAuditTemp ??= new Promise((resolve, reject) => {
+  return darwinAuditTemp ??= new Promise<string>((resolve, reject) => {
     execFile("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { env: {}, timeout: AUDIT_GUARD_GETCONF_TIMEOUT_MS, encoding: "utf8" }, (error, stdout) => {
       if (error) reject(error);
       else resolve(stdout.replace(/\n$/, ""));
     });
+  }).catch(error => {
+    // A transient OS probe failure must not disable every later recovery in this process.
+    darwinAuditTemp = undefined;
+    throw error;
   });
 }
 

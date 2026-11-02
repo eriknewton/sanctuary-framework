@@ -22,7 +22,7 @@ import type {
   StorageBackend,
 } from "../storage/interface.js";
 import * as custodyLocks from "../storage/cross-process-lock.js";
-import { ownProcessStartToken, readProcessStartToken } from "./process-start-token.js";
+import { isProcessStartToken, ownProcessStartToken, readProcessStartToken } from "./process-start-token.js";
 import { chownCreatedDirChain, writeFileCustody } from "../storage/custody-fs.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
@@ -409,14 +409,12 @@ export interface AuditLogConfig {
   /** Test-only smaller cache, a positive integer at most the production cap. */
   verifyCacheMaxEntries?: number;
   /**
-   * Age bound (ms) past which an id-less (0-byte) stale audit-write lock, and an
-   * orphaned `.acquire.*.tmp` acquire-temp, are considered crash litter and
-   * swept. Defaults to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS} (10 min); also
+   * Age bound (ms) for an id-less (0-byte) stale audit-write lock.
+   * Defaults to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS} (10 min); also
    * overridable via the `AUDIT_WRITE_LOCK_IDLESS_STALE_MS` env var. Exposed so
-   * tests can drive the 0-byte-age and orphan-temp-GC branches deterministically
-   * on a freshly-booted host (where a real 10-minute mtime cannot be assumed to
-   * post-date boot). Never breaks a content-bearing lock; only the id-less
-   * fallback and the acquire-temp sweep consult it.
+   * tests can drive the empty-lock age branch on a freshly booted host.
+   * Never breaks a content-bearing lock. Acquire-temp sweeping instead requires
+   * a proven dead pid and does not consult this age bound.
    */
   idlessStaleLockMs?: number;
   /**
@@ -1203,17 +1201,17 @@ const AUDIT_WRITE_LOCK_IDLESS_STALE_MS = 10 * 60 * 1_000;
 // could let a genuinely stale lock masquerade as same-boot-live.
 const AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS = 1_000;
 // Process-local monotonic counter for unique audit-lock temp-file names during
-// the atomic acquire (paired with pid + a wall-clock component). Never
+// the atomic acquire (paired with pid + random bytes). Never
 // persisted; collision-free within a process and across concurrent processes.
 let auditLockTempCounter = 0;
 // Suffix marking an audit-lock acquire-temp: `<lockfile>.acquire.<pid>.<n>.<hex>.tmp`.
 // A crash / kill -9 between `link()` and the `finally` unlink in
-// `atomicAcquireAuditLock` strands one of these; the startup sweep GCs any older
-// than the id-less stale bound (invisible to `list()`, litter only).
+// `atomicAcquireAuditLock` strands one of these; the startup sweep removes only
+// strict-named files whose pid is proven dead, within the process attempt quota.
 const AUDIT_LOCK_ACQUIRE_TEMP_INFIX = ".acquire.";
 const AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX = ".tmp";
 
-/** Parse the id-less-stale-lock / orphan-acquire-temp age bound from config /
+/** Parse the id-less-stale-lock age bound from config /
  * env, defaulting to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS}. A positive finite
  * override wins (config first, then env); anything else falls back to the
  * default. Mirrors {@link resolveEagerReverifyIntervalMs}. */
@@ -1359,6 +1357,16 @@ export function __testResetAuditLockTempSweepBudget(): void {
   auditLockTempSweepAttempts = 0;
   auditLockTempSweepCapReported = false;
 }
+// Linux boot_id and Darwin kern.bootsessionuuid use canonical 8-4-4-4-12 hexadecimal UUID groups.
+const AUDIT_BOOT_UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+// Darwin sysctl kern.boottime prints timeval sec/usec fields, optionally followed by its rendered date.
+const AUDIT_BOOT_TIME_PATTERN = /^\{ sec = \d+, usec = \d+ \}(?: [^\r\n]+)?$/;
+function auditBootIdentityKind(value: string | undefined): "uuid" | "boottime" | "unknown" {
+  if (value !== undefined && AUDIT_BOOT_UUID_PATTERN.exec(value)?.[0] === value) return "uuid";
+  if (value !== undefined && AUDIT_BOOT_TIME_PATTERN.exec(value)?.[0] === value) return "boottime";
+  return "unknown";
+}
+
 /** Root-created daemon namespaces may already have been handed to createOwner. */
 export function auditGuardExpectedDirOwnerUid(authorityUid: number, createOwner?: { uid: number }): number {
   return authorityUid === 0 ? createOwner?.uid ?? 0 : authorityUid;
@@ -4975,9 +4983,8 @@ export class AuditLog {
         }
       }
     }
-    // Once-per-instance: GC any `.acquire.*.tmp` a prior process's crash/kill-9
-    // stranded between `link()` and its cleanup (invisible to `list()`, litter
-    // only). Bounded and best-effort so it can never block or fail an acquire.
+    // Once per instance, list crash residue and attempt deletion only for proven dead pids.
+    // Attempts share a process quota; filesystem I/O and retained residue are not bounded.
     await this.sweepStaleAcquireTempsOnce(this.auditWriteLockPath);
     const deadline = this.monotonicNow() + AUDIT_WRITE_LOCK_TIMEOUT_MS;
     // Identity (dev+ino) of the lock file THIS acquire published, captured at
@@ -5024,6 +5031,8 @@ export class AuditLog {
     }
 
     try {
+      // Successful link and temp cleanup can consume the budget; normal inode-checked release still owns this hold.
+      if (this.monotonicNow() >= deadline) throw new AuditLockContentionError(this.auditWriteLockPath, "acquisition budget exhausted");
       let timer: ReturnType<typeof setTimeout> | undefined;
       const operationPromise = Promise.resolve().then(() => operation(signal));
       void operationPromise.catch(() => undefined);
@@ -5101,7 +5110,7 @@ export class AuditLog {
     try {
       const dir = dirname(lockPath);
       for (const name of await readdir(dir)) {
-        // Must match atomicAcquireAuditLock and state_CLAIMED names below: 24 hex = 12 random bytes.
+        // Must match atomicAcquireAuditLock and state_CLAIMED names below: 24 hex = 12 random bytes. Evidence names from retainEvidence are excluded.
         const match = /^\.audit-write\.lock\.(?:acquire\.([1-9]\d*)\.[a-z0-9]+\.[a-f0-9]{24}\.tmp|claim\.([1-9]\d*)\.[a-f0-9]{24}\.tomb)$/.exec(name);
         if (!match || probePidLiveness(Number(match[1] ?? match[2])) !== "dead") continue;
         if (auditLockTempSweepAttempts >= AUDIT_LOCK_TEMP_SWEEP_MAX_ATTEMPTS) {
@@ -5298,10 +5307,12 @@ export class AuditLog {
       if (typeof parsed.uptime_ms === "number" && Number.isFinite(parsed.uptime_ms)) lockUptimeMs = parsed.uptime_ms;
       if (typeof parsed.boot_id === "string" && parsed.boot_id.length > 0) lockBootId = parsed.boot_id;
       // start_token must match atomicAcquireAuditLock in operational/audit-log.ts; compare exact bytes, never dates.
-      if (typeof parsed.start_token === "string" && parsed.start_token.length > 0) lockStartToken = parsed.start_token;
+      // Shape must match isProcessStartToken in process-start-token.ts; an unknown encoding is not pid-reuse evidence.
+      if (isProcessStartToken(parsed.start_token)) lockStartToken = parsed.start_token;
     } catch { /* Nonempty malformed records carry no additional staleness proof. */ }
     const currentBoot = this.currentLockBootId();
-    const knownBoot = lockBootId !== undefined && currentBoot !== undefined;
+    // Only stable UUIDs describe comparable boot sessions; fallback wall time and unknown shapes prove neither reboot nor same boot.
+    const knownBoot = auditBootIdentityKind(lockBootId) === "uuid" && auditBootIdentityKind(currentBoot) === "uuid";
     const sameBoot = knownBoot && lockBootId === currentBoot;
     // Row 1: a different known boot proves an orphan independently of reused pids.
     if (knownBoot && !sameBoot) return stale("different_boot");
@@ -5358,6 +5369,18 @@ export class AuditLog {
     let runtimeRoot = this.testAuditGuardLockRoot ?? "unresolved audit guard root";
     let rollbackTomb: string | undefined;
     let rollbackIdentity: Stats | undefined;
+    let retainedEvidenceReported = false;
+    const retainEvidence = async (tomb: string): Promise<string> => {
+      // Must remain excluded by sweepStaleAcquireTempsOnce's strict claim pattern: evidence belongs to the operator even after this pid dies.
+      const evidence = `${lockPath}.evidence.${tomb.slice(`${lockPath}.claim.`.length)}`;
+      await rename(tomb, evidence);
+      if (!retainedEvidenceReported) {
+        retainedEvidenceReported = true;
+        // SAFETY: restore refusal must be loud once, even when primary and rollback links both need retention.
+        console.error(`[audit-log] audit lock claim restore refused; keeping ${evidence} and successor ${lockPath}`);
+      }
+      return evidence;
+    };
     try {
       runtimeRoot = this.testAuditGuardLockRoot ?? custodyLocks.resolveAuditGuardRuntimeRoot(
         process.getuid!(), process.platform,
@@ -5378,8 +5401,7 @@ export class AuditLog {
           try { await link(tomb, lockPath); }
           catch (error) {
             if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-              // SAFETY: never discard either the claimed file or a successor on a failed restore.
-              console.error(`[audit-log] audit lock claim restore refused; keeping ${tomb} and successor ${lockPath}`);
+              await retainEvidence(tomb);
             }
             throw error;
           }
@@ -5444,8 +5466,7 @@ export class AuditLog {
             const current = await stat(lockPath);
             // A prior restoration may already have relinked this inode; a different successor must retain both names.
             if (current.dev !== rollbackIdentity!.dev || current.ino !== rollbackIdentity!.ino) {
-              // SAFETY: a late guard failure cannot discard a successor or its retained recovery evidence.
-              console.error(`[audit-log] audit lock claim restore refused; keeping ${rollbackTomb} and successor ${lockPath}`);
+              rollbackTomb = await retainEvidence(rollbackTomb);
               throw restoreError;
             }
           }

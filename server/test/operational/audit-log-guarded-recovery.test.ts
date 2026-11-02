@@ -1,3 +1,4 @@
+// fail-before-exempt: A1b r2 coordinator rulings normalize only planted and mocked identity shapes; all existing assertions and token/boot relationships are unchanged.
 import * as fs from "node:fs/promises";
 import { tmpdir, uptime } from "node:os";
 import { join } from "node:path";
@@ -25,6 +26,11 @@ type Internals = {
 const roots: string[] = [];
 const DEAD = 2147483647; // Maximum signed pid value, outside this host's allocatable pid range.
 const FOREIGN = 1;
+const BOOT = "11111111-1111-4111-8111-111111111111";
+const OTHER_BOOT = "22222222-2222-4222-8222-222222222222";
+const OWN_TOKEN = process.platform === "darwin" ? "Sun Nov  1 10:46:41 2026" : "12345";
+const FOREIGN_TOKEN = process.platform === "darwin" ? "Sun Nov  1 10:46:42 2026" : "12346";
+const OLD_TOKEN = process.platform === "darwin" ? "Sun Nov  1 10:46:43 2026" : "12347";
 const NOW = () => new Date().toISOString();
 const PREBOOT = "2000-01-01T00:00:00.000Z";
 beforeEach(() => __testResetAuditLockTempSweepBudget());
@@ -59,25 +65,25 @@ it("uses the one tri-state probe for success, ESRCH, EPERM, every unknown error 
 
 it("tables rows 1 through 11 with planted records and preserves token-less proofs", async () => {
   const f = await fixture();
-  vi.spyOn(f.internals, "currentLockBootId").mockReturnValue("boot");
-  vi.spyOn(tokens, "ownProcessStartToken").mockResolvedValue("own");
-  vi.spyOn(tokens, "readProcessStartToken").mockResolvedValue("foreign");
+  vi.spyOn(f.internals, "currentLockBootId").mockReturnValue(BOOT);
+  vi.spyOn(tokens, "ownProcessStartToken").mockResolvedValue(OWN_TOKEN);
+  vi.spyOn(tokens, "readProcessStartToken").mockResolvedValue(FOREIGN_TOKEN);
   vi.spyOn(process, "kill").mockImplementation(pid => { if (pid === DEAD) throw Object.assign(new Error(), { code: "ESRCH" }); return true; });
   const current = uptime() * 1000;
   const started = current - process.uptime() * 1000;
   const rows: Array<[string, unknown, string, string?]> = [
-    ["1 different boot", { pid: FOREIGN, boot_id: "other", start_token: "foreign" }, "stale", "different_boot"],
-    ["2 self token differs", { pid: process.pid, start_token: "old" }, "stale", "reused_self_pid"],
-    ["2 self token equal", { pid: process.pid, start_token: "own", acquired_at: PREBOOT }, "in_progress"],
-    ["3 self before start", { pid: process.pid, boot_id: "boot", uptime_ms: started - 5000 }, "stale", "reused_self_pid"],
-    ["3 self after start", { pid: process.pid, boot_id: "boot", uptime_ms: current }, "in_progress"],
+    ["1 different boot", { pid: FOREIGN, boot_id: OTHER_BOOT, start_token: FOREIGN_TOKEN }, "stale", "different_boot"],
+    ["2 self token differs", { pid: process.pid, start_token: OLD_TOKEN }, "stale", "reused_self_pid"],
+    ["2 self token equal", { pid: process.pid, start_token: OWN_TOKEN, acquired_at: PREBOOT }, "in_progress"],
+    ["3 self before start", { pid: process.pid, boot_id: BOOT, uptime_ms: started - 5000 }, "stale", "reused_self_pid"],
+    ["3 self after start", { pid: process.pid, boot_id: BOOT, uptime_ms: current }, "in_progress"],
     ["4 self old wall stamp", { pid: process.pid, acquired_at: PREBOOT }, "stale"],
     ["4 self recent wall stamp", { pid: process.pid, acquired_at: NOW() }, "in_progress"],
-    ["5 self held stale", { pid: process.pid, boot_id: "boot", start_token: "own", uptime_ms: current - 120000 }, "stale", "self_held_stale_forced_release"],
+    ["5 self held stale", { pid: process.pid, boot_id: BOOT, start_token: OWN_TOKEN, uptime_ms: current - 120000 }, "stale", "self_held_stale_forced_release"],
     ["6 dead foreign", { pid: DEAD, acquired_at: NOW() }, "stale", "dead_holder"],
-    ["7 equal token shields clock step", { pid: FOREIGN, start_token: "foreign", acquired_at: PREBOOT }, "in_progress"],
-    ["7 differing token", { pid: FOREIGN, start_token: "old", acquired_at: NOW() }, "stale", "start_token_differs"],
-    ["8 same boot protects foreign", { pid: FOREIGN, boot_id: "boot", acquired_at: PREBOOT }, "in_progress"],
+    ["7 equal token shields clock step", { pid: FOREIGN, start_token: FOREIGN_TOKEN, acquired_at: PREBOOT }, "in_progress"],
+    ["7 differing token", { pid: FOREIGN, start_token: OLD_TOKEN, acquired_at: NOW() }, "stale", "start_token_differs"],
+    ["8 same boot protects foreign", { pid: FOREIGN, boot_id: BOOT, acquired_at: PREBOOT }, "in_progress"],
     ["9 unknown boot preboot stamp", { pid: FOREIGN, acquired_at: PREBOOT }, "stale"],
     ["9 unknown boot recent stamp", { pid: FOREIGN, acquired_at: NOW() }, "in_progress"],
     ["10 recent empty", "", "in_progress"],
@@ -94,17 +100,17 @@ it("tables rows 1 through 11 with planted records and preserves token-less proof
   await fs.utimes(f.lock, new Date(PREBOOT), new Date(PREBOOT));
   expect((await f.internals.decideStaleAuditLock(f.lock)).verdict).toBe("stale");
   vi.mocked(tokens.readProcessStartToken).mockResolvedValue(undefined);
-  await f.plant({ pid: FOREIGN, start_token: "unreadable", acquired_at: PREBOOT });
+  await f.plant({ pid: FOREIGN, start_token: FOREIGN_TOKEN, acquired_at: PREBOOT });
   expect((await f.internals.decideStaleAuditLock(f.lock)).verdict).toBe("stale");
-  await f.plant({ pid: FOREIGN, start_token: "unreadable", acquired_at: NOW() });
+  await f.plant({ pid: FOREIGN, start_token: FOREIGN_TOKEN, acquired_at: NOW() });
   expect((await f.internals.decideStaleAuditLock(f.lock)).verdict).toBe("in_progress");
 });
 
 it("breaks own different token when neither boot id is available", async () => {
   const f = await fixture();
   vi.spyOn(f.internals, "currentLockBootId").mockReturnValue(undefined);
-  vi.spyOn(tokens, "ownProcessStartToken").mockResolvedValue("current");
-  await f.plant({ pid: process.pid, start_token: "old", acquired_at: NOW() });
+  vi.spyOn(tokens, "ownProcessStartToken").mockResolvedValue(OWN_TOKEN);
+  await f.plant({ pid: process.pid, start_token: OLD_TOKEN, acquired_at: NOW() });
   expect(await f.internals.breakStaleAuditLock(f.lock)).toBe(true);
   await expect(fs.stat(f.lock)).rejects.toMatchObject({ code: "ENOENT" });
 });
@@ -122,13 +128,13 @@ it("refuses malformed pids and unknown syscall errors with an unprovable-lock in
   await expect(f.internals.withAuditWriteLock(async () => undefined)).rejects.toThrow(/unprovable.*stop all/s);
 });
 
-it.each(["other", "same"])("row 0 protects an in-place aged inode across instances: %s boot", async boot => {
+it.each([OTHER_BOOT, BOOT])("row 0 protects an in-place aged inode across instances: %s boot", async boot => {
   const f = await fixture({ selfHeldStaleLockMs: 60000 });
   const b = new AuditLog(f.storage, f.key, f.settings) as unknown as Internals;
-  vi.spyOn(b, "currentLockBootId").mockReturnValue("same");
-  vi.spyOn(tokens, "ownProcessStartToken").mockResolvedValue("own");
+  vi.spyOn(b, "currentLockBootId").mockReturnValue(BOOT);
+  vi.spyOn(tokens, "ownProcessStartToken").mockResolvedValue(OWN_TOKEN);
   await f.internals.withAuditWriteLock(async () => {
-    await f.plant({ pid: process.pid, boot_id: boot, start_token: "own", uptime_ms: uptime() * 1000 - 120000, acquired_at: PREBOOT });
+    await f.plant({ pid: process.pid, boot_id: boot, start_token: OWN_TOKEN, uptime_ms: uptime() * 1000 - 120000, acquired_at: PREBOOT });
     const original = await fs.readFile(f.lock, "utf8");
     const decide = b.decideStaleAuditLock.bind(b);
     vi.spyOn(b, "decideStaleAuditLock").mockImplementation(async (...args) => { const result = await decide(...args); if (result.verdict === "in_progress") f.advance(5000); return result; });
@@ -326,11 +332,11 @@ it("readable tokens remain independent proof when the liveness syscall is unknow
   const f = await fixture();
   vi.spyOn(f.internals, "currentLockBootId").mockReturnValue(undefined);
   vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("probe unavailable"), { code: "EIO" }); });
-  vi.spyOn(tokens, "readProcessStartToken").mockResolvedValue("current");
-  await f.plant({ pid: FOREIGN, start_token: "current", acquired_at: PREBOOT });
+  vi.spyOn(tokens, "readProcessStartToken").mockResolvedValue(OWN_TOKEN);
+  await f.plant({ pid: FOREIGN, start_token: OWN_TOKEN, acquired_at: PREBOOT });
   const before = await fs.readFile(f.lock);
   expect(await f.internals.breakStaleAuditLock(f.lock)).toBe(false);
   expect(await fs.readFile(f.lock)).toEqual(before);
-  await f.plant({ pid: FOREIGN, start_token: "previous", acquired_at: NOW() });
+  await f.plant({ pid: FOREIGN, start_token: OLD_TOKEN, acquired_at: NOW() });
   expect(await f.internals.breakStaleAuditLock(f.lock)).toBe(true);
 });
