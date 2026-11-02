@@ -54,6 +54,10 @@ import {
 } from "../audit/checkpoint-identity.js";
 import type { PluginContribution } from "../substrate/attribution.js";
 
+// Shared runaway ceiling for namespace repair and absent-root authority walks.
+// Sixteen hops exceed the deepest known three-level audit namespace.
+const MAX_NAMESPACE_ANCESTOR_WALK = 16;
+
 export interface AuditEntry {
   timestamp: string;
   layer: "l1" | "l2" | "l3" | "l4";
@@ -4760,7 +4764,6 @@ export class AuditLog {
     // within a few hops. A deviating run that never reaches one is pathological
     // (e.g. a root-owned fortress, which is `repair-custody`'s job, not this
     // append path's) and is refused rather than chased toward `/`.
-    const MAX_NAMESPACE_ANCESTOR_WALK = 16;
     let topmostRepair: string | undefined;
     let dir = leafDir;
     for (let depth = 0; ; depth++) {
@@ -4848,10 +4851,9 @@ export class AuditLog {
       if (uid !== requiredOwnerUid) refuse("operator chain owner does not match writer");
       return;
     }
-    // Must match the 16-hop ceiling in verifyOrRepairNamespaceDirOwnership; absent-root admission never walks without a bound.
-    const MAX_AUTHORITY_ANCESTOR_WALK = 16;
+    // Share the repair walk ceiling so absent-root admission never walks without a bound.
     let ancestor = dirname(storageRoot);
-    for (let depth = 0; depth < MAX_AUTHORITY_ANCESTOR_WALK; depth++) {
+    for (let depth = 0; depth < MAX_NAMESPACE_ANCESTOR_WALK; depth++) {
       const identity = await directory(ancestor);
       if (identity) {
         requiredOwnerUid = uid === 0 ? 0 : uid;
@@ -4894,7 +4896,8 @@ export class AuditLog {
           "reach any audit write"
       );
     }
-    // AuditLog chain entry, anchor, checkpoint and lock writes have one authorized writer principal per chain so A1b's per-uid guard can serialize breakers.
+    // AuditLog chain entry, anchor, checkpoint and lock writes admit one authorized writer principal per chain so per-uid guards can serialize breakers.
+    // Namespace identity is checked at writer admission; this check does not by itself hold that identity through later writes.
     await this.assertAuditWriterAuthority();
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);

@@ -1232,6 +1232,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     return entries.sort((a, b) => a.key.localeCompare(b.key));
   }
 
+  /** Names only, with the complete-or-throw contract in storage/interface.ts. */
   async listKeys(namespace: string, prefix?: string): Promise<string[]> {
     this.assertCallerNamespace(namespace);
     const capability = this.darwinCapability(namespace);

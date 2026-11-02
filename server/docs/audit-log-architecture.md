@@ -18,7 +18,9 @@ admits a non-root caller; root requires a root-owned ancestor. The
 custody handback after admission and does not grant writer authority.
 
 Owner directories, storage roots and existing entry, checkpoint and metadata
-namespace directories must be plain directories. Symlinks are refused. The
+namespace directories are checked when a writer is admitted and must be plain
+directories at admission. Symlinks are refused at that check. This check does
+not by itself hold namespace identity through later writes. The
 Linux custody operation's exact `/proc/self/fd/<digits>` directory paths are
 an exception: their descriptors pin directory identity, so the owner is read
 from the pinned directory. An audit namespace cannot itself be the custody

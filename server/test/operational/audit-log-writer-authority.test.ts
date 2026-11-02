@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { AuditLog, AuditPersistenceError } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { acquireMasterWriteBarrier } from "../../src/storage/cross-process-lock.js";
-import { createDaemonAuditLog, migrateFortressAuditStoreSplit } from "../../src/operational/audit-store-split.js";
+import { AuditStoreSplitMigrationError, createDaemonAuditLog, migrateFortressAuditStoreSplit } from "../../src/operational/audit-store-split.js";
 import { seedStoredIdentity } from "../helpers/signing-fixture.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -212,8 +212,8 @@ describe.skipIf(process.platform !== "linux" || process.getuid?.() === 0)("write
         expect(messages.length).toBeGreaterThan(0);
         for (const message of messages) expect(message).toContain("performs no recovery writes");
       }
-      // Deny the daemon genesis after the production migration probe; isolate probe effects.
-      await expect(migrateFortressAuditStoreSplit({ storage, masterKey: master })).rejects.toThrow();
+      // The production probe must reject its observed findings before migration writes.
+      await expect(migrateFortressAuditStoreSplit({ storage, masterKey: master })).rejects.toBeInstanceOf(AuditStoreSplitMigrationError);
       expect(await snapshot(root)).toEqual(before);
     });
   }
@@ -234,25 +234,26 @@ describe.skipIf(process.platform !== "linux" || process.getuid?.() === 0)("write
     expect(Buffer.from(alert!).toString().trim().split("\n")).toHaveLength(1);
   });
 
-  it("a stale decision followed by a different inode reports in progress without removal", async () => {
+  it.each(["ENOENT", "EIO"])("a stale lock observational re-stat handles %s without removal", async (code) => {
     const storage = new FilesystemStorage(join(root, "state"));
     await fs.mkdir(storage.namespacePath("_audit"), { recursive: true });
     const lock = join(storage.namespacePath("_audit"), ".audit-write.lock");
+    // Linux pid_max is below this signed pid ceiling; the holder cannot exist.
     await fs.writeFile(lock, JSON.stringify({ pid: 2_147_483_647 }));
+    const before = await snapshot(root);
     const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-    let replaced = false;
+    const failure = Object.assign(new Error(`observational re-stat ${code}`), { code });
+    const restat = vi.fn(() => { throw failure; });
     vi.mocked(fs.stat).mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
-      if (String(args[0]) === lock && !replaced) {
-        replaced = true;
-        await fs.rename(lock, `${lock}.old`);
-        await fs.writeFile(lock, "replacement");
-      }
+      if (String(args[0]) === lock) return restat();
       return actual.stat(...args);
     }) as typeof fs.stat);
     const log = new AuditLog(storage, master, { readOnly: true });
-    expect(await (log as any).isAuditWriterInProgress()).toBe(true);
-    expect(await fs.readFile(lock, "utf8")).toBe("replacement");
-    expect(await fs.readFile(`${lock}.old`, "utf8")).toContain("2147483647");
+    const observation = (log as unknown as { isAuditWriterInProgress(): Promise<boolean> }).isAuditWriterInProgress();
+    if (code === "ENOENT") await expect(observation).resolves.toBe(false);
+    else await expect(observation).rejects.toBe(failure);
+    expect(restat).toHaveBeenCalledTimes(1);
+    expect(await snapshot(root)).toEqual(before);
   });
 });
 

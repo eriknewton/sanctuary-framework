@@ -25,3 +25,17 @@ it("a successful enumeration without matching entries returns an empty list", as
   await storage.write("_audit", "other", Buffer.from("body"));
   expect(await storage.list("_audit", "entry-")).toEqual([]);
 });
+
+it.each(["EACCES", "EIO"])("a per-file stat %s rejects the entire listing", async (code) => {
+  const storage = new FilesystemStorage(root);
+  for (const name of ["a", "b", "c"]) await storage.write("_audit", name, Buffer.from(name));
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  const failure = Object.assign(new Error(`candidate metadata ${code}`), { code });
+  const candidateStat = vi.fn(() => { throw failure; });
+  vi.mocked(fs.stat).mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
+    if (String(args[0]) === join(root, "_audit", "b.enc")) return candidateStat();
+    return actual.stat(...args);
+  }) as typeof fs.stat);
+  await expect(storage.list("_audit")).rejects.toBe(failure);
+  expect(candidateStat).toHaveBeenCalledTimes(1);
+});
