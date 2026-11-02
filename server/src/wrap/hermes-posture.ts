@@ -294,6 +294,7 @@ export async function runHermesPosture(
     }
     // Preserve the operation's own refusal even when lock cleanup wraps it in an AggregateError.
     if (operationFailure) throw operationFailure.error;
+    // eslint-disable-next-line preserve-caught-error -- intentional: the operator sees only the fixed lock message; lock diagnostics stay out of operator output
     throw new Error(error instanceof CrossProcessLockError && error.kind === "contention" ? LOCK_BUSY : LOCK_UNAVAILABLE);
   }
 }

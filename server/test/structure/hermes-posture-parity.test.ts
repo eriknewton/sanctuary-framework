@@ -29,6 +29,6 @@ describe("Hermes posture complete manifest parity", () => {
       expect(text).toContain("never by writing memories to a file");
       expect(text).toContain("do not retry");
     }
-    for (const marker of HERMES_SOUL_BLOCK.match(/<!--.*?-->/g)!) expect(marker).not.toMatch(/ignore|override|system|secret|hidden/i);
+    for (const marker of HERMES_SOUL_BLOCK.match(/<!--[\s\S]*?-->/g)!) expect(marker).not.toMatch(/ignore|override|system|secret|hidden/i);
   });
 });

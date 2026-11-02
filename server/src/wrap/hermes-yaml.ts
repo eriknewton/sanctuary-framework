@@ -552,7 +552,7 @@ function postureBlocks(lines: string[]): Map<string, PostureBlock> {
   return blocks;
 }
 function simplePostureScalar(token: string): string {
-  if (/^[A-Za-z0-9_.\/-]+$/.test(token)) return token;
+  if (/^[A-Za-z0-9_./-]+$/.test(token)) return token;
   if (/^"[^"\\]*"$/.test(token)) return token.slice(1, -1);
   if (/^'[^']*'$/.test(token)) return token.slice(1, -1);
   return postureRefuse();
