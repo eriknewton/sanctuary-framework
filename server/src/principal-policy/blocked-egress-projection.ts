@@ -152,7 +152,7 @@ export interface BlockedEgressAdmissionStore {
 export type BlockedEgressSnapshotItem = UnifiedInboxEntry & { item_id: string };
 export type BlockedEgressSnapshot = { generation: number; items: BlockedEgressSnapshotItem[] } &
   ({ presence: "complete"; presentIds: ReadonlySet<string> } | { presence: "unknown" });
-export type BlockedEgressWorkflowResult = { kind: "applied" } | { kind: "not_ready" };
+export type BlockedEgressWorkflowResult = { kind: "applied" } | { kind: "not_ready" } | { kind: "refused"; reason: "oversize" | "capacity" };
 type LedgerState = "state_UNRESTORED" | "state_RESTORING" | "state_READY" | "state_FAILED";
 type Retained = UnifiedInboxEntry & { blocked_egress_admission: BlockedEgressAdmissionRecord };
 const hash = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -165,6 +165,9 @@ export class BlockedEgressAdmissions {
   private durableIds = new Set<string>();
   private itemIds = new Map<string, string>();
   private generation = 0;
+  /** Cache consumers compare this counter before reading the committed records. */
+  // Must match reconcileBlockedCache in unified-inbox-bridge.ts: every READY commit advances this counter.
+  get committedGeneration(): number { return this.generation; }
   // A store starts UNRESTORED; no store starts READY because nothing durable needs restoring.
   // UNRESTORED -> RESTORING on restore(); RESTORING -> READY only after all reads and the generation commit;
   // RESTORING -> FAILED on any thrown read/write; READY -> FAILED on a failed durable write.
@@ -282,6 +285,9 @@ export class BlockedEgressAdmissions {
     if (!prior) return { kind: "not_ready" };
     const next = { ...entry, blocked_egress_admission: { ...prior.blocked_egress_admission } };
     next.blocked_egress_admission.encoded_bytes = Buffer.byteLength(JSON.stringify(next)) + BLOCKED_EGRESS_PROOF_RESERVE_BYTES;
+    // Workflow updates must enforce admission's byte bounds so a retained record stays bounded and restorable.
+    if (next.blocked_egress_admission.encoded_bytes > BLOCKED_EGRESS_ENTRY_MAX_BYTES) return { kind: "refused", reason: "oversize" };
+    if (this.bytes() - prior.blocked_egress_admission.encoded_bytes + next.blocked_egress_admission.encoded_bytes > BLOCKED_EGRESS_RETAINED_MAX_BYTES) return { kind: "refused", reason: "capacity" };
     this.entries.set(entry.inbox_id, next);
     this.identities.set(blockedEgressIdentityKey(this.options.fortressId, next.blocked_egress_admission.identity), next);
     this.commit();

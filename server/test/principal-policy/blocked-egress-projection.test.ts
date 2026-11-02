@@ -4,10 +4,11 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { UnifiedInboxStore, UNIFIED_INBOX_NAMESPACE } from "../../src/principal-policy/unified-inbox-store.js";
 import { UnifiedInboxScheduler } from "../../src/principal-policy/unified-inbox-scheduler.js";
-import { UnifiedInboxBridge } from "../../src/principal-policy/unified-inbox-bridge.js";
+import { UnifiedInboxBridge, UNIFIED_INBOX_AUDIT_OPS, type UnifiedInboxEntry } from "../../src/principal-policy/unified-inbox-bridge.js";
+import { sweepUnifiedInboxRetention, UnifiedInboxRetentionPolicy } from "../../src/principal-policy/unified-inbox-retention-policy.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { BlockedEgressAdmissions, BLOCKED_EGRESS_ENTRY_MAX_BYTES, BLOCKED_EGRESS_RETAINED_MAX_BYTES, BLOCKED_EGRESS_RESERVATIONS_MAX,
-  BLOCKED_EGRESS_ORIGIN_MAX, BLOCKED_EGRESS_LIFETIME_MS, BLOCKED_EGRESS_FUTURE_SKEW_MS, parseBlockedEgressAdmissionRecord,
+  BLOCKED_EGRESS_PROOF_RESERVE_BYTES, BLOCKED_EGRESS_ORIGIN_MAX, BLOCKED_EGRESS_LIFETIME_MS, BLOCKED_EGRESS_FUTURE_SKEW_MS, parseBlockedEgressAdmissionRecord,
   type BlockedEgressCandidate, type BlockedEgressSnapshot } from "../../src/principal-policy/blocked-egress-projection.js";
 import { HUB_BLOCKED_EGRESS_FORTRESS_MAX, HUB_BLOCKED_EGRESS_EMITTED_MAX } from "../../src/hub/constants.js";
 import { HubInboxStore } from "../../src/hub/inbox-store.js";
@@ -560,6 +561,232 @@ describe("bounded blocked-egress projection", () => {
     expect(a.stats()).toMatchObject({ retained: 0, pendingWorkflowWrites: 1, reservations: 0 });
     expect(a.stats().encodedBytes).toBeGreaterThan(0);
     await a.settled(); expect(a.stats().encodedBytes).toBe(0);
+  });
+
+
+  // Test-only accessors deliberately read the raw maps without invoking a bridge reconciliation helper.
+  function bridgeInternals(bridge: UnifiedInboxBridge) {
+    return bridge as unknown as {
+      blockedAdmissions: BlockedEgressAdmissions;
+      entriesByKey: Map<string, UnifiedInboxEntry>;
+      keyByInboxId: Map<string, string>;
+    };
+  }
+  function rawBlockedEntries(bridge: UnifiedInboxBridge) {
+    const raw = bridgeInternals(bridge);
+    const entries = [...raw.entriesByKey.values()].filter(e => e.source_class === "blocked_egress");
+    for (const entry of entries) expect(raw.entriesByKey.get(raw.keyByInboxId.get(entry.inbox_id)!)).toEqual(entry);
+    expect(raw.keyByInboxId.size).toBe(raw.entriesByKey.size);
+    return entries;
+  }
+  const sortedEntries = (entries: UnifiedInboxEntry[]) => [...entries].sort((a, b) => a.inbox_id.localeCompare(b.inbox_id));
+
+  it("keeps queried and raw bridge records equal to committed recovery generations across forty cycles", async () => {
+    const r = rig();
+    const auditLog = new AuditLog(new MemoryStorage(), KEY);
+    const bridge = new UnifiedInboxBridge({ auditLog, identityId: FORTRESS, fortressId: FORTRESS, store: r.store, now: r.clock });
+    await bridge.rehydratePendingFromStore();
+    const ledger = bridgeInternals(bridge).blockedAdmissions;
+    const receipt = (id: string) => ({ source_event_id: id, destination_category: "custom", block_reason_class: "other", observed_at: r.clock().toISOString() });
+    const control = bridge.ingestBlockedEgress(receipt("retained"))!;
+    const approval = bridge.ingestApproval({ source_event_id: "approval", summary: "Approval", severity: "warn", observed_at: iso(NOW) })!;
+    await ledger.settled();
+    const write = r.storage.write;
+    const cycles = 40; // Acceptance schedule: forty distinct failed admissions and recovery commits.
+    for (let cycle = 0; cycle < cycles; cycle++) {
+      r.storage.write = async (...args) => {
+        if (args[1] === "blocked_egress.index.v1") throw new Error("index unavailable");
+        return write(...args);
+      };
+      expect(bridge.ingestBlockedEgress(receipt(`failed-${cycle}`))).not.toBeNull();
+      await expect(ledger.settled()).rejects.toThrow("index unavailable");
+      expect(ledger.stats().state).toBe("state_FAILED");
+      r.storage.write = write;
+      expect(bridge.ingestBlockedEgress(receipt(`recovery-${cycle}`))).toBeNull();
+      // Waiting only on the ledger lets automatic recovery commit without a bridge flush, snapshot or rehydrate.
+      await ledger.settled();
+      expect(ledger.stats().state).toBe("state_READY");
+      const queried = bridge.queryInbox({ source_class: "blocked_egress" });
+      const raw = rawBlockedEntries(bridge);
+      const committed = ledger.retained();
+      process.stdout.write(`RECOVERY_COUNTER ${JSON.stringify({ cycle: cycle + 1, queried: queried.length, raw: raw.length, committed: committed.length, cap: HUB_BLOCKED_EGRESS_FORTRESS_MAX })}\n`);
+      expect(sortedEntries(queried)).toEqual(sortedEntries(committed));
+      expect(sortedEntries(raw)).toEqual(sortedEntries(committed));
+      expect(raw.length).toBeLessThanOrEqual(HUB_BLOCKED_EGRESS_FORTRESS_MAX);
+      expect(committed.map(e => e.inbox_id)).toEqual([control.inbox_id]);
+      expect(bridge.get(approval.inbox_id)).toEqual(approval);
+    }
+  });
+
+  it.each(["query", "count", "get", "resolve", "unsnooze", "archive", "dismiss", "snooze", "delete", "scheduler", "snapshot", "list", "size", "flush", "rehydrate", "ingest", "approval"])(
+    "reconciles committed recovery records before %s and leaves unchanged generations unscanned", async operation => {
+      const r = await workflowRig();
+      const ledger = await failBridgeWrite(r);
+      const ghost = rawBlockedEntries(r.bridge).find(e => e.source_event_id === "unsettled")!;
+      await ledger.restore();
+      const retained = vi.spyOn(ledger, "retained");
+      switch (operation) {
+        case "query": r.bridge.queryInbox(); break;
+        case "count": r.bridge.countInbox(); break;
+        case "get": r.bridge.get(ghost.inbox_id); break;
+        case "resolve": r.bridge.resolve(ghost.inbox_id, "operator"); break;
+        case "unsnooze": r.bridge.unsnooze(ghost.inbox_id); break;
+        case "archive": r.bridge.archiveBatch([ghost.inbox_id]); break;
+        case "dismiss": r.bridge.dismissBatch([ghost.inbox_id]); break;
+        case "snooze": r.bridge.snoozeBatch([ghost.inbox_id], iso(NOW + 1)); break;
+        case "delete": r.bridge.deleteBatch([ghost.inbox_id]); break;
+        case "scheduler": new UnifiedInboxScheduler({ bridge: r.bridge, now: r.clock }).tick(); break;
+        case "snapshot": r.bridge.blockedEgressSnapshot(); break;
+        case "list": r.bridge.list(); break;
+        case "size": r.bridge.size(); break;
+        case "flush": await r.bridge.flushPersistence(); break;
+        case "rehydrate": await r.bridge.rehydratePendingFromStore(); break;
+        case "ingest": r.bridge.ingestBlockedEgress({ source_event_id: "fresh", destination_category: "custom", block_reason_class: "other", observed_at: iso(NOW) }); break;
+        case "approval": r.bridge.ingestApproval({ source_event_id: "fresh-approval", summary: "Approval", severity: "warn", observed_at: iso(NOW) }); break;
+      }
+      expect(sortedEntries(rawBlockedEntries(r.bridge))).toEqual(sortedEntries(ledger.retained()));
+      r.bridge.queryInbox(); // Catch up if this operation itself committed a new generation.
+      retained.mockClear();
+      r.bridge.countInbox(); r.bridge.get(r.ids[0]!); r.bridge.queryInbox();
+      expect(retained).not.toHaveBeenCalled();
+      retained.mockRestore();
+      await ledger.settled();
+    },
+  );
+
+  it("refuses an oversized resolver identity before changing memory or durable bytes and stays READY", async () => {
+    const r = await workflowRig();
+    const ledger = bridgeInternals(r.bridge).blockedAdmissions;
+    const id = r.ids[0]!;
+    const before = structuredClone(ledger.retained());
+    const cached = structuredClone(rawBlockedEntries(r.bridge));
+    const durable = await r.memory.read(UNIFIED_INBOX_NAMESPACE, `entry.${id}`);
+    const stats = ledger.stats(); const generation = ledger.committedGeneration; const calls = { ...r.calls };
+    const resolver = "x".repeat(BLOCKED_EGRESS_ENTRY_MAX_BYTES);
+    expect(ledger.update({ ...r.bridge.get(id)!, resolved_by: resolver })).toEqual({ kind: "refused", reason: "oversize" });
+    expect(r.bridge.resolve(id, resolver)).toBeNull();
+    expect(ledger.retained()).toEqual(before);
+    expect(rawBlockedEntries(r.bridge)).toEqual(cached);
+    expect(ledger.stats()).toEqual(stats); expect(ledger.stats().state).toBe("state_READY");
+    expect(ledger.committedGeneration).toBe(generation);
+    await ledger.settled(); expect(r.calls).toEqual(calls);
+    expect(await r.memory.read(UNIFIED_INBOX_NAMESPACE, `entry.${id}`)).toEqual(durable);
+    const refusals = await r.auditLog.query({ operation_type: UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED });
+    expect(refusals.entries.map(e => e.details)).toEqual([{ reason: "oversize" }]);
+  });
+
+  it("refuses workflow growth beyond the retained byte budget while evictions remain unsettled", async () => {
+    const r = rig(); const a = r.admissions; await a.restore();
+    const large = (subject: string, seq: number) => {
+      const c = candidate(subject, seq);
+      c.entry.summary = "x".repeat(3200); // Leaves room for metadata/admission within the 4 KiB non-proof allowance.
+      return c;
+    };
+    for (let i = 0; i < HUB_BLOCKED_EGRESS_FORTRESS_MAX; i++) {
+      admit(a, large(`origin${Math.floor(i / BLOCKED_EGRESS_ORIGIN_MAX)}`, i)); await a.settled();
+    }
+    const gate = deferred(); const write = r.storage.write;
+    r.storage.write = async (...args) => { await gate.promise; return write(...args); };
+    const refusedIds: string[] = [];
+    try {
+      for (let i = 0; i < BLOCKED_EGRESS_RESERVATIONS_MAX; i++) {
+        const result = a.admit(large(`replacement${i}`, i));
+        if (result.kind === "refused") {
+          expect(result.reason).toBe("capacity");
+          break;
+        }
+        expect(result.kind).toBe("admitted");
+      }
+      expect(a.stats().reservations).toBeGreaterThan(0);
+      for (const entry of a.retained()) {
+        const next = { ...entry, resolved_by: "" };
+        const overhead = Buffer.byteLength(JSON.stringify(next)) + BLOCKED_EGRESS_PROOF_RESERVE_BYTES;
+        next.resolved_by = "x".repeat(BLOCKED_EGRESS_ENTRY_MAX_BYTES - overhead);
+        const growth = BLOCKED_EGRESS_ENTRY_MAX_BYTES - entry.blocked_egress_admission!.encoded_bytes;
+        const before = a.stats(); const generation = a.committedGeneration;
+        const exceeds = before.encodedBytes + growth > BLOCKED_EGRESS_RETAINED_MAX_BYTES;
+        const result = a.update(next);
+        expect(result).toEqual(exceeds ? { kind: "refused", reason: "capacity" } : { kind: "applied" });
+        if (exceeds) {
+          refusedIds.push(entry.inbox_id);
+          expect(a.stats()).toEqual(before); expect(a.committedGeneration).toBe(generation);
+          expect(a.retained().find(e => e.inbox_id === entry.inbox_id)).toEqual(entry);
+        }
+        expect(a.stats().state).toBe("state_READY");
+        expect(a.stats().encodedBytes).toBeLessThanOrEqual(BLOCKED_EGRESS_RETAINED_MAX_BYTES);
+      }
+      expect(refusedIds.length).toBeGreaterThan(0);
+    } finally { gate.resolve(); await a.settled(); }
+    for (const id of refusedIds) expect((await r.store.get(id))?.resolved_by).toBeUndefined();
+  });
+
+  async function failBridgeWrite(r: Awaited<ReturnType<typeof workflowRig>>) {
+    const write = r.storage.write;
+    r.storage.write = async (...args) => {
+      if (args[1] === "blocked_egress.index.v1") throw new Error("index unavailable");
+      return write(...args);
+    };
+    expect(r.bridge.ingestBlockedEgress({ source_event_id: "unsettled", destination_category: "custom", block_reason_class: "other", observed_at: r.clock().toISOString() })).not.toBeNull();
+    const ledger = bridgeInternals(r.bridge).blockedAdmissions;
+    await expect(ledger.settled()).rejects.toThrow("index unavailable");
+    expect(ledger.stats().state).toBe("state_FAILED");
+    r.storage.write = write;
+    return ledger;
+  }
+
+  it("audits forty due snoozed cards once across five FAILED scheduler ticks and resets on READY", async () => {
+    const r = await workflowRig();
+    const until = iso(NOW + 1); // One injected millisecond makes every snooze due together.
+    expect(r.bridge.snoozeBatch(r.ids, until).affected).toBe(r.ids.length);
+    await r.bridge.flushPersistence(); r.advance(1);
+    const ledger = await failBridgeWrite(r);
+    const scheduler = new UnifiedInboxScheduler({ bridge: r.bridge, now: r.clock });
+    const ticks = 5; // Acceptance schedule: five repeated ticks in one FAILED episode.
+    for (let tick = 0; tick < ticks; tick++) expect(scheduler.tick()).toBe(0);
+    const refusals = () => r.auditLog.query({ operation_type: UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED, limit: HUB_BLOCKED_EGRESS_FORTRESS_MAX });
+    const firstEpisode = await refusals();
+    process.stdout.write(`REFUSAL_COUNTER ${JSON.stringify({ cards: r.ids.length, ticks, attempts: r.ids.length * ticks, audits: firstEpisode.total })}\n`);
+    expect(firstEpisode.entries.map(e => e.details)).toEqual([{ reason: "not_ready" }]);
+    // A complete READY restore ends the episode even when no workflow succeeds between failures.
+    await ledger.restore(); await failBridgeWrite(r);
+    for (let tick = 0; tick < ticks; tick++) expect(scheduler.tick()).toBe(0);
+    expect((await refusals()).entries).toHaveLength(2); // One audit for each of the two episodes.
+  });
+
+  it("counts refused blocked dismissals as skipped while the approval is affected", async () => {
+    const r = await workflowRig(); await failBridgeWrite(r);
+    const before = r.ids.map(id => r.bridge.get(id));
+    const result = r.bridge.dismissBatch([...r.ids, r.approval.inbox_id]);
+    expect(result.affected).toBe(1);
+    expect(result.missing).toEqual([]);
+    expect(result.skipped).toEqual(r.ids);
+    expect(result.requested).toBe(r.ids.length + 1);
+    expect(r.bridge.get(r.approval.inbox_id)?.state).toBe("dismissed");
+    expect(r.ids.map(id => r.bridge.get(id))).toEqual(before);
+    const refusals = await r.auditLog.query({ operation_type: UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED });
+    expect(refusals.entries.map(e => e.details)).toEqual([{ reason: "not_ready" }]);
+  });
+
+  it("counts only deleted ids and their states in retention sweeps with blocked refusals", async () => {
+    const r = await workflowRig();
+    const [archived, ...dismissed] = r.ids;
+    r.bridge.archiveBatch([archived!]);
+    r.bridge.dismissBatch([...dismissed, r.approval.inbox_id]);
+    await r.bridge.flushPersistence(); await failBridgeWrite(r);
+    const policy = new UnifiedInboxRetentionPolicy([
+      { source_class: "blocked_egress", state: "archived", retain_for_days: 0 },
+      { source_class: "blocked_egress", state: "dismissed", retain_for_days: 0 },
+      { source_class: "approval", state: "dismissed", retain_for_days: 0 },
+    ]);
+    const sweep = () => sweepUnifiedInboxRetention({ bridge: r.bridge, policy, auditLog: r.auditLog, identityId: FORTRESS, fortressId: FORTRESS, now: r.clock() });
+    expect(await sweep()).toEqual({ fortress_id: FORTRESS, deleted: 1, archived_deleted: 0, dismissed_deleted: 1, skipped: r.ids.length });
+    expect(await sweep()).toEqual({ fortress_id: FORTRESS, deleted: 0, archived_deleted: 0, dismissed_deleted: 0, skipped: r.ids.length });
+    const refusals = () => r.auditLog.query({ operation_type: UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED });
+    expect((await refusals()).entries).toHaveLength(1);
+    // Each of the other workflow classes has its own single refusal in the same ledger episode.
+    for (const id of r.ids) { r.bridge.resolve(id, "operator"); r.bridge.dismissBatch([id]); }
+    expect((await refusals()).entries).toHaveLength(3); // Sweep, resolve and batch each emit once.
+    expect(r.bridge.get(r.approval.inbox_id)).toBeNull();
   });
 
 });
