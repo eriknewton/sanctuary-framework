@@ -670,3 +670,92 @@ export async function assertHermesYamlParseParity(
     );
   }
 }
+
+// Must match HermesPostureView in hermes-yaml.ts; both documents are checked in one process.
+const PYYAML_POSTURE_PROGRAM = `
+import sys
+sys.path = [p for p in sys.path if p.startswith('/')]
+try:
+    import yaml
+except ImportError:
+    sys.exit(20)
+import json, copy
+try:
+    request = json.load(sys.stdin)
+    def document(text):
+        value = yaml.safe_load(text or '')
+        if value is None: return {}
+        if not isinstance(value, dict): raise ValueError('document shape')
+        return value
+    def check(text, facts):
+        value = document(text)
+        if list(value) != facts['top']: raise ValueError('top-level disagreement')
+        for name, keys in facts['children'].items():
+            block = value.get(name) or {}
+            if not isinstance(block, dict) or list(block) != keys: raise ValueError('child disagreement')
+        for path, raw in facts['raw'].items():
+            name, key = path.split('.')
+            block = value.get(name) or {}
+            if raw is None:
+                if key in block: raise ValueError('field disagreement')
+            else:
+                expected = yaml.safe_load(raw)
+                if key not in block or block[key] != expected[key]: raise ValueError('value disagreement')
+        plugins = value.get('plugins') or {}
+        if (plugins.get('enabled') or []) != facts['enabled']: raise ValueError('enabled disagreement')
+        if (plugins.get('disabled') or []) != facts['disabled']: raise ValueError('disabled disagreement')
+        if list((value.get('mcp_servers') or {})) != facts['mcp']: raise ValueError('MCP disagreement')
+        if (value.get('tool_loop_guardrails') or {}).get('hard_stop_enabled', False): raise ValueError('hard stop enabled')
+        return value
+    before = check(request['before'], request['beforeFacts'])
+    after = check(request['after'], request['afterFacts'])
+    if not request['install']:
+        original = document(request['original'])
+        for name in ['memory', 'plugins']:
+            # Presence is meaningful: Hermes defaults apply only when a created block is removed.
+            if name not in original and name in after and (after[name] is None or after[name] == {}):
+                raise ValueError('created empty block remains')
+    if request['install']:
+        memory = after.get('memory') or {}
+        if memory.get('provider') != 'sanctuary_memory' or memory.get('memory_enabled') is not False or memory.get('user_profile_enabled') is not False: raise ValueError('planned settings')
+        if 'sanctuary' not in (after.get('plugins') or {}).get('enabled', []): raise ValueError('planned plugin')
+        if 'sanctuary' in (after.get('mcp_servers') or {}): raise ValueError('planned MCP')
+    def unmanaged(value):
+        value = copy.deepcopy(value)
+        for block, keys in {'memory': ['provider','memory_enabled','user_profile_enabled'], 'plugins': ['enabled'], 'mcp_servers': ['sanctuary']}.items():
+            nested = value.get(block) or {}
+            if not isinstance(nested, dict): raise ValueError('mapping shape')
+            for key in keys: nested.pop(key, None)
+            if nested: value[block] = nested
+            else: value.pop(block, None)
+        return value
+    if unmanaged(before) != unmanaged(after): raise ValueError('unrelated values changed')
+    print(json.dumps({'ok': True}))
+except Exception as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(21)
+`;
+
+/** Validate scanner facts and the complete edit through the same real parser. */
+export async function assertHermesPostureParseParity(
+  before: string | null,
+  after: string | null,
+  beforeFacts: import("./hermes-yaml.js").HermesPostureView,
+  afterFacts: import("./hermes-yaml.js").HermesPostureView,
+  install: boolean,
+  original: string | null,
+  options: ParseParityOptions = {},
+): Promise<void> {
+  const candidates = options.pythonPath !== undefined ? [options.pythonPath] : hermesParityPythonCandidates();
+  const timeoutMs = options.timeoutMs ?? 5000; // Same five-second parser deadline as MCP parity.
+  const exec = options.exec ?? defaultSidecarExec;
+  for (const candidate of candidates) {
+    const result = await exec(candidate, ["-E", "-c", PYYAML_POSTURE_PROGRAM], JSON.stringify({ before, after, beforeFacts, afterFacts, install, original }), timeoutMs);
+    if (result.code === null || result.code === PYYAML_EXIT.IMPORT_MISSING) continue;
+    if (result.code !== 0 || result.stdout.trim() !== '{"ok": true}') {
+      throw new HermesYamlParityRefusedError("disagreement", "memory posture or planned bytes do not agree with PyYAML");
+    }
+    return;
+  }
+  throw new HermesYamlParityRefusedError("sidecar-unavailable", "PyYAML is unavailable for memory posture validation");
+}
