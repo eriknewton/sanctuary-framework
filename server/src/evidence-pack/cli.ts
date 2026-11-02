@@ -950,7 +950,7 @@ export async function readDaemonStore(
     };
   }
   try {
-    const daemonLog = createDaemonAuditLog(storage, masterKey);
+    const daemonLog = createDaemonAuditLog(storage, masterKey, { readOnly: true });
     // Default strict integrity mode: a daemon-store tamper makes query() throw
     // AuditIntegrityError, distinguished below from an access failure.
     const { entries, total } = await daemonLog.query({ limit: 1_000_000 });

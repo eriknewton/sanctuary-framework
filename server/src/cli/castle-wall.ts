@@ -3207,7 +3207,11 @@ export async function runSafeModeDaemon(
   const auditLog = new AuditLog(
     auditStorage,
     safeModeAuditKey,
-    fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+    {
+      // Role must match the trusted role union in operational/audit-log.ts.
+      chainWriterRole: "boot_token",
+      ...(fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : {}),
+    },
   );
 
   // 3. Helper signer is mandatory in safe mode.
@@ -3567,6 +3571,7 @@ async function collectDaemonCastleWallEntries(
   }
   try {
     const daemonLog = createDaemonAuditLog(storage, masterKey, {
+      readOnly: true,
       integrityMode: "lenient",
     });
     const q = await daemonLog.query(queryOpts);

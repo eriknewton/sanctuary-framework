@@ -19,6 +19,10 @@
  * plain `query()`. The chokepoint is what re-verifies the sealed region and
  * turns the surfaces honest.
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -109,7 +113,7 @@ async function migratedFortressWithSurface() {
   await auditLog.flush();
 
   // Seal the prefix behind the boundary.
-  await migrateFortressAuditStoreSplit({ storage, masterKey });
+  await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
   // Intact post-split suffix (writes a suffix head anchor + a searchable row).
   await callTool(facadeTools, "sanctuary_remember", { key: "suffix_key", value: "suffix-value" });
@@ -170,3 +174,11 @@ describe("F2 BLOCKER-1: no clean-claiming surface reports a false green over a t
     expect(JSON.stringify(search)).not.toContain("verified_against_audit_chain");
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

@@ -272,6 +272,10 @@ export interface AuditLogConfig {
    * verb, whose no-mutation contract covers the whole fortress directory.
    */
   readOnly?: boolean;
+  /** Trusted construction-time writer principal; custody options do not grant authority. */
+  chainWriterRole?: "operator" | "root_daemon" | "boot_token";
+  /** Test-only authority identity; never changes the master barrier identity. */
+  __testAuditAuthorityUid?: () => number;
   /**
    * F2 Option A (fortress audit store split by writer): whether this
    * instance's load path should consult the on-disk "split boundary" record
@@ -1403,6 +1407,27 @@ export class AuditPersistenceError extends Error {
   }
 }
 
+/** A chain writer was refused before any namespace, anchor, checkpoint or lock mutation. */
+export class AuditWriterAuthorityError extends AuditPersistenceError {
+  constructor(role: AuditWriterRole, uid: number | undefined, ownerUid: number | undefined, reason: string) {
+    super(`audit writer role ${role}, authority uid ${uid}, required owner uid ${ownerUid}: ${reason}`, "permission_denied");
+    this.name = "AuditWriterAuthorityError";
+  }
+}
+
+type AuditWriterRole = NonNullable<AuditLogConfig["chainWriterRole"]>;
+const auditWriterRoleTestUids = new Map<"root_daemon" | "boot_token", number>();
+
+/** Simulate a privileged chain writer in fixtures; the operator role cannot be overridden here. */
+export function __testSetAuditWriterUidForRole(role: "root_daemon" | "boot_token", uid: number | undefined): void {
+  if (uid === undefined) auditWriterRoleTestUids.delete(role);
+  else auditWriterRoleTestUids.set(role, uid);
+}
+
+type AuditStaleLockDecision =
+  | { verdict: "absent" | "in_progress" }
+  | { verdict: "stale"; reason: "proven_stale" | "self_held_stale_forced_release"; proven: Stats; heldForMs?: number; holderPid?: number };
+
 export class AuditLockContentionError extends Error {
   constructor(readonly lockPath: string) {
     super(
@@ -2205,6 +2230,8 @@ export class AuditLog {
   private readonly integrityMode: "strict" | "lenient";
   /** See {@link AuditLogConfig.readOnly}. */
   private readonly readOnly: boolean;
+  private readonly chainWriterRole: AuditWriterRole;
+  private readonly testAuditAuthorityUid?: () => number;
   private readonly checkpointInterval: number;
   private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
@@ -2391,6 +2418,9 @@ export class AuditLog {
     // makes an instance read-only, so no production composition root can be
     // silently demoted by a forgotten field.
     this.readOnly = config?.readOnly ?? false;
+    // Role literals must match createDaemonAuditLog in audit-store-split.ts and the boot constructors in cli/castle-wall.ts, cli/castle-wall-boot.ts and cli/castle-wall-observe.ts.
+    this.chainWriterRole = config?.chainWriterRole ?? "operator";
+    this.testAuditAuthorityUid = config?.__testAuditAuthorityUid;
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
     // IC-05 enforcement site (AGENTS.md assurance rule 3): the checkpoint
@@ -3127,9 +3157,10 @@ export class AuditLog {
         // Hold the raw sized array, assert the lease, check raw-empty against
         // the append hold's raw snapshot, then filter by the floor. Cooperating
         // pruning keeps one survivor; a boundary transition empties only the
-        // filtered population. Empty here is a listing fault, not an empty store;
-        // list can collapse on directory or per-file stat ENOENT, without telling
-        // us which. A shorter nonempty view is an ordinary cross-hold prune.
+        // filtered population. An empty recount reflects a missing directory,
+        // a successful enumeration with no matching entries, or every listed
+        // candidate vanishing during metadata reads; one vanished candidate
+        // no longer discards the survivors.
         recountPending = true;
         const rawMetas = await this.storage.list(AUDIT_NAMESPACE);
         this.assertAuditWriteLockActive(signal);
@@ -3781,7 +3812,8 @@ export class AuditLog {
     }
 
     if (hasLegacyEntries && !hasChainedEntries && highestChainedSeq > 0) {
-      await this.writeHeadAnchor(highestChainedSeq, highestChainedHash);
+      // Only the chain's authorized writer may turn a legacy read into a durable head.
+      if (await this.mayMutateAuditChain()) await this.writeHeadAnchor(highestChainedSeq, highestChainedHash);
       return;
     }
 
@@ -4640,10 +4672,17 @@ export class AuditLog {
           : "";
       return code !== "ENOENT" && code !== "ENOTDIR";
     }
-    if (await this.breakStaleAuditLock(this.auditWriteLockPath)) {
-      return false;
+    const decision = await this.decideStaleAuditLock(this.auditWriteLockPath);
+    if (decision.verdict === "absent") return false;
+    if (decision.verdict !== "stale") return true;
+    // Readers retain the identity check but never remove a writer's lock evidence.
+    try {
+      const current = await stat(this.auditWriteLockPath);
+      return current.dev !== decision.proven.dev || current.ino !== decision.proven.ino;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
     }
-    return true;
   }
 
   private auditLockHoldDeadlineError(): AuditLockHoldDeadlineError {
@@ -4767,6 +4806,76 @@ export class AuditLog {
     }
   }
 
+  private auditAuthorityUid(): number | undefined {
+    return this.testAuditAuthorityUid?.() ??
+      (this.chainWriterRole !== "operator" ? auditWriterRoleTestUids.get(this.chainWriterRole) : undefined) ??
+      process.getuid?.();
+  }
+
+  private async assertAuditWriterAuthority(): Promise<void> {
+    const uid = this.auditAuthorityUid();
+    let requiredOwnerUid: number | undefined = this.chainWriterRole === "operator" ? undefined : 0;
+    const refuse = (reason: string): never => {
+      throw new AuditWriterAuthorityError(this.chainWriterRole, uid, requiredOwnerUid, reason);
+    };
+    if (this.chainWriterRole !== "operator" && uid !== 0) refuse("this chain requires root");
+    if (!this.filesystemCapabilities) return;
+    const directory = async (path: string): Promise<Stats | undefined> => {
+      let identity: Stats;
+      try {
+        // This exact pattern must match descriptorRoot and descriptorNamespace in storage/filesystem.ts; only an fd-pinned directory may be followed.
+        identity = /^\/proc\/self\/fd\/\d+$/.test(path) ? await stat(path) : await lstat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        return refuse(`cannot establish directory identity at ${path}`);
+      }
+      if (identity.isSymbolicLink() || !identity.isDirectory()) refuse(`not a plain directory: ${path}`);
+      return identity;
+    };
+    const storageRoot = dirname(this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE));
+    if (storageRoot === "/proc/self/fd") refuse("the audit namespace cannot be the bound locked namespace");
+    const rootIdentity = await directory(storageRoot);
+    let metaIdentity: Stats | undefined;
+    for (const namespace of [AUDIT_NAMESPACE, AUDIT_CHECKPOINT_NAMESPACE, AUDIT_META_NAMESPACE]) {
+      const identity = await directory(this.filesystemCapabilities.namespacePath(namespace));
+      if (namespace === AUDIT_META_NAMESPACE) metaIdentity = identity;
+    }
+    if (this.chainWriterRole !== "operator") return;
+    // The owner-directory rule must match resolveMasterBarrierCoordinates in storage/cross-process-lock.ts: existing _meta owns the operator chain.
+    const owner = metaIdentity ?? rootIdentity;
+    if (owner) {
+      requiredOwnerUid = owner.uid;
+      if (uid !== requiredOwnerUid) refuse("operator chain owner does not match writer");
+      return;
+    }
+    // Must match the 16-hop ceiling in verifyOrRepairNamespaceDirOwnership; absent-root admission never walks without a bound.
+    const MAX_AUTHORITY_ANCESTOR_WALK = 16;
+    let ancestor = dirname(storageRoot);
+    for (let depth = 0; depth < MAX_AUTHORITY_ANCESTOR_WALK; depth++) {
+      const identity = await directory(ancestor);
+      if (identity) {
+        requiredOwnerUid = uid === 0 ? 0 : uid;
+        if (uid === undefined || (uid === 0 && identity.uid !== 0)) refuse("absent storage requires an authorized ancestor");
+        return;
+      }
+      const parent = dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+    refuse("no directory identity within the ancestor bound");
+  }
+
+  private async mayMutateAuditChain(): Promise<boolean> {
+    if (this.readOnly) return false;
+    try {
+      await this.assertAuditWriterAuthority();
+      return true;
+    } catch (error) {
+      if (error instanceof AuditWriterAuthorityError) return false;
+      throw error;
+    }
+  }
+
   private async withAuditWriteLock<T>(
     operation: (signal: AuditWriteLockAbortSignal) => Promise<T>
   ): Promise<T> {
@@ -4785,6 +4894,8 @@ export class AuditLog {
           "reach any audit write"
       );
     }
+    // AuditLog chain entry, anchor, checkpoint and lock writes have one authorized writer principal per chain so A1b's per-uid guard can serialize breakers.
+    await this.assertAuditWriterAuthority();
     const signal: AuditWriteLockAbortSignal = { aborted: false };
     if (!this.auditWriteLockPath) return operation(signal);
 
@@ -5195,7 +5306,7 @@ export class AuditLog {
    * destroy the audit log directly; this fallback is an availability aid for
    * honest torn acquires, not a defense against a uid-level adversary.
    */
-  private async breakStaleAuditLock(lockPath: string): Promise<boolean> {
+  private async decideStaleAuditLock(lockPath: string): Promise<AuditStaleLockDecision> {
     // Capture the identity + metadata AND the content of the EXACT file we are
     // about to reason about from a SINGLE open file descriptor: `fstat` + read
     // on one fd is a consistent snapshot, so the metadata (inode, size, mtime)
@@ -5216,8 +5327,8 @@ export class AuditLog {
           : "";
       // Vanished: another writer released it; retry. Otherwise (e.g. EACCES):
       // cannot inspect, cannot prove stale.
-      if (code === "ENOENT") return true;
-      return false;
+      if (code === "ENOENT") return { verdict: "absent" };
+      return { verdict: "in_progress" };
     }
     try {
       proven = await handle.stat();
@@ -5227,8 +5338,8 @@ export class AuditLog {
         err instanceof Error && "code" in err
           ? String((err as NodeJS.ErrnoException).code)
           : "";
-      if (code === "ENOENT") return true;
-      return false;
+      if (code === "ENOENT") return { verdict: "absent" };
+      return { verdict: "in_progress" };
     } finally {
       await handle.close().catch(() => undefined);
     }
@@ -5290,7 +5401,7 @@ export class AuditLog {
     // Checked BEFORE any pid-liveness "protect" path so a reused-alive pid can
     // never keep a reboot orphan intact. Rows A/B of the acceptance table.
     if (bootIdentityDifferentBoot) {
-      return this.unlinkIfSameInode(lockPath, proven);
+      return { verdict: "stale", reason: "proven_stale", proven };
     }
 
     const currentUptime = currentUptimeMs();
@@ -5322,7 +5433,7 @@ export class AuditLog {
         // those sources return undefined.
         if (lockUptimeMs !== undefined && ourStartUptime !== undefined) {
           if (lockUptimeMs < ourStartUptime - AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS) {
-            return this.unlinkIfSameInode(lockPath, proven);
+            return { verdict: "stale", reason: "proven_stale", proven };
           }
           // Mini2 2026-08-02 freeze recovery edge (finding 2026-08-03): with
           // the hold deadline above, this process should never leave its own
@@ -5337,29 +5448,19 @@ export class AuditLog {
               this.selfHeldStaleLockMs + AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS
             ) {
               const roundedHeldForMs = Math.max(0, Math.round(heldForMs));
-              // SAFETY: forced lock recovery must be loud on operator-facing
-              // stderr BEFORE any other handling (AGENTS.md constraint 5).
-              console.error(
-                `[audit-log] AUDIT-WRITE-LOCK-RECOVERY reason=self_held_stale_forced_release ` +
-                  `lock=${lockPath} held_for_ms=${roundedHeldForMs} pid=${holderPid}`,
-              );
-              this.recordWriteLockRecoveryEvent({
-                reason: "self_held_stale_forced_release",
-                lockPath,
-              });
-              return this.unlinkIfSameInode(lockPath, proven);
+              return { verdict: "stale", reason: "self_held_stale_forced_release", proven, heldForMs: roundedHeldForMs, holderPid };
             }
           }
-          return false;
+          return { verdict: "in_progress" };
         }
       } else if (isProcessAlive(holderPid)) {
         // A live FOREIGN holder that PROVABLY stamped this boot → legitimate
         // contention. Protect it from the wall-clock `predatesBoot` proof below,
         // which a forward clock step could otherwise use to break this live lock.
-        return false;
+        return { verdict: "in_progress" };
       } else {
         // Foreign holder, proven same boot, NOT alive → same-boot crash orphan.
-        return this.unlinkIfSameInode(lockPath, proven);
+        return { verdict: "stale", reason: "proven_stale", proven };
       }
     }
 
@@ -5403,14 +5504,14 @@ export class AuditLog {
     // would otherwise refuse to break a genuinely orphaned lock (Codex re-gate,
     // 2026-07-15).
     if (predatesBoot || reusedSelfPidOrphan) {
-      return this.unlinkIfSameInode(lockPath, proven);
+      return { verdict: "stale", reason: "proven_stale", proven };
     }
 
     // Our OWN live lock (our pid, stamped at/after our start): never break it.
-    if (holderPid === process.pid) return false;
+    if (holderPid === process.pid) return { verdict: "in_progress" };
 
     if (holderPid !== undefined && !isProcessAlive(holderPid)) {
-      return this.unlinkIfSameInode(lockPath, proven);
+      return { verdict: "stale", reason: "proven_stale", proven };
     }
 
     // 0-byte fallback: a genuinely EMPTY lock carries no id to prove liveness
@@ -5425,11 +5526,27 @@ export class AuditLog {
       const exceedsIdlessAgeBound =
         Date.now() - mtimeMs > this.idlessStaleLockMs;
       if (mtimePredatesBoot || exceedsIdlessAgeBound) {
-        return this.unlinkIfSameInode(lockPath, proven);
+        return { verdict: "stale", reason: "proven_stale", proven };
       }
     }
 
-    return false;
+    return { verdict: "in_progress" };
+  }
+
+  private async breakStaleAuditLock(lockPath: string): Promise<boolean> {
+    const decision = await this.decideStaleAuditLock(lockPath);
+    if (decision.verdict === "absent") return true;
+    if (decision.verdict !== "stale") return false;
+    if (decision.reason === "self_held_stale_forced_release") {
+      // SAFETY: forced lock recovery must be loud on operator-facing stderr (AGENTS.md
+      // constraint 5); reporting belongs to the removal path, so a reader never claims a release.
+      console.error(
+        `[audit-log] AUDIT-WRITE-LOCK-RECOVERY reason=self_held_stale_forced_release ` +
+          `lock=${lockPath} held_for_ms=${decision.heldForMs} pid=${decision.holderPid}`,
+      );
+      this.recordWriteLockRecoveryEvent({ reason: decision.reason, lockPath });
+    }
+    return this.unlinkIfSameInode(lockPath, decision.proven);
   }
 
   private async freshenChainStateFromDisk(signal: AuditWriteLockAbortSignal): Promise<string[]> {
@@ -6024,6 +6141,8 @@ export class AuditLog {
       sealedTipSequence
     );
     if (existing.length === 0) {
+      // Observing legacy bytes does not grant authority to seed their trust anchor.
+      if (!await this.mayMutateAuditChain()) return;
       await this.writeCheckpointRecord({
         checkpoint_kind: "legacy-anchor",
         checkpoint_sequence: legacyCount,
@@ -6831,6 +6950,7 @@ export class AuditLog {
     // from a complete enumeration that is also coverage-finding-free; a
     // partial enumeration may raise findings but may never stamp state.
     if (enumerationComplete && !indeterminate) {
+      const mayMutate = await this.mayMutateAuditChain();
       const hasSignedEvidence = verified.size > 0;
       const latchRecoveryDue = latch.status === "absent" && hasSignedEvidence;
       const headRecoveryDue =
@@ -6846,7 +6966,7 @@ export class AuditLog {
           // The finding's message must describe what THIS instance actually
           // does: a read-only load observes the condition and writes nothing,
           // so it must not claim a marker was latched or a floor re-armed.
-          message: this.readOnly
+          message: !mayMutate
             ? "signed checkpoints exist but the signing latch is absent (a swallowed " +
               "first write, or a deletion); this read-only load records the " +
               "observation only and performs no recovery writes"
@@ -6863,7 +6983,7 @@ export class AuditLog {
         findings.push({
           kind: "checkpoint_signing_head_recovered",
           // Same truthfulness rule as the latch finding above.
-          message: this.readOnly
+          message: !mayMutate
             ? "the signing head is absent while signing evidence survives (deletion, or a " +
               "loudly-diagnosed ensure failure); this read-only load records the " +
               "observation only and performs no recovery writes"
@@ -6890,7 +7010,7 @@ export class AuditLog {
       // stop it here — before `withAuditWriteLock`'s raw-filesystem preamble,
       // which no storage-level guard can see. The findings above still
       // surface the condition; only the writes are subtracted.
-      if ((latchRecoveryDue || headRecoveryDue || selfHealDue) && !this.readOnly) {
+      if ((latchRecoveryDue || headRecoveryDue || selfHealDue) && mayMutate) {
         await this.performSigningRecoveryWrites({
           latchRecoveryDue,
           headRecoveryDue,
@@ -7845,6 +7965,8 @@ export class AuditLog {
       }
     }
 
+    // Subscriber delivery is observational; persisting an alert requires chain authority.
+    if (!await this.mayMutateAuditChain()) return;
     await this.writeIntegrityAlertLog(event).catch(() => {
       // The caller still gets AuditIntegrityError in strict mode.
     });

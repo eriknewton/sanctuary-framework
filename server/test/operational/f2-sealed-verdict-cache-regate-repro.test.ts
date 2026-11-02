@@ -20,6 +20,10 @@
  * the SAME instance now returns `findings`. Against the pre-fix metadata
  * fingerprint this test fails (stale `verified` from cache); post-fix it passes.
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { mkdtemp, open, readdir, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -64,7 +68,7 @@ async function migratedFortress() {
   await auditLog.flush();
 
   // Seal the prefix behind the boundary.
-  await migrateFortressAuditStoreSplit({ storage, masterKey });
+  await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
   // Intact post-split suffix so the routine chain is clean.
   await auditLog.appendCritical({
@@ -154,3 +158,11 @@ describe("F2 sealed-verdict cache: a stale `verified` does not survive a size+mt
     expect(fresh.sealed_region.status).toBe("hash_mismatch");
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

@@ -1,3 +1,6 @@
+// fail-before-exempt: A1a boot_token fixture runs simulate authority only during the root run and reset before reader assertions.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
 import { afterEach, describe, expect, it } from "vitest";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -5,7 +8,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import {
-  runSafeModeDaemon,
+  runSafeModeDaemon as production_runSafeModeDaemon,
   type CastleWallCommandContext,
 } from "../../src/cli/castle-wall.js";
 import type { MacOSCastleWallDaemonInput } from "../../src/castle-wall/runtime/macos-daemon.js";
@@ -301,3 +304,10 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
     expect(statFailErr.text()).toContain("could not resolve the fortress owner");
   });
 });
+
+async function runSafeModeDaemon(...args: Parameters<typeof production_runSafeModeDaemon>): ReturnType<typeof production_runSafeModeDaemon> {
+  __testSetAuditWriterUidForRole("boot_token", 0);
+  try { return await production_runSafeModeDaemon(...args); }
+  finally { __testSetAuditWriterUidForRole("boot_token", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("boot_token", undefined));

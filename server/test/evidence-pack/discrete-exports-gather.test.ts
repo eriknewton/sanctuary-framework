@@ -17,6 +17,10 @@
  *     config-absent-yet-receipts-present (inconsistent) state must be a
  *     read_failed, never a false "not enabled". Uses temp dirs, never host state.
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -60,7 +64,7 @@ async function splitFortress() {
     result: "success",
   });
   await auditLog.flush();
-  await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey });
+  await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey }));
   return f;
 }
 
@@ -216,3 +220,11 @@ describe("P1-A: a corrupt/all-skipped audit chain is disclosed, never a false 'e
     expect(out.audit_chain.status).toBe("empty_verified");
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

@@ -22,6 +22,10 @@
  * process) being unreadable to the real operator uid, and the real
  * `sanctuary castle-wall daemon` startup path invoking this migration.
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { chmod, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -118,13 +122,13 @@ describe("F2 Option A: fortress audit store split", () => {
       const log = createDaemonAuditLog(storage, masterKey, {
         consultSplitBoundary: true,
       });
-      await log.appendCritical({
+      await withRootDaemonWriter(() => log.appendCritical({
         layer: "l2",
         operation: "probe",
         identity_id: "id",
         result: "success",
-      });
-      await log.flush();
+      }));
+      await withRootDaemonWriter(() => log.flush());
       await expect(log.getIntegrityFindings()).resolves.toEqual([]);
     });
   });
@@ -132,7 +136,7 @@ describe("F2 Option A: fortress audit store split", () => {
   describe("migrateFortressAuditStoreSplit", () => {
     it("migrates a fresh (empty) fortress: sealed_tip_sequence 0, one daemon genesis entry", async () => {
       const { storage, masterKey } = await makeFortress();
-      const result = await migrateFortressAuditStoreSplit({ storage, masterKey });
+      const result = await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       expect(result.status).toBe("migrated");
       if (result.status !== "migrated") throw new Error("unreachable");
       expect(result.boundary.sealed_tip_sequence).toBe(0);
@@ -159,11 +163,11 @@ describe("F2 Option A: fortress audit store split", () => {
       const preHead = await operatorLog.getChainHead();
       expect(preHead.sequence).toBe(5);
 
-      const result = await migrateFortressAuditStoreSplit({
+      const result = await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({
         storage,
         masterKey,
         identityId: "castle-wall-daemon-test",
-      });
+      }));
       expect(result.status).toBe("migrated");
       if (result.status !== "migrated") throw new Error("unreachable");
       expect(result.boundary.sealed_tip_sequence).toBe(5);
@@ -193,8 +197,8 @@ describe("F2 Option A: fortress audit store split", () => {
       });
       await operatorLog.flush();
 
-      const first = await migrateFortressAuditStoreSplit({ storage, masterKey });
-      const second = await migrateFortressAuditStoreSplit({ storage, masterKey });
+      const first = await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
+      const second = await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       expect(second.status).toBe("already-migrated");
       expect(second).toEqual({ status: "already-migrated", boundary: (first as any).boundary });
 
@@ -219,7 +223,7 @@ describe("F2 Option A: fortress audit store split", () => {
       // boundary write)": manually land the daemon genesis entry, but write
       // NO boundary record.
       const daemonLog = createDaemonAuditLog(storage, masterKey);
-      await daemonLog.appendCritical({
+      await withRootDaemonWriter(() => daemonLog.appendCritical({
         layer: "l2",
         operation: AUDIT_STORE_SPLIT_MIGRATION_OP,
         identity_id: "castle-wall-daemon",
@@ -230,8 +234,8 @@ describe("F2 Option A: fortress audit store split", () => {
           legacy_tip_entry_hash: head.entry_hash,
           daemon_namespace: AUDIT_DAEMON_NAMESPACE,
         },
-      });
-      await daemonLog.flush();
+      }));
+      await withRootDaemonWriter(() => daemonLog.flush());
 
       const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
       await expect(readAuditStoreSplitBoundary(statePath, macKey)).resolves.toEqual({
@@ -240,7 +244,7 @@ describe("F2 Option A: fortress audit store split", () => {
 
       // Retry: must detect the pre-existing daemon entry, skip re-appending,
       // and proceed straight to committing the boundary.
-      const result = await migrateFortressAuditStoreSplit({ storage, masterKey });
+      const result = await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       expect(result.status).toBe("migrated");
 
       const finalDaemonLog = createDaemonAuditLog(storage, masterKey);
@@ -263,7 +267,7 @@ describe("F2 Option A: fortress audit store split", () => {
       });
 
       await expect(
-        migrateFortressAuditStoreSplit({ storage, masterKey })
+        withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }))
       ).rejects.toThrow(AuditStoreSplitMigrationError);
     });
 
@@ -292,7 +296,7 @@ describe("F2 Option A: fortress audit store split", () => {
       await writeFile(filePath, JSON.stringify(raw));
 
       await expect(
-        migrateFortressAuditStoreSplit({ storage, masterKey })
+        withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }))
       ).rejects.toThrow(AuditStoreSplitMigrationError);
 
       // No boundary was written — the legacy chain is untouched, not
@@ -322,7 +326,7 @@ describe("F2 Option A: fortress audit store split", () => {
         result: "success",
       });
       await operatorLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
       const report = await verifyFortressAuditFullPicture({ storage, masterKey });
       expect(report.operator.status).toBe("verified");
@@ -331,7 +335,7 @@ describe("F2 Option A: fortress audit store split", () => {
 
     it("no master key supplied: both chains report key_unavailable (daemon chain present)", async () => {
       const { storage, masterKey } = await makeFortress();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       const report = await verifyFortressAuditFullPicture({ storage });
       expect(report.operator.status).toBe("key_unavailable");
       expect(report.daemon.status).toBe("key_unavailable");
@@ -339,7 +343,7 @@ describe("F2 Option A: fortress audit store split", () => {
 
     it("daemon chain present but unreadable at this privilege: reports present_unreadable, NEVER verified, NEVER silently skipped", async () => {
       const { statePath, storage, masterKey } = await makeFortress();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
       const daemonDir = join(statePath, AUDIT_DAEMON_NAMESPACE);
       await chmod(daemonDir, 0o000);
@@ -370,7 +374,7 @@ describe("F2 Option A: fortress audit store split", () => {
         });
       }
       await operatorLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
       const report = await verifyFortressAuditFullPicture({ storage, masterKey });
       expect(report.operator.status).toBe("verified");
@@ -389,7 +393,7 @@ describe("F2 Option A: fortress audit store split", () => {
         });
       }
       await operatorLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
       // Make the sealed entries unreadable (chmod the individual files, not the
       // dir, so the listing still succeeds and stays "complete").
@@ -418,7 +422,7 @@ describe("F2 Option A: fortress audit store split", () => {
         });
       }
       await operatorLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
       // Corrupt a sealed entry's payload but leave the stored entry_hash (so the
       // recompute mismatches). File still present → listing complete → the ONLY
@@ -449,7 +453,7 @@ describe("F2 Option A: fortress audit store split", () => {
         });
       }
       await log.flush();
-      await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey }));
       return f;
     }
 
@@ -464,7 +468,7 @@ describe("F2 Option A: fortress audit store split", () => {
 
     it("empty when the migration sealed an empty chain", async () => {
       const { storage, masterKey } = await makeFortress();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       const verdict = await verifySealedLegacyPrefix(storage, masterKey);
       expect(verdict.status).toBe("empty");
     });
@@ -545,7 +549,7 @@ describe("F2 Option A: fortress audit store split", () => {
         await op.appendCritical({ layer: "l1", operation: `op-${i}`, identity_id: "id", result: "success" });
       }
       await op.flush();
-      await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey }));
       // Post-split operator suffix (writes a head anchor for the suffix).
       const suffix = new AuditLog(f.storage, f.masterKey);
       for (let i = 0; i < suffixEntries; i++) {
@@ -674,7 +678,7 @@ describe("F2 Option A: fortress audit store split", () => {
         result: "success",
       });
       await auditLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       expect(await daemonMigrationEstablished(storage, masterKey)).toBe(true);
       expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
         kind: "accessible",
@@ -691,7 +695,7 @@ describe("F2 Option A: fortress audit store split", () => {
         result: "success",
       });
       await auditLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       await rm(join(statePath, AUDIT_DAEMON_NAMESPACE), {
         recursive: true,
         force: true,
@@ -713,7 +717,7 @@ describe("F2 Option A: fortress audit store split", () => {
         result: "success",
       });
       await auditLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       await rm(join(statePath, AUDIT_DAEMON_NAMESPACE), {
         recursive: true,
         force: true,
@@ -739,7 +743,7 @@ describe("F2 Option A: fortress audit store split", () => {
         result: "success",
       });
       await auditLog.flush();
-      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
       await chmod(join(statePath, AUDIT_DAEMON_NAMESPACE), 0o000);
       expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
         kind: "present_unreadable",
@@ -781,3 +785,11 @@ describe("F2 Option A: fortress audit store split", () => {
     });
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

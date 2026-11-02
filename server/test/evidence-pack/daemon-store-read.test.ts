@@ -18,13 +18,13 @@
  *     AuditIntegrityError), NOT the privilege excuse;
  *   present_unreadable -> daemon dir unreadable at this uid (skipped as root).
  */
-
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
 import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import {
   AUDIT_DAEMON_NAMESPACE,
   migrateFortressAuditStoreSplit,
@@ -77,7 +77,7 @@ async function splitFortress() {
     result: "success",
   });
   await auditLog.flush();
-  await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey });
+  await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey }));
   return f;
 }
 
@@ -197,3 +197,11 @@ describe("WATCH-1 round-5: readDaemonStore four honest states over a real on-dis
     expect(report.content).not.toMatch(/re-run .*as root/i);
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+afterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

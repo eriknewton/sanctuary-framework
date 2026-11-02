@@ -229,6 +229,8 @@ export function createDaemonAuditLog(
 ): AuditLog {
   return new AuditLog(new DaemonAuditStorageAdapter(storage), masterKey, {
     ...config,
+    // Role must match the trusted role union in operational/audit-log.ts.
+    chainWriterRole: "root_daemon",
     consultSplitBoundary: false,
   });
 }
@@ -326,6 +328,7 @@ export async function migrateFortressAuditStoreSplit(opts: {
   // probe would see the `_audit-daemon` marker with no boundary and raise a
   // spurious `split_boundary_missing` finding, blocking the legitimate retry.
   const probe = new AuditLog(storage, masterKey, {
+    readOnly: true,
     integrityMode: "lenient",
     consultSplitBoundary: false,
   });
@@ -802,6 +805,7 @@ export async function verifyFortressAuditFullPicture(opts: {
     };
   } else {
     const daemonAuditLog = createDaemonAuditLog(storage, masterKey, {
+      readOnly: true,
       integrityMode: "lenient",
     });
     const findings = await daemonAuditLog.getIntegrityFindings();

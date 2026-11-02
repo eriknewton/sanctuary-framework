@@ -18,6 +18,10 @@
  * and made "unreadable" via chmod 0000 (a faithful proxy for the real root-owned
  * cross-uid case, which only the Mini1 re-drill can fully reproduce).
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { chmod, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -86,19 +90,19 @@ describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
     const daemonLog = createDaemonAuditLog(storage, masterKey);
     for (let i = 0; i < n; i++) {
-      await daemonLog.appendCritical({
+      await withRootDaemonWriter(() => daemonLog.appendCritical({
         layer: "l1",
         operation: i % 2 === 0 ? "egress_allowed" : "egress_blocked",
         identity_id: "castle-wall-daemon",
         result: "success",
         details: { host: `h${i}.example` },
-      });
+      }));
     }
-    await daemonLog.flush();
+    await withRootDaemonWriter(() => daemonLog.flush());
     return { fortressPath, storage, masterKey };
   }
 
@@ -213,3 +217,11 @@ describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Audit chains admit writers by their declared role and directory owner. Diagnostic readers preserve lock evidence, and storage listings retain surviving files when another candidate disappears.
+
 - Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.
 - `sanctuary_active_protections` lists every protection layer with an evidence-based status and a plain-English summary, including layers that are off, not built, or unknown.
 - An agent's memory save into its own memory (`memory_insert`, `sanctuary_remember`) runs without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; every save is audited with the agent named when its identity is known, otherwise marked as unknown, and shows on the dashboard's Evidence page. Set `memory_save_approval: always` in the policy to require approval per insert. Export, delete, signing and reading the policy still ask.

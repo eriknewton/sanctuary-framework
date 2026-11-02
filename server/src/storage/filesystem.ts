@@ -585,6 +585,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         encodedNamespacePath(this.basePath, namespace),
         fsConstants.O_RDONLY | noFollow | directoryOnly,
       );
+      // The /proc/self/fd/<digits> pattern must match assertAuditWriterAuthority in operational/audit-log.ts, including descriptorNamespace below.
       const descriptorRoot = host === "linux"
         ? `/proc/self/fd/${rootHandle.fd}`
         : `/dev/fd/${rootHandle.fd}`;
@@ -682,6 +683,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           );
         }
       };
+      // The descriptor-root binding must match assertAuditWriterAuthority in operational/audit-log.ts.
       const boundBasePath = host === "linux" ? descriptorRoot : this.basePath;
       operationResult = await this.boundBasePath.run({
         basePath: boundBasePath,
@@ -1204,42 +1206,32 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
     const dirPath = this.activeNamespacePath(namespace);
 
+    let files: string[];
     try {
-      const files = await readdir(dirPath);
-      const entries: StorageEntryMeta[] = [];
-
-      for (const file of files) {
-        if (!file.endsWith(".enc")) continue;
-
-        const encodedKey = file.slice(0, -4); // Remove .enc extension
-        const key = decodeRawFilesystemStorageName(encodedKey, "key");
-        if (prefix && !key.startsWith(prefix)) continue;
-
-        const filePath = join(dirPath, file);
-        const fileStat = await stat(filePath);
-
-        entries.push({
-          key,
-          namespace,
-          size_bytes: fileStat.size,
-          modified_at: fileStat.mtime.toISOString(),
-        });
-      }
-
-      return entries.sort((a, b) => a.key.localeCompare(b.key));
+      files = await readdir(dirPath);
     } catch (err: unknown) {
-      if (
-        err instanceof Error &&
-        "code" in err &&
-        (err as NodeJS.ErrnoException).code === "ENOENT"
-      ) {
-        return [];
-      }
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw err;
     }
+    const entries: StorageEntryMeta[] = [];
+    for (const file of files) {
+      if (!file.endsWith(".enc")) continue;
+      const encodedKey = file.slice(0, -4); // Four characters in the .enc suffix.
+      const key = decodeRawFilesystemStorageName(encodedKey, "key");
+      if (prefix && !key.startsWith(prefix)) continue;
+      let fileStat;
+      try {
+        fileStat = await stat(join(dirPath, file));
+      } catch (err: unknown) {
+        // A vanished candidate cannot discard surviving entries; the Darwin directory-capability worker delegates list here too.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      entries.push({ key, namespace, size_bytes: fileStat.size, modified_at: fileStat.mtime.toISOString() });
+    }
+    return entries.sort((a, b) => a.key.localeCompare(b.key));
   }
 
-  /** Names only, with the complete-or-throw contract in storage/interface.ts. */
   async listKeys(namespace: string, prefix?: string): Promise<string[]> {
     this.assertCallerNamespace(namespace);
     const capability = this.darwinCapability(namespace);
