@@ -168,6 +168,85 @@ for (const namesOnly of [true, false]) describe(namesOnly ? "names-only discover
     expect(findings).toEqual(expect.arrayContaining([expect.objectContaining({ kind: kind === "both" ? "storage_unavailable" : "tail_anchor_missing" })]));
     await expect(f.make({ chainWriterRole: "root_daemon" }).query({ limit: 1 })).rejects.toMatchObject({ name: "AuditIntegrityError" });
   });
+  it("C1 load retains the maximum observed sequence despite listing order", async () => {
+    const f = await fixture(namesOnly); await append(f, 2);
+    const original = await keys(f);
+    const first = (await f.storage.read("_audit", original[0]!))!;
+    const second = (await f.storage.read("_audit", original[1]!))!;
+    await erase(f);
+    await f.storage.write("_audit", "entry-00000000000000000001-a", second);
+    await f.storage.write("_audit", "entry-00000000000000000001-z", first);
+    f.log = f.make({ integrityMode: "lenient" });
+    expect((await f.log.getIntegrityFindings()).length).toBeGreaterThan(0);
+    expect(state(f.log)[0]).toBe(3); // T = 2, so the next allocation would be 3.
+    expect(state(f.log)[3]).toBe(2);
+    expect(state(f.log)[1]).toBe(JSON.parse(Buffer.from(second).toString()).entry_hash);
+    await corrupt(f); await refuses(f);
+  });
+  it.each([
+    ["cached", "absent"], ["fresh-lenient", "absent"],
+    ["cached", "EACCES"], ["fresh-lenient", "EACCES"],
+  ])("H1 zero boundary erased history refuses for %s with head %s", async (reader, head) => {
+    const f = await fixture(namesOnly); __testSetAuditWriterUidForRole("root_daemon", 0);
+    expect((await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: master })).status).toBe("migrated");
+    f.log = f.make(); await f.log.getChainHead();
+    await append(f, 2, f.make()); await erase(f);
+    expect(await f.storage.read("_meta", ESTABLISHED)).not.toBeNull();
+    expect(await f.storage.read("_meta", SUFFIX)).toBeNull();
+    if (head === "EACCES") denyRead(f, "_audit_checkpoints", HEAD, head);
+    if (reader === "fresh-lenient") { f.log = f.make({ integrityMode: "lenient" }); await f.log.getChainHead(); }
+    const reads = vi.spyOn(f.storage, "read"); const lists = vi.spyOn(f.storage, "list");
+    await refuses(f);
+    // refuses makes two attempts; each must gather establishment exactly once.
+    expect(reads.mock.calls.filter(([ns, key]) => ns === "_meta" && key === ESTABLISHED)).toHaveLength(2);
+    expect(lists.mock.calls.filter(([ns]) => ns === "_audit_checkpoints")).toHaveLength(2);
+  });
+  it.each(["EACCES", "EIO"])("H1 boundary establishment %s uncertainty refuses then heals", async code => {
+    // Fault-free controls share the regression case so every new item-2 test fails on the base.
+    for (const floor of [0, 2]) {
+      const f = await fixture(namesOnly); await append(f, floor);
+      const previous = floor === 0 ? "GENESIS" : (await envelope(f)).entry_hash;
+      __testSetAuditWriterUidForRole("root_daemon", 0);
+      expect((await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: master })).status).toBe("migrated");
+      await append(f);
+      expect(await envelope(f)).toMatchObject({ sequence: floor + 1, prev_hash: previous });
+      const cached = await envelope(f); await append(f, 1, f.make());
+      expect(await envelope(f)).toMatchObject({ sequence: floor + 2, prev_hash: cached.entry_hash });
+    }
+    const f = await fixture(namesOnly); __testSetAuditWriterUidForRole("root_daemon", 0);
+    await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: master });
+    const { error, spy } = denyRead(f, "_meta", ESTABLISHED, code);
+    await refuses(f, error); spy.mockRestore();
+    await append(f); expect(await envelope(f)).toMatchObject({ sequence: 1, prev_hash: "GENESIS" });
+  });
+  it.each(["EACCES", "EIO"])("C2 marker %s alone prevents a clean fresh load", async code => {
+    const f = await fixture(namesOnly);
+    denyRead(f, "_meta", ESTABLISHED, code);
+    const list = vi.spyOn(f.storage, "list");
+    const reader = f.make({ integrityMode: "lenient", readOnly: true });
+    expect(await reader.getIntegrityFindings()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "storage_unavailable" }),
+    ]));
+    await expect(f.make({ integrityMode: "strict", readOnly: true }).query({ limit: 1 })).rejects.toMatchObject({ name: "AuditIntegrityError" });
+    const checkpointReads = list.mock.calls.flatMap(([ns], index) => ns === "_audit_checkpoints" ? [list.mock.results[index]!.value] : []);
+    expect(checkpointReads.length).toBeGreaterThan(0);
+    for (const result of checkpointReads) expect(await result).toEqual([]);
+  });
+  it("H2 prior trusted floor alone refuses after boundary loss", async () => {
+    const f = await fixture(namesOnly); await append(f, 2); await seal(f);
+    // Standalone checkpoint discovery observes the seal without creating a suffix.
+    await f.log.flush();
+    expect(state(f.log)[2]).toBe(2); expect(state(f.log)[3]).toBe(2);
+    await fs.unlink(auditStoreSplitBoundaryPath(f.path)); await corrupt(f);
+    await refuses(f);
+  });
+  it("H2 head and boundary hash disagreement alone refuses above the cached tip", async () => {
+    const f = await fixture(namesOnly); await append(f);
+    await append(f, 1, f.make());
+    await seal(f, 2, "0".repeat(64)); // SHA-256 hex width; differs from the authentic foreign head.
+    expect(state(f.log)[0]).toBe(2); expect(state(f.log)[3]).toBe(1);
+    await refuses(f);
+  });
   it.each(["boundary-hash", "head-hash", "floor-lost", "boundary-below-legacy"])("S2 refuses %s inconsistency", async kind => {
     const f = await fixture(namesOnly); await append(f, 2);
     const original = await envelope(f);
@@ -321,7 +400,8 @@ for (const namesOnly of [true, false]) {
     `fault-free payload linkage %s namesOnly=${namesOnly}`, async schedule => {
       const f = await fixture(namesOnly);
       const encryptionKey = derivePurposeKey(master, "audit-log");
-      const hashes = new Map<string, string>([["GENESIS", "GENESIS"]]);
+      const hashes = new Map<string, number | string>([["GENESIS", "GENESIS"]]);
+      let boundaryHash: string | undefined;
       const write = (log: AuditLog, step: string) => log.appendCritical({ ...ENTRY, details: { step } });
       const migrate = async () => {
         __testSetAuditWriterUidForRole("root_daemon", 0);
@@ -335,6 +415,7 @@ for (const namesOnly of [true, false]) {
         if (schedule === "S9b-warm-empty" || schedule === "S9b-cold") {
           const foreign = f.make(); await write(foreign, "first"); await write(foreign, "second");
         }
+        if (schedule !== "S9b-zero") boundaryHash = (await envelope(f)).entry_hash;
         await migrate();
         if (schedule === "S9b-cold") f.log = f.make();
         await write(f.log, "final");
@@ -356,31 +437,25 @@ for (const namesOnly of [true, false]) {
           const envelope: PersistedAuditEnvelopeV2 = JSON.parse(Buffer.from((await f.storage.read(namespace, key))!).toString());
           const payload = JSON.parse(Buffer.from(decrypt(JSON.parse(Buffer.from(fromBase64url(envelope.encrypted_payload_bytes)).toString()), encryptionKey)).toString());
           const label = `${namespace}:${payload.details?.step ?? payload.operation}`;
-          hashes.set(envelope.entry_hash, label); records.push({ namespace, envelope, payload, label });
+          hashes.set(envelope.entry_hash, envelope.sequence); records.push({ namespace, envelope, payload, label });
         }
       }
-      // Compare graph identity rather than random ciphertext-derived digests; preserve every payload field except timestamp.
-      const normalize = (value: unknown): unknown => {
-        if (typeof value === "string") return hashes.get(value) ?? value;
-        if (Array.isArray(value)) return value.map(normalize);
-        if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "timestamp").map(([key, item]) => [key, normalize(item)]));
-        return value;
+      // Pin every edge in each namespace; the split boundary and legacy root are explicit anchors.
+      const entries = records.map(({ namespace, envelope }) => ({
+        namespace, sequence: envelope.sequence,
+        previous: envelope.prev_hash === boundaryHash ? "BOUNDARY" : hashes.get(envelope.prev_hash),
+      }));
+      const expected: Record<string, { sequence: number; previous: number | string }[]> = {
+        _audit: schedule.startsWith("S11") ? [{ sequence: 2, previous: "LEGACY_ROOT" }]
+          : schedule === "S0" ? [{ sequence: 1, previous: "GENESIS" }, { sequence: 2, previous: 1 }, { sequence: 3, previous: 2 }]
+          : schedule.startsWith("S9") && schedule !== "S9b-zero"
+            ? [{ sequence: 1, previous: "GENESIS" }, { sequence: 2, previous: 1 }, { sequence: 3, previous: "BOUNDARY" }]
+            : [{ sequence: 1, previous: "GENESIS" }],
       };
-      const entries = records.map(({ namespace, envelope, payload, label }) => {
-        expect(hashes.has(envelope.prev_hash)).toBe(true);
-        expect(payload).toHaveProperty("timestamp");
-        return { namespace, label, schema_version: envelope.schema_version, sequence: envelope.sequence, prev_hash: normalize(envelope.prev_hash), entry_hash: normalize(envelope.entry_hash), payload: normalize(payload) };
-      }).sort((a, b) => a.label.localeCompare(b.label));
-      const heads: Record<string, unknown> = {};
-      for (const namespace of ["_audit_checkpoints", "_audit-daemon_checkpoints"]) {
-        const raw = await f.storage.read(namespace, HEAD);
-        heads[namespace] = raw === null ? null : normalize(JSON.parse(Buffer.from(raw).toString()).data);
-      }
-      const markers: Record<string, string | null> = {};
-      for (const key of [ESTABLISHED, SUFFIX]) {
-        const raw = await f.storage.read("_meta", key); markers[key] = raw === null ? null : Buffer.from(raw).toString();
-      }
-      console.info(`PAYLOAD_LINKAGE ${JSON.stringify({ schedule, namesOnly, entries, heads, markers })}`);
+      // Every migration creates one daemon genesis; an explicit daemon append does the same.
+      const daemon = schedule.startsWith("S9") || schedule === "S10-migration" || schedule === "S10-daemon"
+        ? [{ namespace: "_audit-daemon", sequence: 1, previous: "GENESIS" }] : [];
+      expect(entries).toEqual([...expected._audit!.map(entry => ({ namespace: "_audit", ...entry })), ...daemon]);
     });
 }
 

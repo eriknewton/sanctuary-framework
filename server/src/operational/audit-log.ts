@@ -5630,10 +5630,15 @@ export class AuditLog {
         if (suffix.status === "unreadable") return unknown(suffix.cause);
       }
       let establishment: AuditEstablishmentEvidence | undefined;
-      if (!boundary && candidates.length === 0 && known === 0) {
+      // A boundary cannot explain a missing suffix head; at floor zero no sealed head can explain a permission denial either.
+      const boundaryNeedsEstablishment = boundary !== undefined &&
+        (head.status === "absent" || (sealedFloor === 0 && head.status === "unreadable_sealed"));
+      if (boundaryNeedsEstablishment || (!boundary && candidates.length === 0 && known === 0)) {
         establishment = await this.isEstablishedAuditStore(false);
         this.assertAuditWriteLockActive(signal);
-        if (establishment.unreadable) return unknown(establishment.cause);
+        if (establishment.unreadable) return unknown(establishment.cause); // D1
+        // D12: retained establishment contradicts an empty suffix when its head cannot account for that history.
+        if (boundaryNeedsEstablishment && establishment.established) return unknown();
       }
       // D2: the prior trusted floor cannot be erased; authenticated equal-tip fields must describe the cached chain.
       if (this.cachedSealedTip > sealedFloor || tip < known ||
@@ -5751,6 +5756,13 @@ export class AuditLog {
       key: string;
       envelope: PersistedAuditEnvelopeV2;
     }> = [];
+    let highestObservedV2: Pick<PersistedAuditEnvelopeV2, "sequence" | "entry_hash"> | undefined;
+    const observeV2 = (envelope: Pick<PersistedAuditEnvelopeV2, "sequence" | "entry_hash">): void => {
+      // Listing order is not envelope order; every V2 observation constrains allocation even if payload verification fails.
+      if (!highestObservedV2 || envelope.sequence >= highestObservedV2.sequence) {
+        highestObservedV2 = { sequence: envelope.sequence, entry_hash: envelope.entry_hash };
+      }
+    };
     // Bounded recent-entry window built during the streaming decrypt for the
     // non-streaming callers (query / posture / append). Only the newest
     // `maxInMemoryEntries` decrypted entries are kept; older payloads are dropped
@@ -5869,6 +5881,7 @@ export class AuditLog {
         const byteKey = sha256Hex(raw);
         const cached = consumer ? undefined : this.verificationCache.get(byteKey);
         if (cached) {
+          observeV2(cached);
           cleanThisPass.retain(byteKey, cached);
           // Must match verifyCheckpoints entries: cached envelopes have empty ciphertext and cannot be rehashed.
           // Chain metadata must not retain decrypted entries after the bounded window evicts them.
@@ -5890,6 +5903,7 @@ export class AuditLog {
         }
 
         if (isPersistedAuditEnvelopeV2(parsed)) {
+          observeV2(parsed);
           const expectedHash = computeAuditEntryHash({
             sequence: parsed.sequence,
             prev_hash: parsed.prev_hash,
@@ -6064,12 +6078,12 @@ export class AuditLog {
       // Getting this wrong would corrupt `nextSequence`/`lastEntryHash` below
       // (the state the NEXT append seeds from), not just the head-anchor check.
       const highestChainedSeq =
-        chainedEntries.at(-1)?.envelope.sequence ??
+        highestObservedV2?.sequence ??
         (splitBoundary.status === "valid"
           ? splitBoundary.boundary.sealed_tip_sequence
           : legacyRawEntries.length);
       const highestChainedHash =
-        chainedEntries.at(-1)?.envelope.entry_hash ??
+        highestObservedV2?.entry_hash ??
         (splitBoundary.status === "valid"
           ? splitBoundary.boundary.sealed_tip_entry_hash
           : legacyAnchorHash);
@@ -6083,7 +6097,7 @@ export class AuditLog {
         effectiveSealedTip
       );
       // Must match persistChainedEntry and freshenChainStateFromDisk: actual V2 history never comes from a boundary or legacy count.
-      this.knownV2HighWater = Math.max(this.knownV2HighWater, chainedEntries.at(-1)?.envelope.sequence ?? 0);
+      this.knownV2HighWater = Math.max(this.knownV2HighWater, highestObservedV2?.sequence ?? 0);
       if (findings.length === 0) {
         // A clean verification in any mode establishes legacy history independently of the trimmed RAM window.
         this.verifiedLegacyCount = legacyRawEntries.length;
