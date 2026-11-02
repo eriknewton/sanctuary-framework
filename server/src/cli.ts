@@ -322,7 +322,7 @@ async function main(): Promise<void> {
 
   if (args[0] === "castle-wall") {
     const code = await runCastleWallCommand(args.slice(1));
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "secrets") {
