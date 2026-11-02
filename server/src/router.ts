@@ -164,6 +164,7 @@ export function createServer(
     // The `agent:` form must match audit writers in sdw/memory-tools.ts and agent-native/cooperative-surface.ts.
     // The `agent:` form must match requestingAgentId in
     // server/src/principal-policy/gate.ts, which attributes held calls.
+    // Must match the agent: audit identity in hermes-memory-bridge/bridge-core.ts.
     const callerIdentity = currentAgentId
       ? `agent:${currentAgentId}`
       : "agent:unknown";

@@ -1222,3 +1222,9 @@ describe("Hermes memory bridge Node-to-relay encoder", () => {
     expect(Buffer.from(envelope.result_b64 as string, "base64")).toEqual(Buffer.from(publicPayloadBytes));
   });
 });
+
+// Malformed catalog arguments retain the tool identity for ordinary refusals.
+it("carries catalog v2 names through strict argument rejection", () => {
+  const result = parsePublicFrame(Buffer.from(JSON.stringify({ type: "tools_call", request_id: "recall", name: "memory_recall", arguments: { query: 7 } })));
+  expect(result).toMatchObject({ kind: "public_rejection", disposition: "deny", requestId: "recall", toolName: "memory_recall" });
+});

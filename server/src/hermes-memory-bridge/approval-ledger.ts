@@ -1,28 +1,22 @@
 import {
-  HERMES_APPROVAL_DEADLINE_MS,
-  HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE,
-  HERMES_MAX_PENDING_APPROVALS,
+  HERMES_INSERT_DEADLINE_MS,
   HERMES_MEMORY_DENIAL,
   HERMES_MEMORY_UNAVAILABLE,
-  HERMES_RATE_WINDOW_MS,
   MAX_RESULT_FRAME_BYTES,
 } from "./constants.js";
-import { HermesRateWindow } from "./rate-window.js";
 
 export type HermesApprovalEntryState =
-  | "PENDING"
-  | "APPROVED"
+  | "INSERT_STARTED"
   | "COMMITTING"
   | "COMMITTED"
-  | "DENIED"
   | "CANCELED"
   | "TIMED_OUT"
   | "DISCONNECTED"
   | "REFUSED"
   | "INDETERMINATE";
 
-export type HermesApprovalTerminalState = Exclude<HermesApprovalEntryState, "PENDING" | "APPROVED" | "COMMITTING">;
-export type HermesApprovalResponseClass = "success" | "denial" | "unavailable";
+export type HermesApprovalTerminalState = Exclude<HermesApprovalEntryState, "INSERT_STARTED" | "COMMITTING">;
+export type HermesApprovalResponseClass = "success" | "unavailable";
 export type HermesApprovalDecision = "allow" | "refuse";
 export type HermesApprovalProbeVerdict = "resolved" | "refused";
 export type HermesApprovalWriteOutcome = "committed" | "failed" | "indeterminate";
@@ -31,24 +25,11 @@ export type HermesApprovalRefusalReason =
   | "latched"
   | "busy"
   | "invalid_clock"
-  | "prompt_rate"
-  | "hash_mismatch"
-  | "not_pending"
-  | "not_approved"
   | "unknown_entry";
 export type HermesApprovalFatalReason = "ledger_order";
-export type HermesApprovalLateEvent = "deny" | "deadline" | "cancel" | "gone" | "stop" | "latch";
+export type HermesApprovalLateEvent = "deadline" | "cancel" | "gone" | "stop" | "latch";
 
 export type HermesApprovalAction =
-  | {
-      readonly kind: "audit";
-      readonly entryId: string;
-      readonly event: "created" | "approved" | "terminal";
-      readonly state?: HermesApprovalTerminalState;
-      readonly reason?: string;
-      readonly lateEvents?: readonly HermesApprovalLateEvent[];
-    }
-  | { readonly kind: "prompt_owner"; readonly entryId: string }
   | {
       readonly kind: "respond";
       readonly entryId: string;
@@ -74,6 +55,7 @@ export interface HermesApprovalCommitCheckResult extends HermesApprovalLedgerRes
 
 export interface HermesApprovalCommitCheckInput {
   readonly probe: HermesApprovalProbeVerdict;
+  readonly admitDurable: boolean;
   readonly nowMs: number;
   readonly recordCurrent: boolean;
   readonly passageTextSha256: string;
@@ -101,7 +83,6 @@ export interface HermesApprovalLedgerSnapshot {
   readonly latched: boolean;
   readonly largestNowMs: number;
   readonly entry?: HermesApprovalEntrySnapshot;
-  readonly promptWindowCount: number;
 }
 
 interface HermesApprovalEntry {
@@ -123,7 +104,6 @@ interface HermesApprovalEntry {
 
 const TERMINAL_STATES = new Set<HermesApprovalEntryState>([
   "COMMITTED",
-  "DENIED",
   "CANCELED",
   "TIMED_OUT",
   "DISCONNECTED",
@@ -133,34 +113,12 @@ const TERMINAL_STATES = new Set<HermesApprovalEntryState>([
 
 const EMPTY_RESULT: HermesApprovalLedgerResult = Object.freeze({ actions: [] });
 
-if (HERMES_MAX_PENDING_APPROVALS !== 1) {
-  throw new Error("Hermes approval ledger requires exactly one pending approval slot");
-}
-
-/**
- * Pure approval ledger for Hermes memory inserts.
- *
- * Caller contract: route admission is fed in the same synchronous turn as call
- * routing; insert-started is fed before storage insertion and settled is fed
- * after the storage call even when the call is skipped; lifecycle exits are fed
- * synchronously; every emitted audit is durably appended and append rejection is
- * fed as a latch; the commit barrier awaits prior entry audits plus commit
- * intent, applies queued controls, then calls commitCheck without another
- * await; the hook resolves only on allow, takes the entry id from async call
- * context, and feeds any storage latch before settlement; every response is
- * written through the connection lifecycle. Owner decisions for terminal,
- * unsettled entries return not_pending to the owner surface and never produce a
- * client response.
- */
+/** A single insert slot retains controls through the corpus-lock commit check and storage settlement. */
 export class HermesApprovalLedger {
   private entry: HermesApprovalEntry | undefined;
   private stopped = false;
   private latched = false;
   private largestNowMs = Number.NEGATIVE_INFINITY;
-  private readonly promptWindow = new HermesRateWindow(
-    HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE,
-    HERMES_RATE_WINDOW_MS,
-  );
 
   admit(
     entryId: string,
@@ -174,63 +132,41 @@ export class HermesApprovalLedger {
     if (this.stopped) return { actions: [], refusal: "stopped" };
     if (this.latched) return { actions: [], refusal: "latched" };
     if (this.entry !== undefined) return { actions: [], refusal: "busy" };
-    // The prompt window is check-then-record so refused calls cannot consume owner-prompt capacity.
-    const promptAdmission = this.promptWindow.check(now);
-    if (!promptAdmission.allowed) return { actions: [], refusal: "prompt_rate" };
-    this.promptWindow.record(now);
     this.entry = {
       id: entryId,
       connectionId,
       recordId,
       textSha256,
-      state: "PENDING",
+      state: "INSERT_STARTED",
       started: false,
       settled: false,
       responded: false,
-      deadlineAt: now + HERMES_APPROVAL_DEADLINE_MS,
+      deadlineAt: now + HERMES_INSERT_DEADLINE_MS,
       seen: this.emptySeen(),
       lateEvents: new Set(),
     };
-    return {
-      actions: [
-        { kind: "audit", entryId, event: "created" },
-        { kind: "prompt_owner", entryId },
-      ],
-    };
-  }
-
-  ownerApprove(entryId: string, textSha256: string): HermesApprovalLedgerResult {
-    const entry = this.findEntry(entryId);
-    if (entry === undefined) return { actions: [], refusal: "unknown_entry" };
-    if (entry.state !== "PENDING") return { actions: [], refusal: "not_pending" };
-    if (textSha256 !== entry.textSha256) return { actions: [], refusal: "hash_mismatch" };
-    entry.state = "APPROVED";
-    return { actions: [{ kind: "audit", entryId, event: "approved" }] };
-  }
-
-  ownerDeny(entryId: string): HermesApprovalLedgerResult {
-    return this.control(entryId, "deny", "DENIED", "owner_denied", "denial");
+    return { actions: [] };
   }
 
   deadline(entryId: string): HermesApprovalLedgerResult {
-    return this.control(entryId, "deadline", "TIMED_OUT", "deadline", "denial");
+    return this.control(entryId, "deadline", "TIMED_OUT", "deadline", "unavailable");
   }
 
   cancel(entryId: string): HermesApprovalLedgerResult {
-    return this.control(entryId, "cancel", "CANCELED", "cancel", "denial");
+    return this.control(entryId, "cancel", "CANCELED", "cancel", "unavailable");
   }
 
   peerShutdown(entryId: string): HermesApprovalLedgerResult {
-    return this.control(entryId, "cancel", "CANCELED", "peer_shutdown", "denial");
+    return this.control(entryId, "cancel", "CANCELED", "peer_shutdown", "unavailable");
   }
 
   connectionGone(entryId: string): HermesApprovalLedgerResult {
     const entry = this.findEntry(entryId);
     if (entry === undefined) return EMPTY_RESULT;
-    if (entry.state === "PENDING" || (entry.state === "APPROVED" && !entry.started)) {
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       return this.finish(entry, "DISCONNECTED", "connection_gone", undefined, { settle: true, respondNow: false });
     }
-    if (entry.state === "APPROVED" || entry.state === "COMMITTING") {
+    if (entry.state === "INSERT_STARTED" || entry.state === "COMMITTING") {
       this.recordSeen(entry, "gone");
       return EMPTY_RESULT;
     }
@@ -259,8 +195,7 @@ export class HermesApprovalLedger {
   insertStarted(entryId: string): HermesApprovalLedgerResult {
     const entry = this.findEntry(entryId);
     if (entry === undefined) return { actions: [], refusal: "unknown_entry" };
-    if (entry.state === "PENDING") return { actions: [], refusal: "not_approved" };
-    if (entry.state === "APPROVED" && !entry.started) {
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       entry.started = true;
       return EMPTY_RESULT;
     }
@@ -270,7 +205,7 @@ export class HermesApprovalLedger {
   commitCheck(entryId: string, input: HermesApprovalCommitCheckInput): HermesApprovalCommitCheckResult {
     const entry = this.findEntry(entryId);
     if (entry === undefined) return this.fatal("refuse");
-    if (entry.state !== "APPROVED" || !entry.started) return this.fatal("refuse");
+    if (entry.state !== "INSERT_STARTED" || !entry.started) return this.fatal("refuse");
     if (!Number.isFinite(input.nowMs)) return this.fatal("refuse");
     const now = this.clampNow(input.nowMs);
 
@@ -301,13 +236,13 @@ export class HermesApprovalLedger {
         respondNow: false,
       });
     }
-    return this.finish(entry, "REFUSED", "write_failed", "denial", { settle: false, respondNow: false });
+    return this.finish(entry, "REFUSED", "write_failed", "unavailable", { settle: false, respondNow: false });
   }
 
   settled(entryId: string): HermesApprovalLedgerResult {
     const entry = this.findEntry(entryId);
     if (entry === undefined) return this.fatal();
-    if (entry.state === "APPROVED" && entry.started) return this.startedTerminalFromFlags(entry);
+    if (entry.state === "INSERT_STARTED" && entry.started) return this.startedTerminalFromFlags(entry);
     if (!TERMINAL_STATES.has(entry.state)) return this.fatal();
     entry.settled = true;
     const actions = this.respondAtSettle(entry);
@@ -320,7 +255,6 @@ export class HermesApprovalLedger {
       stopped: this.stopped,
       latched: this.latched,
       largestNowMs: this.largestNowMs,
-      promptWindowCount: this.promptWindow.retainedCount,
       entry: this.entry === undefined ? undefined : this.snapshotEntry(this.entry),
     };
   }
@@ -333,11 +267,11 @@ export class HermesApprovalLedger {
     responseClass: HermesApprovalResponseClass,
   ): HermesApprovalLedgerResult {
     const entry = this.findEntry(entryId);
-    if (entry === undefined) return flag === "deny" ? { actions: [], refusal: "unknown_entry" } : EMPTY_RESULT;
-    if (entry.state === "PENDING" || (entry.state === "APPROVED" && !entry.started)) {
+    if (entry === undefined) return EMPTY_RESULT;
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       return this.finish(entry, terminalState, reason, responseClass, { settle: true, respondNow: true });
     }
-    if (entry.state === "APPROVED" && entry.started) {
+    if (entry.state === "INSERT_STARTED" && entry.started) {
       this.recordSeen(entry, flag, flag === "latch" ? reason : undefined);
       return EMPTY_RESULT;
     }
@@ -346,7 +280,7 @@ export class HermesApprovalLedger {
       this.recordSeen(entry, flag, flag === "latch" ? reason : undefined);
       return EMPTY_RESULT;
     }
-    return flag === "deny" ? { actions: [], refusal: "not_pending" } : EMPTY_RESULT;
+    return EMPTY_RESULT;
   }
 
   private applyGlobalRefusal(
@@ -356,10 +290,10 @@ export class HermesApprovalLedger {
   ): HermesApprovalLedgerResult {
     const entry = this.entry;
     if (entry === undefined) return EMPTY_RESULT;
-    if (entry.state === "PENDING" || (entry.state === "APPROVED" && !entry.started)) {
+    if (entry.state === "INSERT_STARTED" && !entry.started) {
       return this.finish(entry, "REFUSED", reason, responseClass, { settle: true, respondNow: true });
     }
-    if (entry.state === "APPROVED" || entry.state === "COMMITTING") {
+    if (entry.state === "INSERT_STARTED" || entry.state === "COMMITTING") {
       this.recordSeen(entry, flag, flag === "latch" ? reason : undefined);
     }
     return EMPTY_RESULT;
@@ -381,30 +315,31 @@ export class HermesApprovalLedger {
       input.getFrameUtf8Bytes < 0 ||
       !(input.getFrameUtf8Bytes <= MAX_RESULT_FRAME_BYTES)
     ) {
-      return { state: "REFUSED", reason: "commit_binding_mismatch", responseClass: "denial" };
+      return { state: "REFUSED", reason: "commit_binding_mismatch", responseClass: "unavailable" };
     }
-    if (input.probe === "refused") return { state: "REFUSED", reason: "probe_refused", responseClass: "denial" };
     if (entry.seen.stop || entry.seen.latch || this.stopped || this.latched) {
       return { state: "REFUSED", reason: entry.latchReason ?? "service_unavailable", responseClass: "unavailable" };
     }
-    if (entry.seen.cancel) return { state: "CANCELED", reason: "cancel", responseClass: "denial" };
-    if (entry.seen.deny) return { state: "DENIED", reason: "owner_denied", responseClass: "denial" };
+    if (entry.seen.cancel) return { state: "CANCELED", reason: "cancel", responseClass: "unavailable" };
     if (entry.seen.deadline || nowMs >= entry.deadlineAt) {
-      return { state: "TIMED_OUT", reason: "deadline", responseClass: "denial" };
+      return { state: "TIMED_OUT", reason: "deadline", responseClass: "unavailable" };
     }
+    if (input.probe === "refused") return { state: "REFUSED", reason: "probe_refused", responseClass: "unavailable" };
+    if (!input.admitDurable) return { state: "REFUSED", reason: "audit_unavailable", responseClass: "unavailable" };
     return undefined;
   }
 
   private startedTerminalFromFlags(entry: HermesApprovalEntry): HermesApprovalLedgerResult {
     const terminal = this.decideCommit(entry, {
       probe: "resolved",
+      admitDurable: false,
       nowMs: this.largestNowMs,
       recordCurrent: true,
       passageTextSha256: entry.textSha256,
       getFrameUtf8Bytes: 0,
     }, this.largestNowMs);
     if (terminal === undefined) {
-      return this.finish(entry, "REFUSED", "insert_returned_before_commit_check", "denial", {
+      return this.finish(entry, "REFUSED", "insert_returned_before_commit_check", "unavailable", {
         settle: true,
         respondNow: true,
       });
@@ -426,17 +361,7 @@ export class HermesApprovalLedger {
     entry.terminalReason = reason;
     entry.responseClass = state === "DISCONNECTED" ? undefined : responseClass;
     if (options.settle) entry.settled = true;
-    const actions: HermesApprovalAction[] = [
-      {
-        kind: "audit",
-        entryId: entry.id,
-        event: "terminal",
-        state,
-        reason,
-        lateEvents: [...entry.lateEvents],
-      },
-    ];
-    // Terminal audit precedes any response so durable outcome recording leads the caller-facing answer.
+    const actions: HermesApprovalAction[] = [];
     if (options.respondNow) actions.push(...this.respondAtSettle(entry));
     this.deleteIfComplete(entry);
     return options.decision === undefined ? { actions } : { actions, decision: options.decision };
@@ -487,7 +412,6 @@ export class HermesApprovalLedger {
 
   private emptySeen(): Record<HermesApprovalLateEvent, boolean> {
     return {
-      deny: false,
       deadline: false,
       cancel: false,
       gone: false,

@@ -1,3 +1,4 @@
+import type { HermesMemoryToolName } from "./envelopes.js";
 import {
   HERMES_MAX_CALL_RECORDS,
   HERMES_MAX_PUBLIC_CONNECTIONS,
@@ -27,7 +28,7 @@ export type HermesNodeCloseReason = "unparseable_call" | "private_cap_overflow";
 
 export type HermesLifecycleEvent =
   | { type: "accepted"; connectionId: string }
-  | { type: "call"; connectionId: string; requestId: string; kind: HermesCallKind; valid: boolean }
+  | { type: "call"; connectionId: string; requestId: string; kind: HermesCallKind; valid: boolean; toolName?: HermesMemoryToolName }
   | { type: "cancel"; connectionId: string; mcpRequestId: string }
   | { type: "public_shutdown"; connectionId: string }
   | { type: "public_unparseable"; connectionId: string }
@@ -64,6 +65,8 @@ export type HermesLifecycleAction =
       requestId: string;
       message: typeof HERMES_MEMORY_DENIAL;
       responseClass: "immediate" | "release";
+      toolName?: HermesMemoryToolName;
+      capacity?: boolean;
     };
 
 export type HermesFatalReason =
@@ -98,6 +101,7 @@ export interface HermesCallRecordSnapshot {
   readonly connectionId: string;
   readonly requestId: string;
   readonly kind: HermesCallKind;
+  readonly toolName?: HermesMemoryToolName;
   readonly state: HermesCallRecordState;
   readonly pendingCancel: boolean;
   readonly pendingShutdown: boolean;
@@ -108,10 +112,11 @@ export interface HermesPublicFrameSummary {
   readonly requestId?: string;
   readonly mcpRequestId?: string;
   readonly strictValid: boolean;
+  readonly toolName?: HermesMemoryToolName;
 }
 
 export type HermesClassifiedPublicFrame =
-  | { type: "call"; requestId: string; kind: HermesCallKind; valid: boolean }
+  | { type: "call"; requestId: string; kind: HermesCallKind; valid: boolean; toolName?: HermesMemoryToolName }
   | { type: "cancel"; mcpRequestId: string }
   | { type: "public_shutdown" }
   | { type: "public_unparseable" }
@@ -127,6 +132,7 @@ interface CallRecord {
   connectionId: string;
   requestId: string;
   kind: HermesCallKind;
+  toolName?: HermesMemoryToolName;
   state: HermesCallRecordState;
   pendingCancel: boolean;
   pendingShutdown: boolean;
@@ -141,6 +147,7 @@ export function classifyHermesPublicFrameSummary(summary: HermesPublicFrameSumma
       requestId: summary.requestId,
       kind: summary.topLevelType as HermesCallKind,
       valid: summary.strictValid,
+      ...(summary.toolName === undefined ? {} : { toolName: summary.toolName }),
     };
   }
   if (summary.topLevelType === "cancel") {
@@ -364,7 +371,7 @@ export class HermesConnectionLifecycle {
     // The single total record cap is checked before row mutation, so an over-cap call gets exactly one denial and leaves no retained record.
     if (this.records.size >= HERMES_MAX_CALL_RECORDS) {
       return {
-        actions: [this.fixedDenialAction(record, "immediate")],
+        actions: [{ ...this.fixedDenialAction(record, "immediate"), capacity: true }],
         refusal: { connectionId: event.connectionId, reason: "call_record_capacity" },
       };
     }
@@ -466,6 +473,7 @@ export class HermesConnectionLifecycle {
       connectionId: event.connectionId,
       requestId: event.requestId,
       kind: event.kind,
+      ...(event.toolName === undefined ? {} : { toolName: event.toolName }),
       state: "IN_FLIGHT",
       pendingCancel: false,
       pendingShutdown: false,
@@ -480,6 +488,7 @@ export class HermesConnectionLifecycle {
       requestId: record.requestId,
       message: HERMES_MEMORY_DENIAL,
       responseClass,
+      ...(record.toolName === undefined ? {} : { toolName: record.toolName }),
     };
   }
 

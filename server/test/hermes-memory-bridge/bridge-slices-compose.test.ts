@@ -8,6 +8,7 @@ import * as Framing from "../../src/hermes-memory-bridge/framing.js";
 import * as Lifecycle from "../../src/hermes-memory-bridge/connection-lifecycle.js";
 import * as ProbeWaiter from "../../src/hermes-memory-bridge/probe-waiter.js";
 import * as PublicResults from "../../src/hermes-memory-bridge/public-results.js";
+import * as Recall from "../../src/hermes-memory-bridge/recall.js";
 import * as StrictJson from "../../src/hermes-memory-bridge/strict-json.js";
 import type {
   HermesCallKind,
@@ -85,7 +86,7 @@ type BarrelTypeSurface = [
 
 const typeSurfaceCompiles = true satisfies BarrelTypeSurface extends readonly unknown[] ? true : false;
 
-const composedSurfaces = [BridgeCore, Constants, Envelopes, Framing, Lifecycle, ProbeWaiter, PublicResults, StrictJson] as const;
+const composedSurfaces = [BridgeCore, Constants, Envelopes, Framing, Lifecycle, ProbeWaiter, PublicResults, Recall, StrictJson] as const;
 
 describe("Hermes memory bridge composition", () => {
   it("publishes the composed module surface", () => {

@@ -23,11 +23,20 @@ export type PublicFrame =
   | { readonly kind: "cancel"; readonly mcpRequestId: string }
   | { readonly kind: "shutdown" };
 
-export type HermesMemoryToolName = "memory_insert" | "memory_get" | "memory_search";
+/** Closed catalog shared by the bridge and stdio client. */
+export const HERMES_MEMORY_TOOL_NAMES = Object.freeze([
+  "memory_insert", "memory_get", "memory_search", "memory_recall",
+  "sign_statement", "export_memory", "protection_rules",
+] as const);
+export type HermesMemoryToolName = typeof HERMES_MEMORY_TOOL_NAMES[number];
 
 export type HermesMemoryToolArguments =
   | { readonly text: string; readonly taint: "user_content" | "agent_derived_clean" | "system_generated"; readonly tags?: readonly string[]; readonly passage_id?: string }
   | { readonly passage_id: string }
+  | { readonly query: string }
+  | { readonly statement: string }
+  | { readonly scope: "all" }
+  | Record<string, never>
   | { readonly text?: string; readonly query?: string; readonly tag?: string; readonly limit?: number };
 
 export type PublicFrameParseResult =
@@ -37,6 +46,7 @@ export type PublicFrameParseResult =
     readonly reason: string;
     readonly disposition: "deny" | "silent" | "close";
     readonly frameType?: string;
+    readonly toolName?: HermesMemoryToolName;
     readonly requestId?: string;
   };
 
@@ -168,7 +178,7 @@ export const HERMES_MEMORY_WIRE_SCHEMAS = Object.freeze({
       tags: stringArrayField,
       passage_id: stringField,
     }, ["tags", "passage_id"]),
-    // The closed memory_get schema is the only unknown-key refusal; parseToolArguments forwards only { passage_id } to the core.
+    // The closed memory_get schema rejects unknown keys; parseToolArguments forwards only { passage_id } to the core.
     memory_get: schema(["passage_id"], { passage_id: stringField }),
     memory_search: schema([], {
       text: stringField,
@@ -180,7 +190,11 @@ export const HERMES_MEMORY_WIRE_SCHEMAS = Object.freeze({
       const hasQuery = typeof args.query === "string";
       return hasText !== hasQuery;
     }),
-  } satisfies SchemaTable),
+    memory_recall: schema(["query"], { query: stringField }),
+    sign_statement: schema(["statement"], { statement: stringField }),
+    export_memory: schema(["scope"], { scope: literal("all") }),
+    protection_rules: schema([], {}),
+  } satisfies Record<HermesMemoryToolName, ObjectSchema>),
 });
 
 export function parseRelayToNode(bytes: Uint8Array): RelayToNodeParseResult {
@@ -360,6 +374,10 @@ function parseToolArguments(name: HermesMemoryToolName, args: Record<string, unk
     };
   }
   if (name === "memory_get") return { passage_id: args.passage_id as string };
+  if (name === "memory_recall") return { query: args.query as string };
+  if (name === "sign_statement") return { statement: args.statement as string };
+  if (name === "export_memory") return { scope: "all" };
+  if (name === "protection_rules") return {};
   return {
     ...(args.text === undefined ? {} : { text: args.text as string }),
     ...(args.query === undefined ? {} : { query: args.query as string }),
@@ -380,7 +398,8 @@ function encodeResponse(connectionId: string, requestId: string, publicPayloadBy
   }, HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay.response);
 }
 
-function shouldUseDenial(requestId: string, publicPayloadBytes: Uint8Array): boolean {
+/** Check the exact public bytes against the relay response envelope contract. */
+export function shouldUseDenial(requestId: string, publicPayloadBytes: Uint8Array): boolean {
   if (publicPayloadBytes.byteLength > MAX_RESULT_FRAME_BYTES) return true;
   let parsed: Record<string, unknown>;
   try {
@@ -436,8 +455,9 @@ function isRequestId(value: unknown): value is string {
   return typeof value === "string" && REQUEST_ID_PATTERN.test(value);
 }
 
-function isHermesMemoryToolName(value: string): value is HermesMemoryToolName {
-  return value === "memory_insert" || value === "memory_get" || value === "memory_search";
+/** Recognize only the shared catalog, including when malformed arguments are refused. */
+export function isHermesMemoryToolName(value: string): value is HermesMemoryToolName {
+  return (HERMES_MEMORY_TOOL_NAMES as readonly string[]).includes(value);
 }
 
 function requireRequestId(value: string): void {
@@ -474,7 +494,9 @@ function rejectPublic(reason: string, frame?: Record<string, unknown>): PublicFr
     const requestId = isRequestId(frame?.request_id) ? frame.request_id : undefined;
     return requestId === undefined
       ? { kind: "public_rejection", reason, disposition: "close", frameType }
-      : { kind: "public_rejection", reason, disposition: "deny", frameType, requestId };
+      : { kind: "public_rejection", reason, disposition: "deny", frameType, requestId,
+          ...(frameType === "tools_call" && typeof frame?.name === "string" && isHermesMemoryToolName(frame.name)
+            ? { toolName: frame.name } : {}) };
   }
   if (frameType === "cancel" || frameType === "shutdown" || frameType === "ping") {
     return { kind: "public_rejection", reason, disposition: "silent", frameType };
