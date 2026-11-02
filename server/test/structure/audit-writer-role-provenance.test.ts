@@ -1,4 +1,6 @@
+// fail-before-exempt: A1b extends the existing provenance guard to confine recovery clocks, roots and sweep resets to declaring modules and tests.
 import { readdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -19,9 +21,12 @@ describe("audit writer role provenance", () => {
     const roles: string[] = [];
     for (const path of files(src)) {
       const name = relative(src, path);
+      if (name !== declaringModule && name !== "storage/cross-process-lock.ts") {
+        expect(readFileSync(path, "utf8"), name).not.toMatch(/__testMonotonicNow/);
+      }
       if (name === declaringModule) continue;
       const text = readFileSync(path, "utf8");
-      expect(text, name).not.toMatch(/__testAuditAuthorityUid|__testSetAuditWriterUidForRole/);
+      expect(text, name).not.toMatch(/__testAuditAuthorityUid|__testSetAuditWriterUidForRole|__testAuditGuardLockRoot|__testResetAuditLockTempSweepBudget/);
       const occurrences = text.match(/chainWriterRole/g) ?? [];
       let literals = 0;
       const tree = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
@@ -51,6 +56,18 @@ describe("audit writer role provenance", () => {
     expect(implementation.match(/config\?\.chainWriterRole/g)).toHaveLength(1);
     expect(implementation).toContain('this.chainWriterRole !== "operator" ? auditWriterRoleTestUids.get(this.chainWriterRole) : undefined');
     expect(read("index.ts")).toContain('export { AuditLog } from "./operational/audit-log.js"');
+  });
+
+  it("confines recovery seams across the repository to declaring files and server tests", () => {
+    const root = fileURLToPath(new URL("../../../", import.meta.url));
+    // Git's tracked and untracked source inventory includes scripts without traversing dependency/build trees.
+    const paths = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: root, encoding: "utf8" }).split("\0").filter(Boolean);
+    for (const path of new Set(paths)) {
+      if (!/\.(?:[cm]?[jt]sx?)$/.test(path) || path.startsWith("server/test/")) continue;
+      const text = readFileSync(join(root, path), "utf8");
+      if (path !== "server/src/operational/audit-log.ts") expect(text, path).not.toMatch(/__testAuditGuardLockRoot|__testResetAuditLockTempSweepBudget/);
+      if (path !== "server/src/operational/audit-log.ts" && path !== "server/src/storage/cross-process-lock.ts") expect(text, path).not.toMatch(/__testMonotonicNow/);
+    }
   });
 
   it("pins each diagnostic construction as read-only", () => {

@@ -1,0 +1,9 @@
+{
+  "provenance": "captured erik-mac 2026-11-01",
+  "command": "/bin/ps -p <pid> -o lstart=",
+  "env": {
+    "LC_ALL": "C",
+    "TZ": "UTC"
+  },
+  "bytes_base64": "U3VuIE5vdiAgMSAxMDo0Njo0MSAyMDI2ICAgIAo="
+}

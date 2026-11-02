@@ -1,10 +1,4 @@
-// fail-before-exempt: pins pre-existing #944/#1056 lock-recovery + lock-createOwner
-// semantics that are already on main; this PR only extends makeLog's ownership
-// test seams, decoupling the #1056 createOwner tests from the host uid after PR
-// #1084's F2 deep-walk and this PR's three-namespace initialization. No test
-// here should go red-against-main; the deep-walk and namespace-chain handback
-// themselves are covered by audit-log-namespace-dir-owner.test.ts (which is
-// not exempt).
+// fail-before-exempt: A1b preserves token-less assertions, gives fixture directories explicit private modes for the guard, and replaces only the authorized age sweep with strict-name liveness.
 import { mkdtemp, rm, writeFile, readFile, rename, mkdir, stat, utimes, readdir } from "node:fs/promises";
 import { tmpdir, uptime as osUptime } from "node:os";
 import type { Stats } from "node:fs";
@@ -38,6 +32,8 @@ describe("AuditLog stale write-lock recovery (Finding F)", () => {
       integrityMode: "lenient",
     });
     const lockPath = join(storagePath, "_audit", ".audit-write.lock");
+    // The production guard requires a private audit directory, independently of the test runner umask.
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
     return { log, lockPath };
   }
 
@@ -393,7 +389,8 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
       ...config,
     });
     const lockPath = join(storagePath, "_audit", ".audit-write.lock");
-    await mkdir(dirname(lockPath), { recursive: true });
+    // Match production namespace custody without changing the runner's umask.
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
     return { log, lockPath, internals: log as unknown as LockInternals };
   }
 
@@ -801,33 +798,23 @@ describe("AuditLog write-lock robustness (#944 cluster)", () => {
     await expect(stat(lockPath).then((s) => s.ino)).resolves.toBe(republishedIno);
   });
 
-  // Finding 3 — orphan `.acquire.*.tmp` GC. A crash between link() and cleanup
-  // strands an acquire-temp permanently. The once-per-process startup sweep GCs
-  // temps older than the id-less bound, and age-gates so a CONCURRENT acquirer's
-  // in-flight temp is never reaped. One append triggers the lazy sweep.
-  it("sweeps an orphaned acquire-temp older than the bound but keeps a recent one", async () => {
-    // Bound of 3s: the 5s-old temp exceeds it (swept); a "now" temp stays under
-    // it even allowing for the append+flush latency below (kept).
+  // A dead pid proves an orphan regardless of age; a live pid's old temp remains.
+  it("sweeps a dead fresh acquire-temp but keeps a live old one", async () => {
     const { log, lockPath } = await makeLog({ idlessStaleLockMs: 3000 });
     const auditDir = dirname(lockPath);
-    const oldTemp = join(auditDir, ".audit-write.lock.acquire.99999.0.deadbeef.tmp");
-    const recentTemp = join(auditDir, ".audit-write.lock.acquire.88888.0.cafef00d.tmp");
-    await writeFile(oldTemp, JSON.stringify({ pid: 99999 }));
-    await writeFile(recentTemp, JSON.stringify({ pid: 88888 }));
-    const old = new Date(Date.now() - 5000); // 5s old, > 3s bound → swept
-    await utimes(oldTemp, old, old);
-    // recentTemp keeps its "now" mtime → within the bound → NOT swept.
-
-    // The first write-lock acquire runs the one-shot sweep.
+    // 24 hex characters encode the writer's 12 random bytes.
+    const deadName = ".audit-write.lock.acquire.2147483647.0." + "a".repeat(24) + ".tmp";
+    const liveName = `.audit-write.lock.acquire.${process.pid}.0.` + "b".repeat(24) + ".tmp";
+    const deadTemp = join(auditDir, deadName);
+    const liveTemp = join(auditDir, liveName);
+    await writeFile(deadTemp, "fresh dead temp");
+    await writeFile(liveTemp, "live temp");
+    const old = new Date("2000-01-01T00:00:00.000Z");
+    await utimes(liveTemp, old, old);
     await log.append("l1", "egress_allowed", "id-1", { n: 1 });
     await log.flush();
-
-    await expect(stat(oldTemp)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(recentTemp)).resolves.toBeDefined();
-    // The append's own acquire-temp left no litter either.
-    const leftovers = (await readdir(auditDir)).filter(
-      (f) => f.includes(".audit-write.lock.acquire.") && f !== ".audit-write.lock.acquire.88888.0.cafef00d.tmp",
-    );
-    expect(leftovers).toEqual([]);
+    await expect(stat(deadTemp)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(liveTemp)).resolves.toBeDefined();
+    expect((await readdir(auditDir)).filter(f => f.includes(".audit-write.lock.acquire.") && f !== liveName)).toEqual([]);
   });
 });

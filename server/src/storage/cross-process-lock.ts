@@ -46,7 +46,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { access, chmod, lstat, open, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
 import { constants, lstatSync } from "node:fs";
@@ -213,6 +213,7 @@ export async function probeKernelBackedCrossProcessLockCapability(
   host: NodeJS.Platform = platform(),
   _legacyCanExecute?: (command: string) => Promise<void>,
   targetLockDirectory?: string,
+  runtimeRoot?: string,
 ): Promise<KernelLockCapability> {
   if (!kernelBackedCrossProcessLockPlatformSupported(host)) {
     return { available: false, reason: `unsupported host platform ${host}` };
@@ -225,7 +226,7 @@ export async function probeKernelBackedCrossProcessLockCapability(
   }
   try {
     await access(kernelReaperCommand(host));
-    const runtimeDir = await ensureKernelSocketRuntimeDirectory();
+    const runtimeDir = await ensureKernelSocketRuntimeDirectory(undefined, undefined, runtimeRoot);
     await assertCachedLocalLockFilesystem(runtimeDir, host);
     if (targetLockDirectory !== undefined) {
       await assertLocalLockFilesystemAtExistingAncestor(targetLockDirectory, host);
@@ -260,6 +261,16 @@ export function resetKernelLockPoisonForTests(): void {
 }
 
 export interface CrossProcessLockOptions {
+  /** Explicit validated rendezvous; must match runtimeRoot in operational/audit-log.ts. */
+  runtimeRoot?: string;
+  /** Custody principal for the target directory; must match expectedDirOwnerUid in operational/audit-log.ts. */
+  expectedDirOwnerUid?: number;
+  /** False omits the target scaffold; runtime reaper scaffolds remain required. */
+  scaffold?: boolean;
+  /** Caller deadline in performance.now units; must match monotonicDeadlineMs in operational/audit-log.ts. */
+  monotonicDeadlineMs?: number;
+  /** Test clock in deadline units; must match __testMonotonicNow in operational/audit-log.ts. */
+  __testMonotonicNow?: () => number;
   /** Bounded wait before failing closed (default {@link CROSS_PROCESS_LOCK_TIMEOUT_MS}). */
   timeoutMs?: number;
   /** Poll interval while a lock is held (default {@link CROSS_PROCESS_LOCK_RETRY_MS}). */
@@ -1850,14 +1861,17 @@ async function withKernelPathLock<T>(
   let expectedIdentity: KernelDirectoryIdentity;
   try {
     const stats = await lockDirHandle.stat({ bigint: true });
-    const uid = process.getuid?.();
+    // Target custody may be handed back by root; runtime socket ownership remains the invoking uid.
+    const uid = options.expectedDirOwnerUid ?? process.getuid?.();
     if (
       uid === undefined ||
       Number(stats.uid) !== uid ||
       (Number(stats.mode) & 0o077) !== 0
     ) {
       throw new CrossProcessLockError(
-        `custody lock directory must be owned by the invoking uid with mode 0700 (${lockDir})`,
+        options.expectedDirOwnerUid === undefined
+          ? `custody lock directory must be owned by the invoking uid with mode 0700 (${lockDir})`
+          : `custody lock directory must be owned by required uid ${uid} with mode 0700 (${lockDir})`,
         "capability",
       );
     }
@@ -1865,7 +1879,7 @@ async function withKernelPathLock<T>(
   } finally {
     await lockDirHandle.close();
   }
-  await ensureInertLockScaffold(lockDir, lockFileName);
+  if (options.scaffold !== false) await ensureInertLockScaffold(lockDir, lockFileName);
   const lockIdentity = `${expectedIdentity.dev}:${expectedIdentity.ino}:${lockFileName}`;
   const acquired = await acquireKernelLock(
     lockIdentity,
@@ -2064,16 +2078,31 @@ async function acquireKernelLock(
   options: CrossProcessLockOptions,
   abortSignal?: AbortSignal,
 ): Promise<AcquiredKernelLock> {
+  const monotonicNow = options.__testMonotonicNow ?? (() => performance.now());
+  let deadline = options.monotonicDeadlineMs ?? Infinity;
+  let unknownOwner = false;
+  const assertBudget = () => {
+    // A timed-out acquisition must never enter its callback; retain the last refusal's meaning across retry delays.
+    if (monotonicNow() >= deadline) {
+      throw new CrossProcessLockError(
+        unknownOwner
+          ? `kernel custody lock owner liveness is indeterminate (${lockIdentity}); refusing to unlink`
+          : `kernel custody lock ${lockIdentity} remained held for ${timeoutMs}ms (acquisition budget exhausted)`,
+        unknownOwner ? "io" : "contention",
+      );
+    }
+  };
+  assertBudget();
   assertLockWaitNotAborted(abortSignal, lockIdentity);
   const host = options.__testPlatform ?? platform();
-  const capability = await probeKernelBackedCrossProcessLockCapability(host);
+  const capability = await probeKernelBackedCrossProcessLockCapability(host, undefined, undefined, options.runtimeRoot);
   if (!capability.available) {
     throw new CrossProcessLockError(
       `kernel-backed cross-process locking is unavailable: ${capability.reason}`,
       "capability",
     );
   }
-  const runtimeDir = await ensureKernelSocketRuntimeDirectory();
+  const runtimeDir = await ensureKernelSocketRuntimeDirectory(undefined, undefined, options.runtimeRoot);
   await assertCachedLocalLockFilesystem(runtimeDir);
   const runtimeIdentity = await lstat(runtimeDir, { bigint: true });
   const digest = createHash("sha256").update(lockIdentity).digest("hex");
@@ -2095,9 +2124,14 @@ async function acquireKernelLock(
       "capability",
     );
   }
-  const started = Date.now();
+  // The existing local timeout starts after capability setup; the caller's shared deadline covers setup too.
+  deadline = Math.min(monotonicNow() + timeoutMs, options.monotonicDeadlineMs ?? Infinity);
   let contentions = 0;
+  let firstAttempt = true;
   for (;;) {
+    // A zero local wait retains its one nonblocking probe, but an expired caller deadline never starts a probe.
+    if (!firstAttempt || timeoutMs > 0 || options.monotonicDeadlineMs !== undefined) assertBudget();
+    firstAttempt = false;
     // Every retry observes the caller deadline before attempting another bind.
     assertLockWaitNotAborted(abortSignal, socketPath);
     const server = createServer((socket) => socket.destroy());
@@ -2119,6 +2153,7 @@ async function acquireKernelLock(
       // The hook is test-only scheduling control; no hook means no await and no yield.
       const hook = options.__testAfterKernelSocketAcquired;
       if (hook !== undefined) await hook(socketPath);
+      assertBudget();
       let testHelper: ChildProcessWithoutNullStreams | undefined;
       if (options.__testAfterKernelHolderAcquired) {
         testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
@@ -2140,6 +2175,7 @@ async function acquireKernelLock(
       };
     } catch (error) {
       await closeServer(server).catch(() => undefined);
+      if (error instanceof CrossProcessLockError && error.kind === "contention") throw error;
       const code = errorCode(error);
       if (code !== "EADDRINUSE") {
         throw new CrossProcessLockError(
@@ -2157,6 +2193,7 @@ async function acquireKernelLock(
       const probe = options.__testForceKernelProbeUnknown?.() === true
         ? "unknown"
         : await probeSocketOwner(socketPath);
+      unknownOwner = probe === "unknown";
       if (probe === "stale") {
         const reaperOutcome = await reapStaleSocketWithSerializedAuthority(
           socketPath,
@@ -2171,7 +2208,7 @@ async function acquireKernelLock(
         // caller's bound; never turn normal serialized progress into an I/O fault.
         contentions += 1;
         options.onContended?.(contentions);
-        if (Date.now() - started >= timeoutMs) {
+        if (monotonicNow() >= deadline) {
           throw new CrossProcessLockError(
             `kernel custody lock ${socketPath} remained held for ${timeoutMs}ms`,
             "contention",
@@ -2186,7 +2223,7 @@ async function acquireKernelLock(
         // successor bind/release can transiently make one connect probe ambiguous.
         contentions += 1;
         options.onContended?.(contentions);
-        if (Date.now() - started >= timeoutMs) {
+        if (monotonicNow() >= deadline) {
           throw new CrossProcessLockError(
             `kernel custody lock owner liveness is indeterminate (${socketPath}); refusing to unlink`,
             "io",
@@ -2197,7 +2234,7 @@ async function acquireKernelLock(
       }
       contentions += 1;
       options.onContended?.(contentions);
-      if (Date.now() - started >= timeoutMs) {
+      if (monotonicNow() >= deadline) {
         throw new CrossProcessLockError(
           `kernel custody lock ${socketPath} remained held for ${timeoutMs}ms`,
           "contention",
@@ -2527,6 +2564,31 @@ function linuxUserRuntimeDir(uid: number): string {
   return `/run/user/${uid}`;
 }
 
+/** Resolve audit recovery rendezvous from real uid and platform, never environment or authority seams. */
+export function resolveAuditGuardRuntimeRoot(realUid: number, host: NodeJS.Platform, darwinUserTempDir?: string): string {
+  if (!Number.isSafeInteger(realUid) || realUid < 0) throw new Error("audit guard requires a real Unix uid");
+  let root: string;
+  if (host === "linux") root = realUid === 0 ? "/run/sanctuary-audit-guard-0" : `/run/user/${realUid}/sanctuary-audit-guard`;
+  else if (host === "darwin" && darwinUserTempDir !== undefined) root = darwinUserTempDir.replace(/\/$/, "");
+  else throw new Error(`audit guard runtime root unavailable for ${host}`);
+  // Captured Darwin root is 48 bytes; + separator(1) + reaper entry(47) = 96, below the 100-byte limit.
+  if (!isAbsolute(root) || !custodyLockRootFits(root)) throw new Error(`audit guard runtime root is invalid or too long: ${root}`);
+  return root;
+}
+
+/** One second bounds the environment-free Darwin directory query. */
+export const AUDIT_GUARD_GETCONF_TIMEOUT_MS = 1000;
+let darwinAuditTemp: Promise<string> | undefined;
+/** Read this real uid's OS-selected directory once; a failed query never selects a fallback. */
+export function auditGuardDarwinUserTempDir(): Promise<string> {
+  return darwinAuditTemp ??= new Promise((resolve, reject) => {
+    execFile("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { env: {}, timeout: AUDIT_GUARD_GETCONF_TIMEOUT_MS, encoding: "utf8" }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout.replace(/\n$/, ""));
+    });
+  });
+}
+
 /**
  * A root is usable only if every entry we compose beneath it
  * (`${root}/${40-hex}${suffix}`, longest suffix `.reaper`) stays within the
@@ -2796,6 +2858,7 @@ export async function ensureKernelSocketRuntimeDirectory(
     // the verified inode. Production callers pass nothing.
     __testAfterAncestryVerified?: () => void | Promise<void>;
   },
+  runtimeRoot?: string,
 ): Promise<string> {
   if (typeof process.getuid !== "function") {
     throw new Error("Unix process owner identity is unavailable");
@@ -2804,10 +2867,12 @@ export async function ensureKernelSocketRuntimeDirectory(
   const gid = typeof process.getgid === "function" ? process.getgid() : -1;
   // Deterministic root selection (uid + platform + uniform env only). Production
   // reads the real environment; tests inject a context to exercise precedence.
-  const path = resolveCustodyLockRoot(
+  // Explicit audit rendezvous bypasses environment selection on BOTH probe and acquire.
+  const path = runtimeRoot ?? resolveCustodyLockRoot(
     uid,
     context ?? { env: process.env, platform: platform() },
   );
+  if (!isAbsolute(path) || !custodyLockRootFits(path)) throw new CrossProcessLockError(`invalid runtime root ${path}`, "capability");
   // BUG 3: verify the FULL ancestor chain up to '/' is safe BEFORE creating the
   // leaf, so no world/group-writable or foreign ancestor sits above the 0700 lock
   // dir, and an absent required ancestor (e.g. no /run/user/<uid>) fails closed
