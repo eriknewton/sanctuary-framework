@@ -96,9 +96,9 @@ cffi==2.0.0 \
     --hash=sha256:fc7de24befaeae77ba923797c7c87834c73648a05a4bde34b3b7e5588973a453 \
     --hash=sha256:fe562eb1a64e67dd297ccc4f5addea2501664954f2692b69a76449ec7913ecbf
     # via cryptography
-concordia-protocol==0.6.0 \
-    --hash=sha256:49857e6ae8e943e5bacbc7550fe9e269ee31234d2d65f98c87eb32ff8f19fed5 \
-    --hash=sha256:eb0d7f7e8102acd31b8f5cad5796c5b9c4b61ea775bbe50a8cfd56601529ce8e
+concordia-protocol==0.10.0 \
+    --hash=sha256:18eac2e3b82debfea737c4f635c36cf71a9b095c3ad5a987f90b8a4047f4a403 \
+    --hash=sha256:8390d7639956aecf48a13d5056590c89218dae6fafb2ce450a95bdf4567c94a3
     # via -r requirements.in
 cryptography==50.0.0 \
     --hash=sha256:031e2d5dd4bb9caa3ca9c82e5a197fd8ae680232cee62603d1a813f3f07e3d03 \
