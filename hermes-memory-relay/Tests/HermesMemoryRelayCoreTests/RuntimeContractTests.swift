@@ -193,6 +193,12 @@ final class RuntimeContractTests: XCTestCase {
         }
     }
 
+    func testClientCancelDuringCorpusLockWaitWritesNothing() throws {
+        // A save parked behind a held corpus lock and canceled by the client answers the ordinary refusal and writes nothing.
+        try nativeRun(body: approvedCLI(phase: "cancel"), expectsReady: true,
+                      witness: "clientCancelDuringCorpusLockWaitWritesNothing", seeded: true)
+    }
+
     func testRestartRequiresExplicitStaleLockRecovery() throws {
         let killWithLock = Self.realCLIClient.replacingOccurrences(of: "console.log('WITNESS_PASS');", with: """
         const {FilesystemStorage}=await load('src/storage/filesystem.ts');
@@ -617,8 +623,25 @@ final class RuntimeContractTests: XCTestCase {
         const onDrained=HermesBridgeCore.prototype.onDrained;
         HermesBridgeCore.prototype.onDrained=function(listener){core=this;return onDrained.call(this,listener);};
         const {FilesystemStorage}=await load('src/storage/filesystem.ts');
-        const {MEMORY_BATCH_LOCK_NAMESPACE}=await load('src/sdw/adapters/sdw-memory-backend.ts');
+        const {MEMORY_BATCH_LOCK_NAMESPACE,sdwMemoryCorpusBatchLockFile}=await load('src/sdw/adapters/sdw-memory-backend.ts');
         const {SDW_DOCUMENT_CORPUS_NAMESPACE}=await load('src/sdw/records.ts');
+        const {HermesApprovalLedger}=await load('src/hermes-memory-bridge/approval-ledger.ts');
+        const lockStorage=new FilesystemStorage(path.join(root,'Library','Application Support','Sanctuary','Fortresses','hermes-memory','state'));
+        cancelWitness.lockPath=path.join(lockStorage.namespacePath(MEMORY_BATCH_LOCK_NAMESPACE),sdwMemoryCorpusBatchLockFile());
+        cancelWitness.parked=new Promise(resolve=>{cancelWitness.onParked=resolve;});
+        cancelWitness.delivered=new Promise(resolve=>{cancelWitness.onDelivered=resolve;});
+        const ledgerCancel=HermesApprovalLedger.prototype.cancel;
+        HermesApprovalLedger.prototype.cancel=function(entryId){
+          const result=ledgerCancel.call(this,entryId);
+          if(armed && phase==='cancel') cancelWitness.onDelivered(this.snapshot());
+          return result;
+        };
+        const ledgerCommitCheck=HermesApprovalLedger.prototype.commitCheck;
+        HermesApprovalLedger.prototype.commitCheck=function(entryId,input){
+          const result=ledgerCommitCheck.call(this,entryId,input);
+          if(armed && phase==='cancel') cancelWitness.commit={decision:result.decision,ledger:this.snapshot()};
+          return result;
+        };
         const withLock=FilesystemStorage.prototype.withNamespaceLock;
         const storageWrite=FilesystemStorage.prototype.write;
         let armed=false, writes=0;
@@ -634,9 +657,17 @@ final class RuntimeContractTests: XCTestCase {
               },{once:true});
             });
           }
+          if(armed && phase==='cancel' && namespace===MEMORY_BATCH_LOCK_NAMESPACE) {
+            // The fixture holds the real lock file, so this save waits in the product lock loop until it is removed.
+            cancelWitness.lockWaits++;
+            const held=operation;
+            operation=async lease=>{cancelWitness.acquired=true;return held(lease);};
+            cancelWitness.onParked();
+          }
           return withLock.call(this,namespace,name,operation,options);
         };
         FilesystemStorage.prototype.write=async function(namespace,key,data) {
+          if(armed && phase==='cancel' && namespace===SDW_DOCUMENT_CORPUS_NAMESPACE) cancelWitness.mutations++;
           if(armed && phase==='write' && namespace===SDW_DOCUMENT_CORPUS_NAMESPACE && key.startsWith('doc.mem.hermes.')) {
             writes++;
             process.kill(process.ppid,'SIGTERM');
@@ -649,18 +680,72 @@ final class RuntimeContractTests: XCTestCase {
           }
           return storageWrite.call(this,namespace,key,data);
         };
+        const storageDelete=FilesystemStorage.prototype.delete;
+        FilesystemStorage.prototype.delete=async function(namespace,...rest) {
+          if(armed && phase==='cancel' && namespace===SDW_DOCUMENT_CORPUS_NAMESPACE) cancelWitness.mutations++;
+          return storageDelete.call(this,namespace,...rest);
+        };
         """
         var body = Self.realCLIClient.replacingOccurrences(of: "if(fs.existsSync(socketPath))", with: setup + "\nif(fs.existsSync(socketPath))")
-        // The approval capability is captured only in this test process, never exposed by the product shell.
+        // Admission is immediate under catalog v2: the hooks are armed right before the save and the fixture then
+        // waits forever, so the lock or write hook (not a response) decides the witness. Must match the save line in realCLIClient.
         body = body.replacingOccurrences(of: "const before=fs.readdirSync(corpus).sort();", with: "const before=fs.readdirSync(corpus).sort(); armed=true;")
-        let cancellation = "client.write(frame({type:'cancel',mcp_request_id:'insert'}));"
-        body = body.replacingOccurrences(of: cancellation, with: "const entry=core.snapshot().ledger.entry; core.ownerApprove(entry.id,entry.textSha256); await new Promise(()=>{});")
+        let save = "const saved=await call({type:'tools_call',request_id:'insert',name:'memory_insert',arguments:{text:'Saved fixture text',taint:'user_content'}});"
+        precondition(body.contains(save), "approvedCLI: the save line drifted from realCLIClient")
+        body = body.replacingOccurrences(of: save, with: phase == "cancel" ? Self.cancelDuringLockWait :
+            "client.write(frame({type:'tools_call',request_id:'insert',name:'memory_insert',arguments:{text:'Saved fixture text',taint:'user_content'}})); await new Promise(()=>{});")
         // exercise is outside the boot closure, so the test-only capture lives in its enclosing script scope.
-        body = "let core, armed=false;\n" + body.replacingOccurrences(of: "        let core;", with: "")
+        body = "let core, armed=false;\nconst cancelWitness={lockWaits:0,acquired:false,mutations:0};\n" + body.replacingOccurrences(of: "        let core;", with: "")
             .replacingOccurrences(of: "let core;", with: "")
             .replacingOccurrences(of: "let armed=false, writes=0;", with: "let writes=0;")
         return body
     }
+
+    // Runs inside the real CLI client in place of the immediate save; the relay and client stay alive until the witness passes.
+    private static let cancelDuringLockWait = """
+    {
+      const witness='clientCancelDuringCorpusLockWaitWritesNothing';
+      fs.mkdirSync(path.dirname(cancelWitness.lockPath),{recursive:true,mode:0o700});
+      fs.writeFileSync(cancelWitness.lockPath,'held',{flag:'wx',mode:0o600});
+      client.write(frame({type:'tools_call',request_id:'insert',name:'memory_insert',arguments:{text:'Canceled fixture text',taint:'user_content'}}));
+      await cancelWitness.parked;
+      assert.equal(cancelWitness.acquired,false,witness+': the save waits behind the held corpus lock');
+      client.write(frame({type:'cancel',mcp_request_id:'insert'}));
+      const delivered=await cancelWitness.delivered;
+      assert.equal(delivered.entry.state,'INSERT_STARTED',witness+': cancel reaches the started save');
+      assert.equal(delivered.entry.started,true,witness+': cancel reaches the started save');
+      assert.equal(delivered.entry.seen.cancel,true,witness+': cancel is recorded');
+      assert.equal(delivered.stopped,false,witness+': the bridge is running when cancel lands');
+      assert.equal(queue.length,0,witness+': no answer before the lock is released');
+      fs.rmSync(cancelWitness.lockPath);
+      const refused=await next();
+      assert.equal(refused.type,'result',witness+': the refusal is an ordinary result: '+JSON.stringify(refused));
+      assert.equal(refused.request_id,'insert',witness);
+      assert.deepEqual(JSON.parse(refused.payload.content[0].text),
+        {outcome:'unavailable',message:'Sanctuary could not take this request right now; nothing was done.'},witness+': ordinary refusal outcome');
+      assert.equal(cancelWitness.acquired,true,witness+': the refusal is decided inside the real corpus lock');
+      assert.equal(cancelWitness.commit.decision,'refuse',witness+': the commit check refuses');
+      assert.equal(cancelWitness.commit.ledger.entry.state,'CANCELED',witness+': the client cancel decides the refusal');
+      assert.equal(cancelWitness.commit.ledger.entry.terminalReason,'cancel',witness+': the client cancel decides the refusal');
+      assert.equal(cancelWitness.commit.ledger.entry.seen.stop,false,witness+': shutdown plays no part');
+      assert.equal(cancelWitness.commit.ledger.stopped,false,witness+': shutdown plays no part');
+      assert.equal(fs.existsSync(cancelWitness.lockPath),false,witness+': the save releases the corpus lock');
+      assert.deepEqual(fs.readdirSync(corpus).sort(),before,witness+': cancel writes zero documents');
+      assert.equal(cancelWitness.mutations,0,witness+': no corpus write or delete');
+      // A later answer on the same live client follows the settled save, so any late write would already be visible.
+      const quiet=await call({type:'tools_call',request_id:'after-cancel',name:'memory_get',arguments:{passage_id:'seed'}});
+      assert.equal(JSON.parse(quiet.payload.content[0].text).passage.text,'Cedar lantern fixture text',witness+': the relay still answers');
+      assert.equal(core.snapshot().ledger.entry,undefined,witness+': the canceled save has settled');
+      assert.equal(cancelWitness.lockWaits,1,witness+': one lock wait');
+      assert.equal(cancelWitness.mutations,0,witness+': no late corpus write');
+      assert.deepEqual(fs.readdirSync(corpus).sort(),before,witness+': no late corpus write');
+      client.destroy();
+      console.log('WITNESS_PASS');
+      clearTimeout(timer);
+      process.kill(process.ppid,'SIGTERM');
+      return;
+    }
+    """
 
     private static let refusingCLI = """
     boot.then(async()=>{
@@ -713,7 +798,7 @@ final class RuntimeContractTests: XCTestCase {
       const call=async(value)=>{client.write(frame(value));return await next();};
       assert.equal((await call({type:'hello',request_id:'hello',protocol_version:'2026-10-12',client_name:'fixture'})).type,'result','hello');
       const catalog=await call({type:'tools_list',request_id:'catalog'});
-      assert.deepEqual(catalog.payload.tools.map(t=>t.name).sort(),['memory_get','memory_insert','memory_search'],'realRelayCatalogIsExact');
+      assert.deepEqual(catalog.payload.tools.map(t=>t.name).sort(),['export_memory','memory_get','memory_insert','memory_recall','memory_search','protection_rules','sign_statement'],'realRelayCatalogIsExact');
       const get=await call({type:'tools_call',request_id:'get',name:'memory_get',arguments:{passage_id:'seed'}});
       assert.equal(get.type,'result','byte-equal get: '+JSON.stringify(get));
       const payload=JSON.parse(get.payload.content[0].text);
@@ -733,13 +818,24 @@ final class RuntimeContractTests: XCTestCase {
       assert.equal(fs.existsSync(path.join(root,'relay.sock')),false,'runtimeUsesOnlyDocumentedPrivateHandles');
       const corpus=path.join(root,'Library','Application Support','Sanctuary','Fortresses','hermes-memory','state','_sdw_document_corpus');
       const before=fs.readdirSync(corpus).sort();
-      client.write(frame({type:'tools_call',request_id:'insert',name:'memory_insert',arguments:{text:'Unapproved fixture text',taint:'user_content',passage_id:'unapproved'}}));
-      const log=path.join(root,'bridge.log');
-      while(!fs.readFileSync(log,'utf8').includes('owner approval is deferred')) await new Promise(resolve=>setTimeout(resolve,10));
-      assert.equal(queue.length,0,'production insert remains pending');
-      client.write(frame({type:'cancel',mcp_request_id:'insert'}));
-      await next();
-      assert.deepEqual(fs.readdirSync(corpus).sort(),before,'cancel writes zero documents');
+      // Catalog v2: an own-scope save begins at once (no owner hold) and answers with the ordinary saved result.
+      // No passage_id: the restart scenario saves twice into one fortress and a fixed id would collide on the second run.
+      const saved=await call({type:'tools_call',request_id:'insert',name:'memory_insert',arguments:{text:'Saved fixture text',taint:'user_content'}});
+      assert.equal(saved.type,'result','own-scope save answers with a result: '+JSON.stringify(saved));
+      assert.equal(JSON.parse(saved.payload.content[0].text).outcome,'saved','ordinary saved outcome');
+      const {passage_id,document_id}=JSON.parse(saved.payload.content[0].text).passage;
+      const {encodeFilesystemStorageName}=await load('src/storage/filesystem-name-codec.ts');
+      const file=key=>encodeFilesystemStorageName(key)+'.enc';
+      const added=fs.readdirSync(corpus).filter(name=>!before.includes(name)).sort();
+      // One short passage is one chunk, one provenance companion and one document record, all bound to the returned document id.
+      assert.deepEqual(added.filter(name=>name.startsWith(encodeFilesystemStorageName('doc.mem.hermes.')) && name.endsWith('.enc')),[file('doc.'+document_id)],'the save writes exactly one document record');
+      assert.equal(added.length,3,'the save writes exactly three corpus files: '+JSON.stringify(added));
+      assert.equal(added.includes(file('prov.'+document_id)),true,'the save writes its provenance companion: '+JSON.stringify(added));
+      const chunkPrefix=encodeFilesystemStorageName('chunk.'+document_id+'.');
+      assert.equal(added.filter(name=>name.startsWith(chunkPrefix)).length,1,'the save writes exactly one chunk: '+JSON.stringify(added));
+      const readBack=await call({type:'tools_call',request_id:'readback',name:'memory_get',arguments:{passage_id}});
+      assert.equal(readBack.type,'result','the saved passage reads back through the relay: '+JSON.stringify(readBack));
+      assert.equal(JSON.parse(readBack.payload.content[0].text).passage.text,'Saved fixture text','the saved passage reads back through the relay');
       client.destroy();
       console.log('WITNESS_PASS');
       clearTimeout(timer);
