@@ -284,6 +284,8 @@ const STORAGE_READ_ONLY: ReadonlySet<string> = new Set([
   "readAtPath",
   "readFileCustody",
   "readFileCustodyWithStats",
+  // Must match READ_ONLY_STORAGE_DELEGATED_METHODS in storage/read-only-guard.ts.
+  "listKeys",
   "list",
   "listNamespaces",
   "exists",

@@ -223,12 +223,13 @@ describe("round 2 coverage read bounds", () => {
       // Freeze the backstop clock so a timed reload cannot discard the prefix during this schedule.
       clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
       const firstSequence = 1; // Audit chains start at sequence one.
-      const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
-      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const retainedCount = 2; // Configured entry cap; a due prune targets one fewer entry.
+      const appendedCount = retainedCount + firstSequence; // One extra append crosses the cap and rotates the prefix.
       const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
       const readHead = audit.getChainHead.bind(audit);
       for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
-      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
+      // The minimum one-entry margin leaves only the last append as the authenticated base.
+      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: appendedCount });
       const spy = vi.spyOn(audit, "getChainHead").mockImplementationOnce(async () => {
         const snapshot = await readHead();
         await append(audit, appendedCount + 1);
@@ -255,13 +256,14 @@ describe("round 2 coverage read bounds", () => {
       let now = NOW;
       clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       const firstSequence = 1; // Audit chains start at sequence one.
-      const retainedCount = 2; // Disk keeps two entries, so a view reloaded from disk starts above the first sequence.
-      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const retainedCount = 2; // Configured entry cap; the reloaded suffix starts above the first sequence.
+      const appendedCount = retainedCount + firstSequence; // One extra append crosses the cap and rotates the prefix.
       const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount, eagerReverifyIntervalMs: reverifyMs });
       const readHead = audit.getChainHead.bind(audit);
       for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
       now += reverifyMs; // The next eager read reloads the view from disk.
-      expect((await audit.runEagerReads(() => audit.query({}))).entries).toHaveLength(retainedCount);
+      // The minimum one-entry margin leaves one disk row after this cap crossing.
+      expect((await audit.runEagerReads(() => audit.query({}))).entries).toHaveLength(retainedCount - 1);
       head = vi.spyOn(audit, "getChainHead").mockImplementationOnce(async () => {
         const snapshot = await readHead();
         await append(audit, appendedCount + 1);
@@ -282,11 +284,12 @@ describe("round 2 coverage read bounds", () => {
       // Freeze the backstop clock so a timed reload cannot discard the prefix before the eager read.
       clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
       const firstSequence = 1; // Audit chains start at sequence one.
-      const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
-      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const retainedCount = 2; // Configured entry cap; a due prune targets one fewer entry.
+      const appendedCount = retainedCount + firstSequence; // One extra append crosses the cap and rotates the prefix.
       const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
       for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
-      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
+      // The minimum one-entry margin leaves only the last append as the authenticated base.
+      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: appendedCount });
       await audit.runEagerReads(async () => {
         const retained = await audit.query({});
         const head = await audit.getChainHead();
@@ -295,8 +298,8 @@ describe("round 2 coverage read bounds", () => {
         // Must match routineWindowCoverage in posture.ts: the same full view supplies both counts and coverage.
         expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null, kernel_blocks: appendedCount });
       });
-      // A disk read loses the rotated prefix, so its smaller count cannot claim complete coverage.
-      expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention", kernel_blocks: retainedCount });
+      // A disk read keeps the cap minus its one-entry margin and cannot claim complete coverage.
+      expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention", kernel_blocks: retainedCount - 1 });
     } finally {
       clock?.mockRestore();
     }
@@ -317,7 +320,7 @@ describe("round 2 coverage read bounds", () => {
     expect(await eagerDigest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
   });
   it("withholds coverage when the retained view is larger than one read", async () => {
-    // Retention keeps entries 2 and 3, so the uncut view locates the floor entry and reads retention.
+    // Retention keeps entry 3, so the full retained view locates the floor entry and reads retention.
     const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: 2 });
     for (const [seq, at] of [[1, NOW - DAY - 3], [2, NOW - DAY - 2], [3, NOW - 1000]] as const) await append(audit, seq, { timestamp: new Date(at).toISOString() });
     expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention" });

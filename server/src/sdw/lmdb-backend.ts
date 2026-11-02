@@ -145,6 +145,19 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
     return entries.sort((a, b) => a.key.localeCompare(b.key));
   }
 
+  /** Must match StorageBackend.listKeys in storage/interface.ts; values stay unread. */
+  async listKeys(namespace: string, prefix = ""): Promise<string[]> {
+    const start = compositeKey(namespace, prefix);
+    const keys: string[] = [];
+    for (const rawKey of this.db.getKeys({ start })) {
+      const parsed = splitCompositeKey(rawKey);
+      if (parsed === null || parsed.namespace !== namespace) break;
+      if (!parsed.key.startsWith(prefix)) break;
+      keys.push(parsed.key);
+    }
+    return keys.sort();
+  }
+
   async exists(namespace: string, key: string): Promise<boolean> {
     return this.db.getBinary(compositeKey(namespace, key)) !== undefined;
   }

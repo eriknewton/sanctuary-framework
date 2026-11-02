@@ -126,6 +126,16 @@ export interface StorageBackend {
    * These bounds must match the enforcement in filesystem.ts and memory.ts.
    */
   listNamespaces?(): Promise<string[]>;
+
+  /**
+   * OPTIONAL names-only enumeration: every decoded key matching prefix, complete
+   * or throws, never truncated or substituted. An absent namespace directory
+   * (ENOENT) returns [] as list does. Ascending UTF-16 code-unit order; callers
+   * needing another order sort themselves. Must match the consumer comparator
+   * in operational/audit-log.ts readLatestPersistedChainState, listKeys implementations
+   * and READ_ONLY_STORAGE_DELEGATED_METHODS in read-only-guard.ts.
+   */
+  listKeys?(namespace: string, prefix?: string): Promise<string[]>;
 }
 
 /** Optional filesystem capabilities used by code that must coordinate across processes. */

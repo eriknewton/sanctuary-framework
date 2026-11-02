@@ -157,6 +157,12 @@ async function perform(
       const { namespace, args } = requestNamespaceArg(request);
       return storage.list(namespace, args[0] === undefined ? undefined : String(args[0]));
     }
+    case "listKeys": {
+      // Must match FilesystemStorage.listKeys in filesystem.ts: an omitted
+      // prefix stays undefined on both bound-namespace and base-directory routes.
+      const { namespace, args } = requestNamespaceArg(request);
+      return storage.listKeys(namespace, args[0] === undefined ? undefined : String(args[0]));
+    }
     case "exists": {
       const { namespace, args } = requestNamespaceArg(request);
       return storage.exists(namespace, String(args[0]));
