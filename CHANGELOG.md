@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- The Hermes memory bridge serves seven tools: a save into the agent's own memory runs without an approval prompt within the save allowance and is audited with the agent named, `memory_recall` returns a bounded context of matching saved passages with per-call scan work bounded after the key listing, `sign_statement` and `export_memory` answer that they are not available yet, and `protection_rules` is refused; every catalogued refusal is an ordinary tool result.
+
 ### Fixed
 
 - Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.

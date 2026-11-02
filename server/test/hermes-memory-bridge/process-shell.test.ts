@@ -1,3 +1,4 @@
+import { SdwWorkingStateStore } from "../../src/sdw/working-state-store.js";
 import { Buffer } from "node:buffer";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { closeSync, constants as fsConstants, openSync, readSync } from "node:fs";
@@ -34,6 +35,9 @@ import {
   runHermesBridgeProcess as runProductionHermesBridgeProcess,
 } from "../../src/hermes-memory-bridge/index.js";
 import { HermesBridgeCore } from "../../src/hermes-memory-bridge/bridge-core.js";
+import * as bridgeCoreModule from "../../src/hermes-memory-bridge/bridge-core.js";
+import { AuditForwarder } from "../../src/hermes-memory-bridge/process-shell.js";
+import { HERMES_AUDIT_WAITING_CAP, HERMES_AUDIT_PROCESS_ROWS } from "../../src/hermes-memory-bridge/constants.js";
 import { HermesApprovalLedger } from "../../src/hermes-memory-bridge/approval-ledger.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { TRAP_STORE_KEY_PREFIX, TRAP_STORE_NAMESPACE } from "../../src/honeypot/trap-store.js";
@@ -44,6 +48,8 @@ import { passageContentHash } from "../../src/sdw/write-gate.js";
 import { memoryProvenancePublicKeyFingerprint } from "../../src/sdw/memory-provenance-bad-signers.js";
 import {
   MEMORY_BATCH_LOCK_NAMESPACE,
+  HERMES_INSERT_INTENT_KEY,
+  HERMES_INSERT_INTENT_NAMESPACE,
   hermesBridgePassageTextDigest,
   sdwMemoryCorpusBatchLockFile,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
@@ -407,8 +413,8 @@ describe("Hermes memory process shell", () => {
     const fixture = await seededFortress("cli-nonce-cap");
     const coreEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/bridge-core.ts", import.meta.url));
     const constantsEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/constants.ts", import.meta.url));
-    // Seed the actual composed waiter's retained state; a real fixture-approved insert consumes that cap.
-    // Approval exists only in this subprocess fixture, never in the installed CLI.
+    // Seed the actual composed waiter's retained state; a real fixture-admitted insert consumes that cap.
+    // The production save path reaches the probe without a human decision.
     const instrument = `
       const { HermesBridgeCore } = await import(pathToFileURL(${JSON.stringify(coreEntry)}).href);
       const { ABANDONED_PROBE_NONCE_CAP } = await import(pathToFileURL(${JSON.stringify(constantsEntry)}).href);
@@ -423,11 +429,6 @@ describe("Hermes memory process shell", () => {
             this.waiter.timeout(entry,action.nonce);
           }
           const retained=this.waiter.snapshot().abandoned.map(pair=>pair.nonce);
-          const prompt=this.ports.ownerSurface.promptOwner;
-          this.ports.ownerSurface.promptOwner=(id,summary)=>{
-            prompt(id,summary);
-            queueMicrotask(()=>{const entry=this.snapshot().ledger.entry;this.ownerApprove(entry.id,entry.textSha256);});
-          };
           process.on('exit',()=>process.stderr.write('CLI_RETAINED_NONCES='+JSON.stringify({
             before:retained, after:this.waiter.snapshot().abandoned.map(pair=>pair.nonce)
           })+'\\n'));
@@ -446,7 +447,7 @@ describe("Hermes memory process shell", () => {
       expect(response.type, "cliIssuedNonceCapIsConsumed").toBe("response");
       if (response.type === "response") {
         expect(JSON.parse(Buffer.from(String(response.result_b64), "base64").toString()).type,
-          "cliIssuedNonceCapIsConsumed").toBe("error");
+          "cliIssuedNonceCapIsConsumed").toBe("result");
       }
       relay.write(privateFrame({ type: "relay_shutdown" }));
       expect(await childExit(child)).toEqual({ code: EXIT_CLEAN, signal: null });
@@ -468,9 +469,6 @@ describe("Hermes memory process shell", () => {
       HermesBridgeCore.prototype.onDrained=function(listener){
         if(!installed){
           installed=true;
-          this.ports.ownerSurface.promptOwner=()=>queueMicrotask(()=>{
-            const entry=this.snapshot().ledger.entry;this.ownerApprove(entry.id,entry.textSha256);
-          });
           process.on('exit',()=>process.stderr.write('CLI_PROBE_LIVE='+Boolean(this.waiter.snapshot().live)+'\\n'));
         }
         return original.call(this,listener);
@@ -536,7 +534,7 @@ describe("Hermes memory process shell", () => {
       relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
       relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "pending-eof", name: "memory_insert",
         arguments: { text: "unapproved EOF fixture", taint: "user_content" } }));
-      await waitUntil(() => stderr().includes("owner approval is deferred"));
+      expect(await readNodeFrame(relay)).toMatchObject({ type: "probe" });
       relay.end();
       const outcome = await boundedValue(childExit(child), RELAY_CHILD_SIGTERM_GRACE_MS, "not_drained" as const);
       expect(outcome, "supervisionConvergesBothDirections").toEqual({ code: EXIT_CLEAN, signal: null });
@@ -594,48 +592,32 @@ describe("Hermes memory process shell", () => {
     }
   });
 
-  it("keeps production CLI inserts pending without an approval channel", async () => {
-    const fixture = await seededFortress("cli-no-approval");
-    const coreEntry = fileURLToPath(new URL("../../src/hermes-memory-bridge/bridge-core.ts", import.meta.url));
-    // Observe actual approval calls in the isolated CLI child without replacing
-    // their behavior. A short no-output window alone cannot prove no approval.
-    const instrumentApproval = `
-      const { HermesBridgeCore } = await import(pathToFileURL(${JSON.stringify(coreEntry)}).href);
-      const originalApprove = HermesBridgeCore.prototype.ownerApprove;
-      let approvalCalls = 0;
-      HermesBridgeCore.prototype.ownerApprove = function(...args) {
-        approvalCalls++;
-        return originalApprove.apply(this, args);
-      };
-      process.on("exit", () => process.stderr.write("CLI_OWNER_APPROVAL_CALLS=" + approvalCalls + "\\n"));
-    `;
-    const script = fixtureChildScript().replace("    await import(pathToFileURL", instrumentApproval + "    await import(pathToFileURL");
-    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, "hermes-memory-bridge", "run", "--relay-fd", "3"], {
-      cwd: process.cwd(),
-      stdio: ["ignore", "ignore", "pipe", "pipe"],
-      env: { ...process.env, HERMES_FIXTURE_ENV: JSON.stringify(fixture.env) },
-    });
+  it("commits a production CLI own-scope insert with one admitted audit row", async () => {
+    const fixture = await seededFortress("cli-own-scope");
+    const child = spawnBridgeCli(fixture.env);
     const relay = child.stdio[3] as Duplex;
-    const stderr = collectChildStderr(child);
     try {
       expect(await readNodeFrame(relay)).toEqual({ type: "ready" });
       relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
-      relay.write(relayPublicFrame("c1", {
-        type: "tools_call", request_id: "no-approval", name: "memory_insert",
-        arguments: { text: "must require owner approval", taint: "user_content", passage_id: "no-approval" },
-      }));
-      await waitUntil(() => stderr().includes("owner approval is deferred"));
-      // An admitted write would emit a probe; the delivered CLI has no owner authority to reach it.
-      await expectNoRelayBytes(relay);
+      relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "own-scope", name: "memory_insert",
+        arguments: { text: "own-scope CLI fixture", taint: "user_content", passage_id: "own-scope" } }));
+      const probe = await readNodeFrame(relay);
+      expect(probe.type).toBe("probe");
+      relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+      const response = await readNodeFrame(relay);
+      const result = JSON.parse(Buffer.from(String(response.result_b64), "base64").toString());
+      expect(JSON.parse(result.payload.content[0].text).outcome).toBe("saved");
       relay.write(privateFrame({ type: "relay_shutdown" }));
       await expect(childExit(child)).resolves.toMatchObject({ code: EXIT_CLEAN, signal: null });
-      const approvalCounts = [...stderr().matchAll(/CLI_OWNER_APPROVAL_CALLS=(\d+)/g)].map((match) => Number(match[1]));
-      console.log("CLI_OWNER_APPROVAL_COUNTS", approvalCounts);
-      expect(approvalCounts).toEqual([0]);
       const storage = new FilesystemStorage(join(fixture.fortressDir, "state"));
-      expect(await storage.list(SDW_DOCUMENT_CORPUS_NAMESPACE)).toEqual([]);
-    } finally { killChild(child); }
-  }, 30_000);
+      const custody = await establishMaster({ storage, passphrase: PASS });
+      try {
+        const rows = (await new AuditLog(storage, custody.masterKey).query({ operation_type: "hermes_memory_bridge", limit: 20 })).entries;
+        expect(rows.map(row => row.details?.kind)).toEqual(["insert_admitted"]);
+        expect(await documentCount(storage, fixture.env.HERMES_MEMORY_AGENT_ID!)).toBe(1);
+      } finally { await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0); }
+    } finally { killChild(child); await childExit(child); }
+  });
 
   it.each(["reject", "deadline", "late_reject"] as const)("preserves clean audit flush tail %s", async (mode) => {
     const fixture = await seededFortress(`audit-tail-${mode.replaceAll("_", "-")}`);
@@ -659,7 +641,7 @@ describe("Hermes memory process shell", () => {
     } finally { settle?.(); flush.mockRestore(); pair.close(); }
   });
 
-  it("preserves a clean drain when a terminal audit append rejects", async () => {
+  it("preserves a clean drain when an admitted audit append rejects", async () => {
     const fixture = await seededFortress("terminal-audit-reject");
     const pair = await socketPair();
     let stderrText = "";
@@ -674,11 +656,14 @@ describe("Hermes memory process shell", () => {
       expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
       pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
       pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "terminal-audit", name: "memory_insert", arguments: { text: "pending", taint: "user_content", passage_id: "terminal-audit" } }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      append.mockRejectedValue(new Error("fixture terminal audit failure"));
+      await waitUntil(() => shell.core.snapshot().slot !== undefined);
+      append.mockRejectedValue(new Error("fixture admission audit refusal"));
+      const probe = await readNodeFrame(pair.relay);
+      pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+      await readPublicResponse(pair.relay, "terminal-audit");
       pair.relay.write(privateFrame({ type: "relay_shutdown" }));
       await expect(shell.exited).resolves.toBe(EXIT_CLEAN);
-      expect(append.mock.calls.some(([record]) => record.details?.kind === "terminal")).toBe(true);
+      expect(append.mock.calls.some(([record]) => record.details?.kind === "insert_admitted")).toBe(true);
     } finally { append.mockRestore(); pair.close(); }
   });
 
@@ -1599,7 +1584,247 @@ describe("Hermes memory process shell", () => {
     }
   });
 
-  it("commits an approved passage and reads it back over the process socket", async () => {
+  // The production exit report counts an admission whose persisted bytes cannot be confirmed.
+  it("names a rejected admission append after persistence in the exit report", async () => {
+    const fixture = await seededFortress("admission-exit");
+    const pair = await socketPair();
+    let stderrText = "";
+    class AdmissionReadbackStorage extends FilesystemStorage {
+      armed = false;
+      persistedKey: string | undefined;
+      readbackFailures = 0;
+      override async writeDurable(namespace: string, key: string, bytes: Uint8Array): Promise<void> {
+        await super.writeDurable(namespace, key, bytes);
+        if (this.armed && namespace === "_audit" && key.startsWith("entry-")) this.persistedKey = key;
+      }
+      override async read(namespace: string, key: string): Promise<Uint8Array | null> {
+        const bytes = await super.read(namespace, key);
+        if (this.armed && namespace === "_audit" && key === this.persistedKey) {
+          expect(bytes).not.toBeNull();
+          this.armed = false;
+          this.readbackFailures++;
+          throw new Error("private admission readback fixture");
+        }
+        return bytes;
+      }
+    }
+    const storage = new AdmissionReadbackStorage(join(fixture.fortressDir, "state"));
+    let forwarder: AuditForwarder | undefined;
+    let admissionId: string | undefined;
+    const originalForward = AuditForwarder.prototype.append;
+    const forward = vi.spyOn(AuditForwarder.prototype, "append").mockImplementation(function (this: AuditForwarder, row) {
+      forwarder = this;
+      return originalForward.call(this, row);
+    });
+    const originalAppend = AuditLog.prototype.appendCritical;
+    const append = vi.spyOn(AuditLog.prototype, "appendCritical").mockImplementation(function (this: AuditLog, row) {
+      if (row.details?.kind === "insert_admitted") {
+        admissionId = row.details.entryId as string;
+        expect((forwarder as unknown as { terminalSlots: Map<string, string> }).terminalSlots.get(admissionId)).toBe("reserved");
+        storage.armed = true;
+      }
+      return originalAppend.call(this, row);
+    });
+    let shell: Awaited<ReturnType<typeof runHermesBridgeProcess>> | undefined;
+    try {
+      shell = await runHermesBridgeProcess({ env: fixture.env, relaySocketFactory: () => pair.shell,
+        storageFor: () => storage, uid: process.getuid?.() ?? 0,
+        stderr: { write: chunk => { stderrText += String(chunk); return true; } } });
+      expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+      pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "uncertain-admission", name: "memory_insert",
+        arguments: { text: "private admission passage", taint: "user_content" } }));
+      const probe = await readNodeFrame(pair.relay);
+      expect(probe.type).toBe("probe");
+      pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+      const response = await readPublicResponse(pair.relay, "uncertain-admission");
+      expect(response.type).toBe("result");
+      expect(storage.readbackFailures).toBe(1);
+      expect(await storage.read("_audit", storage.persistedKey!)).not.toBeNull();
+      expect((forwarder as unknown as { terminalSlots: Map<string, string> }).terminalSlots.has(admissionId!)).toBe(false);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await shell.exited).toBe(EXIT_CLEAN);
+      const diagnostics = stderrText.split("\n").filter(line => line.includes("terminal_audit_unconfirmed"));
+      expect(diagnostics).toEqual(["hermes-memory-bridge audit: terminal_audit_unconfirmed count=1 reason=append_failure"]);
+      expect(stderrText).not.toContain("private admission");
+      expect(stderrText).not.toContain(admissionId!);
+    } finally {
+      storage.armed = false;
+      shell?.signalStop("SIGTERM"); if (shell !== undefined) await shell.exited;
+      append.mockRestore(); forward.mockRestore(); pair.close();
+    }
+  });
+
+  // The production forwarder retains terminal capacity through the shutdown handoff deadline.
+  it("names every cancelled admission at full capacity across the handoff deadline", async () => {
+    const fixture = await seededFortress("terminal-exit");
+    const pair = await socketPair();
+    let stderrText = "";
+    let release!: () => void;
+    const stalled = new Promise<void>(resolve => { release = resolve; });
+    let deadline: number | undefined;
+    let waitingAtStop = 0;
+    let closeSnapshot: { durableAdmissions: number; afterDeadline: boolean; terminalRows: number } | undefined;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    const originalAppend = AuditLog.prototype.appendCritical;
+    const durable: Array<{ kind?: unknown; entryId?: unknown }> = [];
+    const append = vi.spyOn(AuditLog.prototype, "appendCritical").mockImplementation(async function (this: AuditLog, row) {
+      if (row.details?.kind === "insert_admitted" && durable.length === 0) await stalled;
+      if (deadline !== undefined && clock === undefined) {
+        // The tail timer is armed before this continuation; real storage now commits after the handoff deadline.
+        clock = vi.spyOn(performance, "now").mockReturnValue(deadline + 1);
+      }
+      await originalAppend.call(this, row);
+      durable.push(row.details ?? {});
+    });
+    const accepted: string[] = [];
+    const originalForward = AuditForwarder.prototype.append;
+    const forward = vi.spyOn(AuditForwarder.prototype, "append").mockImplementation(function (this: AuditForwarder, row) {
+      if (row.kind === "insert_admitted") accepted.push(row.entryId!);
+      return originalForward.call(this, row);
+    });
+    const originalStop = AuditForwarder.prototype.stopHandOffAt;
+    const stop = vi.spyOn(AuditForwarder.prototype, "stopHandOffAt").mockImplementation(function (this: AuditForwarder, at) {
+      waitingAtStop = (this as unknown as { waiting: unknown[] }).waiting.length;
+      deadline = at;
+      originalStop.call(this, at);
+      release();
+    });
+    const originalClose = AuditForwarder.prototype.close;
+    const close = vi.spyOn(AuditForwarder.prototype, "close").mockImplementation(function (this: AuditForwarder, ...args) {
+      closeSnapshot = {
+        durableAdmissions: durable.filter(row => row.kind === "insert_admitted").length,
+        afterDeadline: performance.now() > deadline!,
+        terminalRows: (this as unknown as { waiting: Array<{ record: { kind: string } }> }).waiting
+          .filter(entry => entry.record.kind === "insert_refused").length,
+      };
+      return originalClose.apply(this, args);
+    });
+    let shell: Awaited<ReturnType<typeof runHermesBridgeProcess>> | undefined;
+    try {
+      shell = await runHermesBridgeProcess({ env: fixture.env, relaySocketFactory: () => pair.shell,
+        storageFor: dir => new FilesystemStorage(join(dir, "state")), uid: process.getuid?.() ?? 0,
+        stderr: { write: chunk => { stderrText += String(chunk); return true; } } });
+      expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+      pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      // One handed-off admission plus the entire call waiting share; latch space stays separate.
+      const admissions = HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS + 1;
+      for (let n = 0; n < admissions; n++) {
+        const request_id = `cancel-${n}`;
+        pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id, name: "memory_insert",
+          arguments: { text: "private terminal fixture", taint: "user_content", passage_id: request_id } }));
+        const probe = await readNodeFrame(pair.relay);
+        expect(probe.type).toBe("probe");
+        pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+        await waitUntil(() => accepted.length === n + 1);
+        pair.relay.write(relayPublicFrame("c1", { type: "cancel", mcp_request_id: request_id }));
+        await readPublicResponse(pair.relay, request_id);
+        await waitUntil(() => shell!.core.snapshot().slot === undefined);
+      }
+      expect(durable).toHaveLength(0);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await shell.exited).toBe(EXIT_CLEAN);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(waitingAtStop).toBe(HERMES_AUDIT_WAITING_CAP - HERMES_AUDIT_PROCESS_ROWS);
+      expect(closeSnapshot).toEqual({ durableAdmissions: 1, afterDeadline: true, terminalRows: 1 });
+      const terminal = durable.filter(row => row.kind === "insert_refused" || row.kind === "insert_unconfirmed");
+      for (const id of accepted) expect(terminal.filter(row => row.entryId === id).length).toBeLessThanOrEqual(1);
+      const diagnostics = [...stderrText.matchAll(/terminal_audit_unconfirmed count=(\d+) reason=(shutdown_deadline)\n/g)];
+      expect(diagnostics).toHaveLength(1);
+      expect(terminal.length + Number(diagnostics[0]![1])).toBe(accepted.length);
+      expect(stderrText).not.toContain("private terminal fixture");
+    } finally {
+      release(); clock?.mockRestore();
+      shell?.signalStop("SIGTERM"); if (shell !== undefined) await shell.exited;
+      append.mockRestore(); forward.mockRestore(); stop.mockRestore(); close.mockRestore(); pair.close();
+    }
+  });
+
+  // A normal process exit preserves unfinished-save refusal across the production boot path.
+  it.each([false, true])("restarts only after a finished save, unfinished=%s", async unfinished => {
+    const fixture = await seededFortress("insert-restart");
+    const completeAudit = vi.spyOn(AuditForwarder.prototype, "completeInsert");
+    class InsertFaultStorage extends FilesystemStorage {
+      corpusWrites = 0;
+      chunkWritten = false;
+      override async write(namespace: string, key: string, bytes: Uint8Array) {
+        if (namespace === SDW_DOCUMENT_CORPUS_NAMESPACE) {
+          this.corpusWrites++;
+          if (unfinished && key.startsWith("doc.mem.")) throw new Error("publish fixture");
+        }
+        await super.write(namespace, key, bytes);
+        if (namespace === SDW_DOCUMENT_CORPUS_NAMESPACE && key.startsWith("chunk.")) this.chunkWritten = true;
+      }
+      override async delete(namespace: string, key: string, secure?: boolean) {
+        if (unfinished && namespace === SDW_DOCUMENT_CORPUS_NAMESPACE && key.startsWith("chunk.")) throw new Error("rollback fixture");
+        return super.delete(namespace, key, secure);
+      }
+    }
+    const storage = new InsertFaultStorage(join(fixture.fortressDir, "state"));
+    const pair = await socketPair();
+    const options = { env: fixture.env, storageFor: () => storage, uid: process.getuid?.() ?? 0 };
+    const shell = await runHermesBridgeProcess({ ...options, relaySocketFactory: () => pair.shell });
+    try {
+      expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
+      pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
+      pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "save", name: "memory_insert",
+        arguments: { text: "A durable restart memory", taint: "user_content", passage_id: "restart" } }));
+      const probe = await readNodeFrame(pair.relay);
+      expect(probe.type).toBe("probe");
+      pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
+      const response = await readPublicResponse(pair.relay, "save");
+      expect(JSON.parse((response.payload as { content: Array<{ text: string }> }).content[0]!.text).outcome)
+        .toBe(unfinished ? "unconfirmed" : "saved");
+      expect(storage.chunkWritten).toBe(true);
+      expect(completeAudit).toHaveBeenCalledTimes(unfinished ? 0 : 1);
+      expect(shell.core.snapshot().ledger.latched).toBe(unfinished);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      expect(await shell.exited).toBe(EXIT_CLEAN);
+      const intent = await storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY);
+      expect(intent === null).toBe(!unfinished);
+      if (unfinished) {
+        expect(Buffer.from(intent!).toString("utf8")).not.toContain("A durable restart memory");
+        const custody = await establishMaster({ storage: new FilesystemStorage(join(fixture.fortressDir, "state")), passphrase: PASS });
+        try {
+          const checkpoint = new SdwWorkingStateStore({ storage, masterKey: custody.masterKey, fortressId: shell.report.fortressId });
+          expect(await checkpoint.get("tool", "hermes-insert-intent")).toMatchObject({
+            version: 1, owner_ref: shell.report.adapterOwnerRef, created_at: expect.any(String),
+            state: { kind: "task_checkpoint", task_ref: `mem.${shell.report.adapterOwnerRef}.restart`,
+              next_steps: [expect.stringContaining(`chunk.mem.${shell.report.adapterOwnerRef}.restart.`)] },
+          });
+        } finally { await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0); }
+      }
+      const writes = storage.corpusWrites;
+      const nextPair = await socketPair();
+      const factory = vi.fn(() => nextPair.shell);
+      const nextStorage = new InsertFaultStorage(join(fixture.fortressDir, "state"));
+      const restartOptions = { ...options, storageFor: () => nextStorage, relaySocketFactory: factory };
+      const CoreConstructor = HermesBridgeCore;
+      const constructCore = vi.spyOn(bridgeCoreModule, "HermesBridgeCore").mockImplementation(function (...args) { return new CoreConstructor(...args); });
+      let nextHandle: Awaited<ReturnType<typeof runProductionHermesBridgeProcess>> | undefined;
+      try {
+        if (unfinished) {
+          await expect(runProductionHermesBridgeProcess(restartOptions).then(handle => { nextHandle = handle; return handle; }))
+            .rejects.toMatchObject({ name: "UnfinishedInsertRefusal" });
+          expect(factory).toHaveBeenCalledTimes(1);
+          expect(constructCore).not.toHaveBeenCalled();
+        } else {
+          const restarted = nextHandle = await runProductionHermesBridgeProcess(restartOptions);
+          expect(constructCore).toHaveBeenCalledTimes(1);
+          expect(await readNodeFrame(nextPair.relay)).toEqual({ type: "ready" });
+          nextPair.relay.write(privateFrame({ type: "relay_shutdown" }));
+          expect(await restarted.exited).toBe(EXIT_CLEAN);
+        }
+        expect(storage.corpusWrites).toBe(writes);
+        expect(nextStorage.corpusWrites).toBe(0);
+      } finally {
+        nextHandle?.signalStop("SIGTERM"); if (nextHandle !== undefined) await nextHandle.exited;
+        constructCore.mockRestore(); nextPair.close();
+      }
+    } finally { shell.signalStop("SIGTERM"); await shell.exited; pair.close(); completeAudit.mockRestore(); }
+  });
+
+  it("commits an admitted passage and reads it back over the process socket", async () => {
     const fixture = await seededFortress("full-call");
     const pair = await socketPair();
     let stderrText = "";
@@ -1628,8 +1853,8 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: passageText, taint: "user_content", tags: ["hermes"], passage_id: "passage-full" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      shell.decisions.approve("hermes-entry-1", hermesBridgePassageTextDigest(passageText));
+      await waitUntil(() => shell.core.snapshot().slot !== undefined);
+
       const probe = await readNodeFrame(pair.relay);
       expect(probe).toMatchObject({ type: "probe", connection_id: "c1" });
       pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
@@ -2040,8 +2265,8 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: passageText, taint: "user_content", passage_id: "passage-drain" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      shell.decisions.approve("hermes-entry-1", hermesBridgePassageTextDigest(passageText));
+      await waitUntil(() => shell.core.snapshot().slot !== undefined);
+
       const probe = await readNodeFrame(pair.relay);
       pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
       await waitUntil(() => parkedStorage.parkedSettled);
@@ -2079,8 +2304,8 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: passageText, taint: "user_content", passage_id: "passage-fatal-drain" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      shell.decisions.approve("hermes-entry-1", hermesBridgePassageTextDigest(passageText));
+      await waitUntil(() => shell.core.snapshot().slot !== undefined);
+
       const probe = await readNodeFrame(pair.relay);
       pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
       await waitUntil(() => parkedStorage.parkedSettled);
@@ -2176,7 +2401,7 @@ describe("Hermes memory process shell", () => {
       expect(await readNodeFrame(pair.relay)).toEqual({ type: "ready" });
       pair.relay.write(privateFrame({ type: "accepted", connection_id: "c1" }));
       pair.relay.write(relayPublicFrame("c1", { type: "tools_call", request_id: "ledger-fatal", name: "memory_insert", arguments: { text: "pending insert", taint: "user_content", passage_id: "ledger-fatal" } }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
+      await waitUntil(() => shell.core.snapshot().slot !== undefined);
       pair.relay.write(privateFrame({ type: "relay_shutdown" }));
       await expectExitWithin(shell.exited, EXIT_FATAL_BRIDGE);
       expect(stop).toHaveBeenCalled();
@@ -2245,7 +2470,9 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: "audit tail deadline", taint: "user_content", passage_id: "passage-audit-tail" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
+      await waitUntil(() => shell.core.snapshot().waiter.live !== undefined);
+      relay.inject(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: shell.core.snapshot().waiter.live!.nonce }));
+      await waitUntil(() => parkedStorage.auditWriteParked);
       relay.inject(privateFrame({ type: "relay_shutdown" }));
       // The outer bound is the relay's own kill deadline, measured from the stop signal, so it covers
       // the core's drain, the shared tail, the barrier release and process cleanup on a loaded runner.
@@ -2285,7 +2512,12 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: "queued audit at exit", taint: "user_content", passage_id: "passage-queued-audit" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
+      await waitUntil(() => shell.core.snapshot().waiter.live !== undefined);
+      relay.inject(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: shell.core.snapshot().waiter.live!.nonce }));
+      await waitUntil(() => parkedStorage.auditWriteParked);
+      relay.inject(privateFrame({ type: "accepted", connection_id: "c2" }));
+      relay.inject(relayPublicFrame("c2", { type: "tools_call", request_id: "queued-recall", name: "memory_recall", arguments: { query: "the" } }));
+      await new Promise<void>(resolve => setImmediate(resolve));
       relay.inject(privateFrame({ type: "relay_shutdown" }));
       await expectExitWithin(shell.exited, EXIT_CLEAN);
       parkedStorage.exitObserved = true;
@@ -2294,7 +2526,7 @@ describe("Hermes memory process shell", () => {
       // even though the record ahead of it is still parked and may never settle; the parked one is
       // reported as unconfirmed rather than waited for past the tail.
       expect(stderrText).toContain("hermes-memory-bridge audit: 1 record(s) unconfirmed at exit\n");
-      expect(stderrText).toContain("hermes-memory-bridge audit: refused terminal record at exit\n");
+      expect(stderrText).toContain("hermes-memory-bridge audit: refused memory_recall record at exit\n");
       // Residual, recorded rather than hidden (audit-log-torn-multi-write-sequences-01): the parked
       // write outlives the exit. Released after the barrier is gone, the storage refuses it, and no
       // later step of its audit sequence reaches the fortress; a fresh log then opens the fortress
@@ -2340,7 +2572,9 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: "slow checkpoint at exit", taint: "user_content", passage_id: "passage-slow-checkpoint" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
+      await waitUntil(() => shell.core.snapshot().waiter.live !== undefined);
+      relay.inject(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: shell.core.snapshot().waiter.live!.nonce }));
+      await waitUntil(() => shell.core.snapshot().slot === undefined);
       relay.inject(privateFrame({ type: "relay_shutdown" }));
       await expectExitWithin(shell.exited, EXIT_CLEAN);
       parkedStorage.exitObserved = true;
@@ -2363,7 +2597,7 @@ describe("Hermes memory process shell", () => {
         const reopened = new AuditLog(parkedStorage, custody.masterKey, { integrityMode: "lenient" });
         expect(await reopened.getIntegrityFindings()).toEqual([]);
         const entries = await reopened.query({ operation_type: "hermes_memory_bridge", limit: 20 });
-        expect(entries.entries.some((entry) => entry.details?.kind === "terminal")).toBe(true);
+        expect(entries.entries.some((entry) => entry.details?.kind === "insert_admitted")).toBe(true);
       } finally {
         await custody.masterWriteBarrier?.release();
         custody.masterKey.fill(0);
@@ -2473,9 +2707,10 @@ describe("Hermes memory process shell", () => {
         name: "memory_insert",
         arguments: { text: "audit pending at drain", taint: "user_content", passage_id: "passage-audit-drain" },
       }));
-      await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
+      const probe = await readNodeFrame(pair.relay);
+      pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
       await waitUntil(() => parkedStorage.auditWriteParked);
+      pair.relay.write(privateFrame({ type: "relay_shutdown" }));
       expect(await shortOutcome(shell.exited)).toBe("timeout");
       parkedStorage.release();
       await expect(shell.exited).resolves.toBe(EXIT_CLEAN);
@@ -2483,7 +2718,7 @@ describe("Hermes memory process shell", () => {
       try {
         const audit = new AuditLog(parkedStorage, custody.masterKey);
         const entries = await audit.query({ operation_type: "hermes_memory_bridge", limit: 20 });
-        expect(entries.entries.some((entry) => entry.details?.kind === "terminal")).toBe(true);
+        expect(entries.entries.some((entry) => entry.details?.kind === "insert_admitted")).toBe(true);
       } finally {
         await custody.masterWriteBarrier?.release();
         custody.masterKey.fill(0);
@@ -2585,8 +2820,8 @@ async function commitPassage(
       name: "memory_insert",
       arguments: { text: passageText, taint: "user_content", passage_id: passageId },
     }));
-    await waitUntil(() => stderrText.includes("owner approval is deferred"));
-    shell.decisions.approve("hermes-entry-1", hermesBridgePassageTextDigest(passageText));
+    await waitUntil(() => shell.core.snapshot().slot !== undefined);
+
     const probe = await readNodeFrame(pair.relay);
     pair.relay.write(privateFrame({ type: "probe_reply", connection_id: "c1", nonce: probe.nonce }));
     expect(await readPublicResponse(pair.relay, "insert-seed")).toMatchObject({ type: "result" });
@@ -2597,8 +2832,7 @@ async function commitPassage(
   }
 }
 
-// Test-only capture retains real core approval-path coverage without granting
-// that authority through the production process handle.
+// Test-only capture observes the production core without exposing it through the process handle.
 async function runHermesBridgeProcess(options: HermesBridgeProcessOptions) {
   let capturedCore: HermesBridgeCore | undefined;
   const original = HermesBridgeCore.prototype.onDrained;
@@ -2610,10 +2844,7 @@ async function runHermesBridgeProcess(options: HermesBridgeProcessOptions) {
     const shell = await runProductionHermesBridgeProcess(options);
     const core = capturedCore as HermesBridgeCore | undefined;
     if (core === undefined) throw new Error("test failed to capture the composed bridge core");
-    return { ...shell, decisions: {
-      approve: (entryId: string, textSha256: string) => core.ownerApprove(entryId, textSha256),
-      deny: (entryId: string) => core.ownerDeny(entryId),
-    } };
+    return { ...shell, core };
   } finally { capture.mockRestore(); }
 }
 

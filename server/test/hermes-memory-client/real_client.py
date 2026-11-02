@@ -29,10 +29,13 @@ const {pathToFileURL} = require('node:url');
   const {register}=await import(pathToFileURL(repo+'/server/node_modules/tsx/dist/esm/api/index.mjs')); register();
   const load=p=>import(pathToFileURL(repo+'/server/'+p));
   const {HermesBridgeCore}=await load('src/hermes-memory-bridge/bridge-core.ts');
+  const {hermesBridgePassageTextDigest}=await load('src/sdw/adapters/sdw-memory-backend.ts');
+  const {memoryGetSuccessFrameUtf8Bytes}=await load('src/sdw/memory-tool-projection.ts');
   const {parseRelayToNode,encodeNodeToRelay}=await load('src/hermes-memory-bridge/envelopes.ts');
   const channel=new net.Socket({fd:3});
   const log=x=>fs.appendFileSync(root+'/events.jsonl',JSON.stringify(x)+'\n');
   const passage={passage_id:'seed',owner_ref:'hermes',text:'Cedar lantern fixture text',tags:[],metadata:[],created_at:'2026-10-18T00:00:00.000Z',chunk_count:1,content_hash:'a'.repeat(43),provenance_status:'verified'};
+  let releaseInsert;
   const core=new HermesBridgeCore({
     writeFrame(frame){
       if(frame.type==='response' && ['malformed_relay','unavailable'].includes(scenario)) {
@@ -47,9 +50,18 @@ const {pathToFileURL} = require('node:url');
     },
     appendAudit:async record=>log({audit:record}),nowMs:()=>Date.now(),
     setTimer:(ms,fire)=>setTimeout(fire,ms),clearTimer:timer=>clearTimeout(timer),
-    ownerSurface:{promptOwner(){log({pending:true});}},abort:new AbortController(),
+    agentId:"hermes",abort:new AbortController(),
     adapter:{
-      async insertPassage(){log({unexpectedInsert:true});throw Error('write unavailable');},
+      async recallPassages(budget){return budget.result();},
+      async insertPassage(input){
+        log({insertStarted:true});
+        if(scenario==='cancel')await new Promise(resolve=>releaseInsert=resolve);
+        const inserted={...passage,passage_id:'pending',text:input.text};
+        await core.commitCheck.assertAllowedToCommit({passageId:inserted.passage_id,documentId:'mem.hermes.pending',
+          passageTextSha256:hermesBridgePassageTextDigest(input.text),passageTextUtf8:Buffer.from(input.text),
+          getFrameUtf8Bytes:memoryGetSuccessFrameUtf8Bytes(inserted)});
+        log({committed:true});return inserted;
+      },
       async getPassage(id){
         log({get:id});
         if(['deadline','signal','eof','socket_loss','buffered','malformed','pong','cancel','async_failure'].includes(scenario)) return new Promise(()=>{});
@@ -70,7 +82,7 @@ const {pathToFileURL} = require('node:url');
           channel.write(encodeNodeToRelay({type:'close',connectionId:raw.connection_id}));continue;
         }
       }
-      const parsed=parseRelayToNode(bytes);if(parsed.kind!=='ok')throw Error('fixture invalid frame');core.relayFrame(parsed.frame);if(raw.type==='frame' && JSON.parse(Buffer.from(raw.frame_b64,'base64')).type==='cancel')log({cancelPending:!!core.snapshot().ledger.entry});
+      const parsed=parseRelayToNode(bytes);if(parsed.kind!=='ok')throw Error('fixture invalid frame');core.relayFrame(parsed.frame);if(raw.type==='frame' && JSON.parse(Buffer.from(raw.frame_b64,'base64')).type==='cancel'){releaseInsert?.();setImmediate(()=>log({cancelPending:!!core.snapshot().ledger.entry}));}
       if(raw.type==='relay_shutdown') {channel.end();setTimeout(()=>process.exit(0),20);}
     }
   });
@@ -255,16 +267,13 @@ async def run(args, root):
                     await session.initialize()
                     if arm=='done':
                         tools=await session.list_tools()
-                        assert [t.name for t in tools.tools]==['memory_insert','memory_get','memory_search'],'clientCatalogComesFromRealBridge'
+                        assert [t.name for t in tools.tools]==['memory_insert','memory_get','memory_search','memory_recall','sign_statement','export_memory','protection_rules'],'clientCatalogComesFromRealBridge'
                         search=await session.call_tool('memory_search',{'text':'Cedar'})
                         result=await session.call_tool('memory_get',{'passage_id':'seed'})
                         assert 'Cedar lantern fixture text' in result.content[0].text,'realClientExactGet'
                         assert 'seed' in search.content[0].text,'realClientSeededSearch'
-                        try:
-                            await session.call_tool('memory_get',{'passage_id':'seed','approved':True})
-                            raise AssertionError('unknownArgumentsNeverReachAdapter')
-                        except McpError as exc:
-                            assert exc.error.code==-32002,'unknownArgumentsNeverReachAdapter'
+                        denied=await session.call_tool('memory_get',{'passage_id':'seed','approved':True})
+                        assert json.loads(denied.content[0].text)=={'outcome':'denied','message':'Request denied.'},'unknownArgumentsNeverReachAdapter'
                         events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
                         assert sum('get' in row for row in events)==1,'unknownArgumentsNeverReachAdapter'
                     elif arm in ('large_frames','relay_eagain'):
@@ -286,8 +295,8 @@ async def run(args, root):
                     elif arm=='cancel':
                         task=asyncio.create_task(session.call_tool('memory_insert',{'text':'pending fixture','taint':'user_content'}))
                         deadline=time.monotonic()+10
-                        while '"pending":true' not in (root/'events.jsonl').read_text():
-                            assert time.monotonic()<deadline,'pendingInsertAdmission'
+                        while '"insertStarted":true' not in (root/'events.jsonl').read_text():
+                            assert time.monotonic()<deadline,'insertAdmissionBeforeCommit'
                             await anyio.sleep(0.01)
                         cancel=json.dumps({'jsonrpc':'2.0','method':'notifications/cancelled','params':{'requestId':1}}).encode()+b'\n'
                         await shim_process.stdin.send(cancel)
@@ -298,7 +307,7 @@ async def run(args, root):
                         with contextlib.suppress(asyncio.CancelledError): await task
                         await session.send_ping()
                         events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
-                        assert not any(row.get('unexpectedInsert') for row in events),'clientCancelTargetsOriginalCall zero writes'
+                        assert not any(row.get('committed') for row in events),'clientCancelTargetsOriginalCall zero writes'
                         calls=[row['public'] for row in events if row.get('public',{}).get('type')=='tools_call']
                         cancels=[row['public'] for row in events if row.get('public',{}).get('type')=='cancel']
                         assert len(cancels)==1 and cancels[0]['mcp_request_id']==calls[0]['request_id'],'clientCancelTargetsOriginalCall exact wire'
