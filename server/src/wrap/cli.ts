@@ -29,6 +29,7 @@
  *   the advanced path; most operators want Layer 1.
  */
 
+import { runHermesPosture, refuseHermesMcpWithPosture, type HermesPostureHooks } from "./hermes-posture.js";
 import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
@@ -493,6 +494,8 @@ export function registerProcessShutdownCleanup(
 // ── Types ───────────────────────────────────────────────────────────
 
 export interface WrapOptions {
+  /** Install or remove the Hermes memory plugin pair. */
+  hermesMemory?: boolean;
   /** True when the top-level CLI invoked this module through `sanctuary protect`. */
   protectCommand?: boolean;
   /**
@@ -3300,10 +3303,25 @@ export const __hermesParityTestHook: {
   parity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions;
 } = {};
 
+/** Test substitutions are accepted only by the test runner, never through environment input. */
+export const __hermesPostureTestHook: HermesPostureHooks = {};
+
 export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  // Memory installation must return before any account policy or ordinary protection setup.
+  if (options.hermesMemory) {
+    const allowed = new Set(["hermesMemory", "unwrap", "dryRun", "protectCommand"]);
+    if (Object.keys(options).some(key => !allowed.has(key)) || options.unwrap && options.dryRun) {
+      throw new Error("--hermes-memory accepts only --dry-run or --unwrap.");
+    }
+    // Test hooks cannot select another transport or parser in a production process.
+    if (Object.keys(__hermesPostureTestHook).length) assertWrapCliTestHookAllowed("__hermesPostureTestHook");
+    if (__hermesParityTestHook.parity) assertWrapCliTestHookAllowed("__hermesParityTestHook");
+    return runHermesPosture(options, __hermesPostureTestHook, __hermesParityTestHook.parity);
+  }
+  if (options.hermes) await refuseHermesMcpWithPosture();
   installProcessShutdownListeners();
 
   // This operator acknowledgement is valid for one exact planner-declared
@@ -6900,6 +6918,7 @@ const WRAP_VALUE_FLAGS = new Set([
 
 /** Known boolean flags. */
 const WRAP_BOOLEAN_FLAGS = new Set([
+  "--hermes-memory",
   "--openclaw",
   "--hermes",
   "--claude-code",
@@ -6958,6 +6977,11 @@ function parseDashboardPortFlag(flag: string, value: string | undefined): number
 }
 
 export function parseWrapArgs(argv: string[]): WrapOptions {
+  if (argv.includes("--hermes-memory") &&
+      (argv.some(arg => !["--hermes-memory", "--dry-run", "--unwrap"].includes(arg)) ||
+       argv.includes("--dry-run") && argv.includes("--unwrap"))) {
+    throw new Error("--hermes-memory accepts only --dry-run or --unwrap.");
+  }
   const options: WrapOptions = {};
   const passphraseFlagPresent = argv.includes("--passphrase");
   const passphraseStdinFlagPresent = argv.includes("--passphrase-stdin");
@@ -6990,6 +7014,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--openclaw":
         options.openclaw = true;
+        break;
+      case "--hermes-memory":
+        options.hermesMemory = true;
         break;
       case "--hermes":
         options.hermes = true;
@@ -7139,6 +7166,7 @@ function printWrapHelp(): void {
   Usage:
     sanctuary wrap --openclaw          Wrap OpenClaw
     sanctuary wrap --hermes            Wrap Hermes Agent (NousResearch)
+    sanctuary wrap --hermes-memory     Install persistent Sanctuary memory for Hermes
     sanctuary wrap --claude-code       Wrap Claude Code
     sanctuary wrap --cursor            Wrap Cursor
     sanctuary wrap --cline             Wrap Cline (VS Code extension)
@@ -7150,6 +7178,7 @@ function printWrapHelp(): void {
   Options:
     --openclaw         Auto-detect and wrap OpenClaw
     --hermes           Auto-detect and wrap Hermes Agent
+    --hermes-memory    Install memory plugins; --unwrap restores the original files
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)

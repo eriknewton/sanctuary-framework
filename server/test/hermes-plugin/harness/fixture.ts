@@ -97,7 +97,15 @@ export async function startFixture() {
       // port-discipline: ignore - temporary Unix socket, no TCP listener.
       relay.listen(socket, resolveListen);
     });
-    return { close, responses,
+    const shimCommand = (home: string) => [process.execPath, "--import", "tsx", resolve("test/hermes-plugin/harness/shim.ts"), socket, join(home, "shim.log")];
+    return { close, responses, socket, shimCommand,
+      preinstalledSession: async (interpreter: string, scenario: string, home: string): Promise<Record<string, any>> => {
+        const { stdout } = await run(interpreter, ["-I", resolve("../hermes-plugin/tests/harness/drive_hermes.py"),
+          "--preinstalled", "--scenario", scenario, "--home", home, "--socket", socket], {
+          cwd: resolve(".."), env: { ...process.env, HOME: home, HERMES_HOME: join(home, "hermes") },
+          timeout: 60_000, maxBuffer: 1024 * 1024 }); // One minute and one MiB bound an offline report.
+        return JSON.parse(stdout);
+      },
       audit: async () => (await new AuditLog(storage, custody.masterKey).query({ limit: 100 })).entries,
       document: async (id: string) => {
         const document = await corpus.getDocument(id);
