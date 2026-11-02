@@ -31,13 +31,75 @@ Diagnostic readers declare `readOnly: true`. Unauthorized loads also observe
 without seeding anchors, recovering signing controls or persisting integrity
 alerts. Findings and subscriber delivery remain available. No read path removes
 a lock; readers inspect stale-lock evidence and check the current inode while
-writers retain the existing removal proofs. This does not change discovery,
-lock proof strength or hold deadlines.
+writers apply the recovery rules below. Discovery and hold deadlines are unchanged.
 
 Failure mode: a refused writer sees `AuditWriterAuthorityError`, classified as
 `permission_denied`, before namespace creation or lock acquisition. A caller
 must use the chain's authorized principal to write; custody configuration does
 not resolve an authority refusal.
+
+## Lock recovery
+
+A process keeps a registry of the device and inode of every audit lock it holds.
+Those holds remain live until release begins, including release attempts that
+fail. Every other lock is evaluated in order: different known boot identities
+prove staleness; an own-pid start token establishes process identity; otherwise
+same-boot uptime and the existing wall-clock proofs decide own-pid records.
+An own lock outside the registry retains the same-boot self-held age bound.
+For foreign pids, only ESRCH proves death. Permission denial means alive and
+other probe errors mean unknown. A readable start token decides before wall
+age; equal tokens protect the holder and differing tokens prove pid reuse.
+Without readable tokens, same-boot protection and the existing reboot proofs
+remain. Empty records retain the mtime and id-less age checks. Other records
+without sufficient proof remain live.
+
+New transient lock records include an exact process start token when readable.
+Linux uses kernel start ticks; macOS uses the fixed C-locale UTC process start
+string. Token identity has no time tolerance. Entry, anchor, checkpoint and
+marker formats are unchanged.
+
+Every stale-lock removal uses a kernel guard. Its rendezvous is independent of
+environment overrides: Linux uses `/run/user/<uid>/sanctuary-audit-guard`, or
+`/run/sanctuary-audit-guard-0` for root. On macOS it uses the invoking uid's
+OS-selected user temporary directory itself. Directory ancestry, owner, mode
+and socket path length must pass validation; a failed validation has no fallback.
+The target audit directory retains its authorized custody owner, including
+root daemon handback. Runtime sockets remain owned by the invoking uid.
+
+Inside the guard, the writer reads metadata and bytes from one descriptor and
+re-evaluates the lock. A stale record is renamed to a claim tomb, then checked
+again for the same device, inode and bytes before deletion. A second tomb link
+retains that inode until guard release succeeds, so a release error can restore
+it without overwriting a successor. A mismatched claim
+is restored. If a successor prevents restoration, both files are retained and
+recovery refuses loudly. Acquisition without removal still uses atomic linking
+and does not acquire the guard. Stop every Sanctuary process on the host before
+starting the new version so all writers use the same recovery protocol.
+
+The acquisition loop and guard share a five-second monotonic budget. One
+in-flight socket probe or reaper can overrun that budget by its own bound;
+hung acquisition I/O remains unbounded. The thirty-second hold deadline and
+operation settlement behavior are unchanged. Leaked-release recovery continues
+to trust the existing self-held age bound.
+
+An authorized instance sweeps once, listing the audit directory once and reading
+no file bodies. Only strictly named acquire temps and claim tombs with provably
+dead pids are eligible. All instances share a cap of 64 unlink attempts, including
+failures; reaching the cap emits a diagnostic. Listing work is O(directory size).
+Live-pid files, failed deletions and over-cap residue remain, so retained disk
+residue is unbounded. Readers and unauthorized writers never sweep.
+
+Failure mode: an unprovable lock waits for an operator. A Linux user without
+`/run/user/<uid>`, or any writer with an obstructed guard directory, cannot
+recover automatically and sees `AuditLockRecoveryUnavailableError`. The owner
+or root must repair the reported path's ownership and permissions, then follow
+the manual recovery instruction. Missing runtime directories must be provisioned
+by the host's owner; changing custody environment variables does not repair the
+audit guard rendezvous.
+
+Linux recovery has source-level and separate-process test evidence. macOS token
+and directory selection have capture-based unit coverage only; the root-daemon
+recovery drill remains pending.
 
 ## Append and checkpoint work
 
