@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { createServer, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -212,4 +212,245 @@ describe("production idle lifecycle", () => {
     expect(outcome.timedOut).toBe(false); expect(outcome.code).toBe(0);
     expect(JSON.parse(await readFile(join(run.root, "observations.json"), "utf8"))).toEqual({ calls: 1, same: true });
   }, TEST_TIMEOUT_MS);
+});
+
+// Must match the IPC phases and commands in fixtures/lifecycle-idle-child.ts.
+type LK1Message = { recoveryCalls?: number; importCalls?: number; floorReached?: boolean; durableLoads?: number; phase: string; path?: string; directory?: string; request_id?: string; reason?: string; context?: { cause_class?: string }; errors?: Array<{ kind?: string }>; held?: boolean; callbackCount?: number };
+const LK1_STDERR_CAP_BYTES = 16_384; // 16 KiB with 1024 bytes per KiB.
+const LK1_LINE_BUFFER_CAP_BYTES = 65_536; // 64 KiB with 1024 bytes per KiB.
+function lk1Observe(child: ChildProcess) {
+  let stderr = "", buffer = "";
+  const waiting = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  const messages = new Map<string, unknown>();
+  let stopped = false;
+  function deliver(name: string, value: unknown) {
+    const waiter = waiting.get(name);
+    if (waiter) { waiting.delete(name); waiter.resolve(value); }
+    else {
+      if (messages.has(name)) throw new Error(`duplicate LK1 phase ${name}`);
+      messages.set(name, value);
+    }
+  }
+  child.stderr!.on("data", (data: Buffer) => {
+    const wasReady = stderr.includes("Tools: all registered");
+    stderr = (stderr + data.toString()).slice(-LK1_STDERR_CAP_BYTES);
+    if (!wasReady && stderr.includes("Tools: all registered")) deliver("READY", {});
+  });
+  child.stdout!.on("data", (data: Buffer) => {
+    buffer += data.toString();
+    if (Buffer.byteLength(buffer) > LK1_LINE_BUFFER_CAP_BYTES) throw new Error("LK1 RPC line overflow");
+    for (;;) {
+      const end = buffer.indexOf("\n"); if (end < 0) break;
+      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+      const message = JSON.parse(line);
+      if (message.id !== undefined) deliver(`rpc:${message.id}`, message);
+    }
+  });
+  child.on("message", (message: LK1Message) => deliver(message.phase, message));
+  const done = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      stopped = true;
+      for (const waiter of waiting.values()) waiter.reject(new Error(`LK1 child exited ${code}/${signal}: ${stderr}`));
+      waiting.clear(); resolve({ code, signal });
+    });
+  });
+  function phase<T = LK1Message>(name: string, timeoutMs = READY_TIMEOUT_MS): Promise<T> {
+    if (messages.has(name)) { const value = messages.get(name); messages.delete(name); return Promise.resolve(value as T); }
+    if (stopped) return Promise.reject(new Error(`LK1 child stopped before ${name}: ${stderr}`));
+    if (waiting.has(name)) return Promise.reject(new Error(`duplicate LK1 observer ${name}`));
+    let timer: ReturnType<typeof setTimeout>;
+    return new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => { waiting.delete(name); reject(new Error(`LK1 phase ceiling ${name}: ${stderr}`)); }, timeoutMs);
+      waiting.set(name, { resolve, reject });
+    }).finally(() => clearTimeout(timer));
+  }
+  return { phase, done, stderr: () => stderr,
+    command: (command: string, identity?: string) => child.send({ command, identity }),
+    rpc: async (id: number, name: string, args: unknown) => {
+      child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } })}\n`);
+      const response = await phase<{ error?: unknown; result: any }>(`rpc:${id}`, RPC_TIMEOUT_MS);
+      expect(response.error).toBeUndefined(); return response.result;
+    },
+  };
+}
+
+describe.runIf(process.platform === "linux" || process.platform === "darwin")("LK1 real CLI quota ownership", () => {
+  for (const trigger of ["EOF", "SIGTERM", "SIGINT", "ALIVE", "CLAIM", "IDENTITY", "IMPORT"] as const) {
+    it(`${trigger === "CLAIM" ? "T9" : trigger === "IDENTITY" || trigger === "IMPORT" ? "T10" : "T1"} R: completed CLI ${trigger} cleanup preserves its successor`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "l-"));
+      const fortress = join(root, "fortress");
+      await mkdir(fortress, { mode: 0o700 });
+      const key = randomBytes(32);
+      await writeFile(join(root, "fixture-key"), key, { mode: 0o600 });
+      const port = await unusedPort();
+      const token = randomBytes(32).toString("hex");
+      const child = spawn(process.execPath, ["--import", "tsx", fixture, trigger === "CLAIM" ? "cli-lk1-claim" : trigger === "IDENTITY" ? "cli-lk1-identity" : trigger === "IMPORT" ? "cli-lk1-import" : "cli-lk1"], {
+        detached: true, stdio: ["pipe", "pipe", "pipe", "ipc"],
+        env: { PATH: process.env.PATH, HOME: root, TMPDIR: root, VITEST: "true",
+          SANCTUARY_STORAGE_PATH: fortress, SANCTUARY_CUSTODY_LOCK_ROOT: join(root, "k"), SANCTUARY_NO_UPDATE_CHECK: "1",
+          SANCTUARY_DASHBOARD_ENABLED: "true", SANCTUARY_DASHBOARD_PORT: String(port),
+          SANCTUARY_DASHBOARD_AUTO_OPEN: "false", SANCTUARY_DASHBOARD_AUTH_TOKEN: token },
+      });
+      const run = lk1Observe(child);
+      const children: Array<{ child: ChildProcess; done: Promise<unknown> }> = [{ child, done: run.done }];
+      try {
+        await run.phase("READY");
+        child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "lk1", version: "1" } } })}\n`);
+        await run.phase("rpc:1");
+        child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+        const created = await run.rpc(2, "identity_create", { label: "lk1" });
+        expect(created.isError).not.toBe(true);
+        const identity = JSON.parse(created.content[0].text).identity_id;
+        expect(identity).toEqual(expect.any(String));
+        run.command("BIND", identity); await run.phase("BOUND");
+        if (trigger !== "CLAIM" && trigger !== "IDENTITY" && trigger !== "IMPORT") {
+          const warm = await run.rpc(3, "sanctuary_remember", { key: "warm", value: "warm" });
+          expect(warm.isError).not.toBe(true);
+          expect(JSON.stringify(warm)).not.toContain('"denied":true');
+        }
+        const approve = async (pending: Promise<any>, decision: "approve" | "deny") => {
+          const hold = await Promise.race([run.phase("HOLD"), pending.then((): LK1Message => ({ phase: "OP_SETTLED" }))]);
+          expect(hold.phase, "Tier 1 approval precedes import effects").toBe("HOLD");
+          const response = await fetch(`http://127.0.0.1:${port}/api/${decision}/${hold.request_id}`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+          expect(response.status).toBe(200);
+          return pending;
+        };
+        let bundle: string | undefined;
+        if (trigger === "IMPORT") {
+          const exported = await approve(run.rpc(8, "reputation_export", { identity_id: identity }), "approve");
+          expect(exported.isError).not.toBe(true);
+          bundle = JSON.parse(exported.content[0].text).bundle;
+          expect(bundle).toEqual(expect.any(String));
+          const healthy = await approve(run.rpc(9, "reputation_import", { bundle }), "approve");
+          expect(healthy.isError).not.toBe(true);
+          expect(JSON.parse(healthy.content[0].text).error).toBeUndefined();
+          expect(JSON.parse(healthy.content[0].text).completeness_verification).not.toBe("failed");
+          run.command("COUNTS"); expect(await run.phase("RECOVERY_COUNTS")).toMatchObject({ importCalls: 1, recoveryCalls: 0 });
+        }
+        run.command("ARM"); await run.phase("ARMED");
+        if (trigger === "IMPORT") {
+          const denied = run.rpc(10, "reputation_import", { bundle });
+          const hold = await Promise.race([run.phase("HOLD"), denied.then((): LK1Message => ({ phase: "OP_SETTLED" }))]);
+          expect(hold.phase, "unapproved import remains held").toBe("HOLD");
+          run.command("COUNTS"); expect(await run.phase("RECOVERY_COUNTS")).toMatchObject({ importCalls: 1, recoveryCalls: 0 });
+          const response = await fetch(`http://127.0.0.1:${port}/api/deny/${hold.request_id}`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+          expect(response.status).toBe(200); expect(JSON.stringify(await denied)).toMatch(/denied|refused/i);
+          run.command("COUNTS"); expect(await run.phase("RECOVERY_COUNTS")).toMatchObject({ importCalls: 1, recoveryCalls: 0 });
+        }
+        const saving = trigger === "IDENTITY" ? run.rpc(4, "identity_create", { label: "runtime" })
+          : trigger === "IMPORT" ? run.rpc(4, "reputation_import", { bundle })
+          : run.rpc(4, "sanctuary_remember", { key: "refused", value: "refused" });
+        void saving.catch(() => {});
+        if (trigger === "IMPORT") {
+          const hold = await run.phase("HOLD");
+          const response = await fetch(`http://127.0.0.1:${port}/api/approve/${hold.request_id}`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+          expect(response.status).toBe(200);
+        }
+        const pausePhase = trigger === "CLAIM" ? "CLAIM_PAUSED" : trigger === "IDENTITY" || trigger === "IMPORT" ? "RECOVERY_PAUSED" : "READ_PAUSED";
+        const paused = await Promise.race([run.phase(pausePhase), saving.then((result): LK1Message => ({ phase: "OP_SETTLED", result } as LK1Message))]);
+        expect(paused.phase, `real consumer reaches the required lock pause: ${JSON.stringify(paused)}`).toBe(pausePhase);
+        if (trigger === "IDENTITY" || trigger === "IMPORT") expect(paused.floorReached).toBe(true);
+        await unlink(paused.path!);
+        await expect(lstat(paused.path!)).rejects.toMatchObject({ code: "ENOENT" });
+        async function launchPeer(role: string) {
+          const home = join(root, role); await mkdir(home, { mode: 0o700 });
+          const child = spawn(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../fixtures/lock-teardown-child.ts", import.meta.url)), role, "numeric0", "source"], {
+            detached: true, stdio: ["ignore", "pipe", "pipe", "ipc"],
+            env: { PATH: process.env.PATH, HOME: home, TMPDIR: home, VITEST: "true",
+              SANCTUARY_STORAGE_PATH: join(home, "fortress"), SANCTUARY_CUSTODY_LOCK_ROOT: join(root, "k"),
+              SANCTUARY_NO_UPDATE_CHECK: "1", LK1_TARGET: paused.directory, LK1_DIRECT_LOCK: trigger === "CLAIM" ? ".memory-handles.lock" : trigger === "IDENTITY" || trigger === "IMPORT" ? "custody-master.lock" : "own-scope-save-quota.lock" },
+          });
+          const observation = lk1Observe(child);
+          children.push({ child, done: observation.done });
+          return { child, ...observation };
+        }
+        const peer = await launchPeer("successor");
+        const successor = peer.child;
+        await peer.phase("READY");
+        expect((await peer.phase("HELD")).path).toBe(paused.path);
+        const heldIdentity = await lstat(paused.path!, { bigint: true });
+        run.command("RESUME");
+        if (trigger === "IMPORT") {
+          const refusal = JSON.parse((await saving).content[0].text);
+          expect(refusal).toMatchObject({ imported_attestations: 0, completeness_verification: "failed" });
+          expect(refusal.error).toEqual(expect.any(String));
+        } else if (trigger === "CLAIM" || trigger === "IDENTITY") {
+          expect((await saving).isError).toBe(true);
+        } else {
+        const hold = await run.phase("HOLD");
+        expect(hold.reason).toBe("memory save quota unavailable");
+        expect(["deadline", "lock"]).toContain(hold.context?.cause_class);
+        const denial = await fetch(`http://127.0.0.1:${port}/api/deny/${hold.request_id}`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+        expect(denial.status).toBe(200);
+        expect(JSON.stringify(await saving)).toMatch(/denied|refused/i);
+        }
+        await run.phase("DISPOSAL_SETTLED");
+        expect(await run.rpc(5, "state_read", { namespace: "lifecycle", key: "absent" })).toBeDefined();
+        if (trigger === "CLAIM") {
+          run.command("LOADS"); const before = (await run.phase("CACHE_STATE")).durableLoads!;
+          const retried = await run.rpc(6, "sanctuary_remember", { key: "retried", value: "retried" });
+          expect(retried.isError).not.toBe(true);
+          run.command("LOADS"); const after = (await run.phase("CACHE_STATE")).durableLoads!;
+          expect(after, "retry loads the durable first-use claim").toBeGreaterThan(before);
+          const warm = await run.rpc(7, "sanctuary_remember", { key: "cached", value: "cached" });
+          expect(warm.isError).not.toBe(true);
+          run.command("LOADS"); expect((await run.phase("CACHE_STATE")).durableLoads).toBe(after);
+        }
+        const assertConnectable = async () => {
+          await new Promise<void>((resolve, reject) => {
+            const socket = connect(paused.path!);
+            socket.once("connect", () => { socket.destroy(); resolve(); });
+            socket.once("error", reject);
+            socket.setTimeout(RPC_TIMEOUT_MS, () => { socket.destroy(); reject(new Error("quota connection ceiling")); });
+          });
+        };
+        await assertConnectable();
+        if (trigger === "ALIVE") {
+          successor.send("CHECK"); expect((await peer.phase("CHECKED")).held).toBe(true);
+          successor.send("RELEASE"); expect((await peer.phase("DISPOSAL_SETTLED")).errors).toEqual([]);
+          successor.send("EXIT"); await peer.phase("RETURNED");
+          expect(await peer.done).toEqual({ code: 0, signal: null });
+          expect(child.exitCode).toBeNull();
+          const fresh = await run.rpc(6, "sanctuary_remember", { key: "continued", value: "continued" });
+          expect(fresh.isError).not.toBe(true);
+          expect(JSON.stringify(fresh)).not.toMatch(/"denied":true|"refused":true/);
+        }
+        run.command("STOPPING"); await run.phase("STOPPING");
+        if (trigger === "EOF" || trigger === "ALIVE" || trigger === "CLAIM" || trigger === "IDENTITY" || trigger === "IMPORT") child.stdin!.end(); else child.kill(trigger);
+        await run.phase("FLUSH_DONE");
+        expect(await run.done).toEqual({ code: 0, signal: null });
+        expect(run.stderr()).not.toContain("forcing");
+        expect(JSON.parse(await readFile(join(root, "lk1-flush.json"), "utf8")).sort()).toEqual(["audit", "baseline", "inbox"]);
+        const { profile } = await persisted(fortress, key);
+        expect(profile.tool_call_counts.state_read ?? 0, "shutdown persists the final live read").toBeGreaterThan(0);
+        if (trigger === "ALIVE") return;
+        const after = await lstat(paused.path!, { bigint: true }).catch(() => null);
+        expect(after?.ino, "quota successor survives actual CLI shutdown").toBe(heldIdentity.ino);
+        expect(after?.dev).toBe(heldIdentity.dev);
+        await assertConnectable();
+        successor.send("CHECK"); expect((await peer.phase("CHECKED")).held).toBe(true);
+        const contender = await launchPeer("contender");
+        await contender.phase("READY");
+        const blocked = await contender.phase("DISPOSAL_SETTLED");
+        expect(blocked.callbackCount).toBe(0);
+        expect(blocked.errors?.some(error => error.kind === "contention")).toBe(true);
+        contender.child.send("EXIT"); await contender.phase("RETURNED");
+        expect(await contender.done).toEqual({ code: 0, signal: null });
+        successor.send("RELEASE"); expect((await peer.phase("DISPOSAL_SETTLED")).errors).toEqual([]);
+        successor.send("EXIT"); await peer.phase("RETURNED");
+        expect(await peer.done).toEqual({ code: 0, signal: null });
+        const reacquired = await launchPeer("contender-after");
+        await reacquired.phase("READY");
+        expect((await reacquired.phase("HELD")).path).toBe(paused.path);
+        reacquired.child.send("RELEASE");
+        expect((await reacquired.phase("DISPOSAL_SETTLED")).errors).toEqual([]);
+        reacquired.child.send("EXIT"); await reacquired.phase("RETURNED");
+        expect(await reacquired.done).toEqual({ code: 0, signal: null });
+      } finally {
+        for (const item of children) { killOwned(item.child); await item.done; }
+        await rm(root, { recursive: true, force: true });
+      }
+    }, TEST_TIMEOUT_MS);
+  }
 });

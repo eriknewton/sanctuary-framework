@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - `sanctuary castle-wall` commands end with their own exit code and no longer continue into the default startup path.
+- A holder that lost its lock no longer removes a successor's lock when it exits.
 - Linux-verified audit lock recovery uses exact process identity, serialized removal and a monotonic acquisition budget. Unprovable locks require operator recovery. macOS runtime verification remains pending.
 - Audit discovery reports a typed outcome before sequence allocation. Unknown state requires operator investigation; an authenticated empty suffix continues from its current sealed boundary. Full verification and hold-deadline limits remain unchanged.
 - Audit chains admit writers by their declared role and directory owner. Diagnostic readers preserve lock evidence, and storage listings retain surviving files when another candidate disappears.

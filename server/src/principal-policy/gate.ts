@@ -359,7 +359,10 @@ export class ApprovalGate {
     })
       .catch((error): SaveQuotaResult => {
         // Typed lock causes are operator recovery data; exception messages may contain private paths.
-        const lockKind = error instanceof CrossProcessLockError ? error.kind : undefined;
+        // Aggregate membership must match the withKernelPathLock producer in storage/cross-process-lock.ts.
+        const lockError = error instanceof CrossProcessLockError ? error
+          : error instanceof AggregateError ? error.errors.find(member => member instanceof CrossProcessLockError) : undefined;
+        const lockKind = lockError?.kind;
         const lockCause = lockKind === "capability" ? "lock_capability" : lockKind === "scaffold-integrity" ? "lock_integrity" : "lock";
         return { cause_class: abort.signal.aborted ? "deadline" : lockKind ? lockCause : causeClass,
           ...(lockKind ? { lock_kind: lockKind } : {}) };

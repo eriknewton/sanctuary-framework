@@ -244,3 +244,18 @@ it("names the removable quota lock file only in the O_EXCL runbook paragraph", a
   expect(doc).toContain("process never holds");
   expect(doc).toContain("A `lock` hold means the save could not acquire or retain the directory lock: most often another process holds it; it also covers I/O errors on the lock directory and a holder lost after acquisition.");
 });
+
+// Must match aggregate lock classification in principal-policy/gate.ts.
+it("reports the first aggregate lock cause after a quota body rejection", async () => {
+  const failure = new AggregateError([
+    new Error("private quota body failure"),
+    new locks.CrossProcessLockError("private lock path", "holder-lost"),
+    new locks.CrossProcessLockError("later lock cause", "capability"),
+  ]);
+  vi.spyOn(custody, "writeFileCustody").mockRejectedValue(failure);
+  expect((await save(gate())).tier).toBe(2);
+  const row = logs.find(e => e.operation === "memory_save_quota_unavailable");
+  expect(row!.details).toEqual({ cause_class: "lock", lock_kind: "holder-lost" });
+  expect(requests.at(-1)!.context).toMatchObject({ cause_class: "lock", lock_kind: "holder-lost" });
+  expect(JSON.stringify(logs)).not.toContain("private quota body failure");
+});
