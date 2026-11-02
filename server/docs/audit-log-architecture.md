@@ -8,6 +8,37 @@ payload uses AES-256-GCM and the master-derived `audit-log` purpose key. Legacy
 records remain readable through the existing load path. Entry and anchor formats
 are unchanged by names-only enumeration.
 
+## Writer authority
+
+Each chain has a trusted construction-time writer role. The default `operator`
+role admits the owner of the existing metadata directory, or the storage root
+when metadata does not exist. When both are absent, a bounded ancestor walk
+admits a non-root caller; root requires a root-owned ancestor. The
+`root_daemon` and `boot_token` roles require uid 0. `createOwner` controls
+custody handback after admission and does not grant writer authority.
+
+Owner directories, storage roots and existing entry, checkpoint and metadata
+namespace directories are checked when a writer is admitted and must be plain
+directories at admission. Symlinks are refused at that check. This check does
+not by itself hold namespace identity through later writes. The
+Linux custody operation's exact `/proc/self/fd/<digits>` directory paths are
+an exception: their descriptors pin directory identity, so the owner is read
+from the pinned directory. An audit namespace cannot itself be the custody
+operation's locked namespace. Storage without filesystem capabilities has no
+filesystem owner check.
+
+Diagnostic readers declare `readOnly: true`. Unauthorized loads also observe
+without seeding anchors, recovering signing controls or persisting integrity
+alerts. Findings and subscriber delivery remain available. No read path removes
+a lock; readers inspect stale-lock evidence and check the current inode while
+writers retain the existing removal proofs. This does not change discovery,
+lock proof strength or hold deadlines.
+
+Failure mode: a refused writer sees `AuditWriterAuthorityError`, classified as
+`permission_denied`, before namespace creation or lock acquisition. A caller
+must use the chain's authorized principal to write; custody configuration does
+not resolve an authority refusal.
+
 ## Append and checkpoint work
 
 The append queue serializes each instance's writes. Filesystem writers acquire

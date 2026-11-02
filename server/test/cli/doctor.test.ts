@@ -2,7 +2,10 @@
  * Doctor distinguishes missing signature evidence from integrity findings.
  * AUDIT-VERIFY-UNSIGNED-1024
  */
-// fail-before-exempt: These regression guards preserve the base identity FAIL and audit-chain WARN behavior; the coverage and exit tests supply the fail-before cases.
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 import { afterEach, describe, expect, it } from "vitest";
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -669,7 +672,7 @@ approval_channel:
       });
     }
     await auditLog.flush();
-    await migrateFortressAuditStoreSplit({ storage, masterKey: derived.key });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey: derived.key }));
 
     // Tamper one sealed entry IN PLACE (hash_mismatch, not deletion).
     const auditDir = join(statePath, "_audit");
@@ -855,3 +858,11 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
     expect(checks.find((c) => c.name === "wrapped harness ids")!.status).toBe("OK");
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

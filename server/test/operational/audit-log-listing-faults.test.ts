@@ -1,3 +1,6 @@
+// fail-before-exempt: A1a root_daemon fixture identity and recount schedule updates; survivor assertions cover the listing change, existing base fault schedules remain.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -401,20 +404,36 @@ describe("metadata observation contract on real files", () => {
     expect(recountLines(diagnostic)).toEqual([[`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} failed`], [`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} recovered`]]);
   });
 
-  it("rejects a raw empty recount caused by a dangling name without seeding empty accounting", async () => {
+  it("skips a dangling name and seeds the recount from surviving entries", async () => {
     const { raw, log, path } = await setup(3);
     await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-00000000000000000000-dangling.enc"));
-    const before = (log as any).retainedBytesEstimate;
     const seed = vi.spyOn(log as any, "seedRetention");
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
     await log.appendCritical(measureEntry(3));
-    expect(await raw.list("_audit")).toEqual([]);
-    expect(seed).not.toHaveBeenCalled();
-    const tail = (await raw.listKeys("_audit")).filter((key) => key.startsWith("entry-00000000000000000004-"))[0]!;
-    expect((log as any).retainedBytesEstimate).toBe(before + (await raw.read("_audit", tail))!.length);
-    expect((log as any).bytesProvenance).toBe("unknown");
-    expect(recountLines(diagnostic)).toHaveLength(1);
+    const survivors = await raw.list("_audit");
+    expect(survivors).toHaveLength(2); // Cap three minus the one-entry hysteresis margin.
+    expect(seed).toHaveBeenCalled();
+    expect((log as any).retainedBytesEstimate).toBe(survivors.reduce((sum, meta) => sum + meta.size_bytes, 0));
+    expect((log as any).bytesProvenance).toBe("seeded");
+    expect(recountLines(diagnostic)).toEqual([]);
   });
+
+  for (const schedule of ["directory", "all-candidates"] as const) {
+    it(`rejects a raw empty recount after ${schedule} ENOENT without seeding empty accounting`, async () => {
+      const { raw, log, path } = await setup(3);
+      const before = (log as any).retainedBytesEstimate;
+      const seed = vi.spyOn(log as any, "seedRetention");
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+      injectRecountEnoent(raw, path, schedule);
+      await log.appendCritical(measureEntry(3));
+      expect(seed).not.toHaveBeenCalled();
+      const tail = (await raw.listKeys("_audit")).filter((key) => key.startsWith("entry-00000000000000000004-"))[0]!;
+      expect((log as any).retainedBytesEstimate).toBe(before + (await raw.read("_audit", tail))!.length);
+      expect((log as any).bytesProvenance).toBe("unknown");
+      expect(recountLines(diagnostic)).toEqual([[`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} failed`]]);
+      expect((await fs.stat(join(path, "_audit"))).isDirectory()).toBe(true);
+    });
+  }
 
   it("accepts a shorter raw recount after a foreign prefix prune between holds", async () => {
     const { raw, log, path } = await setup();
@@ -513,13 +532,13 @@ for (const collapse of [false, true]) {
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
     let seedBefore = 0;
     vi.spyOn(log as any, "maybeRotate").mockImplementationOnce(async (...args) => {
-      const migrated = await migrateFortressAuditStoreSplit({ storage: raw, masterKey: MEASURE_MASTER_KEY, identityId: "fixture" });
+      const migrated = await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage: raw, masterKey: MEASURE_MASTER_KEY, identityId: "fixture" }));
       expect(migrated.status).toBe("migrated");
       const b = new AuditLog(new FilesystemStorage(path), MEASURE_MASTER_KEY, MEASURE_CONFIG);
       await b.appendCritical(measureEntry(4));
       (log as any).bytesProvenance = "unknown";
       seedBefore = (log as any).retainedBytesEstimate;
-      if (collapse) await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-00000000000000000000-dangling.enc"));
+      if (collapse) injectRecountEnoent(raw, path, "directory");
       return rotate(...args);
     });
     await log.appendCritical(measureEntry(3));
@@ -668,3 +687,31 @@ it("crosses the fallback cap twice with full E plus L accounting and surviving l
   expect(anchors.mock.calls.map(([seq]) => seq)).toEqual([4, 5, 6, 7]);
   expect((await new AuditLog(wrapper, MEASURE_MASTER_KEY, MEASURE_CONFIG).query({ limit: 10 })).integrity_findings).toEqual([]);
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));
+
+function injectRecountEnoent(raw: FilesystemStorage, path: string, schedule: "directory" | "all-candidates") {
+  const list = raw.list.bind(raw);
+  vi.spyOn(raw, "list").mockImplementationOnce(async (...args) => {
+    // The recount invokes list after acquiring the rotation hold, so discovery stays unchanged.
+    expect(await fs.readFile(join(path, "_audit", ".audit-write.lock"), "utf8")).toContain('"pid"');
+    const method = schedule === "directory" ? "readdir" : "stat";
+    const original = fs[method];
+    const fault = vi.spyOn(fs, method).mockImplementation((async (...fsArgs: any[]) => {
+      const file = String(fsArgs[0]);
+      if (schedule === "directory" ? file === join(path, "_audit") : file.startsWith(join(path, "_audit") + "/") && file.endsWith(".enc")) {
+        throw Object.assign(new Error("candidate vanished"), { code: "ENOENT" });
+      }
+      return (original as any)(...fsArgs);
+    }) as any);
+    syncBuiltinESMExports();
+    try { return await list(...args); }
+    finally { fault.mockRestore(); syncBuiltinESMExports(); }
+  });
+}

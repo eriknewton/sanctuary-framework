@@ -1772,6 +1772,7 @@ async function createWrapAuditEvidenceReader(input: {
     }
 
     const daemonLog = createDaemonAuditLog(auditStorage, masterKey, {
+      readOnly: true,
       integrityMode: "lenient",
     });
     return {

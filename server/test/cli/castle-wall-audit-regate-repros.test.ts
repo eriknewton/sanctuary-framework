@@ -14,6 +14,10 @@
  * Single-process tests: cross-uid is simulated where needed via chmod; the
  * armed-box drill still owes the real root/operator split (see the PR body).
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { chmod, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -104,20 +108,20 @@ describe("F2 re-gate repros (round 2)", () => {
     }
     await opLog.flush();
 
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
     if (opts.daemonEntries && opts.daemonEntries > 0) {
       const daemonLog = createDaemonAuditLog(storage, masterKey);
       for (let i = 0; i < opts.daemonEntries; i++) {
-        await daemonLog.appendCritical({
+        await withRootDaemonWriter(() => daemonLog.appendCritical({
           layer: "l1",
           operation: i % 2 === 0 ? "egress_allowed" : "egress_blocked",
           identity_id: "castle-wall-daemon",
           result: "success",
           details: { host: `h${i}.example` },
-        });
+        }));
       }
-      await daemonLog.flush();
+      await withRootDaemonWriter(() => daemonLog.flush());
     }
     return { fortressPath, statePath, storage, masterKey };
   }
@@ -275,3 +279,11 @@ describe("F2 re-gate repros (round 2)", () => {
     expect(report.daemon_integrity_findings.length).toBeGreaterThan(0);
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

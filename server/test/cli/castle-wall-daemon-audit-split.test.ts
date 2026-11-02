@@ -20,6 +20,10 @@
  * property this single-process test cannot reproduce; that is exactly the
  * armed-box Mini1 re-drill's job (see the PR body).
  */
+// fail-before-exempt: A1a root_daemon fixture runs simulate authority only during the root run and reset before reader assertions.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -29,7 +33,7 @@ import { Writable } from "node:stream";
 
 import {
   runAuditStoreStatus,
-  runDaemon,
+  runDaemon as production_runDaemon,
   runProvisionPin,
   type CastleWallCommandContext,
 } from "../../src/cli/castle-wall.js";
@@ -472,3 +476,11 @@ describe("castle-wall audit-store-status (CLI)", () => {
     }
   });
 });
+
+async function runDaemon(...args: Parameters<typeof production_runDaemon>): ReturnType<typeof production_runDaemon> {
+  if (args[1]?.getuid?.() !== 0) return production_runDaemon(...args);
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await production_runDaemon(...args); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

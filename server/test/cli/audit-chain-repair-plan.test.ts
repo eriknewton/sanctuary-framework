@@ -1,4 +1,3 @@
-// fail-before-exempt: comment-only cross-file pin for the machine-key material; behavior is proven by server/test/wrap/passphrase-host-identity.test.ts
 /**
  * `sanctuary audit-chain repair-plan` — behavior and the no-mutation property.
  *
@@ -13,6 +12,10 @@
  * a created empty directory (a namespace materialized as a side effect of being
  * read) and a contents-only hash would call that unchanged.
  */
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
+
 
 import { chmod, lstat, mkdtemp, open, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
@@ -267,15 +270,15 @@ describe("audit-chain repair-plan", () => {
     const fortressPath = await seededFortress();
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
     const daemonLog = createDaemonAuditLog(storage, masterKey);
-    await daemonLog.appendCritical({
+    await withRootDaemonWriter(() => daemonLog.appendCritical({
       layer: "l1",
       operation: "daemon-seed",
       identity_id: "daemon",
       result: "success",
-    });
-    await daemonLog.flush();
+    }));
+    await withRootDaemonWriter(() => daemonLog.flush());
     masterKey.fill(0);
 
     const daemonDir = join(fortressPath, "state", AUDIT_DAEMON_NAMESPACE);
@@ -318,15 +321,15 @@ describe("audit-chain repair-plan", () => {
     const fortressPath = await seededFortress();
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
     const daemonLog = createDaemonAuditLog(storage, masterKey);
-    await daemonLog.appendCritical({
+    await withRootDaemonWriter(() => daemonLog.appendCritical({
       layer: "l1",
       operation: "daemon-seed",
       identity_id: "daemon",
       result: "success",
-    });
-    await daemonLog.flush();
+    }));
+    await withRootDaemonWriter(() => daemonLog.flush());
     // Post-split entries, so there is a readable suffix left to damage.
     const opLog = new AuditLog(storage, masterKey);
     for (let i = 0; i < 3; i++) {
@@ -647,3 +650,11 @@ describe("audit-chain repair-plan", () => {
     );
   });
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));

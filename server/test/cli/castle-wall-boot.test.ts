@@ -1,3 +1,6 @@
+// fail-before-exempt: A1a boot_token fixture runs simulate authority only during the root run and reset before reader assertions.
+import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
+import { afterEach as resetAuditWriterAfterEach } from "vitest";
 import { afterEach, describe, expect, it } from "vitest";
 import { access, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,8 +16,8 @@ import {
   bootServiceReady,
   parseBootArgs,
   renderBootLaunchDaemonPlist,
-  runInstallBoot,
-  runProvisionBootToken,
+  runInstallBoot as production_runInstallBoot,
+  runProvisionBootToken as production_runProvisionBootToken,
   runUninstallBoot,
   type CastleWallBootContext,
   type ExecFileResult,
@@ -1486,3 +1489,18 @@ describe("castle-wall boot service (F1 Option C)", () => {
     });
   });
 });
+
+async function runProvisionBootToken(...args: Parameters<typeof production_runProvisionBootToken>): ReturnType<typeof production_runProvisionBootToken> {
+  if ((args[1]?.getuid?.() ?? process.getuid?.()) !== 0) return production_runProvisionBootToken(...args);
+  __testSetAuditWriterUidForRole("boot_token", 0);
+  try { return await production_runProvisionBootToken(...args); }
+  finally { __testSetAuditWriterUidForRole("boot_token", undefined); }
+}
+
+async function runInstallBoot(...args: Parameters<typeof production_runInstallBoot>): ReturnType<typeof production_runInstallBoot> {
+  if ((args[1]?.getuid?.() ?? process.getuid?.()) !== 0) return production_runInstallBoot(...args);
+  __testSetAuditWriterUidForRole("boot_token", 0);
+  try { return await production_runInstallBoot(...args); }
+  finally { __testSetAuditWriterUidForRole("boot_token", undefined); }
+}
+resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("boot_token", undefined));

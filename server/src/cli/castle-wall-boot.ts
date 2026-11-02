@@ -899,6 +899,8 @@ async function auditBootTokenEvent(
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
   const auditLog = new AuditLog(storage, auditKey, {
+    // Role must match the trusted role union in operational/audit-log.ts.
+    chainWriterRole: "boot_token",
     // IC-05-DG: the safe-mode boot store is structurally NOT a fortress load
     // (its own isolated storage path, a token-derived key, no identities), so
     // downgrade detection is declared off AT CONSTRUCTION (the #1249

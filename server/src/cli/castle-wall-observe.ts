@@ -490,7 +490,12 @@ async function resolveObserveAuditSources(
     auditLog: new AuditLog(
       new FilesystemStorage(auditStoragePath),
       deriveSafeModeAuditKey(tokenRead.token),
-      { consultSplitBoundary: false },
+      {
+        // Role must match the trusted role union in operational/audit-log.ts.
+        chainWriterRole: "boot_token",
+        readOnly: true,
+        consultSplitBoundary: false,
+      },
     ),
     instance_id: instanceId,
   });

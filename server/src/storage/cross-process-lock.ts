@@ -889,6 +889,7 @@ async function resolveMasterBarrierCoordinates(
         "capability",
       );
     }
+    // The _meta owner rule must match assertAuditWriterAuthority in operational/audit-log.ts.
     if (Number(stats.uid) !== uid) {
       // Changing operator-path ownership requires the trusted operator account; this mismatch stays environmental.
       throw new CrossProcessLockError(

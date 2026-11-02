@@ -1,4 +1,4 @@
-// fail-before-exempt: type-forced fixture update only: armed-exclusive outcome fixtures gained the required liveness field; banner evidence probes have no behavioral stake in this PR
+// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
 /**
  * Castle Wall wrap-banner enforcement probes (fix-round MED-4c for PR #843,
  * protection-claim chokepoint 2026-07-19).
@@ -30,7 +30,7 @@ import {
   resolveWrapProtectionClaim,
 } from "../../src/wrap/cli.js";
 import { protectionStateAdvice } from "../../src/egress-gate/protection-claim.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import {
   AUDIT_DAEMON_NAMESPACE,
   createDaemonAuditLog,
@@ -501,10 +501,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       details: { source: "operator-chain-fixture" },
     });
     await operatorLog.flush();
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
     const daemonLog = createDaemonAuditLog(storage, masterKey);
-    await appendDaemonProtectionEvidence(daemonLog);
+    await withRootDaemonWriter(() => appendDaemonProtectionEvidence(daemonLog));
 
     return {
       auditLog: new AuditLog(storage, masterKey),
@@ -527,10 +527,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       details: { source: "operator-chain-fixture" },
     });
     await operatorLog.flush();
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
     const daemonLog = createDaemonAuditLog(storage, masterKey);
-    await appendSignedDaemonProtectionEvidence(daemonLog, privateKey);
+    await withRootDaemonWriter(() => appendSignedDaemonProtectionEvidence(daemonLog, privateKey));
 
     return {
       auditLog: new AuditLog(storage, masterKey),
@@ -552,9 +552,9 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       details: { source: "operator-chain-fixture" },
     });
     await operatorLog.flush();
-    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
     await appendOperatorProtectionEvidence(new AuditLog(storage, masterKey));
-    await appendDaemonProtectionEvidence(createDaemonAuditLog(storage, masterKey));
+    await withRootDaemonWriter(() => appendDaemonProtectionEvidence(createDaemonAuditLog(storage, masterKey)));
     return {
       auditLog: new AuditLog(storage, masterKey),
       auditStorage: storage,
@@ -1527,3 +1527,11 @@ describe("Castle Wall wrap-banner evidence probes", () => {
   });
 
 });
+
+// Scope simulated authority to root-writer fixture work, then restore reader identity.
+async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
+  __testSetAuditWriterUidForRole("root_daemon", 0);
+  try { return await operation(); }
+  finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
+}
+afterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));
