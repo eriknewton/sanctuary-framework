@@ -21,7 +21,7 @@ import { redactAuditEntryForAgent } from "../../../src/operational/agent-audit-r
 import { formatAsCEF, formatAsOCSF, formatAsECS, formatAsXDM } from "../../../src/audit/siem-formatter.js";
 import { DashboardApprovalChannel } from "../../../src/principal-policy/dashboard.js";
 import { handleRequest } from "../../../src/dashboard/api.js";
-import { createDashboardReadFlightMap } from "../../../src/dashboard/read-response.js";
+import { createDashboardReadFlightMap } from "../../../src/dashboard/read-response.js"; import { createPosturePanelStore } from "../../../src/principal-policy/panel-producer.js";
 import { handlePostureRoute } from "../../../src/principal-policy/posture-routes.js";
 import type { HubApprovalPendingItem } from "../../../src/contracts/v1.1/hub-events.js";
 import { HubError } from "../../../src/hub/errors.js";
@@ -138,7 +138,7 @@ async function publisherFrames(item: unknown) {
   try {
     for (let n = 0; n < 2; n++) {
       const res = new Reply(); replies.push(res);
-      await handleRequest({ sources: {}, authToken: TOKEN, readFlightMap: createDashboardReadFlightMap(), onEvent: (listener: (event: any) => void) => { listeners.push(listener); return () => {}; } } as any, request("/api/stream", "GET"), res as unknown as ServerResponse);
+      await handleRequest({ sources: {}, authToken: TOKEN, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(), onEvent: (listener: (event: any) => void) => { listeners.push(listener); return () => {}; } } as any, request("/api/stream", "GET"), res as unknown as ServerResponse);
     }
     for (const listener of listeners) listener({ type: "inbox", data: item });
     for (const res of replies) frames.push(...res.chunks);
@@ -208,7 +208,7 @@ describe("response-only export delivery", () => {
     const raw = await f.auditLog.query({ limit: 100 });
     secretFree(raw);
     const evidenceReply = new Reply();
-    await handlePostureRoute({ auditLog: f.auditLog, originMachine: "fixture", listAgents: () => [], readFlightMap: createDashboardReadFlightMap() }, request("/api/posture/evidence", "GET"), evidenceReply as unknown as ServerResponse, new URL("http://localhost/api/posture/evidence"), "GET");
+    await handlePostureRoute({ auditLog: f.auditLog, originMachine: "fixture", listAgents: () => [], panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap() }, request("/api/posture/evidence", "GET"), evidenceReply as unknown as ServerResponse, new URL("http://localhost/api/posture/evidence"), "GET");
     expect(evidenceReply.statusCode).toBe(200); secretFree(evidenceReply.json());
     const rawChannel = new DashboardApprovalChannel({ port: 0, host: "127.0.0.1", timeout_seconds: 30, auto_open: false });
     (rawChannel as any).auditLog = f.auditLog;

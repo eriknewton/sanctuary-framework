@@ -15,7 +15,7 @@ import {
 } from "../../src/principal-policy/posture-routes.js";
 import type { DetectedHarness } from "../../src/principal-policy/posture.js";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
-import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js"; import { createPosturePanelStore } from "../../src/principal-policy/panel-producer.js";
 const FORTRESS = "fortress:test";
 
 function subjectForUid(uid: number): string {
@@ -115,7 +115,7 @@ function baseDeps(
   const detected: DetectedHarness[] = [
     { platform: "cursor", harness: "cursor", config_path: "/home/u/.cursor/mcp.json" },
   ];
-  return { readFlightMap: createDashboardReadFlightMap(),
+  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => agents,
@@ -449,7 +449,7 @@ describe("posture route layer", () => {
     // Build deps WITHOUT a listReachRules override and WITHOUT enabled curated
     // rule ids - the production default-off shape. The curated catalog must NOT
     // be mapped wholesale into a fabricated kernel-enforced default-deny.
-    const deps: PostureRouteDeps = { readFlightMap: createDashboardReadFlightMap(),
+    const deps: PostureRouteDeps = { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
       auditLog: newLog(),
       originMachine: FORTRESS,
       listAgents: () => [wrappedAgent("a1", "claude_code")],
@@ -469,7 +469,7 @@ describe("posture route layer", () => {
     // When the operator has enabled exactly one curated rule, reach reflects
     // that one rule - never the full curated set. Rules on disk are still only
     // CONFIGURATION (enforcement_confirmed stays false).
-    const deps: PostureRouteDeps = { readFlightMap: createDashboardReadFlightMap(),
+    const deps: PostureRouteDeps = { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
       auditLog: newLog(),
       originMachine: FORTRESS,
       listAgents: () => [wrappedAgent("a1", "claude_code")],
@@ -935,4 +935,31 @@ describe("Overview protection snapshot", () => {
       expect(home.unwrapped.unwrapped).toHaveLength(records.length ? 0 : 1);
     });
   }
+});
+
+it.each(["castle-wall", "digest", "feature-health"])("direct %s derives restrictions from every named key observation", async route => {
+  const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+  const cases = [
+    ["unknown", "absent"], ["unreadable", "absent"], ["absent", "absent"], ["present", "absent"], ["present", "unreadable"],
+  ] as const;
+  try {
+    for (const [producer, broker] of cases) {
+      const url = await serve(baseDeps(log, [], { producerKeyObservation: producer, brokerProducerKeyObservation: broker }));
+      const response = await fetch(`${url}/api/posture/${route}`);
+      expect(response.status).toBe(200);
+      const body = await response.json() as any;
+      const restricted = producer === "unknown" || producer === "unreadable" || broker === "unreadable";
+      if (route === "digest") {
+        expect(body.chain_verified).toBe(!restricted);
+        if (restricted) expect(body).toMatchObject({ window_complete: false, kernel_allows: 0, kernel_blocks: 0, total_operations: 0 });
+      } else if (route === "castle-wall") {
+        expect(body.evidence_basis === "producer_key_unavailable").toBe(restricted);
+        if (restricted) expect(body.arm_state).not.toBe("armed");
+      } else {
+        expect(body.audit_integrity_ok).toBe(producer !== "unknown" && producer !== "unreadable");
+        if (producer === "unknown" || producer === "unreadable") expect(body.rows.every((row: any) => row.status !== "active")).toBe(true);
+        if (broker === "unreadable") expect(body.rows.find((row: any) => row.feature_id === "secret_broker_daemon")).toMatchObject({ status: "unknown", basis: "integrity_tainted" });
+      }
+    }
+  } finally { await log.flush(); }
 });

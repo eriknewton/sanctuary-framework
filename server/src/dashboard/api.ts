@@ -14,6 +14,8 @@
  * pinned exports + test anchors; do not add NEW routes here.
  */
 
+import { observeInjectedProducerKey } from "../principal-policy/posture-routes.js";
+import type { PosturePanelStore } from "../principal-policy/panel-producer.js";
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type {
@@ -79,6 +81,7 @@ export interface APIDeps {
    * Must match the required `readFlights` option in ./read-response.ts.
    */
   readFlightMap: DashboardReadFlightMap;
+  panelStore: PosturePanelStore;
   authToken?: string;
   sessions?: DashboardSessionStore;
   approvals?: ApprovalHandlers;
@@ -404,17 +407,18 @@ export async function handleRequest(
     const handled = await handlePostureRoute(
       {
         readFlightMap: deps.readFlightMap,
+        panelStore: deps.panelStore,
         auditLog: deps.sources.auditLog ?? null,
         originMachine:
           deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",
         listAgents: () => deps.v11Bindings?.hubService.listAgents() ?? [],
         resolvePinnedProducerKey: deps.sources.resolvePinnedProducerKey,
-        producerKeyExpectedButUnavailable:
-          deps.sources.producerKeyExpectedButUnavailable === true,
+        producerKeyObservation: observeInjectedProducerKey(deps.sources.resolvePinnedProducerKey,
+          deps.sources.producerKeyExpectedButUnavailable === true),
         resolveBrokerPinnedProducerKey:
           deps.sources.resolveBrokerPinnedProducerKey,
-        brokerProducerKeyExpectedButUnavailable:
-          deps.sources.brokerProducerKeyExpectedButUnavailable === true,
+        brokerProducerKeyObservation: observeInjectedProducerKey(deps.sources.resolveBrokerPinnedProducerKey,
+          deps.sources.brokerProducerKeyExpectedButUnavailable === true),
         resolveProtectionClaimSubject:
           deps.sources.resolveProtectionClaimSubject,
         // Fleet Console: pass the SAME read-only fleet-roster provider the

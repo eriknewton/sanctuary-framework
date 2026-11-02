@@ -29,6 +29,7 @@
  * `generateDashboardHTML`).
  */
 
+import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "./posture-home-types.js";
 import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
 import {
@@ -999,9 +1000,12 @@ export function renderPostureHomeHTML(): string {
     // holds. Where the payload has no honest denominator or timestamp for a
     // tile, that tile renders WITHOUT one rather than inventing a plausible
     // value. See the null-handling in statOf/fresh below.
-    var detectedTotal =
+    // An unavailable scan is unknown, never evidence that no harness was detected.
+    var detectedTotal = home.panels && ((home.panels.agents_roster && home.panels.agents_roster.state !== "fresh") || home.panels.unwrapped.state === "unavailable") ? "Unknown" :
       ((home.agents && home.agents.length) || 0) +
       ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
+    // An incomplete roster cannot establish any requested or confirmed count.
+    var rosterFresh = !home.panels || !home.panels.agents_roster || home.panels.agents_roster.state === "fresh";
     var wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
     var digest = home.digest || {};
     document.getElementById("banner").innerHTML =
@@ -1011,12 +1015,12 @@ export function renderPostureHomeHTML(): string {
       // split and adds the denominator that makes it legible: requested is "of
       // N detected", and confirmed is "of N requested" -- so a "0 of 3" reads as
       // the honest gap it is rather than an unexplained zero.
-      stat(home.protection_requested_count, "Protection requested", {
+      stat(rosterFresh ? home.protection_requested_count : "Unknown", "Protection requested", {
         of: detectedTotal,
         ev: { href: "#agents", text: "agents" },
       }) +
-      stat(home.enforcement_confirmed_count, "Enforcement confirmed", {
-        of: home.protection_requested_count,
+      stat(rosterFresh ? home.enforcement_confirmed_count : "Unknown", "Enforcement confirmed", {
+        of: rosterFresh ? home.protection_requested_count : "Unknown",
         ev: { href: "/posture/evidence", text: "evidence" },
       }) +
       stat(wallPill(home.castle_wall.arm_state), "Castle Wall", {
@@ -1033,7 +1037,7 @@ export function renderPostureHomeHTML(): string {
       stat(openAnomalies, "Open anomalies", {
         ev: { href: "#anomalies", text: "findings" },
       }) +
-      stat(auditChainPill(home.digest), "Audit chain", {
+      stat(auditChainPill(home.digest, home.panels && home.panels.digest), "Audit chain", {
         // The digest window is the period the chain verdict covers. Rendering
         // its end as a freshness stamp says how current the verdict is.
         fresh: digest.window_end,
@@ -1042,13 +1046,32 @@ export function renderPostureHomeHTML(): string {
       });
   }
   // F2 BLOCKER-1: three-state pill from the shared verdict: green VERIFIED only
-  // for a fully-verified chain; a neutral SUFFIX-ONLY when the sealed history is
-  // unreadable at this privilege (an armed box's operator uid); red UNVERIFIED on
-  // tamper/failure. Never green over an in-place-corrupted sealed entry.
-  function auditChainPill(d) {
-    if (d.chain_verdict === "verified_suffix_only")
-      return '<span class="pill amber">SUFFIX-ONLY</span>';
-    return d.chain_verified
+  // for an authoritative fully-verified chain; qualified suffix evidence is amber.
+  // Observed findings remain red, and freshness withholding remains neutral.
+  function auditChainPill(d, panel) {
+    // Freshness accepts the same strict instant as the SPA, never a browser-local date.
+    ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
+    // An observed failure is never hidden by a freshness cap; must match the SPA and agent HTML badge order.
+    if (d.chain_verdict === "findings") {
+      var detail = Number.isSafeInteger(d.integrity_finding_count) && d.integrity_finding_count > 0
+        ? d.integrity_finding_count + (d.integrity_finding_count === 1 ? " finding" : " findings") : "chain not verified";
+      return '<span class="pill red">FAILED</span> ' + esc(detail);
+    }
+    // capped is a panel status, not a verdict flag: the producer sets chain_verified only for a fully verified chain, so a suffix-only observation is never authoritative by that flag and never capped by it.
+    var digestFresh = !!panel && panel.state === "fresh";
+    // Must match AUDIT_CHAIN_VERIFIED_MAX_AGE_MS in dashboard/v1_1/client.ts and the agent audit line.
+    var maxAge = ${AUDIT_CHAIN_VERIFIED_MAX_AGE_MS};
+    var checkedAt = parseEvidenceTimestamp(d.window_end);
+    var current = Number.isFinite(checkedAt) && Date.now() >= checkedAt && Date.now() - checkedAt <= maxAge;
+    var lastVerified = 'not current, last verified ' + (relTime(d.window_end) || 'Unknown');
+    if (!digestFresh) return panel && panel.reason === "observation_superseded"
+      ? '<span class="pill neutral">WITHHELD</span> observation superseded'
+      : '<span class="pill neutral">UNKNOWN</span> ' + esc(lastVerified);
+    var accepted = (d.chain_verdict === "verified" && d.chain_verified === true) || d.chain_verdict === "verified_suffix_only";
+    if (accepted && !current) return '<span class="pill neutral">UNKNOWN</span> ' + esc(lastVerified);
+    if (d.chain_verdict === "verified_suffix_only" && current)
+      return '<span class="pill amber">SUFFIX-ONLY</span> sealed history not re-verifiable at this privilege';
+    return d.chain_verified === true && d.chain_verdict === "verified" && current
       ? '<span class="pill green">VERIFIED</span>'
       : '<span class="pill red">UNVERIFIED</span>';
   }
@@ -1069,6 +1092,8 @@ export function renderPostureHomeHTML(): string {
     var ofText = "";
     if (typeof o.of === "number" && isFinite(o.of)) {
       ofText = '<span class="stat-of">of ' + esc(o.of) + "</span>";
+    } else if (o.of === "Unknown") {
+      ofText = '<span class="stat-of">of Unknown</span>';
     }
     var foot = "";
     var freshText = o.fresh ? relTime(o.fresh) : "";
@@ -1103,7 +1128,9 @@ export function renderPostureHomeHTML(): string {
         '<div class="reach"><a href="' + drill + '">View posture &rarr;</a>' +
         ' · <a href="/api/posture/reach/' + encodeURIComponent(a.agent_id) + '">raw reach</a></div></div>';
     });
-    (home.unwrapped.unwrapped || []).forEach(function (u) {
+    var scanUnavailable = home.panels && home.panels.unwrapped.state === "unavailable";
+    if (scanUnavailable) html += '<p class="empty">Not available right now</p>';
+    (scanUnavailable ? [] : home.unwrapped.unwrapped || []).forEach(function (u) {
       html +=
         '<div class="card amber"><h3>' + esc(u.harness) + ' <span class="pill amber">NOT protected</span></h3>' +
         '<div class="meta">detected by ' + esc(u.detection_method) + '</div>' +
@@ -1369,6 +1396,7 @@ export function renderPostureHomeHTML(): string {
 
   var STORY_PLAIN_SUMMARY_KEY = "postureStoryPlainSummary";
   var lastStoryDigest = null;
+  var lastStoryPanel = null;
 
   function readStoryPlainSummaryPreference() {
     try {
@@ -1410,27 +1438,35 @@ export function renderPostureHomeHTML(): string {
     );
   }
 
-  function renderStoryPlainSummary(d) {
-    var chainText = d.chain_verified
-      ? "The audit log verified clean: no tampering."
-      : d.chain_verdict === "verified_suffix_only"
-        ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
-        : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
+  function renderStoryPlainSummary(d, panel) {
+    // capped is a panel status, not a verdict flag: the producer sets chain_verified only for a fully verified chain, so a suffix-only observation is never authoritative by that flag and never capped by it.
+    var digestFresh = !!panel && panel.state === "fresh";
+    // The pill owns the accepted-verdict and clock decision; summary prose must match auditChainPill above.
+    var pill = auditChainPill(d, panel);
+    var chainText = d.chain_verdict === "findings"
+      ? "The audit log is unverified: " + (d.integrity_finding_count > 0 ? d.integrity_finding_count + " integrity finding(s)." : "chain not verified.")
+      : !digestFresh
+        ? panel && panel.reason === "observation_superseded" ? "The audit log check is withheld: observation superseded." : "The audit log check is not current."
+      : pill.includes('pill green') ? "The audit log verified clean: no tampering."
+      : pill.includes('pill amber') ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
+      : pill.includes('pill neutral') ? "The audit log check is not current."
+      : "The audit log is unverified.";
     return '<p class="story-summary">Today your agents ran <strong>' + esc(d.total_operations) +
       "</strong> operations in the last 24h. Sanctuary blocked <strong>" + esc(d.kernel_blocks) +
       "</strong> outbound connections and allowed <strong>" + esc(d.kernel_allows) +
       "</strong>. You denied <strong>" + esc(d.approvals_denied) +
       "</strong> approvals and granted <strong>" + esc(d.approvals_granted) +
-      "</strong>. " + esc(chainText) + "</p>" +
+      "</strong>. " + esc(chainText) + "</p>" + pill +
       storyEvidenceFoot(d);
   }
 
-  function renderStory(d) {
+  function renderStory(d, panel) {
     var el = document.getElementById("story");
     lastStoryDigest = d;
+    lastStoryPanel = panel;
     syncStoryToggle();
     if (readStoryPlainSummaryPreference()) {
-      el.innerHTML = renderStoryPlainSummary(d);
+      el.innerHTML = renderStoryPlainSummary(d, panel);
       return;
     }
     // S3 denominators: each count states the whole it came out of, so a "4" is
@@ -1445,11 +1481,7 @@ export function renderPostureHomeHTML(): string {
       " observed outbound connections blocked at the kernel; " + d.kernel_allows + " allowed.");
     lines.push("<strong>" + d.approvals_denied + "</strong> of " + decidedTotal +
       " decided approvals denied by you, " + d.approvals_granted + " granted.");
-    lines.push(d.chain_verified
-      ? '<span class="pill green">Audit chain verified</span> no tampering.'
-      : d.chain_verdict === "verified_suffix_only"
-        ? '<span class="pill amber">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
-        : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
+    lines.push(auditChainPill(d, panel));
     el.innerHTML = lines.map(function (l) { return '<div class="story-line">' + l + "</div>"; }).join("") +
       storyEvidenceFoot(d);
   }
@@ -1460,7 +1492,7 @@ export function renderPostureHomeHTML(): string {
     syncStoryToggle();
     toggle.addEventListener("change", function () {
       setStoryPlainSummaryPreference(toggle.checked === true);
-      if (lastStoryDigest) renderStory(lastStoryDigest);
+      if (lastStoryDigest) renderStory(lastStoryDigest, lastStoryPanel);
     });
   }
 
@@ -1767,12 +1799,35 @@ export function renderPostureHomeHTML(): string {
     renderBanner(home, approvals, findings);
     renderAgents(home);
     renderApprovals(approvals);
-    renderStory(home.digest);
+    renderStory(home.digest, home.panels && home.panels.digest);
     renderAnomalies(findings);
     renderWall(home.castle_wall);
     renderFeatures(home.feature_health);
     renderCustodyExit(home.custody_exit);
     renderQueryPrivacy(home.query_privacy);
+    renderPanelStatus(home);
+  }
+
+  function renderPanelStatus(home) {
+    // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.
+    var reasons = { budget_exceeded: "Time budget exceeded", producer_failed: "Observation failed", never_completed: "No completed observation", upstream_unavailable: "Required evidence unavailable", observation_superseded: "Newer evidence is available" };
+    var MILLISECONDS_PER_SECOND = 1000; // One second contains one thousand milliseconds.
+    var targets = { castle_wall: "wall", digest: "story", feature_health: "features", custody_exit: "custody", query_privacy: "queryprivacy", agents_roster: "agents", federation: "fleet" };
+    Object.keys(targets).forEach(function (id) {
+      var panel = home.panels && home.panels[id];
+      var element = document.getElementById(targets[id]);
+      if (!element || !panel || panel.state === "fresh") return;
+      if (panel.state === "unavailable") element.innerHTML = '<p class="empty">Not available right now</p>';
+      else element.innerHTML += '<p class="meta">Last checked ' + esc(Math.floor((panel.age_ms || 0) / MILLISECONDS_PER_SECOND)) + 's ago</p>';
+      if (panel.reason && reasons[panel.reason]) element.innerHTML += '<p class="meta">' + esc(reasons[panel.reason]) + '</p>';
+    });
+    // Must match PostureHome.producer_keys: unresolved copy never claims a configured key.
+    if (home.producer_keys && home.producer_keys.message) document.getElementById("wall").innerHTML += '<p>' + esc(home.producer_keys.message) + '</p>';
+    var scanPanel = home.panels && home.panels.unwrapped;
+    if (scanPanel && scanPanel.state === "stale") document.getElementById("agents").innerHTML += '<p class="meta">Last checked ' + esc(Math.floor((scanPanel.age_ms || 0) / MILLISECONDS_PER_SECOND)) + 's ago</p>';
+    // Must match PostureHome.audit_verification in posture-home-types.ts.
+    var uncached = home.audit_verification && home.audit_verification.verified_uncached_last_pass;
+    if (uncached > 0) document.getElementById("story").innerHTML += '<p class="meta">' + esc(uncached) + ' more entries are checked in full on every pass</p>';
   }
 
   // ── Honest connection indicator (#617) ──────────────────────────────────
