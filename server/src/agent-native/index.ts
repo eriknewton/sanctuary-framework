@@ -17,3 +17,4 @@
 export * from "./safety-base.js";
 export * from "./cooperative-surface.js";
 export * from "./capabilities-catalog.js";
+export * from "./protection-layers.js";

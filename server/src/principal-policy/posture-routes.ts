@@ -48,6 +48,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { composeProtectionLayers } from "../agent-native/protection-layers.js";
 import {
   respondWithBoundedDashboardRead,
   type DashboardReadFlightMap,
@@ -1206,6 +1207,8 @@ export function reconcilePostureHomeJoiner(home: PostureHome, admissionSequence:
     result.panels[id] = { ...home.panels[id], state: home.panels[id].state === "unavailable" ? "unavailable" : "stale",
       reason: home.panels[id].reason ?? "observation_superseded" };
   }
+  result.protection_layers = composeProtectionLayers({ featureHealth: result.feature_health, custodyExit: result.custody_exit,
+    custodyObservation: result.panels.custody_exit });
   return result;
 }
 
@@ -1335,6 +1338,9 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
   const unwrappedValue = value("unwrapped", unwrapped);
   return {
     origin_machine: deps.originMachine, stream_available: deps.streamRegistry !== undefined,
+    // Must match custodyObservation in protection-layers.ts: use the producer status, including fallback and stale reads.
+    protection_layers: composeProtectionLayers({ featureHealth, custodyExit: value("custody_exit", custody),
+      custodyObservation: custody.status, now: deps.now?.() ?? Date.now() }),
     producer_keys: { producer: deps.producerKeyObservation!, broker: deps.brokerProducerKeyObservation!,
       message: [deps.producerKeyObservation, deps.brokerProducerKeyObservation].includes("unknown")
         ? "Producer key state is not yet determined."
