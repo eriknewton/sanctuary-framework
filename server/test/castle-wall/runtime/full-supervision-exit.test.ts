@@ -105,3 +105,19 @@ it("charges a malformed runtime stop intent cast through never", () => {
   const value = input(attemptId, { stopIntent: { kind: "Operator", attemptId } as never });
   expect(classifyFullSupervisionExit(value)).toEqual({ kind: "charged_unverified_exit", decidedBy: value });
 });
+
+it("charges matched malformed cleanup under an operator SIGTERM stop", () => {
+  const value = input(attemptId, {
+    exit: { signal: "SIGTERM" }, stopIntent: { kind: "operator", attemptId }, readinessCommitted: true,
+    completion: { attemptId, cleanup: "FAILED" } as never,
+  });
+  expect(classifyFullSupervisionExit(value)).toEqual({ kind: "charged_unverified_exit", decidedBy: value });
+});
+
+it("charges matched malformed cleanup under a lifecycle SIGKILL stop", () => {
+  const value = input(attemptId, {
+    exit: { signal: "SIGKILL" }, stopIntent: { kind: "lifecycle", attemptId }, readinessCommitted: true,
+    completion: { attemptId, cleanup: "FAILED" } as never,
+  });
+  expect(classifyFullSupervisionExit(value)).toEqual({ kind: "charged_unverified_exit", decidedBy: value });
+});
