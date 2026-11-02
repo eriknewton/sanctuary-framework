@@ -1,4 +1,4 @@
-// fail-before-exempt: this flake stabilization only widens audit-log lock timing deadlines and asserts no stop-button behavior.
+// fail-before-exempt: A1b gives the existing hold-deadline fixture an explicit private directory mode required by the guard; all deadlines and security assertions remain unchanged.
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { tmpdir, uptime as osUptime } from "node:os";
@@ -92,7 +92,8 @@ describe("AuditLog write-lock hold deadline and self-held recovery", () => {
       ...config,
     });
     const lockPath = join(storagePath, AUDIT_NAMESPACE, LOCK_FILE);
-    await mkdir(dirname(lockPath), { recursive: true });
+    // The recovery guard requires private namespace custody regardless of test runner umask.
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
     return { log, storage, lockPath, internals: log as unknown as LockInternals };
   }
 

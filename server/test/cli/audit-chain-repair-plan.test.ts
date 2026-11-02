@@ -12,7 +12,7 @@
  * a created empty directory (a namespace materialized as a side effect of being
  * read) and a contents-only hash would call that unchanged.
  */
-// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+// fail-before-exempt: A1b renames the no-sweep canary to a strict dead-pid temp so the existing read-only assertions remain non-vacuous.
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
@@ -458,7 +458,7 @@ describe("audit-chain repair-plan", () => {
       fortressPath,
       "state",
       "_audit",
-      ".audit-write.lock.acquire.424242.tmp"
+      ".audit-write.lock.acquire.2147483647.0.aaaaaaaaaaaaaaaaaaaaaaaa.tmp"
     );
     await writeFile(staleTemp, "orphaned-acquire-temp", "utf8");
     await utimes(staleTemp, new Date("2000-01-01"), new Date("2000-01-01"));

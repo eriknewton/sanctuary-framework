@@ -1,0 +1,6 @@
+{
+  "provenance": "captured erik-mac 2026-11-01",
+  "command": "/usr/bin/getconf DARWIN_USER_TEMP_DIR",
+  "env": {},
+  "bytes_base64": "L3Zhci9mb2xkZXJzL3RmLzJtM3Y4bWQxM3Z2OHptM2hweGJmcjZudzAwMDBnbi9ULwo="
+}
