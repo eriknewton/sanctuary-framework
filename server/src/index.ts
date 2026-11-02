@@ -2192,6 +2192,8 @@ export async function createSanctuaryServer(options?: {
     storage,
     stateStore,
     responseScreen,
+    resolveBrokerProducerKey: () => dashboard?.resolveBrokerProducerKey()
+      ?? Promise.resolve({ keyB64url: null, observation: "unknown" }),
     approvalProofStore,
   });
 

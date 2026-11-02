@@ -1,4 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import ts from "typescript";
+import { ed25519 } from "@noble/curves/ed25519";
+import { toBase64url } from "../../src/core/encoding.js";
+import { BROKER_DAEMON_HEARTBEAT_OPERATION } from "../../src/broker-mcp/liveness-constants.js";
+import { buildBrokerProducerSignedDetails, brokerProducerMarkerDetails, resolveBrokerProducerPubKeyPath } from "../../src/broker-mcp/producer-signature.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
@@ -32,7 +40,8 @@ async function setup(extra: Partial<Parameters<typeof createAgentNativeCooperati
   const identity = JSON.parse(created.content[0]!.text);
   binding = { identity_id: identity.identity_id, requester_identity_fingerprint: fingerprintIdentityId(identity.identity_id) };
   const facade = createAgentNativeCooperativeTools({ ...primitives, primitiveTools: primitives.tools,
-    auditLog, storage, currentSessionBinding: () => binding, ...extra });
+    auditLog, storage, currentSessionBinding: () => binding,
+    resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "absent" }), ...extra });
   const tool = facade.tools.find(t => t.name === "sanctuary_active_protections")!;
   return { auditLog, tool, binding, primitives };
 }
@@ -185,6 +194,7 @@ async function currentPanels() {
   const { auditLog } = await setup();
   const health = await healthSource.buildFeatureHealthPanel({ auditLog, originMachine: "test", now: observedAt, protectionClaimSubject: null });
   for (const row of health.rows) {
+    if (row.feature_id === "secret_broker_daemon") continue;
     row.status = "active";
     row.last_evidence_at = new Date(observedAt).toISOString();
   }
@@ -280,16 +290,157 @@ describe("current protection evidence", () => {
     });
   }
 
-  it("a down broker daemon lowers fresh token activity to off on both surfaces", async () => {
-    const { health } = await currentPanels();
-    const { tool } = await setup();
-    health.rows.find(row => row.feature_id === "secret_broker_daemon")!.status = "fault";
+  for (const [daemonStatus, daemonBasis, expected] of [
+    ["unknown", "alive_no_recent_enforcement", "on"],
+    ["unknown", "no_evidence_self_reporting", "on"],
+    ["fault", "dead_no_heartbeat", "off"],
+    ["unknown", "intentionally_stopped", "off"],
+  ] as const) {
+    it(`broker daemon ${daemonBasis} gives ${expected} on both surfaces through the tool feature filter`, async () => {
+      const { health } = await currentPanels();
+      const { tool } = await setup();
+      const daemon = health.rows.find(row => row.feature_id === "secret_broker_daemon")!;
+      // The producer's daemon row has no invocation operations, even when its heartbeat is fresh.
+      expect(daemon).toMatchObject({ status: "unknown", last_evidence_at: null });
+      Object.assign(daemon, { status: daemonStatus, basis: daemonBasis });
+      vi.spyOn(Date, "now").mockReturnValue(observedAt);
+      vi.spyOn(healthSource, "buildFeatureHealthPanel").mockImplementation(async input => ({
+        ...health,
+        // The fixture supplies observations only for features admitted by the real consumer filter.
+        rows: health.rows.filter(row => (input.registry ?? SLICE1_FEATURE_REGISTRY)
+          .some(feature => feature.id === row.feature_id)),
+      }));
+      expect(composeProtectionLayers({ featureHealth: health, now: observedAt })
+        .find(row => row.id === "credential_stand_ins")?.status).toBe(expected);
+      const result = JSON.parse((await tool.handler({})).content[0]!.text);
+      const broker = result.layers.find((row: { id: string }) => row.id === "credential_stand_ins");
+      expect(broker.status).toBe(expected);
+      expect(broker.basis).toContain("secret_broker_daemon");
+    });
+  }
+
+  it("reports a down daemon consistently from real signed broker evidence", async () => {
+    const privateKey = generateRandomKey();
+    const publicKey = toBase64url(ed25519.getPublicKey(privateKey));
+    const resolveBrokerProducerKey = vi.fn(async () => ({ keyB64url: publicKey, observation: "present" as const }));
+    const { tool, auditLog, binding } = await setup({ resolveBrokerProducerKey });
+    expect(resolveBrokerProducerKey).not.toHaveBeenCalled();
     vi.spyOn(Date, "now").mockReturnValue(observedAt);
-    vi.spyOn(healthSource, "buildFeatureHealthPanel").mockResolvedValue(health);
-    expect(composeProtectionLayers({ featureHealth: health, now: observedAt }).find(row => row.id === "credential_stand_ins")?.status).toBe("off");
+    // One millisecond beyond the shared window makes the signed heartbeat stale.
+    const capturedAtUnixMs = observedAt - DEFAULT_ENFORCEMENT_FRESHNESS_MS - 1;
+    await auditLog.appendCritical({ layer: "l3", operation: BROKER_DAEMON_HEARTBEAT_OPERATION,
+      identity_id: binding!.identity_id!, result: "success", timestamp: new Date(capturedAtUnixMs).toISOString(),
+      details: brokerProducerMarkerDetails(buildBrokerProducerSignedDetails({
+        operation: BROKER_DAEMON_HEARTBEAT_OPERATION, capturedAtUnixMs,
+        seq: 1, privateKey, // First signed heartbeat in this isolated log.
+      })) });
+    await auditLog.appendCritical({ layer: "l3", operation: "broker_token_issued",
+      identity_id: binding!.identity_id!, result: "success", timestamp: new Date(observedAt).toISOString(), details: {} });
+    const health = await healthSource.buildFeatureHealthPanel({ auditLog, originMachine: "local",
+      protectionClaimSubject: null, brokerPinnedProducerKeyB64url: publicKey });
+    expect(health.rows.find(row => row.feature_id === "secret_broker"))
+      .toMatchObject({ status: "active", last_evidence_at: new Date(observedAt).toISOString() });
+    expect(health.rows.find(row => row.feature_id === "secret_broker_daemon"))
+      .toMatchObject({ status: "fault", basis: "dead_no_heartbeat", last_evidence_at: null });
+    expect(composeProtectionLayers({ featureHealth: health }).find(row => row.id === "credential_stand_ins")?.status).toBe("off");
     const result = JSON.parse((await tool.handler({})).content[0]!.text);
     expect(result.layers.find((row: { id: string }) => row.id === "credential_stand_ins").status).toBe("off");
+    expect(resolveBrokerProducerKey).toHaveBeenCalledTimes(1);
+    await tool.handler({});
+    expect(resolveBrokerProducerKey).toHaveBeenCalledTimes(2);
   });
+
+  it("wires the lazy broker resolver from the dashboard into the production tool", () => {
+    const source = ts.createSourceFile("index.ts", readFileSync(new URL("../../src/index.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+    const calls: ts.CallExpression[] = [];
+    function visit(node: ts.Node): void {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === "createAgentNativeCooperativeTools") calls.push(node);
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+    expect(calls).toHaveLength(1);
+    const options = calls[0]!.arguments[0]!;
+    expect(ts.isObjectLiteralExpression(options)).toBe(true);
+    const property = (options as ts.ObjectLiteralExpression).properties.find(p => p.name?.getText(source) === "resolveBrokerProducerKey");
+    expect(property, "production tool must receive the dashboard broker resolver").toBeDefined();
+    expect(ts.isPropertyAssignment(property!)).toBe(true);
+    const resolver = (property as ts.PropertyAssignment).initializer;
+    expect(ts.isArrowFunction(resolver)).toBe(true);
+    expect(resolver.getText(source)).toContain("dashboard?.resolveBrokerProducerKey()");
+    expect(resolver.getText(source)).toContain('observation: "unknown"');
+  });
+
+  it("reads and repairs the broker observation through the dashboard's existing loader", async () => {
+    const { DashboardApprovalChannel } = await import("../../src/principal-policy/dashboard.js");
+    const { defaultConfig } = await import("../../src/config.js");
+    const { DEFAULT_POLICY } = await import("../../src/principal-policy/loader.js");
+    const { BaselineTracker } = await import("../../src/principal-policy/baseline.js");
+    const home = await createTempHome("broker-key-observation");
+    const dashboard = new DashboardApprovalChannel({ port: 0, host: "127.0.0.1", timeout_seconds: 30, auto_deny: true });
+    try {
+      expect(await dashboard.resolveBrokerProducerKey()).toEqual({ keyB64url: null, observation: "unknown" });
+      const storage = new MemoryStorage();
+      const key = generateRandomKey();
+      dashboard.setDependencies({ policy: DEFAULT_POLICY, baseline: new BaselineTracker(storage, key),
+        auditLog: new AuditLog(storage, key), sanctuaryConfig: { ...defaultConfig(), storage_path: home.defaultFortressPath } });
+      expect(await dashboard.resolveBrokerProducerKey()).toEqual({ keyB64url: null, observation: "absent" });
+      const path = resolveBrokerProducerPubKeyPath(home.defaultFortressPath);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, "invalid");
+      expect(await dashboard.resolveBrokerProducerKey()).toEqual({ keyB64url: null, observation: "unreadable" });
+      const publicKey = ed25519.getPublicKey(generateRandomKey());
+      await writeFile(path, publicKey);
+      expect(await dashboard.resolveBrokerProducerKey()).toEqual({ keyB64url: toBase64url(publicKey), observation: "present" });
+    } finally {
+      try { await dashboard.stop(); } finally { await home.cleanup(); }
+    }
+  });
+
+  for (const failure of ["missing", "throws", "rejects"] as const) {
+    it(`a ${failure} broker resolver keeps fresh token activity unknown`, async () => {
+      const { tool, auditLog, binding } = await setup({ resolveBrokerProducerKey: failure === "missing" ? undefined
+        : failure === "throws" ? () => { throw new Error("unavailable"); }
+          : async () => { throw new Error("unavailable"); } });
+      await auditLog.appendCritical({ layer: "l3", operation: "broker_token_issued",
+        identity_id: binding!.identity_id!, result: "success", details: {} });
+      const result = JSON.parse((await tool.handler({})).content[0]!.text);
+      expect(result.layers.find((row: { id: string }) => row.id === "credential_stand_ins").status).toBe("unknown");
+    });
+  }
+
+  for (const observation of ["unknown", "unreadable"] as const) {
+    it(`an ${observation} broker key keeps both surfaces unknown despite fresh token activity`, async () => {
+      const { tool, auditLog, binding } = await setup({
+        resolveBrokerProducerKey: async () => ({ keyB64url: null, observation }),
+      });
+      vi.spyOn(Date, "now").mockReturnValue(observedAt);
+      await auditLog.appendCritical({ layer: "l3", operation: "broker_token_issued",
+        identity_id: binding!.identity_id!, result: "success", timestamp: new Date(observedAt).toISOString(), details: {} });
+      const health = await healthSource.buildFeatureHealthPanel({ auditLog, originMachine: "local",
+        protectionClaimSubject: null, brokerPinnedProducerKeyB64url: null, brokerProducerKeyExpectedButUnavailable: true });
+      expect(health.rows.find(row => row.feature_id === "secret_broker_daemon"))
+        .toMatchObject({ status: "unknown", basis: "integrity_tainted" });
+      expect(composeProtectionLayers({ featureHealth: health }).find(row => row.id === "credential_stand_ins")?.status).toBe("unknown");
+      const result = JSON.parse((await tool.handler({})).content[0]!.text);
+      expect(result.layers.find((row: { id: string }) => row.id === "credential_stand_ins").status).toBe("unknown");
+    });
+  }
+
+  for (const timestamp of [null, "invalid", "2026-11-01T12:00:00"]) {
+    it(`refuses missing, unparseable or offset-less freshness timestamps: ${timestamp}`, async () => {
+      const { health, custody } = await currentPanels();
+      for (const featureId of ["approval_gates", "secret_broker"]) {
+        const source = health.rows.find(row => row.feature_id === featureId)!;
+        source.last_evidence_at = timestamp;
+      }
+      const rows = composeProtectionLayers({ featureHealth: health, custodyExit: custody,
+        custodyObservation: { state: "fresh", completed_at: timestamp }, now: observedAt });
+      for (const id of ["approval_gates", "credential_stand_ins", "exit"]) {
+        expect(rows.find(row => row.id === id)?.status).toBe("unknown");
+      }
+    });
+  }
+
 });
 
 
@@ -321,7 +472,7 @@ describe("live Castle Wall wording", () => {
 
 describe("evidence consumer boundaries", () => {
   for (const failure of failures) {
-    it(`Credential stand-ins: daemon ${failure} cannot support on`, async () => {
+    it(`Credential stand-ins: daemon ${failure} qualifies fresh token evidence`, async () => {
       const { health } = await currentPanels();
       const { tool } = await setup();
       const daemon = health.rows.find(row => row.feature_id === "secret_broker_daemon")!;
@@ -330,9 +481,10 @@ describe("evidence consumer boundaries", () => {
       else daemon.status = "unknown"; // The producer projects unreadable and fallback observations as unknown.
       vi.spyOn(Date, "now").mockReturnValue(observedAt);
       vi.spyOn(healthSource, "buildFeatureHealthPanel").mockResolvedValue(health);
-      expect(composeProtectionLayers({ featureHealth: health, now: observedAt }).find(row => row.id === "credential_stand_ins")?.status).toBe("unknown");
+      const expected = failure === "integrity false" ? "unknown" : "on";
+      expect(composeProtectionLayers({ featureHealth: health, now: observedAt }).find(row => row.id === "credential_stand_ins")?.status).toBe(expected);
       const result = JSON.parse((await tool.handler({})).content[0]!.text);
-      expect(result.layers.find((row: { id: string }) => row.id === "credential_stand_ins").status).toBe("unknown");
+      expect(result.layers.find((row: { id: string }) => row.id === "credential_stand_ins").status).toBe(expected);
     });
   }
 
@@ -393,6 +545,7 @@ describe("evidence consumer boundaries", () => {
     const { primitives, auditLog, binding } = await setup();
     const facade = createAgentNativeCooperativeTools({ ...primitives, primitiveTools: primitives.tools,
       auditLog, currentSessionBinding: () => binding,
+      resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "unknown" }),
       get stateStore(): StateStore { throw new Error("unavailable"); } });
     const response = JSON.parse((await facade.tools.find(tool => tool.name === "sanctuary_active_protections")!.handler({})).content[0]!.text);
     expect(response).toHaveProperty("denied", true);

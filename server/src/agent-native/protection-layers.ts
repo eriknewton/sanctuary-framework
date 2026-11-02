@@ -1,4 +1,5 @@
 import type { AuditChainVerdictStatus } from "../operational/audit-log.js";
+import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { FeatureHealthPanel } from "../principal-policy/feature-health.js";
 import { DEFAULT_ENFORCEMENT_FRESHNESS_MS, ENFORCEMENT_FUTURE_SKEW_MS, type CustodyExitPanel } from "../principal-policy/posture.js";
 import type { PosturePanelStatus } from "../principal-policy/panel-producer.js";
@@ -34,9 +35,9 @@ const NO_SOURCE = "no evidence source wired";
 export function composeProtectionLayers(evidence: ProtectionEvidence): ProtectionLayerRow[] {
   const now = evidence.now ?? Date.now();
   function current(timestamp: string | null | undefined, windowMs = DEFAULT_ENFORCEMENT_FRESHNESS_MS): boolean {
-    const at = timestamp ? Date.parse(timestamp) : NaN;
-    // Consumers bound both age and future skew using the same window as feature health.
-    return Number.isFinite(at) && Number.isFinite(windowMs) && windowMs > 0 &&
+    const at = timestamp ? parseIsoInstantWithOffset(timestamp) : undefined;
+    // Explicit offsets make the feature-health age and skew bounds independent of the reader's timezone.
+    return at !== undefined && Number.isFinite(windowMs) && windowMs > 0 &&
       at <= now + ENFORCEMENT_FUTURE_SKEW_MS && now - at <= Math.min(windowMs, DEFAULT_ENFORCEMENT_FRESHNESS_MS);
   }
   function row(id: string, name: string, status: ProtectionLayerStatus = "unknown", basis = NO_SOURCE): ProtectionLayerRow {
@@ -82,9 +83,13 @@ export function composeProtectionLayers(evidence: ProtectionEvidence): Protectio
   const broker = feature("credential_stand_ins", "Credential stand-ins", "secret_broker");
   const daemon = feature("secret_broker_daemon", "Broker daemon", "secret_broker_daemon");
   if (daemon.basis !== NO_SOURCE) {
-    // A down daemon precludes current credential service even after a recent token decision.
+    // Daemon liveness never earns active; fresh token evidence qualifies on unless the daemon is reported down.
     if (daemon.status === "off") broker.status = "off";
-    else if (daemon.status !== "on" && broker.status === "on") broker.status = "unknown";
+    const daemonSource = evidence.featureHealth?.rows.find(r => r.feature_id === "secret_broker_daemon");
+    // Unavailable authenticity evidence cannot establish daemon availability on either surface.
+    if (broker.status === "on" && (daemonSource?.basis === "integrity_tainted" || daemonSource?.audit_integrity_ok === false)) {
+      broker.status = "unknown";
+    }
     broker.basis += `; feature health: secret_broker_daemon ${daemon.status}`;
   }
   return [

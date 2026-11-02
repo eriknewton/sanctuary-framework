@@ -10,6 +10,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import type { StateStore } from "../cognitive/state-store.js";
 import type { ResponseScreen } from "../proxy/response-screen.js";
 import { buildFeatureHealthPanel, SLICE1_FEATURE_REGISTRY } from "../principal-policy/feature-health.js";
+import type { ProducerKeyObservation } from "../principal-policy/panel-producer.js";
 import { buildCustodyExitPanel } from "../principal-policy/posture.js";
 import { composeProtectionLayers, summarizeProtectionLayers } from "./protection-layers.js";
 import {
@@ -84,6 +85,8 @@ export interface CooperativeSurfaceOptions {
   stateStore?: StateStore;
   /** Existing screening readiness observation; separate from inbound protection. */
   responseScreen?: Pick<ResponseScreen, "assertReady">;
+  /** Resolve the dashboard's broker key per request; an unavailable source reports unknown. */
+  resolveBrokerProducerKey?: () => Promise<{ keyB64url: string | null; observation: ProducerKeyObservation }>;
   approvalProofStore?: ApprovalProofStore;
 }
 
@@ -969,15 +972,21 @@ export function createAgentNativeCooperativeTools(
             try { options.responseScreen.assertReady(); toolOutputScreenReady = true; }
             catch { toolOutputScreenReady = false; }
           }
+          // Must match the dashboard accessor: this key pins broker heartbeat signatures, not agent identity.
+          const brokerKey = await Promise.resolve().then(() => options.resolveBrokerProducerKey?.()).catch(() => null);
+          // Must match withDerivedKeyRestriction in posture-routes.ts: only observed presence or absence is conclusive.
+          const brokerKeyUnavailable = brokerKey?.observation !== "present" && brokerKey?.observation !== "absent";
           // Must match custodyObservation in protection-layers.ts: age starts before the audit read.
           const custodyObservation = { state: "fresh" as const, completed_at: new Date(Date.now()).toISOString() };
           const [health, custody, chain] = await Promise.allSettled([
             buildFeatureHealthPanel({
               auditLog: options.auditLog,
               originMachine: "local",
-              // Producer-key and confined-subject resolvers belong to the dashboard; only event-driven evidence is reachable here.
-              registry: SLICE1_FEATURE_REGISTRY.filter(feature => feature.liveness === "event_driven"),
+              // Include daemon observations so a reported stop overrides recent token activity on both surfaces.
+              registry: SLICE1_FEATURE_REGISTRY.filter(feature => feature.liveness === "event_driven" || feature.id === "secret_broker_daemon"),
               protectionClaimSubject: null,
+              brokerPinnedProducerKeyB64url: brokerKey?.keyB64url ?? null,
+              brokerProducerKeyExpectedButUnavailable: brokerKeyUnavailable,
             }),
             buildCustodyExitPanel({ auditLog: options.auditLog, originMachine: "local" }),
             options.auditLog.getAuditChainVerdict(),
