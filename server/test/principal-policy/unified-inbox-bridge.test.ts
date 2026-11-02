@@ -52,6 +52,7 @@ function makeBridge(opts?: { fortressId?: string }): {
     auditLog,
     identityId: IDENTITY,
     fortressId: opts?.fortressId ?? FORTRESS_A,
+    now: () => new Date(OBSERVED_AT),
   });
   return { bridge, auditLog };
 }
@@ -576,5 +577,25 @@ describe("structured blocked-egress bridge admission", () => {
     expect(entry.summary).toBe("Egress to unknown blocked: other");
     expect(entry.source_event_id).toBe(`${OBSERVED_AT}:unknown`);
     expect(entry).not.toHaveProperty("blocked_egress");
+  });
+});
+
+describe("blocked-egress capacity isolation", () => {
+  it("retains approvals through an unsigned blocked-egress flood and later generic admissions", async () => {
+    const { auditLog } = makeBridge();
+    const bridge = new UnifiedInboxBridge({ auditLog, identityId: IDENTITY, fortressId: FORTRESS_A, maxEntries: 2, now: () => new Date(OBSERVED_AT) });
+    const approval = bridge.ingestApproval({ source_event_id: "approval", severity: "warn", summary: "Review", observed_at: OBSERVED_AT })!;
+    const FLOOD = 100; // five times the shared unsigned bucket
+    for (let i = 0; i < FLOOD; i++) {
+      expect(bridge.ingestBlockedEgress({ source_event_id: `flood-${i}`, destination_category: "custom", block_reason_class: "other", observed_at: OBSERVED_AT })).not.toBeNull();
+      await bridge.flushPersistence();
+    }
+    expect(bridge.get(approval.inbox_id)).not.toBeNull();
+    expect(bridge.list({ sourceClass: "blocked_egress" })).toHaveLength(20);
+    bridge.ingestApproval({ source_event_id: "next", severity: "warn", summary: "Next", observed_at: OBSERVED_AT });
+    expect(bridge.get(approval.inbox_id)).not.toBeNull();
+    bridge.ingestApproval({ source_event_id: "third", severity: "warn", summary: "Third", observed_at: OBSERVED_AT });
+    expect(bridge.get(approval.inbox_id)).toBeNull();
+    expect(bridge.list({ sourceClass: "blocked_egress" })).toHaveLength(20);
   });
 });

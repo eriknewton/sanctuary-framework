@@ -1,3 +1,4 @@
+import type { ProtectionSubjectLookup } from "./agent-attribution.js";
 /**
  * Sanctuary v1.1. Local Agent Registry (in-memory implementation)
  *
@@ -69,6 +70,25 @@ function assertNoSecretFields(record: LocalAgentRecord): void {
 
 export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
   private records: Map<string, LocalAgentRecord> = new Map();
+  private subjects = new Map<string, Set<string>>();
+  private subjectByAgent = new Map<string, string>();
+
+  /** Must match HubAgentRegistrySource.lookupProtectionSubject in types.ts; no list or sort participates. */
+  lookupProtectionSubject(subject: string): ProtectionSubjectLookup {
+    const ids = this.subjects.get(subject);
+    if (!ids?.size) return { kind: "none" };
+    if (ids.size !== 1) return { kind: "ambiguous" };
+    return { kind: "unique", record: this.records.get(ids.values().next().value!)! };
+  }
+
+  private removeSubject(agentId: string): void {
+    const subject = this.subjectByAgent.get(agentId);
+    if (subject === undefined) return;
+    const ids = this.subjects.get(subject)!;
+    ids.delete(agentId);
+    if (!ids.size) this.subjects.delete(subject);
+    this.subjectByAgent.delete(agentId);
+  }
 
   private listener?: HubAgentRegistryChangeListener;
   private listenerErrors = 0;
@@ -105,6 +125,13 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
   put(record: LocalAgentRecord): void {
     assertNoSecretFields(record);
     const prior = this.records.get(record.agent_id);
+    this.removeSubject(record.agent_id);
+    if (record.protection_subject) {
+      const ids = this.subjects.get(record.protection_subject) ?? new Set<string>();
+      ids.add(record.agent_id);
+      this.subjects.set(record.protection_subject, ids);
+      this.subjectByAgent.set(record.agent_id, record.protection_subject);
+    }
     this.records.set(record.agent_id, record);
     // Must match snapshotForRecord in hub-service.ts: unchanged persisted refreshes must not trigger refetch loops.
     // An identity change is a roster change for the hub's own view even when the snapshot fields stand still, so it
@@ -119,6 +146,7 @@ export class InMemoryLocalAgentRegistry implements HubAgentRegistrySource {
    * Remove a record entirely. Used after an approved unwrap completes.
    */
   remove(agentId: string): void {
+    this.removeSubject(agentId);
     if (this.records.delete(agentId)) this.notify(agentId, null);
   }
 

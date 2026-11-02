@@ -466,3 +466,34 @@ describe("structured blocked-egress encrypted round trip", () => {
   });
 
 });
+
+describe("bounded blocked-egress encrypted index", () => {
+  it("keeps the maximum validated index in one encrypted record outside entry scans", async () => {
+    const { storage, store, bridge } = rig();
+    const INDEX_LIMIT = 1000; // design fortress limit
+    const MAX_ID_CHARS = 128; // validated index id ceiling
+    const ids = Array.from({ length: INDEX_LIMIT }, (_, i) => `${i}`.padStart(MAX_ID_CHARS, "x"));
+    await store.writeBlockedEgressIndex(ids);
+    expect(await store.readBlockedEgressIndex()).toEqual(ids);
+    const raw = await storage.read(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1");
+    expect(raw!.length).toBeLessThan(256 * 1024); // encrypted store record ceiling
+    expect(await store.list()).toEqual([]);
+    expect(await store.pruneExpired()).toEqual({ pruned: 0 });
+    await expect(store.writeBlockedEgressIndex([...ids, "extra"])).rejects.toThrow();
+    await expect(store.writeBlockedEgressIndex(["a", "a"])).rejects.toThrow();
+    await expect(store.writeBlockedEgressIndex(["../entry"])).rejects.toThrow();
+    expect(bridge.size()).toBe(0);
+  });
+});
+
+it("keeps a pre-admission blocked record directly readable without adding it to the restored cache", async () => {
+  const { storage, masterKey, store } = rig();
+  const legacy = await store.upsert({ inbox_id: "pre-admission", source_class: "blocked_egress", source_event_id: "legacy-receipt",
+    severity: "alert", summary: "Legacy blocked event", details_url: "/inbox", observed_at: OBSERVED_AT, fortress_id: FORTRESS });
+  const before = await storage.read(UNIFIED_INBOX_NAMESPACE, `${UNIFIED_INBOX_KEY_PREFIX}${legacy.inbox_id}`);
+  const next = rig({ storage, masterKey });
+  expect(await next.bridge.rehydratePendingFromStore()).toBe(0);
+  expect(next.bridge.get(legacy.inbox_id)).toBeNull();
+  expect(await store.get(legacy.inbox_id)).toEqual(legacy);
+  expect(await storage.read(UNIFIED_INBOX_NAMESPACE, `${UNIFIED_INBOX_KEY_PREFIX}${legacy.inbox_id}`)).toEqual(before);
+});

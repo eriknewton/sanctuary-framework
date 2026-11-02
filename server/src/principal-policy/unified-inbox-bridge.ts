@@ -1,3 +1,4 @@
+import { BlockedEgressAdmissions, blockedEgressIdentityKey, parseBlockedEgressAdmissionRecord } from "./blocked-egress-projection.js";
 import { readConsumerMintedBlockedEgress, type ConsumerMintedBlockedEgress } from "../castle-wall/runtime/blocked-egress-attribution.js";
 import { parseBlockedEgressMetadata, type BlockedEgressMetadata } from "../contracts/v1.1/index.js";
 
@@ -52,75 +53,14 @@ import { randomUUID, createHash } from "node:crypto";
 
 import type { AuditLog } from "../operational/audit-log.js";
 import type {
-  PersistedInboxEntry,
   UnifiedInboxStore,
 } from "./unified-inbox-store.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
-export type UnifiedInboxSourceClass =
-  | "approval"
-  | "sentinel_finding"
-  | "blocked_egress"
-  | "privacy_event"
-  | "budget_warning"
-  | "recovery_prompt"
-  | "agent_error"
-  // A genuine security-feature fault raised by the feature-health observability
-  // layer (the 3 ratified fault classes only: castle_wall_fault /
-  // feature_silently_off / plugin_failure_surge). See `feature-fault-raise.ts`.
-  // Display-only / read-derived: it feeds NOTHING back into enforcement.
-  | "feature_fault";
-
-export type UnifiedInboxSeverity = "info" | "warn" | "alert" | "critical";
-export type UnifiedInboxEntryState =
-  | "active"
-  | "archived"
-  | "snoozed"
-  | "dismissed";
-
-export interface UnifiedInboxEntry {
-  /** Optional structured block evidence; legacy entries have none. */
-  blocked_egress?: BlockedEgressMetadata;
-  /** Stable per-fortress inbox id (UUID v4). */
-  inbox_id: string;
-  /** Which producer class emitted this entry. */
-  source_class: UnifiedInboxSourceClass;
-  /**
-   * Stable per-source identifier the bridge uses for deduplication.
-   * Format conventions per class:
-   *   approval         - aggregator entry's audit_log_entry_id
-   *   sentinel_finding - finding_id
-   *   blocked_egress   - `<audit-timestamp>:<decision_id>`
-   *   privacy_event    - `<audit-timestamp>:<aggregation-window>`
-   *   budget_warning   - `<bucket>:<threshold-iso>`
-   *   recovery_prompt  - `<ceremony_id>:<recovery_class>`
-   *   agent_error      - `<audit-timestamp>:<agent_id>:<error_class>`
-   */
-  source_event_id: string;
-  /** Optional agent attribution for per-agent entries. */
-  agent_id?: string;
-  /** Severity tier - `critical` is rare; reserved for hard-cap / lockdown class. */
-  severity: UnifiedInboxSeverity;
-  /** Operator-friendly one-line summary. Bounded at 240 chars on persist. */
-  summary: string;
-  /** Operator drill-target URL; opens full source detail. */
-  details_url: string;
-  /** ISO 8601 timestamp of source event. */
-  observed_at: string;
-  /** ISO 8601 timestamp the operator (or auto-resolver) resolved it. */
-  resolved_at?: string;
-  /** Operator identity that resolved this entry, when applicable. */
-  resolved_by?: string;
-  /** Operator workflow state. Missing values from Psi-1/Psi-2 read as active. */
-  state?: UnifiedInboxEntryState;
-  /** ISO 8601 deadline. Snoozed entries re-enter active queries after this. */
-  snoozed_until?: string;
-  archived_at?: string;
-  dismissed_at?: string;
-  /** Stable fortress id stamped at emit. Multi-fortress isolation pivot. */
-  fortress_id: string;
-}
+// Must match the shared entry types in blocked-egress-projection.ts; bridge exports remain source-compatible.
+export type { UnifiedInboxSourceClass, UnifiedInboxSeverity, UnifiedInboxEntryState, UnifiedInboxEntry } from "./blocked-egress-projection.js";
+import type { UnifiedInboxSourceClass, UnifiedInboxSeverity, UnifiedInboxEntryState, UnifiedInboxEntry } from "./blocked-egress-projection.js";
 
 /** Hard cap on summary text. */
 export const UNIFIED_INBOX_SUMMARY_MAX_CHARS = 240;
@@ -130,6 +70,8 @@ export const UNIFIED_INBOX_AUDIT_OPS = {
   AGGREGATED: "unified_inbox_entry_aggregated",
   RESOLVED: "unified_inbox_entry_resolved",
   DEDUPED: "unified_inbox_entry_deduped",
+  BLOCKED_EGRESS_REFUSED: "unified_inbox_blocked_egress_refused",
+  BLOCKED_EGRESS_EVICTED: "unified_inbox_blocked_egress_evicted",
   ARCHIVED: "inbox_entry_archived",
   DISMISSED: "inbox_entry_dismissed",
   SNOOZED: "inbox_entry_snoozed",
@@ -291,7 +233,7 @@ export interface UnifiedInboxBridgeDeps {
   fortressId: string;
   /** Wall-clock provider for deterministic tests. */
   now?: () => Date;
-  /** Optional cap on retained entries (default 1000). */
+  /** Optional cap on retained non-blocked-egress entries (default 1000). */
   maxEntries?: number;
   /**
    * Optional details-URL base. Defaults to `/api/inbox/unified`; the
@@ -321,6 +263,7 @@ export class UnifiedInboxBridge {
   private readonly listeners = new Set<
     (event: UnifiedInboxBridgeEvent) => void
   >();
+  private readonly blockedAdmissions: BlockedEgressAdmissions;
   private readonly pendingStoreWrites = new Set<Promise<unknown>>();
 
   constructor(deps: UnifiedInboxBridgeDeps) {
@@ -331,22 +274,63 @@ export class UnifiedInboxBridge {
     this.maxEntries = deps.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.detailsUrlBase = deps.detailsUrlBase ?? DEFAULT_DETAILS_URL_BASE;
     this.store = deps.store;
+    this.blockedAdmissions = new BlockedEgressAdmissions({ fortressId: this.fortressId, now: this.now, store: this.store, retentionDays: this.store?.retentionDays });
   }
 
   async rehydratePendingFromStore(limit = this.maxEntries): Promise<number> {
     if (!this.store) return 0;
-    const entries = await this.store.list({ status: "pending", limit });
+    const entries = await this.store.list({ status: "pending", limit, exclude_source_class: "blocked_egress" });
     let loaded = 0;
     for (const persisted of entries.reverse()) {
       this.cachePersistedEntry(persisted);
       loaded += 1;
     }
+    await this.blockedAdmissions.restore();
+    for (const entry of this.blockedAdmissions.retained()) {
+      this.cachePersistedEntry(entry);
+      loaded++;
+    }
     return loaded;
   }
 
-  async flushPersistence(): Promise<void> {
-    while (this.pendingStoreWrites.size > 0) {
-      await Promise.allSettled([...this.pendingStoreWrites]);
+  async flushPersistence(opts?: { signal?: AbortSignal }): Promise<void> {
+    const flush = async () => {
+      while (this.pendingStoreWrites.size > 0) await Promise.allSettled([...this.pendingStoreWrites]);
+      await this.blockedAdmissions.settled();
+      this.syncBlockedCache();
+    };
+    if (!opts?.signal) return flush();
+    const signal = opts.signal;
+    if (signal.aborted) throw new Error("Inbox persistence wait aborted");
+    let abort: () => void = () => {};
+    try {
+      await Promise.race([flush(), new Promise<never>((_resolve, reject) => {
+        abort = () => reject(new Error("Inbox persistence wait aborted"));
+        signal.addEventListener("abort", abort, { once: true });
+      })]);
+    } finally { signal.removeEventListener("abort", abort); }
+  }
+
+  /** Dormant memory projection for a future inbox source; complete presence includes retained records beyond the page. */
+  blockedEgressSnapshot() {
+    const snapshot = this.blockedAdmissions.snapshot();
+    this.syncBlockedCache();
+    return snapshot;
+  }
+
+  private syncBlockedCache(): void {
+    const retained = this.blockedAdmissions.retained();
+    const ids = new Set(retained.map(entry => entry.inbox_id));
+    for (const [key, entry] of this.entriesByKey) {
+      if (entry.source_class === "blocked_egress" && !ids.has(entry.inbox_id)) {
+        this.entriesByKey.delete(key);
+        this.keyByInboxId.delete(entry.inbox_id);
+      }
+    }
+    for (const entry of retained) {
+      const key = this.keyByInboxId.get(entry.inbox_id);
+      if (key) this.entriesByKey.set(key, entry);
+      else this.cachePersistedEntry(entry);
     }
   }
 
@@ -405,15 +389,45 @@ export class UnifiedInboxBridge {
       input.block_reason_class === "lockdown_active"
         ? "critical"
         : "alert";
-    return this.ingest({
+    const inboxId = randomUUID();
+    const result = this.blockedAdmissions.admit({ entry: {
+      inbox_id: inboxId,
+      fortress_id: this.fortressId,
+      details_url: `${this.detailsUrlBase}/${inboxId}`,
+      state: "active",
       source_class: "blocked_egress",
       ...(metadata.ok ? { blocked_egress: metadata.value } : {}),
-      source_event_id: input.source_event_id,
-      severity,
-      summary,
-      observed_at: input.observed_at,
+      source_event_id: input.source_event_id, severity, summary, observed_at: input.observed_at,
       ...(input.agent_id !== undefined ? { agent_id: input.agent_id } : {}),
+    }, ...(projection?.signedFields ? { signedIdentity: {
+      producer_key_digest: projection.signedFields.producer_key_digest,
+      seq: projection.signedFields.seq, body_digest: projection.signedFields.body_digest,
+    } } : {}) });
+    if (result.kind === "refused") {
+      void this.auditLog.append("l2", UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED, this.identityId, { reason: result.reason });
+      return null;
+    }
+    if (result.kind === "duplicate") {
+      void this.auditLog.append("l2", UNIFIED_INBOX_AUDIT_OPS.DEDUPED, this.identityId, {
+        source_class: "blocked_egress", source_event_id: input.source_event_id,
+        existing_inbox_id: result.entry.inbox_id, fortress_id: this.fortressId,
+      });
+      return null;
+    }
+    for (const evicted of result.evicted) {
+      const key = this.keyByInboxId.get(evicted.inbox_id);
+      if (key) this.entriesByKey.delete(key);
+      this.keyByInboxId.delete(evicted.inbox_id);
+      void this.auditLog.append("l2", UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_EVICTED, this.identityId, { reason: "capacity_or_expiry" });
+    }
+    this.cachePersistedEntry(result.entry);
+    void this.auditLog.append("l2", UNIFIED_INBOX_AUDIT_OPS.AGGREGATED, this.identityId, {
+      inbox_id: result.entry.inbox_id, source_class: result.entry.source_class,
+      source_event_id: result.entry.source_event_id, severity: result.entry.severity, fortress_id: this.fortressId,
+      ...(result.entry.agent_id !== undefined ? { agent_id: result.entry.agent_id } : {}),
     });
+    this.emit({ type: "ingested", entry: result.entry });
+    return result.entry;
   }
 
   ingestPrivacyEvent(input: PrivacyEventIngest): UnifiedInboxEntry | null {
@@ -612,6 +626,7 @@ export class UnifiedInboxBridge {
       resolved_at: resolvedAt,
       resolved_by: resolvedBy,
     };
+    if (updated.source_class === "blocked_egress" && !this.blockedAdmissions.update(updated)) throw new Error("Blocked-egress workflow capacity unavailable");
     this.entriesByKey.set(key, updated);
     void this.auditLog.append(
       "l2",
@@ -625,7 +640,7 @@ export class UnifiedInboxBridge {
         fortress_id: this.fortressId,
       },
     );
-    if (this.store) {
+    if (updated.source_class !== "blocked_egress" && this.store) {
       this.trackStoreWrite(this.store.resolve(updated.inbox_id, resolvedBy));
     }
     this.emit({ type: "resolved", entry: updated });
@@ -662,8 +677,9 @@ export class UnifiedInboxBridge {
       state: "active",
       snoozed_until: undefined,
     };
+    if (updated.source_class === "blocked_egress") this.persistEntry(updated);
     this.entriesByKey.set(located.key, updated);
-    this.persistEntry(updated);
+    if (updated.source_class !== "blocked_egress") this.persistEntry(updated);
     this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.UNSNOOZED, updated, {
       batch_correlation_id: randomUUID(),
     });
@@ -683,8 +699,9 @@ export class UnifiedInboxBridge {
         state: "active",
         snoozed_until: undefined,
       };
+      if (updated.source_class === "blocked_egress") this.persistEntry(updated);
       this.entriesByKey.set(key, updated);
-      this.persistEntry(updated);
+      if (updated.source_class !== "blocked_egress") this.persistEntry(updated);
       this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.UNSNOOZED, updated, {
         auto_resurfaced: true,
       });
@@ -732,9 +749,10 @@ export class UnifiedInboxBridge {
         continue;
       }
       if (action === "delete") {
+        if (located.entry.source_class === "blocked_egress" && !this.blockedAdmissions.remove(entryId)) throw new Error("Blocked-egress workflow capacity unavailable");
         this.entriesByKey.delete(located.key);
         this.keyByInboxId.delete(entryId);
-        if (this.store) {
+        if (located.entry.source_class !== "blocked_egress" && this.store) {
           this.trackStoreWrite(this.store.delete(entryId));
         }
         this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.DELETED, located.entry, {
@@ -765,8 +783,9 @@ export class UnifiedInboxBridge {
                 state: "snoozed",
                 snoozed_until: until,
               };
+      if (updated.source_class === "blocked_egress") this.persistEntry(updated);
       this.entriesByKey.set(located.key, updated);
-      this.persistEntry(updated);
+      if (updated.source_class !== "blocked_egress") this.persistEntry(updated);
       this.auditEntry(
         action === "archive"
           ? UNIFIED_INBOX_AUDIT_OPS.ARCHIVED
@@ -800,6 +819,10 @@ export class UnifiedInboxBridge {
   }
 
   private persistEntry(entry: UnifiedInboxEntry): void {
+    if (entry.source_class === "blocked_egress") {
+      if (!this.blockedAdmissions.update(entry)) throw new Error("Blocked-egress workflow capacity unavailable");
+      return;
+    }
     if (this.store) {
       this.trackStoreWrite(this.store.upsert(entry));
     }
@@ -875,10 +898,8 @@ export class UnifiedInboxBridge {
 
     // Evict the oldest entry when at cap. Map preserves insertion
     // order; the first key is the oldest.
-    if (this.entriesByKey.size >= this.maxEntries) {
-      const oldestKey = this.entriesByKey.keys().next().value as
-        | string
-        | undefined;
+    if ([...this.entriesByKey.values()].filter(e => e.source_class !== "blocked_egress").length >= this.maxEntries) {
+      const oldestKey = [...this.entriesByKey].find(([, e]) => e.source_class !== "blocked_egress")?.[0];
       if (oldestKey !== undefined) {
         const evicted = this.entriesByKey.get(oldestKey);
         this.entriesByKey.delete(oldestKey);
@@ -922,13 +943,13 @@ export class UnifiedInboxBridge {
     return entry;
   }
 
-  private cachePersistedEntry(entry: PersistedInboxEntry): void {
-    const dedupKey = `${entry.source_class}|${entry.source_event_id}`;
+  private cachePersistedEntry(entry: UnifiedInboxEntry): void {
+    // Must match UnifiedInboxStore.get in unified-inbox-store.ts: both consume parseBlockedEgressAdmissionRecord and omit wrong-source records.
+    const admission = parseBlockedEgressAdmissionRecord(entry.source_class === "blocked_egress" ? entry.blocked_egress_admission : undefined);
+    const dedupKey = admission.ok ? blockedEgressIdentityKey(this.fortressId, admission.value.identity) : `${entry.source_class}|${entry.source_event_id}`;
     if (this.entriesByKey.has(dedupKey)) return;
-    if (this.entriesByKey.size >= this.maxEntries) {
-      const oldestKey = this.entriesByKey.keys().next().value as
-        | string
-        | undefined;
+    if (entry.source_class !== "blocked_egress" && [...this.entriesByKey.values()].filter(e => e.source_class !== "blocked_egress").length >= this.maxEntries) {
+      const oldestKey = [...this.entriesByKey].find(([, e]) => e.source_class !== "blocked_egress")?.[0];
       if (oldestKey !== undefined) {
         const evicted = this.entriesByKey.get(oldestKey);
         this.entriesByKey.delete(oldestKey);
@@ -938,6 +959,7 @@ export class UnifiedInboxBridge {
     // Must match UnifiedInboxStore.get in unified-inbox-store.ts: invalid or non-blocked-egress metadata reads as legacy.
     const metadata = parseBlockedEgressMetadata(entry.source_class === "blocked_egress" ? entry.blocked_egress : undefined);
     const cached: UnifiedInboxEntry = {
+      ...(admission.ok ? { blocked_egress_admission: admission.value } : {}),
       ...(metadata.ok ? { blocked_egress: metadata.value } : {}),
       inbox_id: entry.inbox_id,
       source_class: entry.source_class,

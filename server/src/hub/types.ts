@@ -1,3 +1,4 @@
+import type { ProtectionSubjectLookup } from "./agent-attribution.js";
 /**
  * Sanctuary v1.1. Operator Hub API Types
  *
@@ -382,6 +383,8 @@ export interface HubPolicyAndBudgetSources {
  * may persist records to disk or recompute them per call.
  */
 export interface HubAgentRegistrySource {
+  /** Must match lookupProtectionSubject in agent-registry.ts; absence never implies a unique binding. */
+  lookupProtectionSubject?(subject: string): ProtectionSubjectLookup;
   /** Optional single-owner change subscription; return the disposer to detach it. */
   subscribe?(listener: HubAgentRegistryChangeListener): () => void;
   /**
