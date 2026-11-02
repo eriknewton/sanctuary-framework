@@ -83,7 +83,7 @@ export const BLOCKED_EGRESS_PROOF_RESERVE_BYTES = 16 * 1024;
 export const BLOCKED_EGRESS_ENTRY_MAX_BYTES = BLOCKED_EGRESS_METADATA_MAX_BYTES + BLOCKED_EGRESS_PROOF_RESERVE_BYTES + 2 * 1024;
 /** Independent 20 MiB ceiling, exceeding 1000 * 20 KiB (19.53125 MiB). */
 export const BLOCKED_EGRESS_RETAINED_MAX_BYTES = 20 * 1024 * 1024;
-/** Design limit on concurrent unsettled operations. */
+/** Design limit on concurrent unsettled admissions. */
 export const BLOCKED_EGRESS_RESERVATIONS_MAX = 32;
 const DAY_MS = 24 * 60 * 60 * 1000; // hours/day * minutes/hour * seconds/minute * milliseconds/second
 export const BLOCKED_EGRESS_LIFETIME_MS = DEFAULT_UNIFIED_INBOX_RETENTION_DAYS * DAY_MS;
@@ -136,7 +136,7 @@ export interface BlockedEgressCandidate {
   /** Supplied only from the consumer mint; callers cannot turn stored metadata into new authority. */
   signedIdentity?: { producer_key_digest: string; seq: number; body_digest: string };
 }
-export type BlockedEgressRefusal = "invalid_time" | "future_time" | "expired" | "oversize" | "identity_conflict" | "invalid_identity" | "reservations_full" | "capacity" | "store_failed";
+export type BlockedEgressRefusal = "invalid_time" | "future_time" | "expired" | "oversize" | "identity_conflict" | "invalid_identity" | "reservations_full" | "capacity" | "not_ready";
 export type BlockedEgressAdmissionResult =
   | { kind: "admitted"; entry: UnifiedInboxEntry; evicted: UnifiedInboxEntry[] }
   | { kind: "duplicate"; entry: UnifiedInboxEntry }
@@ -144,7 +144,7 @@ export type BlockedEgressAdmissionResult =
 /** Structural storage port keeps admission independent of the encrypted store implementation. */
 export interface BlockedEgressAdmissionStore {
   upsert(entry: UnifiedInboxEntry): Promise<unknown>;
-  get(inboxId: string): Promise<(UnifiedInboxEntry & { encrypted_at_rest?: true; retention_until?: string }) | null>;
+  get(inboxId: string, options?: { strict: true }): Promise<(UnifiedInboxEntry & { encrypted_at_rest?: true; retention_until?: string }) | null>;
   delete(inboxId: string): Promise<boolean>;
   readBlockedEgressIndex(): Promise<string[]>;
   writeBlockedEgressIndex(ids: string[]): Promise<void>;
@@ -152,6 +152,8 @@ export interface BlockedEgressAdmissionStore {
 export type BlockedEgressSnapshotItem = UnifiedInboxEntry & { item_id: string };
 export type BlockedEgressSnapshot = { generation: number; items: BlockedEgressSnapshotItem[] } &
   ({ presence: "complete"; presentIds: ReadonlySet<string> } | { presence: "unknown" });
+export type BlockedEgressWorkflowResult = { kind: "applied" } | { kind: "not_ready" };
+type LedgerState = "state_UNRESTORED" | "state_RESTORING" | "state_READY" | "state_FAILED";
 type Retained = UnifiedInboxEntry & { blocked_egress_admission: BlockedEgressAdmissionRecord };
 const hash = (v: string) => createHash("sha256").update(v).digest("hex");
 const oldestFirst = (a: Retained, b: Retained) => a.blocked_egress_admission.first_accepted_at.localeCompare(b.blocked_egress_admission.first_accepted_at) || a.inbox_id.localeCompare(b.inbox_id);
@@ -163,32 +165,44 @@ export class BlockedEgressAdmissions {
   private durableIds = new Set<string>();
   private itemIds = new Map<string, string>();
   private generation = 0;
-  private ready = false;
+  // A store starts UNRESTORED; no store starts READY because nothing durable needs restoring.
+  // UNRESTORED -> RESTORING on restore(); RESTORING -> READY only after all reads and the generation commit;
+  // RESTORING -> FAILED on any thrown read/write; READY -> FAILED on a failed durable write.
+  // READY -> RESTORING on explicit restore(); FAILED -> RESTORING only on the next admit (single flight) or explicit restore().
+  // Only READY admits, updates or removes; every other state refuses without scheduling mutation work.
+  private state: LedgerState;
   private reservations = 0;
   private peakReservations = 0;
   private retiringBytes = 0;
-  private expiryCleanupPending = false;
   private tail: Promise<void> = Promise.resolve();
   private failure: unknown;
-  private failed = false;
+  private writerEpoch = 0;
   private restoring?: Promise<void>;
-  private staged = new Map<string, Retained>();
+  // One latest workflow value per retained id, including removed ids until their delete settles.
+  // Removed ids hold their retained slot; admission cancels superseded updates on eviction, so this map is bounded by the retained count (at most the fortress cap).
+  private workflowWrites = new Map<string, { entry: Retained; removed: boolean }>();
   private priorItems: BlockedEgressSnapshotItem[] = [];
   private readonly lifetime: number;
   constructor(private readonly options: { fortressId: string; now: () => Date; store?: BlockedEgressAdmissionStore; retentionDays?: number }) {
+    this.state = options.store ? "state_UNRESTORED" : "state_READY";
     this.lifetime = Math.min(BLOCKED_EGRESS_LIFETIME_MS, (options.retentionDays ?? DEFAULT_UNIFIED_INBOX_RETENTION_DAYS) * DAY_MS);
   }
 
   /**
    * Continuing paths: a fresh bounded identity reserves capacity and joins the writer;
    * identical retained identity/body returns the original workflow and expiry unchanged;
-   * an arrival during restore commits only after the complete restored generation.
+   * workflow changes coalesce by retained id without taking admission reservations.
    * Refusing paths: invalid/future/expired time, oversize encoding, identity conflict,
-   * exhausted reservations/bytes and failed persistence publish no new admission.
+   * exhausted reservations/bytes and any state other than READY publish no new admission.
    * Restore continues only with a complete read, omitting individually invalid records;
    * a thrown read keeps the prior generation with unknown presence.
    */
   admit(candidate: BlockedEgressCandidate): BlockedEgressAdmissionResult {
+    // Durable accounting is authoritative only after a complete restore; no arrival is retained for later reconciliation.
+    if (this.state !== "state_READY") {
+      if (this.state === "state_FAILED") void this.restore().catch(() => {});
+      return { kind: "refused", reason: "not_ready" };
+    }
     const input = candidate.entry;
     // Bound the full encoding before hashing display fields or scheduling any storage operation.
     const encoding = JSON.stringify(input);
@@ -197,7 +211,7 @@ export class BlockedEgressAdmissions {
     const now = this.options.now().getTime();
     if (observed === undefined) return { kind: "refused", reason: "invalid_time" };
     if (observed > now + BLOCKED_EGRESS_FUTURE_SKEW_MS) return { kind: "refused", reason: "future_time" };
-    const expiry = Math.min(observed + BLOCKED_EGRESS_LIFETIME_MS, now + this.lifetime);
+    const expiry = Math.min(observed + this.lifetime, now + this.lifetime);
     if (expiry <= now) return { kind: "refused", reason: "expired" };
     const metadata = parseBlockedEgressMetadata(input.blocked_egress);
     const verified = candidate.signedIdentity && metadata.ok && metadata.value.attribution.state === "verified" && metadata.value.subject;
@@ -210,43 +224,31 @@ export class BlockedEgressAdmissions {
     const entry: Retained = { ...input, ...(metadata.ok ? { blocked_egress: metadata.value } : {}), blocked_egress_admission: record };
     // Reserve proof bytes even while the dormant format has no persisted proof.
     record.encoded_bytes = Buffer.byteLength(JSON.stringify(entry)) + BLOCKED_EGRESS_PROOF_RESERVE_BYTES;
+    // The first pass replaces the one-digit placeholder; the second includes the final five-digit byte count.
     record.encoded_bytes = Buffer.byteLength(JSON.stringify(entry)) + BLOCKED_EGRESS_PROOF_RESERVE_BYTES;
     if (record.encoded_bytes > BLOCKED_EGRESS_ENTRY_MAX_BYTES) return { kind: "refused", reason: "oversize" };
     if (!parseBlockedEgressAdmissionRecord(record).ok || input.fortress_id !== this.options.fortressId || input.source_class !== "blocked_egress") return { kind: "refused", reason: "invalid_identity" };
     if ("content_digest" in identity) identity.content_digest = hash(JSON.stringify([input.source_event_id, input.observed_at, input.severity, input.summary, input.agent_id ?? null, metadata.ok ? metadata.value : null]));
     const key = blockedEgressIdentityKey(this.options.fortressId, identity);
-    const existing = this.identities.get(key) ?? this.staged.get(key);
+    const existing = this.identities.get(key);
     if (existing) {
       const prior = existing.blocked_egress_admission.identity;
       const same = "body_digest" in prior && "body_digest" in identity ? prior.body_digest === identity.body_digest : "content_digest" in prior && "content_digest" in identity && prior.content_digest === identity.content_digest;
       return same ? { kind: "duplicate", entry: existing } : { kind: "refused", reason: "identity_conflict" };
     }
-    if (this.failed) return { kind: "refused", reason: "store_failed" };
     // Every retained blocked-event record and unsettled reservation consumes the same bounded capacity; timeout or cancellation does not release it before the underlying write settles.
     if (this.reservations >= BLOCKED_EGRESS_RESERVATIONS_MAX) return { kind: "refused", reason: "reservations_full" };
-    const deferredCommit = this.restoring !== undefined;
-    const evicted = deferredCommit ? [] : this.selectEvictions(entry, now);
+    const evicted = this.selectEvictions(entry, now);
     if (this.bytes() + record.encoded_bytes > BLOCKED_EGRESS_RETAINED_MAX_BYTES) return { kind: "refused", reason: "capacity" };
+    if (this.entries.size + this.pendingRemovals().length - evicted.length >= HUB_BLOCKED_EGRESS_FORTRESS_MAX) return { kind: "refused", reason: "capacity" };
     this.reserve();
-    const commit = () => {
-      for (const victim of evicted) this.forget(victim);
-      this.entries.set(entry.inbox_id, entry);
-      this.identities.set(key, entry);
-      this.itemIds.set(entry.inbox_id, hubInboxSourceIdPrefix("blocked_egress") + hash(key));
-      this.commit();
-    };
-    if (deferredCommit) this.staged.set(key, entry); else commit();
+    for (const victim of evicted) this.forget(victim);
+    this.entries.set(entry.inbox_id, entry);
+    this.identities.set(key, entry);
+    this.itemIds.set(entry.inbox_id, hubInboxSourceIdPrefix("blocked_egress") + hash(key));
+    this.commit();
     this.retiringBytes += evicted.reduce((sum, e) => sum + e.blocked_egress_admission.encoded_bytes, 0);
     this.enqueue(async () => {
-      if (deferredCommit) {
-        this.staged.delete(key);
-        // Reconcile against the completed restore before publishing the next generation.
-        const restored = this.identities.get(key);
-        if (restored) return;
-        evicted.push(...this.selectEvictions(entry, this.options.now().getTime()));
-        this.retiringBytes += evicted.reduce((sum, e) => sum + e.blocked_egress_admission.encoded_bytes, 0);
-        commit();
-      }
       for (const victim of evicted) {
         await this.options.store?.delete(victim.inbox_id);
         this.durableIds.delete(victim.inbox_id);
@@ -268,58 +270,70 @@ export class BlockedEgressAdmissions {
     // An origin at its quota replaces its own oldest retained incident; projection eviction never deletes the primary audit evidence.
     if (origin.length >= cap) expired.push(origin[0]!);
     // Must match HUB_BLOCKED_EGRESS_FORTRESS_MAX in hub/constants.ts; the overlay imports the same cap.
-    else if (live.length >= HUB_BLOCKED_EGRESS_FORTRESS_MAX || this.bytes() + entry.blocked_egress_admission.encoded_bytes > BLOCKED_EGRESS_RETAINED_MAX_BYTES) expired.push(live[0]!);
+    else if (live.length + this.pendingRemovals().length >= HUB_BLOCKED_EGRESS_FORTRESS_MAX || this.bytes() + entry.blocked_egress_admission.encoded_bytes > BLOCKED_EGRESS_RETAINED_MAX_BYTES) { if (live[0]) expired.push(live[0]); }
     return expired;
   }
 
-  /** Workflow updates retain the immutable admission identity and lifetime on the same writer. */
-  update(entry: UnifiedInboxEntry): boolean {
+  /** Workflow updates retain admission identity and lifetime and coalesce on the serialized writer. */
+  update(entry: UnifiedInboxEntry): BlockedEgressWorkflowResult {
+    // A refresh owns the entire generation; workflow changes cannot race its replacement.
+    if (this.state !== "state_READY") return { kind: "not_ready" };
     const prior = this.entries.get(entry.inbox_id);
-    if (!prior || this.reservations >= BLOCKED_EGRESS_RESERVATIONS_MAX || this.failed) return false;
+    if (!prior) return { kind: "not_ready" };
     const next = { ...entry, blocked_egress_admission: { ...prior.blocked_egress_admission } };
     next.blocked_egress_admission.encoded_bytes = Buffer.byteLength(JSON.stringify(next)) + BLOCKED_EGRESS_PROOF_RESERVE_BYTES;
-    if (next.blocked_egress_admission.encoded_bytes > BLOCKED_EGRESS_ENTRY_MAX_BYTES || this.bytes() + next.blocked_egress_admission.encoded_bytes > BLOCKED_EGRESS_RETAINED_MAX_BYTES) return false;
-    this.reserve();
-    this.retiringBytes += prior.blocked_egress_admission.encoded_bytes;
     this.entries.set(entry.inbox_id, next);
     this.identities.set(blockedEgressIdentityKey(this.options.fortressId, next.blocked_egress_admission.identity), next);
     this.commit();
-    this.enqueue(async () => { await this.options.store?.upsert(next); }, () => { this.retiringBytes -= prior.blocked_egress_admission.encoded_bytes; });
-    return true;
+    this.queueWorkflow(next, false);
+    return { kind: "applied" };
   }
 
-  remove(inboxId: string): boolean {
+  remove(inboxId: string): BlockedEgressWorkflowResult {
+    // Only READY owns a complete accounting view; outside it even a known id must be left alone.
+    if (this.state !== "state_READY") return { kind: "not_ready" };
     const entry = this.entries.get(inboxId);
-    if (!entry || this.reservations >= BLOCKED_EGRESS_RESERVATIONS_MAX || this.failed) return false;
-    this.reserve();
-    this.forget(entry);
-    this.retiringBytes += entry.blocked_egress_admission.encoded_bytes;
+    if (!entry) return { kind: "not_ready" };
+    this.forget(entry, false);
     this.commit();
+    this.queueWorkflow(entry, true);
+    return { kind: "applied" };
+  }
+
+  private queueWorkflow(entry: Retained, removed: boolean): void {
+    const id = entry.inbox_id;
+    const pending = this.workflowWrites.has(id);
+    this.workflowWrites.set(id, { entry, removed });
+    if (pending) return;
+    // Workflow work owns an existing retained slot, never one of the 32 admission reservations.
     this.enqueue(async () => {
-      await this.options.store?.delete(inboxId);
-      this.durableIds.delete(inboxId);
-      await this.options.store?.writeBlockedEgressIndex([...this.durableIds]);
-    }, () => { this.retiringBytes -= entry.blocked_egress_admission.encoded_bytes; });
-    return true;
+      while (true) {
+        const latest = this.workflowWrites.get(id);
+        if (!latest) return;
+        if (latest.removed) {
+          await this.options.store?.delete(id);
+          this.durableIds.delete(id);
+          await this.options.store?.writeBlockedEgressIndex([...this.durableIds]);
+        } else {
+          await this.options.store?.upsert(latest.entry);
+        }
+        if (this.workflowWrites.get(id) === latest) {
+          this.workflowWrites.delete(id);
+          return;
+        }
+      }
+    }, undefined, false);
+  }
+
+  private pendingRemovals(): Retained[] {
+    return [...this.workflowWrites.values()].filter(work => work.removed).map(work => work.entry);
   }
 
   private pruneExpired(now: number): void {
-    const expired = [...this.entries.values()].filter(entry => parseIsoInstantWithOffset(entry.blocked_egress_admission.expires_at)! <= now);
-    this.expiryCleanupPending = expired.length > 0;
-    if (!expired.length || this.reservations >= BLOCKED_EGRESS_RESERVATIONS_MAX || this.failed || this.restoring) return;
-    this.expiryCleanupPending = false;
-    this.reserve();
-    const bytes = expired.reduce((sum, entry) => sum + entry.blocked_egress_admission.encoded_bytes, 0);
-    for (const entry of expired) this.forget(entry);
-    this.retiringBytes += bytes;
-    this.commit();
-    this.enqueue(async () => {
-      for (const entry of expired) {
-        await this.options.store?.delete(entry.inbox_id);
-        this.durableIds.delete(entry.inbox_id);
-      }
-      await this.options.store?.writeBlockedEgressIndex([...this.durableIds]);
-    }, () => { this.retiringBytes -= bytes; });
+    if (this.state !== "state_READY") return;
+    for (const entry of this.entries.values()) {
+      if (parseIsoInstantWithOffset(entry.blocked_egress_admission.expires_at)! <= now) this.remove(entry.inbox_id);
+    }
   }
 
   /** Read every retained record for the bridge cache, including ineligible legacy prose. */
@@ -328,7 +342,11 @@ export class BlockedEgressAdmissions {
   snapshot(): BlockedEgressSnapshot {
     const now = this.options.now().getTime();
     this.pruneExpired(now);
-    if (!this.ready || this.restoring) return { generation: this.generation, presence: "unknown", items: this.priorItems };
+    if (this.state !== "state_READY") return { generation: this.generation, presence: "unknown", items: this.priorItems };
+    return this.readySnapshot(now);
+  }
+
+  private readySnapshot(now: number): BlockedEgressSnapshot {
     const eligible = [...this.entries.values()].filter(e => e.blocked_egress && parseIsoInstantWithOffset(e.blocked_egress_admission.expires_at)! > now);
     const all = eligible.map(e => ({ ...e, item_id: this.itemIds.get(e.inbox_id)! }));
     all.sort((a, b) => parseIsoInstantWithOffset(b.observed_at)! - parseIsoInstantWithOffset(a.observed_at)! || a.item_id.localeCompare(b.item_id));
@@ -340,11 +358,12 @@ export class BlockedEgressAdmissions {
 
   restore(): Promise<void> {
     if (this.restoring) return this.restoring;
-    if (this.ready) this.snapshot();
-    if (this.reservations >= BLOCKED_EGRESS_RESERVATIONS_MAX) return Promise.reject(new Error("Blocked-egress restore capacity unavailable"));
-    // Restore and any indexed cleanup share one reservation until their underlying I/O settles.
-    this.reserve();
+    // Capturing prior items must not prune before all restore reads succeed; a failed read authorizes no deletion.
+    if (this.state === "state_READY") this.readySnapshot(this.options.now().getTime());
+    this.state = "state_RESTORING";
     const work = this.tail.then(async () => {
+      // An earlier queued write may have failed while this explicit restore waited; this same restore now owns the read phase.
+      this.state = "state_RESTORING";
       const ids = await this.options.store?.readBlockedEgressIndex() ?? [];
       if (ids.length > HUB_BLOCKED_EGRESS_FORTRESS_MAX) throw new Error("Blocked-egress index capacity exceeded");
       const restored = new Map<string, Retained>();
@@ -353,8 +372,9 @@ export class BlockedEgressAdmissions {
       const origins = new Map<string, number>();
       let bytes = 0;
       for (const id of ids) {
-        const entry = await this.options.store?.get(id);
-        if (!entry || entry.source_class === "blocked_egress") excludedIds.add(id);
+        // Must match unified-inbox-store.ts list isolation: a failed indexed read fails this entire generation.
+        const entry = await this.options.store?.get(id, { strict: true });
+        if (entry?.source_class === "blocked_egress") excludedIds.add(id);
         if (!entry || entry.source_class !== "blocked_egress" || entry.fortress_id !== this.options.fortressId) continue;
         const parsed = parseBlockedEgressAdmissionRecord(entry.blocked_egress_admission);
         if (!parsed.ok) continue;
@@ -363,7 +383,7 @@ export class BlockedEgressAdmissions {
         const now = this.options.now().getTime();
         const expiry = parseIsoInstantWithOffset(record.expires_at)!;
         const first = parseIsoInstantWithOffset(record.first_accepted_at)!;
-        if (observed === undefined || first > now + BLOCKED_EGRESS_FUTURE_SKEW_MS || observed > first + BLOCKED_EGRESS_FUTURE_SKEW_MS || expiry > Math.min(observed + BLOCKED_EGRESS_LIFETIME_MS, first + this.lifetime) || expiry <= now) continue;
+        if (observed === undefined || first > now + BLOCKED_EGRESS_FUTURE_SKEW_MS || observed > first + BLOCKED_EGRESS_FUTURE_SKEW_MS || expiry > Math.min(observed + this.lifetime, first + this.lifetime) || expiry <= now) continue;
         const metadata = parseBlockedEgressMetadata(entry.blocked_egress);
         if (record.origin !== "unsigned" && (!metadata.ok || metadata.value.attribution.state !== "verified" || record.origin !== `subject:${metadata.value.subject}`)) continue;
         const { encrypted_at_rest: _encrypted, retention_until: _retention, ...admitted } = entry;
@@ -382,38 +402,46 @@ export class BlockedEgressAdmissions {
       for (const id of excludedIds) await this.options.store?.delete(id);
       if (restored.size !== ids.length) await this.options.store?.writeBlockedEgressIndex([...restored.keys()]);
       this.retiringBytes = 0;
+      this.reservations = 0;
+      this.workflowWrites.clear();
       this.durableIds = new Set(restored.keys());
       this.itemIds = new Map([...restored.values()].map(e => [e.inbox_id, hubInboxSourceIdPrefix("blocked_egress") + hash(blockedEgressIdentityKey(this.options.fortressId, e.blocked_egress_admission.identity))]));
       this.entries = restored;
       this.identities = new Map([...restored.values()].map(e => [blockedEgressIdentityKey(this.options.fortressId, e.blocked_egress_admission.identity), e]));
       this.failure = undefined;
-      this.failed = false;
-      this.ready = true;
       this.commit();
+      this.state = "state_READY";
     });
-    this.restoring = work.then(() => { this.restoring = undefined; this.reservations--; }, error => { this.restoring = undefined; this.reservations--; this.ready = false; throw error; });
+    this.restoring = work.then(() => { this.restoring = undefined; }, error => { this.restoring = undefined; this.fail(error); throw error; });
     const result = this.restoring;
     this.tail = result.catch(() => {});
     return result;
   }
 
-  async settled(): Promise<void> { while (true) { const tail = this.tail; await tail; if (tail === this.tail) break; } if (this.failed) throw this.failure; }
+  async settled(): Promise<void> { while (true) { const tail = this.tail; await tail; if (tail === this.tail) break; } if (this.state === "state_FAILED") throw this.failure; }
   stats() {
     const origins: Record<string, number> = {};
     for (const e of this.entries.values()) origins[e.blocked_egress_admission.origin] = (origins[e.blocked_egress_admission.origin] ?? 0) + 1;
-    return { retained: this.entries.size, origins, encodedBytes: this.bytes(), reservations: this.reservations, peakReservations: this.peakReservations, dedupRecords: this.identities.size };
+    return { state: this.state, pendingWorkflowWrites: this.workflowWrites.size, retained: this.entries.size, origins, encodedBytes: this.bytes(), reservations: this.reservations, peakReservations: this.peakReservations, dedupRecords: this.identities.size };
   }
-  private bytes(): number { return this.retiringBytes + [...this.entries.values(), ...this.staged.values()].reduce((sum, e) => sum + e.blocked_egress_admission.encoded_bytes, 0); }
-  private forget(entry: Retained) { this.itemIds.delete(entry.inbox_id); this.entries.delete(entry.inbox_id); this.identities.delete(blockedEgressIdentityKey(this.options.fortressId, entry.blocked_egress_admission.identity)); }
+  private bytes(): number { return this.retiringBytes + [...this.entries.values(), ...this.pendingRemovals()].reduce((sum, e) => sum + e.blocked_egress_admission.encoded_bytes, 0); }
+  private forget(entry: Retained, cancelWorkflow = true) { if (cancelWorkflow) this.workflowWrites.delete(entry.inbox_id); this.itemIds.delete(entry.inbox_id); this.entries.delete(entry.inbox_id); this.identities.delete(blockedEgressIdentityKey(this.options.fortressId, entry.blocked_egress_admission.identity)); }
   private reserve() { this.reservations++; this.peakReservations = Math.max(this.peakReservations, this.reservations); }
   private commit() {
     // Items and complete presence come from one committed generation; an incomplete or failed refresh reports unknown presence and never clears prior cards.
     this.generation++;
   }
-  private enqueue(write: () => Promise<void>, success: () => void = () => {}) {
+  private fail(error: unknown): void {
+    this.failure = error;
+    this.state = "state_FAILED";
+    // Invalidating queued closures prevents an earlier failed write from publishing later partial work.
+    this.writerEpoch++;
+  }
+  private enqueue(write: () => Promise<void>, success: () => void = () => {}, admission = true) {
+    const epoch = this.writerEpoch;
     this.tail = this.tail.then(async () => {
-      try { if (this.failed) return; await write(); success(); } catch (error) { this.failure = error; this.failed = true; this.ready = false; }
-      finally { this.reservations--; if (this.expiryCleanupPending) this.pruneExpired(this.options.now().getTime()); }
+      try { if (epoch !== this.writerEpoch) return; await write(); success(); } catch (error) { this.fail(error); }
+      finally { if (admission) this.reservations--; }
     });
   }
 }

@@ -531,6 +531,7 @@ export class AuditConsumer {
     this.producerSigMaxAgeMs = options?.producerSigMaxAgeMs ?? 5 * 60 * 1000;
     this.producerWalRetentionMs =
       options?.producerWalRetentionMs ?? 24 * 60 * 60 * 1000;
+    // Default must match BLOCKED_EGRESS_FUTURE_SKEW_MS in principal-policy/blocked-egress-projection.ts.
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
     this.chainAnchorSource = options?.chainAnchorSource;

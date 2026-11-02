@@ -171,6 +171,7 @@ describe("Psi-2 - UnifiedInboxStore encrypted persistence", () => {
 describe("Psi-2 - producer wiring", () => {
   it("Castle Wall AuditConsumer emits blocked egress into the bridge", async () => {
     const { auditLog, bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const consumer = new AuditConsumer(auditLog, bridge);
     const event: CastleWallAuditEvent = {
       schema_version: 1,
@@ -388,6 +389,7 @@ import { CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } from "../../src/castle-wall/consta
 describe("structured blocked-egress encrypted round trip", () => {
   it.each(["verified", "unverified"] as const)("retains %s evidence through cache, encryption and restart", async (state) => {
     const { storage, masterKey, store, bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const metadata = {
       destination_host: "bounded.example", destination_ip: "2001:db8::1",
       attribution: { subject: "castle_wall_producer", evidence_source: "producer_signature", verifier: "castle_wall_audit_consumer", state } as const,
@@ -422,6 +424,7 @@ describe("structured blocked-egress encrypted round trip", () => {
 
   it("reads legacy and malformed stored metadata as legacy without rewriting storage", async () => {
     const { storage, masterKey, store, bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const entry = bridge.ingestBlockedEgress({ source_event_id: "legacy", destination_category: "legacy.example", block_reason_class: "other", observed_at: OBSERVED_AT })!;
     await bridge.flushPersistence();
     const legacy = (await store.get(entry.inbox_id))!;

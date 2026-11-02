@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { UnifiedInboxStore, UNIFIED_INBOX_NAMESPACE } from "../../src/principal-policy/unified-inbox-store.js";
+import { UnifiedInboxScheduler } from "../../src/principal-policy/unified-inbox-scheduler.js";
 import { UnifiedInboxBridge } from "../../src/principal-policy/unified-inbox-bridge.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { BlockedEgressAdmissions, BLOCKED_EGRESS_ENTRY_MAX_BYTES, BLOCKED_EGRESS_RETAINED_MAX_BYTES, BLOCKED_EGRESS_RESERVATIONS_MAX,
@@ -87,7 +88,7 @@ describe("bounded blocked-egress projection", () => {
       if (onlyAB) expect(stats.origins["subject:B"]).toBe(Math.min(BLOCKED_EGRESS_ORIGIN_MAX, b));
       expect(stats.retained).toBeLessThanOrEqual(HUB_BLOCKED_EGRESS_FORTRESS_MAX);
       expect(stats.encodedBytes).toBeLessThanOrEqual(BLOCKED_EGRESS_RETAINED_MAX_BYTES);
-      expect(stats.peakReservations).toBeLessThanOrEqual(BLOCKED_EGRESS_RESERVATIONS_MAX);
+      expect(Math.max(peak, stats.peakReservations)).toBe(BLOCKED_EGRESS_RESERVATIONS_MAX);
       expect(stats.dedupRecords).toBe(stats.retained);
       expect(overlaySize(overlay)).toBeLessThanOrEqual(HUB_BLOCKED_EGRESS_FORTRESS_MAX);
       expect(keys.length).toBeLessThanOrEqual(HUB_BLOCKED_EGRESS_FORTRESS_MAX);
@@ -106,31 +107,48 @@ describe("bounded blocked-egress projection", () => {
       expect(r.calls.list - before.list).toBe(0);
       evidence.push({ label, indexReads: r.calls.index - before.index, entryReads: r.calls.entries - before.entries, lists: r.calls.list - before.list });
     }
+    let peak = 0;
+    let reservationRefusals = 0;
+    let writeGate = deferred();
+    const write = r.storage.write;
+    r.storage.write = async (...args) => { await writeGate.promise; await write(...args); };
+    async function submit(c: BlockedEgressCandidate) {
+      admit(a, c); totalAdmissions++;
+      peak = Math.max(peak, a.stats().reservations);
+      feed(overlay, a.snapshot());
+      if (a.stats().reservations === BLOCKED_EGRESS_RESERVATIONS_MAX) {
+        expect(a.admit(candidate("overflow", totalAdmissions))).toEqual({ kind: "refused", reason: "reservations_full" });
+        reservationRefusals++;
+        writeGate.resolve(); await a.settled(); writeGate = deferred();
+      }
+    }
     const WAVES = 10;
     const WAVE_SIZE = 1000;
     const INTERLEAVE = 17; // acceptance schedule: B after each seventeenth A
     for (let wave = 1; wave <= WAVES; wave++) {
       for (let offset = 1; offset <= WAVE_SIZE; offset++) {
         const seq = (wave - 1) * WAVE_SIZE + offset;
-        admit(a, candidate("A", seq)); totalAdmissions++;
-        if (seq % INTERLEAVE === 0) { admit(a, candidate("B", ++b)); totalAdmissions++; }
-        feed(overlay, a.snapshot());
-        await a.settled();
+        await submit(candidate("A", seq, r.clock().getTime()));
+        if (seq % INTERLEAVE === 0) await submit(candidate("B", ++b, r.clock().getTime()));
       }
+      writeGate.resolve(); await a.settled();
       await check(`wave-${wave}`, true);
       if (wave === WAVES / 2 || wave === WAVES) { await restart(`restart-${wave}`); await check(`after-restart-${wave}`, true); }
+      r.advance(1); // Distinct acceptance times decide age across waves.
+      writeGate = deferred();
     }
     // More than one fortress worth of fresh subjects exercises the global bound independently of A's churn.
     for (let origin = 0; origin <= HUB_BLOCKED_EGRESS_FORTRESS_MAX / BLOCKED_EGRESS_ORIGIN_MAX; origin++) {
       for (let seq = 0; seq < BLOCKED_EGRESS_ORIGIN_MAX; seq++) {
-        admit(a, candidate(`fresh${origin}`, seq)); totalAdmissions++;
-        feed(overlay, a.snapshot()); await a.settled();
+        await submit(candidate(`fresh${origin}`, seq, r.clock().getTime()));
       }
+      r.advance(1); // Fresh-origin waves have a strict acceptance-time order.
     }
+    writeGate.resolve(); await a.settled();
     await check("global-cap", false);
     await restart("restart-global-cap"); await check("after-global-restart", false);
     expect(totalAdmissions).toBeGreaterThan(HUB_BLOCKED_EGRESS_FORTRESS_MAX);
-    console.log("BOUNDS_WITNESS", JSON.stringify({ totalAdmissions, evidence }));
+    console.log("BOUNDS_WITNESS", JSON.stringify({ totalAdmissions, peakReservations: peak, reservationRefusals, evidence }));
   }, 90 * 1000); // Three ordinary test windows for the required 11,608 encrypted admissions and every-snapshot overlay.
 
   it("replaces a full origin's oldest record before another origin and uses stable id ties", async () => {
@@ -165,7 +183,7 @@ describe("bounded blocked-egress projection", () => {
   it("keeps identity, expiry and dismissal on retries and separates producer keys and sequence gaps", async () => {
     const r = rig(); const a = r.admissions; await a.restore();
     const first = admit(a, candidate("A", 0)).entry;
-    expect(a.update({ ...first, state: "dismissed", dismissed_at: iso(NOW) })).toBe(true);
+    expect(a.update({ ...first, state: "dismissed", dismissed_at: iso(NOW) })).toEqual({ kind: "applied" });
     await a.settled(); r.advance(BLOCKED_EGRESS_FUTURE_SKEW_MS);
     const duplicate = a.admit(candidate("A", 0));
     expect(duplicate.kind).toBe("duplicate");
@@ -216,31 +234,47 @@ describe("bounded blocked-egress projection", () => {
     vi.restoreAllMocks();
   });
 
-  it("excludes corrupt and oversized direct entries from a complete generation", async () => {
+  it("excludes parsed invalid and oversized content from a complete generation", async () => {
     const r = rig(); await r.admissions.restore();
-    for (let i = 0; i < 3; i++) { admit(r.admissions, candidate("A", i)); await r.admissions.settled(); }
-    await r.memory.write(UNIFIED_INBOX_NAMESPACE, `entry.${candidate("A", 0).entry.inbox_id}`, new TextEncoder().encode("invalid"));
-    await r.memory.write(UNIFIED_INBOX_NAMESPACE, `entry.${candidate("A", 1).entry.inbox_id}`, new Uint8Array(256 * 1024 + 1)); // encrypted store ceiling plus one byte
+    const entries = [];
+    for (let i = 0; i < 3; i++) { entries.push(admit(r.admissions, candidate("A", i)).entry); await r.admissions.settled(); }
+    await r.store.upsert({ ...entries[0]!, blocked_egress_admission: undefined });
+    await r.store.upsert({ ...entries[1]!, summary: "x".repeat(BLOCKED_EGRESS_ENTRY_MAX_BYTES) });
     const a = r.makeAdmissions(); await a.restore();
     expect(a.snapshot().presence).toBe("complete"); expect(a.stats().retained).toBe(1);
-    admit(a, candidate("B", 0)); await a.settled();
-    expect(await r.store.readBlockedEgressIndex()).toHaveLength(2);
+    expect(await r.memory.list(UNIFIED_INBOX_NAMESPACE, "entry.")).toHaveLength(1);
   });
 
-  it("commits items and presence together before publishing an arrival during restore", async () => {
-    const r = rig(); await r.admissions.restore(); admit(r.admissions, candidate("A", 0)); await r.admissions.settled();
+  it("refuses admission and workflow changes without storage calls while RESTORING and FAILED", async () => {
+    const r = rig(); const a = r.admissions;
+    expect(a.admit(candidate("A", 0))).toEqual({ kind: "refused", reason: "not_ready" });
+    expect(a.update(candidate("A", 0).entry)).toEqual({ kind: "not_ready" });
+    expect(a.remove(candidate("A", 0).entry.inbox_id)).toEqual({ kind: "not_ready" });
+    expect(r.calls).toEqual({ read: 0, index: 0, entries: 0, list: 0, write: 0, delete: 0 });
+    await a.restore(); const entry = admit(a, candidate("A", 0)).entry; await a.settled();
     const gate = deferred(); const started = deferred();
-    const real = r.store.get.bind(r.store);
-    vi.spyOn(r.store, "get").mockImplementation(async id => { started.resolve(); await gate.promise; return real(id); });
-    const b = r.makeAdmissions(r.store); const restore = b.restore(); await started.promise;
-    admit(b, candidate("B", 0)); expect(b.snapshot().presence).toBe("unknown");
-    gate.resolve(); await restore;
-    const first = b.snapshot(); expect(first.presence).toBe("complete");
-    expect(first.items).toHaveLength(1);
-    if (first.presence === "complete") expect(new Set(first.items.map(e => e.item_id))).toEqual(first.presentIds);
-    await b.settled();
-    const next = b.snapshot(); expect(next.items).toHaveLength(2); expect(next.generation).toBe(first.generation + 1);
-    vi.restoreAllMocks();
+    const read = r.storage.read;
+    r.storage.read = async (...args) => { await read(...args); started.resolve(); await gate.promise; throw new Error("read unavailable"); };
+    const restoring = a.restore(); await started.promise;
+    const before = { ...r.calls };
+    const generation = a.snapshot().generation;
+    const refuse = () => {
+      expect(a.admit(candidate("B", 0))).toEqual({ kind: "refused", reason: "not_ready" });
+      expect(a.update({ ...entry, state: "dismissed" })).toEqual({ kind: "not_ready" });
+      expect(a.remove(entry.inbox_id)).toEqual({ kind: "not_ready" });
+      expect(a.stats().retained).toBe(1);
+      expect(a.stats().reservations).toBe(0);
+      expect(a.snapshot().generation).toBe(generation);
+      expect(r.calls).toEqual(before);
+    };
+    refuse(); gate.resolve(); await expect(restoring).rejects.toThrow("read unavailable");
+    expect(a.stats().state).toBe("state_FAILED");
+    refuse(); // The next admit schedules recovery, but none of these operations performs storage work synchronously.
+    await expect(a.settled()).rejects.toThrow("read unavailable");
+    expect(r.calls.write).toBe(before.write); expect(r.calls.delete).toBe(before.delete);
+    r.storage.read = read; await a.restore();
+    expect(a.stats()).toMatchObject({ state: "state_READY", retained: 1, reservations: 0 });
+    expect(a.admit(candidate("B", 0)).kind).toBe("admitted"); await a.settled();
   });
 
   it("drops expired presence between reads and refuses a retry without renewal", async () => {
@@ -265,7 +299,7 @@ describe("bounded blocked-egress projection", () => {
     feed(overlay, beyond);
     expect(overlay.reconcileSourceItems("source.blocked_egress.", beyond.presence === "complete" ? beyond.presentIds : new Set(), iso(NOW))).toBe(0);
     a = r.makeAdmissions(); await a.restore(); feed(overlay, a.snapshot()); expect(overlay.get(first.item_id)?.resolved).toBe(true);
-    expect(a.remove(first.inbox_id)).toBe(true); await a.settled();
+    expect(a.remove(first.inbox_id)).toEqual({ kind: "applied" }); await a.settled();
     const removed = a.snapshot(); feed(overlay, removed);
     expect(overlay.reconcileSourceItems("source.blocked_egress.", removed.presence === "complete" ? removed.presentIds : new Set(), iso(NOW))).toBe(0);
     expect(overlaySize(overlay)).toBeLessThanOrEqual(HUB_BLOCKED_EGRESS_FORTRESS_MAX);
@@ -325,7 +359,7 @@ describe("bounded blocked-egress projection", () => {
     admit(a, candidate("A", 0));
     await expect(a.settled()).rejects.toThrow("write unavailable");
     expect(a.snapshot().presence).toBe("unknown");
-    expect(a.admit(candidate("B", 0))).toEqual({ kind: "refused", reason: "store_failed" });
+    expect(a.admit(candidate("B", 0))).toEqual({ kind: "refused", reason: "not_ready" });
     expect(a.stats().reservations).toBe(0);
     r.storage.write = write;
     await a.restore(); admit(a, candidate("B", 0)); await a.settled();
@@ -346,6 +380,186 @@ describe("bounded blocked-egress projection", () => {
     expect(await r.memory.list(UNIFIED_INBOX_NAMESPACE, "entry.")).toHaveLength(1);
     expect(await r.store.get(approval.inbox_id)).toMatchObject({ source_class: "approval" });
     expect(await r.store.readBlockedEgressIndex()).toEqual([]);
+  });
+
+  it("preserves the durable index through failed initial restore and repeated admissions", async () => {
+    const r = rig(); await r.admissions.restore();
+    const original = admit(r.admissions, candidate("A", 0)).entry; await r.admissions.settled();
+    const index = await r.memory.read(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1");
+    const a = r.makeAdmissions(r.store);
+    const read = r.storage.read;
+    r.storage.read = async (...args) => { if (args[1].startsWith("entry.")) throw new Error("entry unavailable"); return read(...args); };
+    await expect(a.restore()).rejects.toThrow("entry unavailable");
+    const before = { ...r.calls };
+    for (let wave = 0; wave < 3; wave++) { // Repeated admission waves must never publish an empty durable view.
+      for (let i = 0; i <= BLOCKED_EGRESS_RESERVATIONS_MAX; i++) expect(a.admit(candidate("B", i))).toEqual({ kind: "refused", reason: "not_ready" });
+      await expect(a.settled()).rejects.toThrow("entry unavailable");
+    }
+    expect(r.calls.write).toBe(before.write); expect(r.calls.delete).toBe(before.delete);
+    expect(await r.memory.read(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1")).toEqual(index);
+    r.storage.read = read; await a.restore();
+    expect(a.stats()).toMatchObject({ state: "state_READY", retained: 1, reservations: 0, dedupRecords: 1,
+      encodedBytes: original.blocked_egress_admission!.encoded_bytes });
+  });
+
+  it("recovers once after a READY write failure and rebuilds exact nonnegative durable accounting", async () => {
+    const r = rig(); const a = r.admissions; await a.restore();
+    for (let i = 0; i < BLOCKED_EGRESS_ORIGIN_MAX; i++) { admit(a, candidate("A", i)); await a.settled(); }
+    const write = r.storage.write;
+    const writeGate = deferred(); const writeStarted = deferred();
+    r.storage.write = async (...args) => {
+      if (args[1].startsWith("entry.")) { writeStarted.resolve(); await writeGate.promise; throw new Error("entry write unavailable"); }
+      return write(...args);
+    };
+    admit(a, candidate("A", BLOCKED_EGRESS_ORIGIN_MAX));
+    admit(a, candidate("B", 0)); // This queued admission must be discarded when its predecessor fails.
+    await writeStarted.promise; writeGate.resolve();
+    await expect(a.settled()).rejects.toThrow("entry write unavailable");
+    expect(a.stats().state).toBe("state_FAILED"); expect(a.stats().encodedBytes).toBeGreaterThanOrEqual(0);
+    r.storage.write = write;
+    const readGate = deferred(); const readStarted = deferred(); const read = r.storage.read;
+    r.storage.read = async (...args) => { const value = await read(...args); if (args[1] === "blocked_egress.index.v1") { readStarted.resolve(); await readGate.promise; } return value; };
+    const before = r.calls.index;
+    for (let i = 0; i <= BLOCKED_EGRESS_RESERVATIONS_MAX; i++) expect(a.admit(candidate("B", i))).toEqual({ kind: "refused", reason: "not_ready" });
+    await readStarted.promise;
+    expect(a.stats().state).toBe("state_RESTORING"); expect(r.calls.index - before).toBe(1);
+    expect(a.restore()).toBe(a.restore());
+    readGate.resolve(); await a.settled();
+    const ids = await r.store.readBlockedEgressIndex();
+    const durable = await Promise.all(ids.map(id => r.store.get(id)));
+    const bytes = durable.reduce((sum, e) => sum + e!.blocked_egress_admission!.encoded_bytes, 0);
+    expect(a.stats()).toMatchObject({ state: "state_READY", retained: BLOCKED_EGRESS_ORIGIN_MAX - 1, encodedBytes: bytes, reservations: 0, pendingWorkflowWrites: 0 });
+    expect(a.stats().encodedBytes).toBeGreaterThanOrEqual(0);
+    expect(a.admit(candidate("B", 0)).kind).toBe("admitted"); await a.settled();
+    expect(a.stats().encodedBytes).toBeGreaterThanOrEqual(bytes);
+  });
+
+  it("enters the restore read phase after an earlier queued write fails", async () => {
+    const r = rig(); const a = r.admissions; await a.restore();
+    const write = r.storage.write; const gate = deferred(); const started = deferred();
+    r.storage.write = async () => { started.resolve(); await gate.promise; throw new Error("write unavailable"); };
+    admit(a, candidate("A", 0)); await started.promise;
+    const read = r.storage.read;
+    r.storage.read = async (...args) => { expect(a.stats().state).toBe("state_RESTORING"); return read(...args); };
+    const restoring = a.restore();
+    expect(a.admit(candidate("B", 0))).toEqual({ kind: "refused", reason: "not_ready" });
+    gate.resolve(); await restoring; await a.settled();
+    expect(a.stats()).toMatchObject({ state: "state_READY", retained: 0, encodedBytes: 0, reservations: 0 });
+    r.storage.write = write;
+  });
+
+  it("rehydrates other sources without throwing when the blocked index is corrupt", async () => {
+    const r = rig();
+    const approval = { ...candidate("approval", 0).entry, source_class: "approval" as const };
+    await r.store.upsert(approval);
+    await r.memory.write(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1", new TextEncoder().encode("invalid"));
+    const bridge = new UnifiedInboxBridge({ auditLog: new AuditLog(new MemoryStorage(), KEY), identityId: FORTRESS, fortressId: FORTRESS, store: r.store, now: r.clock });
+    await expect(bridge.rehydratePendingFromStore()).resolves.toBe(1);
+    expect(bridge.get(approval.inbox_id)?.source_class).toBe("approval");
+    expect(bridge.blockedEgressSnapshot().presence).toBe("unknown");
+  });
+
+  it("rehydrates other sources when an indexed blocked entry read throws", async () => {
+    const r = rig(); await r.admissions.restore();
+    const blocked = admit(r.admissions, candidate("A", 0)).entry; await r.admissions.settled();
+    const approval = { ...candidate("approval", 0).entry, source_class: "approval" as const };
+    await r.store.upsert(approval);
+    const read = r.storage.read;
+    r.storage.read = async (...args) => { if (args[1] === `entry.${blocked.inbox_id}`) throw new Error("entry unavailable"); return read(...args); };
+    const bridge = new UnifiedInboxBridge({ auditLog: new AuditLog(new MemoryStorage(), KEY), identityId: FORTRESS, fortressId: FORTRESS, store: r.store, now: r.clock });
+    const before = { ...r.calls };
+    await expect(bridge.rehydratePendingFromStore()).resolves.toBe(1);
+    expect(bridge.get(approval.inbox_id)?.source_class).toBe("approval");
+    expect(bridge.blockedEgressSnapshot().presence).toBe("unknown");
+    expect(r.calls.write).toBe(before.write); expect(r.calls.delete).toBe(before.delete);
+    // Ordinary reads and non-indexed failures retain the existing store contract.
+    await expect(r.store.list()).rejects.toThrow("entry unavailable");
+    r.storage.read = async (...args) => { if (args[1] === `entry.${approval.inbox_id}`) throw new Error("approval unavailable"); return read(...args); };
+    await expect(r.store.list({ exclude_source_class: "blocked_egress" })).rejects.toThrow("approval unavailable");
+  });
+
+  it("deletes nothing durable when any entry fails decryption after an expired entry was read", async () => {
+    const r = rig(); const a = r.admissions; await a.restore();
+    const expired = admit(a, candidate("A", 0, NOW - BLOCKED_EGRESS_LIFETIME_MS / 2)).entry; await a.settled();
+    const corrupt = admit(a, candidate("B", 0)).entry; await a.settled();
+    r.advance(BLOCKED_EGRESS_LIFETIME_MS / 2);
+    const key = `entry.${corrupt.inbox_id}`;
+    const bytes = (await r.memory.read(UNIFIED_INBOX_NAMESPACE, key))!;
+    // Valid JSON with invalid authenticated ciphertext exercises decryption, not the JSON parser.
+    const envelope = JSON.parse(new TextDecoder().decode(bytes));
+    envelope.ct = Buffer.from("invalid ciphertext").toString("base64url");
+    await r.memory.write(UNIFIED_INBOX_NAMESPACE, key, new TextEncoder().encode(JSON.stringify(envelope)));
+    const before = { ...r.calls };
+    const index = await r.memory.read(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1");
+    await expect(a.restore()).rejects.toThrow();
+    expect(a.stats().state).toBe("state_FAILED"); expect(a.snapshot().presence).toBe("unknown");
+    expect(r.calls.delete).toBe(before.delete); expect(r.calls.write).toBe(before.write);
+    expect(await r.memory.read(UNIFIED_INBOX_NAMESPACE, "blocked_egress.index.v1")).toEqual(index);
+    expect(await r.memory.exists(UNIFIED_INBOX_NAMESPACE, `entry.${expired.inbox_id}`)).toBe(true);
+    expect(await r.memory.exists(UNIFIED_INBOX_NAMESPACE, key)).toBe(true);
+  });
+
+  it("refuses the same receipt as expired after shortened retention", async () => {
+    const r = rig(1); const a = r.admissions; await a.restore();
+    const day = BLOCKED_EGRESS_LIFETIME_MS / 30; // Default lifetime is thirty days; store policy is one day.
+    const old = candidate("old", 0, NOW - day / 2);
+    expect(admit(a, old).entry.blocked_egress_admission!.expires_at).toBe(iso(NOW + day / 2));
+    const current = candidate("A", 0); admit(a, current); await a.settled();
+    r.advance(day); expect(a.snapshot().items).toHaveLength(0); await a.settled();
+    expect(await r.store.readBlockedEgressIndex()).toEqual([]);
+    expect(a.admit(current)).toEqual({ kind: "refused", reason: "expired" });
+    const next = r.makeAdmissions(); await next.restore();
+    expect(next.admit(current)).toEqual({ kind: "refused", reason: "expired" });
+  });
+
+  async function workflowRig() {
+    const r = rig(); await r.admissions.restore();
+    // Two full verified origins produce forty retained ids, exceeding the admission pool by eight.
+    for (let i = 0; i < 2 * BLOCKED_EGRESS_ORIGIN_MAX; i++) {
+      admit(r.admissions, candidate(`origin${Math.floor(i / BLOCKED_EGRESS_ORIGIN_MAX)}`, i)); await r.admissions.settled();
+    }
+    const auditLog = new AuditLog(new MemoryStorage(), KEY);
+    const bridge = new UnifiedInboxBridge({ auditLog, identityId: FORTRESS, fortressId: FORTRESS, store: r.store, now: r.clock });
+    await bridge.rehydratePendingFromStore();
+    const ids = bridge.list().map(e => e.inbox_id);
+    const approval = bridge.ingestApproval({ source_event_id: "approval", summary: "Approval", severity: "warn", observed_at: iso(NOW) })!;
+    await bridge.flushPersistence();
+    return { ...r, bridge, auditLog, ids, approval };
+  }
+
+  it("dismisses forty blocked entries and an approval without taking admission reservations", async () => {
+    const r = await workflowRig();
+    expect(r.ids).toHaveLength(2 * BLOCKED_EGRESS_ORIGIN_MAX);
+    expect(r.bridge.dismissBatch([...r.ids, r.approval.inbox_id]).affected).toBe(r.ids.length + 1);
+    expect(r.bridge.get(r.approval.inbox_id)?.state).toBe("dismissed");
+    await r.bridge.flushPersistence();
+    for (const id of r.ids) expect((await r.store.get(id))?.state).toBe("dismissed");
+  });
+
+  it("resurfaces forty due snoozes in one scheduler tick without throwing", async () => {
+    const r = await workflowRig();
+    const until = iso(NOW + 1); // One injected millisecond makes every retained snooze due together.
+    for (const id of r.ids) { expect(r.bridge.snoozeBatch([id], until).affected).toBe(1); await r.bridge.flushPersistence(); }
+    r.advance(1);
+    const scheduler = new UnifiedInboxScheduler({ bridge: r.bridge, now: r.clock });
+    expect(scheduler.tick()).toBe(r.ids.length);
+    for (const id of r.ids) expect(r.bridge.get(id)?.state).toBe("active");
+    await r.bridge.flushPersistence();
+  });
+
+  it("coalesces workflow writes by retained id and holds removed slots until settlement", async () => {
+    const r = rig(); const a = r.admissions; await a.restore();
+    const entry = admit(a, candidate("A", 0)).entry; await a.settled();
+    const before = r.calls.write;
+    expect(a.update({ ...entry, state: "dismissed" }).kind).toBe("applied");
+    expect(a.update({ ...entry, state: "snoozed", snoozed_until: iso(NOW + 1) }).kind).toBe("applied");
+    expect(a.stats()).toMatchObject({ reservations: 0, pendingWorkflowWrites: 1 });
+    await a.settled(); expect(r.calls.write - before).toBe(1);
+    expect((await r.store.get(entry.inbox_id))?.state).toBe("snoozed");
+    expect(a.remove(entry.inbox_id).kind).toBe("applied");
+    expect(a.stats()).toMatchObject({ retained: 0, pendingWorkflowWrites: 1, reservations: 0 });
+    expect(a.stats().encodedBytes).toBeGreaterThan(0);
+    await a.settled(); expect(a.stats().encodedBytes).toBe(0);
   });
 
 });

@@ -109,10 +109,21 @@ export class UnifiedInboxStore {
       UNIFIED_INBOX_KEY_PREFIX,
     );
     const entries: PersistedInboxEntry[] = [];
+    let excludedBlockedIds: Set<string> | undefined;
     for (const meta of metas) {
       const inboxId = stripKeyPrefix(meta.key);
       if (inboxId === null) continue;
-      const entry = await this.get(inboxId);
+      let entry: PersistedInboxEntry | null;
+      try {
+        entry = await this.get(inboxId);
+      } catch (error) {
+        // Only an authenticated blocked index reference may isolate a read failure from other sources at startup.
+        // Must match the strict restore reader in blocked-egress-projection.ts, which still fails the blocked generation.
+        if (opts?.exclude_source_class !== "blocked_egress") throw error;
+        excludedBlockedIds ??= new Set(await this.readBlockedEgressIndex());
+        if (!excludedBlockedIds.has(inboxId)) throw error;
+        continue;
+      }
       if (!entry) continue;
       if (entry.source_class === opts?.exclude_source_class) continue;
       if (opts?.since && entry.observed_at < opts.since) continue;
@@ -127,12 +138,18 @@ export class UnifiedInboxStore {
     return entries.slice(0, opts?.limit ?? entries.length);
   }
 
-  async get(inbox_id: string): Promise<PersistedInboxEntry | null> {
+  /** Restore requests strict reads so unreadable ciphertext cannot be mistaken for an absent projection record. */
+  async get(inbox_id: string, options?: { strict: true }): Promise<PersistedInboxEntry | null> {
     const raw = await this.storage.read(
       UNIFIED_INBOX_NAMESPACE,
       entryKey(inbox_id),
     );
-    if (!raw || raw.length > MAX_ENTRY_BYTES) return null;
+    if (!raw) return null;
+    // Strict projection restore must distinguish unreadable ciphertext from a missing record; ordinary inbox reads keep their legacy contract.
+    if (raw.length > MAX_ENTRY_BYTES) {
+      if (options?.strict) throw new Error("Invalid blocked-egress entry size");
+      return null;
+    }
     try {
       const envelope: EncryptedPayload = JSON.parse(bytesToString(raw));
       const aad = this.aadFor(this.fortressIdForRead(), inbox_id);
@@ -155,7 +172,8 @@ export class UnifiedInboxStore {
       // Must match cachePersistedEntry in unified-inbox-bridge.ts: both consume parseBlockedEgressAdmissionRecord and omit wrong-source records.
       const admission = parseBlockedEgressAdmissionRecord(legacy.source_class === "blocked_egress" ? blocked_egress_admission : undefined);
       return { ...legacy, ...(metadata.ok ? { blocked_egress: metadata.value } : {}), ...(admission.ok ? { blocked_egress_admission: admission.value } : {}) };
-    } catch {
+    } catch (error) {
+      if (options?.strict) throw error;
       return null;
     }
   }

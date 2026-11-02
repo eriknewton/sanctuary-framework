@@ -285,7 +285,13 @@ export class UnifiedInboxBridge {
       this.cachePersistedEntry(persisted);
       loaded += 1;
     }
-    await this.blockedAdmissions.restore();
+    try {
+      await this.blockedAdmissions.restore();
+    } catch {
+      // Unknown blocked-egress presence must not prevent other inbox sources from rehydrating.
+      return loaded;
+    }
+    this.syncBlockedCache();
     for (const entry of this.blockedAdmissions.retained()) {
       this.cachePersistedEntry(entry);
       loaded++;
@@ -626,7 +632,7 @@ export class UnifiedInboxBridge {
       resolved_at: resolvedAt,
       resolved_by: resolvedBy,
     };
-    if (updated.source_class === "blocked_egress" && !this.blockedAdmissions.update(updated)) throw new Error("Blocked-egress workflow capacity unavailable");
+    if (updated.source_class === "blocked_egress" && !this.persistEntry(updated)) return null;
     this.entriesByKey.set(key, updated);
     void this.auditLog.append(
       "l2",
@@ -677,7 +683,7 @@ export class UnifiedInboxBridge {
       state: "active",
       snoozed_until: undefined,
     };
-    if (updated.source_class === "blocked_egress") this.persistEntry(updated);
+    if (updated.source_class === "blocked_egress" && !this.persistEntry(updated)) return null;
     this.entriesByKey.set(located.key, updated);
     if (updated.source_class !== "blocked_egress") this.persistEntry(updated);
     this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.UNSNOOZED, updated, {
@@ -699,7 +705,7 @@ export class UnifiedInboxBridge {
         state: "active",
         snoozed_until: undefined,
       };
-      if (updated.source_class === "blocked_egress") this.persistEntry(updated);
+      if (updated.source_class === "blocked_egress" && !this.persistEntry(updated)) continue;
       this.entriesByKey.set(key, updated);
       if (updated.source_class !== "blocked_egress") this.persistEntry(updated);
       this.auditEntry(UNIFIED_INBOX_AUDIT_OPS.UNSNOOZED, updated, {
@@ -749,7 +755,10 @@ export class UnifiedInboxBridge {
         continue;
       }
       if (action === "delete") {
-        if (located.entry.source_class === "blocked_egress" && !this.blockedAdmissions.remove(entryId)) throw new Error("Blocked-egress workflow capacity unavailable");
+        if (located.entry.source_class === "blocked_egress" && this.blockedAdmissions.remove(entryId).kind === "not_ready") {
+          this.auditBlockedWorkflowRefusal();
+          continue;
+        }
         this.entriesByKey.delete(located.key);
         this.keyByInboxId.delete(entryId);
         if (located.entry.source_class !== "blocked_egress" && this.store) {
@@ -783,7 +792,7 @@ export class UnifiedInboxBridge {
                 state: "snoozed",
                 snoozed_until: until,
               };
-      if (updated.source_class === "blocked_egress") this.persistEntry(updated);
+      if (updated.source_class === "blocked_egress" && !this.persistEntry(updated)) continue;
       this.entriesByKey.set(located.key, updated);
       if (updated.source_class !== "blocked_egress") this.persistEntry(updated);
       this.auditEntry(
@@ -818,14 +827,23 @@ export class UnifiedInboxBridge {
     return { key, entry };
   }
 
-  private persistEntry(entry: UnifiedInboxEntry): void {
+  private auditBlockedWorkflowRefusal(): void {
+    // A closed reason class is sufficient to audit a skipped id without disclosing its subject, destination or text.
+    void this.auditLog.append("l2", UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED, this.identityId, { reason: "not_ready" });
+  }
+
+  private persistEntry(entry: UnifiedInboxEntry): boolean {
     if (entry.source_class === "blocked_egress") {
-      if (!this.blockedAdmissions.update(entry)) throw new Error("Blocked-egress workflow capacity unavailable");
-      return;
+      if (this.blockedAdmissions.update(entry).kind === "not_ready") {
+        this.auditBlockedWorkflowRefusal();
+        return false;
+      }
+      return true;
     }
     if (this.store) {
       this.trackStoreWrite(this.store.upsert(entry));
     }
+    return true;
   }
 
   private auditEntry(
