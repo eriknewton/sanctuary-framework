@@ -31,3 +31,5 @@ export * from "./linux-daemon.js";
 export * from "./linux-audit-drain.js";
 export * from "./linux-policy-compatibility.js";
 export * from "./linux-activation-gate.js";
+export * from "./full-supervision-state.js";
+export * from "./full-supervision-exit.js";
