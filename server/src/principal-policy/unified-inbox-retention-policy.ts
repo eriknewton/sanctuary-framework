@@ -24,6 +24,8 @@ export interface RetentionSweepResult {
   deleted: number;
   archived_deleted: number;
   dismissed_deleted: number;
+  /** Refused blocked-egress ids only; omitted when none were refused. */
+  skipped?: number;
 }
 
 export const INBOX_RETENTION_AUDIT_OPS = {
@@ -155,6 +157,7 @@ export async function sweepUnifiedInboxRetention(opts: {
   let archivedDeleted = 0;
   let dismissedDeleted = 0;
   const expiredIds: string[] = [];
+  const expiredStates = new Map<string, RetentionPolicy["state"]>();
 
   for (const entry of opts.bridge.queryInbox({
     state: ["archived", "dismissed"],
@@ -166,19 +169,25 @@ export async function sweepUnifiedInboxRetention(opts: {
     const retainMs = policy.daysFor(entry.source_class, state) * 24 * 60 * 60 * 1000;
     if (anchorMs + retainMs > nowMs) continue;
     expiredIds.push(entry.inbox_id);
+    expiredStates.set(entry.inbox_id, state);
     if (state === "archived") archivedDeleted += 1;
     else dismissedDeleted += 1;
   }
 
-  if (expiredIds.length > 0) {
-    opts.bridge.deleteBatch(expiredIds);
+  // Must match BatchActionResult.skipped and deleteBatch in unified-inbox-bridge.ts: refused ids are not deletions, and sweep owns its refusal episode.
+  const batch = expiredIds.length > 0 ? opts.bridge.deleteBatch(expiredIds, "sweep") : undefined;
+  for (const id of [...(batch?.skipped ?? []), ...(batch?.missing ?? [])]) {
+    // State totals count only deletions accepted by the bridge, including during a ledger refusal episode.
+    if (expiredStates.get(id) === "archived") archivedDeleted -= 1;
+    else dismissedDeleted -= 1;
   }
 
   const result: RetentionSweepResult = {
     fortress_id: opts.fortressId,
-    deleted: expiredIds.length,
+    deleted: batch?.affected ?? 0,
     archived_deleted: archivedDeleted,
     dismissed_deleted: dismissedDeleted,
+    ...(batch?.skipped?.length ? { skipped: batch.skipped.length } : {}),
   };
   void opts.auditLog.append(
     "l2",

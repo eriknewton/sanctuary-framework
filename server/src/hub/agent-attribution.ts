@@ -41,3 +41,19 @@ export function publicAgentIdForVerifiedAttribution(
   }
   return matchedAgentId ?? verifiedSubject;
 }
+
+/** Constant-time subject lookup distinguishes uniqueness from ambiguity without a roster scan. */
+export type ProtectionSubjectLookup = { kind: "none" } | { kind: "unique"; record: LocalAgentRecord } | { kind: "ambiguous" };
+
+/** Bind only authenticated subjects with a unique enrollment owned by the trusted header identity. */
+export function enrolledAgentBindingForVerifiedSubject(
+  metadata: import("../contracts/v1.1/blocked-egress.js").BlockedEgressMetadata,
+  ownerIdentityId: string,
+  lookup?: (subject: string) => ProtectionSubjectLookup,
+): { agent_binding: "bound"; agent_id: string } | { agent_binding: "unattributed" } {
+  // The header identity is the trusted hub operator; an agent id requires one same-owner enrolled match for a verified subject, otherwise the event is explicitly unattributed.
+  if (metadata.attribution.state !== "verified" || !metadata.subject || !lookup) return { agent_binding: "unattributed" };
+  const result = lookup(metadata.subject);
+  if (result.kind !== "unique" || result.record.identity_id !== ownerIdentityId) return { agent_binding: "unattributed" };
+  return { agent_binding: "bound", agent_id: result.record.agent_id };
+}

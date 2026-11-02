@@ -1,3 +1,4 @@
+import { HUB_BLOCKED_EGRESS_FORTRESS_MAX } from "./constants.js";
 /**
  * Sanctuary v1.1. Hub inbox resolution store
  *
@@ -124,6 +125,16 @@ export class HubInboxStore {
       };
       // Refresh never notifies: inbox frames trigger refetch, whose aggregator re-upserts every item.
       return;
+    }
+    // Must match HUB_BLOCKED_EGRESS_FORTRESS_MAX in constants.ts and principal-policy/blocked-egress-projection.ts.
+    if (!prior && item.item_id.startsWith(hubInboxSourceIdPrefix("blocked_egress"))) {
+      const blocked = [...this.entries.values()].filter(e => e.item.item_id.startsWith(hubInboxSourceIdPrefix("blocked_egress")));
+      if (blocked.length >= HUB_BLOCKED_EGRESS_FORTRESS_MAX) {
+        const cleared = blocked.filter(e => e.cleared);
+        const candidates = cleared.length ? cleared : blocked;
+        candidates.sort((a, b) => (cleared.length ? (a.resolved_at ?? a.item.created_at).localeCompare(b.resolved_at ?? b.item.created_at) : a.item.created_at.localeCompare(b.item.created_at)) || a.item.item_id.localeCompare(b.item.item_id));
+        this.entries.delete(candidates[0]!.item.item_id);
+      }
     }
     const freshItem = { ...item, resolved: false };
     delete freshItem.resolved_at;

@@ -142,14 +142,16 @@ async function withDashboardUrl<T>(base: string, fn: () => Promise<T>): Promise<
 }
 
 describe("Psi-3 unified inbox query API", () => {
-  it("filters by single source class", () => {
+  it("filters by single source class", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     seed(bridge);
     expect(bridge.queryInbox({ source_class: "blocked_egress" })).toHaveLength(1);
   });
 
-  it("filters by severity and agent id", () => {
+  it("filters by severity and agent id", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     seed(bridge);
     const entries = bridge.queryInbox({
       severity: ["alert"],
@@ -158,14 +160,16 @@ describe("Psi-3 unified inbox query API", () => {
     expect(entries.map((e) => e.source_event_id)).toEqual(["budget-b"]);
   });
 
-  it("filters full text across summary and drill detail fields", () => {
+  it("filters full text across summary and drill detail fields", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     seed(bridge);
     expect(bridge.queryInbox({ full_text: "exit drill" })[0]!.source_class).toBe("recovery_prompt");
   });
 
-  it("applies time range, limit, offset, and recency sort", () => {
+  it("applies time range, limit, offset, and recency sort", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     seed(bridge);
     const entries = bridge.queryInbox({
       time_range: {
@@ -178,8 +182,9 @@ describe("Psi-3 unified inbox query API", () => {
     expect(entries.map((e) => e.source_event_id)).toEqual(["block-a"]);
   });
 
-  it("counts without applying pagination", () => {
+  it("counts without applying pagination", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     seed(bridge);
     expect(bridge.countInbox({ limit: 1 })).toBe(3);
   });
@@ -188,6 +193,7 @@ describe("Psi-3 unified inbox query API", () => {
 describe("Psi-3 batch actions and snooze", () => {
   it("archives a batch with one correlation id and per-entry audit", async () => {
     const { bridge, auditLog } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a, b } = seed(bridge);
     const result = bridge.archiveBatch([a.inbox_id, b.inbox_id]);
     expect(result.affected).toBe(2);
@@ -197,8 +203,9 @@ describe("Psi-3 batch actions and snooze", () => {
     expect(new Set(archived.map((e) => e.details?.batch_correlation_id))).toEqual(new Set([result.batch_correlation_id]));
   });
 
-  it("dismisses a batch and hides entries from default active queries", () => {
+  it("dismisses a batch and hides entries from default active queries", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     expect(bridge.dismissBatch([a.inbox_id]).affected).toBe(1);
     expect(bridge.queryInbox().map((e) => e.inbox_id)).not.toContain(a.inbox_id);
@@ -207,6 +214,7 @@ describe("Psi-3 batch actions and snooze", () => {
 
   it("snoozes entries until a deadline and shares a correlation id", async () => {
     const { bridge, auditLog } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     const result = bridge.snoozeBatch([a.inbox_id], "2026-05-13T16:00:00.000Z");
     expect(bridge.queryInbox()).not.toContainEqual(expect.objectContaining({ inbox_id: a.inbox_id }));
@@ -217,6 +225,7 @@ describe("Psi-3 batch actions and snooze", () => {
 
   it("hard deletes only the selected inbox entries", async () => {
     const { bridge, store } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a, b } = seed(bridge);
     await bridge.flushPersistence();
     expect(bridge.deleteBatch([a.inbox_id]).affected).toBe(1);
@@ -227,6 +236,7 @@ describe("Psi-3 batch actions and snooze", () => {
 
   it("batch delete route requires explicit confirmation and leaves audit untouched when missing", async () => {
     const { storage, masterKey, bridge, auditLog } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     const policy = new UnifiedInboxRetentionPolicy();
     const policyStore = new UnifiedInboxRetentionPolicyStore({
@@ -267,8 +277,9 @@ describe("Psi-3 batch actions and snooze", () => {
     }
   });
 
-  it("auto-resurfaces due snoozes and manual unsnooze clears a future snooze", () => {
+  it("auto-resurfaces due snoozes and manual unsnooze clears a future snooze", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a, b } = seed(bridge);
     bridge.snoozeBatch([a.inbox_id], "2026-05-13T11:00:00.000Z");
     bridge.snoozeBatch([b.inbox_id], "2026-05-13T18:00:00.000Z");
@@ -277,8 +288,9 @@ describe("Psi-3 batch actions and snooze", () => {
     expect(bridge.unsnooze(b.inbox_id)?.state).toBe("active");
   });
 
-  it("scheduler tick auto-resurfaces due snoozes through production wiring", () => {
+  it("scheduler tick auto-resurfaces due snoozes through production wiring", async () => {
     const { bridge } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     bridge.snoozeBatch([a.inbox_id], "2026-05-13T11:59:00.000Z");
     const scheduler = new UnifiedInboxScheduler({
@@ -308,6 +320,7 @@ describe("Psi-3 batch actions and snooze", () => {
 describe("Psi-3 retention and isolation", () => {
   it("default retention deletes archived entries after 90 days", async () => {
     const { bridge, auditLog } = rig("2026-05-13T12:00:00.000Z");
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     bridge.archiveBatch([a.inbox_id]);
     const result = await sweepUnifiedInboxRetention({
@@ -322,6 +335,7 @@ describe("Psi-3 retention and isolation", () => {
 
   it("default retention deletes dismissed entries after 30 days", async () => {
     const { bridge, auditLog } = rig("2026-05-13T12:00:00.000Z");
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     bridge.dismissBatch([a.inbox_id]);
     const result = await sweepUnifiedInboxRetention({
@@ -336,6 +350,7 @@ describe("Psi-3 retention and isolation", () => {
 
   it("operator override changes retention per source class and state", async () => {
     const { bridge, auditLog } = rig("2026-05-13T12:00:00.000Z");
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     bridge.archiveBatch([a.inbox_id]);
     const policy = new UnifiedInboxRetentionPolicy([
@@ -454,9 +469,11 @@ describe("Psi-3 retention and isolation", () => {
     expect(swept[0]!.details?.fortress_id).toBe(FORTRESS);
   });
 
-  it("preserves multi-fortress isolation in operations", () => {
+  it("preserves multi-fortress isolation in operations", async () => {
     const a = rig("2026-05-13T12:00:00.000Z", "fortress-a");
+    await a.bridge.rehydratePendingFromStore();
     const b = rig("2026-05-13T12:00:00.000Z", "fortress-b");
+    await b.bridge.rehydratePendingFromStore();
     const entryA = seed(a.bridge).a;
     seed(b.bridge);
     a.bridge.archiveBatch([entryA.inbox_id]);
@@ -545,6 +562,7 @@ describe("Psi-3 retention and isolation", () => {
   // auto-auth.
   it("rejects tokenless loopback inbox mutations with 401 (bearer required); GET reads stay open", async () => {
     const { bridge, auditLog, storage, masterKey } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     const policyStore = new UnifiedInboxRetentionPolicyStore({
       storage,
@@ -604,10 +622,56 @@ describe("Psi-3 retention and isolation", () => {
 
   it("Castle-walking remains pure local operations", async () => {
     const { bridge, auditLog } = rig();
+    await bridge.rehydratePendingFromStore();
     const { a } = seed(bridge);
     bridge.archiveBatch([a.inbox_id]);
     const ops = new Set((await auditEntries(auditLog)).map((e) => e.operation));
     expect([...ops].some((op) => op.startsWith("proxy_call:"))).toBe(false);
     expect(ops.has("intelligence_substrate_invoked")).toBe(false);
+  });
+});
+
+
+describe("blocked-egress workflow readiness", () => {
+  it.each(["RESTORING", "FAILED"] as const)("continues every other-source workflow while blocked entries are %s", async (state) => {
+    const actions = ["dismiss", "archive", "snooze", "delete", "resolve", "unsnooze", "tick", "sweep"] as const;
+    for (const action of actions) {
+      const { bridge, store, auditLog } = rig();
+      await bridge.rehydratePendingFromStore();
+      const { a } = seed(bridge);
+      const approval = bridge.ingestApproval({ source_event_id: `approval-${action}`, summary: "Approval", severity: "warn", observed_at: "2026-05-13T12:00:00.000Z" })!;
+      const ids = [a.inbox_id, approval.inbox_id];
+      if (action === "unsnooze" || action === "tick") bridge.snoozeBatch(ids, action === "unsnooze" ? "2026-05-13T18:00:00.000Z" : "2026-05-13T11:00:00.000Z");
+      if (action === "sweep") bridge.dismissBatch(ids);
+      await bridge.flushPersistence();
+      let release!: () => void;
+      let started!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const reading = new Promise<void>(resolve => { started = resolve; });
+      const read = store.readBlockedEgressIndex.bind(store);
+      store.readBlockedEgressIndex = async () => { started(); await gate; if (state === "FAILED") throw new Error("index unavailable"); return read(); };
+      const restoring = bridge.rehydratePendingFromStore();
+      await reading;
+      if (state === "FAILED") { release(); await restoring; }
+      try {
+        switch (action) {
+          case "dismiss": expect(bridge.dismissBatch(ids).affected).toBe(1); expect(bridge.get(approval.inbox_id)?.state).toBe("dismissed"); break;
+          case "archive": expect(bridge.archiveBatch(ids).affected).toBe(1); expect(bridge.get(approval.inbox_id)?.state).toBe("archived"); break;
+          case "snooze": expect(bridge.snoozeBatch(ids, "2026-05-13T18:00:00.000Z").affected).toBe(1); expect(bridge.get(approval.inbox_id)?.state).toBe("snoozed"); break;
+          case "delete": expect(bridge.deleteBatch(ids).affected).toBe(1); expect(bridge.get(approval.inbox_id)).toBeNull(); break;
+          case "resolve": expect(bridge.resolve(a.inbox_id, "operator")).toBeNull(); expect(bridge.resolve(approval.inbox_id, "operator")?.resolved_by).toBe("operator"); break;
+          case "unsnooze": expect(bridge.unsnooze(a.inbox_id)).toBeNull(); expect(bridge.unsnooze(approval.inbox_id)?.state).toBe("active"); break;
+          case "tick": expect(new UnifiedInboxScheduler({ bridge, now: () => new Date("2026-05-13T12:00:00.000Z") }).tick()).toBe(1); expect(bridge.get(approval.inbox_id)?.state).toBe("active"); break;
+          case "sweep": await sweepUnifiedInboxRetention({ bridge, auditLog, identityId: IDENTITY, fortressId: FORTRESS, now: new Date("2026-06-14T12:00:00.000Z") }); expect(bridge.get(approval.inbox_id)).toBeNull(); break;
+        }
+        expect(bridge.get(a.inbox_id)).toEqual(expect.objectContaining({ state: action === "sweep" ? "dismissed" : action === "unsnooze" || action === "tick" ? "snoozed" : "active" }));
+        const refused = (await auditEntries(auditLog)).filter(e => e.operation === UNIFIED_INBOX_AUDIT_OPS.BLOCKED_EGRESS_REFUSED);
+        expect(refused).toHaveLength(1);
+        expect(refused[0]!.details).toEqual({ reason: "not_ready" });
+      } finally {
+        release(); await restoring; store.readBlockedEgressIndex = read;
+        await bridge.rehydratePendingFromStore(); await bridge.flushPersistence();
+      }
+    }
   });
 });

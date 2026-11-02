@@ -101,3 +101,32 @@ describe("HubInboxStore reserves the Charter approval id namespace", () => {
     );
   });
 });
+
+import { HUB_BLOCKED_EGRESS_FORTRESS_MAX } from "../../src/hub/constants.js";
+import type { HubBlockedEgressItem } from "../../src/contracts/v1.1/hub-events.js";
+
+describe("blocked-egress overlay capacity", () => {
+  it("removes the oldest cleared card before active cards and retains other prefixes", () => {
+    const store = new HubInboxStore();
+    const blocked = (id: string): HubBlockedEgressItem => ({
+      version: "1.1", item_id: `source.blocked_egress.${id}`, kind: "blocked_egress", created_at: "2026-06-14T00:00:00Z",
+      identity_id: "operator", display_template_id: "blocked_egress.custom.other", display_template_args: [], resolved: false,
+      destination_category: "custom", block_reason_class: "other",
+    });
+    store.upsertFromSource(item("approval-preserved"));
+    const ids = new Set<string>();
+    for (let i = 0; i < HUB_BLOCKED_EGRESS_FORTRESS_MAX; i++) {
+      const next = blocked(String(i).padStart(String(HUB_BLOCKED_EGRESS_FORTRESS_MAX).length, "0"));
+      ids.add(next.item_id); store.upsertFromSource(next);
+    }
+    const cleared = blocked("0001").item_id;
+    ids.delete(cleared);
+    store.reconcileSourceItems("source.blocked_egress.", ids, "2026-06-14T00:00:01Z");
+    store.upsertFromSource(blocked("next"));
+    expect(store.get(cleared)).toBeNull();
+    expect(store.get(blocked("0000").item_id)).not.toBeNull();
+    store.upsertFromSource(blocked("next-again"));
+    expect(store.get(blocked("0000").item_id)).toBeNull();
+    expect(store.get("approval-preserved")).not.toBeNull();
+  });
+});

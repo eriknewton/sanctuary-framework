@@ -597,7 +597,7 @@ function structuredBridge() {
   // 32 bytes is the AES-256 fixture key length; storage is isolated per test.
   return new UnifiedInboxBridge({
     auditLog: new AuditLog(new MemoryStorage(), new Uint8Array(32)),
-    identityId: FORTRESS_ID, fortressId: FORTRESS_ID, now: () => new Date(NOW),
+    identityId: FORTRESS_ID, fortressId: FORTRESS_ID, now: () => new Date("2026-06-14T00:00:00Z"),
   });
 }
 
@@ -879,17 +879,43 @@ describe("structured blocked-egress producer evidence", () => {
       expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
     } finally { log.mockRestore(); }
   });
-  it.each([false, true])("keeps first-writer attribution for duplicate source ids (verified first: %s)", async (verifiedFirst) => {
+  it.each([false, true])("keeps a signed and an unsigned event that share a source id as separate records (verified first: %s)", async (verifiedFirst) => {
     const bridge = structuredBridge();
+    let first: ReturnType<typeof bridge.list>[number] | undefined;
     for (const verified of [verifiedFirst, !verifiedFirst]) {
       const consumer = new AuditConsumer(new RecordingSink(), bridge, { now: () => NOW,
         ...(verified ? { pinnedProducerKeyB64url: daemonPubB64 } : {}) });
       await consumer.ingestCritical(verified ? signedEnvelope(blockedEvent(0, null), daemonPriv) : { event: blockedEvent(0, null), ack: async () => {} });
+      if (!first) first = structuredClone(bridge.list()[0]!);
     }
-    expect(bridge.list()).toHaveLength(1);
-    expect(bridge.list()[0]?.blocked_egress).toEqual(verifiedFirst ? verifiedMetadata : {
-      destination_host: DEST.host, destination_ip: DEST.ip, attribution: unsignedAttribution,
-    });
+    expect(bridge.list()).toHaveLength(2);
+    const verified = bridge.list().find(e => e.blocked_egress?.attribution.state === "verified")!;
+    const unsigned = bridge.list().find(e => e.blocked_egress?.attribution.state === "unverified")!;
+    expect(verified.blocked_egress).toEqual(verifiedMetadata);
+    expect(verified.blocked_egress_admission?.origin).toBe(`subject:${verifiedMetadata.subject}`);
+    expect(unsigned.blocked_egress).toEqual({ destination_host: DEST.host, destination_ip: DEST.ip, attribution: unsignedAttribution });
+    expect(unsigned.blocked_egress_admission?.origin).toBe("unsigned");
+    expect(bridge.get(first!.inbox_id)).toEqual(first);
   });
 
+});
+
+describe("signed blocked-egress admission identity", () => {
+  it("retains distinct enrolled keys at one sequence and assigns minted subject origins", async () => {
+    const bridge = structuredBridge();
+    const secondKey = ed25519.utils.randomPrivateKey();
+    for (const [key, uid] of [[daemonPriv, SIGNED_AGENT_UID], [secondKey, SIGNED_AGENT_UID + 1]] as const) {
+      const event = blockedEvent(0, null);
+      event.agent = { ...AGENT, id: auditTokenForRuid(uid) };
+      const consumer = new AuditConsumer(new RecordingSink(), bridge, { pinnedProducerKeyB64url: toBase64url(ed25519.getPublicKey(key)), now: () => NOW });
+      await consumer.ingestCritical(signedEnvelope(event, key));
+    }
+    const entries = bridge.list();
+    expect(entries).toHaveLength(2);
+    expect(new Set(entries.map(e => e.blocked_egress_admission?.origin))).toEqual(new Set([
+      `subject:${FORTRESS_ID}/uid-${SIGNED_AGENT_UID}`, `subject:${FORTRESS_ID}/uid-${SIGNED_AGENT_UID + 1}`,
+    ]));
+    expect(entries.every(e => e.blocked_egress?.attribution.state === "verified")).toBe(true);
+    expect(new Set(entries.map(e => JSON.stringify(e.blocked_egress_admission?.identity))).size).toBe(2);
+  });
 });
