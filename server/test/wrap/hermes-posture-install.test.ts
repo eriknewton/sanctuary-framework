@@ -422,6 +422,93 @@ print(json.dumps({'has_memory': 'memory' in raw, 'defaults': memory == DEFAULT_C
     await expect(install()).rejects.toThrow("Interrupted install");
     delete (__hermesPostureTestHook as { interruptAfterStep?: string }).interruptAfterStep;
   }
+  it("install after an unpublished intent matches a clean install", async () => {
+    await seed("model: fixture\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
+    await install();
+    const clean = await fileState();
+    const cleanOutput = output.mock.calls.flat();
+    await uninstall();
+    await fs.mkdir(join(root, "sanctuary-install"));
+    await fs.writeFile(join(root, "sanctuary-install/record.json.sanctuary-install-tmp"), "partial intent");
+    output.mockClear();
+    await install();
+    expect(await fileState()).toEqual(clean);
+    expect(output.mock.calls.flat()).toEqual(cleanOutput);
+    expect(await fs.readdir(join(root, "sanctuary-install"))).toEqual(["config.yaml.before", "record.json"]);
+  });
+  it("removal of an unpublished intent leaves Hermes files unchanged", async () => {
+    await seed("model: fixture\n");
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
+    await fs.mkdir(join(root, "memories"));
+    await fs.writeFile(join(root, "memories/MEMORY.md"), "Remembered.\n");
+    const before = await snapshot();
+    await fs.mkdir(join(root, "sanctuary-install"));
+    const staging = join(root, "sanctuary-install/record.json.sanctuary-install-tmp");
+    await fs.writeFile(staging, "partial intent");
+    await uninstall();
+    expect(await fs.lstat(staging).catch(() => null)).toBeNull();
+    expect(await fs.lstat(join(root, "sanctuary-install")).catch(() => null)).toBeNull();
+    expect(await snapshot()).toEqual(before);
+    expect(output.mock.calls.flat().join()).toContain("nothing to remove");
+  });
+  it("unpublished intent cleanup uses only the exact suffix in the record folder", async () => {
+    const folder = join(root, "sanctuary-install");
+    await fs.mkdir(join(folder, "nested"), { recursive: true });
+    for (const path of ["record.json.tmp", "record.json.sanctuary-install-tmp.saved",
+      "nested/record.json.sanctuary-install-tmp"]) await fs.writeFile(join(folder, path), "kept");
+    await fs.writeFile(join(root, "SOUL.md.sanctuary-install-tmp"), "kept");
+    const before = await snapshot();
+    await fs.writeFile(join(folder, "record.json.sanctuary-install-tmp"), "partial intent");
+    await fs.writeFile(join(folder, "config.yaml.before.sanctuary-install-tmp"), "partial backup");
+    await uninstall();
+    expect(await snapshot()).toEqual(before);
+  });
+  it("install metadata stays owner-only across install, reinstall and interruption", async () => {
+    const original = "model: fixture\n";
+    await seed(original);
+    await fs.writeFile(join(root, "SOUL.md"), "Identity.\n");
+    await install();
+    const folder = join(root, "sanctuary-install");
+    const recordPath = join(folder, "record.json");
+    const backupPath = join(folder, "config.yaml.before");
+    const record = await fs.readFile(recordPath);
+    await uninstall();
+    await fs.mkdir(folder);
+    await fs.writeFile(recordPath, record);
+    await fs.writeFile(backupPath, original);
+    const publicFileMode = 0o644; // Owner write, public read.
+    const publicDirMode = 0o755; // Owner write, public read and traversal.
+    const permissionMask = 0o7777; // Permission and special mode bits.
+    async function ownerOnly() {
+      expect((await fs.stat(folder)).mode & permissionMask).toBe(0o700); // Owner only.
+      for (const path of [recordPath, backupPath]) {
+        expect((await fs.stat(path)).mode & permissionMask).toBe(0o600); // Owner read and write.
+      }
+    }
+    const rename = fs.rename;
+    vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+      if ([recordPath, backupPath].includes(String(args[1]))) {
+        expect((await fs.stat(String(args[0]))).mode & permissionMask).toBe(0o600);
+        expect((await fs.stat(folder)).mode & permissionMask).toBe(0o700);
+      }
+      return rename(...args);
+    });
+    for (const action of [install, install, () => interrupt("intent")]) {
+      await fs.chmod(folder, publicDirMode);
+      await fs.chmod(recordPath, publicFileMode);
+      await fs.chmod(backupPath, publicFileMode);
+      if (action !== install) await seed(original);
+      await action();
+      await ownerOnly();
+    }
+    expect(JSON.parse(await fs.readFile(recordPath, "utf8")).state).toBe("intent");
+    await uninstall();
+    await fs.mkdir(folder);
+    await fs.writeFile(backupPath, "prior backup", { mode: publicFileMode });
+    await interrupt("backup");
+    await ownerOnly();
+  });
   it.each(writeSteps)("removal restores bytes and modes after interruption at %s", async step => {
     await seed("model: fixture\n");
     await fs.chmod(join(root, "config.yaml"), 0o644);

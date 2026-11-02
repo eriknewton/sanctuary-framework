@@ -4,7 +4,7 @@ import { lstat, readFile, readdir, realpath, rmdir, chmod, mkdir, rename } from 
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FIXED_SOCKET_PATH } from "../hermes-memory-client/protocol.js";
-import { writeFileSafeUnderRoot, unlinkSafeUnderRoot } from "./config-reader.js";
+import { writeFileSafeUnderRoot, unlinkSafeUnderRoot, mkdirSafeUnderRoot } from "./config-reader.js";
 import { planHermesMemoryPosture, planHermesMemoryRevert, scanHermesPosture } from "./hermes-yaml.js";
 import { assertHermesPostureParseParity, type ParseParityOptions } from "./hermes-yaml-parse-parity.js";
 
@@ -32,7 +32,8 @@ const RECORD = "sanctuary-install/record.json";
 const BACKUP = "sanctuary-install/config.yaml.before";
 const pluginPaths = HERMES_PLUGIN_FILES.map(file => "plugins/" + file);
 const recordedPaths = [...pluginPaths, SHIM, SKILL];
-const temporaryPath = (path: string) => path + ".sanctuary-install-tmp";
+const STAGING_SUFFIX = ".sanctuary-install-tmp";
+const temporaryPath = (path: string) => path + STAGING_SUFFIX;
 // These staging paths are reserved with the intent and are removed with their recorded destinations.
 const temporaryPaths = [...recordedPaths, CONFIG, SOUL, BACKUP, RECORD].map(temporaryPath);
 
@@ -175,7 +176,38 @@ async function originalFile(path: string): Promise<OriginalFile> {
   return { bytes: bytes?.toString("base64") ?? null, mode: stat ? stat.mode & MODE_MASK : null };
 }
 
-async function writeAtomic(path: string, bytes: Buffer, mode: number): Promise<void> {
+async function clearUnpublishedStaging(root: string): Promise<void> {
+  const folder = join(root, dirname(RECORD));
+  await safePath(folder);
+  if (!(await statOptional(folder))?.isDirectory()) return;
+  for (const name of await readdir(folder)) {
+    // Only direct staging files in the record folder belong to an unpublished intent.
+    if (!name.endsWith(STAGING_SUFFIX)) continue;
+    const path = join(folder, name);
+    await safePath(path);
+    if ((await lstat(path)).isFile()) await unlinkSafeUnderRoot(path);
+  }
+  if (!(await readdir(folder)).length) await rmdir(folder);
+}
+
+async function restrictMetadata(root: string): Promise<void> {
+  for (const path of [dirname(RECORD), RECORD, BACKUP]) {
+    const destination = join(root, path);
+    await safePath(destination);
+    // Retained metadata contains originals too, even when no bytes need rewriting.
+    if (await statOptional(destination)) await chmod(destination, path === dirname(RECORD) ? DIR_MODE : FILE_MODE);
+  }
+}
+
+async function writeAtomic(root: string, relative: string, bytes: Buffer, mode: number): Promise<void> {
+  const path = join(root, relative);
+  if (relative === RECORD || relative === BACKUP) {
+    // Metadata copies stay owner-only; original modes apply only to restored Hermes files.
+    mode = FILE_MODE;
+    await mkdirSafeUnderRoot(dirname(path));
+    await safePath(dirname(path));
+    await chmod(dirname(path), DIR_MODE);
+  }
   // The shared safe writer stages complete bytes before rename publishes a file.
   const temporary = temporaryPath(path);
   await safePath(path);
@@ -201,6 +233,7 @@ export async function runHermesPosture(
   const root = await hermesPostureHome();
   for (const path of [CONFIG, SOUL, "plugins", "skills", RECORD, BACKUP, ...recordedPaths, ...temporaryPaths]) await safePath(join(root, path));
   const recordBytes = await readOptional(join(root, RECORD));
+  if (!recordBytes && !options.dryRun) await clearUnpublishedStaging(root);
   // SAFETY: stdout is the operator-facing CLI channel for this fixed removal status.
   if (options.unwrap && !recordBytes) { console.log("nothing to remove"); return; }
   const record = recordBytes ? parseRecord(recordBytes) : null;
@@ -337,8 +370,12 @@ export async function runHermesPosture(
     const stat = await statOptional(join(root, path));
     if (stat) modes.set(path, stat.mode & MODE_MASK);
   }
-  // SAFETY: stdout is the operator-facing CLI channel for these fixed installation statuses.
-  if (!changes.size) { reportPosture?.(true); console.log("already installed"); return; }
+  if (!changes.size) {
+    if (!options.dryRun) await restrictMetadata(root);
+    // SAFETY: stdout is the operator-facing CLI channel for this installation status.
+    reportPosture?.(true); console.log("already installed"); return;
+  }
+  // SAFETY: stdout is the operator-facing CLI channel for this planned installation status.
   if (options.dryRun) { reportPosture?.(false); console.log("Dry run: no files written."); return; }
   // Intent is durable before any managed file changes, including a refresh of recorded files.
   let intent: Buffer | undefined;
@@ -363,9 +400,10 @@ export async function runHermesPosture(
     if (hooks.interruptAfterStep === step) throw new InstallInterrupted(`Interrupted install after ${step}`);
   };
   try {
+    await restrictMetadata(root);
     if (intent) {
       touched.push(RECORD);
-      await writeAtomic(join(root, RECORD), intent, FILE_MODE);
+      await writeAtomic(root, RECORD, intent, FILE_MODE);
       interrupt("intent");
     }
     for (const [path, bytes] of changes) {
@@ -373,7 +411,7 @@ export async function runHermesPosture(
       if (bytes === null) await unlinkSafeUnderRoot(join(root, path));
       else {
         const mode = options.unwrap ? record?.originals?.[path]?.mode ?? modes.get(path) ?? FILE_MODE : modes.get(path) ?? FILE_MODE;
-        await writeAtomic(join(root, path), bytes, mode);
+        await writeAtomic(root, path, bytes, mode);
       }
       interrupt(path === RECORD ? "complete" : path.startsWith("plugins/") ? path : steps.get(path)!);
       const next = [...changes.keys()][[...changes.keys()].indexOf(path) + 1];
@@ -401,7 +439,7 @@ export async function runHermesPosture(
     for (const path of touched.reverse()) {
       const old = prior.get(path)!;
       if (old === null) { if (await statOptional(join(root, path))) await unlinkSafeUnderRoot(join(root, path)); }
-      else { await writeAtomic(join(root, path), old, modes.get(path) ?? FILE_MODE); }
+      else { await writeAtomic(root, path, old, modes.get(path) ?? FILE_MODE); }
     }
     for (const dir of [...createdDirs].sort((a, b) => b.length - a.length)) {
       if (await statOptional(dir)) await rmdir(dir);
