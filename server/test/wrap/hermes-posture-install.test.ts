@@ -464,6 +464,57 @@ print(json.dumps({'has_memory': 'memory' in raw, 'defaults': memory == DEFAULT_C
     await uninstall();
     expect(await snapshot()).toEqual(before);
   });
+  it.each(["install", "unwrap"])("%s preserves operator files beside unpublished intent staging", async action => {
+    await seed("model: fixture\n");
+    const folder = join(root, "sanctuary-install");
+    await fs.mkdir(folder);
+    const notes = join(folder, "notes.sanctuary-install-tmp");
+    const contents = Buffer.from("Operator notes.\n");
+    const notesMode = 0o640; // Owner read and write, group read.
+    const permissionMask = 0o7777; // Permission and special mode bits.
+    await fs.writeFile(notes, contents);
+    await fs.chmod(notes, notesMode);
+    const before = await snapshot();
+    const staging = join(folder, "record.json.sanctuary-install-tmp");
+    await fs.writeFile(staging, "partial intent");
+    if (action === "install") await install();
+    else await uninstall();
+    expect(await fs.readFile(notes)).toEqual(contents);
+    expect((await fs.stat(notes)).mode & permissionMask).toBe(notesMode);
+    expect(await fs.lstat(staging).catch(() => null)).toBeNull();
+    expect((await fs.stat(folder)).isDirectory()).toBe(true);
+    if (action === "install") {
+      expect(JSON.parse(await fs.readFile(join(folder, "record.json"), "utf8")).state).toBe("complete");
+      expect(output.mock.calls.flat().join()).toContain("Sanctuary memory installed");
+    } else {
+      expect(await snapshot()).toEqual(before);
+      expect(output.mock.calls.flat().join()).toContain("nothing to remove");
+    }
+  });
+  it("removal rollback keeps metadata and its staging copies owner-only", async () => {
+    await seed("model: fixture\n");
+    const configMode = 0o644; // Owner read and write, public read.
+    const permissionMask = 0o7777; // Permission and special mode bits.
+    await fs.chmod(join(root, "config.yaml"), configMode);
+    await interrupt("config");
+    const folder = join(root, "sanctuary-install");
+    const metadata = ["record.json", "config.yaml.before", "config.yaml.before.sanctuary-install-tmp"];
+    expect(JSON.parse(await fs.readFile(join(folder, "record.json"), "utf8")).state).toBe("intent");
+    const staging = join(folder, "config.yaml.before.sanctuary-install-tmp");
+    await fs.writeFile(staging, "partial backup");
+    await fs.chmod(staging, configMode);
+    await fs.chmod(folder, 0o755); // Owner write, public read and traversal.
+    const before = await snapshot();
+    __hermesPostureTestHook.failAfterStep = "config";
+    await expect(uninstall()).rejects.toThrow("Injected write failure after config");
+    expect(await snapshot()).toEqual(before);
+    expect((await fs.stat(folder)).mode & permissionMask).toBe(0o700); // Owner only.
+    expect((await fs.readdir(folder)).sort()).toEqual([...metadata].sort());
+    for (const path of metadata) {
+      expect((await fs.stat(join(folder, path))).mode & permissionMask).toBe(0o600); // Owner read and write.
+    }
+    expect((await fs.stat(join(root, "config.yaml"))).mode & permissionMask).toBe(configMode);
+  });
   it("install metadata stays owner-only across install, reinstall and interruption", async () => {
     const original = "model: fixture\n";
     await seed(original);

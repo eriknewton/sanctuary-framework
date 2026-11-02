@@ -34,6 +34,7 @@ const pluginPaths = HERMES_PLUGIN_FILES.map(file => "plugins/" + file);
 const recordedPaths = [...pluginPaths, SHIM, SKILL];
 const STAGING_SUFFIX = ".sanctuary-install-tmp";
 const temporaryPath = (path: string) => path + STAGING_SUFFIX;
+const metadataStagingPaths = [RECORD, BACKUP].map(temporaryPath);
 // These staging paths are reserved with the intent and are removed with their recorded destinations.
 const temporaryPaths = [...recordedPaths, CONFIG, SOUL, BACKUP, RECORD].map(temporaryPath);
 
@@ -181,8 +182,8 @@ async function clearUnpublishedStaging(root: string): Promise<void> {
   await safePath(folder);
   if (!(await statOptional(folder))?.isDirectory()) return;
   for (const name of await readdir(folder)) {
-    // Only direct staging files in the record folder belong to an unpublished intent.
-    if (!name.endsWith(STAGING_SUFFIX)) continue;
+    // Only the writer's exact metadata staging names belong to an unpublished intent.
+    if (!metadataStagingPaths.includes(join(dirname(RECORD), name))) continue;
     const path = join(folder, name);
     await safePath(path);
     if ((await lstat(path)).isFile()) await unlinkSafeUnderRoot(path);
@@ -201,7 +202,7 @@ async function restrictMetadata(root: string): Promise<void> {
 
 async function writeAtomic(root: string, relative: string, bytes: Buffer, mode: number): Promise<void> {
   const path = join(root, relative);
-  if (relative === RECORD || relative === BACKUP) {
+  if (relative === RECORD || relative === BACKUP || metadataStagingPaths.includes(relative)) {
     // Metadata copies stay owner-only; original modes apply only to restored Hermes files.
     mode = FILE_MODE;
     await mkdirSafeUnderRoot(dirname(path));
