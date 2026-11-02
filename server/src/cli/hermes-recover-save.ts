@@ -1,4 +1,4 @@
-import { lstat, unlink } from "node:fs/promises";
+import { lstat, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { consumeFlagValue } from "./argv.js";
 import { IdentityManager } from "../cognitive/tools.js";
@@ -7,6 +7,7 @@ import {
   unlockExistingMasterReadOnly,
 } from "../core/master-custody.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { canonicalHermesFortressPath } from "../hermes-memory-bridge/index.js";
 import { createSdwMemoryAdapter } from "../index.js";
 import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { AuditLog } from "../operational/audit-log.js";
@@ -21,7 +22,7 @@ import {
 } from "../sdw/memory-provenance-signing.js";
 import { CrossProcessLockError, withExclusiveMasterRotationBarrier } from "../storage/cross-process-lock.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { hasInterruptedExitImport } from "../storage/exit-import-journal.js";
+import { EXIT_IMPORT_JOURNAL_NAMESPACE, hasInterruptedExitImport } from "../storage/exit-import-journal.js";
 import { ReadOnlyStorageGuard } from "../storage/read-only-guard.js";
 
 const HELP = "Usage: sanctuary hermes recover-save --fortress <dir> [--apply] [--passphrase <value>] [--json]\nReport an unfinished save; --apply keeps a verified save or rolls back an unpublished save.\n";
@@ -65,12 +66,13 @@ export async function runHermesRecoverSave(options: {
   }
   const apply = passphrase.argv.includes("--apply");
   const json = passphrase.argv.includes("--json");
-  const storagePath = resolve(fortress.value!);
-  const storage = new FilesystemStorage(join(storagePath, "state"));
   let actionStarted = false;
   let actionFinished = false;
   let importsRecovered = false;
   try {
+    // Storage and encrypted record identity must use the same canonical path as bridge startup.
+    const storagePath = await canonicalHermesFortressPath({ home: env.HOME, fortressDir: resolve(fortress.value!), uid: process.getuid!() });
+    const storage = new FilesystemStorage(join(storagePath, "state"));
     // A missing or unsafe fortress must refuse before lock resolution can create its namespace.
     const meta = await lstat(storage.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE));
     if (!meta.isDirectory() || meta.isSymbolicLink()) throw new Error(UNCLASSIFIED);
@@ -91,7 +93,14 @@ export async function runHermesRecoverSave(options: {
           const auditLog = new AuditLog(storage, masterKey);
           if (apply) {
             // Classification and deletion must see the recovered fortress, never a half-applied import.
-            try { importsRecovered = (await recoverInterruptedExitImportsOrThrow(storage, auditLog)).recovered > 0; }
+            try {
+              // No journal directory means no import or admission lock; exclusive custody prevents new imports while we skip it.
+              const journalExists = await stat(storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE)).then(() => true, cause => {
+                if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+                throw cause;
+              });
+              if (journalExists) importsRecovered = (await recoverInterruptedExitImportsOrThrow(storage, auditLog)).recovered > 0;
+            }
             catch {
               err.write("Interrupted exit-import recovery did not finish; save recovery was not attempted.\n");
               return 1;
@@ -137,7 +146,8 @@ export async function runHermesRecoverSave(options: {
           // The exclusive barrier proves no bridge can own this crash residue or enter before cleanup finishes.
           if (corpusLock !== null) await unlink(lockPath);
           // The intent is the restart refusal marker and must survive every incomplete rollback.
-          if (await storage.delete(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY, true)) removed++;
+          // A secure overwrite cut before unlink can strand the fortress with an undecryptable intent; encryption provides its confidentiality.
+          if (await storage.delete(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY, false)) removed++;
           actionFinished = true;
           await auditLog.appendCritical({ layer: "l3", operation: "hermes_save_recovered",
             identity_id: "operator", result: "success", details: { outcome, records_removed: removed } });

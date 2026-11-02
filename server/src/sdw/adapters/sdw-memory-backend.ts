@@ -631,7 +631,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   private async deleteInsertIntent(): Promise<void> {
     try {
-      await this.storage.delete(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY, true);
+      // A secure overwrite cut before unlink can strand the fortress with an undecryptable intent; encryption provides its confidentiality.
+      await this.storage.delete(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY, false);
     } catch (cause) {
       const error = new SdwValidationError("partial_scope", "Hermes save completion requires operator recovery", { cause });
       this.latchHermesBridgeOnPartialScope(error);

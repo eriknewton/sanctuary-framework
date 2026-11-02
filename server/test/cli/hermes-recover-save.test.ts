@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, readFile, realpath, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
@@ -19,7 +19,7 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { ReadOnlyStorageGuard } from "../../src/storage/read-only-guard.js";
 import { SdwWorkingStateStore } from "../../src/sdw/working-state-store.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
-import { HERMES_INSERT_INTENT_KEY, HERMES_INSERT_INTENT_NAMESPACE, DEFAULT_MAX_CHUNK_CHARS } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { HERMES_INSERT_INTENT_KEY, HERMES_INSERT_INTENT_NAMESPACE, DEFAULT_MAX_CHUNK_CHARS, readHermesSaveIntent } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../../src/storage/exit-import-journal.js";
 
@@ -33,7 +33,7 @@ const source = (path: string) => new URL(path, import.meta.url).href;
 const cli = source("../../src/cli.ts");
 const filesystem = source("../../src/storage/filesystem.ts");
 const keychain = source("../setup/keychain-memory-store.ts");
-type Fault = "S1" | "S2" | "S3";
+type Fault = "S1" | "S2" | "S3" | "S3-unlink";
 
 // Each child installs the injected credential store before importing the real dispatcher.
 const preamble = `const { installInMemoryKeychainStore } = await import(${JSON.stringify(keychain)}); installInMemoryKeychainStore();`;
@@ -47,9 +47,12 @@ afterEach(async () => {
   if (failures.length) throw new AggregateError(failures, "Recovery fixture cleanup failed");
 });
 
-async function fixture() {
-  const home = await mkdtemp(join(tmpdir(), "hermes-recover-"));
-  cleanups.push(() => rm(home, { recursive: true, force: true }));
+async function fixture(aliasedParent = false) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "hermes-recover-")));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "home"), { mode: 0o700 });
+  if (aliasedParent) await symlink(root, join(root, "alias"), "dir");
+  const home = join(root, ...(aliasedParent ? ["alias"] : []), "home");
   const fortressId = "fortress-recovery";
   const fortress = join(home, "Library", "Application Support", "Sanctuary", "Fortresses", fortressId);
   let dir = home;
@@ -92,6 +95,7 @@ function observe(child: ChildProcess) {
 function bridge(f: Fixture, fault?: Fault) {
   const script = `${preamble}
     const { FilesystemStorage } = await import(${JSON.stringify(filesystem)});
+    const { chmod } = await import("node:fs/promises");
     const write = FilesystemStorage.prototype.write;
     const del = FilesystemStorage.prototype.delete;
     let chunks = 0;
@@ -105,6 +109,9 @@ function bridge(f: Fixture, fault?: Fault) {
     FilesystemStorage.prototype.delete = async function(ns,key,secure) {
       if (fault === 'S1' && ns === ${JSON.stringify(SDW_DOCUMENT_CORPUS_NAMESPACE)}) throw new Error('rollback refused');
       if (fault === 'S3' && ns === ${JSON.stringify(HERMES_INSERT_INTENT_NAMESPACE)} && key === ${JSON.stringify(HERMES_INSERT_INTENT_KEY)}) throw new Error('intent delete refused');
+      if (fault === 'S3-unlink' && ns === ${JSON.stringify(HERMES_INSERT_INTENT_NAMESPACE)} && key === ${JSON.stringify(HERMES_INSERT_INTENT_KEY)}) {
+        await chmod(${JSON.stringify(join(f.fortress, "state", HERMES_INSERT_INTENT_NAMESPACE))}, 0o555); // Read and search remain allowed; unlink must fail.
+      }
       return del.call(this,ns,key,secure);
     };
     process.env = ${JSON.stringify(f.env)};
@@ -185,7 +192,7 @@ async function direct(f: Fixture, apply = true) {
   let out = "";
   let err = "";
   const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress, ...(apply ? ["--apply"] : [])],
-    env: { SANCTUARY_PASSPHRASE: PASS }, stdout: { write: value => { out += String(value); return true; } }, stderr: { write: value => { err += String(value); return true; } } });
+    env: { HOME: f.home, SANCTUARY_PASSPHRASE: PASS }, stdout: { write: value => { out += String(value); return true; } }, stderr: { write: value => { err += String(value); return true; } } });
   return { code, out, err };
 }
 
@@ -194,7 +201,10 @@ async function hashes(root: string): Promise<Record<string, string>> {
   async function visit(dir: string, prefix: string) {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       const name = prefix + entry.name;
-      if (entry.isDirectory()) await visit(join(dir, entry.name), name + "/");
+      if (entry.isDirectory()) {
+        result[name + "/"] = "directory";
+        await visit(join(dir, entry.name), name + "/");
+      }
       else if (entry.isFile()) result[name] = createHash("sha256").update(await readFile(join(dir, entry.name))).digest("hex");
     }
   }
@@ -214,6 +224,14 @@ async function audit(f: Fixture) {
   finally { master.fill(0); }
 }
 
+async function readIntent(f: Fixture) {
+  const storage = new ReadOnlyStorageGuard(f.storage);
+  const masterKey = await unlockExistingMasterReadOnly(storage, { passphrase: PASS });
+  try {
+    return await readHermesSaveIntent({ storage, masterKey, fortressId: fortressIdFromStoragePath(await realpath(f.fortress)) });
+  } finally { masterKey.fill(0); }
+}
+
 async function refusedStartup(f: Fixture) {
   const b = bridge(f);
   expect(await b.exit).toBe(EXIT_STARTUP_REFUSED);
@@ -221,6 +239,80 @@ async function refusedStartup(f: Fixture) {
 }
 
 describe("Hermes save operator recovery", () => {
+  it("command unlink failure preserves a decryptable intent and retry restores readiness", async () => {
+    const f = await fixture();
+    await save(f, "target", SAVE_TEXT, "S1");
+    const beforeIntent = await readIntent(f);
+    expect(beforeIntent).not.toBeNull();
+    const intentDir = join(f.fortress, "state", HERMES_INSERT_INTENT_NAMESPACE);
+    try {
+      await chmod(intentDir, 0o555); // Read and search remain allowed; unlink must fail.
+      const result = await command(f, true);
+      expect(result.code).not.toBe(0);
+      expect(result.err).toBe("Recovery did not finish; retry --apply if the intent is still readable.\n");
+      expect(await readIntent(f)).toEqual(beforeIntent);
+      await refusedStartup(f);
+    } finally { await chmod(intentDir, 0o700); }
+    expect(await command(f, true)).toMatchObject({ code: 0, out: expect.stringContaining("rolled_back") });
+    const b = bridge(f);
+    expect(await b.next()).toEqual({ type: "ready" });
+    await b.stop();
+  });
+
+  it("bridge unlink failure preserves a decryptable completed intent and recovery keeps the save", async () => {
+    const f = await fixture();
+    const intentDir = join(f.fortress, "state", HERMES_INSERT_INTENT_NAMESPACE);
+    try {
+      await save(f, "target", SAVE_TEXT, "S3-unlink");
+      expect(await readIntent(f)).toMatchObject({ documentId: "mem.agent-recovery.target" });
+      await refusedStartup(f);
+      const before = await hashes(f.fortress);
+      expect(await command(f)).toMatchObject({ code: 0, out: expect.stringContaining("completed; --apply would keep") });
+      expect(await hashes(f.fortress)).toEqual(before);
+    } finally { await chmod(intentDir, 0o700); }
+    const beforeCorpus = await corpusBytes(f);
+    expect(await command(f, true)).toMatchObject({ code: 0, out: expect.stringContaining("completed; kept") });
+    expect(await corpusBytes(f)).toEqual(beforeCorpus);
+    const b = bridge(f);
+    expect(await b.next()).toEqual({ type: "ready" });
+    expect(JSON.stringify(await b.call("memory_get", { passage_id: "target" }))).toContain(SAVE_TEXT);
+    await b.stop();
+  });
+
+  it("real startup prints the fixed unfinished-save recovery sentence on its own line", async () => {
+    const f = await fixture();
+    await save(f, "target", SAVE_TEXT, "S1");
+    const b = bridge(f);
+    expect(await b.exit).toBe(EXIT_STARTUP_REFUSED);
+    expect(b.stderr().split("\n")).toContain("An earlier save did not finish; run `sanctuary hermes recover-save --fortress <dir>` to recover it.");
+  });
+
+  it("canonical fortress path reads a bridge intent through an accepted parent alias", async () => {
+    const f = await fixture(true);
+    expect(await realpath(f.fortress)).not.toBe(f.fortress);
+    await save(f, "target", SAVE_TEXT, "S3");
+    const before = await hashes(f.fortress);
+    expect(await command(f)).toMatchObject({ code: 0, out: expect.stringContaining("completed; --apply would keep") });
+    expect(await hashes(f.fortress)).toEqual(before);
+    expect(await command(f, true)).toMatchObject({ code: 0, out: expect.stringContaining("completed; kept") });
+    const b = bridge(f);
+    expect(await b.next()).toEqual({ type: "ready" });
+    await b.stop();
+  });
+
+  it("nothing to recover creates no files or directories in either mode", async () => {
+    const f = await fixture();
+    const b = bridge(f);
+    expect(await b.next()).toEqual({ type: "ready" });
+    await b.stop();
+    const before = await hashes(f.fortress);
+    expect(before[`state/${EXIT_IMPORT_JOURNAL_NAMESPACE}/`]).toBeUndefined();
+    for (const apply of [false, true]) {
+      expect(await command(f, apply)).toMatchObject({ code: 0, out: "nothing to recover\n" });
+      expect(await hashes(f.fortress)).toEqual(before);
+    }
+  });
+
   it.each(["S1", "S2", "S3"] as const)("%s real save: report is unchanged, dispatcher apply restores readiness and recall", async state => {
     const f = await fixture();
     await save(f, "other", "An unrelated blue garden memory.");
@@ -374,7 +466,7 @@ describe("Hermes save operator recovery", () => {
     const custody = await establishMaster({ storage: f.storage, passphrase: PASS });
     try {
       if (["invalid-intent", "duplicate-chunk", "too-many-chunks"].includes(damage)) {
-        const store = new SdwWorkingStateStore({ storage: f.storage, masterKey: custody.masterKey, fortressId: fortressIdFromStoragePath(f.fortress) });
+        const store = new SdwWorkingStateStore({ storage: f.storage, masterKey: custody.masterKey, fortressId: fortressIdFromStoragePath(await realpath(f.fortress)) });
         const record = await store.get("tool", "hermes-insert-intent");
         if (record?.state.kind !== "task_checkpoint") throw new Error("missing checkpoint");
         const nextSteps = damage === "invalid-intent" ? ["doc.mem.agent-recovery.other"]
