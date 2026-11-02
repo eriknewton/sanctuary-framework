@@ -2850,6 +2850,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this._producerKeyObservation = load.status;
   }
 
+  /** Give protection consumers the posture reader's current broker key and its load observation. */
+  async resolveBrokerProducerKey(): Promise<{ keyB64url: string | null; observation: ProducerKeyObservation }> {
+    await this.ensureBrokerProducerKeyLoaded();
+    // Must match resolveBrokerPinnedProducerKey and brokerProducerKeyObservation in dispatchPosture.
+    return {
+      keyB64url: this._brokerProducerKeyLoad?.status === "present" ? this._brokerProducerKeyLoad.keyB64url : null,
+      observation: this._brokerProducerKeyObservation,
+    };
+  }
+
   private async ensureBrokerProducerKeyLoaded(): Promise<void> {
     if (this._brokerProducerKeyLoad?.status === "present") return;
     const storagePath = this._sanctuaryConfig?.storage_path;

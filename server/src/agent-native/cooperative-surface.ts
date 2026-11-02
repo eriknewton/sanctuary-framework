@@ -7,6 +7,12 @@ import {
 import type { IdentityManager } from "../cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
+import type { StateStore } from "../cognitive/state-store.js";
+import type { ResponseScreen } from "../proxy/response-screen.js";
+import { buildFeatureHealthPanel, SLICE1_FEATURE_REGISTRY } from "../principal-policy/feature-health.js";
+import type { ProducerKeyObservation } from "../principal-policy/panel-producer.js";
+import { buildCustodyExitPanel } from "../principal-policy/posture.js";
+import { composeProtectionLayers, summarizeProtectionLayers } from "./protection-layers.js";
 import {
   COOPERATIVE_CAPABILITIES,
   EVALUATE_NOUNS,
@@ -75,6 +81,12 @@ export interface CooperativeSurfaceOptions {
   currentSessionBinding: () => SessionBinding | undefined;
   primitiveTools: ToolDefinition[];
   storage?: StorageBackend;
+  /** The constructed encrypted state consumer, when supplied by the server boot path. */
+  stateStore?: StateStore;
+  /** Existing screening readiness observation; separate from inbound protection. */
+  responseScreen?: Pick<ResponseScreen, "assertReady">;
+  /** Resolve the dashboard's broker key per request; an unavailable source reports unknown. */
+  resolveBrokerProducerKey?: () => Promise<{ keyB64url: string | null; observation: ProducerKeyObservation }>;
   approvalProofStore?: ApprovalProofStore;
 }
 
@@ -948,13 +960,46 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.activeProtections,
-      description: "List the security guarantees currently in force for this session (e.g. state-encrypted-at-rest, approval-gate-mediated, append-only audit for critical ops, opaque memory handles). Use to tell a counterparty or yourself what protections apply. Read-only; returns guarantee flags plus an audit_ref. Reports only what IS active: absence of a flag is not a claim.",
+      description: "List every layer of Sanctuary with its evidence-based status, including layers that are off, not built, or unknown. Use to ask what is protecting this session right now. Read-only; returns { guarantees, layers, summary, audit_ref }. The guarantees field preserves legacy flags; layers and the one-line-per-layer summary report observed status.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         try {
-          active();
+          const identity = active();
           const auditRef = await audit("sanctuary_active_protections");
+          let toolOutputScreenReady: boolean | undefined;
+          if (options.responseScreen) {
+            try { options.responseScreen.assertReady(); toolOutputScreenReady = true; }
+            catch { toolOutputScreenReady = false; }
+          }
+          // Must match the dashboard accessor: this key pins broker heartbeat signatures, not agent identity.
+          const brokerKey = await Promise.resolve().then(() => options.resolveBrokerProducerKey?.()).catch(() => null);
+          // Must match withDerivedKeyRestriction in posture-routes.ts: only observed presence or absence is conclusive.
+          const brokerKeyUnavailable = brokerKey?.observation !== "present" && brokerKey?.observation !== "absent";
+          // Must match custodyObservation in protection-layers.ts: age starts before the audit read.
+          const custodyObservation = { state: "fresh" as const, completed_at: new Date(Date.now()).toISOString() };
+          const [health, custody, chain] = await Promise.allSettled([
+            buildFeatureHealthPanel({
+              auditLog: options.auditLog,
+              originMachine: "local",
+              // Include daemon observations so a reported stop overrides recent token activity on both surfaces.
+              registry: SLICE1_FEATURE_REGISTRY.filter(feature => feature.liveness === "event_driven" || feature.id === "secret_broker_daemon"),
+              protectionClaimSubject: null,
+              brokerPinnedProducerKeyB64url: brokerKey?.keyB64url ?? null,
+              brokerProducerKeyExpectedButUnavailable: brokerKeyUnavailable,
+            }),
+            buildCustodyExitPanel({ auditLog: options.auditLog, originMachine: "local" }),
+            options.auditLog.getAuditChainVerdict(),
+          ]);
+          const layers = composeProtectionLayers({
+            custodyObservation,
+            ...(toolOutputScreenReady === undefined ? {} : { toolOutputScreenReady }),
+            identityLoaded: options.identityManager.get(identity.identity_id) !== undefined,
+            ...(options.stateStore ? { encryptedStateStoreConstructed: true } : {}),
+            ...(health.status === "fulfilled" ? { featureHealth: health.value } : {}),
+            ...(custody.status === "fulfilled" ? { custodyExit: custody.value } : {}),
+            ...(chain.status === "fulfilled" ? { auditChain: chain.value.status } : {}),
+          });
           return toolResult({
             guarantees: [
               "state_encrypted_at_rest",
@@ -962,6 +1007,8 @@ export function createAgentNativeCooperativeTools(
               "append_only_audit_for_critical_operations",
               "opaque_memory_namespace_handles",
             ],
+            layers,
+            summary: summarizeProtectionLayers(layers),
             audit_ref: auditRef,
           });
         } catch {
