@@ -1,3 +1,4 @@
+// fail-before-exempt: isolate custody locks in a short per-test temporary root and remove it after fixture teardown; assertions are unchanged.
 // After one install command, a fresh Hermes process saves the board-meeting memory
 // and another recalls it through Sanctuary, without an MCP entry or a human step.
 // Uninstall restores the original bytes and retains the Sanctuary passage.
@@ -8,11 +9,15 @@ import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __hermesParityTestHook, __hermesPostureTestHook, parseWrapArgs, runWrap } from "../../src/wrap/cli.js";
 import { HERMES_PLUGIN_FILES, HERMES_SOUL_BLOCK } from "../../src/wrap/hermes-posture.js";
 import { startFixture } from "./harness/fixture.js";
 
+// Darwin root /private/tmp/hplock-XXXXXX is 26 bytes; 26 + 1 + 47 = 74 <= 100
+// (separator plus a 40-character custody digest and the longest suffix, .reaper).
+const SHORT_SOCKET_TMP_PARENT = process.platform === "darwin" ? "/private/tmp" : tmpdir();
+let custodyRoot: string;
 const before = `# My Hermes settings
 model:
   default: offline-fixture
@@ -58,12 +63,17 @@ async function snapshot(root: string): Promise<Record<string, string>> {
 }
 
 describe.skipIf(!process.env.SANCTUARY_HERMES_PYTHON)("Hermes installer acceptance", () => {
-  afterEach(() => {
+  beforeEach(async () => {
+    custodyRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "hplock-"));
+    vi.stubEnv("SANCTUARY_CUSTODY_LOCK_ROOT", custodyRoot);
+  });
+  afterEach(async () => {
     __hermesParityTestHook.parity = undefined;
     delete __hermesPostureTestHook.relaySocketPath;
     delete __hermesPostureTestHook.shimCommand;
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    if (custodyRoot) await rm(custodyRoot, { recursive: true, force: true });
   });
   it("installs once, saves and recalls in fresh processes, then restores bytes and retains the passage", async () => {
     const fixture = await startFixture();
@@ -154,8 +164,8 @@ describe.skipIf(!process.env.SANCTUARY_HERMES_PYTHON)("Hermes installer acceptan
       expect(changed).not.toContain("old-sanctuary");
       expect(output.mock.calls.flat().join("\n")).toContain(join(root, "sanctuary-install/config.yaml.before"));
     } finally {
-      await fixture.close();
-      await rm(home, { recursive: true, force: true });
+      try { await fixture.close(); }
+      finally { await rm(home, { recursive: true, force: true }); }
     }
   }, 240_000); // Four minutes covers both versions and fresh process teardown.
 });

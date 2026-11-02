@@ -12,6 +12,10 @@ import { assertHermesPostureParseParity } from "../../src/wrap/hermes-yaml-parse
 import { scanHermesPosture } from "../../src/wrap/hermes-yaml.js";
 import { HERMES_PLUGIN_FILES } from "../../src/wrap/hermes-posture.js";
 vi.mock("node:fs/promises", async original => ({ ...await original<typeof import("node:fs/promises")>() }));
+// Darwin root /private/tmp/hplock-XXXXXX is 26 bytes; 26 + 1 + 47 = 74 <= 100
+// (separator plus a 40-character custody digest and the longest suffix, .reaper).
+const SHORT_SOCKET_TMP_PARENT = process.platform === "darwin" ? "/private/tmp" : tmpdir();
+let custodyRoot: string;
 const python = process.env.SANCTUARY_HERMES_PYTHON;
 const fresh = "memory:\n  provider: sanctuary_memory\n  memory_enabled: false\n  user_profile_enabled: false\nplugins:\n  enabled: [sanctuary]\n";
 let home: string;
@@ -34,10 +38,10 @@ async function snapshot(): Promise<Record<string, string>> {
     }
   }
   await walk(home);
-  // Run-lock scaffolds use 32 hex characters (128 digest bits); preserve every other path in HOME.
+  // Must match hermesPostureLockPaths in server/src/wrap/hermes-posture.ts; preserve every other path in HOME.
   for (const path of Object.keys(result)) {
-    if (["/.sanctuary", "/.sanctuary/locks", "/.sanctuary/locks/hermes-posture"].includes(path) ||
-        /^\/\.sanctuary\/locks\/hermes-posture\/[a-f0-9]{32}\.lock$/.test(path)) delete result[path];
+    if (["/.sanctuary", "/.sanctuary/locks", "/.sanctuary/locks/hermes-posture",
+      "/.sanctuary/locks/hermes-posture/hermes-posture.lock"].includes(path)) delete result[path];
   }
   return result;
 }
@@ -51,6 +55,8 @@ beforeEach(async () => {
   home = await fs.mkdtemp(join(tmpdir(), "hpost-"));
   root = join(home, "hermes");
   await fs.mkdir(root);
+  custodyRoot = await fs.mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "hplock-"));
+  vi.stubEnv("SANCTUARY_CUSTODY_LOCK_ROOT", custodyRoot);
   vi.stubEnv("HOME", home);
   vi.stubEnv("HERMES_HOME", root);
   output = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -72,11 +78,19 @@ afterEach(async () => {
   __hermesParityTestHook.parity = undefined;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  await new Promise<void>(done => relay.close(() => done()));
-  await fs.rm(home, { recursive: true, force: true });
+  try { await new Promise<void>(done => relay.close(() => done())); }
+  finally {
+    try { await fs.rm(home, { recursive: true, force: true }); }
+    finally { if (custodyRoot) await fs.rm(custodyRoot, { recursive: true, force: true }); }
+  }
 });
 
 describe("Hermes installer controlled-parser paths", () => {
+  it("removal uses the fixed account scaffold", async () => {
+    await uninstall();
+    // Must match hermesPostureLockPaths in server/src/wrap/hermes-posture.ts.
+    expect(await fs.readdir(join(home, ".sanctuary/locks/hermes-posture"))).toEqual(["hermes-posture.lock"]);
+  });
   it("uninstall without record", async () => {
     const before = await snapshot();
     await uninstall();

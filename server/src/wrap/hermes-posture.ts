@@ -24,13 +24,13 @@ export const HERMES_SOUL_BLOCK = `<!-- sanctuary memory begin -->\n${INSTRUCTION
 const MODE_MASK = 0o7777; // Permission and special mode bits, without the file type.
 const FILE_MODE = 0o600; // Owner read and write only.
 const DIR_MODE = 0o700; // Owner traversal, read and write only.
-// 32 hex characters retain 128 bits of the SHA-256 home-path digest.
-const LOCK_DIGEST_HEX_CHARS = 32;
 /** Two seconds bounds operator waiting without expiring or stealing a live holder's lock. */
 export const HERMES_POSTURE_LOCK_TIMEOUT_MS = 2_000;
 // Must match BUSY and UNAVAILABLE in server/test/wrap/hermes-posture-run-lock.test.ts.
-const LOCK_BUSY = "Another Hermes memory install or removal is running for this Hermes home; wait for it to finish, then run the command again.";
+const LOCK_BUSY = "Another Hermes memory install or removal is running for this account; wait for it to finish, then run the command again.";
 const LOCK_UNAVAILABLE = "Hermes memory changes need a private lock directory under ~/.sanctuary/locks; fix its owner and permissions, then run the command again.";
+// Must match RELEASE_WARNING in server/test/wrap/hermes-posture-run-lock.test.ts.
+const LOCK_RELEASE_WARNING = "The change finished, but its lock could not be released cleanly; the next run may report it as busy for a moment.";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const CONFIG = "config.yaml";
 const SOUL = "SOUL.md";
@@ -98,11 +98,12 @@ export async function hermesPostureHome(): Promise<string> {
   return resolve(root);
 }
 
-/** Locate the external run lock for a resolved home returned by hermesPostureHome(). */
-export function hermesPostureLockPaths(root: string): { lockDir: string; lockFileName: string } {
+/** Locate the account lock shared by every Hermes home returned by hermesPostureHome(). */
+export function hermesPostureLockPaths(_root: string): { lockDir: string; lockFileName: string } {
+  // Must match the scaffold layout in server/test/wrap/hermes-posture-{install,run-lock}.test.ts.
   return {
     lockDir: join(resolve(process.env.HOME!), ".sanctuary", "locks", "hermes-posture"),
-    lockFileName: hash(root).slice(0, LOCK_DIGEST_HEX_CHARS) + ".lock",
+    lockFileName: "hermes-posture.lock",
   };
 }
 
@@ -117,7 +118,7 @@ async function prepareLockDirectory(lockDir: string): Promise<void> {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     await safePath(path, home);
     const stat = await lstat(path);
-    // Shared or foreign ancestors could substitute the per-home lock directory.
+    // Shared or foreign ancestors could substitute the account lock directory.
     if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & MODE_MASK) !== DIR_MODE) {
       throw new CrossProcessLockError(LOCK_UNAVAILABLE, "capability");
     }
@@ -268,21 +269,32 @@ export async function runHermesPosture(
   const root = await hermesPostureHome();
   if (options.dryRun) return planAndApplyHermesPosture(root, options, hooks, parity);
   const { lockDir, lockFileName } = hermesPostureLockPaths(root);
-  let entered = false;
+  let completed = false;
+  let operationFailure: { error: unknown } | undefined;
   try {
     // The persistent scaffold must stay outside Hermes even when an explicit home overlaps Sanctuary's directories.
     if (lockDir === root || lockDir.startsWith(root + sep)) throw new CrossProcessLockError(LOCK_UNAVAILABLE, "capability");
     await prepareLockDirectory(lockDir);
-    // The plan and every write share one per-home lock so runs cannot act on each other's partial state, and process ownership releases it when a run is killed.
+    // The lock directory's device and inode plus the fixed name serialize every Hermes home of this account, so runs cannot act on partial state and process ownership releases a killed run; genuinely different HOME directories are not serialized against each other.
     await withPathLock(lockDir, lockFileName, async () => {
-      entered = true;
-      await planAndApplyHermesPosture(root, options, hooks, parity);
+      try {
+        await planAndApplyHermesPosture(root, options, hooks, parity);
+        completed = true;
+      } catch (error) {
+        operationFailure = { error };
+        throw error;
+      }
     }, { kernelBacked: true, timeoutMs: HERMES_POSTURE_LOCK_TIMEOUT_MS });
   } catch (error) {
-    if (error instanceof CrossProcessLockError || !entered) {
-      throw new Error(error instanceof CrossProcessLockError && error.kind === "contention" ? LOCK_BUSY : LOCK_UNAVAILABLE);
+    // Completion is recorded only after all work returns, so a later lock failure cannot undo or misreport the change.
+    if (completed) {
+      // SAFETY: stdout is the existing operator-facing channel; this warning contains no lock diagnostics.
+      console.log(LOCK_RELEASE_WARNING);
+      return;
     }
-    throw error;
+    // Preserve the operation's own refusal even when lock cleanup wraps it in an AggregateError.
+    if (operationFailure) throw operationFailure.error;
+    throw new Error(error instanceof CrossProcessLockError && error.kind === "contention" ? LOCK_BUSY : LOCK_UNAVAILABLE);
   }
 }
 
@@ -300,6 +312,7 @@ async function planAndApplyHermesPosture(
   const record = recordBytes ? parseRecord(recordBytes) : null;
   // An intent is sufficient for removal; a new install needs that removal to finish first.
   if (record?.state === "intent" && !options.unwrap) {
+    // Must match INCOMPLETE in server/test/wrap/hermes-posture-run-lock.test.ts.
     throw new Error("Hermes installation is incomplete; unwrap it before installing again.");
   }
   const stagedPaths: string[] = [];
