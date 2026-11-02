@@ -32,7 +32,11 @@ async function run() {
   }
   await step("after_identity_write");
   await step("before_settle");
-  successful(await instance.settle(attemptId!, classification(attemptId!)));
+  // Exercise completion evidence through a real process and the durable settlement consumer.
+  successful(await instance.settle(attemptId!, classification(attemptId!, {
+    exit: { code: 0 }, stopIntent: { kind: "operator", attemptId: attemptId! },
+    completion: { attemptId: attemptId!, cleanup: "failed" },
+  })));
   await step("after_settle");
 }
 try { await run(); process.disconnect?.(); }

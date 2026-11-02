@@ -1,4 +1,3 @@
-// fail-before-exempt: new module full-supervision ledger and classifier, no base symbol to fail against
 import * as fs from "node:fs/promises";
 import * as syncFs from "node:fs";
 import { tmpdir } from "node:os";
@@ -98,7 +97,7 @@ it("bounds retention and per-call reads across adversarial spaced failures", asy
   const iterations = 50; // Ten complete K=5 waves.
   const windowMs = FULL_SUPERVISION_WINDOW_SECONDS * 1000;
   for (let index = 0; index < iterations; index++) {
-    const instance = ledger(root, { wallClock: () => TEST_WALL + index * (windowMs + 1) });
+    const instance = ledger(root, { wallClock: () => TEST_WALL + index * (windowMs + 1), monotonicClock: () => TEST_MONOTONIC + index * (windowMs + 1) });
     successful(await instance.admit(`spaced-${index}`));
     const state = successful(await instance.settle(`spaced-${index}`, classification(`spaced-${index}`)));
     expect(state.charges).toHaveLength(1);
@@ -115,10 +114,14 @@ it("bounds retention and per-call reads across adversarial spaced failures", asy
     handle.read = (async (...readArgs: any[]) => { maxRead = Math.max(maxRead, readArgs[0].length); reads++; return (read as any)(...readArgs); }) as typeof handle.read;
     return handle;
   } };
-  const instance = ledger(root, { fs: facade, wallClock: () => TEST_WALL + iterations * (windowMs + 1) });
+  const instance = ledger(root, { fs: facade, wallClock: () => TEST_WALL + iterations * (windowMs + 1), monotonicClock: () => TEST_MONOTONIC + iterations * (windowMs + 1) });
   successful(await instance.status());
   expect(maxRead).toBe(instance.readCapBytes + 1);
   expect(reads).toBeLessThanOrEqual(4); // Two bounded files, one data read and one EOF read each.
+  const stepped = await fs.mkdtemp(join(root, "forward-step-"));
+  await charge(stepped, "before-step");
+  const retained = await charge(stepped, "after-step", { wallClock: () => TEST_WALL + windowMs + 1 });
+  expect(retained.charges).toHaveLength(2);
 });
 
 it("has an inclusive window boundary and an injectable throttle", async () => {
@@ -249,4 +252,149 @@ it("serializes competing admissions without retaining a queue", async () => {
   const results = await Promise.all(instances.map((instance, index) => instance.admit(`racer-${index}`)));
   expect(results.filter((result) => result.ok && result.admitted)).toHaveLength(1);
   expect(results.filter((result) => !result.ok)).toHaveLength(instances.length - 1);
+});
+
+it.each(["write", "sync", "rename"] as const)("cleans its own temp after one ENOSPC at %s and retries settlement", async (stage) => {
+  const instance = ledger(root);
+  successful(await instance.admit("first"));
+  let fail = true;
+  const enospc = () => { fail = false; throw Object.assign(new Error("fixture disk full"), { code: "ENOSPC" }); };
+  const facade: FullSupervisionFs = { ...fs,
+    open: async (...args: Parameters<typeof fs.open>) => {
+      const handle = await fs.open(...args);
+      if (String(args[0]).endsWith("ledger.json.next")) {
+        const write = handle.writeFile.bind(handle); const sync = handle.sync.bind(handle);
+        handle.writeFile = async (...values) => { if (stage === "write" && fail) enospc(); return write(...values); };
+        handle.sync = async () => { if (stage === "sync" && fail) enospc(); return sync(); };
+      }
+      return handle;
+    },
+    rename: async (from, to) => { if (stage === "rename" && fail) enospc(); return fs.rename(from, to); },
+  };
+  expect(await ledger(root, { fs: facade }).settle("first", classification("first"))).toEqual(refusal("corrupt_state"));
+  expect(await fs.readdir(root)).not.toContain("ledger.json.next");
+  expect(successful(await instance.settle("first", classification("first"))).charges).toHaveLength(1);
+  // A replacement after open is not ours to delete, even on an IO failure.
+  successful(await instance.admit("second"));
+  const replacement: FullSupervisionFs = { ...fs, rename: async (from) => {
+    await fs.rename(from, join(root, "owned-temp"));
+    await fs.writeFile(from, "replacement");
+    throw new Error("fixture replacement");
+  } };
+  expect((await ledger(root, { fs: replacement }).settle("second", classification("second"))).ok).toBe(false);
+  expect(await fs.readFile(join(root, "ledger.json.next"), "utf8")).toBe("replacement");
+});
+
+it("refuses a stale temp with its own typed reason and preserves it", async () => {
+  const instance = ledger(root);
+  successful(await instance.admit("first"));
+  await fs.writeFile(join(root, "ledger.json.next"), "stale");
+  expect(await instance.settle("first", classification("first"))).toEqual(refusal("stale_temp"));
+  expect(await fs.readFile(join(root, "ledger.json.next"), "utf8")).toBe("stale");
+  expect(successful(await instance.status()).state).toBe("state_PENDING_UNIDENTIFIED");
+});
+
+it("a W+1 forward wall step retains same-boot charges until K", async () => {
+  const budget = 5;
+  for (let index = 0; index < budget - 1; index++) await charge(root, `before-${index}`);
+  const stepped = ledger(root, { wallClock: () => TEST_WALL + FULL_SUPERVISION_WINDOW_SECONDS * 1000 + 1 });
+  successful(await stepped.admit("after"));
+  const state = successful(await stepped.settle("after", classification("after")));
+  expect(state.charges).toHaveLength(budget);
+  expect(state.state).toBe("state_LATCHED");
+  expect(await stepped.admit("sixth")).toEqual(refusal("latched"));
+});
+
+it("refuses a malformed runtime classification cast through never without clearing pending", async () => {
+  const instance = ledger(root);
+  successful(await instance.admit("first"));
+  expect(await instance.settle("first", { kind: "bogus", decidedBy: { attemptId: "first" } } as never)).toEqual(refusal("invalid_attempt"));
+  expect(successful(await instance.status()).state).toBe("state_PENDING_UNIDENTIFIED");
+  expect(successful(await instance.settle("first", classification("first"))).charges).toHaveLength(1);
+});
+
+it.each(["admit", "recordIdentity", "settle", "duplicate-settle", "status", "resetLatch"] as const)(
+  "%s refuses repeated late-timer continuations after the monotonic deadline", async (operation) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const waves = 3; // Repeat the ordering rather than checking a single lucky continuation.
+    for (let wave = 0; wave < waves; wave++) {
+      const directory = await fs.mkdtemp(join(root, "late-timer-"));
+      const setup = ledger(directory);
+      if (operation !== "admit") successful(await setup.admit("first"));
+      if (operation === "resetLatch" || operation === "duplicate-settle") successful(await setup.settle("first", classification("first")));
+      let monotonic = TEST_MONOTONIC;
+      let unlocked = false;
+      const deadline = 1; // One injected millisecond; timer delivery is deliberately withheld.
+      const facade: FullSupervisionFs = { ...fs,
+        unlink: async (path) => { await fs.unlink(path); if (String(path).endsWith("writer.lock")) unlocked = true; },
+        open: async (...args: Parameters<typeof fs.open>) => {
+          const handle = await fs.open(...args);
+          if (String(args[0]) === directory) {
+            const close = handle.close.bind(handle);
+            handle.close = async () => { await close(); if (unlocked) monotonic += deadline; };
+          }
+          return handle;
+        },
+      };
+      const instance = ledger(directory, { fs: facade, monotonicClock: () => monotonic, writeDeadlineMs: deadline });
+      const result = operation === "admit" ? await instance.admit("first")
+        : operation === "recordIdentity" ? await instance.recordIdentity("first", process.pid, "test-start")
+        : operation === "settle" || operation === "duplicate-settle" ? await instance.settle("first", classification("first"))
+        : operation === "status" ? await instance.status() : await instance.resetLatch("explicit-recovery");
+      expect(result).toEqual(refusal("ledger_write_stalled"));
+      expect(vi.getTimerCount()).toBe(0);
+      if (operation === "admit") {
+        expect(vi.mocked(syncFs.writeSync)).toHaveBeenLastCalledWith(2, FULL_SUPERVISION_REFUSAL_LINE);
+        expect(await ledger(directory).admit("next")).toEqual(refusal("unidentified_attempt"));
+      }
+    }
+  },
+);
+
+it("same-ledger timeout and late-timer waves admit zero and latch exactly at K", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const budget = 5;
+  let admissions = 0;
+  let monotonic = TEST_MONOTONIC;
+  for (let wave = 0; wave < budget; wave++) {
+    const reached = deferred(); const release = deferred(); const finished = deferred();
+    const timerFirst = wave % 2 === 0;
+    let unlocked = false;
+    const facade: FullSupervisionFs = { ...fs,
+      rename: async (from, to) => {
+        if (String(to).endsWith("ledger.json") && timerFirst) { reached.resolve(); await release.promise; }
+        return fs.rename(from, to);
+      },
+      unlink: async (path) => { await fs.unlink(path); if (String(path).endsWith("writer.lock")) unlocked = true; },
+      open: async (...args: Parameters<typeof fs.open>) => {
+        const handle = await fs.open(...args);
+        if (String(args[0]) === root) {
+          const close = handle.close.bind(handle);
+          handle.close = async () => {
+            await close();
+            if (unlocked) { if (!timerFirst) monotonic++; finished.resolve(); }
+          };
+        }
+        return handle;
+      },
+    };
+    const instance = ledger(root, { fs: facade, monotonicClock: () => monotonic, writeDeadlineMs: 1 });
+    const pending = instance.admit(`wave-${wave}`);
+    if (timerFirst) {
+      await reached.promise;
+      try { await vi.advanceTimersByTimeAsync(1); }
+      finally { release.resolve(); }
+    }
+    const result = await pending;
+    await finished.promise;
+    if (result.ok && result.admitted) admissions++;
+    expect(result).toEqual(refusal("ledger_write_stalled"));
+    expect(admissions).toBe(0);
+    const recovery = ledger(root, { monotonicClock: () => monotonic });
+    expect(await recovery.admit("late-retry")).toEqual(refusal("unidentified_attempt"));
+    const state = successful(await recovery.settle(`wave-${wave}`, classification(`wave-${wave}`)));
+    expect(state.charges).toHaveLength(wave + 1);
+    expect(state.state).toBe(wave + 1 === budget ? "state_LATCHED" : "state_IDLE");
+  }
+  expect(await ledger(root, { monotonicClock: () => monotonic }).admit("sixth")).toEqual(refusal("latched"));
 });

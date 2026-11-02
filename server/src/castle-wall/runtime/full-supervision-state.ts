@@ -64,7 +64,7 @@ export type FullSupervisionState = "state_IDLE" | "state_PENDING_UNIDENTIFIED" |
 export type FullSupervisionRefusalReason =
   | "unsafe_state_dir" | "corrupt_state" | "enrolled_ledger_missing" | "clock_rollback"
   | "unknown_clock_provenance" | "unidentified_attempt" | "child_alive" | "child_unknown"
-  | "latched" | "ledger_write_stalled" | "ledger_busy" | "invalid_attempt" | "throttled";
+  | "stale_temp" | "latched" | "ledger_write_stalled" | "ledger_busy" | "invalid_attempt" | "throttled";
 /** Successful mutations expose the durable state; admitted is true only on a successful admit call. */
 export type FullSupervisionResult =
   | { ok: true; admitted: boolean; state: FullSupervisionState; charges: readonly Charge[] }
@@ -163,11 +163,32 @@ export class FullSupervisionLedger {
   }
   private async write(name: string, value: unknown): Promise<void> {
     const temp = this.path(`${name}.next`);
-    const handle = await this.fs.open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, PRIVATE_FILE_MODE);
-    try { await handle.writeFile(JSON.stringify(value)); await handle.sync(); }
-    finally { await handle.close(); }
-    await this.fs.rename(temp, this.path(name));
-    await this.syncDirectory();
+    let handle;
+    try { handle = await this.fs.open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, PRIVATE_FILE_MODE); }
+    catch (error) {
+      // A pre-existing temp belongs to an interrupted writer and must not be overwritten or removed.
+      if (errorCode(error) === "EEXIST") refuse("stale_temp");
+      throw error;
+    }
+    let renamed = false;
+    try {
+      await handle.writeFile(JSON.stringify(value));
+      await handle.sync();
+      await this.fs.rename(temp, this.path(name));
+      renamed = true;
+      await this.syncDirectory();
+    } finally {
+      try {
+        if (!renamed) {
+          // Cleanup may unlink only this writer's inode, never a replacement at the same path.
+          try {
+            const owned = await handle.stat();
+            const current = await this.fs.lstat(temp);
+            if (current.dev === owned.dev && current.ino === owned.ino) await this.fs.unlink(temp);
+          } catch { /* An unprovable cleanup leaves a typed stale-temp refusal on the next write. */ }
+        }
+      } finally { await handle.close(); }
+    }
   }
   private async clock(): Promise<Clock> {
     let result;
@@ -219,6 +240,9 @@ export class FullSupervisionLedger {
       return { ok: false, reason };
     };
     if (this.busy) return notify("ledger_busy");
+    let started: number;
+    try { started = timestamp.parse(this.deps.monotonicClock()); }
+    catch { return notify("unknown_clock_provenance"); }
     this.busy = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const operation = (async () => {
@@ -242,6 +266,12 @@ export class FullSupervisionLedger {
     });
     const result = await Promise.race([operation, stalled]);
     if (timer) clearTimeout(timer);
+    // Promise continuations can beat an overdue timer; elapsed time gates every successful return.
+    let finished: number;
+    try { finished = timestamp.parse(this.deps.monotonicClock()); }
+    catch { return notify("unknown_clock_provenance"); }
+    if (finished < started) return notify("clock_rollback");
+    if (finished - started >= this.deadlineMs) return notify("ledger_write_stalled");
     return result.ok ? result : notify(result.reason);
   }
 
@@ -283,7 +313,13 @@ export class FullSupervisionLedger {
   private charge(record: NonNullable<Awaited<ReturnType<FullSupervisionLedger["load"]>>>, now: Clock) {
     if (!record.pending) refuse("invalid_attempt");
     // Retain only the incident window, with K as the hard ceiling; healthy completions never clear charges.
-    record.charges = record.charges.filter((charge) => now.wall - charge.wall <= this.settings.windowMs);
+    record.charges = record.charges.filter((charge) => {
+      // Within one boot, a wall-clock step cannot erase charges that monotonic time still retains.
+      const elapsed = charge.bootId === now.bootId
+        ? Math.min(now.wall - charge.wall, now.monotonic - charge.monotonic)
+        : now.wall - charge.wall;
+      return elapsed <= this.settings.windowMs;
+    });
     record.charges.push({ ...now, attemptId: record.pending.attemptId });
     record.lastSettled = record.pending.attemptId;
     record.pending = null;
@@ -328,7 +364,12 @@ export class FullSupervisionLedger {
         case "terminal": record.latched = true; break;
         case "uncharged_clean":
         case "uncharged_stop": break;
-        default: { const unreachable: never = classification; return unreachable; }
+        default: {
+          const unreachable: never = classification;
+          void unreachable;
+          // Unknown runtime classifications cannot clear a pending attempt or manufacture success.
+          refuse("invalid_attempt");
+        }
       }
       record.pending = null;
       record.lastSettled = attemptId;

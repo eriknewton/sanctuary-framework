@@ -49,15 +49,30 @@ export function classifyFullSupervisionExit(
     case "none": stop = "none"; break;
     case "operator":
     case "lifecycle": stop = intent.attemptId === input.attemptId ? intent.kind : "none"; break;
-    default: { const unreachable: never = intent; return unreachable; }
+    default: {
+      const unreachable: never = intent;
+      void unreachable;
+      // Durable caller input can violate the static union; unknown intent never exempts an exit.
+      return { kind: "charged_unverified_exit", decidedBy: input };
+    }
   }
   const exit = input.exit;
   // A stop request cannot hide a crash; only the enumerated stop shapes qualify.
   const stopShaped = "code" in exit
     ? exit.code === FULL_SUPERVISION_COMPLETION_CODES.ok || exit.code === SIGNAL_EXIT_OFFSET + SIGTERM_NUMBER
     : exit.signal === "SIGTERM" || (exit.signal === "SIGKILL" && stop === "lifecycle");
+  // A deterministic non-stop refusal remains terminal even when a stop races it.
+  if ("code" in exit && !stopShaped) {
+    const terminal = table.terminal.find((row) => row.code === exit.code);
+    if (terminal) return { kind: "terminal", reason: terminal.reason, decidedBy: input };
+  }
   if (stop !== "none") {
-    return { kind: stopShaped ? "uncharged_stop" : "charged_unverified_exit", decidedBy: input };
+    const matchedCompletion = input.completion?.attemptId === input.attemptId;
+    // Status-shaped stops require ok cleanup evidence; signals can precede handler installation.
+    const verified = "code" in exit
+      ? matchedCompletion && input.completion?.cleanup === "ok"
+      : !(matchedCompletion && input.completion?.cleanup === "failed");
+    return { kind: stopShaped && verified ? "uncharged_stop" : "charged_unverified_exit", decidedBy: input };
   }
   if ("code" in exit) {
     if (exit.code === FULL_SUPERVISION_COMPLETION_CODES.ok) {
