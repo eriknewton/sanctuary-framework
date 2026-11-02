@@ -392,3 +392,31 @@ class TxMemoryStorage implements StorageBackend, SdwTransactional {
     return total;
   }
 }
+
+it("enumerates LMDB names through the key-only cursor with full-set guarded parity", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { LmdbStorageBackend } = await import("../../src/sdw/lmdb-backend.js");
+  const { ReadOnlyStorageGuard } = await import("../../src/storage/read-only-guard.js");
+  const root = await mkdtemp(join(tmpdir(), "lmdb-keys-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = root;
+  const backend = await LmdbStorageBackend.open({ path: root });
+  try {
+    for (const keys of [[], ["one"], ["a", "B", "a/2", "z!"]]) {
+      for (const meta of await backend.list("fixture")) await backend.delete("fixture", meta.key);
+      for (const key of keys) await backend.write("fixture", key, new Uint8Array([1]));
+      for (const prefix of [undefined, "", "a", "missing"]) {
+        for (const reader of [backend, new ReadOnlyStorageGuard(backend)]) {
+          expect(typeof reader.listKeys).toBe("function");
+          expect(await reader.listKeys!("fixture", prefix)).toEqual((await reader.list("fixture", prefix)).map((meta) => meta.key).sort());
+        }
+      }
+    }
+  } finally {
+    await backend.close();
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    await rm(root, { recursive: true, force: true });
+  }
+});

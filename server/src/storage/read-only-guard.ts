@@ -93,6 +93,7 @@ export const READ_ONLY_STORAGE_DELEGATED_METHODS = [
   "exists",
   "totalSize",
   "listNamespaces",
+  "listKeys",
   "namespacePath",
 ] as const;
 
@@ -124,8 +125,16 @@ export class ReadOnlyStorageGuard
    */
   listNamespaces?: () => Promise<string[]>;
 
+  /** Mirror presence so AuditLog's absent-capability fallback remains truthful. */
+  listKeys?: (namespace: string, prefix?: string) => Promise<string[]>;
+
   constructor(inner: StorageBackend) {
     this.inner = inner;
+    // Must match StorageBackend.listKeys in interface.ts and STORAGE_READ_ONLY
+    // in test/structure/read-tool-mutation-reachability.ts.
+    if (typeof inner.listKeys === "function") {
+      this.listKeys = (namespace, prefix) => inner.listKeys!(namespace, prefix);
+    }
     this.innerCapabilities = inner as Partial<FilesystemStorageCapabilities>;
     if (typeof inner.listNamespaces === "function") {
       this.listNamespaces = () => inner.listNamespaces!();

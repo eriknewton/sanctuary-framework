@@ -171,6 +171,20 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     return entries.sort((a, b) => a.key.localeCompare(b.key));
   }
 
+  /** Must match the complete, code-unit ordered listKeys contract in interface.ts. */
+  async listKeys(namespace: string, prefix?: string): Promise<string[]> {
+    assertStorageNamespacePathComponent(namespace);
+    const nsPrefix = `${namespace}/`;
+    const keys: string[] = [];
+    for (const storeKey of this.store.keys()) {
+      if (!storeKey.startsWith(nsPrefix)) continue;
+      const key = storeKey.slice(nsPrefix.length);
+      if (prefix && !key.startsWith(prefix)) continue;
+      keys.push(key);
+    }
+    return keys.sort();
+  }
+
   async exists(namespace: string, key: string): Promise<boolean> {
     return this.store.has(this.storageKey(namespace, key));
   }

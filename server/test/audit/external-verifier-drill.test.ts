@@ -416,12 +416,13 @@ describe("external-verifier-drill: happy path", () => {
     const records = parseJsonl(jsonl);
     const checkpointCount = records.filter((r) => r.type === "checkpoint").length;
 
-    expect(records.filter((r) => r.type === "entry")).toHaveLength(maxEntries);
+    const retainedEntries = maxEntries - 1; // The final cap crossing prunes to the minimum one-entry margin.
+    expect(records.filter((r) => r.type === "entry")).toHaveLength(retainedEntries);
     expect(records).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "rotation_anchor",
-          base_sequence: appendedEntries - maxEntries + 1,
+          base_sequence: appendedEntries - retainedEntries + 1,
         }),
       ])
     );

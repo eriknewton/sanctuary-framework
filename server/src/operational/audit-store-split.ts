@@ -186,6 +186,10 @@ export class DaemonAuditStorageAdapter
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
     return this.inner.list(remapNamespace(namespace), prefix);
   }
+  /** Preserve the same namespace authority as list while enumerating only keys. */
+  async listKeys(namespace: string, prefix?: string): Promise<string[]> {
+    return this.inner.listKeys(remapNamespace(namespace), prefix);
+  }
   async exists(namespace: string, key: string): Promise<boolean> {
     return this.inner.exists(remapNamespace(namespace), key);
   }

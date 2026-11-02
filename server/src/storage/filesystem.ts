@@ -1239,6 +1239,33 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
   }
 
+  /** Names only, with the complete-or-throw contract in storage/interface.ts. */
+  async listKeys(namespace: string, prefix?: string): Promise<string[]> {
+    this.assertCallerNamespace(namespace);
+    const capability = this.darwinCapability(namespace);
+    if (capability) {
+      // Must match listKeys in directory-capability-worker.ts: omit undefined
+      // so IPC cannot turn an absent prefix into a literal null prefix.
+      return this.callDarwinNamespace(capability, "listKeys", prefix === undefined ? [] : [prefix]);
+    }
+    let files: string[];
+    try {
+      files = await readdir(this.activeNamespacePath(namespace));
+    } catch (err: unknown) {
+      // Only absence of the namespace is empty; incomplete enumeration throws.
+      if (err instanceof Error && "code" in err && err.code === "ENOENT") return [];
+      throw err;
+    }
+    const keys: string[] = [];
+    for (const file of files) {
+      if (!file.endsWith(".enc")) continue;
+      const key = decodeRawFilesystemStorageName(file.slice(0, -".enc".length), "key");
+      if (prefix && !key.startsWith(prefix)) continue;
+      keys.push(key);
+    }
+    return keys.sort();
+  }
+
   async exists(namespace: string, key: string): Promise<boolean> {
     this.assertCallerNamespace(namespace);
     assertFilesystemStorageNameAddressable(key, "key");
