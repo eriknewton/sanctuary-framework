@@ -355,7 +355,7 @@ it.each(["fallback forward", "fallback reverse", "reversed listKeys"])(
       await raw.write("_audit", ties[i]!, envelopes[i === 0 ? 2 : 1]!);
     }
     const discovered = await (log as any).withAuditWriteLock((signal: unknown) => (log as any).readLatestPersistedChainState(signal));
-    expect((discovered.latest ?? discovered).nextSequence, "discovery total-order tail").toBe(4);
+    expect((discovered.status === "found" ? discovered.sequence + 1 : undefined), "discovery total-order tail").toBe(4);
     // Exercise the collector's own ordering with backend order, independent of discovery's sort.
     const keys = storage.listKeys ? await storage.listKeys("_audit") : (await storage.list("_audit")).map((meta) => meta.key);
     const read = vi.spyOn(raw, "read");
@@ -389,7 +389,7 @@ it("uses a total order for collation ties across memory insertion orders and fil
     for (const i of index === 1 ? [1, 0] : [0, 1]) await storage.write("_audit", ties[i]!, i === 0 ? third : second);
     const discovered = await (log as any).withAuditWriteLock((signal: unknown) => (log as any).readLatestPersistedChainState(signal));
     // The base returned the chain state directly; the candidate also returns its held keys.
-    expect((discovered.latest ?? discovered).nextSequence).toBe(4);
+    expect((discovered.status === "found" ? discovered.sequence + 1 : undefined)).toBe(4);
     await log.appendCritical(measureEntry(3)); outcomes.push(log.currentInMemorySequence());
   }
   expect(outcomes).toEqual([4, 4, 4]);

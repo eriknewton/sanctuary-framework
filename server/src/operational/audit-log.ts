@@ -1284,8 +1284,20 @@ const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
 type HeadAnchorReadResult =
   | { status: "valid"; highest_sequence: number; head_hash: string }
   | { status: "absent" }
-  | { status: "invalid" }
-  | { status: "unreadable_sealed" };
+  | { status: "invalid"; cause?: unknown }
+  | { status: "unreadable_sealed"; cause?: unknown };
+
+// Discovery owns constant-size history; keys remain the one snapshot used by retention.
+type AuditDiscoveryOutcome = { keys: string[] } & (
+  | { status: "found"; sequence: number; hash: string; sealedFloor: number }
+  | { status: "candidates_unusable" | "baseline"; sealedFloor: number }
+  | { status: "empty_suffix"; sequence: number; hash: string; sealedFloor: number }
+  | { status: "unknown"; cause?: unknown }
+);
+type AuditMarkerReadResult =
+  | { status: "present" | "absent" }
+  | { status: "unreadable"; cause: unknown };
+type AuditEstablishmentEvidence = { established: boolean; unreadable: boolean; cause?: unknown };
 // Eager-read backstop throttle. The posture dashboard composes several full-chain
 // reads per board paint and pushes the same payload on an SSE cadence; re-reading
 // + re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
@@ -1434,6 +1446,18 @@ export class AuditPersistenceError extends Error {
     this.name = "AuditPersistenceError";
     this.classification = classification;
     this.cause = cause;
+  }
+}
+
+/** Awaited appends refuse uncertain discovery before allocation; investigate the retained evidence before retrying. */
+export class AuditChainStateUnknownError extends AuditPersistenceError {
+  readonly code?: unknown;
+
+  constructor(cause?: unknown) {
+    super("Audit chain state is unknown. Stop appending and investigate the retained audit evidence." +
+      (cause === undefined ? "" : ` ${failureMessage(cause)}`), "unknown", cause);
+    this.name = "AuditChainStateUnknownError";
+    if (cause !== null && typeof cause === "object" && "code" in cause) this.code = cause.code;
   }
 }
 
@@ -2253,6 +2277,11 @@ export class AuditLog {
    * SUFFIX entry (`sequence > cachedSealedTip`) from a sealed-region one without
    * re-reading the boundary per append. */
   private cachedSealedTip = 0;
+  // Must match persistChainedEntry, freshenChainStateFromDisk and loadPersistedEntries history updates below.
+  // Only actual V2 observations establish history; sealed floors and legacy counts cannot manufacture it.
+  private knownV2HighWater = 0;
+  private verifiedLegacyCount = 0;
+  private verifiedLegacyRoot = AUDIT_CHAIN_GENESIS;
   /** F2 Finding 1: in-memory guard so the post-split-suffix-established marker is
    * written at most once per instance (it is idempotent, but this avoids a
    * `_meta` write on every suffix append). */
@@ -2904,6 +2933,8 @@ export class AuditLog {
           this.expectedStoreFingerprint = null;
           this.retentionGeneration++;
           this.assertAuditWriteLockActive(signal);
+          // Must match freshenChainStateFromDisk and loadPersistedEntries: record actual V2 evidence while active, before anchor failure.
+          this.knownV2HighWater = Math.max(this.knownV2HighWater, sequence);
           // Publish the exact durable delta under the lock before any later
           // anchor or rotation failure; a failed continuation cannot lose it.
           this.retainedBytesEstimate += persistedBytes.length;
@@ -3684,13 +3715,13 @@ export class AuditLog {
         // Root-owned legacy anchor, unreadable at the operator uid, superseded
         // by the MAC'd boundary. Not a finding; the caller re-establishes the
         // suffix anchor. A non-permission fault still fails closed below.
-        return { status: "unreadable_sealed" };
+        return { status: "unreadable_sealed", cause: err };
       }
       findings.push({
         kind: "storage_unavailable",
         message: `audit head anchor could not be read: ${failureMessage(err)}`,
       });
-      return { status: "invalid" };
+      return { status: "invalid", cause: err };
     }
     if (!raw) return { status: "absent" };
 
@@ -3862,7 +3893,8 @@ export class AuditLog {
       return;
     }
 
-    if (await this.isEstablishedAuditStore(hasLegacyEntries || hasChainedEntries)) {
+    const establishment = await this.isEstablishedAuditStore(hasLegacyEntries || hasChainedEntries);
+    if (establishment.established) {
       // First boot is legitimately anchorless. Once audit bytes or the
       // audit-established marker exist, stripping the tail floor makes rollback
       // indistinguishable from an empty log and must fail closed.
@@ -3871,6 +3903,9 @@ export class AuditLog {
         message:
           "audit head anchor missing for established audit store (tail truncation or whole-log deletion may have occurred)",
       });
+    } else if (establishment.unreadable) {
+      // Unreadable evidence cannot certify a fresh store; positive proof above retains its stronger finding.
+      findings.push({ kind: "storage_unavailable", message: "audit establishment evidence could not be read" });
     }
   }
 
@@ -3886,32 +3921,35 @@ export class AuditLog {
    * conservatively as established.
    */
   private async postSplitSuffixWasEstablished(): Promise<boolean> {
+    return (await this.readPostSplitSuffixMarker()).status !== "absent";
+  }
+
+  private async readPostSplitSuffixMarker(): Promise<AuditMarkerReadResult> {
     try {
-      const raw = await this.storage.read(
-        AUDIT_META_NAMESPACE,
-        AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY
-      );
-      return raw !== null;
-    } catch {
-      // Unreadable/errored: cannot prove absence, so assume established (fail
-      // closed) rather than let an unreadable marker suppress the tamper check.
-      return true;
+      const raw = await this.storage.read(AUDIT_META_NAMESPACE, AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY);
+      return { status: raw === null ? "absent" : "present" };
+    } catch (cause) {
+      return { status: "unreadable", cause };
     }
   }
 
-  private async isEstablishedAuditStore(hasAuditEntries: boolean): Promise<boolean> {
-    if (hasAuditEntries) return true;
-    if (
-      await this.storage
-        .exists(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)
-        .catch(() => false)
-    ) {
-      return true;
+  private async isEstablishedAuditStore(hasAuditEntries: boolean): Promise<AuditEstablishmentEvidence> {
+    if (hasAuditEntries) return { established: true, unreadable: false };
+    const evidence: AuditEstablishmentEvidence = { established: false, unreadable: false };
+    try {
+      // Readability is evidence: stat-based existence cannot distinguish absence from access failure.
+      evidence.established = await this.storage.read(AUDIT_META_NAMESPACE, AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY) !== null;
+    } catch (cause) {
+      evidence.unreadable = true; evidence.cause = cause;
     }
-    const checkpointMetas = await this.storage
-      .list(AUDIT_CHECKPOINT_NAMESPACE)
-      .catch(() => []);
-    return checkpointMetas.length > 0;
+    try {
+      // Gather both sources independently: a marker failure must not discard positive checkpoint proof.
+      const checkpoints = await this.storage.list(AUDIT_CHECKPOINT_NAMESPACE);
+      evidence.established = checkpoints.length > 0 || evidence.established;
+    } catch (cause) {
+      evidence.unreadable = true; evidence.cause ??= cause;
+    }
+    return evidence;
   }
 
   /**
@@ -5311,9 +5349,11 @@ export class AuditLog {
       if (isProcessStartToken(parsed.start_token)) lockStartToken = parsed.start_token;
     } catch { /* Nonempty malformed records carry no additional staleness proof. */ }
     const currentBoot = this.currentLockBootId();
-    // Only stable UUIDs describe comparable boot sessions; fallback wall time and unknown shapes prove neither reboot nor same boot.
-    const knownBoot = auditBootIdentityKind(lockBootId) === "uuid" && auditBootIdentityKind(currentBoot) === "uuid";
-    const sameBoot = knownBoot && lockBootId === currentBoot;
+    // Equal identities of the same recognized kind prove one boot; only differing UUIDs prove a reboot.
+    const holderBootKind = auditBootIdentityKind(lockBootId);
+    const currentBootKind = auditBootIdentityKind(currentBoot);
+    const knownBoot = holderBootKind === "uuid" && currentBootKind === "uuid";
+    const sameBoot = holderBootKind !== "unknown" && holderBootKind === currentBootKind && lockBootId === currentBoot;
     // Row 1: a different known boot proves an orphan independently of reused pids.
     if (knownBoot && !sameBoot) return stale("different_boot");
     const currentUptime = currentUptimeMs();
@@ -5484,22 +5524,35 @@ export class AuditLog {
   }
 
   private async freshenChainStateFromDisk(signal: AuditWriteLockAbortSignal): Promise<string[]> {
-    const { keys, latest } = await this.readLatestPersistedChainState(signal);
-    // A listing that outlives the hold deadline is discarded before sequence
-    // state can change or an entry can be allocated.
+    const outcome = await this.readLatestPersistedChainState(signal);
+    // A late evidence read has no authority to publish allocation, history or a sealed floor.
     this.assertAuditWriteLockActive(signal);
-    if (latest) {
-      if (latest.nextSequence > this.nextSequence) {
-        this.nextSequence = latest.nextSequence;
-        this.lastEntryHash = latest.lastEntryHash;
-      } else if (
-        latest.nextSequence === this.nextSequence &&
-        this.lastEntryHash !== latest.lastEntryHash
-      ) {
-        this.lastEntryHash = latest.lastEntryHash;
+    switch (outcome.status) {
+      case "unknown": throw new AuditChainStateUnknownError(outcome.cause);
+      case "found":
+        if (outcome.sequence + 1 >= this.nextSequence) {
+          this.nextSequence = outcome.sequence + 1;
+          this.lastEntryHash = outcome.hash;
+        }
+        // Must match persistChainedEntry and loadPersistedEntries: only actual V2 observations raise this high-water mark.
+        this.knownV2HighWater = Math.max(this.knownV2HighWater, outcome.sequence);
+        break;
+      case "empty_suffix":
+        // The current authenticated boundary seeds the first suffix; the RAM window may retain a gap.
+        this.nextSequence = outcome.sequence + 1;
+        this.lastEntryHash = outcome.hash;
+        break;
+      case "candidates_unusable":
+      case "baseline":
+        break;
+      default: {
+        const unreachable: never = outcome;
+        throw new Error(`unhandled audit discovery outcome: ${unreachable}`);
       }
     }
-    return keys;
+    // Every continuing outcome preserves the lifetime trusted floor, including a usable tail.
+    this.cachedSealedTip = Math.max(this.cachedSealedTip, outcome.sealedFloor);
+    return outcome.keys;
   }
 
   /**
@@ -5523,64 +5576,94 @@ export class AuditLog {
    * candidates than necessary to find a valid one, matching the previous
    * "scan until you find a real entry" behavior exactly).
    */
-  private async readLatestPersistedChainState(signal: AuditWriteLockAbortSignal): Promise<{
-    keys: string[];
-    latest: { nextSequence: number; lastEntryHash: string } | null;
-  }> {
-    // F2 Option A: exactly like `loadPersistedEntries`, never attempt a read
-    // on an entry at or below a valid split boundary's sealed tip: those are
-    // the legacy, possibly-permission-denied entries this instance's routine
-    // paths must never touch. Without this, the O(1) backward tail-scan below
-    // would walk straight into a sealed (potentially unreadable) entry on
-    // EVERY `appendCritical` for a fortress with zero post-split entries so
-    // far, throwing on the very read this file's own fix exists to avoid.
-    // Exhausting the walk without finding anything ABOVE the boundary
-    // correctly returns `null` ("nothing new to freshen from"): the
-    // in-memory state was already seeded from the boundary by `ensureLoaded`.
-    const splitBoundary = await this.loadSplitBoundary();
-    const sealedTipSequence =
-      splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
-    // A warm write does not observe metadata-only faults: a later sized load
-    // or recount observes them; healed faults need no report because no written
-    // bytes depended on them. A headless writer has no wall-clock detector.
-    // The fallback prefix is part of discovery's refusal contract: widening it
-    // would make a foreign key's stat fault refuse an append that never reads it.
-    const keys = typeof this.storage.listKeys === "function"
+  private async readLatestPersistedChainState(signal: AuditWriteLockAbortSignal): Promise<AuditDiscoveryOutcome> {
+    let keys: string[] = [];
+    try {
+      const splitBoundary = await this.loadSplitBoundary();
+      this.assertAuditWriteLockActive(signal);
+      const boundary = splitBoundary.status === "valid" ? splitBoundary.boundary : undefined;
+      const sealedFloor = boundary?.sealed_tip_sequence ?? 0;
+      // Must match loadPersistedEntries and persistChainedEntry: sample the head before listing entries.
+      const head = await this.loadHeadAnchor([], boundary !== undefined);
+      this.assertAuditWriteLockActive(signal);
+      // Keep the names-only capability and exact entry-prefix fallback pinned by audit-listing-call-sites.test.ts.
+      keys = typeof this.storage.listKeys === "function"
       ? await this.storage.listKeys(AUDIT_NAMESPACE)
       : (await this.storage.list(AUDIT_NAMESPACE, "entry-")).map((meta) => meta.key);
-    // A detached directory read has no authority after its hold deadline.
-    this.assertAuditWriteLockActive(signal);
-    // F2 Finding 1 (Codex re-gate MED): refresh the cached sealed tip from this
-    // fresh boundary read. `freshenChainStateFromDisk` runs on every append, so
-    // this keeps `cachedSealedTip` current even for a long-lived instance that
-    // first loaded BEFORE the boundary was created (which would otherwise leave
-    // it 0 and make the post-split-suffix marker write miss). Only advance it
-    // (never zero it) so a transient boundary-read failure cannot lose the tip.
-    if (sealedTipSequence > this.cachedSealedTip) {
-      this.cachedSealedTip = sealedTipSequence;
-    }
-    // Must match listKeys' order contract in storage/interface.ts: the consumer
-    // applies locale collation with a total tie break for noncanonical names.
-    keys.sort(compareAuditKeys);
-    for (let i = keys.length - 1; i >= 0; i--) {
-      const key = keys[i]!;
-      if (!key.startsWith("entry-")) continue;
-      const seq = parseEntryKeySequence(key);
-      if (seq !== null && seq <= sealedTipSequence) break;
-      const raw = await this.storage.read(AUDIT_NAMESPACE, key);
-      if (!raw) continue;
-      try {
-        const parsed = JSON.parse(bytesToString(raw));
+      this.assertAuditWriteLockActive(signal);
+      keys.sort(compareAuditKeys);
+      let knownTipBodySurvives = false;
+      for (let i = keys.length - 1; i >= 0; i--) {
+        const key = keys[i]!;
+        if (!key.startsWith("entry-")) continue;
+        const sequence = parseEntryKeySequence(key);
+        // Never read sealed bodies, even to manufacture evidence that the known tip survived.
+        if (sequence !== null && sequence <= sealedFloor) break;
+        const raw = await this.storage.read(AUDIT_NAMESPACE, key);
+        this.assertAuditWriteLockActive(signal);
+        if (raw === null) continue;
+        if (sequence === this.knownV2HighWater) knownTipBodySurvives = true;
+        let parsed: unknown;
+        try { parsed = JSON.parse(bytesToString(raw)); } catch { continue; }
         if (!isPersistedAuditEnvelopeV2(parsed)) continue;
-        return { keys, latest: {
-          nextSequence: parsed.sequence + 1,
-          lastEntryHash: parsed.entry_hash,
-        } };
-      } catch {
-        // Full integrity verification reports malformed entries separately.
+        // D0 keeps shape-based discovery, but a newer authenticated head cannot be overwritten by a lower adopted tip.
+        const adoptedTip = Math.max(this.nextSequence - 1, parsed.sequence);
+        if (head.status === "valid" && head.highest_sequence > adoptedTip) return { status: "unknown", keys };
+        return { status: "found", keys, sequence: parsed.sequence, hash: parsed.entry_hash, sealedFloor };
       }
+      const unknown = (cause?: unknown): AuditDiscoveryOutcome => ({ status: "unknown", keys, cause });
+      const tip = this.nextSequence - 1;
+      const known = this.knownV2HighWater;
+      const candidates = keys.map(parseEntryKeySequence).filter((sequence): sequence is number => sequence !== null && sequence > sealedFloor);
+      // D1: exhaustion-only evidence never defeats D0; disabled consultation never probes daemon namespaces.
+      if (splitBoundary.status === "invalid") return unknown();
+      if (head.status === "invalid") return unknown(head.cause);
+      if (this.consultSplitBoundary && this.filesystemCapabilities && splitBoundary.status === "absent") {
+        const migrated = await this.daemonMigrationMarkerExists();
+        this.assertAuditWriteLockActive(signal);
+        if (migrated) return unknown();
+      }
+      let suffix: AuditMarkerReadResult = { status: "absent" };
+      if (boundary) {
+        suffix = await this.readPostSplitSuffixMarker();
+        this.assertAuditWriteLockActive(signal);
+        if (suffix.status === "unreadable") return unknown(suffix.cause);
+      }
+      let establishment: AuditEstablishmentEvidence | undefined;
+      if (!boundary && candidates.length === 0 && known === 0) {
+        establishment = await this.isEstablishedAuditStore(false);
+        this.assertAuditWriteLockActive(signal);
+        if (establishment.unreadable) return unknown(establishment.cause);
+      }
+      // D2: the prior trusted floor cannot be erased; authenticated equal-tip fields must describe the cached chain.
+      if (this.cachedSealedTip > sealedFloor || tip < known ||
+          (boundary && sealedFloor === tip && boundary.sealed_tip_entry_hash !== this.lastEntryHash) ||
+          (head.status === "valid" && head.highest_sequence === tip && head.head_hash !== this.lastEntryHash) ||
+          (boundary && head.status === "valid" && head.highest_sequence === sealedFloor && head.head_hash !== boundary.sealed_tip_entry_hash) ||
+          (boundary && known <= sealedFloor && tip > sealedFloor)) return unknown();
+      // D3/D4: retained authenticated head and suffix proof outrank malformed candidates.
+      if (head.status === "valid" && head.highest_sequence > Math.max(sealedFloor, tip)) return unknown();
+      if (boundary && suffix.status === "present") return unknown();
+      // D5/D6: names cannot explain unseen history or substitute for the body of a known tip.
+      if (candidates.some(sequence => sequence > known)) return unknown();
+      if (known > sealedFloor && !knownTipBodySurvives) return unknown();
+      // D7: suppress a sealed anchor's permission error only for a demonstrably empty suffix.
+      if (head.status === "unreadable_sealed" && !(boundary && suffix.status === "absent" && candidates.length === 0 && known <= sealedFloor)) return unknown(head.cause);
+      if (candidates.length > 0) return { status: "candidates_unusable", keys, sealedFloor }; // D8
+      if (boundary) return { status: "empty_suffix", keys, sealedFloor, sequence: sealedFloor, hash: boundary.sealed_tip_entry_hash }; // D9
+      if (known === 0 && this.verifiedLegacyCount === 0 && tip === 0 && establishment?.established === false && this.lastEntryHash === AUDIT_CHAIN_GENESIS) {
+        return { status: "baseline", keys, sealedFloor }; // D10
+      }
+      if (known === 0 && this.verifiedLegacyCount > 0 && tip === this.verifiedLegacyCount && this.lastEntryHash === this.verifiedLegacyRoot &&
+          (head.status === "absent" || (head.status === "valid" && head.highest_sequence <= this.verifiedLegacyCount))) {
+        return { status: "baseline", keys, sealedFloor }; // D11
+      }
+      return unknown(); // D12: unexplained establishment is never a clean baseline.
+    } catch (cause) {
+      // Acquisition and hold deadlines keep their own types even if an evidence read settles after abort.
+      this.assertAuditWriteLockActive(signal);
+      return { status: "unknown", keys, cause };
     }
-    return { keys, latest: null };
   }
 
   private async writeAuditEntryBytes(
@@ -5717,7 +5800,8 @@ export class AuditLog {
       } = await this.resolveSplitBoundaryForLoad(findings);
       // F2 Finding 1: remember the trusted sealed tip so the append path can
       // classify a post-split suffix entry without re-reading the boundary.
-      this.cachedSealedTip = effectiveSealedTip;
+      // Must match freshenChainStateFromDisk: a failed or lenient load cannot erase a previously trusted floor.
+      this.cachedSealedTip = Math.max(this.cachedSealedTip, effectiveSealedTip);
       // ORDERING INVARIANT (must match the entry-then-anchor write order in
       // `persistChainedEntry`): sample the MAC'd head anchor BEFORE listing the
       // entries. The property this buys is narrow, so claim it precisely: a
@@ -5998,6 +6082,13 @@ export class AuditLog {
         findings,
         effectiveSealedTip
       );
+      // Must match persistChainedEntry and freshenChainStateFromDisk: actual V2 history never comes from a boundary or legacy count.
+      this.knownV2HighWater = Math.max(this.knownV2HighWater, chainedEntries.at(-1)?.envelope.sequence ?? 0);
+      if (findings.length === 0) {
+        // A clean verification in any mode establishes legacy history independently of the trimmed RAM window.
+        this.verifiedLegacyCount = legacyRawEntries.length;
+        this.verifiedLegacyRoot = legacyAnchorHash;
+      }
       this.nextSequence = highestChainedSeq + 1;
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
@@ -8080,9 +8171,9 @@ function readBootIdUncached(): string | undefined {
       const sessionUuid = readSysctl("kern.bootsessionuuid");
       if (sessionUuid.length > 0) return sessionUuid;
       // Last-resort fallback for a macOS build without kern.bootsessionuuid: the
-      // boot TIME string. Less ideal (a large clock step can shift it), but still
-      // a per-boot discriminator; the tie-break treats any mismatch as reboot
-      // evidence, never as license to protect an orphan.
+      // boot TIME string. Equal same-kind bytes prove the same boot; a mismatch
+      // stays unknown because a wall-clock step can change this fallback.
+      // Only differing session UUIDs prove reboot in decideStaleAuditLock.
       const boottime = readSysctl("kern.boottime");
       return boottime.length > 0 ? boottime : undefined;
     }

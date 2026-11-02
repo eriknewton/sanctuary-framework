@@ -42,8 +42,9 @@ not resolve an authority refusal.
 
 A process keeps a registry of the device and inode of every audit lock it holds.
 Those holds remain live until release begins, including release attempts that
-fail. Every other lock is evaluated in order: different known boot identities
-prove staleness; an own-pid start token establishes process identity; otherwise
+fail. Every other lock is evaluated in order: differing boot UUIDs
+prove staleness; equal identities of the same recognized kind establish the same
+boot, including the macOS boot-time fallback. An own-pid start token establishes process identity; otherwise
 same-boot uptime and the existing wall-clock proofs decide own-pid records.
 An own lock outside the registry retains the same-boot self-held age bound.
 For foreign pids, only ESRCH proves death. Permission denial means alive and
@@ -138,6 +139,32 @@ Checkpoint records are never pruned; one
 record per `checkpointInterval` critical appends accumulates for the fortress's
 lifetime, with additional checkpoints possible at shutdown. Entry retention does
 not bound this namespace.
+
+## Discovery outcomes
+
+Locked discovery decides whether an append can allocate a sequence. Its outcomes
+are a found tail, unusable candidates consistent with retained instance history,
+a verified baseline, an authenticated empty suffix, or unknown state. Continuing
+from an empty suffix uses the current boundary's sequence and hash, including
+when another writer completed the seal after this instance loaded. Instance
+history uses a fixed number of fields; full verification remains a separate load
+operation. Tail discovery checks envelope shape and does not certify the full
+chain or replace strict load findings.
+
+Unknown state rejects an awaited critical append with
+`AuditChainStateUnknownError`, classified as `unknown`, before discovery
+authorizes allocation or chain writes. Standalone checkpoint discovery uses the
+same decision. Each attempt reads the evidence again; there is no persistent
+refusal latch or automatic repair. Existing asynchronous failure tracking and
+flush aggregation remain in effect.
+
+Failure mode: unknown state requires the operator to stop appending, preserve
+the retained audit evidence and investigate storage access and integrity findings
+before retrying. A retry can proceed only when the evidence supports continuation.
+Restarting is not a repair. This decision does not add stronger usable-tail
+validation, recovery of missing evidence, or guarantees about writes that finish
+after a hold deadline. Read-only diagnostics continue to report findings without
+seeding anchors or writing alerts.
 
 ## Retention accounting
 

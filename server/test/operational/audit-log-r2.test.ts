@@ -15,6 +15,7 @@ vi.mock("../../src/operational/process-start-token.js", async original => ({ ...
 vi.mock("../../src/storage/cross-process-lock.js", async original => ({ ...await original<typeof import("../../src/storage/cross-process-lock.js")>() }));
 const roots: string[] = [];
 const children: ChildProcess[] = [];
+const productionScaffolds = new Set<string>();
 const UUID = "11111111-1111-4111-8111-111111111111";
 const OTHER_UUID = "22222222-2222-4222-8222-222222222222";
 const BOOTTIME = "{ sec = 1793520000, usec = 0 } Sun Nov  1 08:00:00 2026";
@@ -35,6 +36,9 @@ afterEach(async () => {
       const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
     }
   }
+  // Kernel guard scaffolds are permanent rendezvous inodes; report exact test residue rather than unlinking a shared lock name.
+  for (const scaffold of productionScaffolds) console.info(`[audit-r2] retained production guard scaffold: ${scaffold}`);
+  productionScaffolds.clear();
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 async function fixture() {
@@ -111,6 +115,7 @@ it.runIf(process.platform === "linux")("real AuditLog child uses the production 
     await fs.rename(f.dir, `${f.dir}-occupied-${attempt}`); await fs.mkdir(f.dir, { mode: 0o700 });
   }
   expect(scaffold).not.toBe("");
+  productionScaffolds.add(scaffold);
   await f.plant({ pid: DEAD });
   const child = spawn(process.execPath, ["--import", "tsx", fileURLToPath(new URL("./audit-log-r2-recovery-child.ts", import.meta.url)), f.root], {
     env: { ...process.env, HOME: f.root, SANCTUARY_CUSTODY_LOCK_ROOT: "relative-obstruction" }, stdio: ["ignore", "pipe", "pipe"],
@@ -149,4 +154,16 @@ it.each(["mismatch", "unlink", "release"])("retains %s restore-EEXIST evidence a
     expect((await fs.stat(join(f.dir, entry.name))).ino).toBe(entry.inode);
   }
   expect(await fs.readFile(f.lock, "utf8")).toBe("successor");
+});
+
+it("M1 equal boottime identities protect a live holder from wall-clock reboot evidence", async () => {
+  const f = await fixture(); vi.spyOn(f.log, "currentLockBootId").mockReturnValue(BOOTTIME);
+  vi.spyOn(process, "kill").mockReturnValue(true);
+  await f.plant({ pid: 1, boot_id: BOOTTIME, acquired_at: "1970-01-01T00:00:00.000Z" });
+  expect(await f.log.decideStaleAuditLock(f.lock)).toMatchObject({ verdict: "in_progress" });
+});
+it("M3 boot fallback comment matches the same-kind comparison", async () => {
+  const source = await fs.readFile(new URL("../../src/operational/audit-log.ts", import.meta.url), "utf8");
+  expect(source).toContain("Only differing session UUIDs prove reboot in decideStaleAuditLock.");
+  expect(source).not.toContain("the tie-break treats any mismatch as reboot");
 });
