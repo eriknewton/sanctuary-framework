@@ -8,6 +8,7 @@ import {
 } from "../core/master-custody.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { createSdwMemoryAdapter } from "../index.js";
+import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { AuditLog } from "../operational/audit-log.js";
 import {
   HERMES_INSERT_INTENT_KEY, HERMES_INSERT_INTENT_NAMESPACE,
@@ -20,6 +21,7 @@ import {
 } from "../sdw/memory-provenance-signing.js";
 import { CrossProcessLockError, withExclusiveMasterRotationBarrier } from "../storage/cross-process-lock.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { hasInterruptedExitImport } from "../storage/exit-import-journal.js";
 import { ReadOnlyStorageGuard } from "../storage/read-only-guard.js";
 
 const HELP = "Usage: sanctuary hermes recover-save --fortress <dir> [--apply] [--passphrase <value>] [--json]\nReport an unfinished save; --apply keeps a verified save or rolls back an unpublished save.\n";
@@ -29,6 +31,7 @@ const UNCLASSIFIED = "The save could not be classified and nothing was changed."
  * Inspect or recover one unfinished Hermes save in the explicitly selected, stopped fortress.
  *
  * State                 | Report                 | Apply
+ * Interrupted import    | Refuse without changes | Recover first or refuse
  * No intent             | Nothing to recover     | Nothing to recover
  * Unpublished document  | Propose rollback       | Rollback, intent deletion, audit
  * Verified publication  | Propose keeping save   | Intent deletion, audit
@@ -66,6 +69,7 @@ export async function runHermesRecoverSave(options: {
   const storage = new FilesystemStorage(join(storagePath, "state"));
   let actionStarted = false;
   let actionFinished = false;
+  let importsRecovered = false;
   try {
     // A missing or unsafe fortress must refuse before lock resolution can create its namespace.
     const meta = await lstat(storage.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE));
@@ -84,6 +88,19 @@ export async function runHermesRecoverSave(options: {
           storagePathHint: storagePath,
         });
         try {
+          const auditLog = new AuditLog(storage, masterKey);
+          if (apply) {
+            // Classification and deletion must see the recovered fortress, never a half-applied import.
+            try { importsRecovered = (await recoverInterruptedExitImportsOrThrow(storage, auditLog)).recovered > 0; }
+            catch {
+              err.write("Interrupted exit-import recovery did not finish; save recovery was not attempted.\n");
+              return 1;
+            }
+          } else if (await hasInterruptedExitImport(readonlyStorage)) {
+            // Report mode cannot recover an import without breaking its no-mutation contract.
+            err.write("An interrupted exit import prevents save classification; report mode changed nothing.\n");
+            return 1;
+          }
           const fortressId = fortressIdFromStoragePath(storagePath);
           const intent = await readHermesSaveIntent({ storage: readonlyStorage, masterKey, fortressId });
           // Continuing paths: absent -> no action; unpublished -> rollback; verified published -> keep.
@@ -122,7 +139,7 @@ export async function runHermesRecoverSave(options: {
           // The intent is the restart refusal marker and must survive every incomplete rollback.
           if (await storage.delete(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY, true)) removed++;
           actionFinished = true;
-          await new AuditLog(storage, masterKey).appendCritical({ layer: "l3", operation: "hermes_save_recovered",
+          await auditLog.appendCritical({ layer: "l3", operation: "hermes_save_recovered",
             identity_id: "operator", result: "success", details: { outcome, records_removed: removed } });
           out.write(json ? JSON.stringify({ state, outcome, records_removed: removed }) + "\n" : `${state}; ${outcome}; records removed: ${removed}.\n`);
           return 0;
@@ -132,6 +149,7 @@ export async function runHermesRecoverSave(options: {
     const message = actionFinished ? "Recovery completed but the audit append or lock release failed; the action was not reversed."
       : actionStarted ? "Recovery did not finish; retry --apply if the intent is still readable."
       : cause instanceof CrossProcessLockError ? "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it."
+      : importsRecovered ? "The exit import was recovered, but save recovery did not proceed."
       : UNCLASSIFIED;
     err.write(message + "\n");
     return 1;

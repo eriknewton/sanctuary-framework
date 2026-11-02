@@ -21,6 +21,7 @@ import { SdwWorkingStateStore } from "../../src/sdw/working-state-store.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { HERMES_INSERT_INTENT_KEY, HERMES_INSERT_INTENT_NAMESPACE, DEFAULT_MAX_CHUNK_CHARS } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
+import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../../src/storage/exit-import-journal.js";
 
 const PASS = "operator recovery fixture passphrase";
 const INTERRUPTED_CHUNKS = 2; // S2 requires two durable chunks before the process stops.
@@ -262,6 +263,71 @@ describe("Hermes save operator recovery", () => {
     const settled = await hashes(f.fortress);
     expect(await command(f, true)).toMatchObject({ code: 0, out: "nothing to recover\n" });
     expect(await hashes(f.fortress)).toEqual(settled);
+  });
+
+  it("recovers an interrupted exit import before save classification or corpus deletion, and refuses unrecoverable imports", async () => {
+    const f = await fixture();
+    await save(f, "target", SAVE_TEXT, "S2");
+    const importId = "planted-save-recovery-import";
+    const journalStorage = new FilesystemStorage(join(f.fortress, "state"));
+    // Same plaintext journal shape as fortress-open-recovery-wiring.test.ts's open-context fixture.
+    const journal = { import_id: importId, identity_id: "operator", started_at: new Date().toISOString(), snapshots: [] };
+    await journalStorage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, importId, Buffer.from("{}\n"));
+    const before = await hashes(f.fortress);
+    const events: Array<{ kind: "read" | "delete"; pendingImports: number }> = [];
+    let refuseClassification = false;
+    const originalRead = FilesystemStorage.prototype.read;
+    const originalDelete = FilesystemStorage.prototype.delete;
+    vi.spyOn(FilesystemStorage.prototype, "read").mockImplementation(async function(this: FilesystemStorage, ns, key) {
+      if (ns === SDW_DOCUMENT_CORPUS_NAMESPACE || (ns === HERMES_INSERT_INTENT_NAMESPACE && key === HERMES_INSERT_INTENT_KEY)) {
+        events.push({ kind: "read", pendingImports: (await this.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).length });
+        if (refuseClassification) throw new Error("classification read refused");
+      }
+      return originalRead.call(this, ns, key);
+    });
+    vi.spyOn(FilesystemStorage.prototype, "delete").mockImplementation(async function(this: FilesystemStorage, ns, key, secure) {
+      if (ns === SDW_DOCUMENT_CORPUS_NAMESPACE) {
+        events.push({ kind: "delete", pendingImports: (await this.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).length });
+      }
+      return originalDelete.call(this, ns, key, secure);
+    });
+
+    const refused = await direct(f);
+    expect(refused.code, refused.err).toBe(1);
+    expect(refused.err).toContain("exit-import recovery did not finish");
+    expect(events).toEqual([]);
+    expect(await hashes(f.fortress)).toEqual(before);
+    expect(await audit(f)).toHaveLength(0);
+
+    await journalStorage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, importId, Buffer.from(JSON.stringify(journal) + "\n"));
+    const beforeReport = await hashes(f.fortress);
+    const report = await direct(f, false);
+    expect(report.code, report.err).toBe(1);
+    expect(events).toEqual([]);
+    expect(await hashes(f.fortress)).toEqual(beforeReport);
+
+    const beforeCorpus = await corpusBytes(f);
+    refuseClassification = true;
+    const unclassified = await direct(f);
+    expect(unclassified).toMatchObject({ code: 1, err: "The exit import was recovered, but save recovery did not proceed.\n" });
+    expect(await f.storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    expect(events).toEqual([{ kind: "read", pendingImports: 0 }]);
+    expect(await corpusBytes(f)).toEqual(beforeCorpus);
+    expect(await audit(f)).toHaveLength(0);
+
+    refuseClassification = false;
+    events.length = 0;
+    await journalStorage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, importId, Buffer.from(JSON.stringify(journal) + "\n"));
+    const applied = await direct(f);
+    expect(applied.code, applied.err).toBe(0);
+    expect(applied.out).toContain("not_completed; rolled_back");
+    expect(events.some(event => event.kind === "read")).toBe(true);
+    expect(events.some(event => event.kind === "delete")).toBe(true);
+    expect(events.every(event => event.pendingImports === 0)).toBe(true);
+    expect(await f.storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    expect(await f.storage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY)).toBeNull();
+    expect(await corpusBytes(f)).toEqual({});
+    expect(await audit(f)).toHaveLength(1);
   });
 
   it("intent is last: interrupted rollback still refuses startup and retry completes", async () => {

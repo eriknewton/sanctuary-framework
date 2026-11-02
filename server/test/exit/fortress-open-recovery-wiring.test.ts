@@ -205,6 +205,7 @@ describe("structural pin: every named fortress-open call site routes through rec
       [
         "src/cli/anomaly.ts",
         "src/cli/distress.ts",
+        "src/cli/hermes-recover-save.ts",
         "src/cli/intelligence.ts",
         "src/cli/memory-archive.ts",
         "src/cli/sdw-owner.ts",
