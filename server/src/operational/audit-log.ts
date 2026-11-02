@@ -5457,7 +5457,8 @@ export class AuditLog {
       if (rollbackTomb !== undefined) await unlink(rollbackTomb);
       rollbackTomb = undefined;
       return removed;
-    } catch (cause) {
+    } catch (caught) {
+      let cause: unknown = caught;
       if (rollbackTomb !== undefined) {
         try {
           try { await link(rollbackTomb, lockPath); }
