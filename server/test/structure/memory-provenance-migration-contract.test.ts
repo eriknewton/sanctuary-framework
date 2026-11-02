@@ -111,6 +111,7 @@ describe("Memory Integrity C3 frozen and operator-only surfaces", () => {
       }
     }
     expect(inventory).toEqual([
+      { file: "src/cli/hermes-recover-save.ts", constructors: 1, migrateCalls: 0 },
       { file: "src/cli/memory-archive.ts", constructors: 1, migrateCalls: 0 },
       { file: "src/cli/memory-file.ts", constructors: 1, migrateCalls: 0 },
       { file: "src/hermes-memory-bridge/process-shell.ts", constructors: 1, migrateCalls: 0 },

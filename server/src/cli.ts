@@ -64,6 +64,11 @@ async function main(): Promise<void> {
     args = [invokedAs, ...args];
   }
 
+  if (args[0] === "hermes") {
+    const { runHermesRecoverSave } = await import("./cli/hermes-recover-save.js");
+    return drainAndExit(await runHermesRecoverSave({ argv: args.slice(1) }));
+  }
+
   if (args[0] === "hermes-memory-bridge") {
     if (args.length === 1 || args.slice(1).some((arg) => arg === "--help" || arg === "-h")) {
       process.stdout.write("Usage: sanctuary hermes-memory-bridge run --relay-fd <fd>\n");
@@ -1097,6 +1102,8 @@ Subcommands:
   memory_transcode     Manually create a plaintext cross-harness projection plus
                        an encrypted exact-source recovery archive. This is not sync.
                        Use "sanctuary memory_transcode --help" for options.
+
+  hermes               recover-save --fortress <dir> [--apply]: recover an unfinished save.
 
   hermes-memory-client
     Scoped memory search and get; writes not yet available.
