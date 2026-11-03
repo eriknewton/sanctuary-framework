@@ -8,6 +8,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import * as flowModule from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import { MacOSFlowEventConsumer, type MacOSFlowEventConsumerInput } from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import type { AuditSink } from "../../../src/castle-wall/runtime/audit-consumer.js";
+import * as producerSignatures from "../../../src/castle-wall/runtime/producer-signature.js";
 import { startMacOSCastleWallDaemon, type MacOSCastleWallListenerOptions } from "../../../src/castle-wall/runtime/macos-daemon.js";
 import { EmissionLivenessWatchdog, DEFAULT_EMISSION_STALL_GRACE_MS } from "../../../src/castle-wall/audit/emission-liveness.js";
 import type { FlowDecisionRecordedNotification } from "../../../src/castle-wall/ipc/messages.js";
@@ -96,6 +97,52 @@ function requireSummary(consumer: MacOSFlowEventConsumer) {
 }
 
 describe("root flow accounting", () => {
+  it.each([
+    ["subject", () => ({ ...frame(), producer: signed(frame(AGENT_UID, "drop")).producer })],
+    ["decision", () => ({ ...frame(), producer: signed(frame(0, "drop")).producer })],
+    ["seq", () => signedBodyOverride({ details: { seq: 1 } })], // Envelope seq stays zero.
+    ["operation", () => signedBodyOverride({ operation: "egress_blocked" })],
+    ["layer", () => signedBodyOverride({ layer: "other" })],
+    ["details", () => signedBodyOverride({ details: null })],
+  ] as const)("R1 signed %s must bind before root counting", async (_name, makeFrame) => {
+    const f = fixture({ pinnedProducerKeyB64url: PIN });
+    const notification = makeFrame();
+    await f.consumer.handleFlowDecisionRecorded(notification);
+    expect(f.append).toHaveBeenCalledExactlyOnceWith("l1", "flow_decision_rejected", notification.agent.id, { reason: ROOT_REASON }, "failure");
+    expect(f.flush).toHaveBeenCalledOnce();
+    expect(f.consumer.getStats().nonAgentRootFlowsCounted).toBe(0);
+    expect(f.consumer.getNonAgentFlowCounters()).toMatchObject({ root_verified_total: 0, root_allow_total: 0, root_drop_total: 0 });
+  });
+
+  it("R1 counts the signed decision after binding the frame", async () => {
+    const f = fixture({ pinnedProducerKeyB64url: PIN });
+    const notification = signed();
+    const verify = producerSignatures.verifyProducerSignature;
+    vi.spyOn(producerSignatures, "verifyProducerSignature").mockImplementationOnce((...args) => {
+      const result = verify(...args);
+      // An in-process accessor changes only the carrier after its binding read;
+      // the signed decision must remain the source of the informational split.
+      Object.defineProperty(notification, "decision", { configurable: true, get() {
+        Object.defineProperty(notification, "decision", { value: "drop", configurable: true });
+        return "allow";
+      } });
+      return result;
+    });
+    await f.consumer.handleFlowDecisionRecorded(notification);
+    expect(f.append).not.toHaveBeenCalled();
+    expect(f.consumer.getNonAgentFlowCounters()).toMatchObject({ root_verified_total: 1, root_allow_total: 1, root_drop_total: 0 });
+  });
+
+  it("R2 pinned root without producer is rejected once and never counted", async () => {
+    const f = fixture({ pinnedProducerKeyB64url: PIN });
+    const notification = frame();
+    await f.consumer.handleFlowDecisionRecorded(notification);
+    expect(f.append).toHaveBeenCalledExactlyOnceWith("l1", "flow_decision_rejected", notification.agent.id, { reason: ROOT_REASON }, "failure");
+    expect(f.flush).toHaveBeenCalledOnce();
+    expect(f.consumer.getStats().nonAgentRootFlowsCounted).toBe(0);
+    expect(f.consumer.getNonAgentFlowCounters()).toMatchObject({ root_verified_total: 0, root_unverified_total: 0 });
+  });
+
   it("T1 classification preserves every legacy rejection and RUID attribution", async () => {
     const f = fixture({ pinnedProducerKeyB64url: PIN });
     const root = signed();
@@ -300,6 +347,18 @@ describe("root flow accounting", () => {
   });
 });
 
+function signedBodyOverride(overrides: Record<string, unknown>): FlowDecisionRecordedNotification {
+  const notification = signed();
+  const producer = notification.producer!;
+  const body = JSON.parse(producer.event_canonical_json);
+  const details = overrides.details === null ? null : { ...body.details, ...overrides.details as object };
+  producer.event_canonical_json = canonicalize({ ...body, ...overrides, details });
+  producer.signature_b64url = Buffer.from(ed25519.sign(producerSigningBytes(
+    producer.event_canonical_json, producer.captured_at_unix_ms, producer.seq,
+  ), SIGNING_SEED)).toString("base64url");
+  return notification;
+}
+
 async function daemonFixture() {
   const home = await mkdtemp(join(tmpdir(), "cw-root-summary-"));
   vi.stubEnv("HOME", home);
@@ -363,6 +422,27 @@ it("T5 bounded stop reports unsettled totals and reaches filter_stopped", async 
   }
 });
 
+it("R3 fast summary failure at stop reports unsaved totals once", async () => {
+  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+  const f = await daemonFixture();
+  const append = f.audit.append.bind(f.audit);
+  vi.spyOn(f.audit, "append").mockImplementation(async (...args) => {
+    if (args[1] === SUMMARY) throw new Error("fixture summary failure");
+    return append(...args);
+  });
+  try {
+    await f.consumer.handleFlowDecisionRecorded(signed());
+    await f.stop();
+    expect(f.consumer.getNonAgentFlowCounters().summaries_failed).toBe(1);
+    expect(f.consumer.hasUnpersistedNonAgentFlows()).toBe(true);
+    const warnings = stderr.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("[castle-wall] non-agent flow summary not persisted at stop:"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('"root_verified_total":1');
+    expect((await f.audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(true);
+    await expect(readFile(join(f.home, "active.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { await f.cleanup(); }
+});
+
 it("T6 real daemon heartbeat writes root summaries and preserves signed subset agent receipts", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const f = await daemonFixture();
@@ -412,14 +492,19 @@ it("T7 audit-dump lists informational summary records", async () => {
     const storage = new FilesystemStorage(join(home, "state"));
     const { masterKey } = await establishMaster({ storage, passphrase });
     const audit = new AuditLog(storage, masterKey);
-    await audit.append("l1", SUMMARY, FORTRESS, { root_verified_total: 1, summary_seq: 1 }, "success");
+    const f = fixture({ pinnedProducerKeyB64url: PIN, auditSink: audit });
+    await f.consumer.handleFlowDecisionRecorded(signed());
+    await f.consumer.flushNonAgentFlowSummary();
     await audit.flush();
     const out = new Capture();
     const err = new Capture();
     const code = await runAuditDump(["--fortress", home], { out, err, env: { SANCTUARY_STORAGE_PATH: home, SANCTUARY_PASSPHRASE: passphrase } });
     expect(code).toBe(0);
     const entries = out.text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
-    expect(entries.filter((entry) => entry.operation === SUMMARY)).toHaveLength(1);
-    expect(entries[0].details).not.toHaveProperty(CASTLE_WALL_AUDIT_PROVENANCE_KEY);
+    const summaries = entries.filter((entry) => entry.operation === SUMMARY);
+    expect(summaries).toHaveLength(1);
+    const summary = entries.find((entry) => entry.operation === SUMMARY);
+    expect(summary.details).toMatchObject({ root_verified_total: 1, summary_seq: 1 });
+    expect(summary.details).not.toHaveProperty(CASTLE_WALL_AUDIT_PROVENANCE_KEY);
   } finally { await rm(home, { recursive: true, force: true }); }
 });

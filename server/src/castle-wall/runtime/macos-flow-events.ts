@@ -54,6 +54,8 @@ import type {
 import {
   AuditChainError,
   AuditConsumer,
+  parseSignedBody,
+  signedDetailsFromBody,
   type AuditSink,
   type ChainAnchorSource,
   type CriticalEventEnvelope,
@@ -377,10 +379,10 @@ export class MacOSFlowEventConsumer {
   }
 
   /**
-   * Handle a `flow_decision_recorded` notification. Translates into an
-   * `egress_allowed` or `egress_blocked` audit event so the existing
-   * persistence path applies. Validates required fields; rejects malformed
-   * payloads with an audit-rejected entry.
+   * Handle a `flow_decision_recorded` notification. Counts validated root
+   * observations for informational summaries; persists agent flows through
+   * the existing `egress_allowed` / `egress_blocked` audit path. Invalid
+   * frames and root frames that fail pinned verification remain loud rejections.
    */
   async handleFlowDecisionRecorded(
     notification: FlowDecisionRecordedNotification,
@@ -396,18 +398,38 @@ export class MacOSFlowEventConsumer {
         notification.decision === "allow" ? "egress_allowed" : "egress_blocked",
         this.fortressId,
       );
-      // Counts are informational: they carry the producer's credibility only
-      // when verified, and duplicates are possible; no consumer chain state moves.
-      const verified = this.pinnedProducerKeyB64url !== null &&
+      // Verified binds the pinned signer, signed subject token with root RUID,
+      // decision, operation and seq to this counted flow. Freshness is not checked:
+      // counts are informational and no reader treats them as evidence. Duplicates
+      // are possible; no consumer chain state moves.
+      let signedDecision: "allow" | "drop" | null = null;
+      if (this.pinnedProducerKeyB64url !== null &&
         envelope.producer !== undefined &&
-        verifyProducerSignature(envelope.producer, this.pinnedProducerKeyB64url).ok;
+        verifyProducerSignature(envelope.producer, this.pinnedProducerKeyB64url).ok) {
+        // Must match parseSignedBody and signedDetailsFromBody in audit-consumer.ts:
+        // both consumers use the shared signed-body shape before trusting its fields.
+        const parsed = parseSignedBody(envelope.producer.eventCanonicalJson);
+        if (parsed.kind === "ok") {
+          const details = signedDetailsFromBody(parsed.body);
+          if (details.agent_id === notification.agent.id &&
+            ruidFromMacOSAuditTokenHex(details.agent_id) === 0 &&
+            (details.decision === "allow" || details.decision === "drop") &&
+            details.decision === notification.decision &&
+            // Must match AuditProducerSigning.swift's decision operation mapping.
+            parsed.operation === (details.decision === "allow" ? "egress_approved" : "egress_blocked") &&
+            details.seq === envelope.producer.seq) {
+            signedDecision = details.decision;
+          }
+        }
+      }
+      const verified = signedDecision !== null;
       // Only otherwise-valid root flows may bypass rejection and emission notes;
-      // a bad pinned signature retains the existing loud rejection path.
+      // a failed pinned binding retains the existing loud rejection path.
       // Continuing paths: no pin -> unverified count; verified pin -> verified count.
       // Refusal path: failed pin -> existing rejection. Other frames keep their
       // existing validation rejection or agent evidence path below.
       if (this.pinnedProducerKeyB64url === null || verified) {
-        countNonAgentRootFlow(this.nonAgentRootFlows, notification.decision, verified);
+        countNonAgentRootFlow(this.nonAgentRootFlows, signedDecision ?? notification.decision, verified);
         this.stats.nonAgentRootFlowsCounted += 1;
         return;
       }
@@ -634,7 +656,7 @@ export class MacOSFlowEventConsumer {
   }
 
   /** Persist cumulative observations at the daemon's existing heartbeat cadence. */
-  flushNonAgentFlowSummary(): Promise<void> {
+  async flushNonAgentFlowSummary(): Promise<void> {
     // The one slot stays occupied through actual storage settlement, so slow
     // writes cannot accumulate retained summaries across heartbeat ticks.
     if (this.nonAgentSummaryWrite !== null) {

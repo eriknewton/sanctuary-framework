@@ -2072,21 +2072,24 @@ export async function startMacOSCastleWallDaemon(
           // the in-flight reservation) in memory. A late commit may report a count
           // twice, but it must never be lost or turned into an allow.
           await Promise.race([
-            // Both drains share the existing stop budget; an unsettled summary
-            // retains its slot without extending the time to filter_stopped.
+            // Both drains share the existing race budget. Behind an unsettled
+            // discard write, the final summary can delay filter_stopped by at most
+            // one additional input.auditLog.writeLockHoldDeadlineMs, whose default
+            // is DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS in operational/audit-log.ts:
+            // one queued summary adds one write-lock hold deadline. Ordering stays fixed.
             Promise.all([consumer.drainIngressDrops(), consumer.drainNonAgentFlowSummary()]),
             new Promise<void>((resolve) => {
               discardDrainTimer = setTimeout(() => {
-                if (consumer.hasUnpersistedNonAgentFlows()) {
-                  // SAFETY: stderr must expose pending totals independently of an unsettled audit sink.
-                  console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
-                }
                 resolve();
               }, input.auditLog.writeLockHoldDeadlineMs);
             }),
           ]);
         } finally {
           if (discardDrainTimer) clearTimeout(discardDrainTimer);
+        }
+        if (consumer.hasUnpersistedNonAgentFlows()) {
+          // Pending totals stay visible after timeout or fast failure, once per stop.
+          console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
         }
         // #912 MED-1: carry any still-pending degraded-write count into the
         // shutdown audit write too, not only the next heartbeat -- a reload
