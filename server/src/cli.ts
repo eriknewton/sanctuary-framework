@@ -322,7 +322,7 @@ async function main(): Promise<void> {
 
   if (args[0] === "castle-wall") {
     const code = await runCastleWallCommand(args.slice(1));
-    drainAndExit(code);
+    return drainAndExit(code);
   }
 
   if (args[0] === "secrets") {
@@ -1808,6 +1808,7 @@ function printWrapHelpEarly(): void {
   Usage:
     sanctuary protect --openclaw       Protect OpenClaw
     sanctuary protect --hermes         Protect Hermes Agent (NousResearch)
+    sanctuary protect --hermes-memory  Install persistent Sanctuary memory for Hermes
     sanctuary protect --claude-code    Protect Claude Code
     sanctuary protect --cursor         Protect Cursor
     sanctuary protect --cline          Protect Cline (VS Code extension)
@@ -1820,6 +1821,7 @@ function printWrapHelpEarly(): void {
   Options:
     --openclaw         Auto-detect and wrap OpenClaw
     --hermes           Auto-detect and wrap Hermes Agent
+    --hermes-memory    Install memory plugins; --unwrap restores the original files
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)

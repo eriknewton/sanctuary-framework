@@ -11,10 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `sanctuary hermes recover-save` recovers a Hermes save that did not finish, so the memory bridge can start again.
 
 - The Hermes memory bridge serves seven tools: a save into the agent's own memory runs without an approval prompt within the save allowance and is audited with the agent named, `memory_recall` returns a bounded context of matching saved passages with per-call scan work bounded after the key listing, `sign_statement` and `export_memory` answer that they are not available yet, and `protection_rules` is refused; every catalogued refusal is an ordinary tool result.
+- `sanctuary protect --hermes-memory` sets Hermes to save and recall memory through the Sanctuary memory plugin, turns Hermes's built-in memory off, removes the Sanctuary MCP server entry from its config, and `--unwrap` reverts those changes.
+
 - A Hermes plugin pair (a Sanctuary memory provider and a tools plugin) saves and recalls Hermes memory through the Sanctuary memory bridge; `sign_statement` and `export_memory` answer that they are not available yet, and every refusal from a Sanctuary tool is an ordinary tool result.
 
 ### Fixed
 
+- `sanctuary castle-wall` commands end with their own exit code and no longer continue into the default startup path.
 - Linux-verified audit lock recovery uses exact process identity, serialized removal and a monotonic acquisition budget. Unprovable locks require operator recovery. macOS runtime verification remains pending.
 - Audit chains admit writers by their declared role and directory owner. Diagnostic readers preserve lock evidence, and storage listings retain surviving files when another candidate disappears.
 - Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.

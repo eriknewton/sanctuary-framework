@@ -29,3 +29,15 @@ describe("sanctuary wrap strict argv parsing (Finding EEE)", () => {
     expect(opts).toEqual({});
   });
 });
+
+describe("Hermes memory command isolation", () => {
+  it.each([[[]], [["--dry-run"]], [["--unwrap"]]])("accepts the memory command with %j", suffix => {
+    expect(parseWrapArgs(["--hermes-memory", ...suffix]).hermesMemory).toBe(true);
+  });
+  it.each(["--hermes", "--openclaw", "--no-dashboard", "--help", "--fortress", "--passphrase", "--preflight"])("rejects the memory command with %s", flag => {
+    expect(() => parseWrapArgs(["--hermes-memory", flag])).toThrow("accepts only");
+  });
+  it("rejects simultaneous dry run and removal", () => {
+    expect(() => parseWrapArgs(["--hermes-memory", "--dry-run", "--unwrap"])).toThrow("accepts only");
+  });
+});

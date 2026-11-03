@@ -25,6 +25,7 @@ MS_PER_SECOND = 1000
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--preinstalled", action="store_true")
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--home", required=True)
     parser.add_argument("--socket", required=True)
@@ -36,27 +37,28 @@ def main():
                       NO_PROXY="", no_proxy="")
     os.chdir(ROOT / "server")
     plugin_root = hermes_home / "plugins"
-    plugin_root.mkdir(parents=True)
-    for name in ("sanctuary", "sanctuary_memory"):
-        shutil.copytree(ROOT / "hermes-plugin" / name, plugin_root / name)
     log = home / "shim.log"
-    command = [shutil.which("node"), "--import", "tsx", str(ROOT / "server/test/hermes-plugin/harness/shim.ts"), args.socket, str(log)]
-    if args.scenario == "fault-insert":
-        command.append("--die-after-request")
-    if args.scenario == "no-shim":
-        command = [str(home / "missing-executable")]
-    (plugin_root / "sanctuary/shim-command.json").write_text(json.dumps(command))
-    enabled = ["sanctuary"]
-    if args.scenario in ("block-first", "approve-first"):
-        # Sorted directory discovery supplies both load orders without changing production callbacks.
-        other = "aaa_directive" if args.scenario == "approve-first" else "zzz_directive"
-        target = plugin_root / other
-        target.mkdir()
-        (target / "plugin.yaml").write_text("name: " + other + "\nkind: standalone\n")
-        (target / "__init__.py").write_text('def register(ctx):\n    ctx.register_hook("pre_tool_call", lambda **kwargs: {"action": "approve", "message": "Fixture confirmation."})\n')
-        enabled.append(other)
-    (hermes_home / "config.yaml").write_text(
-        "memory:\n  provider: sanctuary_memory\n  memory_enabled: false\n  user_profile_enabled: false\nplugins:\n  enabled: " + json.dumps(enabled) + "\n")
+    if not args.preinstalled:
+        plugin_root.mkdir(parents=True)
+        for name in ("sanctuary", "sanctuary_memory"):
+            shutil.copytree(ROOT / "hermes-plugin" / name, plugin_root / name)
+        command = [shutil.which("node"), "--import", "tsx", str(ROOT / "server/test/hermes-plugin/harness/shim.ts"), args.socket, str(log)]
+        if args.scenario == "fault-insert":
+            command.append("--die-after-request")
+        if args.scenario == "no-shim":
+            command = [str(home / "missing-executable")]
+        (plugin_root / "sanctuary/shim-command.json").write_text(json.dumps(command))
+        enabled = ["sanctuary"]
+        if args.scenario in ("block-first", "approve-first"):
+            # Sorted directory discovery supplies both load orders without changing production callbacks.
+            other = "aaa_directive" if args.scenario == "approve-first" else "zzz_directive"
+            target = plugin_root / other
+            target.mkdir()
+            (target / "plugin.yaml").write_text("name: " + other + "\nkind: standalone\n")
+            (target / "__init__.py").write_text('def register(ctx):\n    ctx.register_hook("pre_tool_call", lambda **kwargs: {"action": "approve", "message": "Fixture confirmation."})\n')
+            enabled.append(other)
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n  provider: sanctuary_memory\n  memory_enabled: false\n  user_profile_enabled: false\nplugins:\n  enabled: " + json.dumps(enabled) + "\n")
     captured = io.StringIO()
     report = {"executed_tools": [], "fallback": False}
     with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
@@ -78,6 +80,19 @@ def main():
         agent = AIAgent(base_url="http://127.0.0.1:9/v1", api_key="offline-fixture", model="offline-fixture",
                         provider="custom", enabled_toolsets=["sanctuary", "file"], quiet_mode=True,
                         tool_progress_mode="off", skip_context_files=True, tool_delay=0)
+        if args.preinstalled:
+            from agent.prompt_builder import load_soul_md, build_skills_system_prompt
+            from tools.mcp_tool import _load_mcp_config
+            report["mcp_names"] = list(_load_mcp_config())
+            report["soul"] = load_soul_md()
+            report["skills"] = build_skills_system_prompt()
+            if args.scenario == "uninstalled":
+                report["memory_store_none"] = agent._memory_store is None
+                providers = agent._memory_manager.providers if agent._memory_manager else []
+                report["provider"] = providers[0].name if providers else None
+                report["plugin_loaded"] = "sign_statement" in manager._plugin_tool_names
+                agent.close()
+                return report
         shared = sys.modules["sanctuary_hermes_client"]
         client = shared.get_client()
         observers = contextlib.ExitStack()
