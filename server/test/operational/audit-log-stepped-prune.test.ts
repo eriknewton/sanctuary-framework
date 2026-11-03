@@ -22,9 +22,14 @@ async function reap(child: ChildProcess) {
 }
 afterEach(async () => {
   await Promise.all(children.splice(0).map(reap));
-  vi.restoreAllMocks(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true });
+  vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true });
 });
 function gate() { let release!: () => void; const wait = new Promise<void>((resolve) => { release = resolve; }); return { wait, release }; }
+function controlPruneTime() {
+  // AuditLog uses setTimeout for the hold and performance.now for the episode budget;
+  // neither may elapse during real filesystem I/O before the test advances time.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+}
 async function setup(deadline?: number) {
   const path = join(root, "state"); await prepopulateAudit(path, CAP);
   const raw = new FilesystemStorage(path);
@@ -48,7 +53,7 @@ async function belowCut(raw: FilesystemStorage) {
 }
 
 it("stops a hold deadline between prune steps before publishing the next anchor", async () => {
-  // The short real hold expires while the second step reads its prospective base.
+  controlPruneTime();
   const { raw, log } = await setup(200);
   const read = raw.read.bind(raw); const hold = gate(); const entered = gate(); const settled = gate();
   let deletes = 0; let delay = true;
@@ -70,6 +75,8 @@ it("stops a hold deadline between prune steps before publishing the next anchor"
   const append = log.appendCritical(measureEntry(CAP));
   try {
     await Promise.race([entered.wait, append.then(() => { throw new Error("prune did not reach the second step"); })]);
+    // Fire the production deadline only while the second step's read is held.
+    await vi.advanceTimersByTimeAsync(log.writeLockHoldDeadlineMs);
     await append;
   } finally {
     hold.release();
@@ -175,7 +182,7 @@ it("repairs a step-three throwing delete on the very next append below the cap",
 });
 
 it("repairs a step-three anchor that lands after the hold deadline on the next append", async () => {
-  // A one-second hold allows three fast steps before the deliberately blocked anchor.
+  controlPruneTime();
   const { raw, log } = await setup(1_000);
   const write = raw.writeDurable.bind(raw); const entered = gate(); const release = gate(); const finished = gate();
   let anchors = 0;
@@ -193,6 +200,8 @@ it("repairs a step-three anchor that lands after the hold deadline on the next a
   const append = log.appendCritical(measureEntry(CAP));
   try {
     await Promise.race([entered.wait, append.then(() => { throw new Error("third anchor not reached"); })]);
+    // Fire the production deadline only while the third anchor's write is held.
+    await vi.advanceTimersByTimeAsync(log.writeLockHoldDeadlineMs);
     await append;
     expect((log as any).bytesProvenance).toBe("unknown");
     expect((log as any).unconfirmedPruneCutKey).not.toBeNull();
@@ -230,6 +239,7 @@ it("clears the recorded cut after a foreign prune moves past its key", async () 
 });
 
 it("limits a configured 300 ms hold episode to 100 ms plus one step", async () => {
+  controlPruneTime();
   const { raw, log } = await setup(300);
   const remove = raw.delete.bind(raw); const realNow = performance.now.bind(performance);
   // Two sixty-millisecond steps cross the one-third budget, so no third step may start.
