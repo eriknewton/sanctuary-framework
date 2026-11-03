@@ -182,6 +182,43 @@ describe("flushDurable", () => {
     await verify(storage);
   });
 
+  it("R1 reconciles another writer's coverage and restarts own count and age", async () => {
+    let now = 0;
+    const interval = 2; // One critical append before reconciliation and one after must not combine.
+    const { storage, log: writerA } = fixture({ checkpointInterval: interval, __testMonotonicNow: () => now });
+    await append(writerA); await durable(writerA);
+    const writerB = new AuditLog(storage, masterKey, { ...signedConfig,
+      checkpointInterval: interval, __testMonotonicNow: () => now });
+    await writerB.appendCritical({ layer: "l1", operation: "own-before", identity_id: "fixture", result: "success" });
+    await append(writerA);
+    await writerA.flush();
+    const covered = (await checkpoints(storage)).map(cp => cp.checkpoint_sequence);
+    expect(covered).toEqual([1, 3]); // Seed, then both writers' entries.
+
+    now = MAX_AGE_MS;
+    await durable(writerB);
+    expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual(covered);
+    const reads = vi.spyOn(storage, "read");
+    const auditReads = () => reads.mock.calls.filter(([ns]) => ns === "_audit" || ns === "_audit_checkpoints");
+    await durable(writerB);
+    expect(auditReads()).toHaveLength(0);
+    // An empty local hash buffer also makes a graceful barrier a no-op.
+    await writerB.flush();
+    expect(auditReads()).toHaveLength(0);
+
+    await writerB.appendCritical({ layer: "l1", operation: "own-after", identity_id: "fixture", result: "success" });
+    reads.mockClear();
+    await durable(writerB);
+    expect(auditReads()).toHaveLength(0);
+    expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual(covered);
+    now += MAX_AGE_MS - 1;
+    await durable(writerB);
+    expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual(covered);
+    now++;
+    await durable(writerB);
+    expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual([...covered, 4]);
+  });
+
   it("drains queue-only work before the durable barrier resolves", async () => {
     const { storage, log } = fixture();
     await append(log); await durable(log);

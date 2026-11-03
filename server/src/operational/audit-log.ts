@@ -7718,7 +7718,15 @@ export class AuditLog {
         }
         // Even an already-covered range must observe every above-floor body
         // fault before resolving, as the base's collector did.
-        if (fromSequence > checkpointSequence) return;
+        if (fromSequence > checkpointSequence) {
+          // a checkpoint written by another writer covers our entries too; stale local accounting would make every later barrier due and rescan the chain.
+          this.lastCheckpointSequence = previousCheckpointSequence;
+          // All own appends are at or below checkpointSequence under this write lock, so none remain uncovered.
+          this.hashesSinceCheckpoint = [];
+          this.criticalAppendsSinceCheckpoint = 0;
+          this.oldestUncheckpointedOwnEntryAt = undefined;
+          return;
+        }
         const hashes = collected.hashes;
         await this.writeCheckpointRecord({
           checkpoint_kind: "audit-checkpoint",

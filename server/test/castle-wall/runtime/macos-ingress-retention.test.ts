@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only adds the flushDurable barrier method to a mock AuditLog so the daemon composition still accepts it; no assertion changes, so it passes against pre-fix source by construction. Fail-before coverage for flushDurable lives in audit-log-flush-durable.test.ts and macos-flush-durable.test.ts.
 /** Bounded daemon ingestion under slow persistence, reconnects and expired approvals. */
 import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";

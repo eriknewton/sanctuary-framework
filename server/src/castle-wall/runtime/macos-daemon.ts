@@ -1278,7 +1278,7 @@ export async function startMacOSCastleWallDaemon(
       },
     },
     // A flow's durability barrier must preserve the daemon's amortized checkpoint cadence.
-    // This adapter must match the AuditSink interface in castle-wall/runtime/audit-consumer.ts:75.
+    // This adapter must match the AuditSink interface in castle-wall/runtime/audit-consumer.ts.
     auditSink: {
       append: (...args) => input.auditLog.append(...args),
       flush: () => input.auditLog.flushDurable(),
@@ -1443,7 +1443,7 @@ export async function startMacOSCastleWallDaemon(
           },
           "success",
         );
-        await input.auditLog.flushDurable();
+        await input.auditLog.flush();
       } catch {
         // Intentional no-op: see comment above (fail toward the alarm).
       }

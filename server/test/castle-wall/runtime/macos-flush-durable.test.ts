@@ -72,3 +72,41 @@ it("T5 real daemon amortizes 300 flows and heartbeat ticks, then stop seals the 
     expect(result.entries.at(-1)?.operation).toBe("filter_stopped");
   } finally { if (!stopped) await handle.stop(); }
 });
+
+it("R2 real daemon revoke seals the stand-down marker", async () => {
+  const key = ed25519.utils.randomPrivateKey();
+  const storage = new FilesystemStorage(join(home, "state"));
+  const audit = new AuditLog(storage, key, { checkpointInterval: INTERVAL, __testMonotonicNow: () => 0 });
+  expect(typeof audit.flushDurable).toBe("function");
+  let options!: MacOSCastleWallListenerOptions;
+  // Invoke real timer callbacks deterministically without changing filesystem or deadline timers.
+  vi.spyOn(globalThis, "setInterval").mockImplementation(() => {
+    return { unref() {} } as ReturnType<typeof setInterval>;
+  });
+  const count = async () => (await storage.list("_audit_checkpoints", "audit-checkpoint-")).length;
+  const handle = await startMacOSCastleWallDaemon({
+    fortressPath: home, fortressId: "durable-test", masterKey: key, auditLog: audit,
+    platform: "darwin", daemonMode: "safe", auditHeartbeatIntervalSeconds: HEARTBEAT_MS / 1000,
+    socketPath: join(home, "castle.sock"), activeConfigPath: join(home, "active.json"),
+    globalPinnedPublicKeyPath: join(home, "pin"), auditProducerPublicKeyPath: join(home, "producer"), auditProducerStatePath: null,
+    systemResolverProvider: async () => [], agentEgressProbe: async () => true,
+    signerClientInvoke: async (args, data) => ({ code: 0, stderr: "", stdout: Buffer.from(args[0] === "get-pubkey" ? ed25519.getPublicKey(key) : ed25519.sign(data!, key)).toString("base64url") }),
+    listenerFactory(opts) { options = opts; return { async start() {}, async stop() {}, async broadcastManifestUpdate() { return 0; }, async broadcastDecisionResponse() { return 0; }, async broadcastArmLease() { return 0; }, recycleConnection() { return false; } }; },
+  });
+  try {
+    await audit.flushDurable(); // Finish the startup heartbeat before measuring revoke.
+    const beforeRevoke = await count();
+    await options.onArmLeaseRevoke!({
+      type: "arm_lease", armed: false, ttl_seconds: null,
+      heartbeat_interval_seconds: HEARTBEAT_MS / 1000, updated_at: new Date().toISOString(),
+    });
+    expect(await count()).toBe(beforeRevoke + 1);
+    const entries = await storage.list("_audit");
+    const records = await storage.list("_audit_checkpoints", "audit-checkpoint-");
+    const sequences = await Promise.all(records.map(async ({ key: cpKey }) =>
+      JSON.parse(Buffer.from((await storage.read("_audit_checkpoints", cpKey))!).toString()).checkpoint_sequence as number));
+    expect(Math.max(...sequences)).toBe(entries.length);
+    const result = await new AuditLog(storage, key).query({ limit: entries.length });
+    expect(result.entries.at(-1)?.operation).toBe("arm_lease_revoked");
+  } finally { await handle.stop(); }
+});
