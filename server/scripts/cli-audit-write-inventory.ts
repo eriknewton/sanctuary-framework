@@ -230,9 +230,9 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   // to add a `castle_wall_pin_provisioned` audit entry is a separate decision.
   "castle-wall provision-pin": { classification: "mutator", auditOverride: false, notes: "M2: pins operator key under custody write lock; emits no dedicated audit entry today (gap recorded, not silently classified read-only)" },
 
-  "castle-wall install-full": { classification: "mutator", auditOverride: false, notes: "host launchd config; no fortress state" },
+  "castle-wall install-full": { classification: "mutator", auditOverride: false, notes: "host launchd config and fortress log directory creation" },
   "castle-wall uninstall-full": { classification: "mutator", auditOverride: false, notes: "host launchd config; no fortress state" },
-  "castle-wall reset-full": { classification: "mutator", auditOverride: false, notes: "resets the fortress supervision counter and requests launchd start" },
+  "castle-wall reset-full": { classification: "mutator", auditOverride: false, notes: "unloads the bound launchd job, removes fortress supervision counter and temp state, then bootstraps" },
   "castle-wall full-status": { classification: "read-only", auditOverride: false, notes: "reads the fortress supervision counter and bound launchd job" },
 
   // ---- exit ----

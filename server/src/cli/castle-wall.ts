@@ -236,6 +236,8 @@ export interface CastleWallCommandContext {
    */
   readFileSyncFn?: (path: string) => string;
   getuid?: () => number;
+  /** Parent identity seam for launchd-only full-agent admission; production reads process.ppid. */
+  getppid?: () => number;
   /**
    * TEST SEAM ONLY for the `re-pin` confirmation gate (house pattern, mirroring
    * `rotate-master.ts` `args.stdin` and `reset-passphrase.ts`): supply the
@@ -2607,6 +2609,11 @@ export async function runDaemon(
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
   const storagePath = resolveFortressArg(parsed.fortress, env);
+  // launchd's one-instance-per-label rule is the mutual exclusion; any other process touching the counter would break it, so it is refused.
+  if (launchAgent && (ctx.getppid?.() ?? process.ppid) !== 1) {
+    write(err, "--launch-agent requires a launchd-spawned process (parent pid 1).\n");
+    return 2;
+  }
   const fullAgentState = launchAgent ? new FullAgentStateStore(storagePath) : undefined;
   if (fullAgentState) {
     const admission = fullAgentState.admit();

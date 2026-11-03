@@ -1791,7 +1791,7 @@ function printCastleWallHelp(): void {
     install-full     Install the user-session full daemon (macOS, attended TTY).
     uninstall-full   Remove the user-session full daemon service (requires --yes).
     full-status      Show the full daemon restart state and running pid.
-    reset-full       Reset the stopped full daemon counter and start it (TTY, --yes).
+    reset-full       Unload, clear the full daemon counter and start it (TTY, --yes).
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.

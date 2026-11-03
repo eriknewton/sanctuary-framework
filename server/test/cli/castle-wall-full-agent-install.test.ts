@@ -16,19 +16,24 @@ class Capture extends Writable {
   text = "";
   override _write(chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void) { this.text += String(chunk); callback(); }
 }
-function fixture() {
+function fixture(fortressName = "fortress") {
   const root = fs.mkdtempSync("/tmp/j996-install-"); roots.push(root);
-  const home = join(root, "home"), fortress = join(root, "fortress"), cli = join(root, "cli.js");
+  const home = join(root, "home"), fortress = join(root, fortressName), cli = join(root, "cli.js");
   fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(fortress, { mode: 0o700 }); fs.writeFileSync(cli, "// fixture entry\n");
   let bootLoaded = false;
+  let fullLoaded = false;
   let loadedFortress: string | null = fortress;
   let pid: number | null = 1234; // Fixed fake launchd process identity; never signalled.
   const exec = vi.fn((_command: string, args: string[]): ExecFileResult => {
     if (args[0] === "print" && args[1] === `system/${CASTLE_WALL_BOOT_LABEL}`) {
       return bootLoaded ? { code: 0, stdout: "state = running\npid = 111\n", stderr: "" } : { code: 113, stdout: "", stderr: "Could not find service" };
     }
-    if (args[0] === "print") return { code: 0, stdout: (pid === null ? "state = exited\n" : `state = running\npid = ${pid}\n`) +
-      `arguments = {\n${process.execPath}\n${cli}\ncastle-wall\ndaemon\n${loadedFortress === null ? "" : `--fortress\n${loadedFortress}\n`}--launch-agent\n}\n`, stderr: "" };
+    if (args[0] === "print") return fullLoaded ? { code: 0, stdout: `gui/501/${api!.FULL_AGENT_LABEL} = {\n` +
+      (pid === null ? "state = exited\n" : `state = running\npid = ${pid}\n`) +
+      `arguments = {\n${process.execPath}\n${cli}\ncastle-wall\ndaemon\n${loadedFortress === null ? "" : `--fortress\n${JSON.stringify(loadedFortress)}\n`}--launch-agent\n}\n}\n`, stderr: "" } :
+      { code: 113, stdout: "", stderr: "Could not find service" };
+    if (args[0] === "bootstrap") fullLoaded = true;
+    if (args[0] === "bootout") fullLoaded = false;
     return { code: 0, stdout: "", stderr: "" };
   });
   const observe = vi.fn(async (): Promise<StoredPassphraseObservation> => ({ status: "found", result: { value: "fixture credential", source: "keychain", location: "fixture" }, keyringUnreachable: false }));
@@ -41,7 +46,7 @@ function fixture() {
     isTTY: true, cliPath: cli, execPath: process.execPath, out, err, fs: io,
     execFileFn: exec, observePassphrase: observe, sleep,
   };
-  return { setLoadedFortress: (value: string | null) => { loadedFortress = value; }, root, home, fortress, cli, out, err, ctx, exec, observe, sleep, write, setBoot: (value: boolean) => { bootLoaded = value; }, setPid: (value: number | null) => { pid = value; } };
+  return { setLoaded: (value: boolean) => { fullLoaded = value; }, io, setLoadedFortress: (value: string | null) => { loadedFortress = value; }, root, home, fortress, cli, out, err, ctx, exec, observe, sleep, write, setBoot: (value: boolean) => { bootLoaded = value; }, setPid: (value: number | null) => { pid = value; } };
 }
 
 describe("full agent attended commands", () => {
@@ -90,27 +95,6 @@ describe("full agent attended commands", () => {
     expect(fs.existsSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`))).toBe(false);
   });
 
-  it("resets a stopped latch before kickstart and status is never green for pid zero or a latch", async () => {
-    const f = fixture();
-    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
-    const store = new state!.FullAgentStateStore(f.fortress);
-    for (let i = 0; i <= state!.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
-    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
-    f.setPid(null);
-    const original = f.exec.getMockImplementation()!;
-    f.exec.mockImplementation((command, args) => {
-      if (args[0] === "kickstart") expect(store.read()?.state).toBe("state_STOPPED_CLEAN");
-      return original(command, args);
-    });
-    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(0);
-    expect(f.exec).toHaveBeenCalledWith("launchctl", ["kickstart", `gui/501/${api!.FULL_AGENT_LABEL}`]);
-    store.admit();
-    f.setPid(0); expect(await api!.runFullStatus([], f.ctx)).toBe(1);
-    f.setPid(1234); expect(await api!.runFullStatus([], f.ctx)).toBe(0);
-    f.setLoadedFortress(join(f.root, "other"));
-    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
-  });
-
   it.each(["plist", "loaded", "missing-plist", "missing-loaded", "both-other"])("status binds matching fortress and refuses %s mismatch", async source => {
     const f = fixture();
     expect(await api!.runInstallFull([], f.ctx)).toBe(0);
@@ -144,31 +128,20 @@ describe("full agent attended commands", () => {
     expect(f.err.text).toContain("the installed full LaunchAgent serves a different fortress");
   });
 
-  it("reset lock timeout reports failure without kickstart", async () => {
-    const f = fixture();
-    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
-    const store = new state!.FullAgentStateStore(f.fortress, { wait: () => {} });
-    for (let i = 0; i <= state!.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
-    f.ctx.stateStore = () => store;
-    f.setPid(null);
-    fs.writeFileSync(join(store.directory, "full-agent.lock"), JSON.stringify({ pid: process.pid, started_ms: 0 }), { mode: 0o600 });
-    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
-    expect(store.read()?.state).toBe("state_LATCHED");
-    expect(f.exec.mock.calls.some(([, args]) => args[0] === "kickstart")).toBe(false);
-    expect(f.err.text).toContain("reset-full failed");
-  });
-
   it.each([false, true])("bootstrap failure removes plist with loaded=%s", async loaded => {
     const f = fixture();
     const original = f.exec.getMockImplementation()!;
     f.exec.mockImplementation((command, args) => {
-      if (args[0] === "bootstrap") return { code: 1, stdout: "", stderr: "fixture bootstrap failure" };
+      if (args[0] === "bootstrap") { f.setLoaded(loaded); return { code: 1, stdout: "", stderr: "fixture bootstrap failure" }; }
       if (!loaded && args[0] === "print" && args[1] !== `system/${CASTLE_WALL_BOOT_LABEL}`) return { code: 113, stdout: "", stderr: "Could not find service" };
       return original(command, args);
     });
     expect(await api!.runInstallFull([], f.ctx)).toBe(1);
     expect(fs.existsSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`))).toBe(false);
     expect(f.exec.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(loaded);
+    const bootstrapIndex = f.exec.mock.calls.findIndex(([, args]) => args[0] === "bootstrap");
+    const rollbackCommands = f.exec.mock.calls.slice(bootstrapIndex + 1).map(([, args]) => args[0]);
+    expect(rollbackCommands).toEqual(loaded ? ["print", "bootout", "print"] : ["print", "print"]);
   });
 
   it("stable-pid failure boots out before removing plist", async () => {
@@ -193,4 +166,126 @@ describe("full agent attended commands", () => {
     expect(fs.existsSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`))).toBe(false);
     expect(await api!.runUninstallFull(["--yes"], f.ctx)).toBe(0);
   });
+  it.each(["corrupt", "state_RUNNING", "state_LATCHED", "temp", "absent", "state_STOPPED_CLEAN"])("reset recovers %s in unload-remove-bootstrap order", async kind => {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const store = new state!.FullAgentStateStore(f.fortress, { now: () => 1_000_000 });
+    if (kind !== "absent") store.admit();
+    if (kind === "corrupt") fs.writeFileSync(store.path, "{");
+    if (kind === "state_LATCHED") for (let i = 0; i < state!.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
+    if (kind === "state_STOPPED_CLEAN") store.stoppedClean();
+    if (kind === "state_LATCHED") expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    f.setPid(0); expect(await api!.runFullStatus([], f.ctx)).toBe(1); f.setPid(1234);
+    if (kind === "temp") fs.writeFileSync(join(store.directory, ".full-agent.tmp"), "unfinished", { mode: 0o600 });
+    const events: string[] = [];
+    f.ctx.stateStore = () => new state!.FullAgentStateStore(f.fortress, { fs: { ...fs, unlinkSync: path => {
+      events.push(String(path).endsWith(".tmp") ? "remove-temp" : "remove-record");
+      fs.unlinkSync(path);
+    } } });
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation((command, args) => {
+      const result = original(command, args);
+      if (args[0] === "bootout" || args[0] === "bootstrap") events.push(args[0]);
+      if (args[0] === "print" && result.code !== 0) events.push("unloaded");
+      return result;
+    });
+    expect(await api!.runResetFull(["--yes"], f.ctx), f.err.text).toBe(0);
+    expect(events).toEqual(["bootout", "unloaded", "remove-record", "remove-temp", "bootstrap"]);
+    expect(store.read()).toBeNull();
+    expect(fs.existsSync(join(store.directory, ".full-agent.tmp"))).toBe(false);
+    events.length = 0;
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(0);
+    expect(events).toEqual(["bootout", "unloaded", "remove-record", "remove-temp", "bootstrap"]);
+  });
+
+  it("reset refuses a still-loaded job without removing either state file", async () => {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const store = new state!.FullAgentStateStore(f.fortress); store.admit();
+    const before = fs.readFileSync(store.path);
+    const temp = join(store.directory, ".full-agent.tmp"); fs.writeFileSync(temp, "unfinished", { mode: 0o600 });
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation((command, args) => args[0] === "bootout" ? { code: 0, stdout: "", stderr: "" } : original(command, args));
+    f.exec.mockClear();
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(f.err.text).toContain("still loaded");
+    expect(f.exec.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(true);
+    expect(f.exec.mock.calls.filter(([, args]) => args[0] === "print").length).toBeGreaterThan(1);
+    expect(fs.readFileSync(store.path)).toEqual(before);
+    expect(fs.readFileSync(temp, "utf8")).toBe("unfinished");
+    expect(f.exec.mock.calls.some(([, args]) => args[0] === "bootstrap")).toBe(false);
+  });
+
+  it("a second reset after fsync failure succeeds from the unloaded state", async () => {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const store = new state!.FullAgentStateStore(f.fortress); store.admit();
+    let fail = true;
+    f.ctx.stateStore = () => new state!.FullAgentStateStore(f.fortress, { fs: { ...fs, fsyncSync: fd => {
+      if (fail) { fail = false; throw new Error("fixture fsync failed"); }
+      fs.fsyncSync(fd);
+    } } });
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(store.read()).toBeNull();
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(0);
+    expect(store.read()).toBeNull();
+  });
+
+  it.each(['pid = 1234', 'with spaces pid = 1234', 'with "quotes" pid = 1234'])("status ignores argument pid text in %s", async name => {
+    const f = fixture(name);
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    new state!.FullAgentStateStore(f.fortress).admit();
+    expect(await api!.runFullStatus([], f.ctx)).toBe(0);
+    f.setPid(null);
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(f.out.text).toContain("pid=none");
+    expect(f.err.text).not.toContain("different fortress");
+  });
+
+  it("status ignores pid fields in nested launchctl dictionaries", async () => {
+    const f = fixture(); expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    new state!.FullAgentStateStore(f.fortress).admit(); f.setPid(null);
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation((command, args) => {
+      const result = original(command, args);
+      result.stdout = result.stdout.replace("state = exited", "state = exited\nresource = {\npid = 1234\nchild = {\npid = 5678\n}\n}");
+      return result;
+    });
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(f.out.text).toContain("pid=none");
+  });
+
+  it("relative fortress requests refuse binding", async () => {
+    const f = fixture(); expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    new state!.FullAgentStateStore(f.fortress).admit();
+    const relative = (await import("node:path")).relative(process.cwd(), f.fortress);
+    expect(await api!.runFullStatus(["--fortress", relative], f.ctx)).toBe(1);
+    expect(await api!.runResetFull(["--yes", "--fortress", relative], f.ctx)).toBe(1);
+    f.setLoadedFortress(relative);
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+  });
+
+  it("rollback reports a distinct exit if bootout leaves the job loaded and removes plist", async () => {
+    const f = fixture();
+    f.sleep.mockImplementation(async () => { f.setPid(5678); });
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation((command, args) => args[0] === "bootout" ? { code: 0, stdout: "", stderr: "" } : original(command, args));
+    expect(await api!.runInstallFull([], f.ctx)).toBe(3);
+    expect(f.err.text).toContain("rollback incomplete: the job is still loaded; run uninstall-full");
+    expect(fs.existsSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`))).toBe(false);
+  });
+
+  it("install refuses an already loaded job without changing its plist or job", async () => {
+    const f = fixture(); expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const plist = join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`);
+    const before = fs.readFileSync(plist); const inode = fs.statSync(plist).ino;
+    f.exec.mockClear(); f.write.mockClear(); f.observe.mockClear();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(1);
+    expect(f.err.text).toContain("already installed; run uninstall-full first");
+    expect(f.write).not.toHaveBeenCalled(); expect(f.observe).not.toHaveBeenCalled();
+    expect(fs.readFileSync(plist)).toEqual(before); expect(fs.statSync(plist).ino).toBe(inode);
+    expect(f.exec.mock.calls.every(([, args]) => args[0] === "print")).toBe(true);
+  });
+
 });

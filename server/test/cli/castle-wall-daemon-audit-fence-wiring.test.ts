@@ -43,7 +43,7 @@ function context(uid: number) {
   let captured: MacOSCastleWallDaemonInput | undefined;
   const err = new Capture();
   const ctx: CastleWallCommandContext = {
-    out: new Capture(), err, platform: "darwin", getuid: () => uid,
+    out: new Capture(), err, platform: "darwin", getuid: () => uid, getppid: () => 1,
     env: { HOME: join(root, "home"), SANCTUARY_STORAGE_PATH: root, SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_CASTLE_LOCAL_SIGN: "1", SANCTUARY_TRANSPARENCY_INTERVAL: "off" },
     fullDaemonStart: async input => { captured = input; throw new Error("fixture captured before daemon start"); },
   };
@@ -66,6 +66,12 @@ describe("full daemon fence production wiring", () => {
     const array = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist)![1]!;
     const rendered = [...array.matchAll(/<string>(.*?)<\/string>/g)].map(match => match[1]!);
     const f = context(501);
+    f.ctx.getppid = () => 501;
+    expect(await runDaemon(rendered.slice(4), f.ctx)).toBe(2);
+    await expect(stat(join(root, "supervision"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.captured()).toBeUndefined();
+    expect(f.err.text).toContain("requires a launchd-spawned process");
+    f.ctx.getppid = () => 1;
     expect(await runDaemon(rendered.slice(4), f.ctx)).toBe(1);
     expect(f.captured()!.auditLog.processExitFence).toBe(state!.WALL_DAEMON_AUDIT_EXIT_FENCE);
     expect(JSON.parse(await readFile(join(root, "supervision", "full-agent.json"), "utf8")).state).toBe("state_RUNNING");
