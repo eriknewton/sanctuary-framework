@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.sanctuaryprotocol.castle-wall.full</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/node</string>
+		<string>/opt/sanctuary/cli.js</string>
+		<string>castle-wall</string>
+		<string>daemon</string>
+		<string>--fortress</string>
+		<string>/Users/operator/Fortress</string>
+		<string>--launch-agent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/operator/Fortress/logs/castle-wall-full.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/operator/Fortress/logs/castle-wall-full.err.log</string>
+	<key>WorkingDirectory</key>
+	<string>/</string>
+</dict>
+</plist>

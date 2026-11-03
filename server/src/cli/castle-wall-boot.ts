@@ -1047,7 +1047,7 @@ export async function runProvisionBootToken(
  * stayed up. Certifying a non-starting service would look like F1 is closed
  * while the brick survives. We require an observed running PID.
  */
-function serviceRunningPid(
+export function serviceRunningPid(
   execFileFn: (cmd: string, args: string[]) => ExecFileResult,
 ): number | null {
   const printed = printBootService(execFileFn);
