@@ -616,6 +616,8 @@ for (const faultKind of ["readdir", "raw-name"] as const) {
     else await fs.writeFile(join(path, "_audit", "key-!4E2D.enc"), "unaddressable fixture name");
     const write = vi.spyOn(raw, "writeDurable");
     await expect(log.appendCritical(measureEntry(3))).rejects.toMatchObject({
+      name: "AuditChainStateUnknownError", classification: "unknown",
+      cause: expect.objectContaining({ code: faultKind === "readdir" ? "EIO" : "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE" }),
       code: faultKind === "readdir" ? "EIO" : "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
     });
     expect(log.currentInMemorySequence()).toBe(3);

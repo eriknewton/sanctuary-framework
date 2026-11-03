@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - `sanctuary castle-wall` commands end with their own exit code and no longer continue into the default startup path.
 - Linux-verified audit lock recovery uses exact process identity, serialized removal and a monotonic acquisition budget. Unprovable locks require operator recovery. macOS runtime verification remains pending.
+- Audit discovery reports a typed outcome before sequence allocation. Unknown state requires operator investigation; an authenticated empty suffix continues from its current sealed boundary. Full verification and hold-deadline limits remain unchanged.
 - Audit chains admit writers by their declared role and directory owner. Diagnostic readers preserve lock evidence, and storage listings retain surviving files when another candidate disappears.
 - Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.
 - `sanctuary_active_protections` lists every protection layer with an evidence-based status and a plain-English summary, including layers that are off, not built, or unknown.
