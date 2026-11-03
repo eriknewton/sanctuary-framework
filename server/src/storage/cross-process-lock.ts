@@ -846,7 +846,7 @@ interface AcquiredKernelLock {
 
 // Six families: serialized quota, lifetime reader, first-use claim, custody recovery,
 // exclusive barrier and transient probe. Policy headroom 8 covers up to one transient
-// probe per concurrently acquiring family; ceil(log2(6 * 8)) gives 64, with 16 spare.
+// probe per concurrently acquiring family; 2^ceil(log2(6 * 8)) = 64, with 16 spare.
 // Must match the derivation assertion in test/storage/lock-teardown-ownership.test.ts.
 /** Process lifetime listener budget; new kernel acquisitions refuse when occupied. */
 export const MAX_RETAINED_KERNEL_LOCK_LISTENERS = 64;
@@ -1911,6 +1911,8 @@ export async function withExclusiveMasterRotationBarrier<T>(
     await options.__testAfterExclusiveDrain?.();
     assertAcquiredKernelLockHeld(acquired);
     assertMasterBarrierCoordinatesHeld(coordinates);
+    // Callback admission requires fresh ancestry and ownership after every awaited drain step.
+    assertKernelListenerAdmission(acquired);
     result = await exclusiveMasterBarrierScope.run(
       {
         storage,
@@ -2029,9 +2031,14 @@ async function withKernelPathLock<T>(
     options.abortSignal,
   );
   const controller = new AbortController();
+  let released = false;
   const lease: CrossProcessLockLease = {
     signal: controller.signal,
-    assertHeld: () => assertAcquiredKernelLockHeld(acquired),
+    assertHeld: () => {
+      // A released lease owes no further unlink and must not retain a closing or closed listener.
+      if (released) return;
+      assertAcquiredKernelLockHeld(acquired);
+    },
   };
   let result!: T;
   let operationError: unknown;
@@ -2039,11 +2046,14 @@ async function withKernelPathLock<T>(
   try {
     // Abort after bind still releases the acquired socket through this finally block.
     assertLockWaitNotAborted(options.abortSignal, acquired.socketPath);
+    // The acquiring continuation cannot authorize a callback in a later continuation.
+    assertKernelListenerAdmission(acquired);
     result = await operation(lease);
     lease.assertHeld();
   } catch (error) {
     operationError = error;
   } finally {
+    released = true;
     controller.abort();
     try {
       await releaseKernelLock(acquired, options.__testReleaseTimeoutMs);

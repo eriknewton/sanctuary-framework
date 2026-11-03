@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 const fixture = fileURLToPath(new URL("../fixtures/lock-teardown-child.ts", import.meta.url));
 // Must match test/fixtures/lock-teardown-child.ts: one command and response per role.
 type Command = "RELEASE" | "CHECK" | "EXIT" | "EXPIRE" | "CONTINUE";
-type Message = { directory?: string; overflowDenied?: boolean; denied?: number; queue?: number; writes?: number; spent?: number; expectedSpent?: number; boundaryLosses?: number; live?: number; before?: number; afterResult?: number; afterEvent?: number; pendingBefore?: boolean; afterEventPending?: boolean; closeCalls?: number; firstKind?: string; firstFailed?: boolean; sameRepeat?: boolean; sameConcurrent?: boolean; delivered?: number; aborts?: number; unregistered?: boolean; successorIntact?: boolean; reacquired?: number; exists?: boolean; primaryPreserved?: boolean; guardInCatch?: number; sameLockCallbacks?: number; sameLockKind?: string; otherCallbacks?: number; contendingCallbacks?: number; refusals?: number; heldStats?: number; readOnly?: number; inert?: number; reached?: boolean; available?: boolean; originalCause?: boolean; closes?: number; closeEvents?: number; observed?: string; phase: string; path?: string; held?: boolean; errors?: Array<{ kind?: string; message: string }>; guardAtUnref?: number; callbackCount?: number;
+type Message = { identitiesPreserved?: boolean; directory?: string; overflowDenied?: boolean; denied?: number; queue?: number; writes?: number; spent?: number; expectedSpent?: number; boundaryLosses?: number; live?: number; before?: number; afterResult?: number; afterEvent?: number; pendingBefore?: boolean; afterEventPending?: boolean; closeCalls?: number; firstKind?: string; firstFailed?: boolean; sameRepeat?: boolean; sameConcurrent?: boolean; delivered?: number; aborts?: number; unregistered?: boolean; successorIntact?: boolean; reacquired?: number; exists?: boolean; primaryPreserved?: boolean; guardInCatch?: number; sameLockCallbacks?: number; sameLockKind?: string; otherCallbacks?: number; contendingCallbacks?: number; refusals?: number; heldStats?: number; readOnly?: number; inert?: number; reached?: boolean; available?: boolean; originalCause?: boolean; closes?: number; closeEvents?: number; observed?: string; phase: string; path?: string; held?: boolean; errors?: Array<{ kind?: string; message: string }>; guardAtUnref?: number; callbackCount?: number;
   losses?: number; refused?: number; callbacks?: number; unexpected?: number; artifacts?: number; binds?: number; retained?: number; guards?: number; exportedBudget?: number };
 const STDERR_CAP_BYTES = 16_384; // 16 KiB, 1024 bytes per KiB.
 const LINE_BUFFER_CAP_BYTES = 65_536; // 64 KiB, 1024 bytes per KiB.
@@ -92,6 +92,36 @@ async function connectable(path: string): Promise<boolean> {
 }
 
 describe.runIf(process.platform === "linux" || process.platform === "darwin")("lock teardown ownership", () => {
+  for (const shape of ["ordinary", "exclusive"] as const) {
+    it(`L1 R: ${shape} callback requires fresh admission`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "lk1-")); roots.push(root);
+      const holder = await launch(root, "callback-admission", shape, "source", {
+        SANCTUARY_CUSTODY_LOCK_ROOT: join(root, "ancestor", "locks"),
+      });
+      await holder.phase("READY");
+      const fault = await holder.phase("FAULT_REACHED");
+      expect(fault.reached).toBe(true);
+      if (shape === "exclusive") expect(fault.identitiesPreserved).toBe(true);
+      const result = await holder.phase("DISPOSAL_SETTLED");
+      expect(result.callbackCount, "fresh admission refuses callback effects").toBe(0);
+      expect(result.errors?.some(error => error.kind === (shape === "ordinary" ? "holder-lost" : "scaffold-integrity"))).toBe(true);
+      expect(result).toMatchObject({ closes: 0, retained: 1, guardAtUnref: 1 });
+      holder.command("EXIT"); await holder.phase("RETURNED");
+      expect(await holder.done).toEqual({ code: 0, signal: null });
+    }, TEST_TIMEOUT_MS);
+  }
+
+  it("L5 R: assertHeld after path release does not retain a closed listener", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lk1-")); roots.push(root);
+    const holder = await launch(root, "released-lease");
+    await holder.phase("READY"); expect((await holder.phase("FAULT_REACHED")).reached).toBe(true);
+    const result = await holder.phase("DISPOSAL_SETTLED");
+    expect(result.errors, "released lease held check returns without a new failure").toEqual([]);
+    expect(result.guards).toBe(0);
+    holder.command("EXIT"); await holder.phase("RETURNED");
+    expect(await holder.done).toEqual({ code: 0, signal: null });
+  }, TEST_TIMEOUT_MS);
+
   for (const shape of ["ordinary", "reader", "exclusive"] as const) {
     it(`T2a E HEALTHY-LOCK: ${shape} exclusion and reacquisition`, async () => {
       const root = await mkdtemp(join(tmpdir(), "lk1-")); roots.push(root);

@@ -1,3 +1,4 @@
+// fail-before-exempt: L5 non-lock aggregate regression passes on a84d77ab; aggregate-implies-lock mutant must fail phase classification
 /** Own-memory admissions share durable, bounded caller budgets and hold on unavailable accounting. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
@@ -243,6 +244,21 @@ it("names the removable quota lock file only in the O_EXCL runbook paragraph", a
   expect(doc).toContain("loginctl enable-linger");
   expect(doc).toContain("process never holds");
   expect(doc).toContain("A `lock` hold means the save could not acquire or retain the directory lock: most often another process holds it; it also covers I/O errors on the lock directory and a holder lost after acquisition.");
+});
+
+// Must match aggregate lock classification in principal-policy/gate.ts.
+it("keeps the write phase for an aggregate without a lock member", async () => {
+  const failure = new AggregateError([
+    new Error("private quota body failure"),
+    new Error("private secondary failure"),
+  ]);
+  vi.spyOn(custody, "writeFileCustody").mockRejectedValue(failure);
+  expect((await save(gate())).tier).toBe(2);
+  const row = logs.find(e => e.operation === "memory_save_quota_unavailable");
+  expect(row!.details).toEqual({ cause_class: "write" });
+  expect(requests.at(-1)!.context).toMatchObject({ cause_class: "write" });
+  expect(requests.at(-1)!.context).not.toHaveProperty("lock_kind");
+  expect(JSON.stringify(logs)).not.toContain("private");
 });
 
 // Must match aggregate lock classification in principal-policy/gate.ts.

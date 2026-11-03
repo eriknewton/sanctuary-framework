@@ -506,6 +506,86 @@ if (role === "wrap") {
   report("DISPOSAL_SETTLED", { errors: errors(result), originalCause: members.some(error => error instanceof Error && error.cause === cause),
     primaryPreserved: members.includes(primary), guardInCatch, guardAtUnref, sameLockCallbacks, sameLockKind, otherCallbacks });
   await exit; report("RETURNED"); process.disconnect!();
+} else if (role === "callback-admission") {
+  const locks = await import("../../src/storage/cross-process-lock.js");
+  const fs = (await import("node:fs")).default;
+  const { dirname, join } = await import("node:path");
+  const runtime = process.env.SANCTUARY_CUSTODY_LOCK_ROOT!;
+  const ancestor = dirname(runtime);
+  await fsPromises.mkdir(ancestor, { recursive: true, mode: 0o700 });
+  const storage = new FilesystemStorage(target);
+  const originalRead = fsPromises.readdir, originalClose = Server.prototype.close;
+  let path = "", reached = false, callbackCount = 0, closes = 0, result: unknown;
+  let identitiesPreserved = false;
+  Server.prototype.close = function (this: Server, ...args: Parameters<Server["close"]>) {
+    if (path && this.address() === path) closes++;
+    return Reflect.apply(originalClose, this, args);
+  };
+  fsPromises.readdir = (async (...args: Parameters<typeof originalRead>) => {
+    const entries = await Reflect.apply(originalRead, fsPromises, args);
+    if (shape === "exclusive" && path && String(args[0]) === runtime && !reached) {
+      const paths = [runtime, path, storage.namespacePath("_meta")];
+      const before = paths.map(p => fs.lstatSync(p, { bigint: true }));
+      const oldAncestor = fs.lstatSync(ancestor, { bigint: true });
+      const displaced = `${ancestor}-original`;
+      fs.renameSync(ancestor, displaced);
+      fs.mkdirSync(ancestor, { mode: 0o700 });
+      fs.renameSync(join(displaced, "locks"), runtime);
+      identitiesPreserved = paths.every((p, index) => {
+        const after = fs.lstatSync(p, { bigint: true });
+        return after.dev === before[index]!.dev && after.ino === before[index]!.ino;
+      }) && fs.lstatSync(ancestor, { bigint: true }).ino !== oldAncestor.ino;
+      reached = true;
+      report("FAULT_REACHED", { reached, identitiesPreserved });
+    }
+    return entries;
+  }) as typeof originalRead;
+  syncBuiltinESMExports();
+  report("READY");
+  try {
+    if (shape === "ordinary") {
+      await locks.withPathLock(target, ".admission", async () => { callbackCount++; }, {
+        kernelBacked: true,
+        __testAfterKernelSocketAcquired: socket => {
+          path = socket;
+          // Two turns place the mutation between the acquire and caller continuations.
+          queueMicrotask(() => queueMicrotask(() => {
+            fs.unlinkSync(path);
+            reached = !fs.existsSync(path);
+            report("FAULT_REACHED", { reached });
+          }));
+        },
+      });
+    } else {
+      await locks.withExclusiveMasterRotationBarrier(storage, "_meta", "admission", async () => { callbackCount++; }, {
+        __testAfterExclusiveSocketAcquired: socket => { path = socket; },
+      });
+    }
+  } catch (error) { result = error; }
+  finally {
+    fsPromises.readdir = originalRead;
+    Server.prototype.close = originalClose;
+    syncBuiltinESMExports();
+  }
+  const registry = (globalThis as Record<symbol, unknown>)[Symbol.for("sanctuary.default-kernel-lock-retention.v1")] as
+    { records: Map<symbol, { socketPath: string; state: string }> };
+  const retained = [...registry.records.values()].filter(record => record.socketPath === path && record.state === "retained").length;
+  const exit = next("EXIT");
+  report("DISPOSAL_SETTLED", { callbackCount, closes, retained, guardAtUnref,
+    errors: result === undefined ? [] : errors(result) });
+  await exit; report("RETURNED"); process.disconnect!();
+} else if (role === "released-lease") {
+  const locks = await import("../../src/storage/cross-process-lock.js");
+  let saved: import("../../src/storage/cross-process-lock.js").CrossProcessLockLease | undefined;
+  let result: unknown;
+  report("READY");
+  await locks.withPathLock(target, ".released", async lease => { saved = lease; }, { kernelBacked: true });
+  report("FAULT_REACHED", { reached: saved!.signal.aborted });
+  try { saved!.assertHeld(); } catch (error) { result = error; }
+  const exit = next("EXIT");
+  report("DISPOSAL_SETTLED", { errors: result === undefined ? [] : errors(result),
+    guards: process.listenerCount("beforeExit") });
+  await exit; report("RETURNED"); process.disconnect!();
 } else if (role === "healthy-family") {
   const locks = await import("../../src/storage/cross-process-lock.js");
   const fs = (await import("node:fs")).default;
