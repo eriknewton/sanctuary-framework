@@ -661,7 +661,9 @@ export class MacOSFlowEventConsumer {
     // writes cannot accumulate retained summaries across heartbeat ticks.
     if (this.nonAgentSummaryWrite !== null) {
       this.nonAgentRootFlows.summaries_skipped_in_flight += 1;
-      return this.nonAgentSummaryWrite;
+      // A skipped tick returns at once rather than adopting the in-flight write, so
+      // retained reactions never grow with ticks; drainNonAgentFlowSummary awaits the slot.
+      return;
     }
     if (!this.hasUnpersistedNonAgentFlows()) return Promise.resolve();
     const snapshot = { ...this.nonAgentRootFlows };

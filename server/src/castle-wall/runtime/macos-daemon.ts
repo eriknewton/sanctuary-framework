@@ -2073,10 +2073,10 @@ export async function startMacOSCastleWallDaemon(
           // twice, but it must never be lost or turned into an allow.
           await Promise.race([
             // Both drains share the existing race budget. Behind an unsettled
-            // discard write, the final summary can delay filter_stopped by at most
-            // one additional input.auditLog.writeLockHoldDeadlineMs, whose default
-            // is DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS in operational/audit-log.ts:
-            // one queued summary adds one write-lock hold deadline. Ordering stays fixed.
+            // discard write, the final summary append runs next and filter_stopped
+            // waits for it in appendQueue order. This stop path claims no bound on
+            // that wait; the audit layer's admission and hold-callback timeouts do
+            // not cover filesystem settlement or lock release. Ordering stays fixed.
             Promise.all([consumer.drainIngressDrops(), consumer.drainNonAgentFlowSummary()]),
             new Promise<void>((resolve) => {
               discardDrainTimer = setTimeout(() => {
@@ -2088,7 +2088,7 @@ export async function startMacOSCastleWallDaemon(
           if (discardDrainTimer) clearTimeout(discardDrainTimer);
         }
         if (consumer.hasUnpersistedNonAgentFlows()) {
-          // Pending totals stay visible after timeout or fast failure, once per stop.
+          // SAFETY: operator-facing stop diagnostic; pending totals stay visible after timeout or fast failure, once per stop.
           console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
         }
         // #912 MED-1: carry any still-pending degraded-write count into the
