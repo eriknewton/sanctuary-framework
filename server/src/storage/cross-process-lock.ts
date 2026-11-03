@@ -1418,6 +1418,7 @@ export async function acquireMasterWriteBarrier(
       if (admittedLease) {
         try { await admittedLease.release(); }
         catch (disposalError) {
+          // eslint-disable-next-line preserve-caught-error -- intentional: the admission failure is the cause; the disposal error is carried in errors[]
           if (disposalError !== error) throw new AggregateError([error, disposalError], "reader admission and disposal failed", { cause: error });
         }
         throw error;
@@ -3285,6 +3286,7 @@ async function rejectAfterKernelDisposal(record: AcquiredKernelLock, error: unkn
   try { await releaseKernelLock(record); }
   catch (disposalError) {
     if (disposalError !== primary && disposalError !== error) {
+      // eslint-disable-next-line preserve-caught-error -- intentional: the acquisition failure is the cause; the disposal error is carried in errors[]
       throw new AggregateError([primary, disposalError], "kernel lock acquisition and disposal failed", { cause: primary });
     }
   }
@@ -3310,6 +3312,7 @@ function releaseKernelLock(
   acquired.disposal = new Promise<void>((yes, no) => { resolve = yes; reject = no; })
     .finally(() => reapKernelTestHelper(acquired));
   let settled = false;
+  // eslint-disable-next-line prefer-const -- assigned once below, after the closures that read it are created
   let timer: ReturnType<typeof setTimeout> | undefined;
   const fail = (cause: unknown): void => {
     if (settled) return;
