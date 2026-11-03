@@ -72,6 +72,7 @@ export const ENFORCEMENT_EVIDENCE_EVENT_TYPES: ReadonlySet<CastleWallEventType> 
   );
 
 /** Shape the consumer pushes into; `AuditLog.append` matches structurally. */
+// The adapter in castle-wall/runtime/macos-daemon.ts must match the AuditSink interface in castle-wall/runtime/audit-consumer.ts:75.
 export interface AuditSink {
   /**
    * Append one entry. The implementer is responsible for the actual

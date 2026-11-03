@@ -295,7 +295,7 @@ export interface AuditLogConfig {
   __testAuditAuthorityUid?: () => number;
   /** Test-only runtime rendezvous, validated exactly like the real root. */
   __testAuditGuardLockRoot?: string;
-  /** Test-only acquisition clock; must match __testMonotonicNow in storage/cross-process-lock.ts. */
+  /** Test-only monotonic clock for acquisition and tail age; must match __testMonotonicNow in storage/cross-process-lock.ts. */
   __testMonotonicNow?: () => number;
   /**
    * F2 Option A (fortress audit store split by writer): whether this
@@ -316,7 +316,7 @@ export interface AuditLogConfig {
    * compared against the legacy `_audit` chain's sealed tip sequence.
    */
   consultSplitBoundary?: boolean;
-  /** Write a checkpoint after this many critical appends. Default: 100. */
+  /** Checkpoint cadence for critical appends and all appends at durable flush. Default: 100; <= 0 disables the interval trigger. */
   checkpointInterval?: number;
   /**
    * Typed identity signing bridge for checkpoint records. Optional in the
@@ -496,6 +496,9 @@ type PersistedEntryHashCollection =
   | { status: "complete"; hashes: string[] }
   | { status: "incomplete"; reason: "gap" | "duplicate"; atSequence: number };
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
+/** Maximum age of an own uncheckpointed entry at a durable flush. */
+// At most six O(chain) checkpoint collections an hour, bounding the uncheckpointed-tail age at ten minutes.
+export const AUDIT_TAIL_CHECKPOINT_MAX_AGE_MS = 10 * 60_000;
 // In-memory retention bound for the decrypted recent-entry window the instance
 // holds in `this.entries` / `this.chainEntries`. On-disk rotation prunes the
 // PERSISTED log (authoritative), but the in-memory arrays were never trimmed:
@@ -2358,6 +2361,7 @@ export class AuditLog {
   private hashesSinceCheckpoint: string[] = [];
   private lastCheckpointSequence = 0;
   private criticalAppendsSinceCheckpoint = 0;
+  private oldestUncheckpointedOwnEntryAt: number | undefined;
   // The flag is a per-hold ownership token, not a process-wide latch: an
   // abandoned flight must not suppress its successor or clear it on late cleanup.
   private checkpointInFlight = false;
@@ -2834,6 +2838,31 @@ export class AuditLog {
    * `process.exit()` to keep audit writes durable.
    */
   async flush(): Promise<void> {
+    await this.drainPendingWrites();
+    await this.writeCheckpointIfNeeded("graceful-shutdown");
+  }
+
+  /**
+   * Wait for pending writes using the same persistence-error contract as flush(),
+   * checkpointing only the first nonempty tail or a tail due by count or age.
+   * Long-running consumers use this barrier; shutdown callers keep flush().
+   */
+  async flushDurable(): Promise<void> {
+    await this.drainPendingWrites();
+    const tailLength = this.nextSequence - 1 - this.lastCheckpointSequence;
+    // A hot-path flush is a durability barrier; tamper-evidence checkpoints are amortized per the checkpoint interval and bounded by tail age, never per append.
+    if (tailLength > 0 && (
+      // The first seal must match the keyed zero-checkpoint rule in cli/audit-chain-verify.ts:350.
+      this.lastCheckpointSequence === 0 ||
+      (this.checkpointInterval > 0 && tailLength >= this.checkpointInterval) ||
+      (this.oldestUncheckpointedOwnEntryAt !== undefined &&
+        this.monotonicNow() - this.oldestUncheckpointedOwnEntryAt >= AUDIT_TAIL_CHECKPOINT_MAX_AGE_MS)
+    )) {
+      await this.writeCheckpointIfNeeded("durable-flush-due");
+    }
+  }
+
+  private async drainPendingWrites(): Promise<void> {
     const failures: unknown[] = [];
     while (this.pendingWrites.size > 0) {
       const results = await Promise.allSettled([...this.pendingWrites]);
@@ -2845,7 +2874,6 @@ export class AuditLog {
       throw new AuditLogPersistenceError(failures);
     }
     await this.appendQueue;
-    await this.writeCheckpointIfNeeded("graceful-shutdown");
   }
 
   private enqueueAppend(
@@ -3027,6 +3055,7 @@ export class AuditLog {
         this.nextSequence = sequence + 1;
         this.lastEntryHash = entryHash;
         this.hashesSinceCheckpoint.push(entryHash);
+        this.oldestUncheckpointedOwnEntryAt ??= this.monotonicNow();
         // Bound the in-memory recent-entry window. Without this the arrays grow
         // one element per append forever (the long-running-daemon OOM); disk
         // rotation never touched them. Trimming here keeps the heap flat while
@@ -7706,6 +7735,7 @@ export class AuditLog {
         this.lastCheckpointSequence = checkpointSequence;
         this.hashesSinceCheckpoint = [];
         this.criticalAppendsSinceCheckpoint = 0;
+        this.oldestUncheckpointedOwnEntryAt = undefined;
       };
       if (held) {
         await write(held.keys, held.signal);

@@ -1175,7 +1175,7 @@ export async function startMacOSCastleWallDaemon(
         },
         result,
       );
-      await input.auditLog.flush();
+      await input.auditLog.flushDurable();
     })().catch((err: unknown) => {
       // SAFETY: never crash the daemon, never mask the alarm; the stderr line
       // has already fired before this append was attempted, so this is a
@@ -1277,7 +1277,12 @@ export async function startMacOSCastleWallDaemon(
         });
       },
     },
-    auditSink: input.auditLog,
+    // A flow's durability barrier must preserve the daemon's amortized checkpoint cadence.
+    // This adapter must match the AuditSink interface in castle-wall/runtime/audit-consumer.ts:75.
+    auditSink: {
+      append: (...args) => input.auditLog.append(...args),
+      flush: () => input.auditLog.flushDurable(),
+    },
     // Restore the producer-signed flow chain's anchor from the fortress's OWN
     // persisted audit log at startup (one-time old-basis migration included).
     // Same log instance the sink appends to — the anchor is recomputed from
@@ -1352,7 +1357,7 @@ export async function startMacOSCastleWallDaemon(
           },
           "success",
         );
-        await input.auditLog.flush();
+        await input.auditLog.flushDurable();
         return { ok: true };
       },
     },
@@ -1438,7 +1443,7 @@ export async function startMacOSCastleWallDaemon(
           },
           "success",
         );
-        await input.auditLog.flush();
+        await input.auditLog.flushDurable();
       } catch {
         // Intentional no-op: see comment above (fail toward the alarm).
       }
@@ -1608,7 +1613,7 @@ export async function startMacOSCastleWallDaemon(
           },
           "success",
         );
-        await input.auditLog.flush();
+        await input.auditLog.flushDurable();
       } catch {
         // A heartbeat write failure must never crash the daemon or take down
         // enforcement. The reader's silent-death detection fails toward an
@@ -1724,7 +1729,7 @@ export async function startMacOSCastleWallDaemon(
                 },
                 "failure",
               );
-              await input.auditLog.flush();
+              await input.auditLog.flushDurable();
             }
           }
         } catch {
@@ -1780,7 +1785,7 @@ export async function startMacOSCastleWallDaemon(
           { ...details, source },
           result,
         );
-        await input.auditLog.flush();
+        await input.auditLog.flushDurable();
       })(),
       reloadAuditDeadlineMs,
       `reload audit write (${operation}) did not complete within ${reloadAuditDeadlineMs}ms`,

@@ -339,7 +339,7 @@ describe("macOS ingress retention", () => {
         writes.push({ operation, counts: details?.counts as Record<string, number> | undefined });
         if (operation === "castle_wall_ingress_discarded") discarded += Object.values(details!.counts as Record<string, number>).reduce((a, b) => a + b, 0);
       },
-      async flush() {}, onWriteLockRecovery() {},
+      async flush() {}, async flushDurable() {}, onWriteLockRecovery() {},
     } as unknown as AuditLog;
     const key = ed25519.utils.randomPrivateKey();
     try {
