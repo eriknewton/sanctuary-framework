@@ -1,6 +1,7 @@
+// fail-before-exempt: deterministic test lifecycle for the recovery custody check; behavior unchanged
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readdir, readFile, realpath, symlink, writeFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, readFile, realpath, stat, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
@@ -10,7 +11,8 @@ import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { fromBase64url } from "../../src/core/encoding.js";
-import { establishMaster, unlockExistingMasterReadOnly } from "../../src/core/master-custody.js";
+import { CUSTODY_WRITE_LOCK_FILE, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, establishMaster, unlockExistingMasterReadOnly } from "../../src/core/master-custody.js";
+import { ensureKernelSocketRuntimeDirectory, withExclusiveMasterRotationBarrier } from "../../src/storage/cross-process-lock.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { persistUserProvidedPassphrase } from "../../src/wrap/passphrase.js";
 import { memoryProvenancePublicKeyFingerprint } from "../../src/sdw/memory-provenance-bad-signers.js";
@@ -61,6 +63,30 @@ async function fixture(aliasedParent = false) {
     await mkdir(dir, { mode: 0o700 });
   }
   const storage = new FilesystemStorage(join(fortress, "state"));
+  await mkdir(storage.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE), { mode: 0o700 });
+  const custodyRoot = await ensureKernelSocketRuntimeDirectory();
+  const { dev, ino } = await stat(storage.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE), { bigint: true });
+  // Must match resolveMasterBarrierCoordinates/acquireKernelLock in storage/cross-process-lock.ts:
+  // scaffold names use 40 digest hex characters; reader names use the first 24.
+  const digestFor = (name: string) => createHash("sha256").update(`${dev}:${ino}:${name}`).digest("hex");
+  const barrierDigest = digestFor(MASTER_ROTATION_BARRIER_NAME);
+  const custodyDigest = digestFor(CUSTODY_WRITE_LOCK_FILE);
+  const ownedNames = new Set([
+    `${barrierDigest.slice(0, 40)}.sock`, `${barrierDigest.slice(0, 40)}.reaper`,
+    `${barrierDigest.slice(0, 40)}.reader-reaper`,
+    `${custodyDigest.slice(0, 40)}.sock`, `${custodyDigest.slice(0, 40)}.reaper`,
+  ]);
+  const readerPrefix = `${barrierDigest.slice(0, 24)}.reader-`;
+  cleanups.push(async () => {
+    // LIFO teardown settles children first, then drains crash custody before the fixture inode can be reused.
+    await withExclusiveMasterRotationBarrier(storage, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, async () => undefined);
+    // Only this still-existing fixture's identities may be removed from the shared runtime directory.
+    for (const name of await readdir(custodyRoot)) {
+      if (ownedNames.has(name) || (name.startsWith(readerPrefix) && name.endsWith(".sock"))) {
+        await rm(join(custodyRoot, name), { force: true });
+      }
+    }
+  });
   await persistUserProvidedPassphrase(PASS, { home, storagePath: fortress, platformOverride: "freebsd" });
   const custody = await establishMaster({ storage, passphrase: PASS,
     firstRun: { installMode: "headless", mintRecoveryKey: false } });
@@ -83,7 +109,8 @@ function observe(child: ChildProcess) {
   child.stdout?.on("data", bytes => { stdout += String(bytes); });
   const exit = new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", code => resolve(code));
+    // Close includes stdio teardown, so cleanup cannot race output or inherited child pipes.
+    child.once("close", code => resolve(code));
   });
   cleanups.push(async () => {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
