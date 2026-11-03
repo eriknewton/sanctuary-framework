@@ -1,3 +1,4 @@
+// fail-before-exempt: test lease teardown for the LK1 listener budget; behavior on the base is unchanged
 /**
  * Federation rotate-root --renew (Slice 3a) tests. This rotates the
  * cross-machine ROOT OF TRUST (the federation signing master), so these are the
@@ -24,7 +25,7 @@
  * unlock path is exercised end to end.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Writable } from "node:stream";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -84,6 +85,30 @@ import {
   seedFederationIssuerFortress,
 } from "../util/federation-drill-seed.js";
 
+
+// Delegate custody acquisition unchanged; this in-process harness owns every returned lease.
+const { custodyLeases } = vi.hoisted(() => ({
+  custodyLeases: [] as import("../../src/storage/cross-process-lock.js").MasterWriteBarrierLease[],
+}));
+vi.mock("../../src/storage/cross-process-lock.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/cross-process-lock.js")>();
+  return {
+    ...actual,
+    acquireMasterWriteBarrier: async (...args: Parameters<typeof actual.acquireMasterWriteBarrier>) => {
+      const lease = await actual.acquireMasterWriteBarrier(...args);
+      custodyLeases.push(lease);
+      return lease;
+    },
+  };
+});
+
+async function releaseCustodyLeases(): Promise<void> {
+  // Release before deleting fixture paths so close can still verify their ownership.
+  const results = await Promise.allSettled(custodyLeases.splice(0).map(lease => lease.release()));
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), "Test custody lease teardown failed");
+}
+
 function capture() {
   let text = "";
   const stream = new Writable({
@@ -108,12 +133,16 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await rm(fortressPath, {
-    recursive: true,
-    force: true,
-    maxRetries: 5,
-    retryDelay: 50,
-  });
+  try {
+    await releaseCustodyLeases();
+  } finally {
+    await rm(fortressPath, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
+  }
 });
 
 /** Provision an issuer fortress (custody + operator + issuer trust root). */

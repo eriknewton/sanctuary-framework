@@ -1,3 +1,4 @@
+// fail-before-exempt: test lease teardown for the LK1 listener budget; behavior on the base is unchanged
 /**
  * CAPABILITY (STATE-DISCLOSE-UNATTRIB-01), CLI half: `sanctuary
  * state_disclose_unattributed` is a WIRED consumer of the disclosure surface,
@@ -18,7 +19,7 @@
  * failed there, which is what makes them assertions about the change.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { chmodSync } from "node:fs";
 import { join } from "node:path";
@@ -49,6 +50,30 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StateEntry } from "../../src/cognitive/state-store.js";
 import { runInit as runInitRaw, type InitOptions } from "../../src/wrap/init.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
+
+
+// Delegate custody acquisition unchanged; this in-process harness owns every returned lease.
+const { custodyLeases } = vi.hoisted(() => ({
+  custodyLeases: [] as import("../../src/storage/cross-process-lock.js").MasterWriteBarrierLease[],
+}));
+vi.mock("../../src/storage/cross-process-lock.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/cross-process-lock.js")>();
+  return {
+    ...actual,
+    acquireMasterWriteBarrier: async (...args: Parameters<typeof actual.acquireMasterWriteBarrier>) => {
+      const lease = await actual.acquireMasterWriteBarrier(...args);
+      custodyLeases.push(lease);
+      return lease;
+    },
+  };
+});
+
+async function releaseCustodyLeases(): Promise<void> {
+  // Release before deleting fixture paths so close can still verify their ownership.
+  const results = await Promise.allSettled(custodyLeases.splice(0).map(lease => lease.release()));
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), "Test custody lease teardown failed");
+}
 
 const NAMESPACE = "memories";
 const RESERVED_NAMESPACE = "_reputation";
@@ -280,12 +305,16 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   });
 
   afterEach(async () => {
-    delete process.env.SANCTUARY_STORAGE_PATH;
-    delete process.env.SANCTUARY_RECOVERY_KEY;
     try {
-      await rm(tmp, { recursive: true, force: true });
-    } catch {
-      // best-effort temp cleanup
+      await releaseCustodyLeases();
+    } finally {
+      delete process.env.SANCTUARY_STORAGE_PATH;
+      delete process.env.SANCTUARY_RECOVERY_KEY;
+      try {
+        await rm(tmp, { recursive: true, force: true });
+      } catch {
+        // best-effort temp cleanup
+      }
     }
   });
 

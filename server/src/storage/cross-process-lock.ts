@@ -47,9 +47,9 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { access, chmod, lstat, open, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
+import { access, lstat, open, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
-import { constants, lstatSync } from "node:fs";
+import { chmodSync, constants, lstatSync, realpathSync, writeSync } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -197,8 +197,8 @@ export type CrossProcessLockErrorKind =
 
 export class CrossProcessLockError extends Error {
   readonly kind: CrossProcessLockErrorKind;
-  constructor(message: string, kind: CrossProcessLockErrorKind = "io") {
-    super(message);
+  constructor(message: string, kind: CrossProcessLockErrorKind = "io", options?: ErrorOptions) {
+    super(message, options);
     this.name = "CrossProcessLockError";
     this.kind = kind;
   }
@@ -224,6 +224,8 @@ export async function probeKernelBackedCrossProcessLockCapability(
       reason: "the Node runtime does not expose a Unix process owner identity",
     };
   }
+  assertKernelListenerCapacity();
+  let bound = false;
   try {
     await access(kernelReaperCommand(host));
     const runtimeDir = await ensureKernelSocketRuntimeDirectory(undefined, undefined, runtimeRoot);
@@ -239,25 +241,28 @@ export async function probeKernelBackedCrossProcessLockCapability(
     if (Buffer.byteLength(probePath) > KERNEL_SOCKET_PATH_MAX_BYTES) {
       throw new Error("custody lock capability probe path is too long");
     }
-    const server = createServer((socket) => socket.destroy());
+    const runtime = await lstat(runtimeDir, { bigint: true });
+    const record = prepareKernelListener(probePath, { dev: String(runtime.dev), ino: String(runtime.ino) }, "", host);
     try {
-      await listenOnSocket(server, probePath);
-      await chmod(probePath, 0o600);
-      const stats = await lstat(probePath, { bigint: true });
-      assertOwnedSocket(probePath, stats);
-      if (!server.listening) throw new Error("custody lock probe listener stopped");
-    } finally {
-      await closeServer(server);
+      await listenOnSocket(record);
+      bound = true;
+      secureKernelListener(record);
+      assertKernelListenerAdmission(record);
+    } catch (error) {
+      bound = record.state !== "closed" && record.state !== "never_bound";
+      await rejectAfterKernelDisposal(record, error);
     }
+    await releaseKernelLock(record);
     return { available: true, command: "process-owned-unix-domain-socket" };
   } catch (error) {
+    if (bound || (error instanceof CrossProcessLockError && error.kind === "poisoned")) throw error;
     return { available: false, reason: errorMessage(error) };
   }
 }
 
-/** Legacy test-isolation seam; process-owned locks require no poison map. */
+/** Legacy test-isolation seam; retained ownership protection is process lifetime state. */
 export function resetKernelLockPoisonForTests(): void {
-  // Intentionally empty.
+  // Protection cannot be reset while any retained listener still owes pathname cleanup.
 }
 
 export interface CrossProcessLockOptions {
@@ -823,10 +828,175 @@ interface KernelDirectoryIdentity {
 interface AcquiredKernelLock {
   server: NetServer;
   socketPath: string;
-  socketIdentity: KernelDirectoryIdentity;
+  socketIdentity: Readonly<BigIntStats> | undefined;
+  state: KernelListenerState;
+  secured: boolean;
+  runtimeIdentity: Readonly<KernelDirectoryIdentity>;
+  ancestors: ReadonlyArray<{ path: string; dev: bigint; ino: bigint }>;
+  reservation: symbol;
+  registry: KernelListenerRegistry;
+  refunded: boolean;
+  disposal: Promise<void> | undefined;
+  failure: CrossProcessLockError | undefined;
   reaperScaffoldPath: string;
   host: NodeJS.Platform;
   testHelper?: ChildProcessWithoutNullStreams;
+  testHelperClosed: Promise<void>;
+}
+
+// Six families: serialized quota, lifetime reader, first-use claim, custody recovery,
+// exclusive barrier and transient probe. Policy headroom 8 covers up to one transient
+// probe per concurrently acquiring family; 2^ceil(log2(6 * 8)) = 64, with 16 spare.
+// Must match the derivation assertion in test/storage/lock-teardown-ownership.test.ts.
+/** Process lifetime listener budget; new kernel acquisitions refuse when occupied. */
+export const MAX_RETAINED_KERNEL_LOCK_LISTENERS = 64;
+const KERNEL_LISTENER_REGISTRY = Symbol.for("sanctuary.default-kernel-lock-retention.v1");
+const KERNEL_LISTENER_REGISTRY_VERSION = 1; // Version one of the shared main-isolate schema.
+const KERNEL_LISTENER_LIMIT_MESSAGE = "Kernel lock retention limit reached; restart this process after outstanding work settles.";
+type KernelListenerState = "never_bound" | "bound_identity_unknown" | "bound_identity_validated" | "retained" | "closing" | "closed";
+interface KernelListenerRegistry {
+  version: typeof KERNEL_LISTENER_REGISTRY_VERSION;
+  records: Map<symbol, AcquiredKernelLock>;
+  guardInstalled: boolean;
+  diagnosticAttempted: boolean;
+}
+
+function kernelListenerRegistry(): KernelListenerRegistry {
+  const shared = globalThis as typeof globalThis & { [KERNEL_LISTENER_REGISTRY]?: unknown };
+  if (!Object.prototype.hasOwnProperty.call(shared, KERNEL_LISTENER_REGISTRY)) {
+    shared[KERNEL_LISTENER_REGISTRY] = {
+      version: KERNEL_LISTENER_REGISTRY_VERSION, records: new Map(),
+      guardInstalled: false, diagnosticAttempted: false,
+    };
+  }
+  const value = shared[KERNEL_LISTENER_REGISTRY] as Partial<KernelListenerRegistry> | null;
+  // A malformed shared registry cannot be replaced without abandoning another copy's protection.
+  if (!value || value.version !== KERNEL_LISTENER_REGISTRY_VERSION || !(value.records instanceof Map) ||
+      typeof value.guardInstalled !== "boolean" || typeof value.diagnosticAttempted !== "boolean") {
+    throw new CrossProcessLockError("Kernel lock retention registry is invalid; restart this process.", "poisoned");
+  }
+  return value as KernelListenerRegistry;
+}
+
+function assertKernelListenerCapacity(): KernelListenerRegistry {
+  const registry = kernelListenerRegistry();
+  // Refuse admission instead of exiting so outstanding operations can finish their cleanup.
+  if (registry.records.size >= MAX_RETAINED_KERNEL_LOCK_LISTENERS) {
+    let cause: unknown;
+    if (!registry.diagnosticAttempted) {
+      registry.diagnosticAttempted = true;
+      try { writeSync(2, `${KERNEL_LISTENER_LIMIT_MESSAGE}\n`); } catch (error) { cause = error; }
+    }
+    throw new CrossProcessLockError(KERNEL_LISTENER_LIMIT_MESSAGE, "poisoned", { cause });
+  }
+  return registry;
+}
+
+function refundKernelListener(record: AcquiredKernelLock): void {
+  if (record.refunded) return;
+  record.refunded = true;
+  record.registry.records.delete(record.reservation);
+}
+
+function retainKernelListener(record: AcquiredKernelLock, error: CrossProcessLockError): CrossProcessLockError {
+  if (record.failure) return record.failure;
+  record.failure = error;
+  record.state = "retained";
+  // Retention never evicts or expires: every retained listener still owes unsafe pathname cleanup.
+  if (!record.registry.guardInstalled) {
+    // The guard must be synchronous before unref and permanent because any later drain can close retained listeners.
+    process.once("beforeExit", code => process.exit(code));
+    record.registry.guardInstalled = true;
+  }
+  record.server.unref();
+  return error;
+}
+
+function captureKernelAncestors(runtimeDir: string): Array<{ path: string; dev: bigint; ino: bigint }> {
+  const parent = realpathSync(dirname(runtimeDir));
+  const result: Array<{ path: string; dev: bigint; ino: bigint }> = [];
+  for (let path = parent; ; path = dirname(path)) {
+    const stats = lstatSync(path, { bigint: true });
+    assertSafeCustodyAncestor(path, stats, process.getuid!(), process.getgid?.() ?? -1);
+    result.push({ path, dev: stats.dev, ino: stats.ino });
+    if (dirname(path) === path) break;
+  }
+  return result;
+}
+
+function assertKernelListenerCoordinates(record: AcquiredKernelLock): void {
+  try {
+    for (const ancestor of record.ancestors) {
+      const stats = lstatSync(ancestor.path, { bigint: true });
+      assertSafeCustodyAncestor(ancestor.path, stats, process.getuid!(), process.getgid?.() ?? -1);
+      if (stats.dev !== ancestor.dev || stats.ino !== ancestor.ino) throw new Error("runtime ancestor changed");
+    }
+    const current = lstatSync(dirname(record.socketPath), { bigint: true });
+    if (!current.isDirectory() || current.isSymbolicLink() || Number(current.uid) !== process.getuid?.() ||
+        (Number(current.mode) & 0o077) !== 0 ||
+        String(current.dev) !== record.runtimeIdentity.dev || String(current.ino) !== record.runtimeIdentity.ino) {
+      throw new Error("runtime directory changed");
+    }
+  } catch (cause) {
+    throw new CrossProcessLockError("custody lock runtime ancestry changed during ownership validation", "scaffold-integrity", { cause });
+  }
+}
+
+function prepareKernelListener(
+  socketPath: string, runtimeIdentity: KernelDirectoryIdentity,
+  reaperScaffoldPath: string, host: NodeJS.Platform,
+): AcquiredKernelLock {
+  const registry = assertKernelListenerCapacity();
+  const ancestors = captureKernelAncestors(dirname(socketPath));
+  const record: AcquiredKernelLock = {
+    server: createServer(socket => socket.destroy()), socketPath, socketIdentity: undefined,
+    state: "never_bound", secured: false, runtimeIdentity, ancestors,
+    reservation: Symbol(), registry, refunded: false, disposal: undefined, failure: undefined,
+    reaperScaffoldPath, host, testHelperClosed: Promise.resolve(),
+  };
+  // Synchronous reservation covers the pending bind as well as every live, closing or retained listener.
+  registry.records.set(record.reservation, record);
+  return record;
+}
+
+function kernelListenerOwnershipError(record: AcquiredKernelLock): CrossProcessLockError | undefined {
+  let stats: BigIntStats;
+  try { stats = lstatSync(record.socketPath, { bigint: true }); }
+  catch (cause) {
+    return errorCode(cause) === "ENOENT"
+      ? new CrossProcessLockError(`custody lock socket changed before release (${record.socketPath})`, "holder-lost", { cause })
+      : new CrossProcessLockError("custody lock socket ownership could not be inspected", "io", { cause });
+  }
+  if (!record.server.listening || !record.socketIdentity ||
+      stats.dev !== record.socketIdentity.dev || stats.ino !== record.socketIdentity.ino) {
+    return new CrossProcessLockError(`custody lock socket changed before release (${record.socketPath})`, "holder-lost");
+  }
+  try {
+    if (record.secured) {
+      assertOwnedSocket(record.socketPath, stats);
+      // A secured listener keeps the owner read/write mode that authorized admission and cleanup.
+      if ((Number(stats.mode) & 0o777) !== 0o600) throw new Error("secured socket mode changed");
+    }
+    // Before securing, the immutable bind-time mode and uid are the authority for safe cleanup.
+    else if (!stats.isSocket() || stats.isSymbolicLink() || stats.uid !== record.socketIdentity.uid || stats.mode !== record.socketIdentity.mode) {
+      throw new Error("unsecured socket shape changed");
+    }
+  } catch (cause) { return new CrossProcessLockError("custody lock socket shape changed", "io", { cause }); }
+  return undefined;
+}
+
+function assertKernelListenerAdmission(record: AcquiredKernelLock): void {
+  assertKernelListenerCoordinates(record);
+  const error = kernelListenerOwnershipError(record);
+  if (error) throw error;
+}
+
+function secureKernelListener(record: AcquiredKernelLock): void {
+  // Fresh synchronous ownership prevents chmod from being applied using a stale bind observation.
+  assertKernelListenerAdmission(record);
+  chmodSync(record.socketPath, 0o600);
+  record.secured = true;
+  assertKernelListenerAdmission(record);
 }
 
 interface MasterBarrierCoordinates {
@@ -843,24 +1013,10 @@ interface MasterBarrierCoordinates {
 }
 
 function assertAcquiredKernelLockHeld(acquired: AcquiredKernelLock): void {
-  let current;
-  try {
-    current = lstatSync(acquired.socketPath, { bigint: true });
-  } catch {
-    current = null;
-  }
-  if (
-    !acquired.server.listening ||
-    current === null ||
-    String(current.dev) !== acquired.socketIdentity.dev ||
-    String(current.ino) !== acquired.socketIdentity.ino
-  ) {
-    throw new CrossProcessLockError(
-      `process-owned custody lock socket identity was lost (${acquired.socketPath})`,
-      "holder-lost",
-    );
-  }
-  assertOwnedSocket(acquired.socketPath, current);
+  if (acquired.failure) throw acquired.failure;
+  const error = kernelListenerOwnershipError(acquired);
+  // Held checks protect loss in the same stack while preserving the existing per-write identity/shape cost.
+  if (error) throw retainKernelListener(acquired, error);
 }
 
 async function resolveMasterBarrierCoordinates(
@@ -879,6 +1035,7 @@ async function resolveMasterBarrierCoordinates(
       "capability",
     );
   }
+  assertKernelListenerCapacity();
   const lockDir = capabilities.namespacePath(namespace);
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
   await assertLocalLockFilesystem(lockDir, host);
@@ -1180,33 +1337,15 @@ export async function acquireMasterWriteBarrier(
         "capability",
       );
     }
-    const server = createServer((socket) => socket.destroy());
-    let acquired: AcquiredKernelLock | undefined;
+    const acquired = prepareKernelListener(readerSocketPath, coordinates.runtimeIdentity,
+      coordinates.readerReaperScaffoldPath, host);
+    const server = acquired.server;
+    let admittedLease: MasterWriteBarrierLease | undefined;
     try {
-      await listenOnSocket(server, readerSocketPath);
-      await chmod(readerSocketPath, 0o600);
-      const currentRuntime = await lstat(coordinates.runtimeDir, { bigint: true });
-      if (
-        String(currentRuntime.dev) !== coordinates.runtimeIdentity.dev ||
-        String(currentRuntime.ino) !== coordinates.runtimeIdentity.ino
-      ) {
-        throw new CrossProcessLockError(
-          "master write barrier runtime directory changed during admission",
-          "holder-lost",
-        );
-      }
-      const stats = await lstat(readerSocketPath, { bigint: true });
-      assertOwnedSocket(readerSocketPath, stats);
-      acquired = {
-        server,
-        socketPath: readerSocketPath,
-        socketIdentity: { dev: String(stats.dev), ino: String(stats.ino) },
-        reaperScaffoldPath: coordinates.readerReaperScaffoldPath,
-        host,
-      };
+      await listenOnSocket(acquired);
+      secureKernelListener(acquired);
       if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
         await releaseKernelLock(acquired, options.__testReleaseTimeoutMs);
-        acquired = undefined;
         if (afterContention !== undefined) await afterContention();
         if (Date.now() - started >= timeoutMs) {
           throw new CrossProcessLockError(
@@ -1217,6 +1356,7 @@ export async function acquireMasterWriteBarrier(
         await sleep(retryMs);
         continue;
       }
+      assertKernelListenerAdmission(acquired);
       server.unref();
       const controller = new AbortController();
       let released = false;
@@ -1255,10 +1395,6 @@ export async function acquireMasterWriteBarrier(
             closePromise = releaseKernelLock(held, options.__testReleaseTimeoutMs)
               .then(() => {
                 closeFinished = true;
-              })
-              .catch((error) => {
-                closePromise = undefined;
-                throw error;
               });
           }
           await closePromise;
@@ -1266,6 +1402,7 @@ export async function acquireMasterWriteBarrier(
       };
       options.__testAfterSharedSocketAcquired?.(readerSocketPath);
       registerMasterWriteBarrier(storage, lease);
+      admittedLease = lease;
       // Round-2 (unbounded lock-dir growth): rotations are rare, so crashed
       // readers would otherwise leave sockets in the shared runtime dir forever.
       // Amortize cleanup on the acquire path: a bounded, best-effort reap of dead
@@ -1274,15 +1411,19 @@ export async function acquireMasterWriteBarrier(
       await evictStaleBarrierReaders(coordinates, readerSocketPath).catch(
         () => undefined,
       );
+      assertKernelListenerAdmission(acquired);
+      assertMasterBarrierCoordinatesHeld(coordinates);
       return lease;
     } catch (error) {
-      if (acquired !== undefined) {
-        await releaseKernelLock(acquired, options.__testReleaseTimeoutMs)
-          .catch(() => undefined);
-      } else {
-        await closeServer(server).catch(() => undefined);
+      if (admittedLease) {
+        try { await admittedLease.release(); }
+        catch (disposalError) {
+          // eslint-disable-next-line preserve-caught-error -- intentional: the admission failure is the cause; the disposal error is carried in errors[]
+          if (disposalError !== error) throw new AggregateError([error, disposalError], "reader admission and disposal failed", { cause: error });
+        }
+        throw error;
       }
-      throw error;
+      await rejectAfterKernelDisposal(acquired, error);
     }
   }
 }
@@ -1771,6 +1912,8 @@ export async function withExclusiveMasterRotationBarrier<T>(
     await options.__testAfterExclusiveDrain?.();
     assertAcquiredKernelLockHeld(acquired);
     assertMasterBarrierCoordinatesHeld(coordinates);
+    // Callback admission requires fresh ancestry and ownership after every awaited drain step.
+    assertKernelListenerAdmission(acquired);
     result = await exclusiveMasterBarrierScope.run(
       {
         storage,
@@ -1795,7 +1938,7 @@ export async function withExclusiveMasterRotationBarrier<T>(
   }
   if (operationError !== undefined && releaseError !== undefined) {
     throw new AggregateError(
-      [operationError, releaseError],
+      [...new Set([operationError, releaseError])],
       "master rotation failed and its exclusive barrier did not release cleanly",
       { cause: operationError },
     );
@@ -1852,6 +1995,7 @@ async function withKernelPathLock<T>(
       "capability",
     );
   }
+  assertKernelListenerCapacity();
   const timeoutMs = options.timeoutMs ?? CROSS_PROCESS_LOCK_TIMEOUT_MS;
   // An expired arrival cannot start custody acquisition, even before capability probing.
   assertLockWaitNotAborted(options.abortSignal, lockDir);
@@ -1888,27 +2032,13 @@ async function withKernelPathLock<T>(
     options.abortSignal,
   );
   const controller = new AbortController();
+  let released = false;
   const lease: CrossProcessLockLease = {
     signal: controller.signal,
     assertHeld: () => {
-      let current;
-      try {
-        current = lstatSync(acquired.socketPath, { bigint: true });
-      } catch {
-        current = null;
-      }
-      if (
-        !acquired.server.listening ||
-        current === null ||
-        String(current.dev) !== acquired.socketIdentity.dev ||
-        String(current.ino) !== acquired.socketIdentity.ino
-      ) {
-        throw new CrossProcessLockError(
-          `process-owned custody lock socket identity was lost (${acquired.socketPath})`,
-          "holder-lost",
-        );
-      }
-      assertOwnedSocket(acquired.socketPath, current);
+      // A released lease never reports itself held and must not retain a closing or closed listener.
+      if (released) throw new CrossProcessLockError("custody lock lease was released", "holder-lost");
+      assertAcquiredKernelLockHeld(acquired);
     },
   };
   let result!: T;
@@ -1917,11 +2047,14 @@ async function withKernelPathLock<T>(
   try {
     // Abort after bind still releases the acquired socket through this finally block.
     assertLockWaitNotAborted(options.abortSignal, acquired.socketPath);
+    // The acquiring continuation cannot authorize a callback in a later continuation.
+    assertKernelListenerAdmission(acquired);
     result = await operation(lease);
     lease.assertHeld();
   } catch (error) {
     operationError = error;
   } finally {
+    released = true;
     controller.abort();
     try {
       await releaseKernelLock(acquired, options.__testReleaseTimeoutMs);
@@ -1930,8 +2063,9 @@ async function withKernelPathLock<T>(
     }
   }
   if (operationError !== undefined && releaseError !== undefined) {
+    // Aggregate members must match the own-scope quota lock-cause consumer in principal-policy/gate.ts.
     throw new AggregateError(
-      [operationError, releaseError],
+      [...new Set([operationError, releaseError])],
       "custody operation failed and the process-owned lock did not release cleanly",
       { cause: operationError },
     );
@@ -2135,55 +2269,36 @@ async function acquireKernelLock(
     firstAttempt = false;
     // Every retry observes the caller deadline before attempting another bind.
     assertLockWaitNotAborted(abortSignal, socketPath);
-    const server = createServer((socket) => socket.destroy());
+    const acquired = prepareKernelListener(socketPath,
+      { dev: String(runtimeIdentity.dev), ino: String(runtimeIdentity.ino) }, reaperScaffoldPath, host);
     try {
-      await listenOnSocket(server, socketPath);
-      await chmod(socketPath, 0o600);
-      const currentRuntime = await lstat(runtimeDir, { bigint: true });
-      if (
-        currentRuntime.dev !== runtimeIdentity.dev ||
-        currentRuntime.ino !== runtimeIdentity.ino
-      ) {
-        throw new Error("custody lock runtime directory changed during bind");
-      }
-      const stats = await lstat(socketPath, { bigint: true });
-      assertOwnedSocket(socketPath, stats);
-      if (!server.listening) {
-        throw new Error("listener stopped before custody callback admission");
-      }
+      await listenOnSocket(acquired);
+      secureKernelListener(acquired);
       // The hook is test-only scheduling control; no hook means no await and no yield.
       const hook = options.__testAfterKernelSocketAcquired;
       if (hook !== undefined) await hook(socketPath);
       // A zero local timeout permits its single free bind; explicit caller deadlines always fence admission.
       if (!nonblockingFirstAttempt) assertBudget();
-      let testHelper: ChildProcessWithoutNullStreams | undefined;
+      assertKernelListenerAdmission(acquired);
       if (options.__testAfterKernelHolderAcquired) {
-        testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
+        const testHelper = acquired.testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
           stdio: ["pipe", "pipe", "pipe"],
         });
+        // Observe close before any failure so disposal also reaps helpers that fail to spawn.
+        acquired.testHelperClosed = new Promise(resolve => {
+          testHelper.once("close", () => resolve());
+          testHelper.once("error", () => undefined);
+        });
         if (testHelper.pid === undefined) {
-          await closeServer(server);
           throw new Error("test observer helper has no pid");
         }
         options.__testAfterKernelHolderAcquired(testHelper.pid);
       }
-      return {
-        server,
-        socketPath,
-        socketIdentity: { dev: String(stats.dev), ino: String(stats.ino) },
-        reaperScaffoldPath,
-        host,
-        ...(testHelper ? { testHelper } : {}),
-      };
+      assertKernelListenerAdmission(acquired);
+      return acquired;
     } catch (error) {
-      await closeServer(server).catch(() => undefined);
-      if (error instanceof CrossProcessLockError && error.kind === "contention") throw error;
-      const code = errorCode(error);
-      if (code !== "EADDRINUSE") {
-        throw new CrossProcessLockError(
-          `kernel custody lock could not bind ${socketPath}: ${errorMessage(error)}`,
-          "io",
-        );
+      if (errorCode(error) !== "EADDRINUSE" || acquired.state !== "closed") {
+        await rejectAfterKernelDisposal(acquired, error);
       }
       let observed = await lstat(socketPath, { bigint: true }).catch((cause) => {
         if (errorCode(cause) === "ENOENT") return null;
@@ -2764,6 +2879,52 @@ export function resolveCustodyLockRoot(
  * identity so {@link ensureKernelSocketRuntimeDirectory} can bind leaf creation
  * to the exact directory verified here, never re-resolving the original string.
  */
+function assertSafeCustodyAncestor(
+  dir: string,
+  stats: { mode: number | bigint; uid: number | bigint; gid: number | bigint; isSymbolicLink(): boolean; isDirectory(): boolean },
+  uid: number, gid: number,
+): void {
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      // A changed canonical directory tree is tampering, so refuse rather than degrade.
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is not a non-symlink directory. Check the custody lock directory owner and contents.`,
+        "scaffold-integrity",
+      );
+    }
+    const worldWritable = (Number(stats.mode) & 0o002) !== 0;
+    const groupWritable = (Number(stats.mode) & 0o020) !== 0;
+    const sticky = (Number(stats.mode) & 0o1000) !== 0;
+    if (worldWritable && !sticky) {
+      // Weakening operator-owned permissions requires the trusted operator account; writable parents stay environmental.
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is world-writable without the ` +
+          `sticky bit`,
+        "capability",
+      );
+    }
+    // A group-writable ancestor lets any member of its group create/rename
+    // entries; without the sticky bit a non-owner member can host the swap the
+    // fd binding closes, so refuse it unless the group is root or this uid's own
+    // group AND the sticky bit prevents non-owner renames.
+    const trustedGroup = Number(stats.gid) === 0 || (gid >= 0 && Number(stats.gid) === gid);
+    if (groupWritable && !(trustedGroup && sticky)) {
+      // Weakening operator-owned permissions requires the trusted operator account; writable parents stay environmental.
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is group-writable without a ` +
+          `trusted group and the sticky bit`,
+        "capability",
+      );
+    }
+    if (Number(stats.uid) !== 0 && Number(stats.uid) !== uid) {
+      // Changing operator-path ownership requires the trusted operator account; foreign ownership stays environmental.
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is owned by neither root nor ` +
+          `uid ${uid}`,
+        "capability",
+      );
+    }
+}
+
 async function assertSafeCustodyLockAncestry(
   leaf: string,
   uid: number,
@@ -2795,45 +2956,7 @@ async function assertSafeCustodyLockAncestry(
   let parentStats: Awaited<ReturnType<typeof lstat>> | undefined;
   for (const dir of chain.reverse()) {
     const stats = await lstat(dir);
-    if (stats.isSymbolicLink() || !stats.isDirectory()) {
-      // A changed canonical directory tree is tampering, so refuse rather than degrade.
-      throw new CrossProcessLockError(
-        `custody lock runtime ancestor '${dir}' is not a non-symlink directory. Check the custody lock directory owner and contents.`,
-        "scaffold-integrity",
-      );
-    }
-    const worldWritable = (stats.mode & 0o002) !== 0;
-    const groupWritable = (stats.mode & 0o020) !== 0;
-    const sticky = (stats.mode & 0o1000) !== 0;
-    if (worldWritable && !sticky) {
-      // Weakening operator-owned permissions requires the trusted operator account; writable parents stay environmental.
-      throw new CrossProcessLockError(
-        `custody lock runtime ancestor '${dir}' is world-writable without the ` +
-          `sticky bit`,
-        "capability",
-      );
-    }
-    // A group-writable ancestor lets any member of its group create/rename
-    // entries; without the sticky bit a non-owner member can host the swap the
-    // fd binding closes, so refuse it unless the group is root or this uid's own
-    // group AND the sticky bit prevents non-owner renames.
-    const trustedGroup = stats.gid === 0 || (gid >= 0 && stats.gid === gid);
-    if (groupWritable && !(trustedGroup && sticky)) {
-      // Weakening operator-owned permissions requires the trusted operator account; writable parents stay environmental.
-      throw new CrossProcessLockError(
-        `custody lock runtime ancestor '${dir}' is group-writable without a ` +
-          `trusted group and the sticky bit`,
-        "capability",
-      );
-    }
-    if (stats.uid !== 0 && stats.uid !== uid) {
-      // Changing operator-path ownership requires the trusted operator account; foreign ownership stays environmental.
-      throw new CrossProcessLockError(
-        `custody lock runtime ancestor '${dir}' is owned by neither root nor ` +
-          `uid ${uid}`,
-        "capability",
-      );
-    }
+    assertSafeCustodyAncestor(dir, stats, uid, gid);
     if (dir === canonicalParent) parentStats = stats;
   }
   // The loop always visits canonicalParent (chain[0], the leaf's direct parent),
@@ -3096,14 +3219,42 @@ async function settleOwnedSocketPermissions(
   return current;
 }
 
-async function listenOnSocket(server: NetServer, path: string): Promise<void> {
+async function listenOnSocket(record: AcquiredKernelLock): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => reject(error);
-    server.once("error", onError);
-    server.listen({ path, exclusive: true }, () => {
-      server.off("error", onError);
-      resolve();
-    });
+    let captured = false;
+    const capture = (): void => {
+      if (captured) return;
+      captured = true;
+      record.state = "bound_identity_unknown";
+      const stats = lstatSync(record.socketPath, { bigint: true });
+      assertKernelListenerCoordinates(record);
+      if (!stats.isSocket() || stats.isSymbolicLink() || Number(stats.uid) !== process.getuid?.()) {
+        throw new CrossProcessLockError("custody lock bind identity is invalid", "io");
+      }
+      // Capture at successful bind, before chmod or an awaited continuation can observe a successor.
+      record.socketIdentity = Object.freeze(stats);
+      record.state = "bound_identity_validated";
+    };
+    const onError = (error: Error): void => {
+      // Listen errors mean Node already disposed its handle; there is no remaining unlink obligation.
+      record.state = "closed";
+      refundKernelListener(record);
+      reject(error);
+    };
+    record.server.once("error", onError);
+    try {
+      record.server.listen({ path: record.socketPath, exclusive: true }, () => {
+        record.server.off("error", onError);
+        try { capture(); resolve(); } catch (error) { reject(error); }
+      });
+    } catch (error) {
+      record.server.off("error", onError);
+      onError(error as Error);
+      return;
+    }
+    if (record.server.listening) {
+      try { capture(); } catch (error) { reject(error); }
+    }
   });
 }
 
@@ -3129,79 +3280,112 @@ async function probeSocketOwner(
   });
 }
 
-async function closeServer(
-  server: NetServer,
-  timeoutMs = KERNEL_LOCK_RELEASE_TIMEOUT_MS,
-): Promise<void> {
-  if (!server.listening) return;
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new CrossProcessLockError(
-        `process-owned custody lock listener did not close within ${timeoutMs}ms`,
-        "holder-lost",
-      ));
-    }, timeoutMs);
-    timeout.unref?.();
-    server.close((error) => {
-      clearTimeout(timeout);
-      if (error) reject(error);
-      else resolve();
-    });
-  });
+async function rejectAfterKernelDisposal(record: AcquiredKernelLock, error: unknown): Promise<never> {
+  const primary = error instanceof CrossProcessLockError ? error
+    : new CrossProcessLockError(`kernel custody lock acquisition failed: ${errorMessage(error)}`, "io", { cause: error });
+  try { await releaseKernelLock(record); }
+  catch (disposalError) {
+    if (disposalError !== primary && disposalError !== error) {
+      // eslint-disable-next-line preserve-caught-error -- intentional: the acquisition failure is the cause; the disposal error is carried in errors[]
+      throw new AggregateError([primary, disposalError], "kernel lock acquisition and disposal failed", { cause: primary });
+    }
+  }
+  throw primary;
 }
 
-async function releaseKernelLock(
+function releaseKernelLock(
   acquired: AcquiredKernelLock,
   timeoutMs = KERNEL_LOCK_RELEASE_TIMEOUT_MS,
 ): Promise<void> {
-  if (acquired.testHelper) {
-    acquired.testHelper.stdin.end();
-    acquired.testHelper.kill("SIGTERM");
+  // A cached refusal or pending result survives close events and every repeated release.
+  if (acquired.disposal) return acquired.disposal;
+  if (acquired.failure) {
+    return acquired.disposal = Promise.reject(acquired.failure).finally(() => reapKernelTestHelper(acquired));
   }
-  const current = await lstat(acquired.socketPath, { bigint: true }).catch((error) => {
-    if (errorCode(error) === "ENOENT") return null;
-    throw error;
-  });
-  if (
-    current === null ||
-    String(current.dev) !== acquired.socketIdentity.dev ||
-    String(current.ino) !== acquired.socketIdentity.ino
-  ) {
-    // Node's public net.Server API always unlinks its pathname on close and has
-    // no supported unlinkOnClose=false option on the Node >=22 floor. Closing a
-    // displaced listener could therefore delete a successor at the same path.
-    // Fail-stop instead: unref the now-unreachable old listener so process exit
-    // releases the kernel fd without a normal pathname cleanup, and leave the
-    // successor byte-for-byte untouched.
-    acquired.server.unref();
-    throw new CrossProcessLockError(
-      `custody lock socket changed before release (${acquired.socketPath})`,
-      "holder-lost",
-    );
+  if (acquired.state === "closed" || acquired.state === "never_bound") {
+    acquired.state = "closed";
+    refundKernelListener(acquired);
+    return acquired.disposal = reapKernelTestHelper(acquired);
   }
-  assertOwnedSocket(acquired.socketPath, current);
-  await closeServer(acquired.server, timeoutMs);
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  acquired.disposal = new Promise<void>((yes, no) => { resolve = yes; reject = no; })
+    .finally(() => reapKernelTestHelper(acquired));
+  let settled = false;
+  // eslint-disable-next-line prefer-const -- assigned once below, after the closures that read it are created
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const fail = (cause: unknown): void => {
+    if (settled) return;
+    settled = true;
+    acquired.failure = cause instanceof CrossProcessLockError ? cause
+      : new CrossProcessLockError("custody lock listener close failed", "io", { cause });
+    if (timer && acquired.state === "closed") clearTimeout(timer);
+    reject(acquired.failure);
+  };
+  try {
+    if (acquired.state !== "bound_identity_validated") {
+      throw new CrossProcessLockError("custody lock bind identity is unknown", "holder-lost");
+    }
+    // Close unlinks synchronously, so only fresh synchronous ancestry and ownership may authorize it.
+    assertKernelListenerAdmission(acquired);
+  } catch (cause) {
+    const error = cause instanceof CrossProcessLockError ? cause
+      : new CrossProcessLockError("custody lock ownership validation failed", "io", { cause });
+    fail(retainKernelListener(acquired, error));
+    return acquired.disposal;
+  }
+  acquired.state = "closing";
+  const closed = (): void => {
+    acquired.state = "closed";
+    refundKernelListener(acquired);
+    if (timer && settled) clearTimeout(timer);
+  };
+  acquired.server.once("close", closed);
+  timer = setTimeout(() => {
+    // Once close was called no further unlink is owed; timeout refunds once without retry or retention.
+    acquired.state = "closed";
+    refundKernelListener(acquired);
+    fail(new CrossProcessLockError(`process-owned custody lock listener did not close within ${timeoutMs}ms`, "holder-lost"));
+  }, timeoutMs);
+  timer.unref?.();
+  try {
+    acquired.server.close(error => {
+      if (settled) return;
+      if (error) { fail(error); return; }
+      void finishKernelClose(acquired).then(() => {
+        if (!settled) { settled = true; if (timer && acquired.state === "closed") clearTimeout(timer); resolve(); }
+      }, fail);
+    });
+  } catch (error) { fail(error); }
+  return acquired.disposal;
+}
 
-  // Node normally removed the path as part of close. If this runtime leaves the
-  // socket inode behind, use the same serialized, repeated-probe, same-inode
-  // reaper as crash recovery. A successor has a different inode or answers live
-  // and is therefore never unlinked.
-  const after = await lstat(acquired.socketPath, { bigint: true }).catch((error) => {
+async function reapKernelTestHelper(record: AcquiredKernelLock): Promise<void> {
+  if (!record.testHelper) return;
+  // Disposal completes only after the observer's pipes and process have closed, including failed spawns.
+  record.testHelper.stdin.end();
+  record.testHelper.kill("SIGTERM");
+  await record.testHelperClosed;
+}
+
+async function finishKernelClose(acquired: AcquiredKernelLock): Promise<void> {
+  // The fallback may inspect only the captured inode after a successful close callback.
+  const after = await lstat(acquired.socketPath, { bigint: true }).catch(error => {
     if (errorCode(error) === "ENOENT") return null;
     throw error;
   });
-  if (
-    after !== null &&
-    String(after.dev) === acquired.socketIdentity.dev &&
-    String(after.ino) === acquired.socketIdentity.ino
-  ) {
+  if (after !== null && acquired.socketIdentity &&
+      after.dev === acquired.socketIdentity.dev && after.ino === acquired.socketIdentity.ino) {
     assertOwnedSocket(acquired.socketPath, after);
-    await reapStaleSocketWithSerializedAuthority(
-      acquired.socketPath,
-      acquired.socketIdentity,
-      acquired.reaperScaffoldPath,
-      acquired.host,
-    );
+    let scaffoldPath = acquired.reaperScaffoldPath;
+    if (!scaffoldPath) {
+      // A transient probe uses the shared probe scaffold so fallback has serialized authority without per-probe growth.
+      const name = ".probe.reaper";
+      await ensureInertLockScaffold(dirname(acquired.socketPath), name);
+      scaffoldPath = join(dirname(acquired.socketPath), name);
+    }
+    await reapStaleSocketWithSerializedAuthority(acquired.socketPath,
+      { dev: String(after.dev), ino: String(after.ino) }, scaffoldPath, acquired.host);
   }
 }
 

@@ -1,3 +1,4 @@
+// fail-before-exempt: test lease teardown for the LK1 listener budget; behavior on the base is unchanged
 /**
  * STEP1-F1: a CLI `memory_ingest` on a fresh fortress must establish the SDW
  * owner pin under the same rule the MCP persistent guard applies, so a
@@ -31,7 +32,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   runMemoryIngestCommand as runMemoryIngestCommandProduction,
@@ -52,6 +53,30 @@ import {
 } from "../../src/sdw/memory-isolation.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { writeReplayAnchor } from "../../src/sdw/write-gate.js";
+
+
+// Delegate custody acquisition unchanged; this in-process harness owns every returned lease.
+const { custodyLeases } = vi.hoisted(() => ({
+  custodyLeases: [] as import("../../src/storage/cross-process-lock.js").MasterWriteBarrierLease[],
+}));
+vi.mock("../../src/storage/cross-process-lock.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/cross-process-lock.js")>();
+  return {
+    ...actual,
+    acquireMasterWriteBarrier: async (...args: Parameters<typeof actual.acquireMasterWriteBarrier>) => {
+      const lease = await actual.acquireMasterWriteBarrier(...args);
+      custodyLeases.push(lease);
+      return lease;
+    },
+  };
+});
+
+async function releaseCustodyLeases(): Promise<void> {
+  // Release before deleting fixture paths so close can still verify their ownership.
+  const results = await Promise.allSettled(custodyLeases.splice(0).map(lease => lease.release()));
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), "Test custody lease teardown failed");
+}
 
 const FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/", import.meta.url),
@@ -136,10 +161,14 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
   });
 
   afterEach(async () => {
-    if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
-    else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
-    while (liveMasterKeys.length > 0) liveMasterKeys.pop()!.fill(0);
-    while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
+    try {
+      await releaseCustodyLeases();
+    } finally {
+      if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
+      while (liveMasterKeys.length > 0) liveMasterKeys.pop()!.fill(0);
+      while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
+    }
   });
 
   /** Real backend + real master key, exactly what the CLI and the MCP server
@@ -404,10 +433,14 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
     });
 
     afterEach(async () => {
-      if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
-      else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
-      while (liveMasterKeys.length > 0) liveMasterKeys.pop()!.fill(0);
-      while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
+      try {
+        await releaseCustodyLeases();
+      } finally {
+        if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+        else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
+        while (liveMasterKeys.length > 0) liveMasterKeys.pop()!.fill(0);
+        while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
+      }
     });
 
     async function realStorageAndMasterKey(): Promise<{
