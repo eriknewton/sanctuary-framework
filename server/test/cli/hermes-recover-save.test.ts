@@ -1,4 +1,5 @@
-// fail-before-exempt: deterministic test lifecycle for the recovery custody check; behavior unchanged
+// fail-before-exempt: test lifecycle for the recovery custody check; behavior unchanged
+import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readdir, readFile, realpath, stat, symlink, writeFile, rm } from "node:fs/promises";
@@ -11,7 +12,7 @@ import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { fromBase64url } from "../../src/core/encoding.js";
-import { CUSTODY_WRITE_LOCK_FILE, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, establishMaster, unlockExistingMasterReadOnly } from "../../src/core/master-custody.js";
+import { CUSTODY_WRITE_LOCK_FILE, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, establishMaster, unlockExistingMasterReadOnly, withCustodyWriteLock } from "../../src/core/master-custody.js";
 import { ensureKernelSocketRuntimeDirectory, withExclusiveMasterRotationBarrier } from "../../src/storage/cross-process-lock.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { persistUserProvidedPassphrase } from "../../src/wrap/passphrase.js";
@@ -30,7 +31,17 @@ const INTERRUPTED_CHUNKS = 2; // S2 requires two durable chunks before the proce
 const SAVE_SENTENCE = "Remember the blue garden beside the library. ";
 // One additional chunk beyond S2's stopping point guarantees an unfinished multi-chunk save.
 const SAVE_TEXT = SAVE_SENTENCE.repeat(Math.ceil(DEFAULT_MAX_CHUNK_CHARS * (INTERRUPTED_CHUNKS + 1) / SAVE_SENTENCE.length));
-const cleanups: Array<() => Promise<unknown>> = [];
+// Match the producer's 160-bit scaffold and 96-bit reader identity partitions (four bits per hex digit).
+const SCAFFOLD_DIGEST_HEX_CHARS = 160 / 4;
+const READER_DIGEST_HEX_CHARS = 96 / 4;
+// One serialized product reaper has a two-second deadline; allow that much time for inherited pipes to settle.
+const CHILD_CLOSE_GRACE_MS = 2_000;
+// Allow a killed direct child the same scheduling window as pipe settlement before reporting a reap failure.
+const CHILD_EXIT_WAIT_MS = CHILD_CLOSE_GRACE_MS;
+// Witness startup and teardown each allow exit, pipe settlement, and one extra scheduling window.
+const WITNESS_DEADLINE_MS = CHILD_EXIT_WAIT_MS + CHILD_CLOSE_GRACE_MS + CHILD_EXIT_WAIT_MS;
+type Cleanup = () => Promise<unknown>;
+const cleanups: Cleanup[] = [];
 const source = (path: string) => new URL(path, import.meta.url).href;
 const cli = source("../../src/cli.ts");
 const filesystem = source("../../src/storage/filesystem.ts");
@@ -40,18 +51,33 @@ type Fault = "S1" | "S2" | "S3" | "S3-unlink";
 // Each child installs the injected credential store before importing the real dispatcher.
 const preamble = `const { installInMemoryKeychainStore } = await import(${JSON.stringify(keychain)}); installInMemoryKeychainStore();`;
 
+async function runCleanups(stack: Cleanup[]) {
+  const failures: unknown[] = [];
+  while (stack.length) {
+    try { await stack.pop()!(); } catch (cause) { failures.push(cause); }
+  }
+  if (failures.length) throw new AggregateError(failures,
+    `Recovery fixture cleanup failed: ${failures.map(String).join("; ")}`);
+}
+
 afterEach(async () => {
   vi.restoreAllMocks();
-  const failures: unknown[] = [];
-  while (cleanups.length) {
-    try { await cleanups.pop()!(); } catch (cause) { failures.push(cause); }
-  }
-  if (failures.length) throw new AggregateError(failures, "Recovery fixture cleanup failed");
+  await runCleanups(cleanups);
 });
 
-async function fixture(aliasedParent = false) {
+async function fixture(aliasedParent = false, stack = cleanups) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "hermes-recover-")));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  let cleanupCustody: Cleanup = async () => undefined;
+  const cleanup = async () => {
+    try {
+      // Retain the namespace inode on every drain, completeness, or unlink failure, including partial setup.
+      await cleanupCustody();
+      await rm(root, { recursive: true, force: true });
+    } catch (cause) {
+      throw new Error(`Recovery fixture retained at ${root}`, { cause });
+    }
+  };
+  stack.push(cleanup);
   await mkdir(join(root, "home"), { mode: 0o700 });
   if (aliasedParent) await symlink(root, join(root, "alias"), "dir");
   const home = join(root, ...(aliasedParent ? ["alias"] : []), "home");
@@ -71,22 +97,27 @@ async function fixture(aliasedParent = false) {
   const digestFor = (name: string) => createHash("sha256").update(`${dev}:${ino}:${name}`).digest("hex");
   const barrierDigest = digestFor(MASTER_ROTATION_BARRIER_NAME);
   const custodyDigest = digestFor(CUSTODY_WRITE_LOCK_FILE);
-  const ownedNames = new Set([
-    `${barrierDigest.slice(0, 40)}.sock`, `${barrierDigest.slice(0, 40)}.reaper`,
-    `${barrierDigest.slice(0, 40)}.reader-reaper`,
-    `${custodyDigest.slice(0, 40)}.sock`, `${custodyDigest.slice(0, 40)}.reaper`,
+  const scaffoldNames = [
+    `${barrierDigest.slice(0, SCAFFOLD_DIGEST_HEX_CHARS)}.reaper`,
+    `${barrierDigest.slice(0, SCAFFOLD_DIGEST_HEX_CHARS)}.reader-reaper`,
+    `${custodyDigest.slice(0, SCAFFOLD_DIGEST_HEX_CHARS)}.reaper`,
+  ];
+  const socketNames = new Set([
+    `${barrierDigest.slice(0, SCAFFOLD_DIGEST_HEX_CHARS)}.sock`,
+    `${custodyDigest.slice(0, SCAFFOLD_DIGEST_HEX_CHARS)}.sock`,
   ]);
-  const readerPrefix = `${barrierDigest.slice(0, 24)}.reader-`;
-  cleanups.push(async () => {
-    // LIFO teardown settles children first, then drains crash custody before the fixture inode can be reused.
+  const readerPrefix = `${barrierDigest.slice(0, READER_DIGEST_HEX_CHARS)}.reader-`;
+  cleanupCustody = async () => {
+    // LIFO teardown settles children first; sequential real drains prove both holders have released.
     await withExclusiveMasterRotationBarrier(storage, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, async () => undefined);
-    // Only this still-existing fixture's identities may be removed from the shared runtime directory.
-    for (const name of await readdir(custodyRoot)) {
-      if (ownedNames.has(name) || (name.startsWith(readerPrefix) && name.endsWith(".sock"))) {
-        await rm(join(custodyRoot, name), { force: true });
-      }
-    }
-  });
+    await withCustodyWriteLock(storage, async () => undefined);
+    const names = await readdir(custodyRoot);
+    // This executed producer pin fails on naming drift before any scaffold or namespace is removed.
+    for (const name of scaffoldNames) expect(names, `Missing fixture scaffold ${name}`).toContain(name);
+    // Product release owns socket unlinking; an unexpected surviving socket retains the fixture for inspection.
+    expect(names.filter(name => socketNames.has(name) || (name.startsWith(readerPrefix) && name.endsWith(".sock")))).toEqual([]);
+    for (const name of scaffoldNames) await rm(join(custodyRoot, name), { force: true });
+  };
   await persistUserProvidedPassphrase(PASS, { home, storagePath: fortress, platformOverride: "freebsd" });
   const custody = await establishMaster({ storage, passphrase: PASS,
     firstRun: { installMode: "headless", mintRecoveryKey: false } });
@@ -95,28 +126,70 @@ async function fixture(aliasedParent = false) {
     await identities.load();
     const { storedIdentity } = createIdentity("recovery fixture", derivePurposeKey(custody.masterKey, "identity-encryption"), "passphrase");
     await identities.save(storedIdentity);
-    return { home, fortress, storage, env: { HOME: home, LANG: "C", TMPDIR: tmpdir(),
+    return { root, cleanup, home, fortress, storage, env: { HOME: home, LANG: "C", TMPDIR: tmpdir(),
       HERMES_MEMORY_BRIDGE_IDENTITY: memoryProvenancePublicKeyFingerprint(fromBase64url(storedIdentity.public_key)),
       HERMES_MEMORY_AGENT_ID: "agent-recovery", HERMES_MEMORY_FORTRESS_ID: fortressId } };
   } finally { await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0); }
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-function observe(child: ChildProcess) {
+async function within<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+function killOwnedGroup(child: ChildProcess) {
+  if (child.pid === undefined) return;
+  // All observed children are detached group leaders; never signal the test runner's process group.
+  try { process.kill(-child.pid, "SIGKILL"); }
+  catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ESRCH") throw cause; }
+}
+
+function destroyStdio(child: ChildProcess) {
+  for (const stream of child.stdio) stream?.destroy();
+}
+
+function observe(child: ChildProcess, stack = cleanups) {
   let stderr = "";
   let stdout = "";
   child.stderr?.on("data", bytes => { stderr += String(bytes); });
   child.stdout?.on("data", bytes => { stdout += String(bytes); });
+  const close = new Promise<void>(resolve => { child.once("close", () => resolve()); });
   const exit = new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);
-    // Close includes stdio teardown, so cleanup cannot race output or inherited child pipes.
-    child.once("close", code => resolve(code));
+    // Process exit is independent of inherited pipes; descendants cannot delay this observer.
+    child.once("exit", code => resolve(code));
   });
-  cleanups.push(async () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await exit;
+  const settled = exit.then(async code => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const closed = await Promise.race([close.then(() => true), new Promise<false>(resolve => {
+        timer = setTimeout(() => resolve(false), CHILD_CLOSE_GRACE_MS);
+      })]);
+      if (!closed) {
+        // Expired pipe settlement ends owned descendants and closes every local fd, including the relay.
+        try { killOwnedGroup(child); } finally { destroyStdio(child); }
+        await within(close, CHILD_EXIT_WAIT_MS, "Child stdio destruction");
+      }
+      return code;
+    } finally { clearTimeout(timer); }
   });
-  return { exit, stderr: () => stderr, stdout: () => stdout };
+  // Callers may inspect exit first; keep a settlement rejection observed until teardown reports it.
+  void settled.catch(() => undefined);
+  stack.push(async () => {
+    try {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await within(exit, CHILD_EXIT_WAIT_MS, "Child exit");
+      await settled;
+    } finally {
+      try { killOwnedGroup(child); } finally { destroyStdio(child); }
+    }
+  });
+  return { exit, settled, stderr: () => stderr, stdout: () => stdout };
 }
 
 function bridge(f: Fixture, fault?: Fault) {
@@ -146,7 +219,7 @@ function bridge(f: Fixture, fault?: Fault) {
     await import(${JSON.stringify(cli)});
   `;
   const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script],
-    { stdio: ["ignore", "pipe", "pipe", "pipe"], env: { ...process.env, VITEST: "true" } });
+    { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe"], env: { ...process.env, VITEST: "true" } });
   const observed = observe(child);
   const socket = child.stdio[3] as Duplex;
   const decoder = new PrivateFrameDecoder();
@@ -166,7 +239,7 @@ function bridge(f: Fixture, fault?: Fault) {
   const next = async () => {
     if (frames.length === 0) await Promise.race([
       new Promise<void>(resolve => { wake = resolve; }),
-      observed.exit.then(() => { throw new Error(`bridge exited: ${observed.stderr()}`); }),
+      observed.settled.then(() => { throw new Error(`bridge exited: ${observed.stderr()}`); }),
     ]);
     const frame = frames.shift();
     if (frame === undefined) throw new Error("missing bridge frame");
@@ -208,10 +281,10 @@ async function command(f: Fixture, apply = false, overrideArgv?: string[]) {
   const argv = overrideArgv ?? ["hermes", "recover-save", "--fortress", f.fortress, ...(apply ? ["--apply"] : [])];
   const script = `${preamble} process.argv = [process.execPath, ${JSON.stringify(cli)}, ...${JSON.stringify(argv)}]; await import(${JSON.stringify(cli)});`;
   const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
-    stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, HOME: f.home, SANCTUARY_PASSPHRASE: PASS, VITEST: "true", SANCTUARY_SKIP_UPDATE_CHECK: "1" },
+    detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, HOME: f.home, SANCTUARY_PASSPHRASE: PASS, VITEST: "true", SANCTUARY_SKIP_UPDATE_CHECK: "1" },
   });
   const observed = observe(child);
-  const code = await observed.exit;
+  const code = await observed.settled;
   return { code, out: observed.stdout(), err: observed.stderr() };
 }
 
@@ -261,6 +334,7 @@ async function readIntent(f: Fixture) {
 
 async function refusedStartup(f: Fixture) {
   const b = bridge(f);
+  await b.settled;
   expect(await b.exit).toBe(EXIT_STARTUP_REFUSED);
   expect(b.stderr()).toContain("startup refused");
 }
@@ -310,6 +384,7 @@ describe("Hermes save operator recovery", () => {
     const f = await fixture();
     await save(f, "target", SAVE_TEXT, "S1");
     const b = bridge(f);
+    await b.settled;
     expect(await b.exit).toBe(EXIT_STARTUP_REFUSED);
     expect(b.stderr().split("\n")).toContain("An earlier save did not finish; run `sanctuary hermes recover-save --fortress <dir>` to recover it.");
   });
@@ -545,5 +620,59 @@ describe("Hermes save operator recovery", () => {
     let out = "";
     expect(await runHermesRecoverSave({ argv: ["--help"], stdout: { write: value => { out += String(value); return true; } } })).toBe(0);
     expect(out).toContain("hermes recover-save");
+  });
+});
+
+describe("Recovery fixture lifecycle witnesses", () => {
+  it("bounds teardown when an exited child's grandchild holds stderr open", async () => {
+    const stack: Cleanup[] = [];
+    // The grandchild acknowledges its inherited stderr before the direct child exits.
+    const script = `
+      const { spawn } = require("node:child_process");
+      const grandchild = spawn(process.execPath, ["-e", ${JSON.stringify(`
+        setInterval(() => undefined, ${CHILD_CLOSE_GRACE_MS});
+        process.send("holding stderr");
+      `)}], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
+      grandchild.once("message", () => process.stdout.write(${JSON.stringify("holding stderr\n")}, () => process.exit(0)));
+    `;
+    const child = spawn(process.execPath, ["-e", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const directExit = new Promise<void>(resolve => { child.once("exit", () => resolve()); });
+    let closed = false;
+    child.once("close", () => { closed = true; });
+    const observed = observe(child, stack);
+    try {
+      await within(directExit, WITNESS_DEADLINE_MS, "Planted child startup");
+      expect(observed.stdout()).toBe("holding stderr\n");
+      expect(closed).toBe(false);
+      await within(runCleanups(stack), WITNESS_DEADLINE_MS, "Inherited stderr teardown");
+      expect(closed).toBe(true);
+      expect(child.stderr?.destroyed).toBe(true);
+    } finally {
+      // The same rescue runs against the old observer, so a failing witness leaves no live descendant.
+      try { killOwnedGroup(child); } finally { destroyStdio(child); }
+      await within(directExit, CHILD_EXIT_WAIT_MS, "Witness child exit");
+    }
+  });
+
+  it("retains and reports the fixture path when a planted barrier rejection stops cleanup", async () => {
+    const stack: Cleanup[] = [];
+    const f = await fixture(false, stack);
+    const namespace = f.storage.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE);
+    try {
+      // A real mode violation makes the production barrier reject even when tests run as root.
+      await chmod(namespace, 0o750);
+      const failure = await runCleanups(stack).catch(cause => cause);
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(existsSync(namespace), `Retained fixture ${f.root}`).toBe(true);
+      expect(failure.message).toContain(f.root);
+      expect((await stat(namespace)).isDirectory()).toBe(true);
+      expect((await stat(f.root)).isDirectory()).toBe(true);
+      expect(String(failure.errors[0].cause)).toContain("must be mode 0700");
+    } finally {
+      if (existsSync(namespace)) {
+        await chmod(namespace, 0o700);
+        await f.cleanup();
+      }
+    }
   });
 });
