@@ -104,6 +104,10 @@ describe("full agent restart state", () => {
     expect(store.admit()).toMatchObject({ admitted: false, exitCode: 0 });
     expect(fs.readFileSync(temporary, "utf8")).toBe("unfinished");
     expect(fs.readdirSync(store.directory).sort()).toEqual([".full-agent.tmp", "full-agent.json"]);
+    expect(() => store.reset()).toThrow("Only a latched full daemon can be reset.");
+    fs.unlinkSync(temporary);
+    for (let i = 0; i < loaded!.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
+    fs.writeFileSync(temporary, "unfinished", { mode: 0o600 });
     store.reset();
     expect(fs.existsSync(temporary)).toBe(false);
     expect(store.admit().admitted).toBe(true);
@@ -117,5 +121,98 @@ describe("full agent restart state", () => {
     const failing = new api.FullAgentStateStore(root, { fs: { ...io, writeFileSync: () => { throw new Error("fixture write failed"); } } });
     expect(() => failing.stoppedClean()).toThrow();
     expect(store.read()?.state).toBe("state_RUNNING");
+  });
+
+  it.each(["state_RUNNING", "state_STOPPED_CLEAN", "state_ABSENT"])("reset refuses %s without changing accounting", state => {
+    const { store } = fixture();
+    if (state !== "state_ABSENT") store.admit();
+    if (state === "state_STOPPED_CLEAN") store.stoppedClean();
+    const before = store.read();
+    expect(() => store.reset()).toThrow("Only a latched full daemon can be reset.");
+    expect(store.read()).toEqual(before);
+  });
+
+  it("reset waits and re-reads an admission published while it contends", () => {
+    const { api, root, store, io } = fixture();
+    for (let i = 0; i <= api.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
+    const lock = join(store.directory, "full-agent.lock");
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, started_ms: 0 }), { mode: 0o600 });
+    const running = { ...store.read()!, state: "state_RUNNING", latched_reason: null, charges_ms: [] };
+    const wait = vi.fn(() => {
+      // Inject the lock owner's publication and release before the reset can acquire.
+      expect(fs.existsSync(lock)).toBe(true);
+      fs.writeFileSync(store.path, JSON.stringify(running));
+      fs.unlinkSync(lock);
+    });
+    const resetting = new api.FullAgentStateStore(root, { fs: io, wait });
+    expect(() => resetting.reset()).toThrow("Only a latched full daemon can be reset.");
+    expect(wait).toHaveBeenCalledOnce();
+    expect(store.read()).toEqual(running);
+  });
+
+  it("reset cannot read or remove the publication slot while admission holds the lock", () => {
+    const { api, root, store, io } = fixture();
+    store.admit(); store.stoppedClean();
+    const wait = vi.fn();
+    const resetting = new api.FullAgentStateStore(root, { fs: io, wait });
+    let contention: unknown;
+    const admitting = new api.FullAgentStateStore(root, { fs: {
+      ...io,
+      renameSync: (from, to) => {
+        try { resetting.reset(); } catch (error) { contention = error; }
+        expect(fs.existsSync(from)).toBe(true);
+        fs.renameSync(from, to);
+      },
+    } });
+    expect(admitting.admit().admitted).toBe(true);
+    expect(contention).toMatchObject({ message: "state_io" });
+    expect(wait).toHaveBeenCalled();
+    expect(store.read()?.state).toBe("state_RUNNING");
+  });
+
+  it.each(["admit", "stoppedClean", "reset"] as const)("live-pid lock times out and %s fails closed", operation => {
+    const { api, root, store, io } = fixture();
+    store.admit();
+    if (operation === "reset") for (let i = 0; i < api.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
+    const before = store.read();
+    const lock = join(store.directory, "full-agent.lock");
+    const metadata = JSON.stringify({ pid: process.pid, started_ms: 0 });
+    fs.writeFileSync(lock, metadata, { mode: 0o600 });
+    const wait = vi.fn();
+    const contender = new api.FullAgentStateStore(root, { fs: io, wait });
+    if (operation === "admit") expect(contender.admit()).toMatchObject({ admitted: false, exitCode: 0, reason: "state_io" });
+    else expect(() => contender[operation]()).toThrow("state_io");
+    expect(store.read()).toEqual(before);
+    expect(fs.readFileSync(lock, "utf8")).toBe(metadata);
+    expect(wait.mock.calls.reduce((sum, [ms]) => sum + ms, 0)).toBe(api.FULL_AGENT_LOCK_WAIT_MS);
+  });
+
+  it("reclaims a proven dead-pid lock before admission", () => {
+    const { api, root, store, io } = fixture();
+    store.admit();
+    const lock = join(store.directory, "full-agent.lock");
+    const deadPid = 12345; // Injected identity, never sent to the OS.
+    fs.writeFileSync(lock, JSON.stringify({ pid: deadPid, started_ms: 0 }), { mode: 0o600 });
+    const probePid = vi.fn(() => { throw Object.assign(new Error("fixture dead"), { code: "ESRCH" }); });
+    const successor = new api.FullAgentStateStore(root, { fs: io, wait: () => {}, probePid });
+    expect(successor.admit().admitted).toBe(true);
+    expect(probePid).toHaveBeenCalledWith(deadPid);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(store.read()?.charges_ms).toHaveLength(1);
+  });
+
+  it("post-rename directory fsync failure succeeds with a visible clean stop and diagnostic", () => {
+    const { api, root, store, io, stderr } = fixture();
+    store.admit();
+    const failing = new api.FullAgentStateStore(root, { fs: {
+      ...io,
+      fsyncSync: fd => {
+        if (fs.fstatSync(fd).isDirectory()) throw new Error("fixture directory fsync failed");
+        fs.fsyncSync(fd);
+      },
+    } });
+    expect(() => failing.stoppedClean()).not.toThrow();
+    expect(store.read()?.state).toBe("state_STOPPED_CLEAN");
+    expect(stderr).toHaveBeenCalledWith(2, "[castle-wall] Clean stop published; supervision directory sync failed.\n");
   });
 });

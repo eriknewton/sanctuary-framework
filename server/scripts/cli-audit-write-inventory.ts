@@ -232,8 +232,8 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
 
   "castle-wall install-full": { classification: "mutator", auditOverride: false, notes: "host launchd config; no fortress state" },
   "castle-wall uninstall-full": { classification: "mutator", auditOverride: false, notes: "host launchd config; no fortress state" },
-  "castle-wall reset-full": { classification: "mutator", auditOverride: false, notes: "host launchd config; no fortress state" },
-  "castle-wall full-status": { classification: "read-only", auditOverride: false, notes: "host launchd config; no fortress state" },
+  "castle-wall reset-full": { classification: "mutator", auditOverride: false, notes: "resets the fortress supervision counter and requests launchd start" },
+  "castle-wall full-status": { classification: "read-only", auditOverride: false, notes: "reads the fortress supervision counter and bound launchd job" },
 
   // ---- exit ----
   "exit export":        { classification: "mutator", auditOverride: true, notes: "AuditLog.append in exit export handler" },
