@@ -2553,6 +2553,7 @@ export async function runDaemon(
   const env = ctx.env ?? process.env;
   const platform = ctx.platform ?? process.platform;
   const parsed = parseCastleWallArgs(argv);
+  // must match FULL_SUPERVISION_DEFAULT_CODES in server/src/castle-wall/runtime/full-supervision-exit.ts.
   if (writeCastleWallParseError(parsed, err)) return 2;
   const acceptBrokenChain = parsed.acceptBrokenChain ?? false;
 
@@ -3041,6 +3042,7 @@ export async function runDaemon(
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
+  // must match FULL_SUPERVISION_COMPLETION_CODES in server/src/castle-wall/runtime/full-supervision-exit.ts.
   return (await releaseDaemonMasterSession()) ? 0 : 1;
   } finally {
     // INVARIANT (daemon session ownership): any path after master unlock that
