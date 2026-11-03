@@ -1558,6 +1558,7 @@ export async function startMacOSCastleWallDaemon(
     const emitAuditHeartbeat = async (): Promise<void> => {
       prunePendingRequests();
       void consumer.flushIngressDrops();
+      void consumer.flushNonAgentFlowSummary();
       // RESERVATION carry (fix-round HIGH): take ownership of the pending
       // units synchronously BEFORE the append, so an overlapping beat (slow
       // append + short interval) reserves 0 and can never double-subtract
@@ -2071,9 +2072,17 @@ export async function startMacOSCastleWallDaemon(
           // the in-flight reservation) in memory. A late commit may report a count
           // twice, but it must never be lost or turned into an allow.
           await Promise.race([
-            consumer.drainIngressDrops(),
+            // Both drains share the existing stop budget; an unsettled summary
+            // retains its slot without extending the time to filter_stopped.
+            Promise.all([consumer.drainIngressDrops(), consumer.drainNonAgentFlowSummary()]),
             new Promise<void>((resolve) => {
-              discardDrainTimer = setTimeout(resolve, input.auditLog.writeLockHoldDeadlineMs);
+              discardDrainTimer = setTimeout(() => {
+                if (consumer.hasUnpersistedNonAgentFlows()) {
+                  // SAFETY: stderr must expose pending totals independently of an unsettled audit sink.
+                  console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
+                }
+                resolve();
+              }, input.auditLog.writeLockHoldDeadlineMs);
             }),
           ]);
         } finally {

@@ -6904,6 +6904,8 @@ function isCastleWallAuditEntry(entry: AuditEntry): boolean {
 }
 
 const CASTLE_WALL_AUDIT_OPERATIONS = new Set([
+  // Must match NON_AGENT_FLOW_SUMMARY_OPERATION in castle-wall/runtime/macos-non-agent-flows.ts.
+  "castle_wall_non_agent_flows_observed",
   "egress_allowed",
   "egress_blocked",
   "operator_decision",
