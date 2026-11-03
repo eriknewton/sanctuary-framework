@@ -1,3 +1,4 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 import { ed25519 } from "@noble/curves/ed25519";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -13,6 +14,7 @@ import {
 } from "../../src/contracts/v1.1/constants.js";
 import {
   EXIT_V2_MANIFEST_VERSION,
+  EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT,
   SDW_MEMORY_ARCHIVE_ARTIFACT_KIND,
   type ExitV2SdwMemoryArtifact,
   type ExitV2SdwMemoryLogicalPayload,
@@ -43,6 +45,7 @@ import type {
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
 import {
+  readMemoryTranscodeArchive,
   restoreMemoryTranscodeArchive,
   transcodeMemoryDirectory,
 } from "../../src/sdw/memory-transcode.js";
@@ -51,6 +54,8 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { KnownSignersStore } from "../../src/reputation/known-signers-store.js";
 import { testMemoryProvenanceDependencies } from "../sdw/test-memory-backend.js";
 import type { MemoryProvenanceSigningHandle } from "../../src/sdw/memory-provenance-contract.js";
+
+import { assertEncryptedJsonPrivacy } from "../helpers/assert-encrypted-privacy.js";
 
 const CLAUDE_FIXTURE = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/basic/", import.meta.url),
@@ -225,7 +230,34 @@ describe("Exit V2 SDW memory archive", () => {
     const publicBytes = Buffer.from(first.artifact_bytes).toString("utf8");
     expect(publicBytes).not.toContain("Prefer brief status notes with concrete next steps");
     expect(publicBytes).not.toContain("MEMORY.md");
-    expect(publicBytes).not.toContain(source.adapter.ownerRef);
+    const artifact = JSON.parse(publicBytes) as ExitV2SdwMemoryArtifact;
+    expect(Object.keys(artifact).sort()).toEqual(["aad", "encrypted_payload", "format"]);
+    const { encrypted_payload, ...metadata } = artifact;
+    expect(JSON.stringify({ fields: Object.keys(artifact), metadata }))
+      .not.toContain(source.adapter.ownerRef);
+    const payload = assertEncryptedJsonPrivacy(
+      JSON.stringify(encrypted_payload), source.adapter.ownerRef, first.transfer_key,
+      canonicalizeToBytes(artifact.aad),
+    );
+    const archive = await readMemoryTranscodeArchive(source.adapter, source.archiveId);
+    expect(payload).toEqual({
+      format: EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT,
+      transcode_version: archive.version,
+      state: "complete",
+      source_harness: archive.from_harness,
+      destination_harness: archive.to_harness,
+      source_owner_ref: archive.owner_ref,
+      source_archive_lineage_ref: first.source_lineage_ref,
+      source_file_count: archive.source_file_count,
+      source_set_sha256: archive.source_set_sha256,
+      projection_file_count: archive.projection_file_count,
+      projection_set_sha256: archive.projection_set_sha256,
+      files: archive.files.map((file) => ({
+        path: file.path, source_class: file.source_class,
+        bytes_base64url: toBase64url(Buffer.from(file.text, "utf8")),
+        size_bytes: file.size, sha256: file.sha256,
+      })),
+    });
     expect(publicBytes).not.toContain(source.archiveId);
     expect(publicBytes).not.toContain(Buffer.from(first.transfer_key).toString("hex"));
 

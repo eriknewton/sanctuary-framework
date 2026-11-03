@@ -1,3 +1,4 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 import { describe, expect, it } from "vitest";
 import {
   LocalPrivacyEngine,
@@ -9,6 +10,9 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString } from "../../src/core/encoding.js";
+import { decrypt } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { assertEncryptedJsonPrivacy } from "../helpers/assert-encrypted-privacy.js";
 import { PRIVACY_FIELD_PATH_PATTERN } from "../../src/contracts/v1.1/constants.js";
 
 const IDENTITY_ID = "did:example:operator";
@@ -16,7 +20,7 @@ const AGENT_ID = "agent-privacy-core";
 
 describe("v1.1 local privacy core", () => {
   it("filters nested objects and arrays with audit-safe metadata", async () => {
-    const { engine, vault, auditLog, storage } = setup();
+    const { engine, vault, auditLog, storage, masterKey } = setup();
     const policy = makePolicy({
       client_names: ["Acme Corp", "Acme"],
       project_names: ["Project Phoenix"],
@@ -91,12 +95,28 @@ describe("v1.1 local privacy core", () => {
 
     const vaultEntries = await storage.list("_privacy_placeholder_vault");
     expect(vaultEntries.length).toBeGreaterThan(0);
+    // Must match the vault purpose label in src/operational/privacy-filter.ts.
+    const vaultKey = derivePurposeKey(masterKey, "l2-privacy-placeholders");
+    const reloadedVault = new PrivacyPlaceholderVault(storage, masterKey);
     for (const entry of vaultEntries) {
       const raw = await storage.read(entry.namespace, entry.key);
       expect(raw).not.toBeNull();
       const stored = bytesToString(raw!);
       expect(stored).not.toContain("jane@example.com");
-      expect(stored).not.toContain("Acme");
+      expect(JSON.stringify(entry)).not.toContain("Acme");
+      const record = assertEncryptedJsonPrivacy(stored, "Acme", vaultKey);
+      expect(record.version).toBe(1);
+      if (record.kind === "placeholder") {
+        await expect(reloadedVault.resolvePlaceholder(record.placeholder as string, record.scope as string))
+          .resolves.toBe(record.raw_value);
+      } else if (record.kind === "field_path") {
+        await expect(reloadedVault.resolveFieldPathAlias(record.alias as string, record.scope as string))
+          .resolves.toBe(record.raw_path);
+      } else if (entry.key.endsWith("__path_index")) {
+        expect(record).toEqual({ version: 1, next: expect.any(Number) });
+      } else {
+        expect(record).toEqual({ version: 1, counters: expect.any(Object) });
+      }
       expect(stored).not.toContain("Project Phoenix");
       expect(stored).not.toContain("/Users/erik");
     }
@@ -104,6 +124,33 @@ describe("v1.1 local privacy core", () => {
     await expect(vault.resolvePlaceholder("CLIENT_1", IDENTITY_ID)).resolves.toBe(
       "Acme Corp"
     );
+  });
+
+  it("accepts authenticated ciphertext spelling Acme and rejects real metadata leaks", () => {
+    const key = new Uint8Array(256 / 8).fill(1); // Fixed AES-256 test key.
+    const expected = { raw_value: "Acme", padding: "xxD0F" };
+    // Fixed AES-GCM vector: IV bytes are all 9; padding aligns the Acme ciphertext window.
+    // No random search, crypto mock, or environment switch is involved in this witness.
+    const envelope = {
+      v: 1,
+      alg: "aes-256-gcm" as const,
+      iv: "CQkJCQkJCQkJCQkJ",
+      ct: "vy1Vr7lvcKATIS9tlP_EdPSiXNYW71WCUzFeLsxt3YUTAcmegoiflJemeXOjau_719BA0V6d",
+      ts: "2026-11-03T00:00:00.000Z",
+    };
+    const stored = JSON.stringify(envelope);
+    expect(envelope.ct).toContain("Acme");
+    expect(() => expect(stored).not.toContain("Acme")).toThrow();
+    expect(assertEncryptedJsonPrivacy(stored, "Acme", key)).toEqual(expected);
+
+    const leaked = { ...envelope, ts: "Acme" };
+    // Timestamp metadata is outside GCM authentication, so decryption alone misses this leak.
+    expect(JSON.parse(bytesToString(decrypt(leaked, key)))).toEqual(expected);
+    expect(() => assertEncryptedJsonPrivacy(JSON.stringify(leaked), "Acme", key))
+      .toThrow(/Acme/);
+    expect(() => assertEncryptedJsonPrivacy(
+      JSON.stringify({ ...envelope, raw_value: "Acme" }), "Acme", key,
+    )).toThrow();
   });
 
   it("uses repeated stable placeholders across payloads for the same identity", async () => {
@@ -297,6 +344,7 @@ describe("v1.1 local privacy core", () => {
 });
 
 function setup(): {
+  masterKey: Uint8Array;
   storage: MemoryStorage;
   vault: PrivacyPlaceholderVault;
   engine: LocalPrivacyEngine;
@@ -306,6 +354,7 @@ function setup(): {
   const masterKey = generateRandomKey();
   const vault = new PrivacyPlaceholderVault(storage, masterKey);
   return {
+    masterKey,
     storage,
     vault,
     engine: new LocalPrivacyEngine(vault, masterKey),

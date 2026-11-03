@@ -1,9 +1,13 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 import { describe, expect, it } from "vitest";
 
 import type { LocalHandoffRecord } from "../../src/contracts/v1.1/handoff-records.js";
-import { HandoffStore, HANDOFF_NAMESPACE } from "../../src/coordination/handoff-store.js";
+import { HandoffStore, HANDOFF_NAMESPACE, HANDOFF_PURPOSE_KEY } from "../../src/coordination/handoff-store.js";
 import { stringToBytes } from "../../src/core/encoding.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { assertEncryptedJsonPrivacy } from "../helpers/assert-encrypted-privacy.js";
 
 const MASTER_KEY = new Uint8Array(32).fill(17);
 
@@ -42,7 +46,9 @@ describe("HandoffStore", () => {
 
     const raw = await storage.read(HANDOFF_NAMESPACE, laterAccepted.handoff_id);
     expect(raw).not.toBeNull();
-    expect(new TextDecoder().decode(raw!)).not.toContain("agent-a");
+    expect(assertEncryptedJsonPrivacy(
+      new TextDecoder().decode(raw!), "agent-a", derivePurposeKey(MASTER_KEY, HANDOFF_PURPOSE_KEY),
+    )).toEqual(laterAccepted);
     expect(new TextDecoder().decode(raw!)).not.toContain("handoff-later");
 
     const reloaded = new HandoffStore(storage, MASTER_KEY);

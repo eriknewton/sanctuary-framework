@@ -1,3 +1,4 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 /**
  * Fleet control plane - signed compliance-attestation export (pure core).
  *
@@ -42,6 +43,8 @@ import {
 } from "../../src/entitlement/compliance-attestation.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { randomBytes } from "../../src/core/random.js";
+
+import { assertAttestationPrivacy } from "../helpers/assert-attestation-privacy.js";
 
 const NOW_ISO = "2026-07-07T12:00:00.000Z";
 
@@ -426,7 +429,7 @@ describe("sign + verify round-trip (fresh in-memory identity, no custody)", () =
     expect(decoded.length).toBe(32);
 
     const serialized = JSON.stringify(doc);
-    expect(serialized).not.toMatch(/private/i);
+    assertAttestationPrivacy(serialized, publicKey);
     expect(serialized).not.toMatch(/encrypted_private_key/i);
     expect(serialized).not.toMatch(/passphrase/i);
     expect(serialized).not.toMatch(/recovery/i);
