@@ -40,8 +40,8 @@ Server.prototype.unref = function () {
 };
 syncBuiltinESMExports();
 
-const { FilesystemStorage } = implementation === "built"
-  ? await import("../../dist/index.js")
+const { FilesystemStorage }: typeof import("../../src/storage/filesystem.js") = implementation === "built"
+  ? await import(new URL("../../dist/index.js", import.meta.url).href)
   : await import("../../src/storage/filesystem.js");
 if (role === "wrap") {
   const { registerHooks } = await import("node:module");
@@ -576,14 +576,27 @@ if (role === "wrap") {
   await exit; report("RETURNED"); process.disconnect!();
 } else if (role === "released-lease") {
   const locks = await import("../../src/storage/cross-process-lock.js");
+  const { unlinkSync } = await import("node:fs");
   let saved: import("../../src/storage/cross-process-lock.js").CrossProcessLockLease | undefined;
-  let result: unknown;
+  let path = "", result: unknown, releaseError: unknown;
   report("READY");
-  await locks.withPathLock(target, ".released", async lease => { saved = lease; }, { kernelBacked: true });
+  try {
+    await locks.withPathLock(target, ".released", async lease => {
+      saved = lease;
+      if (shape === "failed-release") lease.signal.addEventListener("abort", () => { unlinkSync(path); }, { once: true });
+    }, { kernelBacked: true, __testAfterKernelSocketAcquired: socket => { path = socket; } });
+  } catch (error) { releaseError = error; }
+  const registry = (globalThis as Record<symbol, unknown>)[Symbol.for("sanctuary.default-kernel-lock-retention.v1")] as
+    { records: Map<symbol, { state: string }> };
+  const retainedCount = () => [...registry.records.values()].filter(record => record.state === "retained").length;
+  const guardsBefore = process.listenerCount("beforeExit"), retainedBefore = retainedCount();
   report("FAULT_REACHED", { reached: saved!.signal.aborted });
   try { saved!.assertHeld(); } catch (error) { result = error; }
   const exit = next("EXIT");
   report("DISPOSAL_SETTLED", { errors: result === undefined ? [] : errors(result),
+    typedRefusal: result instanceof locks.CrossProcessLockError,
+    releaseErrors: releaseError === undefined ? [] : errors(releaseError),
+    guardsBefore, retainedBefore, retained: retainedCount(), records: registry.records.size,
     guards: process.listenerCount("beforeExit") });
   await exit; report("RETURNED"); process.disconnect!();
 } else if (role === "healthy-family") {

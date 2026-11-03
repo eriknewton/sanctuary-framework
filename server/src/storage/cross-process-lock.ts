@@ -2035,8 +2035,8 @@ async function withKernelPathLock<T>(
   const lease: CrossProcessLockLease = {
     signal: controller.signal,
     assertHeld: () => {
-      // A released lease owes no further unlink and must not retain a closing or closed listener.
-      if (released) return;
+      // A released lease never reports itself held and must not retain a closing or closed listener.
+      if (released) throw new CrossProcessLockError("custody lock lease was released", "holder-lost");
       assertAcquiredKernelLockHeld(acquired);
     },
   };

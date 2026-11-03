@@ -11,7 +11,8 @@ const fixture = fileURLToPath(new URL("../fixtures/lock-teardown-child.ts", impo
 // Must match test/fixtures/lock-teardown-child.ts: one command and response per role.
 type Command = "RELEASE" | "CHECK" | "EXIT" | "EXPIRE" | "CONTINUE";
 type Message = { identitiesPreserved?: boolean; directory?: string; overflowDenied?: boolean; denied?: number; queue?: number; writes?: number; spent?: number; expectedSpent?: number; boundaryLosses?: number; live?: number; before?: number; afterResult?: number; afterEvent?: number; pendingBefore?: boolean; afterEventPending?: boolean; closeCalls?: number; firstKind?: string; firstFailed?: boolean; sameRepeat?: boolean; sameConcurrent?: boolean; delivered?: number; aborts?: number; unregistered?: boolean; successorIntact?: boolean; reacquired?: number; exists?: boolean; primaryPreserved?: boolean; guardInCatch?: number; sameLockCallbacks?: number; sameLockKind?: string; otherCallbacks?: number; contendingCallbacks?: number; refusals?: number; heldStats?: number; readOnly?: number; inert?: number; reached?: boolean; available?: boolean; originalCause?: boolean; closes?: number; closeEvents?: number; observed?: string; phase: string; path?: string; held?: boolean; errors?: Array<{ kind?: string; message: string }>; guardAtUnref?: number; callbackCount?: number;
-  losses?: number; refused?: number; callbacks?: number; unexpected?: number; artifacts?: number; binds?: number; retained?: number; guards?: number; exportedBudget?: number };
+  losses?: number; refused?: number; callbacks?: number; unexpected?: number; artifacts?: number; binds?: number; retained?: number; guards?: number; exportedBudget?: number;
+  typedRefusal?: boolean; releaseErrors?: Array<{ kind?: string; message: string }>; guardsBefore?: number; retainedBefore?: number; records?: number };
 const STDERR_CAP_BYTES = 16_384; // 16 KiB, 1024 bytes per KiB.
 const LINE_BUFFER_CAP_BYTES = 65_536; // 64 KiB, 1024 bytes per KiB.
 const STEP_TIMEOUT_MS = 15_000; // One lifecycle fixture RPC budget.
@@ -111,16 +112,22 @@ describe.runIf(process.platform === "linux" || process.platform === "darwin")("l
     }, TEST_TIMEOUT_MS);
   }
 
-  it("L5 R: assertHeld after path release does not retain a closed listener", async () => {
-    const root = await mkdtemp(join(tmpdir(), "lk1-")); roots.push(root);
-    const holder = await launch(root, "released-lease");
-    await holder.phase("READY"); expect((await holder.phase("FAULT_REACHED")).reached).toBe(true);
-    const result = await holder.phase("DISPOSAL_SETTLED");
-    expect(result.errors, "released lease held check returns without a new failure").toEqual([]);
-    expect(result.guards).toBe(0);
-    holder.command("EXIT"); await holder.phase("RETURNED");
-    expect(await holder.done).toEqual({ code: 0, signal: null });
-  }, TEST_TIMEOUT_MS);
+  for (const shape of ["healthy", "failed-release"] as const) {
+    it(`L5 R: assertHeld after ${shape} path release refuses without changing retention`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "lk1-")); roots.push(root);
+      const holder = await launch(root, "released-lease", shape);
+      await holder.phase("READY"); expect((await holder.phase("FAULT_REACHED")).reached).toBe(true);
+      const result = await holder.phase("DISPOSAL_SETTLED");
+      expect(result.errors, "a released lease refuses the next protected step").toEqual([expect.objectContaining({ kind: "holder-lost" })]);
+      expect(result.typedRefusal).toBe(true);
+      expect(result.releaseErrors).toEqual(shape === "healthy" ? [] : [expect.objectContaining({ kind: "holder-lost" })]);
+      const retained = shape === "healthy" ? 0 : 1; // Only failed disposal retains its one acquired listener.
+      expect(result).toMatchObject({ guardsBefore: retained, guards: retained, retainedBefore: retained, retained, records: retained });
+      holder.command("EXIT"); await holder.phase("RETURNED");
+      expect(await holder.done).toEqual({ code: 0, signal: null });
+      expect(holder.stderr()).toBe("");
+    }, TEST_TIMEOUT_MS);
+  }
 
   for (const shape of ["ordinary", "reader", "exclusive"] as const) {
     it(`T2a E HEALTHY-LOCK: ${shape} exclusion and reacquisition`, async () => {
