@@ -68,10 +68,10 @@ export function classifyFullSupervisionExit(
   }
   if (stop !== "none") {
     const matchedCompletion = input.completion?.attemptId === input.attemptId;
-    // Status-shaped stops require ok cleanup evidence; signals can precede handler installation.
+    // Signals can precede handler installation, but any matched completion must prove ok cleanup.
     const verified = "code" in exit
       ? matchedCompletion && input.completion?.cleanup === "ok"
-      : !(matchedCompletion && input.completion?.cleanup === "failed");
+      : !matchedCompletion || input.completion?.cleanup === "ok";
     return { kind: stopShaped && verified ? "uncharged_stop" : "charged_unverified_exit", decidedBy: input };
   }
   if ("code" in exit) {

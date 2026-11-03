@@ -1,3 +1,4 @@
+// fail-before-exempt: the boundary test is a regression witness for correct base code; its witness is the comparison mutation
 import * as fs from "node:fs/promises";
 import * as syncFs from "node:fs";
 import { tmpdir } from "node:os";
@@ -125,10 +126,22 @@ it("bounds retention and per-call reads across adversarial spaced failures", asy
 });
 
 it("has an inclusive window boundary and an injectable throttle", async () => {
+  const windowMs = FULL_SUPERVISION_WINDOW_SECONDS * 1000;
   await charge(root, "first", { budget: 2 });
-  const atBoundary = ledger(root, { budget: 2, wallClock: () => TEST_WALL + FULL_SUPERVISION_WINDOW_SECONDS * 1000 });
+  const atBoundary = ledger(root, {
+    budget: 2, wallClock: () => TEST_WALL + windowMs,
+    monotonicClock: () => TEST_MONOTONIC + windowMs,
+  });
   successful(await atBoundary.admit("second"));
   expect(successful(await atBoundary.settle("second", classification("second"))).state).toBe("state_LATCHED");
+  const expired = await fs.mkdtemp(join(root, "expired-"));
+  await charge(expired, "first", { budget: 2 });
+  const pastBoundary = await charge(expired, "second", {
+    budget: 2, wallClock: () => TEST_WALL + windowMs + 1,
+    monotonicClock: () => TEST_MONOTONIC + windowMs + 1,
+  });
+  expect(pastBoundary.charges.map((entry) => entry.attemptId)).toEqual(["second"]);
+  expect(pastBoundary.state).toBe("state_IDLE");
   const fresh = await fs.mkdtemp(join(root, "throttle-"));
   await charge(fresh, "first", { throttleSeconds: 5 });
   expect(await ledger(fresh, { throttleSeconds: 5 }).admit("second")).toEqual(refusal("throttled"));
