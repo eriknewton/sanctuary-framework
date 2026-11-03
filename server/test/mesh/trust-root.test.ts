@@ -1,5 +1,6 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 /**
- * Sanctuary Federation Protocol v0.1 — Trust Root Tests
+ * Sanctuary Federation Protocol v0.1 - Trust Root Tests
  *
  * Real-shape tests: generates actual fortress-master keypair, issues real
  * principal + node certs, walks the chain against real signatures. No mocks.
@@ -48,7 +49,7 @@ import {
 } from "../../src/mesh/trust-root-hybrid.js";
 import { randomBytes } from "../../src/core/random.js";
 
-describe("mesh/trust-root — fortress-master bootstrap", () => {
+describe("mesh/trust-root - fortress-master bootstrap", () => {
   it("generates a fortress-master keypair with stable fortress-id", () => {
     const master = generateFortressMaster();
     expect(master.public.fortress_id).toHaveLength(32);
@@ -67,7 +68,7 @@ describe("mesh/trust-root — fortress-master bootstrap", () => {
   });
 });
 
-describe("mesh/trust-root — principal cert chain", () => {
+describe("mesh/trust-root - principal cert chain", () => {
   let master: ReturnType<typeof generateFortressMaster>;
   let rootPrincipalKeypair: ReturnType<typeof generateKeypair>;
   let rootPrincipalCert: ReturnType<typeof issuePrincipalCertificate>;
@@ -123,7 +124,7 @@ describe("mesh/trust-root — principal cert chain", () => {
   });
 });
 
-describe("mesh/trust-root — per-node cert chain + hard-gate capability reservations", () => {
+describe("mesh/trust-root - per-node cert chain + hard-gate capability reservations", () => {
   let master: ReturnType<typeof generateFortressMaster>;
   let principalKeypair: ReturnType<typeof generateKeypair>;
   let principalCert: ReturnType<typeof issuePrincipalCertificate>;
@@ -258,7 +259,7 @@ describe("mesh/trust-root — per-node cert chain + hard-gate capability reserva
     // masks bit 3 off).
     const v1xCert = issueNode(CAP_STANDARD_FORTRESS_NODE);
     // Monkey-patch bit 3 onto the capabilities field. Because signatures cover
-    // the field, we must re-sign — simulating what a v1.x issuer would do.
+    // the field, we must re-sign - simulating what a v1.x issuer would do.
     const body = {
       node_id: v1xCert.node_id,
       node_pubkey: v1xCert.node_pubkey,
@@ -340,7 +341,7 @@ describe("mesh/trust-root — per-node cert chain + hard-gate capability reserva
   });
 });
 
-describe("mesh/trust-root — frozen v1 canonical bodies", () => {
+describe("mesh/trust-root - frozen v1 canonical bodies", () => {
   it("keeps v1 principal and node signed bodies byte-stable", () => {
     const principalBody = {
       principal_id: "root",
@@ -378,7 +379,7 @@ describe("mesh/trust-root — frozen v1 canonical bodies", () => {
   });
 });
 
-describe("mesh/trust-root — v2 hybrid certificate chain", () => {
+describe("mesh/trust-root - v2 hybrid certificate chain", () => {
   async function makeHybridChain() {
     const master = generateFortressMasterV2Hybrid();
     const principalKeys = generateHybridCertificateKeypair({
@@ -417,7 +418,33 @@ describe("mesh/trust-root — v2 hybrid certificate chain", () => {
     const { master, principalCert, nodeCert } = await makeHybridChain();
 
     expect(master.public.public_keys.ml_dsa_65.public_key).toBeTruthy();
-    expect(JSON.stringify(master.public)).not.toContain("private");
+    const descriptor = JSON.parse(JSON.stringify(master.public)) as typeof master.public;
+    expect(Object.keys(descriptor).sort()).toEqual([
+      "created_at", "fortress_id", "key_version", "public_keys", "signature_suite",
+    ]);
+    expect(Object.keys(descriptor.public_keys).sort()).toEqual([
+      "ed25519", "ml_dsa_65", "signature_suite",
+    ]);
+    const metadata = { ...descriptor, public_keys: { ...descriptor.public_keys } };
+    for (const scheme of ["ed25519", "ml_dsa_65"] as const) {
+      const key = descriptor.public_keys[scheme];
+      expect(Object.keys(key).sort()).toEqual(["key_ref", "public_key"]);
+      expect(toBase64url(fromBase64url(key.public_key))).toBe(key.public_key);
+      // Only public-key bytes are opaque; all field names, ids and references remain inspected.
+      metadata.public_keys[scheme] = { ...key, public_key: "" };
+    }
+    expect(JSON.stringify(metadata)).not.toContain("private");
+    const now = Date.parse("2026-06-23T12:00:00.000Z");
+    await expect(verifyPrincipalCertificateV2Hybrid(principalCert, descriptor, now))
+      .resolves.toBeUndefined();
+    for (const scheme of ["ed25519", "ml_dsa_65"] as const) {
+      const tampered = { ...descriptor, public_keys: { ...descriptor.public_keys } };
+      const bytes = fromBase64url(tampered.public_keys[scheme].public_key);
+      bytes[0] = bytes[0]! ^ 1; // Each public key must authenticate its certificate signature.
+      tampered.public_keys[scheme] = { ...tampered.public_keys[scheme], public_key: toBase64url(bytes) };
+      await expect(verifyPrincipalCertificateV2Hybrid(principalCert, tampered, now))
+        .rejects.toThrow();
+    }
     expect(JSON.stringify(principalCert)).not.toContain("secret_key");
     expect(JSON.stringify(nodeCert)).not.toContain("secret_key");
   });
@@ -541,7 +568,7 @@ describe("mesh/trust-root — v2 hybrid certificate chain", () => {
   });
 });
 
-describe("mesh/trust-root — HKDF per-node key derivation", () => {
+describe("mesh/trust-root - HKDF per-node key derivation", () => {
   it("derives deterministic node_transport_key from master + node_id + mode", () => {
     const master = generateFortressMaster();
     const k1 = deriveNodeTransportKey({

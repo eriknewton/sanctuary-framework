@@ -1,5 +1,6 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 /**
- * `sanctuary license` CLI tests (PR-1 — fleet license issuance).
+ * `sanctuary license` CLI tests (PR-1 - fleet license issuance).
  *
  * Verifies the SELL-side surface end to end against a real keychain-free
  * fortress seeded WITH a default operator identity (the issuer):
@@ -8,10 +9,10 @@
  *   - `list` reflects issued + revoked state; `--json` round-trips.
  *   - `revoke` marks the row and surfaces in `list`.
  *   - Fail-closed non-zero exits: unknown tier, past expiry, negative nodes,
- *     no fortress unlock, unknown licenseId on revoke — none leak a secret.
+ *     no fortress unlock, unknown licenseId on revoke - none leak a secret.
  *
  * The fortress is seeded keychain-free (mocked `security` exec) so the real
- * macOS login keychain is never touched — the pattern in identity-create.test.
+ * macOS login keychain is never touched - the pattern in identity-create.test.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -20,7 +21,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
 import { runLicenseCommand } from "../../src/cli/license.js";
-import { fromBase64url } from "../../src/core/encoding.js";
+import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import { runInit as runInitRaw, type InitOptions } from "../../src/wrap/init.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -154,7 +155,7 @@ async function issuerPublicKey(
 
 const FUTURE = "2030-01-01T00:00:00Z";
 
-describe("sanctuary license — help + arg validation (no fortress needed)", () => {
+describe("sanctuary license - help + arg validation (no fortress needed)", () => {
   it("prints usage on --help (exit 0)", async () => {
     const out = new StringWritable();
     const err = new StringWritable();
@@ -295,7 +296,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
     expect(err.text).toContain("--features");
     expect(err.text).toContain("--pricing-unit");
     // The refusal path must never reach the raw-flag validators (e.g. it
-    // does not report "unknown feature 'roster'" — 'roster' is valid; the
+    // does not report "unknown feature 'roster'" - 'roster' is valid; the
     // point is the refusal happens BEFORE any raw-flag value is inspected).
     expect(err.text).not.toContain("unknown feature");
   });
@@ -315,11 +316,11 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
       ["Infinity keyword", "Infinity"],
       ["NaN keyword", "NaN"],
       ["thousands separator", "1,000"],
-      // Number("9007199254740993") is NOT the safe integer it names — it
+      // Number("9007199254740993") is NOT the safe integer it names - it
       // silently rounds to 9007199254740992 (MAX_SAFE_INTEGER + 1), the exact
       // class of "unsafe entitledCount signed into the ledger" the finding
       // named. Canonical decimal syntax alone (the regex) does not catch
-      // this — only Number.isSafeInteger does.
+      // this - only Number.isSafeInteger does.
       ["unsafe integer beyond MAX_SAFE_INTEGER", "9007199254740993"],
     ])("rejects --extra-nodes with %s ('%s')", async (_label, value) => {
       const err = new StringWritable();
@@ -350,7 +351,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
       expect(overErr.text).toMatch(REFUSAL);
 
       // AT the bound: passes extra-nodes validation and proceeds to the next
-      // fail-closed gate (no fortress unlockable) — proves the bound is
+      // fail-closed gate (no fortress unlockable) - proves the bound is
       // inclusive, not off-by-one, without needing a real fortress.
       const atErr = new StringWritable();
       const atCode = await runLicenseCommand({
@@ -426,7 +427,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
         expect(err.text).toContain(`--plan team conflicts with explicit ${flag}`);
       });
 
-      it(`refuses '${flag}=${value}' (equals form) AFTER --plan — THE FINDING'S EXACT REPRO ('--plan=team --tier=fleet' shape`, async () => {
+      it(`refuses '${flag}=${value}' (equals form) AFTER --plan - THE FINDING'S EXACT REPRO ('--plan=team --tier=fleet' shape`, async () => {
         const err = new StringWritable();
         const code = await runLicenseCommand({
           argv: [
@@ -479,7 +480,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
 
       const token = decodeLicense(out.text);
       // graceUntil = notAfter + 14 days (the catalog's defaultGraceDays), not
-      // some other value — proves the preset FILLS it from the template
+      // some other value - proves the preset FILLS it from the template
       // rather than relying on the CLI's separate DEFAULT_GRACE_DAYS fallback
       // happening to match today.
       const claims = token.claims as { notAfter: number; graceUntil: number | null };
@@ -498,7 +499,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
     );
     // Independent oracle (finding EFC-04's own instruction): assert against
     // literal expected values, NOT by re-importing the same constant the
-    // production code renders from — a bug in the constant itself must still
+    // production code renders from - a bug in the constant itself must still
     // be caught by a test that does not share its source.
     expect([...ALL_ENTITLEMENT_FEATURE_FLAGS]).toEqual([
       "roster", "policy-dist", "kill-safety", "console",
@@ -620,7 +621,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
   });
 });
 
-describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
+describe("sanctuary license - end-to-end (keychain-free fortress)", () => {
   let tmp: string;
 
   beforeEach(async () => {
@@ -660,8 +661,14 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
     const token = decodeLicense(out.text);
     expect(token.claims).toBeTruthy();
     expect(token.signature).toBeTruthy();
-    // No secret-key material in the printed output — the token is claims+signature only.
-    expect(out.text).not.toMatch(/private/i);
+    // No secret-key material in the printed output - the token is claims+signature only.
+    expect(Object.keys(token).sort()).toEqual(["claims", "signature"]);
+    const claims = token.claims as typeof token.claims & { licenseId: string };
+    const { licenseId, ...metadata } = claims;
+    // The random license id is signed too; its spelling is not plaintext metadata.
+    expect(fromBase64url(licenseId)).toHaveLength(128 / 8); // 128-bit issuer-generated id.
+    expect(toBase64url(fromBase64url(licenseId))).toBe(licenseId);
+    expect(JSON.stringify({ fields: Object.keys(claims), metadata })).not.toMatch(/private/i);
 
     // Full chain: the printed token INDEPENDENTLY resolves granted against the
     // issuer's public key (recovered from the fortress). This proves the CLI
@@ -677,6 +684,13 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
     expect(resolved.entitledCount).toBe(25);
     expect(resolved.period).toBe("annual");
     expect(resolved.featureFlags).toEqual(["console", "policy-dist", "roster"]);
+    const tampered = fromBase64url(token.signature);
+    tampered[0] = tampered[0]! ^ 1; // Flip one signature bit, preserving the encoded shape.
+    expect(resolveEntitlement({
+      token: { ...token, signature: toBase64url(tampered) },
+      issuerPublicKey: pub,
+      now: Math.floor(Date.parse(FUTURE) / 1000) - 86_400, // One day before expiry.
+    })).toMatchObject({ granted: false, reason: "bad_signature" });
   });
 
   it("--plan team --extra-nodes 3 issues a license that independently resolves the catalog's D1/D2 claim (10+3 nodes, full feature set, node pricing)", async () => {
@@ -837,7 +851,7 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
 
     // Tamper the ledger file on disk: inflate the signed entitledCount. (We do
     // NOT repair the rowHash here; the point is the CLI runs the integrity check
-    // AT ALL and refuses to display a tampered ledger — exit non-zero.)
+    // AT ALL and refuses to display a tampered ledger - exit non-zero.)
     const ledgerPath = join(fortressPath, "state", "fleet-license-ledger.json");
     const raw = JSON.parse(await readFile(ledgerPath, "utf-8")) as {
       rows: Array<{ token: { claims: { entitledCount: number } } }>;
@@ -877,7 +891,7 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
   });
 });
 
-describe("sanctuary license — anti-rollback fast-follow (list key-pin + external anchor)", () => {
+describe("sanctuary license - anti-rollback fast-follow (list key-pin + external anchor)", () => {
   let tmp: string;
   beforeEach(async () => {
     tmp = await mkdtemp(join(tmpdir(), "sanctuary-license-ar-"));
@@ -960,7 +974,7 @@ describe("sanctuary license — anti-rollback fast-follow (list key-pin + extern
 
     // The attacker replaces the ledger file WHOLESALE with a self-consistent
     // ledger they built under their OWN keypair (forging an enterprise/unlimited
-    // grant). Every signature inside it is valid — under the ATTACKER key. The
+    // grant). Every signature inside it is valid - under the ATTACKER key. The
     // old self-cert bug would trust the file's own `issuerPublicKey`; the fix
     // pins the operator key from the fortress, so the attacker key ≠ pinned key.
     const { generateKeypair, generateIdentityId } = await import(

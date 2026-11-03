@@ -1,3 +1,4 @@
+// fail-before-exempt: deterministic replacement for a probabilistic ciphertext-absence check; behavior unchanged
 /**
  * `sanctuary fleet attest` CLI tests (signed compliance-attestation export).
  *
@@ -34,6 +35,12 @@ import {
 } from "../util/port-collision-retry.js";
 import { runInit as runInitRaw, type InitOptions } from "../../src/wrap/init.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
+
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
+import { resolveCliMasterKey } from "../../src/core/master-custody.js";
+import { fromBase64url } from "../../src/core/encoding.js";
+import { assertAttestationPrivacy } from "../helpers/assert-attestation-privacy.js";
 
 // ── Keychain-free fortress seeding (mirrors identity-create.test.ts / license.test.ts) ──
 type ExecCall = { cmd: string; args: string[]; input?: string };
@@ -266,7 +273,19 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     expect(doc.attestation.claims_scope).toMatch(/NOT a third-party audit/i);
 
     // No secret-key material anywhere in the printed output.
-    expect(out.text).not.toMatch(/private/i);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey, storagePathHint: fortressPath,
+    });
+    try {
+      const identities = new IdentityManager(storage, masterKey);
+      await identities.load();
+      const identity = identities.getDefault();
+      expect(identity).toBeDefined();
+      assertAttestationPrivacy(out.text, fromBase64url(identity!.public_key));
+    } finally {
+      masterKey.fill(0);
+    }
     expect(out.text).not.toMatch(/passphrase/i);
     expect(out.text).not.toMatch(/recovery/i);
 
