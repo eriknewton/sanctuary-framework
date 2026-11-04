@@ -625,7 +625,7 @@ class OrderedAuditBodyReads {
   stop(): void {
     // A verdict retires queued admissions immediately; captured reads settle alone.
     this.stopped.abort();
-    this.slots.fill(undefined);
+    void this.slots.fill(undefined);
   }
 }
 
