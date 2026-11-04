@@ -8,10 +8,8 @@ import { resolveStoragePath } from "../paths.js";
 import { observeStoredPassphrase } from "../wrap/passphrase.js";
 import { consumeFlagValue } from "./argv.js";
 import {
-  bootServiceLoadState,
   CASTLE_WALL_BOOT_LABEL,
   FORBIDDEN_PLIST_ENV,
-  type ExecFileResult,
 } from "./castle-wall-boot.js";
 import {
   FullAgentStateStore,
@@ -22,7 +20,10 @@ export { FULL_AGENT_THROTTLE_INTERVAL_S } from "./castle-wall-full-agent-state.j
 
 // must match FULL_AGENT_LABEL in server/reorg-surface-manifest.md.
 export const FULL_AGENT_LABEL = "ai.sanctuaryprotocol.castle-wall.full";
-const MS_PER_SECOND = 1000;
+const MS_PER_SECOND = 1000; // Milliseconds in one second.
+// launchctl print exits 113 with empty stdout for a label launchd does not hold (captured 2026-11-03 on macOS 26.6.2: stderr "Could not find service ... in domain for user gui: 501"); the Mini2 drill re-verifies it.
+export const LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS = 113;
+const LAUNCHD_PID = 1; // macOS launchd is the system's initial process.
 const LAUNCHCTL_TIMEOUT_MS = 10 * MS_PER_SECOND; // One local launchctl request budget.
 const STABLE_SAMPLE_INTERVAL_MS = MS_PER_SECOND;
 /** Distinguish incomplete rollback from success (0), ordinary failure (1) and usage refusal (2). */
@@ -110,6 +111,14 @@ export function fullAgentLaunchAgentWellFormed(contents: string): boolean {
   catch { return false; }
 }
 
+/** Preserve normal exit, signal termination and spawn failure as separate observations. */
+export interface FullAgentExecResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  signal?: NodeJS.Signals | null;
+  error?: Error;
+}
 type AgentFs = Pick<typeof fs, "mkdirSync" | "writeFileSync" | "openSync" | "closeSync" | "fchmodSync" | "unlinkSync" | "realpathSync" | "readFileSync">;
 export interface FullAgentCommandContext {
   out?: Writable;
@@ -122,15 +131,15 @@ export interface FullAgentCommandContext {
   cliPath?: string;
   execPath?: string;
   fs?: AgentFs;
-  execFileFn?: (command: string, args: string[]) => ExecFileResult;
+  execFileFn?: (command: string, args: string[]) => FullAgentExecResult;
   observePassphrase?: typeof observeStoredPassphrase;
   sleep?: (ms: number) => Promise<void>;
   stateStore?: (fortress: string) => FullAgentStateStore;
 }
 
-function launchctl(command: string, args: string[]): ExecFileResult {
+function launchctl(command: string, args: string[]): FullAgentExecResult {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: LAUNCHCTL_TIMEOUT_MS });
-  return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  return { code: result.status, signal: result.signal, error: result.error, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 function context(argv: string[], input: FullAgentCommandContext) {
   const fortress = consumeFlagValue(argv, "--fortress");
@@ -165,7 +174,7 @@ function refuseUnsupported(ctx: AgentContext): boolean {
   return false;
 }
 /** Interpret only service-level fields and the service's own arguments block. */
-function parseFullAgentPrint(stdout: string): { pid: number | null; arguments: string[] } {
+function parseFullAgentPrint(stdout: string): { valid: boolean; pid: number | null; arguments: string[] } {
   const blocks: string[] = [];
   const args: string[] = [];
   let pid: number | null = null;
@@ -176,9 +185,9 @@ function parseFullAgentPrint(stdout: string): { pid: number | null; arguments: s
   for (const raw of stdout.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
-    if (state_CLOSED) return { pid: null, arguments: [] };
+    if (state_CLOSED) return { valid: false, pid: null, arguments: [] };
     if (line === "}") {
-      if (blocks.length === 0) return { pid: null, arguments: [] };
+      if (blocks.length === 0) return { valid: false, pid: null, arguments: [] };
       blocks.pop();
       if (blocks.length === 0) state_CLOSED = true;
       continue;
@@ -188,9 +197,9 @@ function parseFullAgentPrint(stdout: string): { pid: number | null; arguments: s
       if (argument.startsWith('"')) {
         try {
           const decoded: unknown = JSON.parse(argument);
-          if (typeof decoded !== "string") return { pid: null, arguments: [] };
+          if (typeof decoded !== "string") return { valid: false, pid: null, arguments: [] };
           args.push(decoded);
-        } catch { return { pid: null, arguments: [] }; }
+        } catch { return { valid: false, pid: null, arguments: [] }; }
       } else args.push(argument);
       continue;
     }
@@ -210,23 +219,68 @@ function parseFullAgentPrint(stdout: string): { pid: number | null; arguments: s
       }
     }
   }
-  if (!state_CLOSED || blocks.length !== 0 || argumentBlocks !== 1) return { pid: null, arguments: [] };
-  return { pid: pidFields === 1 ? pid : null, arguments: args };
+  if (!state_CLOSED || blocks.length !== 0) return { valid: false, pid: null, arguments: [] };
+  return { valid: true, pid: pidFields === 1 && argumentBlocks === 1 ? pid : null, arguments: argumentBlocks === 1 ? args : [] };
+}
+
+type FullAgentPrint =
+  | { state: "state_LOADED"; pid: number | null; arguments: string[] }
+  | { state: "state_UNLOADED" }
+  | { state: "state_INDETERMINATE"; spawnFailure: boolean };
+
+function observeJob(exec: NonNullable<FullAgentCommandContext["execFileFn"]>, target: string): FullAgentPrint {
+  let printed: FullAgentExecResult;
+  try { printed = exec("launchctl", ["print", target]); }
+  catch { return { state: "state_INDETERMINATE", spawnFailure: true }; }
+  // Only a normal not-found exit without a service block establishes absence; payload phrases carry no lifecycle authority.
+  if (!printed.error && !printed.signal && printed.code === LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS &&
+      !/^[^\n]*=\s*\{\s*$/m.test(printed.stdout)) return { state: "state_UNLOADED" };
+  const parsed = parseFullAgentPrint(printed.stdout);
+  if (!printed.error && !printed.signal && printed.code === 0 && parsed.valid) {
+    return { state: "state_LOADED", pid: parsed.pid, arguments: parsed.arguments };
+  }
+  return { state: "state_INDETERMINATE", spawnFailure: !!printed.error };
+}
+
+/** Refuse counter access unless launchd identifies this process as the full label's instance. */
+export function fullAgentAdmissionRefusal(ppid: number, pid: number, uid: number, exec = launchctl): string | null {
+  if (ppid !== LAUNCHD_PID) return "--launch-agent requires a launchd-spawned process (parent pid 1).";
+  const printed = observeJob(exec, `gui/${uid}/${FULL_AGENT_LABEL}`);
+  if (printed.state === "state_INDETERMINATE") {
+    return printed.spawnFailure ? "--launch-agent launchctl spawn failure (INDETERMINATE)." : "--launch-agent launchctl print is INDETERMINATE.";
+  }
+  if (printed.state !== "state_LOADED" || printed.pid === null) return "--launch-agent launchd record has no pid.";
+  // PID 1 parentage is shared by every reparented process; only launchd's own record of this label's pid identifies the supervised instance.
+  if (printed.pid !== pid) return "--launch-agent launchd record has a different pid.";
+  return null;
 }
 
 function loadedPid(ctx: AgentContext): number | null {
-  const printed = ctx.exec("launchctl", ["print", ctx.target]);
-  return printed.code === 0 ? parseFullAgentPrint(printed.stdout).pid : null;
+  const printed = observeJob(ctx.exec, ctx.target);
+  if (printed.state === "state_INDETERMINATE") throw new Error("Full LaunchAgent job state is INDETERMINATE.");
+  return printed.state === "state_LOADED" ? printed.pid : null;
 }
 
-type BoundJob = { state: "state_LOADED"; pid: number | null } | { state: "state_UNLOADED" };
+type BoundJob = { state: "state_LOADED"; pid: number | null } | { state: "state_UNLOADED"; plistAbsent: boolean };
 function boundJob(ctx: AgentContext, allowUnloaded = false): BoundJob | null {
-  const printed = ctx.exec("launchctl", ["print", ctx.target]);
-  const state_UNLOADED = !bootServiceLoadState(() => printed).loaded;
-  let plist = "";
-  try { plist = ctx.io.readFileSync(ctx.plist, "utf8"); } catch { /* Missing installed identity refuses binding. */ }
-  const installed = plistProgramArguments(plist);
-  const parsed = parseFullAgentPrint(printed.stdout);
+  const printed = observeJob(ctx.exec, ctx.target);
+  if (printed.state === "state_INDETERMINATE") {
+    ctx.err.write("Full LaunchAgent job state is INDETERMINATE.\n");
+    return null;
+  }
+  let plist: string;
+  try { plist = ctx.io.readFileSync(ctx.plist, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    // Without an installed identity, only confirmed absence permits clearing the requested fortress without bootstrap.
+    if (allowUnloaded && printed.state === "state_UNLOADED") return { state: "state_UNLOADED", plistAbsent: true };
+    ctx.err.write("Full LaunchAgent plist is absent.\n");
+    return null;
+  }
+  if (!fullAgentLaunchAgentWellFormed(plist)) {
+    ctx.err.write("Full LaunchAgent plist is malformed.\n");
+    return null;
+  }
   const fortressArgument = (args: string[]): string | undefined => {
     // cli-argv-indexof-allowed: searches launchd ProgramArguments read from the plist and launchctl print, not CLI argv tokens.
     const index = args.indexOf("--fortress"), last = args.lastIndexOf("--fortress");
@@ -235,17 +289,27 @@ function boundJob(ctx: AgentContext, allowUnloaded = false): BoundJob | null {
   const canonical = (path: string): string => {
     try { return ctx.io.realpathSync(path); } catch { return path; }
   };
-  const installedFortress = fortressArgument(installed), loadedFortress = fortressArgument(parsed.arguments);
-  const installedMatches = fullAgentLaunchAgentWellFormed(plist) && installedFortress && isAbsolute(installedFortress) &&
-    canonical(installedFortress) === canonical(ctx.fortressPath);
-  // A loaded job must bind both identities; an unloaded reset binds the installed identity before it can bootstrap.
-  if (installedMatches && state_UNLOADED && allowUnloaded) return { state: "state_UNLOADED" };
-  if (!installedMatches || printed.code !== 0 || !loadedFortress || !isAbsolute(loadedFortress) ||
-      canonical(installedFortress!) !== canonical(loadedFortress)) {
+  const installedFortress = fortressArgument(plistProgramArguments(plist))!;
+  if (canonical(installedFortress) !== canonical(ctx.fortressPath)) {
     ctx.err.write("the installed full LaunchAgent serves a different fortress\n");
     return null;
   }
-  return { state: "state_LOADED", pid: parsed.pid };
+  // A loaded job binds both identities; an unloaded reset binds the installed identity before bootstrap.
+  if (printed.state === "state_UNLOADED") {
+    if (allowUnloaded) return { state: "state_UNLOADED", plistAbsent: false };
+    ctx.err.write("Full LaunchAgent job is UNLOADED.\n");
+    return null;
+  }
+  const loadedFortress = fortressArgument(printed.arguments);
+  if (!loadedFortress || !isAbsolute(loadedFortress)) {
+    ctx.err.write("Full LaunchAgent fortress binding is unavailable.\n");
+    return null;
+  }
+  if (canonical(installedFortress) !== canonical(loadedFortress)) {
+    ctx.err.write("the installed full LaunchAgent serves a different fortress\n");
+    return null;
+  }
+  return { state: "state_LOADED", pid: printed.pid };
 }
 
 function removePlist(ctx: AgentContext): void {
@@ -253,16 +317,12 @@ function removePlist(ctx: AgentContext): void {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 }
 
-function bootoutSucceeded(result: ExecFileResult): boolean {
-  // Adapt the result through the existing load-state classifier, including its fail-closed treatment of unknown errors.
-  return result.code === 0 || !bootServiceLoadState(() => result).loaded;
-}
-
 async function state_CONFIRM_UNLOADED(ctx: AgentContext): Promise<boolean> {
   // Reuse the local launchctl request budget and sample cadence to bound unload observation.
   for (let elapsed = 0; elapsed <= LAUNCHCTL_TIMEOUT_MS; elapsed += STABLE_SAMPLE_INTERVAL_MS) {
-    const printed = ctx.exec("launchctl", ["print", ctx.target]);
-    if (!bootServiceLoadState(() => printed).loaded) return true;
+    const printed = observeJob(ctx.exec, ctx.target);
+    if (printed.state === "state_INDETERMINATE") throw new Error("Full LaunchAgent job state is INDETERMINATE; unload refused.");
+    if (printed.state === "state_UNLOADED") return true;
     if (elapsed < LAUNCHCTL_TIMEOUT_MS) await ctx.sleep(STABLE_SAMPLE_INTERVAL_MS);
   }
   return false;
@@ -270,8 +330,8 @@ async function state_CONFIRM_UNLOADED(ctx: AgentContext): Promise<boolean> {
 
 async function rollbackInstall(ctx: AgentContext): Promise<boolean> {
   try {
-    const printed = ctx.exec("launchctl", ["print", ctx.target]);
-    if (bootServiceLoadState(() => printed).loaded) ctx.exec("launchctl", ["bootout", ctx.target]);
+    const printed = observeJob(ctx.exec, ctx.target);
+    if (printed.state !== "state_UNLOADED") ctx.exec("launchctl", ["bootout", ctx.target]);
     return await state_CONFIRM_UNLOADED(ctx);
   } finally { removePlist(ctx); }
 }
@@ -302,11 +362,15 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
     const ctx = context(argv, input);
     if (refuseUnsupported(ctx)) return 1;
     if (!ctx.isTTY) { err.write("install-full requires an attended TTY session.\n"); return 2; }
-    if (bootServiceLoadState(ctx.exec).loaded) {
+    const bootJob = observeJob(ctx.exec, `system/${CASTLE_WALL_BOOT_LABEL}`);
+    if (bootJob.state === "state_INDETERMINATE") throw new Error("Safe-mode boot daemon job state is INDETERMINATE.");
+    if (bootJob.state === "state_LOADED") {
       err.write(`The safe-mode boot daemon is loaded. Run 'sudo launchctl bootout system/${CASTLE_WALL_BOOT_LABEL}' before install-full.\n`);
       return 1;
     }
-    if (bootServiceLoadState(() => ctx.exec("launchctl", ["print", ctx.target])).loaded) {
+    const fullJob = observeJob(ctx.exec, ctx.target);
+    if (fullJob.state === "state_INDETERMINATE") throw new Error("Full LaunchAgent job state is INDETERMINATE.");
+    if (fullJob.state === "state_LOADED") {
       err.write("already installed; run uninstall-full first\n");
       return 1;
     }
@@ -340,7 +404,7 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
     if (rollback) {
       let state_UNLOADED = false;
       try { state_UNLOADED = await rollbackInstall(rollback); }
-      catch { err.write("Full LaunchAgent rollback failed; inspect the job and plist.\n"); }
+      catch (error) { err.write(`Full LaunchAgent rollback failed: ${error instanceof Error ? error.message : String(error)}\n`); }
       if (!state_UNLOADED) {
         err.write("rollback incomplete: the job is still loaded; run uninstall-full\n");
         return FULL_AGENT_ROLLBACK_INCOMPLETE_EXIT_CODE;
@@ -358,8 +422,8 @@ export async function runUninstallFull(argv: string[] = [], input: FullAgentComm
   try {
     const ctx = context(argv, input);
     if (refuseUnsupported(ctx)) return 1;
-    const result = ctx.exec("launchctl", ["bootout", ctx.target]);
-    if (!bootoutSucceeded(result)) { err.write("Full LaunchAgent bootout failed; its plist was retained.\n"); return 1; }
+    ctx.exec("launchctl", ["bootout", ctx.target]);
+    if (!await state_CONFIRM_UNLOADED(ctx)) { err.write("Full LaunchAgent bootout failed; its plist was retained.\n"); return 1; }
     removePlist(ctx);
     ctx.out.write("Full LaunchAgent uninstalled.\n");
     return 0;
@@ -389,17 +453,21 @@ export async function runResetFull(argv: string[] = [], input: FullAgentCommandC
     const ctx = context(argv, input);
     if (refuseUnsupported(ctx)) return 1;
     if (!ctx.isTTY) { err.write("reset-full requires an attended TTY session.\n"); return 2; }
-    // state_BIND: an unloaded retry still verifies the installed fortress.
+    // state_BIND: verify the installed identity when present; absence permits unloaded recovery only.
     const state_BOUND = boundJob(ctx, true);
     if (!state_BOUND) return 1;
     if (state_BOUND.state === "state_LOADED") ctx.exec("launchctl", ["bootout", ctx.target]);
-    // With the label unloaded, launchd cannot start writer 1, so reset has no concurrent writer and can recover every crash state.
+    // The unloaded observation is a snapshot. Two operator lifecycle commands run at once (reset, install or uninstall) are unsupported: they can stop the wall or drop one crash charge.
     if (!await state_CONFIRM_UNLOADED(ctx)) {
       err.write("Full LaunchAgent is still loaded; counter reset refused.\n");
       return 1;
     }
     // state_CLEAR: no record content is trusted on the attended recovery path.
     ctx.state.reset();
+    if (state_BOUND.state === "state_UNLOADED" && state_BOUND.plistAbsent) {
+      ctx.out.write("Counter reset. No full LaunchAgent is installed; run install-full to start it.\n");
+      return 0;
+    }
     // state_BOOTSTRAP: only the cleared, unloaded label may start again.
     const result = ctx.exec("launchctl", ["bootstrap", ctx.domain, ctx.plist]);
     if (result.code !== 0) { err.write("Counter reset, but full LaunchAgent bootstrap failed.\n"); return 1; }

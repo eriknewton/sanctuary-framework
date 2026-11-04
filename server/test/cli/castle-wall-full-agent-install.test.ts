@@ -26,7 +26,7 @@ function fixture(fortressName = "fortress") {
   let pid: number | null = 1234; // Fixed fake launchd process identity; never signalled.
   const exec = vi.fn((_command: string, args: string[]): ExecFileResult => {
     if (args[0] === "print" && args[1] === `system/${CASTLE_WALL_BOOT_LABEL}`) {
-      return bootLoaded ? { code: 0, stdout: "state = running\npid = 111\n", stderr: "" } : { code: 113, stdout: "", stderr: "Could not find service" };
+      return bootLoaded ? { code: 0, stdout: `system/${CASTLE_WALL_BOOT_LABEL} = {\nstate = running\npid = 111\n}\n`, stderr: "" } : { code: 113, stdout: "", stderr: "Could not find service" };
     }
     if (args[0] === "print") return fullLoaded ? { code: 0, stdout: `gui/501/${api!.FULL_AGENT_LABEL} = {\n` +
       (pid === null ? "state = exited\n" : `state = running\npid = ${pid}\n`) +
@@ -109,7 +109,7 @@ describe("full agent attended commands", () => {
     if (source === "missing-plist") fs.unlinkSync(plist);
     if (source === "missing-loaded") f.setLoadedFortress(null);
     expect(await api!.runFullStatus([], f.ctx)).toBe(1);
-    expect(f.err.text).toContain("the installed full LaunchAgent serves a different fortress");
+    expect(f.err.text).toContain(source === "missing-plist" ? "plist is absent" : source === "missing-loaded" ? "fortress binding is unavailable" : "the installed full LaunchAgent serves a different fortress");
   });
 
   it.each(["plist", "loaded"])("reset checks %s fortress binding before counter writes or kickstart", async source => {
@@ -286,6 +286,87 @@ describe("full agent attended commands", () => {
     expect(f.write).not.toHaveBeenCalled(); expect(f.observe).not.toHaveBeenCalled();
     expect(fs.readFileSync(plist)).toEqual(before); expect(fs.statSync(plist).ino).toBe(inode);
     expect(f.exec.mock.calls.every(([, args]) => args[0] === "print")).toBe(true);
+  });
+
+  it.each(["payload", "signal", "null-status", "spawn-error", "service-block", "malformed-success"])("E1a E1b reset refuses INDETERMINATE %s", async kind => {
+    const f = fixture("not found");
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const store = new state!.FullAgentStateStore(f.fortress); store.admit();
+    const before = fs.readFileSync(store.path);
+    const loaded = f.exec("launchctl", ["print", `gui/501/${api!.FULL_AGENT_LABEL}`]);
+    f.ctx.execFileFn = vi.fn(() => ({
+      code: kind === "null-status" ? null : kind === "payload" ? 1 : kind === "malformed-success" ? 0 : 113,
+      stdout: kind === "payload" || kind === "service-block" ? loaded.stdout : kind === "malformed-success" ? "incomplete" : "",
+      stderr: "Could not find service",
+      signal: kind === "signal" ? "SIGTERM" as const : null,
+      error: kind === "spawn-error" ? new Error("fixture spawn error") : undefined,
+    }));
+    f.exec.mockClear();
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(f.err.text).toContain("INDETERMINATE");
+    expect(f.err.text).not.toContain("different fortress");
+    expect(fs.readFileSync(store.path)).toEqual(before);
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it("E1c status 113 with empty stdout and stderr is UNLOADED", async () => {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const store = new state!.FullAgentStateStore(f.fortress); store.admit();
+    f.setLoaded(false);
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation((command, args) => {
+      const result = original(command, args);
+      return result.code === 113 ? { ...result, stderr: "" } : result;
+    });
+    f.exec.mockClear();
+    expect(await api!.runResetFull(["--yes"], f.ctx), f.err.text).toBe(0);
+    expect(store.read()).toBeNull();
+    expect(f.exec.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(false);
+    expect(f.exec.mock.calls.some(([, args]) => args[0] === "bootstrap")).toBe(true);
+  });
+
+  it("E3a absent plist resets a latched counter without bootstrap or reading either name", async () => {
+    const f = fixture();
+    const store = new state!.FullAgentStateStore(f.fortress);
+    for (let i = 0; i <= state!.FULL_AGENT_CRASH_BUDGET; i++) store.admit();
+    expect(store.read()?.state).toBe("state_LATCHED");
+    const temp = join(store.directory, ".full-agent.tmp");
+    fs.writeFileSync(temp, "unfinished", { mode: 0o600 }); // Owner-only temporary accounting.
+    const read = vi.fn(() => { throw new Error("reset must not read supervision contents"); });
+    f.ctx.stateStore = () => new state!.FullAgentStateStore(f.fortress, { fs: { ...fs, readSync: read } });
+    expect(await api!.runResetFull(["--yes", "--fortress", f.fortress], f.ctx), f.err.text).toBe(0);
+    expect(f.out.text).toBe("Counter reset. No full LaunchAgent is installed; run install-full to start it.\n");
+    expect(fs.existsSync(store.path)).toBe(false);
+    expect(fs.existsSync(temp)).toBe(false);
+    expect(read).not.toHaveBeenCalled();
+    expect(f.exec.mock.calls.every(([, args]) => args[0] === "print")).toBe(true);
+  });
+
+  it("E3b malformed plist has its own refusal", async () => {
+    const f = fixture(); expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    fs.writeFileSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`), "malformed");
+    f.setLoaded(false); f.exec.mockClear();
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(f.err.text).toBe("Full LaunchAgent plist is malformed.\n");
+    expect(f.exec.mock.calls.every(([, args]) => args[0] === "print")).toBe(true);
+  });
+
+  it("E3c absent plist, fortress mismatch and indeterminate state have distinct refusals", async () => {
+    const f = fixture(); expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    const plist = join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`);
+    const saved = fs.readFileSync(plist);
+    fs.unlinkSync(plist);
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(f.err.text).toBe("Full LaunchAgent plist is absent.\n");
+    f.err.text = ""; fs.writeFileSync(plist, saved);
+    f.setLoadedFortress(join(f.root, "other"));
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(f.err.text).toBe("the installed full LaunchAgent serves a different fortress\n");
+    f.err.text = "";
+    f.exec.mockReturnValue({ code: 1, stdout: "", stderr: "fixture unknown failure" });
+    expect(await api!.runResetFull(["--yes"], f.ctx)).toBe(1);
+    expect(f.err.text).toBe("Full LaunchAgent job state is INDETERMINATE.\n");
   });
 
 });

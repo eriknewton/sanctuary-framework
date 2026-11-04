@@ -1789,9 +1789,11 @@ function printCastleWallHelp(): void {
                      Mint the software-protected boot token (root-owned 0600; run with sudo). Anti-brick
                      credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
     install-full     Install the user-session full daemon (macOS, attended TTY).
+                     Do not run install-full, reset-full or uninstall-full concurrently.
     uninstall-full   Remove the user-session full daemon service (requires --yes).
     full-status      Show the full daemon restart state and running pid.
     reset-full       Unload, clear the full daemon counter and start it (TTY, --yes).
+                     Do not run install-full, reset-full or uninstall-full concurrently.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.

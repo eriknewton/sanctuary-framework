@@ -44,6 +44,7 @@ function context(uid: number) {
   const err = new Capture();
   const ctx: CastleWallCommandContext = {
     out: new Capture(), err, platform: "darwin", getuid: () => uid, getppid: () => 1,
+    fullAgentExecFileFn: vi.fn((_command, _args) => ({ code: 0, stdout: `gui/${uid}/${agent!.FULL_AGENT_LABEL} = {\npid = ${process.pid}\narguments = {\n--launch-agent\n}\n}\n`, stderr: "" })),
     env: { HOME: join(root, "home"), SANCTUARY_STORAGE_PATH: root, SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_CASTLE_LOCAL_SIGN: "1", SANCTUARY_TRANSPARENCY_INTERVAL: "off" },
     fullDaemonStart: async input => { captured = input; throw new Error("fixture captured before daemon start"); },
   };
@@ -75,6 +76,33 @@ describe("full daemon fence production wiring", () => {
     expect(await runDaemon(rendered.slice(4), f.ctx)).toBe(1);
     expect(f.captured()!.auditLog.processExitFence).toBe(state!.WALL_DAEMON_AUDIT_EXIT_FENCE);
     expect(JSON.parse(await readFile(join(root, "supervision", "full-agent.json"), "utf8")).state).toBe("state_RUNNING");
+  });
+
+  it("E2b matching launchd pid admits through the production observation", async () => {
+    await prepared();
+    const f = context(501); // Fixture operator uid, never used for host execution.
+    expect(await runDaemon(["--fortress", root, "--launch-agent"], f.ctx)).toBe(1);
+    expect(f.captured(), f.err.text).toBeDefined();
+    expect(f.ctx.fullAgentExecFileFn).toHaveBeenCalledWith("launchctl", ["print", `gui/501/${agent!.FULL_AGENT_LABEL}`]);
+    expect(new state!.FullAgentStateStore(root).read()?.state).toBe("state_RUNNING");
+  });
+
+  it.each(["different pid", "no pid", "INDETERMINATE", "spawn failure", "thrown spawn failure"])("E2a E2c refuses %s before supervision access", async reason => {
+    const f = context(501); // Fixture operator uid.
+    const record = (pid: string) => `gui/501/${agent!.FULL_AGENT_LABEL} = {\n${pid}\narguments = {\n--launch-agent\n}\n}\n`;
+    f.ctx.fullAgentExecFileFn = vi.fn(() => {
+      if (reason === "thrown spawn failure") throw new Error("fixture spawn failure");
+      return {
+        code: reason === "INDETERMINATE" ? 1 : reason === "spawn failure" ? null : 0,
+        stdout: record(reason === "different pid" ? `pid = ${process.pid + 1}` : ""), // Adjacent pid differs from this process.
+        stderr: "",
+        error: reason === "spawn failure" ? new Error("fixture spawn failure") : undefined,
+      };
+    });
+    expect(await runDaemon(["--fortress", root, "--launch-agent"], f.ctx)).toBe(2);
+    expect(f.err.text).toContain(reason.replace("thrown ", ""));
+    await expect(stat(join(root, "supervision"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.captured()).toBeUndefined();
   });
 
   it("startup assertion refuses an unfenced root log before the start seam", async () => {
