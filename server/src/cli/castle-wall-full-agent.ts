@@ -406,7 +406,7 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
       try { state_UNLOADED = await rollbackInstall(rollback); }
       catch (error) { err.write(`Full LaunchAgent rollback failed: ${error instanceof Error ? error.message : String(error)}\n`); }
       if (!state_UNLOADED) {
-        err.write("rollback incomplete: the job is still loaded; run uninstall-full\n");
+        err.write("rollback incomplete: the job was not confirmed unloaded or its plist was not removed; run full-status, then uninstall-full\n");
         return FULL_AGENT_ROLLBACK_INCOMPLETE_EXIT_CODE;
       }
     }
@@ -457,7 +457,7 @@ export async function runResetFull(argv: string[] = [], input: FullAgentCommandC
     const state_BOUND = boundJob(ctx, true);
     if (!state_BOUND) return 1;
     if (state_BOUND.state === "state_LOADED") ctx.exec("launchctl", ["bootout", ctx.target]);
-    // The unloaded observation is a snapshot. Two operator lifecycle commands run at once (reset, install or uninstall) are unsupported: they can stop the wall or drop one crash charge.
+    // The unloaded observation is a snapshot. Two operator lifecycle commands run at once (reset, install or uninstall) are unsupported: they can stop the wall or erase every crash charge recorded since the other command started the job, including a fresh latch. Admission requires launchd's own pid for this label, so they do not admit a second daemon writer provided launchd keeps a booted-out job's record until its process exits; the Mini2 drill verifies that premise.
     if (!await state_CONFIRM_UNLOADED(ctx)) {
       err.write("Full LaunchAgent is still loaded; counter reset refused.\n");
       return 1;
@@ -465,7 +465,7 @@ export async function runResetFull(argv: string[] = [], input: FullAgentCommandC
     // state_CLEAR: no record content is trusted on the attended recovery path.
     ctx.state.reset();
     if (state_BOUND.state === "state_UNLOADED" && state_BOUND.plistAbsent) {
-      ctx.out.write("Counter reset. No full LaunchAgent is installed; run install-full to start it.\n");
+      ctx.out.write(`Counter reset at ${ctx.state.directory}. No full LaunchAgent is installed; run install-full to start it.\n`);
       return 0;
     }
     // state_BOOTSTRAP: only the cleared, unloaded label may start again.

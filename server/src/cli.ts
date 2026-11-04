@@ -1792,7 +1792,7 @@ function printCastleWallHelp(): void {
                      Do not run install-full, reset-full or uninstall-full concurrently.
     uninstall-full   Remove the user-session full daemon service (requires --yes).
     full-status      Show the full daemon restart state and running pid.
-    reset-full       Unload, clear the full daemon counter and start it (TTY, --yes).
+    reset-full       Unload and clear the full daemon counter, then start it if installed (TTY, --yes).
                      Do not run install-full, reset-full or uninstall-full concurrently.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --signer-client <path>

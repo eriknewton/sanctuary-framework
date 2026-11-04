@@ -272,7 +272,7 @@ describe("full agent attended commands", () => {
     const original = f.exec.getMockImplementation()!;
     f.exec.mockImplementation((command, args) => args[0] === "bootout" ? { code: 0, stdout: "", stderr: "" } : original(command, args));
     expect(await api!.runInstallFull([], f.ctx)).toBe(3);
-    expect(f.err.text).toContain("rollback incomplete: the job is still loaded; run uninstall-full");
+    expect(f.err.text).toContain("rollback incomplete: the job was not confirmed unloaded or its plist was not removed; run full-status, then uninstall-full");
     expect(fs.existsSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`))).toBe(false);
   });
 
@@ -336,7 +336,7 @@ describe("full agent attended commands", () => {
     const read = vi.fn(() => { throw new Error("reset must not read supervision contents"); });
     f.ctx.stateStore = () => new state!.FullAgentStateStore(f.fortress, { fs: { ...fs, readSync: read } });
     expect(await api!.runResetFull(["--yes", "--fortress", f.fortress], f.ctx), f.err.text).toBe(0);
-    expect(f.out.text).toBe("Counter reset. No full LaunchAgent is installed; run install-full to start it.\n");
+    expect(f.out.text).toBe(`Counter reset at ${store.directory}. No full LaunchAgent is installed; run install-full to start it.\n`);
     expect(fs.existsSync(store.path)).toBe(false);
     expect(fs.existsSync(temp)).toBe(false);
     expect(read).not.toHaveBeenCalled();
