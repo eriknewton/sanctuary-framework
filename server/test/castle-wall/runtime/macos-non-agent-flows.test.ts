@@ -1,4 +1,5 @@
 /** Informational root accounting preserves agent evidence, availability and bounded teardown. */
+// fail-before-exempt: this change makes the root-flow flood test force a full garbage collection before both heap readings, so the unchanged 64 MiB bound measures retained growth instead of uncollected garbage; it asserts no new product behavior and passes against pre-fix source by construction.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
