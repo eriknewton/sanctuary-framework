@@ -1558,6 +1558,7 @@ export async function startMacOSCastleWallDaemon(
     const emitAuditHeartbeat = async (): Promise<void> => {
       prunePendingRequests();
       void consumer.flushIngressDrops();
+      void consumer.flushNonAgentFlowSummary();
       // RESERVATION carry (fix-round HIGH): take ownership of the pending
       // units synchronously BEFORE the append, so an overlapping beat (slow
       // append + short interval) reserves 0 and can never double-subtract
@@ -2071,13 +2072,24 @@ export async function startMacOSCastleWallDaemon(
           // the in-flight reservation) in memory. A late commit may report a count
           // twice, but it must never be lost or turned into an allow.
           await Promise.race([
-            consumer.drainIngressDrops(),
+            // Both drains share the existing race budget. Behind an unsettled
+            // discard write, the final summary append runs next and filter_stopped
+            // waits for it in appendQueue order. This stop path claims no bound on
+            // that wait; the audit layer's admission and hold-callback timeouts do
+            // not cover filesystem settlement or lock release. Ordering stays fixed.
+            Promise.all([consumer.drainIngressDrops(), consumer.drainNonAgentFlowSummary()]),
             new Promise<void>((resolve) => {
-              discardDrainTimer = setTimeout(resolve, input.auditLog.writeLockHoldDeadlineMs);
+              discardDrainTimer = setTimeout(() => {
+                resolve();
+              }, input.auditLog.writeLockHoldDeadlineMs);
             }),
           ]);
         } finally {
           if (discardDrainTimer) clearTimeout(discardDrainTimer);
+        }
+        if (consumer.hasUnpersistedNonAgentFlows()) {
+          // SAFETY: operator-facing stop diagnostic; pending totals stay visible after timeout or fast failure, once per stop.
+          console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
         }
         // #912 MED-1: carry any still-pending degraded-write count into the
         // shutdown audit write too, not only the next heartbeat -- a reload

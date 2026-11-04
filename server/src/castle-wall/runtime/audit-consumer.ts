@@ -1332,7 +1332,8 @@ export const WAL_OPERATION_TO_EVENT_TYPE: Readonly<Record<string, CastleWallEven
  * trust the event's fields for signed evidence, so there is nothing to staple
  * onto.
  */
-function parseSignedBody(
+// Must match the shared signed-body parse in macos-flow-events.ts root counting.
+export function parseSignedBody(
   signedCanonicalJson: string
 ):
   | { kind: "ok"; body: Record<string, unknown>; operation: string }
@@ -1468,7 +1469,8 @@ function resultForSignatureOutcome(
   return "success";
 }
 
-function signedDetailsFromBody(
+// Must match the shared signed-details extraction in macos-flow-events.ts root counting.
+export function signedDetailsFromBody(
   signedBody: Record<string, unknown>
 ): Record<string, unknown> {
   return signedBody.details !== null &&

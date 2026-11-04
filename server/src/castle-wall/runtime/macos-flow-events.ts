@@ -54,11 +54,24 @@ import type {
 import {
   AuditChainError,
   AuditConsumer,
+  parseSignedBody,
+  signedDetailsFromBody,
   type AuditSink,
   type ChainAnchorSource,
   type CriticalEventEnvelope,
 } from "./audit-consumer.js";
-import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
+import {
+  isLegacyMacOSAuditTokenHex,
+  protectionSubjectFromMacOSAuditToken,
+  ruidFromMacOSAuditTokenHex,
+} from "../subject-binding.js";
+import { verifyProducerSignature } from "./producer-signature.js";
+import {
+  countNonAgentRootFlow,
+  createNonAgentRootFlowCounters,
+  NON_AGENT_FLOW_SUMMARY_OPERATION,
+  type NonAgentRootFlowCounters,
+} from "./macos-non-agent-flows.js";
 import {
   EnforcementAvailabilityStore,
   verifyEnforcementAvailabilityReport,
@@ -132,6 +145,8 @@ export interface MacOSFlowEventStats {
   subscribers: number;
   manifestSnapshotsEmitted: number;
   decisionsRecorded: number;
+  /** Informational root observations counted without a per-flow append. */
+  nonAgentRootFlowsCounted: number;
   decisionsRejected: number;
   extensionDiagnosticsRecorded: number;
   extensionDiagnosticsRejected: number;
@@ -179,7 +194,7 @@ export interface MacOSFlowEventConsumerInput {
   now?: () => number;
   /**
    * Optional decided-vs-emitted divergence feed (Slice M emission-liveness
-   * watchdog). Every `flow_decision_recorded` arrival is noted as a decision;
+   * watchdog). Arrivals outside root counting are noted as decisions;
    * only a successful enforcement persist is noted as an emission; every
    * reject/persist-failure path is noted as a rejection. The daemon owns the
    * watchdog's tick timer and loud outputs; this consumer only feeds it.
@@ -220,6 +235,11 @@ export class MacOSFlowEventConsumer {
     approval_id_too_large: 0,
   };
   private ingressDropWrite: Promise<void> | null = null;
+  private readonly nonAgentRootFlows = createNonAgentRootFlowCounters();
+  private nonAgentSummaryWrite: Promise<void> | null = null;
+  private nonAgentSummarySeq = 0;
+  private nonAgentPersistedTotal = 0;
+  private readonly nonAgentCountingStartedAt: string;
   private readonly subscribers = new Map<string, MacOSSubscriber>();
   private readonly manifestProvider: MacOSManifestProvider;
   private readonly approvalQueue: MacOSApprovalQueue;
@@ -237,6 +257,7 @@ export class MacOSFlowEventConsumer {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
     decisionsRecorded: 0,
+    nonAgentRootFlowsCounted: 0,
     decisionsRejected: 0,
     extensionDiagnosticsRecorded: 0,
     extensionDiagnosticsRejected: 0,
@@ -259,6 +280,7 @@ export class MacOSFlowEventConsumer {
         ? input.pinnedProducerKeyB64url
         : null;
     this.now = input.now ?? Date.now;
+    this.nonAgentCountingStartedAt = new Date(this.now()).toISOString();
     this.enforcementAvailability = new EnforcementAvailabilityStore({
       now: this.now,
       onVerifiedReport: input.onVerifiedAvailabilityReport,
@@ -357,10 +379,10 @@ export class MacOSFlowEventConsumer {
   }
 
   /**
-   * Handle a `flow_decision_recorded` notification. Translates into an
-   * `egress_allowed` or `egress_blocked` audit event so the existing
-   * persistence path applies. Validates required fields; rejects malformed
-   * payloads with an audit-rejected entry.
+   * Handle a `flow_decision_recorded` notification. Counts validated root
+   * observations for informational summaries; persists agent flows through
+   * the existing `egress_allowed` / `egress_blocked` audit path. Invalid
+   * frames and root frames that fail pinned verification remain loud rejections.
    */
   async handleFlowDecisionRecorded(
     notification: FlowDecisionRecordedNotification,
@@ -369,12 +391,55 @@ export class MacOSFlowEventConsumer {
     if (subscriberId !== undefined) {
       this.recordFlowCarriedAvailability(notification, subscriberId);
     }
+    const validation = validateFlowDecisionRecordedTyped(notification, this.fortressId);
+    if (validation.code === "root") {
+      const envelope = buildProducerSignedEnvelope(
+        notification,
+        notification.decision === "allow" ? "egress_allowed" : "egress_blocked",
+        this.fortressId,
+      );
+      // Verified binds the pinned signer, signed subject token with root RUID,
+      // decision, operation and seq to this counted flow. Freshness is not checked:
+      // counts are informational and no reader treats them as evidence. Duplicates
+      // are possible; no consumer chain state moves.
+      let signedDecision: "allow" | "drop" | null = null;
+      if (this.pinnedProducerKeyB64url !== null &&
+        envelope.producer !== undefined &&
+        verifyProducerSignature(envelope.producer, this.pinnedProducerKeyB64url).ok) {
+        // Must match parseSignedBody and signedDetailsFromBody in audit-consumer.ts:
+        // both consumers use the shared signed-body shape before trusting its fields.
+        const parsed = parseSignedBody(envelope.producer.eventCanonicalJson);
+        if (parsed.kind === "ok") {
+          const details = signedDetailsFromBody(parsed.body);
+          if (details.agent_id === notification.agent.id &&
+            ruidFromMacOSAuditTokenHex(details.agent_id) === 0 &&
+            (details.decision === "allow" || details.decision === "drop") &&
+            details.decision === notification.decision &&
+            // Must match AuditProducerSigning.swift's decision operation mapping.
+            parsed.operation === (details.decision === "allow" ? "egress_approved" : "egress_blocked") &&
+            details.seq === envelope.producer.seq) {
+            signedDecision = details.decision;
+          }
+        }
+      }
+      const verified = signedDecision !== null;
+      // Only otherwise-valid root flows may bypass rejection and emission notes;
+      // a failed pinned binding retains the existing loud rejection path.
+      // Continuing paths: no pin -> unverified count; verified pin -> verified count.
+      // Refusal path: failed pin -> existing rejection. Other frames keep their
+      // existing validation rejection or agent evidence path below.
+      if (this.pinnedProducerKeyB64url === null || verified) {
+        countNonAgentRootFlow(this.nonAgentRootFlows, signedDecision ?? notification.decision, verified);
+        this.stats.nonAgentRootFlowsCounted += 1;
+        return;
+      }
+    }
     // Slice M emission-liveness: an ARRIVING flow_decision_recorded is
     // evidence the wall reports having decided a flow, independent of whether
     // it persists below. Noted FIRST so every downstream reject path counts
     // as decided-but-not-emitted divergence, never as silence.
     this.emissionLiveness?.noteDecision("flow_decision_recorded");
-    const reason = validateFlowDecisionRecorded(notification, this.fortressId);
+    const reason = validation.reason;
     if (reason !== null) {
       this.stats.decisionsRejected += 1;
       this.emissionLiveness?.noteRejection(`validation:${reason}`);
@@ -579,6 +644,64 @@ export class MacOSFlowEventConsumer {
     return { ...this.stats };
   }
 
+  /** Return cumulative informational counts without exposing mutable consumer state. */
+  getNonAgentFlowCounters(): NonAgentRootFlowCounters {
+    return { ...this.nonAgentRootFlows };
+  }
+
+  /** Whether any counted flow remains outside the last successfully persisted summary. */
+  hasUnpersistedNonAgentFlows(): boolean {
+    return this.nonAgentRootFlows.root_verified_total +
+      this.nonAgentRootFlows.root_unverified_total !== this.nonAgentPersistedTotal;
+  }
+
+  /** Persist cumulative observations at the daemon's existing heartbeat cadence. */
+  async flushNonAgentFlowSummary(): Promise<void> {
+    // The one slot stays occupied through actual storage settlement, so slow
+    // writes cannot accumulate retained summaries across heartbeat ticks.
+    if (this.nonAgentSummaryWrite !== null) {
+      this.nonAgentRootFlows.summaries_skipped_in_flight += 1;
+      // A skipped tick returns at once rather than adopting the in-flight write, so
+      // retained reactions never grow with ticks; drainNonAgentFlowSummary awaits the slot.
+      return;
+    }
+    if (!this.hasUnpersistedNonAgentFlows()) return Promise.resolve();
+    const snapshot = { ...this.nonAgentRootFlows };
+    const summarySeq = ++this.nonAgentSummarySeq;
+    const windowEnd = new Date(this.now()).toISOString();
+    // Must match flushIngressDrops in macos-flow-events.ts: withAuditWriteSettlement
+    // retains the single slot even when the audit append's lock deadline rejects.
+    const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
+      await this.auditSink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        NON_AGENT_FLOW_SUMMARY_OPERATION,
+        this.fortressId,
+        {
+          ...snapshot,
+          summary_seq: summarySeq,
+          counting_started_at: this.nonAgentCountingStartedAt,
+          window_end: windowEnd,
+        },
+        "success",
+      );
+      this.nonAgentPersistedTotal = snapshot.root_verified_total + snapshot.root_unverified_total;
+      this.nonAgentRootFlows.summaries_written += 1;
+    })).catch(() => {
+      this.nonAgentRootFlows.summaries_failed += 1;
+    }).finally(() => {
+      // A failed append never schedules work; the next tick carries cumulative totals.
+      this.nonAgentSummaryWrite = null;
+    });
+    this.nonAgentSummaryWrite = write;
+    return write;
+  }
+
+  /** Wait for the occupied slot, then start at most one final cumulative write. */
+  async drainNonAgentFlowSummary(): Promise<void> {
+    if (this.nonAgentSummaryWrite !== null) await this.nonAgentSummaryWrite;
+    await this.flushNonAgentFlowSummary();
+  }
+
   /** Record discarded input without retaining its payload or spawning one write per drop. */
   noteIngressDrop(reason: MacOSIngressDropReason, count = 1): void {
     if (this.ingressDrops[reason] === 0) {
@@ -600,6 +723,8 @@ export class MacOSFlowEventConsumer {
     }
     let persisted = false;
     // Reserve counts before yielding so drops during a slow write survive it.
+    // Must match flushNonAgentFlowSummary in macos-flow-events.ts: both slots
+    // stay reserved through withAuditWriteSettlement, not just append rejection.
     // Must match withAuditWriteSettlement in operational/audit-log.ts: the
     // single discard-write slot includes storage abandoned at a lock deadline.
     const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
@@ -949,29 +1074,51 @@ export function validateFlowDecisionRecorded(
   notification: FlowDecisionRecordedNotification,
   fortressId = "validation",
 ): string | null {
+  return validateFlowDecisionRecordedTyped(notification, fortressId).reason;
+}
+
+/** Closed classification retaining the legacy validator's reason and precedence. */
+export type FlowDecisionRecordedValidation =
+  | { code: "agent"; reason: null }
+  | { code: "root" | "invalid"; reason: string };
+
+/** Classify root only after every other recorded-decision field has passed validation. */
+export function validateFlowDecisionRecordedTyped(
+  notification: FlowDecisionRecordedNotification,
+  fortressId = "validation",
+): FlowDecisionRecordedValidation {
   if (notification.type !== "flow_decision_recorded") {
-    return `unexpected message type: ${String(notification.type)}`;
+    return { code: "invalid", reason: `unexpected message type: ${String(notification.type)}` };
   }
   if (notification.decision !== "allow" && notification.decision !== "drop") {
-    return `decision must be allow or drop (got ${String(notification.decision)})`;
+    return { code: "invalid", reason: `decision must be allow or drop (got ${String(notification.decision)})` };
   }
   if (!notification.agent || typeof notification.agent.id !== "string" || notification.agent.id.length === 0) {
-    return "missing agent.id";
+    return { code: "invalid", reason: "missing agent.id" };
   }
-  if (protectionSubjectFromMacOSAuditToken(fortressId, notification.agent.id) === null) {
-    return "agent.id must be a non-root macOS audit_token_t hex";
-  }
+  // RUID names the flow's principal; effective root from a setuid binary never
+  // converts an agent's traffic into informational root accounting.
+  const root = isLegacyMacOSAuditTokenHex(notification.agent.id) &&
+    ruidFromMacOSAuditTokenHex(notification.agent.id) === 0;
+  const subjectReason = protectionSubjectFromMacOSAuditToken(fortressId, notification.agent.id) === null
+    ? "agent.id must be a non-root macOS audit_token_t hex"
+    : null;
+  if (subjectReason !== null && !root) return { code: "invalid", reason: subjectReason };
+  // Preserve the old subject-error precedence even when a root frame has
+  // another invalid field; only the closed code can authorize root counting.
   if (!notification.destination || typeof notification.destination.ip !== "string") {
-    return "missing destination.ip";
+    return { code: "invalid", reason: subjectReason ?? "missing destination.ip" };
   }
   if (typeof notification.recorded_at !== "string" || notification.recorded_at.length === 0) {
-    return "missing recorded_at";
+    return { code: "invalid", reason: subjectReason ?? "missing recorded_at" };
   }
   const matchedRuleId = notification.matched_rule_id;
   if (matchedRuleId !== undefined && matchedRuleId !== null && typeof matchedRuleId !== "string") {
-    return "matched_rule_id must be string or null";
+    return { code: "invalid", reason: subjectReason ?? "matched_rule_id must be string or null" };
   }
-  return null;
+  return root
+    ? { code: "root", reason: "agent.id must be a non-root macOS audit_token_t hex" }
+    : { code: "agent", reason: null };
 }
 
 function resolveMacOSFlowFortressId(input: MacOSFlowEventConsumerInput): string {
