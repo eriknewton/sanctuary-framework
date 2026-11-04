@@ -17,6 +17,7 @@ import { runAuditDump } from "../../src/cli/castle-wall.js";
 import { buildAuditDigest } from "../../src/principal-policy/posture.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
+import { deriveAuditStoreSplitBoundaryMacKey, writeAuditStoreSplitBoundary } from "../../src/operational/audit-log.js";
 
 const INTERVAL = 100; // Production checkpoint cadence.
 const MAX_AGE_MS = 10 * 60_000; // Ten minutes, independent of the implementation constant.
@@ -252,5 +253,104 @@ describe("flushDurable", () => {
     const result = Promise.allSettled([writing]);
     await expect(log.flushDurable()).rejects.toBeInstanceOf(AuditLogPersistenceError);
     await result;
+  });
+
+  it("G1a retains own age and count across an older query publication", async () => {
+    let now = 0;
+    const { storage, log: writerA } = fixture({ __testMonotonicNow: () => now });
+    await append(writerA); await durable(writerA);
+    const writerB = new AuditLog(storage, masterKey, { ...signedConfig, __testMonotonicNow: () => now });
+    const critical = () => writerB.appendCritical({ layer: "l1", operation: "own", identity_id: "fixture", result: "success" });
+    await critical();
+    await append(writerA); await writerA.flush();
+    expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual([1, 3]);
+    now = MAX_AGE_MS;
+
+    const gate = () => {
+      let release!: () => void;
+      const wait = new Promise<void>(resolve => { release = resolve; });
+      return { wait, release };
+    };
+    const queryCaptured = gate(); const releaseQuery = gate();
+    const checkpointDiscovery = gate(); const releaseDiscovery = gate();
+    const list = storage.list.bind(storage);
+    let holdQuery = true;
+    vi.spyOn(storage, "list").mockImplementation(async (...args) => {
+      const captured = await list(...args);
+      if (args[0] === "_audit" && holdQuery) {
+        holdQuery = false;
+        queryCaptured.release();
+        await releaseQuery.wait;
+      }
+      return captured;
+    });
+    const query = writerB.query({});
+    let flushing: Promise<void> | undefined;
+    try {
+      await queryCaptured.wait;
+      await critical();
+      const appendedAt = now;
+      const accounting = writerB as unknown as {
+        oldestUncheckpointedOwnEntryAt: number | undefined;
+        criticalAppendsSinceCheckpoint: number;
+      };
+      const ageBefore = accounting.oldestUncheckpointedOwnEntryAt;
+      const countBefore = accounting.criticalAppendsSinceCheckpoint;
+      const listKeys = storage.listKeys.bind(storage);
+      let holdDiscovery = true;
+      vi.spyOn(storage, "listKeys").mockImplementation(async (...args) => {
+        const captured = await listKeys(...args);
+        if (args[0] === "_audit_checkpoints" && holdDiscovery) {
+          holdDiscovery = false;
+          checkpointDiscovery.release();
+          await releaseDiscovery.wait;
+        }
+        return captured;
+      });
+      flushing = writerB.flushDurable();
+      await checkpointDiscovery.wait;
+      releaseQuery.release();
+      expect((await query).total).toBe(3); // The captured view precedes B's second entry.
+      releaseDiscovery.release();
+      await flushing;
+      const ownSequence = 4; // Seed, B, A, then B again.
+      const sealed = (await checkpoints(storage)).some(cp => cp.checkpoint_sequence >= ownSequence);
+      if (!sealed) {
+        expect(accounting.oldestUncheckpointedOwnEntryAt).toBe(ageBefore);
+        expect(accounting.criticalAppendsSinceCheckpoint).toBe(countBefore);
+      }
+      now = appendedAt + MAX_AGE_MS;
+      await durable(writerB);
+      expect((await checkpoints(storage)).some(cp => cp.checkpoint_sequence >= ownSequence)).toBe(true);
+    } finally {
+      releaseQuery.release(); releaseDiscovery.release();
+      await Promise.allSettled([query, ...(flushing ? [flushing] : [])]);
+    }
+  });
+
+  it("G2a a tail wholly inside the sealed region never lowers checkpoint sequence", async () => {
+    const statePath = join(home, "state");
+    const storage = new FilesystemStorage(statePath);
+    const log = new AuditLog(storage, masterKey, { ...signedConfig, __testMonotonicNow: () => 0 });
+    await append(log); await durable(log);
+    await append(log);
+    const head = await log.getChainHead();
+    await writeAuditStoreSplitBoundary(statePath, deriveAuditStoreSplitBoundaryMacKey(masterKey), {
+      sealed_tip_sequence: head.sequence, sealed_base_sequence: 1,
+      sealed_tip_entry_hash: head.entry_hash, daemon_namespace: "_audit-daemon",
+    });
+    const accounting = log as unknown as { lastCheckpointSequence: number };
+    const before = accounting.lastCheckpointSequence;
+    expect(before).toBe(1); // The seed checkpoint remains the loaded checkpoint floor.
+    const read = storage.read.bind(storage);
+    const reads = vi.spyOn(storage, "read").mockImplementation(async (...args) => {
+      if (args[0] === "_audit_checkpoints") {
+        throw Object.assign(new Error("sealed checkpoint permission fixture"), { code: "EACCES" });
+      }
+      return read(...args);
+    });
+    await log.flush();
+    expect(reads.mock.calls.some(([namespace]) => namespace === "_audit_checkpoints")).toBe(true);
+    expect(accounting.lastCheckpointSequence).toBe(before);
   });
 });
