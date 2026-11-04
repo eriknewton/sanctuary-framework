@@ -2359,6 +2359,8 @@ export class AuditLog {
   private nextSequence = 1;
   // Only persistChainedEntry may advance this instance's own persisted high-water.
   private ownHighestPersistedSequence = 0;
+  // Must only be raised where ownEntriesCoveredThrough held and checkpoint accounting was cleared.
+  private ownCoveredThroughSequence = 0;
   private lastEntryHash = AUDIT_CHAIN_GENESIS;
   private hashesSinceCheckpoint: string[] = [];
   private lastCheckpointSequence = 0;
@@ -7665,13 +7667,18 @@ export class AuditLog {
       .map((entry) => entry.entry_hash);
   }
 
+  private ownEntriesCoveredThrough(sequence: number): boolean {
+    // Reload publication can move the shared tip without the lock; only this instance's own persisted high-water proves its entries are covered, so a stale tip can cause an early checkpoint, never a late one.
+    return this.ownHighestPersistedSequence <= sequence;
+  }
+
   private async writeCheckpointIfNeeded(
     _reason: string,
     held?: { keys: string[]; signal: AuditWriteLockAbortSignal },
   ): Promise<void> {
     // An older reload can empty the shared hash buffer while this writer still has persisted entries to seal.
     if (this.checkpointInFlight || (this.hashesSinceCheckpoint.length === 0 &&
-      this.ownHighestPersistedSequence <= this.lastCheckpointSequence)) return;
+      this.ownHighestPersistedSequence <= Math.max(this.lastCheckpointSequence, this.ownCoveredThroughSequence))) return;
     this.checkpointInFlight = true;
     const generation = ++this.checkpointFlightGeneration;
     try {
@@ -7729,17 +7736,18 @@ export class AuditLog {
         // Even an already-covered range must observe every above-floor body
         // fault before resolving, as the base's collector did.
         if (fromSequence > checkpointSequence) {
-          // a checkpoint written by another writer covers our entries too; stale local accounting would make every later barrier due and rescan the chain.
+          // Reconcile only the discovered range; newer own entries can remain uncovered.
           // A sealed-region discovery can skip unreadable checkpoints, so it must not lower the known checkpoint floor.
           this.lastCheckpointSequence = Math.max(this.lastCheckpointSequence, previousCheckpointSequence);
           const coveredHashes = new Set(this.chainEntries
             .filter(entry => entry.sequence <= checkpointSequence)
             .map(entry => entry.entry_hash));
           this.hashesSinceCheckpoint = this.hashesSinceCheckpoint.filter(hash => !coveredHashes.has(hash));
-          // reload publication can move the shared tip without the lock; only this instance's own persisted high-water proves its entries are covered, so a stale tip can cause an early checkpoint, never a late one.
-          if (this.ownHighestPersistedSequence <= checkpointSequence) {
+          // ownEntriesCoveredThrough must authorize both the reset and the ownCoveredThroughSequence advance.
+          if (this.ownEntriesCoveredThrough(checkpointSequence)) {
             this.criticalAppendsSinceCheckpoint = 0;
             this.oldestUncheckpointedOwnEntryAt = undefined;
+            this.ownCoveredThroughSequence = Math.max(this.ownCoveredThroughSequence, checkpointSequence);
           }
           return;
         }
@@ -7756,10 +7764,17 @@ export class AuditLog {
           signed_at: new Date().toISOString(),
         }, signal);
         this.assertAuditWriteLockActive(signal);
-        this.lastCheckpointSequence = checkpointSequence;
-        this.hashesSinceCheckpoint = [];
-        this.criticalAppendsSinceCheckpoint = 0;
-        this.oldestUncheckpointedOwnEntryAt = undefined;
+        this.lastCheckpointSequence = Math.max(this.lastCheckpointSequence, checkpointSequence);
+        const coveredHashes = new Set(this.chainEntries
+          .filter(entry => entry.sequence <= checkpointSequence)
+          .map(entry => entry.entry_hash));
+        this.hashesSinceCheckpoint = this.hashesSinceCheckpoint.filter(hash => !coveredHashes.has(hash));
+        // ownEntriesCoveredThrough must authorize both the reset and the ownCoveredThroughSequence advance.
+        if (this.ownEntriesCoveredThrough(checkpointSequence)) {
+          this.criticalAppendsSinceCheckpoint = 0;
+          this.oldestUncheckpointedOwnEntryAt = undefined;
+          this.ownCoveredThroughSequence = Math.max(this.ownCoveredThroughSequence, checkpointSequence);
+        }
       };
       if (held) {
         await write(held.keys, held.signal);

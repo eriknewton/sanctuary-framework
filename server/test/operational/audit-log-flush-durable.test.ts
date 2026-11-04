@@ -328,6 +328,97 @@ describe("flushDurable", () => {
     }
   });
 
+  it.each([false, true])("H1a preserves own accounting and hashes after a stale-tip write (refresh buffer: %s)", async (refreshBuffer) => {
+    let now = 0;
+    const { storage, log: writerA } = fixture({ __testMonotonicNow: () => now });
+    await append(writerA); await durable(writerA);
+    const writerB = new AuditLog(storage, masterKey, { ...signedConfig, __testMonotonicNow: () => now });
+    const critical = () => writerB.appendCritical({ layer: "l1", operation: "own", identity_id: "fixture", result: "success" });
+    await critical();
+    await append(writerA);
+    expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual([1]);
+    now = MAX_AGE_MS;
+
+    const gate = () => {
+      let release!: () => void;
+      const wait = new Promise<void>(resolve => { release = resolve; });
+      return { wait, release };
+    };
+    const queryCaptured = gate(); const releaseQuery = gate();
+    const checkpointDiscovery = gate(); const releaseDiscovery = gate();
+    const list = storage.list.bind(storage);
+    let holdQuery = true;
+    vi.spyOn(storage, "list").mockImplementation(async (...args) => {
+      const captured = await list(...args);
+      if (args[0] === "_audit" && holdQuery) {
+        holdQuery = false;
+        queryCaptured.release();
+        await releaseQuery.wait;
+      }
+      return captured;
+    });
+    const query = writerB.query({});
+    let flushing: Promise<void> | undefined;
+    try {
+      await queryCaptured.wait;
+      await critical();
+      const appendedAt = now;
+      const accounting = writerB as unknown as {
+        oldestUncheckpointedOwnEntryAt: number | undefined;
+        criticalAppendsSinceCheckpoint: number;
+        hashesSinceCheckpoint: string[];
+        chainEntries: { sequence: number; entry_hash: string }[];
+      };
+      const ageBefore = accounting.oldestUncheckpointedOwnEntryAt;
+      const countBefore = accounting.criticalAppendsSinceCheckpoint;
+      const listKeys = storage.listKeys.bind(storage);
+      let holdDiscovery = true;
+      vi.spyOn(storage, "listKeys").mockImplementation(async (...args) => {
+        const captured = await listKeys(...args);
+        if (args[0] === "_audit_checkpoints" && holdDiscovery) {
+          holdDiscovery = false;
+          checkpointDiscovery.release();
+          await releaseDiscovery.wait;
+        }
+        return captured;
+      });
+      const ownSequence = 4; // Seed, B, A, then B again.
+      let ownHash: string | undefined;
+      if (refreshBuffer) {
+        const write = storage.write.bind(storage);
+        let refreshOnce = true;
+        vi.spyOn(storage, "write").mockImplementation(async (...args) => {
+          if (args[0] === "_audit_checkpoints" && refreshOnce) {
+            refreshOnce = false;
+            // Publish the full buffer after the checkpoint tip is captured but before its write completes.
+            expect((await writerB.query({})).total).toBe(ownSequence);
+            ownHash = accounting.chainEntries.find(entry => entry.sequence === ownSequence)?.entry_hash;
+          }
+          return write(...args);
+        });
+      }
+      flushing = writerB.flushDurable();
+      await checkpointDiscovery.wait;
+      releaseQuery.release();
+      expect((await query).total).toBe(3); // The captured view precedes B's second entry.
+      releaseDiscovery.release();
+      await flushing;
+      expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual([1, ownSequence - 1]);
+      expect(accounting.oldestUncheckpointedOwnEntryAt).toBe(ageBefore);
+      expect(accounting.criticalAppendsSinceCheckpoint).toBe(countBefore);
+      if (refreshBuffer) {
+        expect(ownHash).toBeDefined();
+        expect(accounting.hashesSinceCheckpoint).toEqual([ownHash]);
+      }
+      now = appendedAt + MAX_AGE_MS;
+      await durable(writerB);
+      expect((await checkpoints(storage)).some(cp => cp.checkpoint_sequence >= ownSequence)).toBe(true);
+    } finally {
+      releaseQuery.release(); releaseDiscovery.release();
+      await Promise.allSettled([query, ...(flushing ? [flushing] : [])]);
+    }
+  });
+
   it("G2a a tail wholly inside the sealed region never lowers checkpoint sequence", async () => {
     const statePath = join(home, "state");
     const storage = new FilesystemStorage(statePath);
@@ -336,7 +427,7 @@ describe("flushDurable", () => {
     await append(log);
     const head = await log.getChainHead();
     await writeAuditStoreSplitBoundary(statePath, deriveAuditStoreSplitBoundaryMacKey(masterKey), {
-      sealed_tip_sequence: head.sequence, sealed_base_sequence: 1,
+      sealed_tip_sequence: head.sequence, sealed_base_sequence: 1, // The sealed region starts at the seed entry.
       sealed_tip_entry_hash: head.entry_hash, daemon_namespace: "_audit-daemon",
     });
     const accounting = log as unknown as { lastCheckpointSequence: number };
@@ -352,5 +443,34 @@ describe("flushDurable", () => {
     await log.flush();
     expect(reads.mock.calls.some(([namespace]) => namespace === "_audit_checkpoints")).toBe(true);
     expect(accounting.lastCheckpointSequence).toBe(before);
+  });
+
+  it("H2a skips repeated discovery after reconciling a wholly sealed own tail", async () => {
+    const statePath = join(home, "state");
+    const storage = new FilesystemStorage(statePath);
+    const interval = 2; // Two ordinary tail entries make every barrier count-due against checkpoint 1.
+    const log = new AuditLog(storage, masterKey, { ...signedConfig,
+      checkpointInterval: interval, __testMonotonicNow: () => 0 });
+    const sealThroughHead = async () => {
+      const head = await log.getChainHead();
+      await writeAuditStoreSplitBoundary(statePath, deriveAuditStoreSplitBoundaryMacKey(masterKey), {
+        sealed_tip_sequence: head.sequence, sealed_base_sequence: 1, // The sealed region starts at the seed entry.
+        sealed_tip_entry_hash: head.entry_hash, daemon_namespace: "_audit-daemon",
+      });
+      // Advancing this fixture's boundary leaves no post-split suffix.
+      await storage.delete("_meta", "audit-post-split-suffix-established-v1");
+    };
+    await append(log); await durable(log);
+    await sealThroughHead();
+    for (let index = 0; index < interval; index++) await append(log);
+    await sealThroughHead();
+
+    const listings = vi.spyOn(storage, "listKeys");
+    const discoveries = () => listings.mock.calls.filter(([namespace]) => namespace === "_audit").length;
+    await durable(log);
+    const afterReconciliation = discoveries();
+    expect(afterReconciliation).toBeGreaterThan(0);
+    await durable(log);
+    expect(discoveries()).toBe(afterReconciliation);
   });
 });
