@@ -7669,6 +7669,7 @@ export class AuditLog {
 
   private ownEntriesCoveredThrough(sequence: number): boolean {
     // Reload publication can move the shared tip without the lock; only this instance's own persisted high-water proves its entries are covered, so a stale tip can cause an early checkpoint, never a late one.
+    // With the target bounded by ownHighestPersistedSequence, the false arm is unreachable while the lock is held; the guard stays so future changes to target capture fail toward an early checkpoint.
     return this.ownHighestPersistedSequence <= sequence;
   }
 
@@ -7704,7 +7705,8 @@ export class AuditLog {
         const previousCheckpointSequence =
           await this.readHighestAuditCheckpointSequence(sealedTipSequence);
         this.assertAuditWriteLockActive(signal);
-        const checkpointSequence = this.nextSequence - 1;
+        // The target always covers this writer's own persisted entries because an unlocked reload can publish a stale tip; only a persisted append under this lock advances the own high-water, so every sequence through it is persisted and the range is collectable while this writer holds the lock.
+        const checkpointSequence = Math.max(this.nextSequence - 1, this.ownHighestPersistedSequence);
         const fromSequence = Math.max(
           previousCheckpointSequence + 1,
           sealedTipSequence + 1

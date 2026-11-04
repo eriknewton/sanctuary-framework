@@ -328,7 +328,11 @@ describe("flushDurable", () => {
     }
   });
 
-  it.each([false, true])("H1a preserves own accounting and hashes after a stale-tip write (refresh buffer: %s)", async (refreshBuffer) => {
+  it.each([
+    { name: "H1a covers own entries despite a stale tip", refreshBuffer: false, atDeadline: false },
+    { name: "H1a covers own entries despite a stale tip", refreshBuffer: true, atDeadline: false },
+    { name: "H1b covers own entries on the first barrier at their age deadline", refreshBuffer: false, atDeadline: true },
+  ])("$name (refresh buffer: $refreshBuffer)", async ({ refreshBuffer, atDeadline }) => {
     let now = 0;
     const { storage, log: writerA } = fixture({ __testMonotonicNow: () => now });
     await append(writerA); await durable(writerA);
@@ -337,7 +341,7 @@ describe("flushDurable", () => {
     await critical();
     await append(writerA);
     expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual([1]);
-    now = MAX_AGE_MS;
+    if (!atDeadline) now = MAX_AGE_MS;
 
     const gate = () => {
       let release!: () => void;
@@ -369,8 +373,6 @@ describe("flushDurable", () => {
         hashesSinceCheckpoint: string[];
         chainEntries: { sequence: number; entry_hash: string }[];
       };
-      const ageBefore = accounting.oldestUncheckpointedOwnEntryAt;
-      const countBefore = accounting.criticalAppendsSinceCheckpoint;
       const listKeys = storage.listKeys.bind(storage);
       let holdDiscovery = true;
       vi.spyOn(storage, "listKeys").mockImplementation(async (...args) => {
@@ -397,18 +399,20 @@ describe("flushDurable", () => {
           return write(...args);
         });
       }
+      if (atDeadline) now = appendedAt + MAX_AGE_MS;
       flushing = writerB.flushDurable();
       await checkpointDiscovery.wait;
       releaseQuery.release();
       expect((await query).total).toBe(3); // The captured view precedes B's second entry.
       releaseDiscovery.release();
       await flushing;
-      expect((await checkpoints(storage)).map(cp => cp.checkpoint_sequence)).toEqual([1, ownSequence - 1]);
-      expect(accounting.oldestUncheckpointedOwnEntryAt).toBe(ageBefore);
-      expect(accounting.criticalAppendsSinceCheckpoint).toBe(countBefore);
+      // H1a is restated: the first barrier covers every own entry and clears accounting, including a refreshed buffer.
+      expect((await checkpoints(storage)).some(cp => cp.checkpoint_sequence >= ownSequence)).toBe(true);
+      expect(accounting.oldestUncheckpointedOwnEntryAt).toBeUndefined();
+      expect(accounting.criticalAppendsSinceCheckpoint).toBe(0);
       if (refreshBuffer) {
         expect(ownHash).toBeDefined();
-        expect(accounting.hashesSinceCheckpoint).toEqual([ownHash]);
+        expect(accounting.hashesSinceCheckpoint).toEqual([]);
       }
       now = appendedAt + MAX_AGE_MS;
       await durable(writerB);
