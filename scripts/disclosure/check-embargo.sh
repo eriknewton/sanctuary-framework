@@ -2,8 +2,18 @@
 # Refuse a range or text body that cites a listed id, without printing citations.
 # A required PR check gates merging. A push run is a detector after publication,
 # and requires operator review; it cannot refuse a push already accepted.
-# Bound: ids spelled with spaces, split across lines, or described in words are
-# not recognized. Public salt allows membership testing of guessed ids.
+# Unscanned: branch names, tags and tag messages, release notes and GitHub release
+# bodies, binary text git cannot split into lines even with --text, ids spelled
+# with spaces, split across lines or described in words, and bare short slugs
+# without their defect. prefix. Public salt allows membership testing of guesses.
+# Content absent from the net added lines, including text added and then removed
+# within the range or removed and restored unchanged, is outside the added-line
+# surface; commit messages are still scanned.
+# Added (A) and renamed (R) destination paths are scanned; copies appear as A
+# without copy detection. Type changes (T) introduce no new name and are not
+# scanned; a rewrite too large to be a rename appears as A and is scanned.
+# A PR editing scripts/disclosure/ or .github/workflows/embargo-guard.yml runs its
+# own copy of the guard. Such a PR merges only after the coordinator's two-family review.
 # Exit codes: 0 clean, 1 match, 2 cannot run.
 set -euo pipefail
 export LC_ALL=C
@@ -40,7 +50,8 @@ if [[ "$base" =~ ^0+$ ]]; then zero=1; else git -C "$repo" cat-file -e "$base^{c
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/embargo-scan.XXXXXX")
 cleanup() {
   local file
-  for file in "$tmp/union" "$tmp/list" "$tmp/raw-diff" "$tmp/added" "$tmp/messages" "$tmp/line" "$tmp/tokens"; do
+  # Must match embargo_tokens scratch ownership in embargo-digest-lib.sh.
+  for file in "$tmp"/*; do
     [[ ! -f "$file" ]] || unlink "$file"
   done
   rmdir -- "$tmp"
@@ -48,61 +59,81 @@ cleanup() {
 trap cleanup EXIT
 salt_path=scripts/disclosure/embargo-salt.txt
 list_path=scripts/disclosure/embargoed-id-digests.txt
-salt=$(git -C "$repo" show "$head:$salt_path" || { [[ $zero -eq 0 ]] && git -C "$repo" show "$base:$salt_path"; }) || fail
-[[ "$salt" =~ ^[0-9a-f]{64}$ ]] || fail # 32 bytes in hex.
-# Lists from two salts cannot be compared using one recipe; rotation needs regenerated evidence.
-if [[ $zero -eq 0 ]] && base_salt=$(git -C "$repo" show "$base:$salt_path"); then
-  [[ "$base_salt" == "$salt" ]] || fail
-fi
-: > "$tmp/union"
-found=0
-for tree in "$base" "$head"; do
-  [[ "$tree" =~ ^0+$ ]] && continue
-  if git -C "$repo" cat-file -e "$tree:$list_path"; then
-    git -C "$repo" show "$tree:$list_path" > "$tmp/list" || fail
-    found=1
-    while IFS= read -r row || [[ -n "$row" ]]; do
-      [[ "$row" == \#* || -z "$row" ]] && continue
-      [[ "$row" =~ ^[0-9a-f]{64}$ ]] || fail # SHA-256 is 32 bytes, two hex digits each.
-      printf '%s\n' "$row" >> "$tmp/union"
-    done < "$tmp/list"
+base_salt=''; head_salt=''; base_present=0
+: > "$tmp/pairs"
+# Both endpoint pairs participate, so removing a head digest cannot suppress a
+# recognized same-range citation protected by the base pair; a lift that cites
+# nothing is allowed by design. Digests across different salts are incomparable.
+for side in base head; do
+  tree=$base
+  [[ "$side" != head ]] || tree=$head
+  [[ ! "$tree" =~ ^0+$ ]] || continue
+  # Only absence from a successfully read inventory permits the pre-guard shape.
+  git -C "$repo" ls-tree -r -z "$tree" -- "$salt_path" "$list_path" > "$tmp/inventory" || fail
+  has_salt=0; has_list=0
+  while IFS= read -r -d '' entry; do
+    metadata=${entry%%$'\t'*}; path=${entry#*$'\t'}
+    [[ "$metadata" == *' blob '* ]] || fail
+    case "$path" in
+      "$salt_path") has_salt=1 ;;
+      "$list_path") has_list=1 ;;
+      *) fail ;;
+    esac
+  done < "$tmp/inventory"
+  if [[ "$side" == base && $has_salt -eq 0 && $has_list -eq 0 ]]; then
+    printf '%s\n' 'INFO base tree carries no list; head list only.' >&3
+    continue
   fi
+  [[ $has_list -eq 1 ]] || fail
+  if [[ $has_salt -eq 1 ]]; then
+    salt=$(git -C "$repo" show "$tree:$salt_path") || fail
+    [[ "$salt" =~ ^[0-9a-f]{64}$ ]] || fail # 32 bytes in hex.
+  else
+    [[ "$side" == head && -n "$base_salt" ]] || fail
+    salt=$base_salt
+  fi
+  if [[ "$side" == base ]]; then base_salt=$salt; base_present=1; else head_salt=$salt; fi
+  git -C "$repo" show "$tree:$list_path" > "$tmp/list" || fail
+  while IFS= read -r row || [[ -n "$row" ]]; do
+    [[ "$row" == \#* || -z "$row" ]] && continue
+    [[ "$row" =~ ^[0-9a-f]{64}$ ]] || fail # SHA-256 is 32 bytes in hex.
+    printf '%s\t%s\n' "$salt" "$row" >> "$tmp/pairs"
+  done < "$tmp/list"
 done
-# Missing both lists provides no membership evidence, so cannot count as clean.
-[[ $found -eq 1 ]] || fail
-sort -u "$tmp/union" > "$tmp/list"
+[[ -n "$head_salt" ]] || fail
+printf '%s\n' "$head_salt" > "$tmp/salts.raw"
+[[ $base_present -eq 0 ]] || printf '%s\n' "$base_salt" >> "$tmp/salts.raw"
+sort -u "$tmp/salts.raw" > "$tmp/salts" || fail
 printf '%s\n' 'INFO required PR check gates merging; push scan is a detector after publication.' >&3
 if [[ $zero -eq 1 ]]; then
   printf '%s\n' 'INFO zero base: scanning only the head commit and head tree list.' >&3
   git -C "$repo" log -1 --format=%H%n%B "$head" > "$tmp/messages"
-  git -C "$repo" diff-tree --root --no-commit-id --no-ext-diff --no-textconv --unified=0 -r -p "$head" > "$tmp/raw-diff"
+  git -C "$repo" diff-tree --root --no-commit-id --no-ext-diff --no-textconv --text --unified=0 -r -p "$head" > "$tmp/raw-diff"
+  git -C "$repo" diff-tree --root --no-commit-id -r -M --name-only --diff-filter=AR -z "$head" -- > "$tmp/paths" || fail
 else
   git -C "$repo" log --format=%H%n%B "$base..$head" > "$tmp/messages"
   ancestor=$(git -C "$repo" merge-base "$base" "$head") || fail
-  git -C "$repo" diff --no-ext-diff --no-textconv --unified=0 "$ancestor" "$head" -- > "$tmp/raw-diff"
+  git -C "$repo" diff --no-ext-diff --no-textconv --text --unified=0 "$ancestor" "$head" -- > "$tmp/raw-diff"
+  git -C "$repo" diff -M --name-only --diff-filter=AR -z "$ancestor" "$head" -- > "$tmp/paths" || fail
 fi
 # Hunk state distinguishes added content beginning with ++ from +++ path headers.
 awk '/^diff --git / { hunk=0 } /^@@ / { hunk=1; next } hunk && /^\+/ { print substr($0,2) }' "$tmp/raw-diff" > "$tmp/added"
-result=0
+# Occurrences retain surface order, while the global set bounds work before hashing.
+: > "$tmp/occurrences"
+stage_record() {
+  local surface=$1 number=$2 token
+  embargo_tokens "$tmp/line" "$tmp/tokenizer" > "$tmp/tokens" || fail
+  while IFS= read -r token; do
+    printf '%s\t%s\t%s\n' "$token" "$surface" "$number" >> "$tmp/occurrences"
+  done < "$tmp/tokens"
+}
 scan() {
-  local surface=$1 file=$2 line number=0 token digest
+  local surface=$1 file=$2 line number=0
   [[ -f "$file" && -r "$file" ]] || fail
   while IFS= read -r line || [[ -n "$line" ]]; do
     number=$((number + 1))
     printf '%s\n' "$line" > "$tmp/line"
-    embargo_tokens "$tmp/line" > "$tmp/tokens"
-    while IFS= read -r token; do
-      digest=$(embargo_digest "$salt" "$token")
-      if grep -Fqx -- "$digest" "$tmp/list"; then
-        # Fixed surfaces and a 12-hex digest prefix identify evidence without echoing input.
-        if [[ "$format" == tsv ]]; then
-          printf 'FAIL\tEMB-01\t%s\tline\t%s\tdigest\t%.12s\n' "$surface" "$number" "$digest"
-        else
-          printf 'FAIL EMB-01 %s line %s digest %.12s\n' "$surface" "$number" "$digest"
-        fi
-        result=1
-      fi
-    done < "$tmp/tokens"
+    stage_record "$surface" "$number"
   done < "$file"
 }
 scan commit-message "$tmp/messages"
@@ -112,4 +143,48 @@ while [[ $i -lt $text_count ]]; do
   i=$((i + 1))
 done
 scan added-line "$tmp/added"
-exit "$result"
+number=0
+# NUL records preserve one index per path, including names containing newlines.
+while IFS= read -r -d '' path; do
+  number=$((number + 1))
+  printf '%s\n' "$path" > "$tmp/line"
+  stage_record added-path "$number"
+done < "$tmp/paths"
+cut -f1 "$tmp/occurrences" > "$tmp/token-column" || fail
+sort -u "$tmp/token-column" > "$tmp/unique" || fail
+count=$(wc -l < "$tmp/unique") || fail
+# 50000 tokens times at most two salts is 100000 hash processes, about 300 s at
+# 3 ms each, plus tokenizer/sort/join overhead inside the 30 minute job bound.
+# This work bound must match timeout-minutes in .github/workflows/embargo-guard.yml.
+EMBARGO_MAX_UNIQUE_TOKENS=50000
+if [[ $count -gt $EMBARGO_MAX_UNIQUE_TOKENS ]]; then
+  printf '%s\n' 'ERROR embargo scanner cannot run: token bound exceeded' >&3
+  exit 2
+fi
+: > "$tmp/matches"
+while IFS= read -r salt; do
+  awk -F '\t' -v salt="$salt" '$1 == salt {print $2}' "$tmp/pairs" > "$tmp/members" || fail
+  while IFS= read -r token; do
+    digest=$(embargo_digest "$salt" "$token") || fail
+    if grep -Fqx -- "$digest" "$tmp/members"; then
+      printf '%s\t%s\n' "$token" "$digest" >> "$tmp/matches"
+    else
+      status=$?
+      [[ $status -eq 1 ]] || fail # grep 1 means no member; other failures provide no evidence.
+    fi
+  done < "$tmp/unique"
+done < "$tmp/salts"
+# Portable awk joins membership to original occurrence order without printing input.
+# A 12-hex prefix identifies evidence while keeping reports compact.
+awk -F '\t' -v format="$format" '
+  FILENAME == ARGV[1] {if (!($1 in hit)) hit[$1]=$2; next}
+  $1 in hit {
+    key=$1 FS $2 FS $3
+    if (seen[key]++) next
+    sep=(format == "tsv" ? "\t" : " ")
+    printf "FAIL%sEMB-01%s%s%sline%s%s%sdigest%s%.12s\n", sep,sep,$2,sep,sep,$3,sep,sep,hit[$1]
+  }
+' "$tmp/matches" "$tmp/occurrences" > "$tmp/report" || fail
+cat "$tmp/report" || fail
+[[ ! -s "$tmp/report" ]] || exit 1
+exit 0

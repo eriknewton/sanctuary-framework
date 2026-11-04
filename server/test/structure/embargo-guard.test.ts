@@ -2,8 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 
@@ -47,7 +47,9 @@ describe("embargo guard", () => {
   const generate = (ids: string) => {
     const input = join(temp, "extract.txt");
     writeFileSync(input, ids);
-    return spawnSync("bash", [generator, input, "--salt", join(repo, saltPath)], { cwd: repo, env, encoding: "utf8" });
+    const result = spawnSync("bash", [generator, input, "--salt", join(repo, saltPath)], { cwd: repo, env, encoding: "utf8" });
+    completed(result);
+    return result;
   };
   const seed = (ids = listed) => {
     put(saltPath, `${salt}\n`);
@@ -57,8 +59,28 @@ describe("embargo guard", () => {
     base = commit("Initial fixture");
     git("switch", "-qc", "candidate");
   };
-  const scan = (head = git("rev-parse", "HEAD"), args: string[] = [], from = base) => {
-    const result = spawnSync("bash", [scanner, "--repo", repo, "--base", from, "--head", head, ...args], { cwd: repo, env, encoding: "utf8" });
+  const completed = (result: ReturnType<typeof spawnSync>) => {
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+  };
+  const fakeTool = (name: string, body: string) => {
+    const bin = join(temp, "bin");
+    mkdirSync(bin, { recursive: true });
+    const file = join(bin, name);
+    writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`);
+    chmodSync(file, 0o755); // Executable fixture tool, writable only by its owner.
+    return `${bin}:${env.PATH}`;
+  };
+  const realTool = (name: string) => execFileSync("bash", ["-c", 'command -v "$1"', "fixture", name], { cwd: repo, env, encoding: "utf8" }).trim();
+  const copyScripts = () => {
+    mkdirSync(join(repo, "scripts/disclosure"), { recursive: true });
+    for (const name of ["check-embargo.sh", "embargo-digest-lib.sh", "generate-embargo-digests.sh"]) {
+      copyFileSync(join(scripts, name), join(repo, "scripts/disclosure", name));
+    }
+  };
+  const scan = (head = git("rev-parse", "HEAD"), args: string[] = [], from = base, childPath = env.PATH) => {
+    const result = spawnSync("bash", [scanner, "--repo", repo, "--base", from, "--head", head, ...args], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: childPath }, encoding: "utf8", timeout: 60_000 }); // One minute bounds each synchronous fixture child.
+    completed(result);
     // W10: every scanner result is checked, so each continuing and refusing path stays private.
     const output = result.stdout + result.stderr;
     for (const value of [listed, listed.toLowerCase(), listed.replaceAll("-", "_"), ...subjects]) {
@@ -105,7 +127,7 @@ describe("embargo guard", () => {
   });
   it("W3 accepts unlisted ids on all three surfaces", () => {
     seed();
-    put("content.txt", allowed);
+    put("content.txt", `${allowed} v1.2.3-RC-1 SHA-256.md`);
     expect(scan(commit(`Allowed citation ${allowed}`), ["--text", `pr-body=${text(allowed)}`]).status).toBe(0);
   });
   it.each(["`testemb-zulu-01`.", "TESTEMB_ZULU_01"])("W4 normalizes %s", (value) => {
@@ -128,10 +150,11 @@ describe("embargo guard", () => {
     put("content.txt", "");
     expect(scan(commit("Remove fixture text")).status).toBe(0);
   });
-  it("W7 retains base membership after head removes the list", () => {
+  it("W7 retains base membership after head removes the listed rows", () => {
     seed();
-    rmSync(join(repo, listPath));
-    refusal(scan(commit(`Remove fixture list ${listed}`)), "commit-message");
+    const rows = readFileSync(join(repo, listPath), "utf8").split("\n");
+    put(listPath, rows.filter((row) => ![digest(listed), digest(`DEFECT.${listed}`)].includes(row)).join("\n"));
+    refusal(scan(commit(`Update fixture list ${listed}`)), "commit-message");
   });
   it("W8 permits a lift followed by a separate citation range", () => {
     seed();
@@ -167,6 +190,7 @@ describe("embargo guard", () => {
   it("W12 pins salt and newline hashing across implementations", () => {
     const result = spawnSync("bash", ["-c", 'source "$1"; embargo_digest fixture-salt X-1', "fixture", lib], { cwd: repo, env, encoding: "utf8" });
     expect(result.status).toBe(0);
+    completed(result);
     expect(result.stdout.trim()).toBe(digest("X-1", "fixture-salt"));
   });
   it("W13 wires the parsed workflow to every event and environment text binding", () => {
@@ -176,13 +200,17 @@ describe("embargo guard", () => {
     expect(flow.name).toBe("embargo-guard");
     expect(flow.on.pull_request.types).toContain("edited");
     expect(flow.on.push.branches).toContain("main");
-    expect(flow.on).toHaveProperty("workflow_dispatch");
+    expect(Object.keys(flow.on).sort()).toEqual(["pull_request", "push"]);
+    expect(flow.jobs["embargo-guard"]["timeout-minutes"]).toBe(30); // Minutes, matching the scanner work budget.
     expect(flow.on).not.toHaveProperty("pull_request_target");
     expect(source).not.toMatch(/^\s*paths(?:-ignore)?:/m);
     expect(flow.permissions).toEqual({ contents: "read" });
     const steps = flow.jobs["embargo-guard"].steps;
     expect(steps.find((step: any) => step.uses === "actions/checkout@v7").with["fetch-depth"]).toBe(0);
-    const run = steps.find((step: any) => step.run);
+    const consumers = steps.filter((step: any) => step.name === "Scan range and PR text");
+    expect(consumers).toHaveLength(1);
+    const run = consumers[0];
+    expect(typeof run.run).toBe("string");
     expect(run.run).toMatch(/scripts\/disclosure\/check-embargo.sh --base "\$base" --head "\$head"/);
     for (const ref of ["github.event.pull_request.base.sha", "github.event.pull_request.head.sha", "github.event.before", "github.sha"]) expect(Object.values(run.env)).toContain(`\u0024{{ ${ref} }}`);
     for (const field of ["title", "body"]) {
@@ -191,16 +219,32 @@ describe("embargo guard", () => {
       expect(refs[0]).toMatch(new RegExp(`^\\s+PR_${field.toUpperCase()}:\\s*\\$\\{\\{\\s*github\\.event\\.pull_request\\.${field}\\s*\\}\\}\\s*$`));
     }
   });
-  it.each(["pull_request", "push", "workflow_dispatch"])("W13 executes the workflow consumer for %s", (event) => {
+  it("W24 executes push and PR consumers with literal text", () => {
+    copyScripts();
     seed();
-    const head = commit(event === "pull_request" ? "Clean fixture" : `Event fixture ${listed}`);
-    for (const name of ["check-embargo.sh", "embargo-digest-lib.sh"]) copyFileSync(join(scripts, name), join(repo, "scripts/disclosure", name));
     const flow = yaml.load(readFileSync(workflowPath, "utf8"));
-    const run = flow.jobs["embargo-guard"].steps.find((step: any) => step.run).run;
-    const result = spawnSync("bash", ["-c", run], { cwd: repo, env: { ...env, VITEST: env.VITEST, EVENT_NAME: event, PR_BASE: base, PR_HEAD: head, PUSH_BASE: base, EVENT_HEAD: head, PR_TITLE: "Fixture title", PR_BODY: `${listed} $(touch should-not-exist)` }, encoding: "utf8" });
-    expect(result.status, result.stderr).toBe(1);
-    expect(result.stdout).toContain(event === "pull_request" ? "pr-body" : "commit-message");
-    expect(result.stdout + result.stderr).not.toContain(listed);
+    const consumers = flow.jobs["embargo-guard"].steps.filter((step: any) => step.name === "Scan range and PR text");
+    expect(consumers).toHaveLength(1);
+    const run = consumers[0].run;
+    expect(typeof run).toBe("string");
+    const bash = platform() === "darwin" ? "/bin/bash" : "bash";
+    if (platform() === "darwin") {
+      const version = spawnSync(bash, ["-c", 'printf "%s" "$BASH_VERSION"'], { cwd: repo, env, encoding: "utf8" });
+      completed(version);
+      expect(version.status).toBe(0);
+      expect(version.stdout).toMatch(/^3\.2/);
+    }
+    const execute = (event: string, head: string, title = "Fixture title", body = "") => {
+      const result = spawnSync(bash, ["-c", run], { cwd: repo, env: { ...env, VITEST: env.VITEST, EVENT_NAME: event, PR_BASE: base, PR_HEAD: head, PUSH_BASE: base, EVENT_HEAD: head, PR_TITLE: title, PR_BODY: body }, encoding: "utf8" });
+      completed(result);
+      expect(result.stdout + result.stderr).not.toContain(listed);
+      return result;
+    };
+    const clean = commit("Clean fixture");
+    expect(execute("push", clean).status).toBe(0);
+    refusal(execute("push", commit(`Event fixture ${listed}`)), "commit-message");
+    refusal(execute("pull_request", clean, listed), "pr-title");
+    refusal(execute("pull_request", clean, "Fixture title", `${listed} $(touch should-not-exist)`), "pr-body");
     expect(existsSync(join(repo, "should-not-exist"))).toBe(false);
   });
   it("reads both parents from a merge checkout", () => {
@@ -227,9 +271,9 @@ describe("embargo guard", () => {
     rmSync(join(repo, saltPath));
     refusal(scan(commit(`Salt fixture ${listed}`)), "commit-message");
   });
-  it.each(["salt", "list", "rotation"])("refuses inconsistent %s evidence", (kind) => {
+  it.each(["salt", "list"])("refuses inconsistent %s evidence", (kind) => {
     seed();
-    put(kind === "list" ? listPath : saltPath, kind === "rotation" ? `${"cd".repeat(32)}\n` : "invalid\n");
+    put(kind === "list" ? listPath : saltPath, "invalid\n");
     expect(scan(commit("Invalid fixture evidence")).status).toBe(2);
   });
   it("refuses an unreadable range and missing text", () => {
@@ -255,7 +299,153 @@ describe("embargo guard", () => {
     put("extract.txt", listed);
     git("add", "extract.txt");
     const result = spawnSync("bash", [generator, join(repo, "extract.txt"), "--salt", join(repo, saltPath)], { cwd: repo, env, encoding: "utf8" });
+    completed(result);
     expect(result.status).toBe(2);
     expect(result.stdout + result.stderr).not.toContain(listed);
   });
+  it("W14 scans text in binary-classified content", () => {
+    seed();
+    put("content.bin", `\0\0${listed}\n`);
+    refusal(scan(commit("Add binary fixture")), "added-line");
+  });
+  it.each(["addition", "rename"])("W15 scans %s destination paths privately", (kind) => {
+    seed();
+    if (kind === "rename") {
+      put("source.txt", "Innocuous fixture content\n");
+      base = commit("Prepare path fixture");
+    }
+    const path = kind === "rename" ? `docs/${listed}.md` : `${listed}.txt`;
+    if (kind === "rename") {
+      mkdirSync(join(repo, "docs"));
+      git("mv", "source.txt", path);
+    } else put(path, "");
+    const result = scan(commit("Update fixture path"));
+    refusal(result, "added-path");
+    expect(result.stdout + result.stderr).not.toContain(path);
+  });
+  it("W15 preserves record indices for newline paths", () => {
+    seed();
+    put(`docs/first\n${listed}.txt`, "");
+    const result = scan(commit("Add multiline path"));
+    refusal(result, "added-path");
+    expect(result.stdout).toContain("added-path line 1 digest");
+  });
+  it.each(["tokenizer", "digest"])("W16 checks %s completion", (kind) => {
+    seed();
+    const head = commit("Clean fixture");
+    const marker = join(temp, "called");
+    let childPath: string;
+    if (kind === "tokenizer") {
+      const tr = realTool("tr");
+      childPath = fakeTool("tr", `if [[ "$1" == -cs && "$2" == A-Za-z0-9._- ]]; then touch '${marker}'; exit 3; fi\nexec '${tr}' "$@"`);
+    } else {
+      childPath = fakeTool("sha256sum", `touch '${marker}'; exit 3`);
+      fakeTool("shasum", `touch '${marker}'; exit 3`);
+    }
+    expect(scan(head, ["--text", `pr-body=${text(allowed)}`], base, childPath).status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+  });
+  it("W17a requires the head list", () => {
+    seed();
+    rmSync(join(repo, listPath));
+    expect(scan(commit("Update fixture evidence")).status).toBe(2);
+  });
+  it("W17b accepts checked pre-guard evidence", () => {
+    base = commit("Initial fixture");
+    put(saltPath, `${salt}\n`);
+    put(listPath, generate(listed).stdout);
+    const clean = scan(commit("Introduce fixture evidence"));
+    expect(clean.status).toBe(0);
+    expect(clean.stderr).toContain("INFO base tree carries no list; head list only.");
+    refusal(scan(commit(`Fixture citation ${listed}`)), "commit-message");
+  });
+  it("W17c checks evidence inventory completion", () => {
+    base = commit("Initial fixture");
+    put(saltPath, `${salt}\n`);
+    put(listPath, generate(listed).stdout);
+    const head = commit("Introduce fixture evidence");
+    const realGit = realTool("git");
+    const marker = join(temp, "called");
+    const childPath = fakeTool("git", `if [[ "$3" == ls-tree && "$6" == '${base}' ]]; then touch '${marker}'; exit 128; fi\nexec '${realGit}' "$@"`);
+    expect(scan(head, [], base, childPath).status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+  });
+  it("W18a uses both regenerated rotation pairs", () => {
+    seed();
+    put(saltPath, `${"cd".repeat(32)}\n`); // Second 32-byte salt.
+    put(listPath, generate(`${listed}\n${allowed}`).stdout);
+    const clean = commit("Rotate fixture evidence");
+    expect(scan(clean).status).toBe(0);
+    refusal(scan(commit(`Fixture citation ${listed}`)), "commit-message");
+    git("reset", "--hard", clean);
+    refusal(scan(commit(`Fixture citation ${allowed}`)), "commit-message");
+  });
+  it("W18b retains the base rotation pair", () => {
+    seed();
+    put(saltPath, `${"cd".repeat(32)}\n`); // Second 32-byte salt.
+    put(listPath, generate(allowed).stdout);
+    const result = scan(commit(`Rotate fixture evidence ${listed}`));
+    refusal(result, "commit-message");
+    expect(result.stdout).toContain(`digest ${digest(listed).slice(0, 12)}`); // Public report prefix length.
+  });
+  it("W19 checks the global token budget before hashing", () => {
+    seed();
+    // One more than the scanner's 50000-token budget, in a single added record.
+    put("content.txt", Array.from({ length: 50_001 }, (_, i) => `TESTEMB-TOKEN-${i}`).join(" "));
+    const head = commit("Add token fixture");
+    const marker = join(temp, "hashed");
+    const childPath = fakeTool("sha256sum", `touch '${marker}'; exit 3`);
+    fakeTool("shasum", `touch '${marker}'; exit 3`);
+    const result = scan(head, [], base, childPath);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("ERROR embargo scanner cannot run: token bound exceeded");
+    expect(existsSync(marker)).toBe(false);
+  }, 90_000); // Child has a one-minute budget plus test setup and cleanup margin.
+  it("W20 recognizes dotted citation suffixes", () => {
+    seed();
+    refusal(scan(commit(`Add ${listed}.txt`)), "commit-message");
+    base = git("rev-parse", "HEAD");
+    put("docs/defect.testemb-zulu-01.md", "");
+    refusal(scan(commit("Add prefixed path fixture")), "added-path");
+  });
+  it("W21 emits exactly the supported short-slug membership", () => {
+    put(saltPath, `${salt}\n`);
+    const input = join(temp, "short.txt");
+    writeFileSync(input, "defect.t7\n");
+    const counter = join(temp, "counter");
+    const childPath = fakeTool("openssl", `n=0; [[ ! -f '${counter}' ]] || read -r n < '${counter}'\nn=$((n + 1)); printf '%s\n' "$n" > '${counter}'; printf '%064x\n' "$n"`);
+    const result = spawnSync("bash", [generator, input, "--salt", join(repo, saltPath)], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: childPath }, encoding: "utf8" });
+    completed(result);
+    expect(result.status).toBe(0);
+    const decoys = new Set(Array.from({ length: Number(readFileSync(counter, "utf8")) }, (_, i) => digest((i + 1).toString(16).padStart(64, "0")))); // 32-byte decoy preimages.
+    const rows = result.stdout.trim().split("\n").slice(2); // Two header lines.
+    expect(rows.filter((row) => !decoys.has(row))).toEqual([digest("DEFECT.T7")]);
+    expect(rows).not.toContain(digest("T7"));
+    put(listPath, result.stdout);
+    base = commit("Initial fixture");
+    expect(scan(commit("fixes t7")).status).toBe(0);
+    refusal(scan(commit("see defect.t7")), "commit-message");
+  });
+  it("W22 keeps extracts physically outside the checkout", () => {
+    copyScripts();
+    put(saltPath, `${salt}\n`);
+    put("extract.txt", listed);
+    const outside = join(temp, "extract.txt");
+    writeFileSync(outside, listed);
+    for (const [input, status] of [[join(repo, "extract.txt"), 2], [outside, 0]] as const) {
+      const result = spawnSync("bash", [join(repo, "scripts/disclosure/generate-embargo-digests.sh"), input], { cwd: repo, env, encoding: "utf8" });
+      completed(result);
+      expect(result.status).toBe(status);
+    }
+  });
+  it("W23 publishes output only after random generation completes", () => {
+    seed();
+    const out = join(temp, "fresh-output");
+    const childPath = fakeTool("openssl", "exit 3");
+    const result = spawnSync("bash", [generator, join(temp, "extract.txt"), "--salt", join(repo, saltPath), "--out", out], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: childPath }, encoding: "utf8" });
+    completed(result);
+    expect(result.status).toBe(2);
+    expect(existsSync(out)).toBe(false);
+  });
+
 });

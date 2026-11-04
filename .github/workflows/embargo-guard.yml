@@ -3,6 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # The push run is a detector after publication, never a gate on an accepted push.
 # A red push run needs operator review; history changes are never automated.
+# A PR editing scripts/disclosure/ or .github/workflows/embargo-guard.yml runs its
+# own copy of the guard. Such a PR merges only after the coordinator's two-family review.
+# Unscanned surfaces include branch names, tags and tag messages, release notes
+# and GitHub release bodies, content absent from net added lines, unsplittable
+# binary text, word-described or spaced/split ids, and bare short slugs.
+# The full surface and path policy is in scripts/disclosure/check-embargo.sh.
 # Keep edited: a title or body can change after the first successful check.
 # No paths filter: commit messages and PR text are independent of changed paths.
 # Use pull_request with read-only access; pull_request_target is unnecessary.
@@ -14,7 +20,6 @@ on:
     types: [opened, edited, reopened, synchronize, ready_for_review]
   push:
     branches: [main]
-  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -23,6 +28,8 @@ jobs:
   embargo-guard:
     name: embargo-guard
     runs-on: ubuntu-latest
+    # Must match the work bound in scripts/disclosure/check-embargo.sh, with full-depth checkout time.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -55,10 +62,6 @@ jobs:
               base=$PUSH_BASE
               head=$EVENT_HEAD
               ;;
-            workflow_dispatch)
-              head=$EVENT_HEAD
-              base=$(git rev-parse "$head^" 2>/dev/null) || base=0000000000000000000000000000000000000000
-              ;;
             *) exit 2 ;;
           esac
-          scripts/disclosure/check-embargo.sh --base "$base" --head "$head" "${text_args[@]}"
+          scripts/disclosure/check-embargo.sh --base "$base" --head "$head" ${text_args[@]+"${text_args[@]}"}
