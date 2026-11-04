@@ -1,9 +1,12 @@
 /** Informational root accounting preserves agent evidence, availability and bounded teardown. */
+// fail-before-exempt: this change makes the root-flow flood test force a full garbage collection before both heap readings, so the unchanged 64 MiB bound measures retained growth instead of uncollected garbage; it asserts no new product behavior and passes against pre-fix source by construction.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { ed25519 } from "@noble/curves/ed25519";
 import * as flowModule from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import { MacOSFlowEventConsumer, type MacOSFlowEventConsumerInput } from "../../../src/castle-wall/runtime/macos-flow-events.js";
@@ -33,7 +36,10 @@ const STOP_SLACK_MS = 1_000; // Local filesystem and timer scheduling allowance.
 const HEARTBEAT_MS = 45_000; // Shipped default audit heartbeat cadence.
 const FLOOD_FRAMES = 100_000; // Required adversarial workload.
 const FLOOD_TIMEOUT_MS = 15 * 60_000; // Fifteen minutes allows strict verification on slow CI CPUs.
-const HEAP_BOUND_BYTES = 64 * 1024 * 1024; // 64 MiB bounds retained and transient heap growth.
+const HEAP_BOUND_BYTES = 64 * 1024 * 1024; // 64 MiB bounds retained heap growth across the flood, read after a full collection.
+// Without a collection, heapUsed also counts garbage the next GC frees, and that share grows with runner slowness.
+setFlagsFromString("--expose-gc");
+const collectGarbage = runInNewContext("gc") as () => void;
 const SIGNING_SEED = ed25519.utils.randomPrivateKey(); // Fixture-only signing seed, never persisted.
 const PIN = Buffer.from(ed25519.getPublicKey(SIGNING_SEED)).toString("base64url");
 const COUNTER_KEYS = ["root_verified_total", "root_unverified_total", "root_allow_total", "root_drop_total", "summaries_written", "summaries_skipped_in_flight", "summaries_failed"].sort();
@@ -223,8 +229,10 @@ describe("root flow accounting", () => {
     await f.consumer.handleFlowDecisionRecorded(notification);
     expect(appends).toBe(0);
     const keysBefore = Object.keys(f.consumer.getNonAgentFlowCounters()).sort();
+    collectGarbage();
     const heapBefore = process.memoryUsage().heapUsed;
     for (let count = 1; count < FLOOD_FRAMES; count++) await f.consumer.handleFlowDecisionRecorded(notification);
+    collectGarbage();
     const growth = process.memoryUsage().heapUsed - heapBefore;
     expect(appends).toBe(0);
     expect(growth).toBeLessThan(HEAP_BOUND_BYTES);
