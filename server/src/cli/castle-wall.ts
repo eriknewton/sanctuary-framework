@@ -236,6 +236,10 @@ export interface CastleWallCommandContext {
    */
   readFileSyncFn?: (path: string) => string;
   getuid?: () => number;
+  /** Parent identity seam for launchd-only full-agent admission; production reads process.ppid. */
+  getppid?: () => number;
+  /** Test runner for full-agent identity observation; production uses bounded launchctl. */
+  fullAgentExecFileFn?: import("./castle-wall-full-agent.js").FullAgentCommandContext["execFileFn"];
   /**
    * TEST SEAM ONLY for the `re-pin` confirmation gate (house pattern, mirroring
    * `rotate-master.ts` `args.stdin` and `reset-passphrase.ts`): supply the
@@ -1160,19 +1164,21 @@ async function buildAuditLogForPrivilegedAction(opts: {
   verb: "daemon" | "re-pin";
   acceptBrokenChain: boolean;
   err: Writable;
+  processExitFence?: import("../operational/audit-log.js").AuditProcessExitFence;
 }): Promise<AuditLog> {
   const { storage, masterKey, fortressPath, verb, acceptBrokenChain, err } = opts;
+  const auditConfig = verb === "daemon" ? { processExitFence: opts.processExitFence } : {};
   if (!acceptBrokenChain) {
-    return new AuditLog(storage, masterKey);
+    return new AuditLog(storage, masterKey, auditConfig);
   }
 
   // Flag set: probe findings without throwing (lenient read).
-  const lenient = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+  const lenient = new AuditLog(storage, masterKey, { ...auditConfig, integrityMode: "lenient" });
   const findings = await lenient.getIntegrityFindings();
   if (findings.length === 0) {
     // Clean chain: the override is a no-op. Keep the default strict log and do
     // not write a spurious consent entry.
-    return new AuditLog(storage, masterKey);
+    return new AuditLog(storage, masterKey, auditConfig);
   }
 
   // Findings present + operator consented. Make it loud, then record consent
@@ -2556,6 +2562,13 @@ export async function runDaemon(
   // must match FULL_SUPERVISION_DEFAULT_CODES in server/src/castle-wall/runtime/full-supervision-exit.ts.
   if (writeCastleWallParseError(parsed, err)) return 2;
   const acceptBrokenChain = parsed.acceptBrokenChain ?? false;
+  const { WALL_DAEMON_AUDIT_EXIT_FENCE, FullAgentStateStore } = await import("./castle-wall-full-agent-state.js");
+  // must match --launch-agent in server/src/cli/castle-wall-full-agent.ts.
+  const launchAgent = argv.includes("--launch-agent");
+  if (launchAgent && argv.includes("--safe-mode")) {
+    write(err, "--launch-agent cannot be combined with --safe-mode.\n");
+    return 2;
+  }
 
   // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
   // The daemon verb is macOS by default. On Linux it stays unsupported UNLESS the
@@ -2598,6 +2611,17 @@ export async function runDaemon(
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
   const storagePath = resolveFortressArg(parsed.fortress, env);
+  if (launchAgent) {
+    const { fullAgentAdmissionRefusal } = await import("./castle-wall-full-agent.js");
+    const refusal = fullAgentAdmissionRefusal(ctx.getppid?.() ?? process.ppid, process.pid,
+      (ctx.getuid ?? process.getuid!.bind(process))(), ctx.fullAgentExecFileFn);
+    if (refusal) { write(err, `${refusal}\n`); return 2; }
+  }
+  const fullAgentState = launchAgent ? new FullAgentStateStore(storagePath) : undefined;
+  if (fullAgentState) {
+    const admission = fullAgentState.admit();
+    if (!admission.admitted) return admission.exitCode;
+  }
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
   const launchdBoot = argv.includes("--launchd");
 
@@ -2785,7 +2809,10 @@ export async function runDaemon(
     auditLog = createDaemonAuditLog(
       storage,
       derived.key,
-      fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : undefined,
+      {
+        ...(fortressCreateOwner !== undefined ? { createOwner: fortressCreateOwner } : {}),
+        ...(platform === "darwin" ? { processExitFence: WALL_DAEMON_AUDIT_EXIT_FENCE } : {}),
+      },
     );
   } else {
     auditLog = await buildAuditLogForPrivilegedAction({
@@ -2793,6 +2820,7 @@ export async function runDaemon(
       masterKey: derived.key,
       fortressPath: storagePath,
       verb: "daemon",
+      ...(platform === "darwin" ? { processExitFence: WALL_DAEMON_AUDIT_EXIT_FENCE } : {}),
       acceptBrokenChain,
       err,
     });
@@ -2877,6 +2905,12 @@ export async function runDaemon(
       ctx.auditProducerPublicKeyPath ??
       env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY;
 
+    // A full daemon cannot reach readiness with ordinary release-and-continue recovery.
+    if (auditLog.processExitFence !== WALL_DAEMON_AUDIT_EXIT_FENCE) {
+      write(err, "Refusing to start: the full daemon audit exit fence is missing.\n");
+      await releaseDaemonMasterSession();
+      return 1;
+    }
     const startFullDaemon =
       ctx.fullDaemonStart ??
       (async (input) => {
@@ -3042,6 +3076,15 @@ export async function runDaemon(
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
+  if (fullAgentState) {
+    // Clean accounting requires a released session; the pinned return below then observes an already released barrier.
+    if (!(await releaseDaemonMasterSession())) return 1;
+    try { fullAgentState.stoppedClean(); }
+    catch {
+      write(err, "Could not record the full daemon clean stop.\n");
+      return 1;
+    }
+  }
   // must match FULL_SUPERVISION_COMPLETION_CODES in server/src/castle-wall/runtime/full-supervision-exit.ts.
   return (await releaseDaemonMasterSession()) ? 0 : 1;
   } finally {

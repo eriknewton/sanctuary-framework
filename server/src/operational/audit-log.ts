@@ -241,6 +241,17 @@ export type AuditCheckpointKeyResolution =
   | ReadonlyArray<string | Uint8Array>
   | undefined;
 
+/** A daemon fence identifies the exact unsettled lifecycle state. */
+export type AuditProcessExitFenceEvent =
+  | { fence: "fence_HOLD_DEADLINE_LAPSED"; lockPath: string; deadlineMs: number }
+  | { fence: "fence_FIRST_LOAD_UNSETTLED"; deadlineMs: number };
+
+/** Supply only when the composition root can terminate the entire writer synchronously. */
+export interface AuditProcessExitFence {
+  firstLoadDeadlineMs: number;
+  exit(event: AuditProcessExitFenceEvent): void;
+}
+
 export interface AuditLogConfig {
   /** Maximum total size of stored audit entries in bytes. Default: 100 MB. */
   maxTotalSizeBytes?: number;
@@ -424,6 +435,8 @@ export interface AuditLogConfig {
    * recovery bound.
    */
   writeLockHoldDeadlineMs?: number;
+  /** Opt-in process boundary for daemon audit stalls; absent preserves ordinary recovery. */
+  processExitFence?: AuditProcessExitFence;
   /**
    * Same-process, same-boot lock age (ms) after which a later acquire may force
    * release of its own stale lock. Defaults to 60s and must be strictly greater
@@ -2408,6 +2421,8 @@ export class AuditLog {
   private readonly idlessStaleLockMs: number;
   /** Bound shutdown waits by the same resolved deadline as each acquired audit write lock. */
   readonly writeLockHoldDeadlineMs: number;
+  /** The exact opt-in object lets the daemon verify its production wiring. */
+  readonly processExitFence: AuditProcessExitFence | undefined;
   /** Same-pid stale-lock breaker bound; must exceed {@link writeLockHoldDeadlineMs}. */
   private readonly selfHeldStaleLockMs: number;
   /** Process-local count of forced audit-write-lock recovery events. */
@@ -2437,6 +2452,10 @@ export class AuditLog {
   private cachedSealedVerdict: { fingerprint: string; verdict: SealedRegionVerdict } | null = null;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
+    this.processExitFence = config?.processExitFence;
+    if (this.processExitFence && (!Number.isFinite(this.processExitFence.firstLoadDeadlineMs) || this.processExitFence.firstLoadDeadlineMs <= 0)) {
+      throw new Error("AuditLogConfig.processExitFence.firstLoadDeadlineMs must be a positive finite number");
+    }
     this.verifyCacheMaxEntries = config?.verifyCacheMaxEntries ?? AUDIT_VERIFY_CACHE_MAX_ENTRIES;
     this.eagerBytePassIntervalMs = config?.eagerBytePassIntervalMs ?? AUDIT_EAGER_SENTINEL_INTERVAL_MS;
     // Test overrides may tighten bounds, never silently enlarge them.
@@ -4615,111 +4634,124 @@ export class AuditLog {
   private async loadPersistedEntriesWithReadConsistency(
     consumer?: VerifiedChainConsumer
   ): Promise<void> {
-    const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
-    let lastSignature: string | null = null;
-    let streamedThisLoop = false;
-    // IC-05-DG: a fresh top-level load starts with no live recovery; the flag
-    // survives retry passes within this call (see its field doc).
-    this.signingRecoveryThisLoad = false;
-    for (;;) {
-      // A retry means the prior pass observed a transient mid-mutation state and
-      // is being discarded. Tell the streaming consumer to drop everything it
-      // accumulated from that abandoned pass BEFORE we re-decrypt, so the entries
-      // it keeps are exactly those of the single accepted pass (the one we return
-      // from). The first pass needs no reset (nothing accumulated yet).
-      if (consumer && streamedThisLoop) consumer.reset?.();
-      await this.loadPersistedEntries(consumer);
-      streamedThisLoop = consumer !== undefined;
-      // IC-05-DG: a warn-grade latched-recovery re-emission is a PERMANENT
-      // property of the store, not a torn-read symptom, so it must not spend
-      // the retry budget (it would cost one extra full pass on every load
-      // forever). Hard findings keep the retry semantics unchanged.
-      if (!this.integrityFindings.some(isHardIntegrityFinding)) {
-        return; // clean read (warn-grade re-emissions are not torn-read signals)
+    let firstLoadTimer: ReturnType<typeof setTimeout> | undefined;
+    if (!this.loaded && this.processExitFence) {
+      const fence = this.processExitFence;
+      // Every first-load entry shares this boundary; an unsettled load must not strand the daemon before it requests a lock.
+      firstLoadTimer = setTimeout(() => {
+        fence.exit({ fence: "fence_FIRST_LOAD_UNSETTLED", deadlineMs: fence.firstLoadDeadlineMs });
+      }, fence.firstLoadDeadlineMs);
+      firstLoadTimer.unref?.();
+    }
+    try {
+      const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
+      let lastSignature: string | null = null;
+      let streamedThisLoop = false;
+      // IC-05-DG: a fresh top-level load starts with no live recovery; the flag
+      // survives retry passes within this call (see its field doc).
+      this.signingRecoveryThisLoad = false;
+      for (;;) {
+        // A retry means the prior pass observed a transient mid-mutation state and
+        // is being discarded. Tell the streaming consumer to drop everything it
+        // accumulated from that abandoned pass BEFORE we re-decrypt, so the entries
+        // it keeps are exactly those of the single accepted pass (the one we return
+        // from). The first pass needs no reset (nothing accumulated yet).
+        if (consumer && streamedThisLoop) consumer.reset?.();
+        await this.loadPersistedEntries(consumer);
+        streamedThisLoop = consumer !== undefined;
+        // IC-05-DG: a warn-grade latched-recovery re-emission is a PERMANENT
+        // property of the store, not a torn-read symptom, so it must not spend
+        // the retry budget (it would cost one extra full pass on every load
+        // forever). Hard findings keep the retry semantics unchanged.
+        if (!this.integrityFindings.some(isHardIntegrityFinding)) {
+          return; // clean read (warn-grade re-emissions are not torn-read signals)
+        }
+        // Give-up discriminator (attacker safety) is STORE STABILITY, not the
+        // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
+        // a writer marker is currently held, OR the entry listing changed since the
+        // previous attempt. The listing-changed signal is essential - a bursty
+        // writer releases the cross-process marker between appends, so an
+        // instantaneous marker check alone gives up mid-burst and surfaces a
+        // legitimate rotation tear (the CI false-fail). A STATIC store with findings
+        // is real tamper (truncation, byte edit, forged anchor) and falls through to
+        // fail closed within a single retry - discriminating on stability rather
+        // than on finding-kind means ALL torn-read shapes (anchor floor ahead of a
+        // pruned listing, entries pruned out from under a scan, a half-updated
+        // checkpoint root) are tolerated WITHOUT ever classifying a genuine tamper
+        // signal as "transient". The first attempt with findings always retries once
+        // to establish the listing baseline. The wall-clock deadline below bounds an
+        // attacker who keeps the store permanently churning.
+        const signature = await this.auditEntryListingSignature();
+        const hadBaseline = lastSignature !== null;
+        const listingChanged = hadBaseline && signature !== lastSignature;
+        lastSignature = signature;
+        const storeIsMutating =
+          listingChanged || (await this.isAuditWriterInProgress());
+        if (hadBaseline && !storeIsMutating) {
+          return; // static store with findings → fail closed (no masking)
+        }
+        // The deadline is checked only AFTER a baseline exists, so the one
+        // mandatory retry above is real work rather than a claim. Checking it
+        // first (the pre-2026-08-05 order) silently deleted that retry on any
+        // store where a SINGLE pass outlives the whole budget, which is the
+        // normal case at scale: one full decrypt+verify pass costs 11-30s
+        // on a 10k-entry chain (see the #714 note on the eager-read backstop) and
+        // the budget is 2s. Every transient tear on a large log therefore became
+        // a hard tamper verdict on the first look, with no second look at all.
+        //
+        // LATENCY NOTE (availability, not tamper weakening). In the case this
+        // change is about - one pass outliving the 2s budget - making the retry
+        // mandatory costs exactly ONE extra full pass: the second pass
+        // establishes the baseline with the deadline already blown, so this
+        // check ends the loop. (Further passes remain possible in general, but
+        // only while the store is demonstrably mutating AND the whole loop is
+        // still inside the budget, i.e. only when passes are cheap.)
+        //
+        // FORMERLY a KNOWN LATENCY EXPOSURE (accepted 2026-08-05, unmitigated
+        // on purpose): `persistChainedEntry` used to call `ensureLoaded()`
+        // INSIDE `withAuditWriteLock`, so on an appending process's FIRST load
+        // that extra pass was paid while the cross-process write lock was
+        // held. RESOLVED for C9 (register): `persistChainedEntry` now calls
+        // `ensureLoaded()` BEFORE requesting the write lock, so this retry loop
+        // (unchanged below) runs lock-free on the first load; the call inside
+        // the lock is a cheap already-loaded no-op, and the lock instead gets a
+        // narrow incremental re-check of just the tail (`freshenChainStateFromDisk`,
+        // O(1) backward walk) for the write that may have landed in the gap
+        // between the outside-lock load and the actual lock acquisition. This
+        // narrows the LOCK-HOLD window; it does not shrink or skip a single
+        // pass of the retry loop itself, so the read-consistency guarantee
+        // (store-stability discrimination, the same 2s deadline, the same
+        // fail-closed-on-a-static-store-with-findings behavior) is unchanged.
+        //
+        // The size of the extra pass this retry can still cost, measured rather
+        // than assumed. A cold full pass is LINEAR in entry count, not
+        // quadratic: timed on this branch (macOS, ~250-byte entries) at
+        // 250/500/1000/2000 entries the pass took 28/50/95/193ms, a flat
+        // ~0.1ms per entry. The per-entry constant, though, tracks PAYLOAD
+        // size, so it is not one number: the #714 profile (10k entries at
+        // ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms per
+        // entry, ~10-30x the small-entry constant above. At the ~166k entries
+        // the register-C6 production host carries, the extra pass is therefore
+        // ~16s of decrypt+verify with small entries and ~180-500s with
+        // #714-sized ones. Before the C9 fix, the upper half of that range blew
+        // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s) while the lock was
+        // held, aborting the hold via `signal` and running lock recovery, while
+        // concurrent appenders waiting to acquire gave up after
+        // `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with `AuditLockContentionError`.
+        // With the retry now running before lock acquisition, that same pass
+        // still costs the appending process the same wall-clock time, but no
+        // longer holds the lock (or blocks other appenders behind it) while it
+        // runs; a caller that never reaches a stable store still fails the
+        // append (strict-mode `AuditIntegrityError`, thrown before the lock is
+        // ever requested), which is the correct outcome for a store that is
+        // genuinely never becoming readable.
+        if (hadBaseline && Date.now() >= deadline) {
+          return; // bounded backstop; surfaced in strict mode by the caller
+        }
+        await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
       }
-      // Give-up discriminator (attacker safety) is STORE STABILITY, not the
-      // finding kind. Retry only while the store is DEMONSTRABLY mid-mutation:
-      // a writer marker is currently held, OR the entry listing changed since the
-      // previous attempt. The listing-changed signal is essential — a bursty
-      // writer releases the cross-process marker between appends, so an
-      // instantaneous marker check alone gives up mid-burst and surfaces a
-      // legitimate rotation tear (the CI false-fail). A STATIC store with findings
-      // is real tamper (truncation, byte edit, forged anchor) and falls through to
-      // fail closed within a single retry — discriminating on stability rather
-      // than on finding-kind means ALL torn-read shapes (anchor floor ahead of a
-      // pruned listing, entries pruned out from under a scan, a half-updated
-      // checkpoint root) are tolerated WITHOUT ever classifying a genuine tamper
-      // signal as "transient". The first attempt with findings always retries once
-      // to establish the listing baseline. The wall-clock deadline below bounds an
-      // attacker who keeps the store permanently churning.
-      const signature = await this.auditEntryListingSignature();
-      const hadBaseline = lastSignature !== null;
-      const listingChanged = hadBaseline && signature !== lastSignature;
-      lastSignature = signature;
-      const storeIsMutating =
-        listingChanged || (await this.isAuditWriterInProgress());
-      if (hadBaseline && !storeIsMutating) {
-        return; // static store with findings → fail closed (no masking)
-      }
-      // The deadline is checked only AFTER a baseline exists, so the one
-      // mandatory retry above is real work rather than a claim. Checking it
-      // first (the pre-2026-08-05 order) silently deleted that retry on any
-      // store where a SINGLE pass outlives the whole budget, which is the
-      // normal case at scale: one full decrypt+verify pass costs 11-30s
-      // on a 10k-entry chain (see the #714 note on the eager-read backstop) and
-      // the budget is 2s. Every transient tear on a large log therefore became
-      // a hard tamper verdict on the first look, with no second look at all.
-      //
-      // LATENCY NOTE (availability, not tamper weakening). In the case this
-      // change is about — one pass outliving the 2s budget — making the retry
-      // mandatory costs exactly ONE extra full pass: the second pass
-      // establishes the baseline with the deadline already blown, so this
-      // check ends the loop. (Further passes remain possible in general, but
-      // only while the store is demonstrably mutating AND the whole loop is
-      // still inside the budget, i.e. only when passes are cheap.)
-      //
-      // FORMERLY a KNOWN LATENCY EXPOSURE (accepted 2026-08-05, unmitigated
-      // on purpose): `persistChainedEntry` used to call `ensureLoaded()`
-      // INSIDE `withAuditWriteLock`, so on an appending process's FIRST load
-      // that extra pass was paid while the cross-process write lock was
-      // held. RESOLVED for C9 (register): `persistChainedEntry` now calls
-      // `ensureLoaded()` BEFORE requesting the write lock, so this retry loop
-      // (unchanged below) runs lock-free on the first load; the call inside
-      // the lock is a cheap already-loaded no-op, and the lock instead gets a
-      // narrow incremental re-check of just the tail (`freshenChainStateFromDisk`,
-      // O(1) backward walk) for the write that may have landed in the gap
-      // between the outside-lock load and the actual lock acquisition. This
-      // narrows the LOCK-HOLD window; it does not shrink or skip a single
-      // pass of the retry loop itself, so the read-consistency guarantee
-      // (store-stability discrimination, the same 2s deadline, the same
-      // fail-closed-on-a-static-store-with-findings behavior) is unchanged.
-      //
-      // The size of the extra pass this retry can still cost, measured rather
-      // than assumed. A cold full pass is LINEAR in entry count, not
-      // quadratic: timed on this branch (macOS, ~250-byte entries) at
-      // 250/500/1000/2000 entries the pass took 28/50/95/193ms, a flat
-      // ~0.1ms per entry. The per-entry constant, though, tracks PAYLOAD
-      // size, so it is not one number: the #714 profile (10k entries at
-      // ~40MB, so ~4KB each) measured 11-30s per pass, i.e. ~1.1-3ms per
-      // entry, ~10-30x the small-entry constant above. At the ~166k entries
-      // the register-C6 production host carries, the extra pass is therefore
-      // ~16s of decrypt+verify with small entries and ~180-500s with
-      // #714-sized ones. Before the C9 fix, the upper half of that range blew
-      // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` (30s) while the lock was
-      // held, aborting the hold via `signal` and running lock recovery, while
-      // concurrent appenders waiting to acquire gave up after
-      // `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s) with `AuditLockContentionError`.
-      // With the retry now running before lock acquisition, that same pass
-      // still costs the appending process the same wall-clock time, but no
-      // longer holds the lock (or blocks other appenders behind it) while it
-      // runs; a caller that never reaches a stable store still fails the
-      // append (strict-mode `AuditIntegrityError`, thrown before the lock is
-      // ever requested), which is the correct outcome for a store that is
-      // genuinely never becoming readable.
-      if (hadBaseline && Date.now() >= deadline) {
-        return; // bounded backstop; surfaced in strict mode by the caller
-      }
-      await sleep(AUDIT_READ_CONSISTENCY_RETRY_MS);
+    } finally {
+      if (firstLoadTimer) clearTimeout(firstLoadTimer);
     }
   }
 
@@ -5087,6 +5119,15 @@ export class AuditLog {
       try {
         const deadlinePromise = new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => {
+            // exit, not release: a dead process cannot publish; the successor breaks only a dead-pid lock and allocates from disk truth.
+            if (this.processExitFence) {
+              this.processExitFence.exit({
+                fence: "fence_HOLD_DEADLINE_LAPSED",
+                lockPath: this.auditWriteLockPath!,
+                deadlineMs: this.writeLockHoldDeadlineMs,
+              });
+              return;
+            }
             signal.aborted = true;
             // Release this hold's checkpoint token on rejection, even if its
             // callback never settles. Generation guards its eventual cleanup.
