@@ -295,7 +295,7 @@ export interface AuditLogConfig {
   __testAuditAuthorityUid?: () => number;
   /** Test-only runtime rendezvous, validated exactly like the real root. */
   __testAuditGuardLockRoot?: string;
-  /** Test-only acquisition clock; must match __testMonotonicNow in storage/cross-process-lock.ts. */
+  /** Test-only monotonic clock for acquisition and tail age; must match __testMonotonicNow in storage/cross-process-lock.ts. */
   __testMonotonicNow?: () => number;
   /**
    * F2 Option A (fortress audit store split by writer): whether this
@@ -316,7 +316,7 @@ export interface AuditLogConfig {
    * compared against the legacy `_audit` chain's sealed tip sequence.
    */
   consultSplitBoundary?: boolean;
-  /** Write a checkpoint after this many critical appends. Default: 100. */
+  /** Checkpoint cadence for critical appends and all appends at durable flush. Default: 100; <= 0 disables the interval trigger. */
   checkpointInterval?: number;
   /**
    * Typed identity signing bridge for checkpoint records. Optional in the
@@ -496,6 +496,9 @@ type PersistedEntryHashCollection =
   | { status: "complete"; hashes: string[] }
   | { status: "incomplete"; reason: "gap" | "duplicate"; atSequence: number };
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
+/** Maximum age of an own uncheckpointed entry at a durable flush. */
+// At most six O(chain) checkpoint collections an hour, bounding the uncheckpointed-tail age at ten minutes.
+export const AUDIT_TAIL_CHECKPOINT_MAX_AGE_MS = 10 * 60_000;
 // In-memory retention bound for the decrypted recent-entry window the instance
 // holds in `this.entries` / `this.chainEntries`. On-disk rotation prunes the
 // PERSISTED log (authoritative), but the in-memory arrays were never trimmed:
@@ -2354,10 +2357,15 @@ export class AuditLog {
   private loaded = false;
   private integrityFindings: AuditIntegrityFinding[] = [];
   private nextSequence = 1;
+  // Only persistChainedEntry may advance this instance's own persisted high-water.
+  private ownHighestPersistedSequence = 0;
+  // Must only be raised where ownEntriesCoveredThrough held and checkpoint accounting was cleared.
+  private ownCoveredThroughSequence = 0;
   private lastEntryHash = AUDIT_CHAIN_GENESIS;
   private hashesSinceCheckpoint: string[] = [];
   private lastCheckpointSequence = 0;
   private criticalAppendsSinceCheckpoint = 0;
+  private oldestUncheckpointedOwnEntryAt: number | undefined;
   // The flag is a per-hold ownership token, not a process-wide latch: an
   // abandoned flight must not suppress its successor or clear it on late cleanup.
   private checkpointInFlight = false;
@@ -2834,6 +2842,32 @@ export class AuditLog {
    * `process.exit()` to keep audit writes durable.
    */
   async flush(): Promise<void> {
+    await this.drainPendingWrites();
+    await this.writeCheckpointIfNeeded("graceful-shutdown");
+  }
+
+  /**
+   * Wait for pending writes using the same persistence-error contract as flush(),
+   * checkpointing only the first nonempty tail or a tail due by count or age.
+   * Long-running consumers use this barrier; shutdown callers keep flush().
+   */
+  async flushDurable(): Promise<void> {
+    await this.drainPendingWrites();
+    // A reload's older shared view must not hide this writer's persisted tail from the age barrier.
+    const tailLength = Math.max(this.nextSequence - 1, this.ownHighestPersistedSequence) - this.lastCheckpointSequence;
+    // A hot-path flush is a durability barrier; tamper-evidence checkpoints are amortized per the checkpoint interval and bounded by tail age, never per append.
+    if (tailLength > 0 && (
+      // The first seal must match the keyed zero-checkpoint rule in cli/audit-chain-verify.ts:350.
+      this.lastCheckpointSequence === 0 ||
+      (this.checkpointInterval > 0 && tailLength >= this.checkpointInterval) ||
+      (this.oldestUncheckpointedOwnEntryAt !== undefined &&
+        this.monotonicNow() - this.oldestUncheckpointedOwnEntryAt >= AUDIT_TAIL_CHECKPOINT_MAX_AGE_MS)
+    )) {
+      await this.writeCheckpointIfNeeded("durable-flush-due");
+    }
+  }
+
+  private async drainPendingWrites(): Promise<void> {
     const failures: unknown[] = [];
     while (this.pendingWrites.size > 0) {
       const results = await Promise.allSettled([...this.pendingWrites]);
@@ -2845,7 +2879,6 @@ export class AuditLog {
       throw new AuditLogPersistenceError(failures);
     }
     await this.appendQueue;
-    await this.writeCheckpointIfNeeded("graceful-shutdown");
   }
 
   private enqueueAppend(
@@ -3025,8 +3058,11 @@ export class AuditLog {
         this.entries.push(normalized);
         this.chainEntries.push({ sequence, entry_hash: entryHash });
         this.nextSequence = sequence + 1;
+        // Must match the ownHighestPersistedSequence field contract: only a persisted append under this lock advances it.
+        this.ownHighestPersistedSequence = Math.max(this.ownHighestPersistedSequence, sequence);
         this.lastEntryHash = entryHash;
         this.hashesSinceCheckpoint.push(entryHash);
+        this.oldestUncheckpointedOwnEntryAt ??= this.monotonicNow();
         // Bound the in-memory recent-entry window. Without this the arrays grow
         // one element per append forever (the long-running-daemon OOM); disk
         // rotation never touched them. Trimming here keeps the heap flat while
@@ -5572,6 +5608,7 @@ export class AuditLog {
       case "unknown": throw new AuditChainStateUnknownError(outcome.cause);
       case "found":
         if (outcome.sequence + 1 >= this.nextSequence) {
+          // Shared discovery must not write ownHighestPersistedSequence; it does not establish this instance's writes.
           this.nextSequence = outcome.sequence + 1;
           this.lastEntryHash = outcome.hash;
         }
@@ -5580,6 +5617,7 @@ export class AuditLog {
         break;
       case "empty_suffix":
         // The current authenticated boundary seeds the first suffix; the RAM window may retain a gap.
+        // Shared discovery must not write ownHighestPersistedSequence; it does not establish this instance's writes.
         this.nextSequence = outcome.sequence + 1;
         this.lastEntryHash = outcome.hash;
         break;
@@ -6144,6 +6182,7 @@ export class AuditLog {
         this.verifiedLegacyCount = legacyRawEntries.length;
         this.verifiedLegacyRoot = legacyAnchorHash;
       }
+      // Query/reload publication must not write ownHighestPersistedSequence; its snapshot can predate an own append.
       this.nextSequence = highestChainedSeq + 1;
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
@@ -7628,11 +7667,19 @@ export class AuditLog {
       .map((entry) => entry.entry_hash);
   }
 
+  private ownEntriesCoveredThrough(sequence: number): boolean {
+    // Reload publication can move the shared tip without the lock; only this instance's own persisted high-water proves its entries are covered, so a stale tip can cause an early checkpoint, never a late one.
+    // The guard is required: an own entry outside the captured target keeps its age and count, so the next barrier checkpoints it early, never late.
+    return this.ownHighestPersistedSequence <= sequence;
+  }
+
   private async writeCheckpointIfNeeded(
     _reason: string,
     held?: { keys: string[]; signal: AuditWriteLockAbortSignal },
   ): Promise<void> {
-    if (this.checkpointInFlight || this.hashesSinceCheckpoint.length === 0) return;
+    // An older reload can empty the shared hash buffer while this writer still has persisted entries to seal.
+    if (this.checkpointInFlight || (this.hashesSinceCheckpoint.length === 0 &&
+      this.ownHighestPersistedSequence <= Math.max(this.lastCheckpointSequence, this.ownCoveredThroughSequence))) return;
     this.checkpointInFlight = true;
     const generation = ++this.checkpointFlightGeneration;
     try {
@@ -7658,7 +7705,8 @@ export class AuditLog {
         const previousCheckpointSequence =
           await this.readHighestAuditCheckpointSequence(sealedTipSequence);
         this.assertAuditWriteLockActive(signal);
-        const checkpointSequence = this.nextSequence - 1;
+        // The target includes this writer's own persisted high-water, so a stale tip published by an unlocked reload cannot leave this writer's own entries outside the checkpoint.
+        const checkpointSequence = Math.max(this.nextSequence - 1, this.ownHighestPersistedSequence);
         const fromSequence = Math.max(
           previousCheckpointSequence + 1,
           sealedTipSequence + 1
@@ -7689,7 +7737,22 @@ export class AuditLog {
         }
         // Even an already-covered range must observe every above-floor body
         // fault before resolving, as the base's collector did.
-        if (fromSequence > checkpointSequence) return;
+        if (fromSequence > checkpointSequence) {
+          // Reconcile only the discovered range; newer own entries can remain uncovered.
+          // A sealed-region discovery can skip unreadable checkpoints, so it must not lower the known checkpoint floor.
+          this.lastCheckpointSequence = Math.max(this.lastCheckpointSequence, previousCheckpointSequence);
+          const coveredHashes = new Set(this.chainEntries
+            .filter(entry => entry.sequence <= checkpointSequence)
+            .map(entry => entry.entry_hash));
+          this.hashesSinceCheckpoint = this.hashesSinceCheckpoint.filter(hash => !coveredHashes.has(hash));
+          // ownEntriesCoveredThrough must authorize both the reset and the ownCoveredThroughSequence advance.
+          if (this.ownEntriesCoveredThrough(checkpointSequence)) {
+            this.criticalAppendsSinceCheckpoint = 0;
+            this.oldestUncheckpointedOwnEntryAt = undefined;
+            this.ownCoveredThroughSequence = Math.max(this.ownCoveredThroughSequence, checkpointSequence);
+          }
+          return;
+        }
         const hashes = collected.hashes;
         await this.writeCheckpointRecord({
           checkpoint_kind: "audit-checkpoint",
@@ -7703,9 +7766,17 @@ export class AuditLog {
           signed_at: new Date().toISOString(),
         }, signal);
         this.assertAuditWriteLockActive(signal);
-        this.lastCheckpointSequence = checkpointSequence;
-        this.hashesSinceCheckpoint = [];
-        this.criticalAppendsSinceCheckpoint = 0;
+        this.lastCheckpointSequence = Math.max(this.lastCheckpointSequence, checkpointSequence);
+        const coveredHashes = new Set(this.chainEntries
+          .filter(entry => entry.sequence <= checkpointSequence)
+          .map(entry => entry.entry_hash));
+        this.hashesSinceCheckpoint = this.hashesSinceCheckpoint.filter(hash => !coveredHashes.has(hash));
+        // ownEntriesCoveredThrough must authorize both the reset and the ownCoveredThroughSequence advance.
+        if (this.ownEntriesCoveredThrough(checkpointSequence)) {
+          this.criticalAppendsSinceCheckpoint = 0;
+          this.oldestUncheckpointedOwnEntryAt = undefined;
+          this.ownCoveredThroughSequence = Math.max(this.ownCoveredThroughSequence, checkpointSequence);
+        }
       };
       if (held) {
         await write(held.keys, held.signal);

@@ -276,18 +276,18 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     // flush. A wedged audit log must NOT turn a successful reload into a
     // client-visible timeout. Here the sign + broadcast succeed and the audit is
     // frozen; the reload must still return ok:true promptly.
-    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const { fortressPath, masterKey, auditLog } = await provisionFortress(); expect(typeof auditLog.flushDurable).toBe("function");
     const helper = makeControllableHelper();
     const listener = makeControllableListener();
     const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
       reloadAuditDeadlineMs: 50,
     });
     const origAppend = auditLog.append.bind(auditLog);
-    const origFlush = auditLog.flush.bind(auditLog);
+    const origFlush = auditLog.flushDurable.bind(auditLog);
     try {
       // Freeze the audit log AFTER startup (startup's own appends already ran).
       auditLog.append = (() => new Promise<void>(() => {})) as typeof auditLog.append;
-      auditLog.flush = (() => new Promise<void>(() => {})) as typeof auditLog.flush;
+      auditLog.flushDurable = (() => new Promise<void>(() => {})) as typeof auditLog.flushDurable;
       const started = Date.now();
       const reply = await handle.reloadPolicy({
         type: "policy_reload_request",
@@ -302,7 +302,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     } finally {
       // Restore before stop() so the daemon's filter_stopped audit can complete.
       auditLog.append = origAppend;
-      auditLog.flush = origFlush;
+      auditLog.flushDurable = origFlush;
       await handle.stop();
     }
   });
@@ -315,7 +315,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     // a policy_loaded event was lost. This proves the drop is now durably
     // chain-visible: it is carried on the next successful audit append (here,
     // the `filter_stopped` write at shutdown) as `audit_write_degraded_count`.
-    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const { fortressPath, masterKey, auditLog } = await provisionFortress(); expect(typeof auditLog.flushDurable).toBe("function");
     const helper = makeControllableHelper();
     const listener = makeControllableListener();
     const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
@@ -325,11 +325,11 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       auditHeartbeatIntervalSeconds: 3_600,
     });
     const origAppend = auditLog.append.bind(auditLog);
-    const origFlush = auditLog.flush.bind(auditLog);
+    const origFlush = auditLog.flushDurable.bind(auditLog);
     try {
       // Freeze the audit log AFTER startup (startup's own appends already ran).
       auditLog.append = (() => new Promise<void>(() => {})) as typeof auditLog.append;
-      auditLog.flush = (() => new Promise<void>(() => {})) as typeof auditLog.flush;
+      auditLog.flushDurable = (() => new Promise<void>(() => {})) as typeof auditLog.flushDurable;
       const reply = await handle.reloadPolicy({
         type: "policy_reload_request",
         request_id: "req-audit-degraded",
@@ -342,7 +342,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       // Restore before stop() so the shutdown audit write can complete AND
       // carry the degraded-write marker recorded while frozen.
       auditLog.append = origAppend;
-      auditLog.flush = origFlush;
+      auditLog.flushDurable = origFlush;
       await handle.stop();
     }
 
@@ -428,7 +428,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     // failure) make that impossible; this test pins both halves:
     //   (1) overlapping carries emit EXACTLY one 1-unit marker for one drop;
     //   (2) a second drop after the overlap window still emits its marker.
-    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const { fortressPath, masterKey, auditLog } = await provisionFortress(); expect(typeof auditLog.flushDurable).toBe("function");
     const helper = makeControllableHelper();
     const listener = makeControllableListener();
     const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
@@ -506,17 +506,17 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       // run, so a heartbeat that was still sleeping-then-writing when the
       // assertions above returned cannot land a file mid-cleanup.
       await Promise.allSettled(pendingSlowAppends);
-      // stop() clears the heartbeat interval synchronously before its first
-      // await, so no beat can interleave between this restore and the
-      // filter_stopped carry.
-      auditLog.append = origAppend;
-      auditLog.flush = origFlush;
       // Extra quiescence: drain the real append queue/checkpoint path too
       // (flush() is documented safe to call repeatedly), belt-and-suspenders
       // alongside the pendingSlowAppends drain above. Not asserted on: this is
       // a settle wait, and any real failure it would swallow still shows up
       // as an unexplained marker count in the assertions below.
       await auditLog.flush().catch(() => undefined);
+      // Drain while replacement appends still reject, then restore immediately
+      // before stop so no extra await lets a heartbeat consume the marker
+      // intended for the shutdown assertion.
+      auditLog.append = origAppend;
+      auditLog.flush = origFlush;
       await handle.stop();
     }
 
