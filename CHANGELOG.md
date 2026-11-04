@@ -6,14 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Next Castle Wall Linux package (not in 0.1.0-1)
+
+- `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.
+
+### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
+
+- `@sanctuary-framework/quickstart` 0.2.0: publishing is opt-in. In a terminal it shows the destination and the exact request body and asks `[y/N]` (default No); `--publish` publishes without asking, `--no-publish` never publishes, and a run without a terminal does not publish unless `--publish` is given. The local identity exists before the publish decision in every case. A saved identity in `~/.sanctuary/quickstart-identity.json` is reused and never rewritten; `--new-identity` mints a fresh one after copying the old file to a backup.
+
+## [1.9.0-rc.3] - 2026-11-05
+
+Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 until 1.9.0 ships. Adds the wall reliability, Hermes memory, console and warehouse work merged since rc.2.
+
 ### Added
 
-- `sanctuary hermes recover-save` recovers a Hermes save that did not finish, so the memory bridge can start again.
-
+- `sanctuary castle-wall install-full`, `uninstall-full`, `full-status` and `reset-full` run the full macOS Castle Wall daemon as a user-session LaunchAgent that launchd restarts after a crash, with a crash-loop counter that stops automatic restarts once the daemon keeps failing. All four need an attended TTY; `uninstall-full` and `reset-full` need `--yes`; running two of them at once is unsupported. No restart or reboot drill is recorded for this path.
+- An agent's memory save into its own memory (`memory_insert`, `sanctuary_remember`) runs without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; every save is audited with the agent named when its identity is known, otherwise marked as unknown, and shows on the dashboard's Evidence page. Set `memory_save_approval: always` in the policy to require approval per insert. Export, delete, signing and reading the policy still ask.
 - The Hermes memory bridge serves seven tools: a save into the agent's own memory runs without an approval prompt within the save allowance and is audited with the agent named, `memory_recall` returns a bounded context of matching saved passages with per-call scan work bounded after the key listing, `sign_statement` and `export_memory` answer that they are not available yet, and `protection_rules` is refused; every catalogued refusal is an ordinary tool result.
-- `sanctuary protect --hermes-memory` sets Hermes to save and recall memory through the Sanctuary memory plugin, turns Hermes's built-in memory off, removes the Sanctuary MCP server entry from its config, and `--unwrap` reverts those changes.
-
 - A Hermes plugin pair (a Sanctuary memory provider and a tools plugin) saves and recalls Hermes memory through the Sanctuary memory bridge; `sign_statement` and `export_memory` answer that they are not available yet, and every refusal from a Sanctuary tool is an ordinary tool result.
+- `sanctuary protect --hermes-memory` sets Hermes to save and recall memory through the Sanctuary memory plugin, turns Hermes's built-in memory off, removes the Sanctuary MCP server entry from its config, and `--unwrap` reverts those changes.
+- `sanctuary hermes recover-save` recovers a Hermes save that did not finish, so the memory bridge can start again.
+- `sanctuary_active_protections` lists every protection layer with an evidence-based status and a plain-English summary, including layers that are off, not built, or unknown.
+- Dashboard approval cards show a bounded preview of what is asked (on the operator's dashboard only), a countdown that follows the server's deadline, and a plain reason when a late decision misses (expired, already decided, or no longer exists); Tier 1 consent is two steps, and after a server restart the live stream reconnects with a bounded backoff. The agent sees nothing new and denials still give no reason.
+- Castle Wall blocked-egress records carry a bounded destination and the producer's verification state, a verified record vouches only for the fields the producer signed, and the inbox's blocked-egress store is capped per origin, deduplicated and expiring; no shipped path writes these records to the inbox yet, so the blocked-egress card stays empty.
+- The Sovereign Data Warehouse write journal's record format, signing contract, generation guards and ordered admission are defined and tested; nothing in production calls them yet, so no warehouse behavior changes.
+
+### Changed
+
+- On macOS, the Castle Wall daemon counts root-owned flows and writes one `castle_wall_non_agent_flows_observed` summary record per audit heartbeat instead of one record per flow; agent flows and liveness accounting are unchanged, and root traffic feeds no liveness, posture or armed-banner evidence.
+- Hot-path audit flushes are durability barriers: a flush returns only after the entries it covers are on disk, checkpoint work stays amortized across flushes, and a writer sharing a log accounts for checkpoints another writer already wrote. Checkpoint verification overlaps checkpoint body reads under a fixed module-wide concurrency while deciding strictly in checkpoint order.
+- Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.
 
 ### Fixed
 
@@ -22,21 +44,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Linux-verified audit lock recovery uses exact process identity, serialized removal and a monotonic acquisition budget. Unprovable locks require operator recovery. macOS runtime verification remains pending.
 - Audit discovery reports a typed outcome before sequence allocation. Unknown state requires operator investigation; an authenticated empty suffix continues from its current sealed boundary. Full verification and hold-deadline limits remain unchanged.
 - Audit chains admit writers by their declared role and directory owner. Diagnostic readers preserve lock evidence, and storage listings retain surviving files when another candidate disappears.
-- Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.
-- `sanctuary_active_protections` lists every protection layer with an evidence-based status and a plain-English summary, including layers that are off, not built, or unknown.
-- An agent's memory save into its own memory (`memory_insert`, `sanctuary_remember`) runs without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; every save is audited with the agent named when its identity is known, otherwise marked as unknown, and shows on the dashboard's Evidence page. Set `memory_save_approval: always` in the policy to require approval per insert. Export, delete, signing and reading the policy still ask.
-- the posture home stays up when one panel is slow: each panel has its own time budget and says when it is out of date, and audit-chain re-verification reuses results for entries whose bytes have not changed
+- The posture home stays up when one panel is slow: each panel has its own time budget and says when it is out of date, and audit-chain re-verification reuses results for entries whose bytes have not changed.
 - An SDW import refused by the import handler for an empty or non-string source key reference now leaves a denial row in the audit log, like the other refusals the import handler makes before approval.
 - Lifting a lockdown is refused on a platform where stopping is unsupported, matching the stop.
 - A refused lockdown-lift approval shows the operator the reason it was refused.
 
-### Next Castle Wall Linux package (not in 0.1.0-1)
+### Security
 
-- `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.
-
-### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
-
-- `@sanctuary-framework/quickstart` 0.2.0: publishing is opt-in. In a terminal it shows the destination and the exact request body and asks `[y/N]` (default No); `--publish` publishes without asking, `--no-publish` never publishes, and a run without a terminal does not publish unless `--publish` is given. The local identity exists before the publish decision in every case. A saved identity in `~/.sanctuary/quickstart-identity.json` is reused and never rewritten; `--new-identity` mints a fresh one after copying the old file to a backup.
+- Audit record integrity hardening; a notice with affected and fixed versions follows under the coordinated-disclosure terms in SECURITY.md.
 
 ## [1.9.0-rc.2] - 2026-10-27
 
