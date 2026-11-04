@@ -12,6 +12,11 @@ const state = await import(statePath).catch(() => null) as typeof import("../../
 const roots: string[] = [];
 beforeEach(() => { expect(api, "LaunchAgent commands are shipped").not.toBeNull(); expect(state).not.toBeNull(); });
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+// Mode, inode and bytes come from one open descriptor, so every assertion describes the same file even if the path is replaced in between.
+function snapshot(path: string): { stat: fs.Stats; bytes: Buffer } {
+  const fd = fs.openSync(path, "r");
+  try { return { stat: fs.fstatSync(fd), bytes: fs.readFileSync(fd) }; } finally { fs.closeSync(fd); }
+}
 class Capture extends Writable {
   text = "";
   override _write(chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void) { this.text += String(chunk); callback(); }
@@ -66,8 +71,9 @@ describe("full agent attended commands", () => {
     const f = fixture();
     expect(await api!.runInstallFull([], f.ctx), f.err.text).toBe(0);
     const plist = join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`);
-    expect(fs.statSync(plist).mode & 0o777).toBe(0o644);
-    expect(api!.fullAgentLaunchAgentWellFormed(fs.readFileSync(plist, "utf8"))).toBe(true);
+    const installed = snapshot(plist);
+    expect(installed.stat.mode & 0o777).toBe(0o644);
+    expect(api!.fullAgentLaunchAgentWellFormed(installed.bytes.toString("utf8"))).toBe(true);
     expect(f.exec).toHaveBeenCalledWith("launchctl", ["bootstrap", "gui/501", plist]);
     expect(f.observe).toHaveBeenCalledWith({ storagePath: f.fortress, home: f.home, readOnly: true, platformOverride: "darwin" });
     expect(f.sleep.mock.calls.reduce((sum, [ms]) => sum + ms, 0)).toBeGreaterThan(api!.FULL_AGENT_THROTTLE_INTERVAL_S * 1000);
@@ -279,12 +285,12 @@ describe("full agent attended commands", () => {
   it("install refuses an already loaded job without changing its plist or job", async () => {
     const f = fixture(); expect(await api!.runInstallFull([], f.ctx)).toBe(0);
     const plist = join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`);
-    const before = fs.readFileSync(plist); const inode = fs.statSync(plist).ino;
+    const { bytes: before, stat: { ino: inode } } = snapshot(plist);
     f.exec.mockClear(); f.write.mockClear(); f.observe.mockClear();
     expect(await api!.runInstallFull([], f.ctx)).toBe(1);
     expect(f.err.text).toContain("already installed; run uninstall-full first");
     expect(f.write).not.toHaveBeenCalled(); expect(f.observe).not.toHaveBeenCalled();
-    expect(fs.readFileSync(plist)).toEqual(before); expect(fs.statSync(plist).ino).toBe(inode);
+    const after = snapshot(plist); expect(after.bytes).toEqual(before); expect(after.stat.ino).toBe(inode);
     expect(f.exec.mock.calls.every(([, args]) => args[0] === "print")).toBe(true);
   });
 
