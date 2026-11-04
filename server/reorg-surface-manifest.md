@@ -120,3 +120,10 @@ Credential surrogacy slice 1b-i internal response codes (2026-10-01): the new
 artifacts, not frozen display strings. Existing CONNECT codes and bytes stay
 unchanged. `surrogate events` now accepts only `[egress-gate] ` lines with valid
 JSON and a `kind` beginning `surrogate_`; its help strings did not change.
+
+## Full daemon user-session supervision
+
+- `FULL_AGENT_LABEL = ai.sanctuaryprotocol.castle-wall.full`; must match `FULL_AGENT_LABEL` in `server/src/cli/castle-wall-full-agent.ts`.
+- `CASTLE_WALL_DAEMON_AUDIT_FENCE_EXIT_CODE = 74` (EX_IOERR); must match `CASTLE_WALL_DAEMON_AUDIT_FENCE_EXIT_CODE` in `server/src/cli/castle-wall-full-agent-state.ts`.
+- `[castle-wall] AUDIT-EXIT-FENCE`; must match `AUDIT-EXIT-FENCE` in `server/src/cli/castle-wall-full-agent-state.ts`.
+- `[castle-wall] FULL-AGENT-CRASH-LOOP-STOP`; must match `FULL-AGENT-CRASH-LOOP-STOP` in `server/src/cli/castle-wall-full-agent-state.ts`.

@@ -1488,6 +1488,26 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runDaemon(args.slice(1));
   }
 
+  if (command === "install-full") {
+    const { runInstallFull } = await import("./cli/castle-wall-full-agent.js");
+    return runInstallFull(args.slice(1));
+  }
+
+  if (command === "uninstall-full") {
+    const { runUninstallFull } = await import("./cli/castle-wall-full-agent.js");
+    return runUninstallFull(args.slice(1));
+  }
+
+  if (command === "full-status") {
+    const { runFullStatus } = await import("./cli/castle-wall-full-agent.js");
+    return runFullStatus(args.slice(1));
+  }
+
+  if (command === "reset-full") {
+    const { runResetFull } = await import("./cli/castle-wall-full-agent.js");
+    return runResetFull(args.slice(1));
+  }
+
   if (command === "install-boot") {
     const { runInstallBoot } = await import("./cli/castle-wall-boot.js");
     return runInstallBoot(args.slice(1));
@@ -1768,6 +1788,12 @@ function printCastleWallHelp(): void {
     provision-boot-token
                      Mint the software-protected boot token (root-owned 0600; run with sudo). Anti-brick
                      credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
+    install-full     Install the user-session full daemon (macOS, attended TTY).
+                     Do not run install-full, reset-full or uninstall-full concurrently.
+    uninstall-full   Remove the user-session full daemon service (requires --yes).
+    full-status      Show the full daemon restart state and running pid.
+    reset-full       Unload and clear the full daemon counter, then start it if installed (TTY, --yes).
+                     Do not run install-full, reset-full or uninstall-full concurrently.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
