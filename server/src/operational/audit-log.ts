@@ -473,6 +473,7 @@ export type AuditWriteLockRecoveryListener = (
 
 interface AuditWriteLockAbortSignal {
   aborted: boolean;
+  checkpointReadAbort: AbortSignal;
 }
 
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
@@ -488,8 +489,144 @@ export const AUDIT_CHECKPOINT_RANGE_DIAGNOSTIC_PREFIX = "[audit-log] AUDIT-CHECK
 
 // The base preserved backend listing order among collation ties. Noncanonical
 // names can tie, so code-unit order is the only backend-independent tie break.
+// Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
 function compareAuditKeys(a: string, b: string): number {
   return a.localeCompare(b) || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+/** Maximum concurrent checkpoint body reads across AuditLog instances. */
+// 3 is empirical: it stays below the default libuv pool size of 4 so this
+// prefetch never holds every pool worker. Measured overlap was 0.51 of
+// sequential read time at 2 in flight and 0.41 at 4.
+// Must match P in audit-log-checkpoint-read-schedule.test.ts.
+export const AUDIT_CHECKPOINT_READ_CONCURRENCY = 3;
+
+type AuditBodyReadOutcome =
+  | { state: "read"; raw: Uint8Array | null }
+  | { state: "faulted"; error: unknown };
+type AuditReadPermit = () => void;
+interface AuditReadWaiter {
+  state: "state_WAITING" | "state_GRANTED" | "state_ABORTED";
+  grant: () => void;
+}
+
+class AuditCheckpointReadPermits {
+  private active = 0;
+  private readonly waiters = new Set<AuditReadWaiter>();
+
+  acquire(signal: AbortSignal): Promise<AuditReadPermit> {
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        if (waiter.state !== "state_WAITING") return;
+        waiter.state = "state_ABORTED";
+        // Retired holds must leave the FIFO before a later release can admit them.
+        this.waiters.delete(waiter);
+        signal.removeEventListener("abort", abort);
+        reject(signal.reason);
+      };
+      const waiter: AuditReadWaiter = {
+        state: "state_WAITING",
+        grant: () => {
+          if (waiter.state !== "state_WAITING") return;
+          waiter.state = "state_GRANTED";
+          signal.removeEventListener("abort", abort);
+          this.active++;
+          let released = false;
+          resolve(() => {
+            if (released) return;
+            released = true;
+            this.active--;
+            const next = this.waiters.values().next().value;
+            if (next) {
+              this.waiters.delete(next);
+              next.grant();
+            }
+          });
+        },
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) { abort(); return; }
+      // The module owns the budget so separate logs and later holds share it.
+      if (this.active < AUDIT_CHECKPOINT_READ_CONCURRENCY && this.waiters.size === 0) waiter.grant();
+      else this.waiters.add(waiter);
+    });
+  }
+}
+const auditCheckpointReadPermits = new AuditCheckpointReadPermits();
+
+type OrderedAuditBodyRead =
+  | { phase: "state_EXHAUSTED" }
+  | { phase: "state_ABORTED" }
+  | { phase: "state_DECIDING"; key: string; outcome: AuditBodyReadOutcome };
+
+class OrderedAuditBodyReads {
+  private readonly slots: Array<Promise<AuditBodyReadOutcome> | undefined> =
+    new Array(AUDIT_CHECKPOINT_READ_CONCURRENCY);
+  private issued = 0;
+  private consumed = 0;
+  private readonly stopped = new AbortController();
+  private readonly admission: AbortSignal;
+
+  constructor(
+    private readonly storage: StorageBackend,
+    private readonly namespace: string,
+    private readonly keys: readonly string[],
+    private readonly signal?: AuditWriteLockAbortSignal,
+  ) {
+    // Must match withAuditWriteLock's checkpointReadAbort: queued permits observe hold retirement.
+    this.admission = signal?.checkpointReadAbort
+      ? AbortSignal.any([signal.checkpointReadAbort, this.stopped.signal])
+      : this.stopped.signal;
+  }
+
+  private async capture(key: string): Promise<AuditBodyReadOutcome> {
+    // Never rejects: each prefetched read needs a handler before a later decision.
+    try {
+      const release = await auditCheckpointReadPermits.acquire(this.admission);
+      try {
+        // A hold may end between permit delivery and this continuation.
+        if (this.signal?.aborted || this.admission.aborted) throw this.admission.reason;
+        return { state: "read", raw: await Promise.resolve(this.storage.read(this.namespace, key)) };
+      } finally {
+        // Storage owns its permit until settlement, independently of consumption.
+        release();
+      }
+    } catch (error) {
+      return { state: "faulted", error };
+    }
+  }
+
+  private fill(): void {
+    // Issue only while issued minus consumed is below the cap and the hold is live:
+    // the ring bounds retained outcomes and prevents admission after lock loss.
+    while (this.issued < this.keys.length && this.issued - this.consumed < AUDIT_CHECKPOINT_READ_CONCURRENCY) {
+      if (this.signal?.aborted || this.admission.aborted) return;
+      this.slots[this.issued % AUDIT_CHECKPOINT_READ_CONCURRENCY] = this.capture(this.keys[this.issued]!);
+      this.issued++;
+    }
+  }
+
+  async next(): Promise<OrderedAuditBodyRead> {
+    // Refill only on the next request: the caller must first continue its fold.
+    this.fill();
+    if (this.signal?.aborted || this.admission.aborted) return { phase: "state_ABORTED" };
+    if (this.consumed === this.keys.length) return { phase: "state_EXHAUSTED" };
+    const slot = this.consumed % AUDIT_CHECKPOINT_READ_CONCURRENCY;
+    // Outcomes are decided strictly in key order; the first throwing outcome keeps
+    // its identity. Equal captured outcomes give the sequential verdict; later
+    // read-only outcomes never participate in it.
+    const outcome = await this.slots[slot]!;
+    this.slots[slot] = undefined;
+    const key = this.keys[this.consumed++]!;
+    if (this.signal?.aborted || this.admission.aborted) return { phase: "state_ABORTED" };
+    return { phase: "state_DECIDING", key, outcome };
+  }
+
+  stop(): void {
+    // A verdict retires queued admissions immediately; captured reads settle alone.
+    this.stopped.abort();
+    this.slots.fill(undefined);
+  }
 }
 
 type PersistedEntryHashCollection =
@@ -1937,6 +2074,7 @@ export async function readAuditStoreSplitEstablishedMarker(
  * key (`entry-${20-digit-sequence}-${epochMs}-${counter}`). Returns null for
  * any key that does not match this shape (e.g. a pre-V2 legacy key), which
  * callers must treat as "not filterable by sequence", never as sequence 0. */
+// Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
 function parseEntryKeySequence(key: string): number | null {
   const match = /^entry-(\d{20})-/.exec(key);
   if (!match) return null;
@@ -1951,6 +2089,7 @@ function parseEntryKeySequence(key: string): number | null {
  * operator decide a checkpoint sits in the sealed legacy region from the
  * UNENCRYPTED key alone, without reading the (possibly root-owned, unreadable)
  * file. */
+// Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
 function parseCheckpointKeySequence(key: string): number | null {
   const match = /-(\d{20})$/.exec(key);
   if (!match) return null;
@@ -1965,6 +2104,7 @@ function parseCheckpointKeySequence(key: string): number | null {
  * the operator uid's read throws EACCES; that is the contamination case the
  * split boundary re-routes, distinct from a genuine tamper/IO fault which must
  * still fail closed. */
+// Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
 function isPermissionError(err: unknown): boolean {
   const code =
     err instanceof Error && "code" in err
@@ -5046,7 +5186,10 @@ export class AuditLog {
     // AuditLog chain entry, anchor, checkpoint and lock writes admit one authorized writer principal per chain so per-uid guards can serialize breakers.
     // Namespace identity is checked at writer admission; this check does not by itself hold that identity through later writes.
     await this.assertAuditWriterAuthority();
-    const signal: AuditWriteLockAbortSignal = { aborted: false };
+    // Must match the checkpoint permit waiter's abort subscription above: a
+    // released hold must wake queued readers even if no storage read settles.
+    const checkpointReadAbort = new AbortController();
+    const signal: AuditWriteLockAbortSignal = { aborted: false, checkpointReadAbort: checkpointReadAbort.signal };
     if (!this.auditWriteLockPath) return operation(signal);
 
     // A single append writes one chained entry, its durable head anchor, and
@@ -5165,6 +5308,7 @@ export class AuditLog {
               return;
             }
             signal.aborted = true;
+            checkpointReadAbort.abort(this.auditLockHoldDeadlineError());
             // Release this hold's checkpoint token on rejection, even if its
             // callback never settles. Generation guards its eventual cleanup.
             if (this.checkpointFlightSignal === signal) {
@@ -5190,6 +5334,7 @@ export class AuditLog {
         return await Promise.race([operationPromise, deadlinePromise]);
       } finally {
         signal.aborted = true;
+        checkpointReadAbort.abort(this.auditLockHoldDeadlineError());
         if (timer) clearTimeout(timer);
       }
     } finally {
@@ -7703,7 +7848,7 @@ export class AuditLog {
             ? splitBoundary.boundary.sealed_tip_sequence
             : 0;
         const previousCheckpointSequence =
-          await this.readHighestAuditCheckpointSequence(sealedTipSequence);
+          await this.readHighestAuditCheckpointSequence(sealedTipSequence, signal);
         this.assertAuditWriteLockActive(signal);
         // The target includes this writer's own persisted high-water, so a stale tip published by an unlocked reload cannot leave this writer's own entries outside the checkpoint.
         const checkpointSequence = Math.max(this.nextSequence - 1, this.ownHighestPersistedSequence);
@@ -7716,6 +7861,7 @@ export class AuditLog {
           checkpointSequence,
           sealedTipSequence,
           keys,
+          signal,
         );
         this.assertAuditWriteLockActive(signal);
         // Only complete, unique occupancy can authorize signing control writes;
@@ -7796,7 +7942,8 @@ export class AuditLog {
   }
 
   private async readHighestAuditCheckpointSequence(
-    sealedTipSequence = 0
+    sealedTipSequence = 0,
+    signal?: AuditWriteLockAbortSignal,
   ): Promise<number> {
     // DEBT(AUDIT-CHECKPOINT-LIFETIME-GROWTH): checkpoints are never pruned;
     // one record per checkpointInterval critical appends accumulates for the
@@ -7810,36 +7957,46 @@ export class AuditLog {
     // establish the parsed maximum nor excuse an earlier record's read fault.
     keys.sort(compareAuditKeys);
     let highest = 0;
-    for (const key of keys) {
-      // F2 Option A: the operator's own checkpoints are always ABOVE the sealed
-      // tip, so a sealed-region checkpoint the operator uid cannot open on an
-      // armed box (root-owned legacy file) is never the highest and can be
-      // skipped silently. A non-permission fault, or an unreadable checkpoint
-      // above the tip, still surfaces (rethrown to the append/checkpoint caller,
-      // which fails closed rather than under-counting the checkpoint floor).
-      const keySeq = parseCheckpointKeySequence(key);
-      const inSealedRegion =
-        sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
-      let raw: Uint8Array | null;
-      try {
-        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, key);
-      } catch (err) {
-        if (inSealedRegion && isPermissionError(err)) continue;
-        throw err;
-      }
-      if (!raw) continue;
-      try {
-        const parsed = JSON.parse(bytesToString(raw));
-        if (
-          isAuditCheckpointRecord(parsed) &&
-          parsed.checkpoint_kind === "audit-checkpoint"
-        ) {
-          highest = Math.max(highest, parsed.checkpoint_sequence);
+    // Must match the f1a35781 predecessor oracle in audit-log-checkpoint-read-schedule.test.ts.
+    const reads = new OrderedAuditBodyReads(this.storage, AUDIT_CHECKPOINT_NAMESPACE, keys, signal);
+    try {
+      while (true) {
+        if (signal) this.assertAuditWriteLockActive(signal);
+        const next = await reads.next();
+        if (next.phase === "state_ABORTED") throw this.auditLockHoldDeadlineError();
+        if (next.phase === "state_EXHAUSTED") break;
+        const { key, outcome } = next;
+        // F2 Option A: the operator's own checkpoints are always ABOVE the sealed
+        // tip, so a sealed-region checkpoint the operator uid cannot open on an
+        // armed box (root-owned legacy file) is never the highest and can be
+        // skipped silently. A non-permission fault, or an unreadable checkpoint
+        // above the tip, still surfaces (rethrown to the append/checkpoint caller,
+        // which fails closed rather than under-counting the checkpoint floor).
+        const keySeq = parseCheckpointKeySequence(key);
+        const inSealedRegion =
+          sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
+        let raw: Uint8Array | null;
+        try {
+          if (outcome.state === "faulted") throw outcome.error;
+          raw = outcome.raw;
+        } catch (err) {
+          if (inSealedRegion && isPermissionError(err)) continue;
+          throw err;
         }
-      } catch {
-        // Full verification reports malformed checkpoints.
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(bytesToString(raw));
+          if (
+            isAuditCheckpointRecord(parsed) &&
+            parsed.checkpoint_kind === "audit-checkpoint"
+          ) {
+            highest = Math.max(highest, parsed.checkpoint_sequence);
+          }
+        } catch {
+          // Full verification reports malformed checkpoints.
+        }
       }
-    }
+    } finally { reads.stop(); }
     return highest;
   }
 
@@ -7848,6 +8005,7 @@ export class AuditLog {
     toSequence: number,
     sealedTipSequence: number,
     keys: readonly string[],
+    signal?: AuditWriteLockAbortSignal,
   ): Promise<PersistedEntryHashCollection> {
     const bySequence = new Map<number, string>();
     let duplicate: number | undefined;
@@ -7855,27 +8013,41 @@ export class AuditLog {
     // every entry body above the sealed tip is read, as before. Reusing keys
     // saves one listing; body reads are unchanged, amortized over the checkpoint
     // interval. A cheaper collector needs authenticated key/envelope agreement.
-    for (const key of [...keys].sort(compareAuditKeys)) {
-      if (!key.startsWith("entry-")) continue;
+    // DEBT(AUDIT-CHECKPOINT-LINEAR-READ): a due checkpoint still reads every entry body above the sealed tip under the write lock; reads overlap up to AUDIT_CHECKPOINT_READ_CONCURRENCY.
+    // Filtering must precede admission so sealed and legacy names never enter storage.
+    const orderedKeys = [...keys].sort(compareAuditKeys).filter((key) => {
+      if (!key.startsWith("entry-")) return false;
       const seq = parseEntryKeySequence(key);
-      if (seq !== null && seq <= sealedTipSequence) continue;
-      const raw = await this.storage.read(AUDIT_NAMESPACE, key);
-      if (!raw) continue;
-      try {
-        const parsed = JSON.parse(bytesToString(raw));
-        if (isPersistedAuditEnvelopeV2(parsed)) {
-          // Envelope sequence is authoritative, including identical copies
-          // under out-of-range filenames; never collapse duplicate occupancy.
-          if (bySequence.has(parsed.sequence) &&
-              parsed.sequence >= fromSequence && parsed.sequence <= toSequence) {
-            duplicate = duplicate === undefined ? parsed.sequence : Math.min(duplicate, parsed.sequence);
+      return !(seq !== null && seq <= sealedTipSequence);
+    });
+    // Must match the f1a35781 collector oracle in audit-log-checkpoint-read-schedule.test.ts.
+    const reads = new OrderedAuditBodyReads(this.storage, AUDIT_NAMESPACE, orderedKeys, signal);
+    try {
+      while (true) {
+        if (signal) this.assertAuditWriteLockActive(signal);
+        const next = await reads.next();
+        if (next.phase === "state_ABORTED") throw this.auditLockHoldDeadlineError();
+        if (next.phase === "state_EXHAUSTED") break;
+        const { outcome } = next;
+        if (outcome.state === "faulted") throw outcome.error;
+        const raw = outcome.raw;
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(bytesToString(raw));
+          if (isPersistedAuditEnvelopeV2(parsed)) {
+            // Envelope sequence is authoritative, including identical copies
+            // under out-of-range filenames; never collapse duplicate occupancy.
+            if (bySequence.has(parsed.sequence) &&
+                parsed.sequence >= fromSequence && parsed.sequence <= toSequence) {
+              duplicate = duplicate === undefined ? parsed.sequence : Math.min(duplicate, parsed.sequence);
+            }
+            bySequence.set(parsed.sequence, parsed.entry_hash);
           }
-          bySequence.set(parsed.sequence, parsed.entry_hash);
+        } catch {
+          // Full verification reports malformed entries; missing occupancy is a gap.
         }
-      } catch {
-        // Full verification reports malformed entries; missing occupancy is a gap.
       }
-    }
+    } finally { reads.stop(); }
     if (duplicate !== undefined) return { status: "incomplete", reason: "duplicate", atSequence: duplicate };
     const hashes: string[] = [];
     for (let sequence = fromSequence; sequence <= toSequence; sequence++) {
@@ -8340,10 +8512,12 @@ function asFilesystemCapabilities(
   return undefined;
 }
 
+// Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+// Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
 function isPersistedAuditEnvelopeV2(
   value: unknown
 ): value is PersistedAuditEnvelopeV2 {
