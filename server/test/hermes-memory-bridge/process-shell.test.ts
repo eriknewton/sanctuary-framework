@@ -2739,40 +2739,65 @@ async function seededFortress(label: string): Promise<{
   const fortressId = `fortress-${unique}`;
   const fortressDir = join(home, "Library", "Application Support", "Sanctuary", "Fortresses", fortressId);
   cleanups.push(() => rm(fortressDir, { recursive: true, force: true }));
-  await mkdirChain([
-    join(home, "Library"),
-    join(home, "Library", "Application Support"),
-    join(home, "Library", "Application Support", "Sanctuary"),
-    join(home, "Library", "Application Support", "Sanctuary", "Fortresses"),
-    fortressDir,
-    join(fortressDir, "state"),
-  ]);
-  const storage = new FilesystemStorage(join(fortressDir, "state"));
-  await persistUserProvidedPassphrase(PASS, {
-    home,
-    storagePath: fortressDir,
-    platformOverride: "freebsd",
-  });
-  const custody = await establishMaster({
-    storage,
-    passphrase: PASS,
-    firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
-  const identityManager = new IdentityManager(storage, custody.masterKey);
-  await identityManager.load();
-  const { storedIdentity } = createIdentity(
-    `hermes-${label}`,
-    derivePurposeKey(custody.masterKey, "identity-encryption"),
-    "passphrase",
-  );
-  await identityManager.save(storedIdentity);
-  const bridgeIdentity = memoryProvenancePublicKeyFingerprint(fromBase64url(storedIdentity.public_key));
-  await custody.masterWriteBarrier?.release();
-  custody.masterKey.fill(0);
-  return {
-    fortressDir,
-    env: allowlistedEnv(home, bridgeIdentity, `agent-${label}`, fortressId),
-  };
+  const seeded = (async () => {
+    await mkdirChain([
+      join(home, "Library"),
+      join(home, "Library", "Application Support"),
+      join(home, "Library", "Application Support", "Sanctuary"),
+      join(home, "Library", "Application Support", "Sanctuary", "Fortresses"),
+      fortressDir,
+      join(fortressDir, "state"),
+    ]);
+    const storage = new FilesystemStorage(join(fortressDir, "state"));
+    await persistUserProvidedPassphrase(PASS, {
+      home,
+      storagePath: fortressDir,
+      platformOverride: "freebsd",
+    });
+    const custody = await establishMaster({
+      storage,
+      passphrase: PASS,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    const writes: Promise<void>[] = [];
+    const write = storage.write.bind(storage);
+    const observedWrites = vi.spyOn(storage, "write").mockImplementation((...args) => {
+      const pending = write(...args);
+      writes.push(pending);
+      return pending;
+    });
+    try {
+      const identityManager = new IdentityManager(storage, custody.masterKey);
+      await identityManager.load();
+      const { storedIdentity } = createIdentity(
+        `hermes-${label}`,
+        derivePurposeKey(custody.masterKey, "identity-encryption"),
+        "passphrase",
+      );
+      await identityManager.save(storedIdentity);
+      const bridgeIdentity = memoryProvenancePublicKeyFingerprint(fromBase64url(storedIdentity.public_key));
+      return {
+        fortressDir,
+        env: allowlistedEnv(home, bridgeIdentity, `agent-${label}`, fortressId),
+      };
+    } finally {
+      try {
+        // Identity seeding starts a detached primary-pointer write; even a failed write must not let its peers outlive custody.
+        const outcomes = await Promise.allSettled(writes);
+        const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+        if (failures.length) throw new AggregateError(failures.map(outcome => outcome.reason), "Fixture identity writes failed");
+      } finally {
+        observedWrites.mockRestore();
+        try { await custody.masterWriteBarrier?.release(); }
+        // Zero the fixture key even on release failure so decrypted custody material cannot linger.
+        finally { custody.masterKey.fill(0); }
+      }
+    }
+  })();
+  // A timed-out test can leave setup running; await its finally before the LIFO directory removals.
+  // The calling test owns setup errors; cleanup must still wait for the failed setup to settle.
+  cleanups.push(async () => { await seeded.catch(() => undefined); });
+  return seeded;
 }
 
 async function tempHome(label: string): Promise<string> {

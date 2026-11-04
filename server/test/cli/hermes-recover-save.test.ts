@@ -412,7 +412,9 @@ describe("Hermes save operator recovery", () => {
     const before = await hashes(f.fortress);
     expect(before[`state/${EXIT_IMPORT_JOURNAL_NAMESPACE}/`]).toBeUndefined();
     for (const apply of [false, true]) {
-      expect(await command(f, apply)).toMatchObject({ code: 0, out: "nothing to recover\n" });
+      const result = await command(f, apply);
+      // POSIX success is status zero; include stderr and the mode so a refusal preserves its diagnostic.
+      expect(result, JSON.stringify({ apply, ...result })).toMatchObject({ code: 0, out: "nothing to recover\n" });
       expect(await hashes(f.fortress)).toEqual(before);
     }
   });
