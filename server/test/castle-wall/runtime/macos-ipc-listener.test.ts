@@ -11,7 +11,7 @@
  *   - `manifest_subscribe` from the extension produces an immediate
  *     `manifest_updated` emit back to that connection.
  *   - `flow_decision_recorded` dispatches into the consumer's audit
- *     sink (one entry per inbound).
+ *     sink (one entry per inbound head; same-key inbounds inside an open window are counted into a summary).
  *   - `flow_pending_approval` dispatches into the consumer's approval
  *     queue (one enqueue per inbound).
  *   - Re-bind on an existing socket path succeeds by unlinking the
@@ -904,11 +904,53 @@ describe("MacOSFlowIpcListener", () => {
       recorded_at: "2026-05-12T13:00:00Z",
     };
     for (let i = 0; i < 5; i++) {
-      socket.write(envelope(flow));
+      socket.write(envelope({ ...flow, destination: { ...flow.destination, port: 1024 + i } }));
     }
     await new Promise((r) => setTimeout(r, 50));
     expect(h.listener.getStats().framesDecoded).toBe(5);
     expect(h.audit.entries.filter((e) => e.operation === "egress_allowed")).toHaveLength(5);
+  });
+
+  it("counts five same-key socket deliveries as one head and four observations", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cw-macos-listener-"));
+    const audit = makeAuditSink(), approvals = makeApprovalQueue();
+    const consumer = new MacOSFlowEventConsumer({
+      coalesceLiveFlows: true, fortressId: FORTRESS_ID,
+      auditSink: audit.sink, approvalQueue: approvals.queue,
+      manifestProvider: makeManifestProvider([SAMPLE_RULE]), defaultApprovalTimeoutSeconds: 30,
+    });
+    expect(consumer.flushCoalescedFlowSummaries).toBeTypeOf("function");
+    const socketPath = join(dir, "castle.sock");
+    const listener = new MacOSFlowIpcListener({ socketPath, consumer });
+    await listener.start();
+    const h = { socketPath, listener, consumer, audit, approvals };
+    registerHarness(h);
+    const { socket, buf } = await connectClient(h.socketPath);
+    track(socket);
+    await nextMessage(buf);
+
+    const flow: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: AGENT_COUNTER_TOKEN, template: "coding-assistant" },
+      matched_rule_id: "rule-allow-anthropic",
+      recorded_at: "2026-05-12T13:00:00Z",
+    };
+    for (let i = 0; i < 5; i++) {
+      socket.write(envelope(flow));
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h.listener.getStats().framesDecoded).toBe(5);
+    expect(h.audit.entries.filter((e) => e.operation === "egress_allowed")).toHaveLength(1);
+    expect(h.consumer.getStats().decisionsCoalesced).toBe(4);
   });
 
   it("clamps connections to maxConnections", async () => {

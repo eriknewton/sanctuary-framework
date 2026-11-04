@@ -1,3 +1,6 @@
+import { FULL_SUPERVISION_COMPLETION_CODES } from "../castle-wall/runtime/full-supervision-exit.js";
+import fs from "node:fs";
+import { CASTLE_WALL_STOP_EXIT_DEADLINE_MS } from "../castle-wall/constants.js";
 import { CrossProcessLockError } from "../storage/cross-process-lock.js";
 import {
   execFile as nodeExecFile,
@@ -441,6 +444,8 @@ export interface CastleWallCommandContext {
    * key-resolution + producer-key threading can be exercised without a real
    * socket/helper). Defaults to {@link startMacOSCastleWallDaemon}.
    */
+  /** Injectable process exit for the signal-time completion fence; production exits synchronously. */
+  stopExit?: (code: number) => void;
   fullDaemonStart?: (
     input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
   ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
@@ -2720,7 +2725,25 @@ export async function runDaemon(
     return 1;
   }
   if (derived === undefined) return 1;
+  let stopLapsed = false;
+  let stopTimer: ReturnType<typeof setTimeout> | undefined;
+  let signalStop: (() => void) | undefined;
+  let resolveSignalWait: (() => void) | undefined;
+  const armStopFence = () => {
+    if (stopTimer !== undefined) return;
+    stopTimer = setTimeout(() => {
+      stopLapsed = true;
+      try {
+        // SAFETY: synchronous fixed operator diagnostic precedes exit even if normal streams cannot drain.
+        fs.writeSync(2, "[castle-wall] process stop budget lapsed\n");
+      } finally {
+        try { (ctx.stopExit ?? process.exit)(FULL_SUPERVISION_COMPLETION_CODES.failed); }
+        finally { resolveSignalWait?.(); }
+      }
+    }, CASTLE_WALL_STOP_EXIT_DEADLINE_MS);
+  };
   const releaseDaemonMasterSession = async (): Promise<boolean> => {
+    if (stopLapsed) return false;
     derived?.key.fill(0);
     try {
       // INVARIANT (daemon session lifetime): the foreground daemon keeps the
@@ -2729,7 +2752,7 @@ export async function runDaemon(
       // in-process caller.
       await daemonMasterWriteBarrier?.release();
       daemonMasterWriteBarrier = undefined;
-      return true;
+      return !stopLapsed;
     } catch (error) {
       write(
         err,
@@ -2741,11 +2764,13 @@ export async function runDaemon(
   let transparencyScheduler: { stop(): Promise<void> } | undefined;
   let daemon: { socketPath: string; stop: () => Promise<void> } | undefined;
   const stopTransparencySchedulerOnce = async (): Promise<void> => {
+    if (stopLapsed) return;
     const current = transparencyScheduler;
     transparencyScheduler = undefined;
     await current?.stop().catch(() => undefined);
   };
   const stopDaemonOnce = async (): Promise<void> => {
+    if (stopLapsed) return;
     const current = daemon;
     daemon = undefined;
     await current?.stop().catch(() => undefined);
@@ -3062,10 +3087,12 @@ export async function runDaemon(
   }
 
   await new Promise<void>((resolveWait) => {
+    resolveSignalWait = resolveWait;
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
+      armStopFence();
       write(err, "\nStopping Castle Wall daemon...\n");
       void (async () => {
         await stopTransparencySchedulerOnce();
@@ -3073,12 +3100,14 @@ export async function runDaemon(
         resolveWait();
       })();
     };
+    signalStop = stop;
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
+  if (stopLapsed) return FULL_SUPERVISION_COMPLETION_CODES.failed;
   if (fullAgentState) {
     // Clean accounting requires a released session; the pinned return below then observes an already released barrier.
-    if (!(await releaseDaemonMasterSession())) return 1;
+    if (!(await releaseDaemonMasterSession()) || stopLapsed) return 1;
     try { fullAgentState.stoppedClean(); }
     catch {
       write(err, "Could not record the full daemon clean stop.\n");
@@ -3091,9 +3120,14 @@ export async function runDaemon(
     // INVARIANT (daemon session ownership): any path after master unlock that
     // returns or throws must stop daemon work and drain checkpoint work before
     // dropping the reader.
-    await stopTransparencySchedulerOnce();
-    await stopDaemonOnce();
-    await releaseDaemonMasterSession();
+    try {
+      await stopTransparencySchedulerOnce();
+      await stopDaemonOnce();
+      await releaseDaemonMasterSession();
+    } finally {
+      if (stopTimer !== undefined) clearTimeout(stopTimer);
+      if (signalStop) { process.removeListener("SIGINT", signalStop); process.removeListener("SIGTERM", signalStop); }
+    }
   }
 }
 
@@ -6947,6 +6981,9 @@ function isCastleWallAuditEntry(entry: AuditEntry): boolean {
 }
 
 const CASTLE_WALL_AUDIT_OPERATIONS = new Set([
+  // Must match FLOW_COALESCE_SUMMARY_OPERATION in castle-wall/runtime/macos-flow-coalescing.ts and flushIngressDrops in castle-wall/runtime/macos-flow-events.ts.
+  "castle_wall_flow_decisions_coalesced",
+  "castle_wall_ingress_discarded",
   // Must match NON_AGENT_FLOW_SUMMARY_OPERATION in castle-wall/runtime/macos-non-agent-flows.ts.
   "castle_wall_non_agent_flows_observed",
   "egress_allowed",

@@ -25,6 +25,9 @@
  *     existing `decision_response` envelope keyed by request_id.
  */
 
+import { randomUUID } from "node:crypto";
+import { FlowAdmission, FlowCoalescer, FLOW_COALESCE_SUMMARY_OPERATION, flowCoalescingMetadata } from "./macos-flow-coalescing.js";
+import type { FlowClassification } from "./macos-flow-coalescing.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
@@ -100,7 +103,9 @@ export type MacOSIngressDropReason =
   | "approval_capacity"
   | "approval_expired"
   | "approval_shutdown"
-  | "approval_id_too_large";
+  | "approval_id_too_large"
+  | "audit_persist_failed"
+  | "flow_shutdown";
 
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
@@ -145,6 +150,16 @@ export interface MacOSFlowEventStats {
   subscribers: number;
   manifestSnapshotsEmitted: number;
   decisionsRecorded: number;
+  decisionsCoalesced: number;
+  coalescedSummariesWritten: number;
+  received: number;
+  waiting_or_in_flight: number;
+  primary_confirmed: number;
+  coalesced: number;
+  rejection_confirmed: number;
+  duplicate_settled: number;
+  delivery_unconfirmed_or_discarded: number;
+  counters_lower_bound: boolean;
   /** Informational root observations counted without a per-flow append. */
   nonAgentRootFlowsCounted: number;
   decisionsRejected: number;
@@ -158,6 +173,8 @@ export interface MacOSFlowEventStats {
 
 /** Constructor input. */
 export interface MacOSFlowEventConsumerInput {
+  /** Trusted runtime opt-in for live delivery; existing callers keep primary persistence. */
+  coalesceLiveFlows?: boolean;
   manifestProvider: MacOSManifestProvider;
   approvalQueue: MacOSApprovalQueue;
   auditSink: AuditSink;
@@ -233,8 +250,21 @@ export class MacOSFlowEventConsumer {
     approval_expired: 0,
     approval_shutdown: 0,
     approval_id_too_large: 0,
+    audit_persist_failed: 0,
+    flow_shutdown: 0,
   };
+  private readonly instanceId = randomUUID();
+  private readonly flowAdmission = new FlowAdmission();
+  private readonly coalescer: FlowCoalescer;
+  private readonly coalesceLiveFlows: boolean;
+  private summaryWrite: Promise<void> | null = null;
+  private stopBudgetLapsed = false;
   private ingressDropWrite: Promise<void> | null = null;
+  private ingressFirst: number | null = null;
+  private ingressLast: number | null = null;
+  private ingressBatchSeq = 0;
+  private lossStatusFailures = 0;
+  private ingressReservation: { details: Record<string, unknown>; counts: Record<MacOSIngressDropReason, number>; appended: boolean } | null = null;
   private readonly nonAgentRootFlows = createNonAgentRootFlowCounters();
   private nonAgentSummaryWrite: Promise<void> | null = null;
   private nonAgentSummarySeq = 0;
@@ -257,6 +287,16 @@ export class MacOSFlowEventConsumer {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
     decisionsRecorded: 0,
+    decisionsCoalesced: 0,
+    coalescedSummariesWritten: 0,
+    received: 0,
+    waiting_or_in_flight: 0,
+    primary_confirmed: 0,
+    coalesced: 0,
+    rejection_confirmed: 0,
+    duplicate_settled: 0,
+    delivery_unconfirmed_or_discarded: 0,
+    counters_lower_bound: false,
     nonAgentRootFlowsCounted: 0,
     decisionsRejected: 0,
     extensionDiagnosticsRecorded: 0,
@@ -280,6 +320,8 @@ export class MacOSFlowEventConsumer {
         ? input.pinnedProducerKeyB64url
         : null;
     this.now = input.now ?? Date.now;
+    this.coalescer = new FlowCoalescer(this.instanceId, this.now);
+    this.coalesceLiveFlows = input.coalesceLiveFlows ?? false;
     this.nonAgentCountingStartedAt = new Date(this.now()).toISOString();
     this.enforcementAvailability = new EnforcementAvailabilityStore({
       now: this.now,
@@ -292,6 +334,7 @@ export class MacOSFlowEventConsumer {
         ? new AuditConsumer(input.auditSink, undefined, {
             pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
             now: this.now,
+            ...(this.coalesceLiveFlows ? { liveFlowCoalescer: this.coalescer } : {}),
             // The extension signs flow decisions AND availability reports into
             // ONE shared seq/prior chain, but only flow decisions arrive here
             // — subset continuity (signature + strict seq monotonicity), never
@@ -388,6 +431,34 @@ export class MacOSFlowEventConsumer {
     notification: FlowDecisionRecordedNotification,
     subscriberId?: string,
   ): Promise<void> {
+    // Agent deliveries partition into waiting, primary, coalesced, rejection, duplicate and unconfirmed outcomes.
+    // Root observations retain their separate informational accounting in macos-non-agent-flows.ts.
+    const accounting = { terminal: false, root: false };
+    this.countFlow("received"); this.countFlow("waiting_or_in_flight");
+    const finish = (kind: "primary_confirmed" | "coalesced" | "rejection_confirmed" | "duplicate_settled" | "delivery_unconfirmed_or_discarded") => {
+      if (accounting.terminal) return;
+      accounting.terminal = true;
+      this.stats.waiting_or_in_flight--;
+      this.countFlow(kind);
+    };
+    const shutdown = () => { finish("delivery_unconfirmed_or_discarded"); this.noteIngressDrop("flow_shutdown"); };
+    const run = async () => {
+      try { await this.handleAdmittedFlow(notification, subscriberId, finish, accounting); }
+      catch (error) {
+        if (!accounting.terminal) { finish("delivery_unconfirmed_or_discarded"); this.noteIngressDrop("audit_persist_failed"); }
+        throw error;
+      }
+    };
+    if (this.coalesceLiveFlows) return this.flowAdmission.enter(() => withAuditWriteSettlement(run), shutdown);
+    return run();
+  }
+
+  private async handleAdmittedFlow(
+    notification: FlowDecisionRecordedNotification,
+    subscriberId: string | undefined,
+    finish: (kind: "primary_confirmed" | "coalesced" | "rejection_confirmed" | "duplicate_settled" | "delivery_unconfirmed_or_discarded") => void,
+    accounting: { terminal: boolean; root: boolean },
+  ): Promise<void> {
     if (subscriberId !== undefined) {
       this.recordFlowCarriedAvailability(notification, subscriberId);
     }
@@ -431,16 +502,15 @@ export class MacOSFlowEventConsumer {
       if (this.pinnedProducerKeyB64url === null || verified) {
         countNonAgentRootFlow(this.nonAgentRootFlows, signedDecision ?? notification.decision, verified);
         this.stats.nonAgentRootFlowsCounted += 1;
+        // The existing root summary owns these observations, outside the agent-delivery partition.
+        accounting.root = true; accounting.terminal = true;
+        this.stats.received--; this.stats.waiting_or_in_flight--;
         return;
       }
     }
-    // Slice M emission-liveness: an ARRIVING flow_decision_recorded is
-    // evidence the wall reports having decided a flow, independent of whether
-    // it persists below. Noted FIRST so every downstream reject path counts
-    // as decided-but-not-emitted divergence, never as silence.
-    this.emissionLiveness?.noteDecision("flow_decision_recorded");
     const reason = validation.reason;
     if (reason !== null) {
+      this.emissionLiveness?.noteDecision("flow_decision_recorded");
       this.stats.decisionsRejected += 1;
       this.emissionLiveness?.noteRejection(`validation:${reason}`);
       await this.auditSink.append(
@@ -451,6 +521,7 @@ export class MacOSFlowEventConsumer {
         "failure"
       );
       await this.auditSink.flush();
+      finish("rejection_confirmed");
       return;
     }
     const eventType =
@@ -458,13 +529,30 @@ export class MacOSFlowEventConsumer {
     if (this.producerAuditConsumer !== null) {
       try {
         await this.producerAuditConsumer.ingestCritical(
-          buildProducerSignedEnvelope(notification, eventType, this.fortressId)
+          buildProducerSignedEnvelope(notification, eventType, this.fortressId),
+          {
+            classify: (kind) => {
+              if (kind === "coalesced") {
+                this.countFlow("decisionsCoalesced");
+                finish("coalesced");
+              } else if (kind === "shutdown") {
+                finish("delivery_unconfirmed_or_discarded"); this.noteIngressDrop("flow_shutdown");
+              } else {
+                // Continuing heads and bounded windows are required for two-decision detection; a held head has no two-window guarantee.
+                this.emissionLiveness?.noteDecision("flow_decision_recorded");
+              }
+            },
+            confirmed: (kind) => {
+              if (kind === "primary") {
+                finish("primary_confirmed"); this.stats.decisionsRecorded += 1; this.emissionLiveness?.noteEmission();
+              } else finish(kind === "duplicate" ? "duplicate_settled" : "rejection_confirmed");
+            },
+          },
         );
-        this.stats.decisionsRecorded += 1;
-        this.emissionLiveness?.noteEmission();
       } catch (err) {
         this.stats.decisionsRejected += 1;
         if (err instanceof AuditChainError) {
+          if (!accounting.terminal) { finish("delivery_unconfirmed_or_discarded"); this.noteIngressDrop("audit_persist_failed"); }
           // The consumer has already durably recorded the rejection entry
           // before throwing (audit_event_rejected / producer_signature_rejected
           // / wal_chain_verification_failed), but this catch used to be
@@ -486,6 +574,8 @@ export class MacOSFlowEventConsumer {
         this.emissionLiveness?.noteRejection(
           `persist_error:${err instanceof Error ? err.message : String(err)}`
         );
+        // A delivery owns one terminal outcome even when its persistence diagnostic also fails.
+        if (!accounting.terminal) { finish("delivery_unconfirmed_or_discarded"); this.noteIngressDrop("audit_persist_failed"); }
         throw err;
       }
       return;
@@ -508,11 +598,21 @@ export class MacOSFlowEventConsumer {
     // detail key added here stays private by default (no denylist to forget to
     // update). The operator reads the unredacted entry via the Castle Wall CLI /
     // dashboard.
+    let classification: FlowClassification | undefined;
     try {
       const subject = macOSFlowProtectionSubject(
         this.fortressId,
         notification.agent.id,
       );
+      classification = this.coalesceLiveFlows ? this.coalescer.classify(flowCoalescingMetadata(subject, {
+        dest_ip: notification.destination.ip, dest_port: notification.destination.port,
+        dest_protocol: notification.destination.protocol, dest_host: notification.destination.host,
+        decision: notification.decision,
+      })) : undefined;
+      if (classification?.kind === "coalesced") {
+        this.countFlow("decisionsCoalesced"); finish("coalesced"); return;
+      }
+      this.emissionLiveness?.noteDecision("flow_decision_recorded");
       await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         eventType,
@@ -537,7 +637,12 @@ export class MacOSFlowEventConsumer {
         "success"
       );
       await this.auditSink.flush();
+      classification?.settled(true);
+      finish("primary_confirmed");
     } catch (err) {
+      // A failed primary closes only its logical window, preserving older pending summary evidence.
+      if (classification?.kind === "head") classification.settled(false);
+      if (!accounting.terminal) { finish("delivery_unconfirmed_or_discarded"); this.noteIngressDrop("audit_persist_failed"); }
       // A failed channel-path persist re-throws to the listener (which logs
       // to daemon stderr); the watchdog counts it so a persist-failure BURST
       // shows up as decided-but-not-emitted divergence, not just log lines.
@@ -641,7 +746,9 @@ export class MacOSFlowEventConsumer {
   }
 
   getStats(): MacOSFlowEventStats {
-    return { ...this.stats };
+    const coalescing = this.coalescer.snapshot();
+    return { ...this.stats, coalescedSummariesWritten: coalescing.coalescedSummariesWritten,
+      counters_lower_bound: this.stats.counters_lower_bound || coalescing.counters_lower_bound };
   }
 
   /** Return cumulative informational counts without exposing mutable consumer state. */
@@ -657,6 +764,7 @@ export class MacOSFlowEventConsumer {
 
   /** Persist cumulative observations at the daemon's existing heartbeat cadence. */
   async flushNonAgentFlowSummary(): Promise<void> {
+    if (this.stopBudgetLapsed) return;
     // The one slot stays occupied through actual storage settlement, so slow
     // writes cannot accumulate retained summaries across heartbeat ticks.
     if (this.nonAgentSummaryWrite !== null) {
@@ -697,65 +805,150 @@ export class MacOSFlowEventConsumer {
   }
 
   /** Wait for the occupied slot, then start at most one final cumulative write. */
-  async drainNonAgentFlowSummary(): Promise<void> {
+  async drainNonAgentFlowSummary(continuing = () => true): Promise<void> {
     if (this.nonAgentSummaryWrite !== null) await this.nonAgentSummaryWrite;
-    await this.flushNonAgentFlowSummary();
+    if (continuing()) await this.flushNonAgentFlowSummary();
   }
 
-  /** Record discarded input without retaining its payload or spawning one write per drop. */
+  private countFlow(key: "decisionsCoalesced" | "received" | "waiting_or_in_flight" | "primary_confirmed" | "coalesced" | "rejection_confirmed" | "duplicate_settled" | "delivery_unconfirmed_or_discarded"): void {
+    if (this.stats[key] === Number.MAX_SAFE_INTEGER) this.stats.counters_lower_bound = true;
+    else this.stats[key]++;
+  }
+
+  /** Close routed waiters before teardown; active writes retain their listener charges. */
+  closeFlowAdmission(): void { this.flowAdmission.close(); this.producerAuditConsumer?.closeFlowAdmission(); }
+  /** Join admitted work under the daemon's stop deadline. */
+  async drainFlowAdmission(): Promise<void> { await this.flowAdmission.drain(); await this.producerAuditConsumer?.drainFlowAdmission(); }
+  /** Fence new evidence writes after the stop result has latched; existing reservations remain owned. */
+  lapseStopBudget(): void { this.stopBudgetLapsed = true; }
+  /** Read queued and active work without changing admission ownership. */
+  getFlowAdmissionSnapshot() { return this.flowAdmission.snapshot(); }
+  /** Read current signed-flow floor for ordered-admission diagnostics. */
+  getFlowChainState() { return this.producerAuditConsumer?.getWalChainState() ?? null; }
+  /** Read all coalesced ownership, including an immutable reservation held in storage. */
+  getCoalescingSnapshot() { return { ...this.coalescer.snapshot(), summary_write_active: this.summaryWrite !== null }; }
+
+  /** Close windows on the existing heartbeat; a busy slot never attaches another waiter. */
+  flushCoalescedFlowSummaries(): Promise<void> {
+    if (this.stopBudgetLapsed) return Promise.resolve();
+    this.coalescer.closeWindows();
+    if (this.summaryWrite !== null) return Promise.resolve();
+    const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
+      for (const reservation of this.coalescer.reservations()) {
+        if (this.stopBudgetLapsed) return;
+        try {
+          if (!reservation.appended) {
+            await this.auditSink.append(CASTLE_WALL_AUDIT_LAYER, FLOW_COALESCE_SUMMARY_OPERATION, this.fortressId, { ...reservation.record }, "success");
+            reservation.markAppended();
+          }
+          if (this.stopBudgetLapsed) return;
+          await this.auditSink.flush();
+          reservation.confirm();
+        } catch {
+          this.coalescer.noteWriteFailure();
+          break;
+        }
+      }
+    })).finally(() => { this.summaryWrite = null; });
+    this.summaryWrite = write;
+    const snapshot = this.coalescer.snapshot();
+    if (snapshot.keys_overflowed > 0) {
+      // SAFETY: bounded operator diagnostics use scalar counters only.
+      console.error(`[castle-wall] flow summary flush keys_overflowed=${snapshot.keys_overflowed}`);
+    }
+    return write;
+  }
+  /** Await the occupied slot and at most one final pass; failed reservations stay owned. */
+  async drainCoalescedFlowSummaries(continuing = () => true): Promise<void> { await this.summaryWrite; if (continuing()) await this.flushCoalescedFlowSummaries(); }
+
+  /** Record terminal loss without retaining payloads; retries preserve the reservation's identity. */
+  noteFlowIngressDrop(): void {
+    // Flow telemetry refused by the listener belongs to the flow partition; approval traffic does not.
+    this.countFlow("received"); this.countFlow("delivery_unconfirmed_or_discarded");
+    this.noteIngressDrop("audit_backpressure");
+  }
+
+  /** Record one reason in the shared loss ledger without retaining its payload. */
   noteIngressDrop(reason: MacOSIngressDropReason, count = 1): void {
+    if (!Number.isSafeInteger(count) || count < 1) return;
     if (this.ingressDrops[reason] === 0) {
-      // SAFETY: stderr is the daemon operator log; the operator must see loss
-      // even when the audit backend cannot persist, once per reason per window.
+      // SAFETY: existing operator diagnostic remains independent of the audit sink.
       console.error(`[castle-wall] ingress discarded reason=${reason}; counts pending audit`);
     }
-    this.ingressDrops[reason] += count;
+    const now = this.now();
+    this.ingressFirst ??= now; this.ingressLast = now;
+    if (count > Number.MAX_SAFE_INTEGER - this.ingressDrops[reason]) this.stats.counters_lower_bound = true;
+    this.ingressDrops[reason] = Math.min(Number.MAX_SAFE_INTEGER, this.ingressDrops[reason] + count);
     void this.flushIngressDrops();
   }
 
-  /** Persist a coalesced discard record; failed writes remain counted for a later retry. */
-  flushIngressDrops(): Promise<void> {
-    if (this.ingressDropWrite) return this.ingressDropWrite;
-    if (!Object.values(this.ingressDrops).some((count) => count > 0)) return Promise.resolve();
-    const reserved = { ...this.ingressDrops };
-    for (const reason of Object.keys(reserved) as MacOSIngressDropReason[]) {
-      this.ingressDrops[reason] = 0;
+  /** Snapshot live and reserved counts together; ownership transfers do not change pending totals. */
+  getIngressLossSnapshot() {
+    const counts = { ...this.ingressDrops };
+    let lowerBound = this.stats.counters_lower_bound;
+    for (const reason of Object.keys(counts) as MacOSIngressDropReason[]) {
+      const reserved = this.ingressReservation?.counts[reason] ?? 0;
+      if (reserved > Number.MAX_SAFE_INTEGER - counts[reason]) lowerBound = true;
+      counts[reason] = Math.min(Number.MAX_SAFE_INTEGER, counts[reason] + reserved);
     }
-    let persisted = false;
-    // Reserve counts before yielding so drops during a slow write survive it.
-    // Must match flushNonAgentFlowSummary in macos-flow-events.ts: both slots
-    // stay reserved through withAuditWriteSettlement, not just append rejection.
-    // Must match withAuditWriteSettlement in operational/audit-log.ts: the
-    // single discard-write slot includes storage abandoned at a lock deadline.
+    return { counts, counters_lower_bound: lowerBound, summary_write_failures: this.coalescer.snapshot().summary_write_failures,
+      coalesced_evidence_pending: this.coalescer.snapshot().coalesced_evidence_pending };
+  }
+
+  /** Reserve pending counts before yielding; attempted batches retain their own identity and content. */
+  private reserveIngressDrops(): void {
+    if (this.ingressReservation) return;
+    const snapshot = this.coalescer.snapshot();
+    if (!Object.values(this.ingressDrops).some(count => count > 0) && snapshot.summary_write_failures === this.lossStatusFailures) return;
+    if (this.ingressBatchSeq === Number.MAX_SAFE_INTEGER) { this.stats.counters_lower_bound = true; return; }
+    const counts = { ...this.ingressDrops };
+    const first = this.ingressFirst, last = this.ingressLast;
+    // Reserve before yielding: later arrivals cannot mutate an attempted identifier or disappear with its confirmation.
+    this.ingressReservation = { counts, appended: false, details: {
+      counts, consumer_instance_id: this.instanceId, batch_seq: ++this.ingressBatchSeq,
+      first_dropped_at: first === null ? null : new Date(first).toISOString(),
+      last_dropped_at: last === null ? null : new Date(last).toISOString(),
+      window_ms: first === null || last === null ? 0 : Math.max(0, last - first),
+      summary_write_failures: snapshot.summary_write_failures,
+      coalesced_evidence_pending: snapshot.coalesced_evidence_pending,
+    } };
+    for (const reason of Object.keys(counts) as MacOSIngressDropReason[]) this.ingressDrops[reason] = 0;
+    this.ingressFirst = null; this.ingressLast = null;
+  }
+
+  /** Persist loss through the shared sink; a successful retry also drains one pending batch. */
+  flushIngressDrops(): Promise<void> {
+    if (this.stopBudgetLapsed) return Promise.resolve();
+    if (this.ingressDropWrite) return this.ingressDropWrite;
+    const retrying = this.ingressReservation !== null;
+    this.reserveIngressDrops();
+    if (!this.ingressReservation) return Promise.resolve();
+    // Two passes are one immutable retry and one newly reserved pending batch, never a retry loop.
+    const passes = retrying ? 2 : 1;
     const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
-      await this.auditSink.append(
-        CASTLE_WALL_AUDIT_LAYER,
-        "castle_wall_ingress_discarded",
-        this.fortressId,
-        { counts: reserved },
-        "failure",
-      );
-      persisted = true;
-    })).catch(() => {
-      for (const reason of Object.keys(reserved) as MacOSIngressDropReason[]) {
-        this.ingressDrops[reason] += reserved[reason];
+      for (let pass = 0; pass < passes && !this.stopBudgetLapsed; pass++) {
+        this.reserveIngressDrops();
+        const reservation = this.ingressReservation;
+        if (!reservation) return;
+        if (!reservation.appended) {
+          // Must match CASTLE_WALL_AUDIT_OPERATIONS in cli/castle-wall.ts.
+          await this.auditSink.append(CASTLE_WALL_AUDIT_LAYER, "castle_wall_ingress_discarded", this.fortressId, reservation.details, "failure");
+          reservation.appended = true;
+        }
+        if (this.stopBudgetLapsed) return;
+        await this.auditSink.flush();
+        this.lossStatusFailures = reservation.details.summary_write_failures as number;
+        this.ingressReservation = null;
       }
-    }).finally(() => {
-      this.ingressDropWrite = null;
-      // Retry only after success or a new caller; a failed store must not spin.
-      if (persisted) void this.flushIngressDrops();
-    });
+    })).catch(() => {
+      // A failed store must not spin: retain the immutable reservation and leave the pending batch for a later flush.
+    }).finally(() => { this.ingressDropWrite = null; });
     this.ingressDropWrite = write;
     return write;
   }
 
-  /** Await coalesced loss records at shutdown; failed persistence stays counted without a retry loop. */
-  async drainIngressDrops(): Promise<void> {
-    await this.flushIngressDrops();
-    // A successful write can start the next batch before its callers resume.
-    // Wait iteratively so continuous drops cannot retain a recursive promise chain.
-    while (this.ingressDropWrite) await this.ingressDropWrite;
-  }
+  /** Join the occupied slot then attempt one final loss batch without scheduling a retry loop. */
+  async drainIngressDrops(continuing = () => true): Promise<void> { await this.ingressDropWrite; if (continuing()) await this.flushIngressDrops(); }
 
   handleEnforcementAvailabilityReport(
     notification: EnforcementAvailabilityReportNotification,
@@ -999,6 +1192,7 @@ function buildProducerSignedEnvelope(
   });
   return {
     event,
+    producerDelivery: "live",
     ack: async () => {},
     ...(producer
       ? {

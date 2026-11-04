@@ -12,6 +12,7 @@ import { frame } from "../../../src/castle-wall/ipc/framing.js";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import { MacOSFlowIpcListener } from "../../../src/castle-wall/runtime/macos-ipc-listener.js";
 import { startMacOSCastleWallDaemon, type MacOSCastleWallListenerOptions } from "../../../src/castle-wall/runtime/macos-daemon.js";
+import { CASTLE_WALL_STOP_DEADLINE_MS } from "../../../src/castle-wall/constants.js";
 import type { AuditSink } from "../../../src/castle-wall/runtime/audit-consumer.js";
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -41,12 +42,12 @@ function fixture(sink: AuditSink) {
 }
 
 describe("macOS ingress retention", () => {
-  it("bounds shutdown discard draining by the write deadline while keeping unflushed counts", async () => {
+  it("bounds shutdown discard draining by the global deadline while keeping pending counts", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const home = await mkdtemp(join(tmpdir(), "cw-stop-deadline-"));
     vi.stubEnv("HOME", home);
     const writeDeadlineMs = 500; // Short fault-injection deadline with room for healthy startup writes.
-    const schedulingSlackMs = 1_000; // Allow local filesystem and timer scheduling during shutdown.
+    const schedulingSlackMs = 1; // One fake-clock millisecond beyond the global deadline.
     const key = ed25519.utils.randomPrivateKey();
     const storage = new FilesystemStorage(join(home, "state"));
     const audit = new AuditLog(storage, key, {
@@ -85,19 +86,18 @@ describe("macOS ingress retention", () => {
         }
         await write(namespace, entryKey, data);
       });
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const timeout = new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error("stop exceeded write deadline plus slack")), writeDeadlineMs + schedulingSlackMs);
-        });
-        stopping = handle.stop();
-        await Promise.race([stopping, timeout]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
+      expect(options.consumer.flushCoalescedFlowSummaries).toBeTypeOf("function");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let settled = false;
+      stopping = handle.stop().then(() => { settled = true; });
+      // Filesystem setup reaches the held write before fake time advances.
+      while (!hungWriteActive) await turn();
+      await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_DEADLINE_MS + schedulingSlackMs);
+      expect(settled, "stop settles at the global deadline with the storage write held").toBe(true);
+      vi.useRealTimers();
       expect(hungWriteActive).toBe(true);
       expect(audit.getWriteLockRecoveryCount()).toBe(1);
-      expect((await audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(true);
+      expect((await audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(false);
       await expect(readFile(activeConfigPath)).rejects.toMatchObject({ code: "ENOENT" });
       expect((await options.adminHandler!.handleDecision({ type: "decision_response", request_id: "stop-pending", decision: "allow_once" })).ok).toBe(false);
       // The storage promise stays unsettled throughout shutdown; release only for fixture cleanup.
@@ -105,8 +105,9 @@ describe("macOS ingress retention", () => {
       await options.consumer.drainIngressDrops();
       await options.consumer.flushIngressDrops();
       const discards = (await audit.query({ layer: "l1" })).entries.filter((entry) => entry.operation === "castle_wall_ingress_discarded");
-      expect(discards.reduce((sum, entry) => sum + (entry.details?.counts as Record<string, number>).approval_shutdown!, 0)).toBe(1);
+      expect(discards.reduce((sum, entry) => sum + (entry.details?.counts as Record<string, number>).approval_shutdown!, 0) + options.consumer.getIngressLossSnapshot().counts.approval_shutdown).toBe(1);
     } finally {
+      vi.useRealTimers();
       hangNextWrite = false;
       release();
       try {
@@ -271,7 +272,8 @@ describe("macOS ingress retention", () => {
     const events = 10_000;
     try {
       const first = state("first");
-      for (let i = 0; i < events / 2; i++) f.dispatch(first);
+      const distinctFlow = (index: number) => FLOW.replace('"port":443', `"port":${1024 + index}`); // Start above reserved ports.
+      for (let i = 0; i < events / 2; i++) f.dispatch(first, distinctFlow(i));
       expect(admitted).toBeGreaterThan(0);
       expect(admitted).toBeLessThanOrEqual(256); // one MiB / four KiB minimum charge
       for (let i = events / 2; i < events; i++) {
@@ -282,28 +284,31 @@ describe("macOS ingress retention", () => {
       const beforeLateCompletion = admitted;
       expect(beforeLateCompletion).toBeLessThanOrEqual(2048); // eight MiB / four KiB
       await turn();
-      for (let i = 0; i < events; i++) f.dispatch(state(`late-${i}`));
+      for (let i = 0; i < events; i++) f.dispatch(state(`late-${i}`), distinctFlow(events + i));
       expect(admitted).toBe(beforeLateCompletion);
       release();
       await turn(); await turn();
       await f.consumer.flushIngressDrops();
-      expect(admitted + discarded).toBe(events * 2);
+      expect(admitted + f.consumer.getStats().decisionsCoalesced + discarded).toBe(events * 2);
+      await f.consumer.flushCoalescedFlowSummaries();
       f.dispatch(first);
       await turn();
       expect(admitted).toBe(beforeLateCompletion + 1);
     } finally { release(); await turn(); stderr.mockRestore(); }
   });
 
-  it("accounts for payload size and retries a failed discard audit without multiplying writes", async () => {
+  it("retries a failed discard audit with the same reservation and drains the pending batch in one flush", async () => {
     const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
     let reject!: (e: Error) => void;
     const gate = new Promise<void>((_resolve, rejectGate) => { reject = rejectGate; });
     void gate.catch(() => {}); // cleanup also consumes the gate on the fail-before path
     let writes = 0, discarded = 0;
+    const batches: Array<{ counts: string; batch_seq: unknown }> = [];
     const f = fixture({
       async append(_layer, operation, _id, details) {
         expect(operation).toBe("castle_wall_ingress_discarded");
         writes++;
+        batches.push({ counts: JSON.stringify(details?.counts), batch_seq: details?.batch_seq });
         if (writes === 1) await gate;
         discarded += (details?.counts as Record<string, number>).audit_backpressure!;
       },
@@ -320,8 +325,12 @@ describe("macOS ingress retention", () => {
       await turn();
       expect(writes).toBe(1);
       await f.consumer.flushIngressDrops();
+      expect(batches[1], "retry counts and batch_seq are byte-identical to the first reservation").toEqual(batches[0]);
       expect(discarded).toBe(100);
-      expect(writes).toBe(2);
+      expect(writes).toBe(3);
+      expect(JSON.parse(batches[0]!.counts).audit_backpressure).toBe(1);
+      expect(JSON.parse(batches[2]!.counts).audit_backpressure).toBe(99);
+      expect(batches[2]!.batch_seq).toBe(Number(batches[0]!.batch_seq) + 1);
     } finally { reject(new Error("cleanup")); await turn(); stderr.mockRestore(); }
   });
 

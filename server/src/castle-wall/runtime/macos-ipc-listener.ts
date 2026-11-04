@@ -507,6 +507,7 @@ export class MacOSFlowIpcListener {
 
   /** Close every active connection and unlink the socket path. */
   async stop(): Promise<void> {
+    this.consumer.closeFlowAdmission();
     if (!this.server) return;
     const server = this.server;
     this.server = null;
@@ -870,7 +871,8 @@ export class MacOSFlowIpcListener {
       // Observations may be discarded under pressure; operator control remains
       // routable, and loss is audited without queuing another copy of the frame.
       this.stats.framesRejected += 1;
-      this.consumer.noteIngressDrop("audit_backpressure");
+      if (message.type === "flow_decision_recorded") this.consumer.noteFlowIngressDrop();
+      else this.consumer.noteIngressDrop("audit_backpressure");
       return;
     }
     this.telemetryBytes += charge;

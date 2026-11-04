@@ -15,6 +15,8 @@ import { isBlockedEgressSubject, parseBlockedEgressHost, parseBlockedEgressIp, p
  */
 
 import { createHash } from "node:crypto";
+import { FlowAdmission, FlowCoalescer, flowCoalescingMetadata } from "./macos-flow-coalescing.js";
+import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import { mintConsumerBlockedEgress, type BlockedEgressProjection, type ConsumerMintedBlockedEgress } from "./blocked-egress-attribution.js";
 
 import {
@@ -258,6 +260,8 @@ export type CriticalAckCallback = () => Promise<void>;
 /** Diagnostic counters surfaced for the lifecycle layer to expose. */
 export interface AuditConsumerStats {
   acceptedCriticalEvents: number;
+  /** Accepted informational observations counted separately from durable primaries. */
+  coalescedCriticalEvents: number;
   acceptedMetricBatches: number;
   rejectedEvents: number;
   /**
@@ -336,6 +340,11 @@ export interface CriticalEventEnvelope {
         kind: "signed_identity_id";
       };
 }
+/** Invocation-local classification; confirmations describe completed evidence, never mere fulfillment. */
+export interface FlowAdmissionObserver {
+  classify(kind: "head" | "coalesced" | "rejected" | "duplicate" | "shutdown"): void;
+  confirmed?(kind: "primary" | "rejection" | "duplicate"): void;
+}
 
 /** Metric-batch entry shape, mirroring the IPC message. */
 export interface MetricBatch {
@@ -400,6 +409,7 @@ export function validateEvent(event: CastleWallAuditEvent): string | null {
 export class AuditConsumer {
   private stats: AuditConsumerStats = {
     acceptedCriticalEvents: 0,
+    coalescedCriticalEvents: 0,
     acceptedMetricBatches: 0,
     rejectedEvents: 0,
     duplicatesDropped: 0,
@@ -410,6 +420,8 @@ export class AuditConsumer {
     producerSignatureRejections: 0,
     producerSignatureAccepted: 0,
   };
+  private readonly flowAdmission = new FlowAdmission();
+  private readonly liveFlowCoalescer: FlowCoalescer | undefined;
   private lastAckedSeq: number | null = null;
   /**
    * The chain anchor: for producer-signed entries this is
@@ -484,6 +496,8 @@ export class AuditConsumer {
     private readonly sink: AuditSink,
     private readonly inboxBridge?: UnifiedInboxBridge,
     options?: {
+      /** Trusted macOS live-flow composition only; absent means primary persistence. */
+      liveFlowCoalescer?: FlowCoalescer;
       pinnedProducerKeyB64url?: string | null;
       /** Reject signed enforcement events older than this many ms. Default 5 min. */
       producerSigMaxAgeMs?: number;
@@ -535,6 +549,7 @@ export class AuditConsumer {
     // Default must match BLOCKED_EGRESS_FUTURE_SKEW_MS in principal-policy/blocked-egress-projection.ts.
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
+    this.liveFlowCoalescer = options?.liveFlowCoalescer;
     this.chainAnchorSource = options?.chainAnchorSource;
     this.chainContinuity = options?.chainContinuity ?? "complete";
   }
@@ -566,7 +581,21 @@ export class AuditConsumer {
    *     entry; the daemon receives a fresh ACK so it stops retrying. Audit
    *     log integrity is preserved (no silent duplicate entries).
    */
-  async ingestCritical(envelope: CriticalEventEnvelope): Promise<void> {
+  async ingestCritical(envelope: CriticalEventEnvelope, observer?: FlowAdmissionObserver): Promise<void> {
+    if (!this.liveFlowCoalescer) return this.ingestOrderedCritical(envelope, observer);
+    // FIFO ownership includes detached storage settlement so a later frame cannot commit ahead of its head.
+    return this.flowAdmission.enter(
+      () => withAuditWriteSettlement(() => this.ingestOrderedCritical(envelope, observer)),
+      () => observer?.classify("shutdown"),
+    );
+  }
+
+  /** Stop closes queued live admissions before any dependent teardown writes. */
+  closeFlowAdmission(): void { this.flowAdmission.close(); }
+  /** Wait for admitted live work to settle; the caller supplies the stop budget. */
+  drainFlowAdmission(): Promise<void> { return this.flowAdmission.drain(); }
+
+  private async ingestOrderedCritical(envelope: CriticalEventEnvelope, observer?: FlowAdmissionObserver): Promise<void> {
     // The anchor must be restored from LOCAL storage before the first incoming
     // event is even looked at: an event examined against a null anchor is
     // bootstrap-accepted, which is precisely the wire-trust the restore exists
@@ -580,6 +609,7 @@ export class AuditConsumer {
     }
     const reason = validateEvent(envelope.event);
     if (reason) {
+      observer?.classify("rejected");
       this.stats.rejectedEvents += 1;
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
@@ -590,6 +620,7 @@ export class AuditConsumer {
       );
       await this.sink.flush();
       // ACK rejected events too; the daemon should not re-deliver malformed.
+      observer?.confirmed?.("rejection");
       await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
@@ -613,6 +644,7 @@ export class AuditConsumer {
     try {
       canonicalHash = computeCanonicalHash(envelope.event);
     } catch (err) {
+      observer?.classify("rejected");
       this.stats.rejectedEvents += 1;
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
@@ -634,6 +666,7 @@ export class AuditConsumer {
       await this.sink.flush();
       // Settle + ACK exactly like the shape-validation rejection above: a
       // refused forgery must never stop the drain loop.
+      observer?.confirmed?.("rejection");
       await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
@@ -644,7 +677,9 @@ export class AuditConsumer {
     // on it forked the chain on every deployment, #1096 root cause).
     const sigOutcome = this.evaluateProducerSignature(envelope);
     if (sigOutcome.kind === "rejected") {
+      observer?.classify("rejected");
       await this.emitProducerSignatureRejected(envelope, sigOutcome.reason);
+      observer?.confirmed?.("rejection");
       throw new AuditChainError(sigOutcome.reason);
     }
     if (sigOutcome.kind === "verified") {
@@ -657,6 +692,7 @@ export class AuditConsumer {
       sigOutcome.kind === "verified",
     );
     if (chainOutcome.kind === "duplicate_replay") {
+      observer?.classify("duplicate");
       // Daemon retried a critical event whose persistence completed but whose
       // ACK never landed. Drop the payload silently (no double-append) and
       // record the diagnostic entry so an auditor can see why the chain has a
@@ -672,11 +708,13 @@ export class AuditConsumer {
         "success"
       );
       await this.sink.flush();
+      observer?.confirmed?.("duplicate");
       this.stats.duplicatesDropped += 1;
       await this.tryAck(envelope, "critical_event_duplicate_dropped");
       return;
     }
     if (chainOutcome.kind === "error") {
+      observer?.classify("rejected");
       // A fork now means real damage (crash mid-write, force-clear, rolled-back
       // producer WAL): stop the chain LOUDLY and do not self-heal. There is
       // deliberately no automatic recovery here - every wire-driven re-anchor
@@ -684,13 +722,35 @@ export class AuditConsumer {
       // stuck chain an operator must clear is honest where a self-healing one
       // an attacker can steer is not.
       await this.emitVerificationFailure(chainOutcome.reason, envelope.event);
+      observer?.confirmed?.("rejection");
       throw new AuditChainError(chainOutcome.reason);
     }
 
     const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
     if (identityOutcome.kind === "rejected") {
+      observer?.classify("rejected");
       await this.emitProducerSignatureRejected(envelope, identityOutcome.reason);
+      observer?.confirmed?.("rejection");
       throw new AuditChainError(identityOutcome.reason);
+    }
+
+    // This subject is verified by persistedIdentityForEvent; only the verified body's fields may select its window.
+    const signedFlowFields = sigOutcome.kind === "verified" ? signedDetailsFromBody(sigOutcome.signedBody) : null;
+    const metadata = sigOutcome.kind === "verified" && envelope.producerDelivery === "live" &&
+      envelope.producerSubjectBinding?.kind === "macos_audit_token" &&
+      // Unsupported operation/verdict pairs retain ordinary primary persistence, never a new refusal.
+      ((envelope.event.event_type === "egress_allowed" && signedFlowFields?.decision === "allow") ||
+        (envelope.event.event_type === "egress_blocked" && signedFlowFields?.decision === "drop"))
+      ? flowCoalescingMetadata(identityOutcome.identityId, { ...signedFlowFields, seq: sigOutcome.seq }) : null;
+    // Failed primary evidence can only be retired by the ordinary successful primary path below.
+    const classification = this.liveFlowCoalescer?.classify(metadata, this.pendingUnpersistedSeq !== null);
+    observer?.classify(classification?.kind ?? "head");
+    if (classification?.kind === "coalesced") {
+      this.lastAckedSeq = Number(envelope.event.details.seq);
+      this.lastEventChainHash = chainBasis.hash;
+      this.stats.coalescedCriticalEvents += 1;
+      await this.tryAck(envelope, envelope.event.event_type);
+      return;
     }
 
     try {
@@ -724,11 +784,14 @@ export class AuditConsumer {
       // FIX 2: remember the seq we owe so a LATER event cannot bootstrap-ack
       // past it (no WAL truncation through an unpersisted event). The cursor /
       // chain anchor are deliberately NOT advanced and no ack is sent.
+      classification?.settled(false);
       const failedSeq = Number(envelope.event.details.seq);
       if (Number.isSafeInteger(failedSeq)) this.pendingUnpersistedSeq = failedSeq;
       await this.emitPersistenceFailure(err, envelope.event);
       throw err;
     }
+    classification?.settled(true);
+    observer?.confirmed?.("primary");
     if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
       // No blocked-egress projection is published before its primary audit receipt is durably appended and flushed; projection failure never rewrites the enforcement outcome.
       try {
@@ -814,6 +877,9 @@ export class AuditConsumer {
   getStats(): AuditConsumerStats {
     return { ...this.stats };
   }
+
+  /** Read admission counts without changing ownership. */
+  getFlowAdmissionSnapshot() { return this.flowAdmission.snapshot(); }
 
   getWalChainState(): {
     lastAckedSeq: number | null;
