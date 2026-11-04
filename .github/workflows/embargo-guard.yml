@@ -1,0 +1,64 @@
+# Refuse a PR range that cites a listed id once this context is required.
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+# The push run is a detector after publication, never a gate on an accepted push.
+# A red push run needs operator review; history changes are never automated.
+# Keep edited: a title or body can change after the first successful check.
+# No paths filter: commit messages and PR text are independent of changed paths.
+# Use pull_request with read-only access; pull_request_target is unnecessary.
+# Wiring must match W13 in server/test/structure/embargo-guard.test.ts.
+name: embargo-guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  embargo-guard:
+    name: embargo-guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Scan range and PR text
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          EVENT_HEAD: ${{ github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          text_args=()
+          case "$EVENT_NAME" in
+            pull_request)
+              base=$PR_BASE
+              head=$PR_HEAD
+              tmp=$(mktemp -d)
+              trap 'for file in "$tmp/title" "$tmp/body"; do [[ ! -f "$file" ]] || unlink "$file"; done; rmdir "$tmp"' EXIT
+              printf '%s\n' "$PR_TITLE" > "$tmp/title"
+              printf '%s\n' "$PR_BODY" > "$tmp/body"
+              text_args=(--text "pr-title=$tmp/title" --text "pr-body=$tmp/body")
+              ;;
+            push)
+              base=$PUSH_BASE
+              head=$EVENT_HEAD
+              ;;
+            workflow_dispatch)
+              head=$EVENT_HEAD
+              base=$(git rev-parse "$head^" 2>/dev/null) || base=0000000000000000000000000000000000000000
+              ;;
+            *) exit 2 ;;
+          esac
+          scripts/disclosure/check-embargo.sh --base "$base" --head "$head" "${text_args[@]}"
