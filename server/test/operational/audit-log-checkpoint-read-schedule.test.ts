@@ -185,6 +185,43 @@ function fixture(mode: Mode, count = CHECKPOINTS) {
   return { keys, storage, log };
 }
 
+// Match withAuditWriteLock's paired retirement fields in operational/audit-log.ts;
+// the production reader composes checkpointReadAbort with its own stop signal.
+function permitSchedule() {
+  let outstanding = 0; let maximum = 0;
+  const admissions: number[] = [];
+  const flights: { retire: () => void; holds: ReturnType<typeof gate>[]; run: Promise<unknown> }[] = [];
+  return {
+    admissions,
+    outstanding: () => outstanding,
+    maximum: () => maximum,
+    start(mode: Mode, count = P) {
+      const { keys, storage, log } = fixture(mode, count);
+      const holds = keys.map(() => gate());
+      const controller = new AbortController();
+      const signal = { aborted: false, checkpointReadAbort: controller.signal };
+      const id = flights.length; const issued: string[] = [];
+      vi.spyOn(storage, "read").mockImplementation(async (_ns, key) => {
+        issued.push(key); admissions.push(id);
+        outstanding++; maximum = Math.max(maximum, outstanding);
+        try { await holds[keys.indexOf(key)]!.wait; return null; }
+        finally { outstanding--; }
+      });
+      const retire = () => { signal.aborted = true; controller.abort(new Error("hold retired")); };
+      const run = settle(invoke(log, mode, keys, signal));
+      flights.push({ retire, holds, run });
+      return { id, keys, holds, issued, retire, run };
+    },
+    async close() {
+      // Retire queued admissions before releasing gates, including assertion failures.
+      for (const flight of flights) flight.retire();
+      for (const flight of flights) for (const hold of flight.holds) hold.release();
+      await Promise.all(flights.map(flight => flight.run));
+      await turns();
+    },
+  };
+}
+
 type Scripted = Uint8Array | null | { error: unknown; sync?: boolean } | { plain: true; raw: Uint8Array | null };
 function scriptedStorage(keys: string[], outcomes: Scripted[], scrambled: boolean, delays?: number[]) {
   const storage = new MemoryStorage();
@@ -279,6 +316,36 @@ for (const mode of modes) describe(mode, () => {
     }
   });
 
+  it("T-EQ reversed faults preserve the first fault in key order", async () => {
+    const faultCount = 2; // Two distinct faults separate key order from settlement order.
+    const { keys, storage, log } = fixture(mode, faultCount);
+    const holds = keys.map(() => gate());
+    const faults = keys.map(key => new Error(`read fault for ${key}`));
+    const issued: string[] = []; const settled: string[] = [];
+    vi.spyOn(storage, "read").mockImplementation(async (_ns, key) => {
+      const index = keys.indexOf(key); issued.push(key);
+      await holds[index]!.wait; settled.push(key); throw faults[index];
+    });
+    const oracle = scriptedStorage(keys, faults.map(error => ({ error })), false);
+    const reference = new SequentialOracle(oracle.storage);
+    const expected = await settle<unknown>(mode === "collector"
+      ? reference.collector(1, P, 0, keys)
+      : reference.predecessor([...keys], 0));
+    const run = settle(invoke(log, mode, keys));
+    try {
+      await turns(); expect(issued).toEqual(keys);
+      // Keep the earlier key pending until the later fault has settled.
+      holds[faultCount - 1]!.release(); await turns();
+      expect(settled).toEqual([keys[faultCount - 1]]);
+      holds[0]!.release();
+      const result = await run;
+      expect(settled).toEqual([...keys].reverse());
+      expect(expected).toMatchObject({ state: "faulted", error: faults[0] });
+      expect(result.state).toBe("faulted");
+      expect((result as { error: unknown }).error).toBe(faults[0]);
+    } finally { for (const hold of holds) hold.release(); await run; await turns(); }
+  });
+
   it("T-CAP admits exactly one window and waits for the head decision", async () => {
     expect((auditModule as any).AUDIT_CHECKPOINT_READ_CONCURRENCY).toBe(P);
     const { keys, storage, log } = fixture(mode);
@@ -364,6 +431,87 @@ it("T-WAVES shares permits across logs and releases on settlement", async () => 
     }
   } finally { hold.release(); await firstRun; await Promise.all(waveRuns); await turns(); }
   expect(active).toBe(0);
+});
+
+it("T-WAVES-R retains permits for pending reads from each abandoned hold", async () => {
+  const schedule = permitSchedule();
+  const waves: Mode[] = ["collector", "predecessor", "collector"]; // Three successive holds share the process budget.
+  try {
+    for (const [index, mode] of waves.entries()) {
+      const before = schedule.outstanding();
+      const wave = schedule.start(mode);
+      await turns();
+      expect(wave.issued).toHaveLength(P - before);
+      expect(schedule.outstanding()).toBe(P);
+      expect(schedule.maximum()).toBeLessThanOrEqual(auditModule.AUDIT_CHECKPOINT_READ_CONCURRENCY);
+      wave.retire(); await turns();
+      // Retirement alone cannot free the permit of a storage read still pending.
+      expect(schedule.outstanding()).toBe(P);
+      if (index === 0) {
+        // Only this tail settles; the first hold's other reads span both later waves.
+        wave.holds[P - 1]!.release(); await turns();
+        expect(schedule.outstanding()).toBe(P - 1);
+      }
+    }
+  } finally { await schedule.close(); }
+  expect(schedule.outstanding()).toBe(0);
+});
+
+it("T-HANDOFF grants a live waiter on a single read settlement", async () => {
+  const schedule = permitSchedule();
+  try {
+    const active = schedule.start("collector"); await turns();
+    expect(active.issued).toHaveLength(P);
+    const live = schedule.start("predecessor", 1); await turns();
+    expect(live.issued).toEqual([]);
+    active.holds[P - 1]!.release(); await turns();
+    // No new acquirer or second settlement can supply this handoff.
+    expect(live.issued).toEqual(live.keys);
+    expect(schedule.outstanding()).toBe(P);
+    expect(schedule.maximum()).toBe(P);
+  } finally { await schedule.close(); }
+  expect(schedule.outstanding()).toBe(0);
+});
+
+it("T-ABORT-QUEUE grants the live waiter after an earlier waiter retires", async () => {
+  const schedule = permitSchedule();
+  try {
+    const active = schedule.start("collector"); await turns();
+    expect(active.issued).toHaveLength(P);
+    const aborted = schedule.start("predecessor", 1); await turns();
+    const live = schedule.start("collector", 1); await turns();
+    expect(aborted.issued).toEqual([]); expect(live.issued).toEqual([]);
+    aborted.retire(); await turns();
+    expect(await aborted.run).toMatchObject({ state: "faulted", error: { name: "AuditLockHoldDeadlineError" } });
+    expect(schedule.outstanding()).toBe(P);
+    active.holds[P - 1]!.release(); await turns();
+    // A retired queue entry cannot consume the only handoff to a live waiter.
+    expect(live.issued).toEqual(live.keys);
+    expect(aborted.issued).toEqual([]);
+    expect(schedule.outstanding()).toBe(P);
+    expect(schedule.maximum()).toBe(P);
+  } finally { await schedule.close(); }
+  expect(schedule.outstanding()).toBe(0);
+});
+
+it("T-FIFO grants several live waiters in arrival order", async () => {
+  const schedule = permitSchedule();
+  try {
+    const active = schedule.start("collector"); await turns();
+    expect(active.issued).toHaveLength(P);
+    const waiters = [];
+    for (let index = 0; index < P; index++) {
+      const waiter = schedule.start(modes[index % modes.length]!, 1);
+      waiters.push(waiter); await turns(); expect(waiter.issued).toEqual([]);
+    }
+    for (let index = 0; index < waiters.length; index++) {
+      active.holds[index]!.release(); await turns();
+      expect(schedule.admissions.slice(P)).toEqual(waiters.slice(0, index + 1).map(waiter => waiter.id));
+      expect(schedule.outstanding()).toBe(P);
+      expect(schedule.maximum()).toBe(P);
+    }
+  } finally { await schedule.close(); }
+  expect(schedule.outstanding()).toBe(0);
 });
 
 async function productionFixture() {
