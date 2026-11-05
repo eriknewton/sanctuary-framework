@@ -47,6 +47,7 @@ import {
   persistUserProvidedPassphrase,
   readStoredPassphrase,
 } from "../../src/wrap/passphrase.js";
+import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
 
 const OLD_PASSPHRASE = "reset-rk-dur-OLD-correct-horse-not-a-real-secret";
 
@@ -986,7 +987,11 @@ describe("two-path (alias + real) concurrent rekey converges on one canonical cr
     if (parent) await rm(parent, { recursive: true, force: true });
   });
 
-  it("a rekey via a symlink alias and via the real path serialize on the shared lock and leave ONE consistent credential", async () => {
+  async function seedRealFortress(): Promise<{
+    realFortress: string;
+    recoveryKey: string;
+    readerSocketPath: string | undefined;
+  }> {
     parent = await mkdtemp(join(tmpdir(), "f5-twopath-"));
     const realFortress = join(parent, "real", ".sanctuary");
     await mkdir(join(realFortress, "state"), { recursive: true, mode: 0o700 });
@@ -997,8 +1002,28 @@ describe("two-path (alias + real) concurrent rekey converges on one canonical cr
       firstRun: { installMode: "headless", mintRecoveryKey: true },
       storagePathHint: realFortress,
     });
-    custody.masterKey.fill(0);
-    const recoveryKey = custody.mintedRecoveryKey ?? "";
+    const lease = takeCustodyLease(custody);
+    try {
+      return {
+        realFortress,
+        recoveryKey: custody.mintedRecoveryKey ?? "",
+        readerSocketPath: lease.socketPath,
+      };
+    } finally {
+      custody.masterKey.fill(0);
+      // The rekeys below open their own storage, and the namespace must still
+      // exist when the seed relinquishes custody, so the lease ends here.
+      await lease.release();
+    }
+  }
+
+  it("seeded fortress releases its custody lease before the rekeys run", async () => {
+    const { readerSocketPath } = await seedRealFortress();
+    await expectReaderSocketReleased(readerSocketPath);
+  });
+
+  it("a rekey via a symlink alias and via the real path serialize on the shared lock and leave ONE consistent credential", async () => {
+    const { realFortress, recoveryKey } = await seedRealFortress();
 
     // A symlink alias to the exact same physical fortress directory.
     const aliasFortress = join(parent, "alias-fortress");

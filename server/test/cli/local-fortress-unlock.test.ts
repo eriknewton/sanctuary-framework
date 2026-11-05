@@ -27,6 +27,8 @@ import {
   type PassphraseResult,
   type PassphraseOptions,
 } from "../../src/wrap/passphrase.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
+import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
 
 const PASSPHRASE = "unlock-correct-horse-battery-staple-not-a-real-secret";
 const WRONG_PASSPHRASE = "unlock-WRONG-passphrase-not-a-real-secret";
@@ -37,6 +39,7 @@ interface Seeded {
   storage: FilesystemStorage;
   master: Uint8Array;
   recoveryKey: string;
+  readerSocketPath?: string;
   cleanup: () => Promise<void>;
 }
 
@@ -52,13 +55,20 @@ async function seedFortress(): Promise<Seeded> {
     firstRun: { installMode: "headless", mintRecoveryKey: true },
     storagePathHint: storagePath,
   });
+  const lease = takeCustodyLease(custody);
   return {
     storagePath,
     statePath,
     storage,
     master: custody.masterKey,
     recoveryKey: custody.mintedRecoveryKey!,
-    cleanup: () => rm(dir, { recursive: true, force: true }),
+    readerSocketPath: lease.socketPath,
+    cleanup: async () => {
+      // Cases unlock through the seed's storage, so its lease lives until
+      // teardown; the namespace must still exist when it relinquishes custody.
+      await lease.release();
+      await rm(dir, { recursive: true, force: true });
+    },
   };
 }
 
@@ -86,6 +96,11 @@ describe("unlockLocalFortress", () => {
   function envelopeBytes(): Promise<Uint8Array | null> {
     return f.storage.read("_meta", "custody-envelope");
   }
+
+  it("seeded fortress releases its custody lease at teardown", async () => {
+    await f.cleanup();
+    await expectReaderSocketReleased(f.readerSocketPath);
+  });
 
   it("uses SANCTUARY_PASSPHRASE and returns only the master key", async () => {
     const r = await unlockLocalFortress({
@@ -247,6 +262,7 @@ describe("unlockLocalFortress", () => {
 
   it("opens and scrubs the custody-key factor enrolled by interactive init", async () => {
     const dir = await mkdtemp(join(tmpdir(), "local-unlock-keychain-"));
+    let lease: MasterWriteBarrierLease | undefined;
     try {
       const storagePath = join(dir, ".sanctuary");
       const storage = new FilesystemStorage(join(storagePath, "state"));
@@ -258,6 +274,7 @@ describe("unlockLocalFortress", () => {
         firstRun: { installMode: "interactive", mintRecoveryKey: true },
         storagePathHint: storagePath,
       });
+      lease = takeCustodyLease(established);
       const observed = keychainKey.slice();
       const r = await unlockLocalFortress({
         storage,
@@ -276,12 +293,16 @@ describe("unlockLocalFortress", () => {
       established.masterKey.fill(0);
       keychainKey.fill(0);
     } finally {
+      // The unlock above reads through this storage, and the namespace must
+      // still exist when the case relinquishes custody.
+      await lease?.release();
       await rm(dir, { recursive: true, force: true });
     }
   });
 
   it("falls back from a stale stored passphrase to the interactive-init custody key", async () => {
     const dir = await mkdtemp(join(tmpdir(), "local-unlock-keychain-fallback-"));
+    let lease: MasterWriteBarrierLease | undefined;
     try {
       const storagePath = join(dir, ".sanctuary");
       const storage = new FilesystemStorage(join(storagePath, "state"));
@@ -293,6 +314,7 @@ describe("unlockLocalFortress", () => {
         firstRun: { installMode: "interactive", mintRecoveryKey: true },
         storagePathHint: storagePath,
       });
+      lease = takeCustodyLease(established);
       const observed = keychainKey.slice();
       const r = await unlockLocalFortress({
         storage,
@@ -311,6 +333,9 @@ describe("unlockLocalFortress", () => {
       established.masterKey.fill(0);
       keychainKey.fill(0);
     } finally {
+      // The unlock above reads through this storage, and the namespace must
+      // still exist when the case relinquishes custody.
+      await lease?.release();
       await rm(dir, { recursive: true, force: true });
     }
   });

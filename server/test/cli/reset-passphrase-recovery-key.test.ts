@@ -39,6 +39,7 @@ import {
 } from "../../src/core/master-custody.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import { capturePassphraseCredentialIdentity } from "../../src/wrap/passphrase.js";
+import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
 
 const OLD_PASSPHRASE = "reset-rk-OLD-correct-horse-not-a-real-secret";
 
@@ -109,6 +110,7 @@ interface Seeded {
   storagePath: string;
   home: string;
   recoveryKey: string;
+  readerSocketPath: string | undefined;
   cleanup: () => Promise<void>;
 }
 
@@ -124,13 +126,25 @@ async function seed(mintRecoveryKey = true): Promise<Seeded> {
     firstRun: { installMode: "headless", mintRecoveryKey },
     storagePathHint: storagePath,
   });
-  custody.masterKey.fill(0);
-  return {
-    storagePath,
-    home,
-    recoveryKey: custody.mintedRecoveryKey ?? "",
-    cleanup: () => rm(home, { recursive: true, force: true }),
-  };
+  const lease = takeCustodyLease(custody);
+  try {
+    return {
+      storagePath,
+      home,
+      recoveryKey: custody.mintedRecoveryKey ?? "",
+      readerSocketPath: lease.socketPath,
+      cleanup: async () => {
+        // Releasing again is a no-op; kept so teardown does not depend on the seed's ordering.
+        await lease.release();
+        await rm(home, { recursive: true, force: true });
+      },
+    };
+  } finally {
+    custody.masterKey.fill(0);
+    // The seed's storage makes no later write and the namespace must still
+    // exist when the seed relinquishes custody, so the lease ends here.
+    await lease.release();
+  }
 }
 
 function stdinFromLines(lines: string[]): NodeJS.ReadableStream & { isTTY?: boolean } {
@@ -171,6 +185,10 @@ describe("reset-passphrase --mode recovery-key", () => {
   });
   afterEach(async () => {
     await f.cleanup();
+  });
+
+  it("seeded fortress releases its custody lease before teardown", async () => {
+    await expectReaderSocketReleased(f.readerSocketPath);
   });
 
   it("rekeys: enrolls+verifies a new passphrase, then removes the old one, preserving the recovery wrap", async () => {

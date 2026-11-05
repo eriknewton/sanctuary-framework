@@ -33,6 +33,7 @@ import {
   type PassphraseResult,
   type PassphraseOptions,
 } from "../../src/wrap/passphrase.js";
+import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
 
 const PASSPHRASE = "install-probe-correct-horse-not-a-real-secret";
 
@@ -57,7 +58,14 @@ const mutationAvailable = async () => ({
   command: "process-owned-unix-domain-socket",
 });
 
-async function seedFortress(dir: string, mintRecoveryKey: boolean): Promise<void> {
+/**
+ * Seed a fortress and relinquish its custody lease. Returns the released
+ * lease's reader socket path so a case can observe the release.
+ */
+async function seedFortress(
+  dir: string,
+  mintRecoveryKey: boolean,
+): Promise<string | undefined> {
   await mkdir(join(dir, "state"), { recursive: true, mode: 0o700 });
   const storage = new FilesystemStorage(join(dir, "state"));
   const custody = await establishMaster({
@@ -66,13 +74,13 @@ async function seedFortress(dir: string, mintRecoveryKey: boolean): Promise<void
     firstRun: { installMode: "headless", mintRecoveryKey },
     storagePathHint: dir,
   });
-  custody.masterKey.fill(0);
+  return relinquishSeedCustody(custody);
 }
 
 async function seedKeychainFortress(
   dir: string,
   keychainKey: Uint8Array,
-): Promise<void> {
+): Promise<string | undefined> {
   await mkdir(join(dir, "state"), { recursive: true, mode: 0o700 });
   const storage = new FilesystemStorage(join(dir, "state"));
   const custody = await establishMaster({
@@ -81,7 +89,21 @@ async function seedKeychainFortress(
     firstRun: { installMode: "interactive", mintRecoveryKey: true },
     storagePathHint: dir,
   });
-  custody.masterKey.fill(0);
+  return relinquishSeedCustody(custody);
+}
+
+async function relinquishSeedCustody(
+  custody: Awaited<ReturnType<typeof establishMaster>>,
+): Promise<string | undefined> {
+  const lease = takeCustodyLease(custody);
+  try {
+    return lease.socketPath;
+  } finally {
+    custody.masterKey.fill(0);
+    // The seed's storage makes no later write and the namespace must still
+    // exist when the seed relinquishes custody, so the lease ends here.
+    await lease.release();
+  }
 }
 
 describe("probeCustodyAccess (Rung 1 daily-UX probe)", () => {
@@ -91,6 +113,18 @@ describe("probeCustodyAccess (Rung 1 daily-UX probe)", () => {
   });
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it("seeded fortresses release their custody leases before teardown", async () => {
+    await expectReaderSocketReleased(await seedFortress(dir, true));
+    const keychainDir = await mkdtemp(join(tmpdir(), "install-probe-keychain-lease-"));
+    try {
+      const keychainKey = new Uint8Array(32).fill(0x24);
+      await expectReaderSocketReleased(await seedKeychainFortress(keychainDir, keychainKey));
+      keychainKey.fill(0);
+    } finally {
+      await rm(keychainDir, { recursive: true, force: true });
+    }
   });
 
   it("virgin fortress: missing / absent", async () => {
@@ -252,7 +286,7 @@ describe("probeCustodyAccess (Rung 1 daily-UX probe)", () => {
         firstRun: { installMode: "headless", mintRecoveryKey: false },
         storagePathHint: swapped,
       });
-      otherCustody.masterKey.fill(0);
+      await relinquishSeedCustody(otherCustody);
 
       const swapOnRead = async (): Promise<PassphraseResult> => {
         // The stored-credential read is the probe's own step between the two
@@ -304,7 +338,7 @@ describe("probeCustodyAccess (Rung 1 daily-UX probe)", () => {
         firstRun: { installMode: "headless", mintRecoveryKey: true },
         storagePathHint: foreign,
       });
-      foreignCustody.masterKey.fill(0);
+      await relinquishSeedCustody(foreignCustody);
       // A: read BEFORE the spy is installed, or the spy would intercept it.
       const foreignEnvelope = await new FilesystemStorage(
         join(foreign, "state"),

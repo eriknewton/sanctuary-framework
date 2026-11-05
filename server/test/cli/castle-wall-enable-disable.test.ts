@@ -7,6 +7,8 @@ import { Writable } from "node:stream";
 
 import { parseFrame } from "../../src/castle-wall/ipc/framing.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
+import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -122,12 +124,36 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 
 describe("castle-wall enable/disable CLI verbs", () => {
   const tempDirs: string[] = [];
+  const caseLeases: MasterWriteBarrierLease[] = [];
+
+  async function releaseCaseLeases(): Promise<void> {
+    for (const lease of caseLeases.splice(0)) await lease.release();
+  }
 
   afterEach(async () => {
+    // A case reads its audit log through the unlocked storage until it ends,
+    // and the namespace must still exist when it relinquishes custody.
+    await releaseCaseLeases();
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  /** Unlock a fixture fortress for a case that reads its audit log afterwards. */
+  async function establishCaseCustody(
+    fixture: Awaited<ReturnType<typeof makeFixture>>,
+    storage: FilesystemStorage,
+  ): Promise<Uint8Array> {
+    const { establishMaster } = await import("../../src/core/master-custody.js");
+    const established = await establishMaster({
+      storage,
+      recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+      storagePathHint: fixture.fortressPath,
+    });
+    caseLeases.push(takeCustodyLease(established));
+    return established.masterKey;
+  }
 
   async function makeFixture() {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-arm-"));
@@ -2160,6 +2186,16 @@ describe("castle-wall enable/disable CLI verbs", () => {
       };
     }
 
+    it("case custody opened to read the audit log is released at teardown", async () => {
+      const fixture = await makeFixture();
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const masterKey = await establishCaseCustody(fixture, storage);
+      masterKey.fill(0);
+      const caseSocketPath = caseLeases.at(-1)?.socketPath;
+      await releaseCaseLeases();
+      await expectReaderSocketReleased(caseSocketPath);
+    });
+
     it("REFUSES to arm a uid-mode wall with ZERO agent-matchable allow rules (real disk read: empty rules dir) and names --allow-no-egress", async () => {
       const fixture = await makeFixture();
       const plistPath = join(fixture.fortressPath, "boot.plist");
@@ -2195,13 +2231,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       expect(code).toBe(1);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
-      const { establishMaster } = await import("../../src/core/master-custody.js");
-      const { masterKey } = await establishMaster({
-        storage,
-        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
-        firstRun: { installMode: "headless", mintRecoveryKey: false },
-        storagePathHint: fixture.fortressPath,
-      });
+      const masterKey = await establishCaseCustody(fixture, storage);
       const auditLog = new AuditLog(storage, masterKey);
       const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
       const refusal = entries.find((e) => e.operation === "egress_provision_refused");
@@ -2246,13 +2276,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       expect(calls).toHaveLength(0);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
-      const { establishMaster } = await import("../../src/core/master-custody.js");
-      const { masterKey } = await establishMaster({
-        storage,
-        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
-        firstRun: { installMode: "headless", mintRecoveryKey: false },
-        storagePathHint: fixture.fortressPath,
-      });
+      const masterKey = await establishCaseCustody(fixture, storage);
       const auditLog = new AuditLog(storage, masterKey);
       const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
       const refusal = entries.find(
@@ -2299,13 +2323,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       expect(calls).toHaveLength(0);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
-      const { establishMaster } = await import("../../src/core/master-custody.js");
-      const { masterKey } = await establishMaster({
-        storage,
-        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
-        firstRun: { installMode: "headless", mintRecoveryKey: false },
-        storagePathHint: fixture.fortressPath,
-      });
+      const masterKey = await establishCaseCustody(fixture, storage);
       const auditLog = new AuditLog(storage, masterKey);
       const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
       const refusal = entries.find(
@@ -2379,13 +2397,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       ]);
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
-      const { establishMaster } = await import("../../src/core/master-custody.js");
-      const { masterKey } = await establishMaster({
-        storage,
-        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
-        firstRun: { installMode: "headless", mintRecoveryKey: false },
-        storagePathHint: fixture.fortressPath,
-      });
+      const masterKey = await establishCaseCustody(fixture, storage);
       const auditLog = new AuditLog(storage, masterKey);
       const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
       const armed = entries.find((e) => e.operation === "wall_armed");
@@ -2434,13 +2446,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       expect(out.text()).not.toContain("Castle Wall armed");
 
       const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
-      const { establishMaster } = await import("../../src/core/master-custody.js");
-      const { masterKey } = await establishMaster({
-        storage,
-        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
-        firstRun: { installMode: "headless", mintRecoveryKey: false },
-        storagePathHint: fixture.fortressPath,
-      });
+      const masterKey = await establishCaseCustody(fixture, storage);
       const auditLog = new AuditLog(storage, masterKey);
       const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
       const refusal = entries.find(
