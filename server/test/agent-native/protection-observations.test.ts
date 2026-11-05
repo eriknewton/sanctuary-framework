@@ -14,7 +14,7 @@ import { composeProtectionLayers, type ProtectionLayerRow } from "../../src/agen
 import { buildHome, reconcilePostureHomeJoiner } from "../../src/principal-policy/posture-routes.js";
 import { createPosturePanelStore, capStalePanel } from "../../src/principal-policy/panel-producer.js";
 import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
-import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 const observedAt = Date.parse("2026-11-05T12:00:00Z"); // Shared fixed evaluation instant.
 const FIRST_CONTENT = 0; // The text response occupies the first content block.
@@ -116,7 +116,8 @@ it("protection surfaces share every observed layer", async () => {
       featureHealth: { supported: f.health, unavailable: undefined },
       custodyExit: { supported: f.custody, unavailable: undefined },
       custodyObservation: { supported: fresh, unavailable: undefined },
-      now: { supported: observedAt, unavailable: undefined },
+      // First millisecond beyond the shared freshness window, so a supplied instant is distinguishable from the mocked clock.
+      now: { supported: observedAt + custodySource.DEFAULT_ENFORCEMENT_FRESHNESS_MS + 1, unavailable: undefined },
       toolOutputScreenReady: { supported: false, unavailable: undefined },
     };
     expect(Object.keys(fields).sort()).toEqual([...protectionEvidenceKeys].sort());
@@ -126,6 +127,10 @@ it("protection surfaces share every observed layer", async () => {
         expect(protectionEvidenceSchema.parse(evidence)).toEqual(evidence);
         expect(Object.keys(evidence).sort()).toEqual([...protectionEvidenceKeys].sort());
       }
+      // A value of the wrong shape is refused, and every supported value changes the composed rows.
+      expect(protectionEvidenceSchema.safeParse({ ...snapshot, [key]: "not an observation" }).success, `${key} shape`).toBe(false);
+      expect(composeProtectionLayers({ ...snapshot, [key]: fields[key].supported }), `${key} composes`)
+        .not.toEqual(composeProtectionLayers({ ...snapshot, [key]: fields[key].unavailable }));
     }
     expect(status(composeProtectionLayers({ encryptedStateStoreConstructed: false }), "encrypted_vault")).toBe("off");
     const absent = observeProtections(protectionRuntimeUnavailable, { featureHealth: undefined, custodyExit: undefined,

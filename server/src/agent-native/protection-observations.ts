@@ -63,8 +63,8 @@ export function observeProtections(runtime: ProtectionRuntimeSources, panels: Qu
   return snapshot;
 }
 
+// Only the sources are retained; each follower composes a fresh snapshot from them.
 interface HomeObservation {
-  snapshot: ProtectionObservationSnapshot;
   runtime: ProtectionRuntimeProvider;
   now: () => number;
 }
@@ -77,10 +77,13 @@ export function associateProtectionHome(home: object, observation: HomeObservati
 }
 
 /** Re-observe current runtime sources while preserving the caller's capped panel qualifications. */
-export function observeProtectionJoiner(home: object, panels: Omit<QualifiedProtectionPanels, "now">): HomeObservation {
+export function observeProtectionJoiner(home: object, panels: Omit<QualifiedProtectionPanels, "now">): {
+  snapshot: ProtectionObservationSnapshot;
+  observation: HomeObservation;
+} {
   const prior = homeObservations.get(home);
   const runtime = prior?.runtime ?? (() => protectionRuntimeUnavailable);
   const now = prior?.now ?? Date.now;
   const snapshot = observeProtections(runtime(), { ...panels, now: now() });
-  return { snapshot, runtime, now };
+  return { snapshot, observation: { runtime, now } };
 }

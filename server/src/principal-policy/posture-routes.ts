@@ -1210,10 +1210,10 @@ export function reconcilePostureHomeJoiner(home: PostureHome, admissionSequence:
     result.panels[id] = { ...home.panels[id], state: home.panels[id].state === "unavailable" ? "unavailable" : "stale",
       reason: home.panels[id].reason ?? "observation_superseded" };
   }
-  // Must match associateProtectionHome in protection-observations.ts: every copy keeps its own qualified snapshot.
-  const observation = observeProtectionJoiner(home, { featureHealth: result.feature_health, custodyExit: result.custody_exit,
+  // Must match associateProtectionHome in protection-observations.ts: every copy keeps its own runtime association.
+  const { snapshot, observation } = observeProtectionJoiner(home, { featureHealth: result.feature_health, custodyExit: result.custody_exit,
     custodyObservation: result.panels.custody_exit, auditChain: undefined });
-  result.protection_layers = composeProtectionLayers(observation.snapshot);
+  result.protection_layers = composeProtectionLayers(snapshot);
   // Reuse requires freshly evaluated whole-row equality; an unchanged audit sequence alone proves no runtime fact.
   if (arrivalSequence <= admissionSequence && JSON.stringify(result.protection_layers) === JSON.stringify(home.protection_layers)) {
     associateProtectionHome(home, observation);
@@ -1350,6 +1350,7 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
   const runtime = deps.protectionRuntime ?? (() => protectionRuntimeUnavailable);
   const now = deps.now ?? Date.now;
   // Page composition has no bounded chain observation; existing panel qualifications remain authoritative.
+  // Must match custodyObservation in protectionEvidenceSchema (protection-layers.ts): use the producer status, including fallback and stale reads.
   const snapshot = observeProtections(runtime(), { featureHealth, custodyExit: value("custody_exit", custody),
     custodyObservation: custody.status, now: now(), auditChain: undefined });
   const home: PostureHome = {
@@ -1373,7 +1374,7 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
     enforcement_confirmed_count: agents.filter(a => a.enforcement_active === "active").length,
   };
   // Must match observeProtectionJoiner in protection-observations.ts: route flights retain this exact object.
-  associateProtectionHome(home, { snapshot, runtime, now });
+  associateProtectionHome(home, { runtime, now });
   return home;
 }
 
