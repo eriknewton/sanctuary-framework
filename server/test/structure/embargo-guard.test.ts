@@ -408,7 +408,12 @@ describe("embargo guard", () => {
     const marker = join(temp, "hashed");
     const childPath = fakeTool("sha256sum", `touch '${marker}'; exit 3`);
     fakeTool("shasum", `touch '${marker}'; exit 3`);
+    const started = Date.now();
     const result = scan(head, [], base, childPath);
+    const elapsed = Date.now() - started;
+    // Ten seconds allows processing of this approximately 1 MB fixture of short tokens on Linux;
+    // each scanner child has a one-minute budget.
+    if (platform() === "linux") expect(elapsed).toBeLessThan(10_000);
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("ERROR embargo scanner cannot run: token bound exceeded");
     expect(existsSync(marker)).toBe(false);
@@ -533,12 +538,24 @@ describe("embargo guard", () => {
     expect(scan(base, [], base, bin).status).toBe(0);
     rmSync(join(bin, hashName));
     expect(scan(base, [], base, bin).status).toBe(2);
+    const marker = join(temp, "acquired");
+    const cat = resolved.find(([name]) => name === "cat")![1];
+    rmSync(join(bin, "cat"));
+    writeFileSync(join(bin, "cat"), `#!/usr/bin/env bash\nprintf called > '${marker}'\nexec '${cat}' "$@"\n`);
+    chmodSync(join(bin, "cat"), 0o755); // Executable fixture tool, writable only by its owner.
     const out = join(temp, "fresh-output");
     const generated = spawnSync(join(bin, "bash"), [generator, join(temp, "extract.txt"), "--salt", join(repo, saltPath), "--out", out], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: bin }, encoding: "utf8" });
     completed(generated);
     expect(generated.status).toBe(2);
     expect(generated.stderr).toBe("ERROR embargo generator cannot run\n");
     expect(existsSync(out)).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+    symlinkSync(hash, join(bin, hashName));
+    const control = spawnSync(join(bin, "bash"), [generator, join(temp, "extract.txt"), "--salt", join(repo, saltPath), "--out", out], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: bin }, encoding: "utf8" });
+    completed(control);
+    expect(control.status).toBe(0);
+    expect(existsSync(out)).toBe(true);
+    expect(existsSync(marker)).toBe(true);
   });
   it("W29 preserves added-record indices through bulk normalization", () => {
     seed();
@@ -558,6 +575,19 @@ describe("embargo guard", () => {
     const childPath = fakeTool("grep", `if [[ "$1" == -Fqx ]]; then printf called > '${marker}'; exit 2; fi\nexec '${grep}' "$@"`);
     const result = scan(head, [], base, childPath);
     expect(result.status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  it("W31 requires complete delimiter splitting", () => {
+    seed();
+    put("content.txt", `${listed}\n`);
+    const head = commit("Add delimiter fixture");
+    const tr = realTool("tr");
+    const marker = join(temp, "split");
+    const childPath = fakeTool("tr", `if [[ "$1" == -c ]]; then printf called > '${marker}'; exit 1; fi\nexec '${tr}' "$@"`);
+    const result = scan(head, [], base, childPath);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("ERROR embargo scanner cannot run\n");
     expect(existsSync(marker)).toBe(true);
   });
 

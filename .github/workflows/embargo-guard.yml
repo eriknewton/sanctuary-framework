@@ -8,7 +8,8 @@
 # own copy of the guard. Such a PR merges only after the coordinator's two-family review.
 # Unscanned surfaces include branch names, tags and tag messages, release notes
 # and GitHub release bodies, content absent from net added lines, unsplittable
-# binary text, word-described or spaced/split ids, and bare short slugs.
+# binary text, word-described or spaced/split ids, ids interrupted by a NUL byte,
+# and bare short slugs.
 # The full surface and path policy is in scripts/disclosure/check-embargo.sh.
 # Keep edited: a title or body can change after the first successful check.
 # No paths filter: commit messages and PR text are independent of changed paths.

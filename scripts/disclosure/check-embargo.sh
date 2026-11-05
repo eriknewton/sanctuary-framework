@@ -4,7 +4,8 @@
 # and requires operator review; it cannot refuse a push already accepted.
 # Unscanned: branch names, tags and tag messages, release notes and GitHub release
 # bodies, binary text git cannot split into lines even with --text, ids spelled
-# with spaces, split across lines or described in words, and bare short slugs
+# with spaces, split across lines or described in words, ids interrupted by a NUL byte,
+# and bare short slugs
 # without their defect. prefix. Public salt allows membership testing of guesses.
 # Content absent from the net added lines, including text added and then removed
 # within the range or removed and restored unchanged, is outside the added-line
@@ -58,6 +59,7 @@ cleanup() {
   local pending=$? file cleanup_failed=0
   # Must match scratch ownership in embargo-digest-lib.sh and generate-embargo-digests.sh.
   # Globbing is enabled only for owned scratch, never for input token splitting.
+  # This includes split and split-paths from the shared bulk split stage.
   set +f
   for file in "$tmp"/*; do
     [[ ! -f "$file" ]] || unlink "$file" || cleanup_failed=1
@@ -150,10 +152,12 @@ scan() {
   embargo_normalize_stream < "$tmp/content" > "$tmp/normalized" || fail
   # Number original records once; normalization preserves LF and embedded token boundaries.
   awk '{ print NR "\t" $0 }' "$tmp/normalized" > "$tmp/numbered" || fail
+  # Must match embargo_split_stream in embargo-digest-lib.sh; incomplete split output is never parsed.
+  embargo_split_stream < "$tmp/numbered" > "$tmp/split" || fail
   while IFS= read -r line || [[ -n "$line" ]]; do
     number=${line%%$'\t'*}; line=${line#*$'\t'}
     embargo_tokens "$line" "$surface" "$number" >> "$tmp/occurrences" || fail
-  done < "$tmp/numbered"
+  done < "$tmp/split"
 }
 scan commit-message "$tmp/messages"
 i=0
@@ -166,18 +170,21 @@ while [[ $i -lt $text_count ]]; do
 done
 scan added-line "$tmp/added"
 embargo_normalize_stream < "$tmp/paths" > "$tmp/normalized-paths" || fail
+# Must match embargo_split_stream in embargo-digest-lib.sh; incomplete split output is never parsed.
+embargo_split_stream < "$tmp/normalized-paths" > "$tmp/split-paths" || fail
 number=0
 # NUL records preserve one index per path, including names containing newlines.
 while IFS= read -r -d '' path; do
   number=$((number + 1))
   embargo_tokens "$path" added-path "$number" >> "$tmp/occurrences" || fail
-done < "$tmp/normalized-paths"
+done < "$tmp/split-paths"
 cut -f1 "$tmp/occurrences" > "$tmp/token-column" || fail
 sort -u "$tmp/token-column" > "$tmp/unique" || fail
 count=$(wc -l < "$tmp/unique") || fail
 # 50000 tokens times at most two salts is 100000 hash processes, about 300 s at
 # 3 ms each, plus hash output processing and bulk tokenizer/sort/join stages.
-# Each surface uses a fixed number of bulk stages; record parsing uses builtins.
+# Content uses bulk NUL mapping, normalization, numbering and delimiter splitting;
+# paths use bulk normalization and delimiter splitting. Record parsing uses builtins.
 # The combined budget remains inside the 30 minute job bound.
 # This work bound must match timeout-minutes in .github/workflows/embargo-guard.yml.
 EMBARGO_MAX_UNIQUE_TOKENS=50000

@@ -5,11 +5,22 @@
 # Bare short slugs stay outside the grammar: hashing every short word would make
 # the work bound the limiting factor on large diffs. Prefixed slugs use the shared regex.
 # Every non-decoy generator digest has a tokenizer spelling; random hex decoys do not.
+# The callers set their shell options before sourcing; the digest subshell sets pipefail itself.
+# Delimiter substitution runs once over each complete surface; the per-record loop
+# uses default-IFS word splitting with globbing disabled. Delimiter splitting is
+# linear in input bytes; the existing per-token trim and alias rules retain their separate costs.
 export LC_ALL=C
 
 # Must match the bulk stage in check-embargo.sh and generate-embargo-digests.sh.
 embargo_normalize_stream() {
   tr 'a-z_' 'A-Z-' || return 2
+}
+
+# Must match the split stage callers in check-embargo.sh. 055 is octal for hyphen;
+# this spelling keeps it literal in the set on both supported userlands.
+# Tab, newline and NUL preserve record numbering, LF framing and NUL path framing.
+embargo_split_stream() {
+  LC_ALL=C tr -c 'A-Za-z0-9._\055\t\n\000' ' ' || return 2
 }
 
 # The caller supplies normalized in its local scope; no subprocess runs per record.
@@ -47,12 +58,14 @@ embargo_digest() (
 )
 
 # The scanner owns all staged files and cleanup; this helper uses only builtins.
-# Must match check-embargo.sh: normalized records, globbing disabled, fixed surface and index.
+# Must match check-embargo.sh: normalized and split records, globbing disabled, fixed surface and index.
 embargo_tokens() {
   local line=$1 surface=$2 number=$3 normalized segment rest
   local IFS=$' \t\n'
-  # Default-IFS splitting follows bulk normalization, preserving the shared alias grammar.
-  for normalized in ${line//[^A-Za-z0-9._-]/ }; do
+  # Callers disable globbing before splitting; a record is never expanded as a filesystem pattern.
+  [[ $- == *f* ]] || return 2
+  # Default-IFS splitting follows the bulk split stage, preserving the shared alias grammar.
+  for normalized in $line; do
     embargo_trim_id || return 2
     if embargo_is_id_shaped "$normalized"; then
       printf '%s\t%s\t%s\n' "$normalized" "$surface" "$number" || return 2
