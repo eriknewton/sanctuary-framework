@@ -136,9 +136,10 @@ describe("protection layers", () => {
     const { createPosturePanelStore } = await import("../../src/principal-policy/panel-producer.js");
     const { createDashboardReadFlightMap } = await import("../../src/dashboard/read-response.js");
     const { auditLog, binding, primitives, stateStore } = await setup();
-    vi.spyOn(Date, "now").mockReturnValue(Date.now());
     await auditLog.appendCritical({ layer: "l2", operation: "cross_harness_approval_resolved",
       identity_id: binding!.identity_id!, result: "success", details: {} });
+    // Freeze the clock after the append: feature health skips entries timestamped past now.
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
     const home = await buildHome({ auditLog, originMachine: "test", listAgents: () => [],
       detectInstalledHarnesses: async () => [], resolvePinnedProducerKey: () => null,
       resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(),
