@@ -1,3 +1,4 @@
+import type { ProtectionRuntimeSources } from "../agent-native/protection-observations.js";
 /**
  * Sanctuary Sovereignty Dashboard — public surface.
  *
@@ -76,6 +77,10 @@ export interface StartDashboardOptions {
   serverVersion: string;
   auditLog?: AuditLog;
   identityManager?: IdentityManager;
+  /** Raw consumers for local observations; an unbound secondary process has no session identity observation. */
+  stateStore?: ProtectionRuntimeSources["stateStore"];
+  responseScreen?: ProtectionRuntimeSources["responseScreen"];
+  currentSessionBinding?: ProtectionRuntimeSources["currentSessionBinding"];
   clientManager?: ClientManager;
   baseline?: BaselineTracker;
   policy?: PrincipalPolicy;
@@ -166,6 +171,9 @@ export async function startDashboard(
     serverVersion: options.serverVersion,
     auditLog: options.auditLog,
     identityManager: options.identityManager,
+    // Must match ProtectionRuntimeProvider in protection-observations.ts: observe sources at composition time.
+    protectionRuntime: () => ({ identityManager: options.identityManager, stateStore: options.stateStore,
+      responseScreen: options.responseScreen, currentSessionBinding: options.currentSessionBinding }),
     clientManager: options.clientManager,
     baseline: options.baseline,
     policy: options.policy,

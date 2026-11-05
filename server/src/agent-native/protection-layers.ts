@@ -1,4 +1,4 @@
-import type { AuditChainVerdictStatus } from "../operational/audit-log.js";
+import { z } from "zod";
 import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { FeatureHealthPanel } from "../principal-policy/feature-health.js";
 import { DEFAULT_ENFORCEMENT_FRESHNESS_MS, ENFORCEMENT_FUTURE_SKEW_MS, type CustodyExitPanel } from "../principal-policy/posture.js";
@@ -15,19 +15,29 @@ export interface ProtectionLayerRow {
   basis: string;
 }
 
-/** Observations from existing consumers, never policy intent or enabled flags. */
-export interface ProtectionEvidence {
-  identityLoaded?: boolean;
-  encryptedStateStoreConstructed?: boolean;
-  auditChain?: AuditChainVerdictStatus;
-  featureHealth?: Pick<FeatureHealthPanel, "rows" | "audit_integrity_ok" | "window_end">;
-  custodyExit?: CustodyExitPanel;
-  /** Must match the custody producer observation in cooperative-surface.ts and posture-routes.ts. */
-  custodyObservation?: Pick<PosturePanelStatus, "state" | "completed_at">;
-  /** Evaluation time for current evidence, injectable for deterministic consumers. */
-  now?: number;
-  toolOutputScreenReady?: boolean;
-}
+/** Runtime schema for the qualified observations consumed by every protection surface. */
+export const protectionEvidenceSchema = z.object({
+  identityLoaded: z.boolean().optional(),
+  encryptedStateStoreConstructed: z.boolean().optional(),
+  auditChain: z.enum(["verified", "verified_suffix_only", "findings", "key_unavailable"]).optional(),
+  featureHealth: z.custom<Pick<FeatureHealthPanel, "rows" | "audit_integrity_ok" | "window_end">>(
+    value => typeof value === "object" && value !== null && "rows" in value && "audit_integrity_ok" in value && "window_end" in value).optional(),
+  custodyExit: z.custom<CustodyExitPanel>(
+    value => typeof value === "object" && value !== null && "exit_state" in value && "audit_integrity_ok" in value).optional(),
+  custodyObservation: z.custom<Pick<PosturePanelStatus, "state" | "completed_at">>(
+    value => typeof value === "object" && value !== null && "state" in value && "completed_at" in value).optional(),
+  now: z.number().finite().optional(),
+  toolOutputScreenReady: z.boolean().optional(),
+});
+
+/** Must match observeProtections in protection-observations.ts: every key is present even when unavailable. */
+export type ProtectionObservationSnapshot = {
+  [K in keyof typeof protectionEvidenceSchema.shape]: z.output<typeof protectionEvidenceSchema.shape[K]>;
+};
+/** Derived from the schema so adding an observation also extends completeness checks. */
+export const protectionEvidenceKeys = Object.keys(protectionEvidenceSchema.shape);
+/** Optional input preserves the browser's empty-evidence fallback. */
+export type ProtectionEvidence = Partial<ProtectionObservationSnapshot>;
 
 const NO_SOURCE = "no evidence source wired";
 

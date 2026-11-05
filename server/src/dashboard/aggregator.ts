@@ -1,3 +1,4 @@
+import type { ProtectionRuntimeProvider } from "../agent-native/protection-observations.js";
 /**
  * Sanctuary Dashboard — Protection Snapshot Aggregator
  *
@@ -229,6 +230,8 @@ export interface ReputationLookup {
 }
 
 export interface AggregatorSources {
+  /** Must match ProtectionRuntimeProvider in protection-observations.ts; forwarded without evaluating runtime. */
+  protectionRuntime?: ProtectionRuntimeProvider;
   mode: "co-located" | "standalone";
   server_version: string;
   identityManager?: IdentityManager;
@@ -324,6 +327,7 @@ export interface AggregatorSources {
  * straight through and let the ONE builder own the include-or-omit decision.
  */
 export interface AggregatorSourcesInput {
+  protectionRuntime?: ProtectionRuntimeProvider | undefined;
   mode: "co-located" | "standalone";
   serverVersion: string;
   identityManager?: IdentityManager | null | undefined;
@@ -386,6 +390,7 @@ export function composeAggregatorSources(
     mode: input.mode,
     server_version: input.serverVersion,
     ...(input.identityManager ? { identityManager: input.identityManager } : {}),
+    ...(input.protectionRuntime ? { protectionRuntime: input.protectionRuntime } : {}),
     ...(input.auditLog ? { auditLog: input.auditLog } : {}),
     ...(input.clientManager ? { clientManager: input.clientManager } : {}),
     ...(input.baseline ? { baseline: input.baseline } : {}),

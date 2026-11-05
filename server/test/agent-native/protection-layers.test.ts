@@ -33,7 +33,8 @@ async function setup(extra: Partial<Parameters<typeof createAgentNativeCooperati
   const key = generateRandomKey();
   const auditLog = new AuditLog(storage, key);
   let binding: SessionBinding | undefined;
-  const primitives = createCognitiveTools(new StateStore(storage, key), storage, key, "recovery-key", auditLog,
+  const stateStore = new StateStore(storage, key);
+  const primitives = createCognitiveTools(stateStore, storage, key, "recovery-key", auditLog,
     { currentSessionBinding: () => binding });
   await primitives.identityManager.load();
   const created = await primitives.tools.find(t => t.name === "identity_create")!.handler({ label: "protections-test" });
@@ -43,7 +44,7 @@ async function setup(extra: Partial<Parameters<typeof createAgentNativeCooperati
     auditLog, storage, currentSessionBinding: () => binding,
     resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "absent" }), ...extra });
   const tool = facade.tools.find(t => t.name === "sanctuary_active_protections")!;
-  return { auditLog, tool, binding, primitives };
+  return { auditLog, tool, binding, primitives, stateStore };
 }
 
 describe("protection layers", () => {
@@ -134,16 +135,27 @@ describe("protection layers", () => {
     const { buildHome, reconcilePostureHomeJoiner } = await import("../../src/principal-policy/posture-routes.js");
     const { createPosturePanelStore } = await import("../../src/principal-policy/panel-producer.js");
     const { createDashboardReadFlightMap } = await import("../../src/dashboard/read-response.js");
-    const { composeProtectionLayers } = await import("../../src/agent-native/protection-layers.js");
-    const { auditLog, binding } = await setup();
+    const { auditLog, binding, primitives, stateStore } = await setup();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
     await auditLog.appendCritical({ layer: "l2", operation: "cross_harness_approval_resolved",
       identity_id: binding!.identity_id!, result: "success", details: {} });
     const home = await buildHome({ auditLog, originMachine: "test", listAgents: () => [],
       detectInstalledHarnesses: async () => [], resolvePinnedProducerKey: () => null,
       resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(),
-      readFlightMap: createDashboardReadFlightMap() });
+      readFlightMap: createDashboardReadFlightMap(),
+      protectionRuntime: () => ({ identityManager: primitives.identityManager, stateStore, currentSessionBinding: () => binding }) });
+    expect(home.protection_layers?.find(r => r.id === "identity")?.status, "Identity status").toBe("on");
+    expect(home.protection_layers?.find(r => r.id === "encrypted_vault")?.status, "Encrypted vault status").toBe("on");
     expect(home.protection_layers?.map(r => r.name)).toEqual(names);
-    expect(home.protection_layers).toEqual(composeProtectionLayers({ featureHealth: home.feature_health, custodyExit: home.custody_exit, custodyObservation: home.panels!.custody_exit }));
+    vi.spyOn(healthSource, "buildFeatureHealthPanel").mockResolvedValue(home.feature_health);
+    vi.spyOn(custodySource, "buildCustodyExitPanel").mockResolvedValue(home.custody_exit);
+    vi.spyOn(auditLog, "getAuditChainVerdict").mockRejectedValue(new Error("chain unavailable"));
+    const facade = createAgentNativeCooperativeTools({ ...primitives, primitiveTools: primitives.tools,
+      auditLog, stateStore, currentSessionBinding: () => binding });
+    const response = await facade.tools.find(tool => tool.name === "sanctuary_active_protections")?.handler({});
+    const toolResult = JSON.parse(response?.content?.[0]?.text ?? "null");
+    expect(toolResult?.layers?.find((row: { id: string }) => row.id === "identity")?.status).toBe("on");
+    expect(home.protection_layers).toEqual(toolResult?.layers);
     expect(home.protection_layers?.find(r => r.id === "approval_gates")?.status).toBe("on");
     const superseded = reconcilePostureHomeJoiner(home, 0, 1); // A follower observed one newer audit sequence.
     expect(superseded.protection_layers?.find(r => r.id === "approval_gates")?.status).toBe("unknown");
@@ -524,7 +536,7 @@ describe("evidence consumer boundaries", () => {
     });
   }
 
-  it("Identity uses a new lookup on every call and denies a throwing lookup", async () => {
+  it("Identity uses a new lookup on every call and reports unavailable lookup", async () => {
     const { tool, primitives } = await setup();
     const get = vi.spyOn(primitives.identityManager, "get");
     get.mockReturnValue(undefined);
@@ -533,11 +545,10 @@ describe("evidence consumer boundaries", () => {
     expect(result.layers.find((row: { id: string }) => row.id === "identity").status).toBe("off");
     get.mockImplementation(() => { throw new Error("unavailable"); });
     result = JSON.parse((await tool.handler({})).content[0]!.text);
-    expect(result).toHaveProperty("denied", true);
-    expect(result).not.toHaveProperty("layers");
+    expect(result.layers?.find((row: { id: string }) => row.id === "identity")?.status).toBe("unknown");
   });
 
-  it("Encrypted vault reports construction only and denies an unreadable construction source", async () => {
+  it("Encrypted vault reports construction only and preserves unavailable construction", async () => {
     const { tool } = await setup();
     const result = JSON.parse((await tool.handler({})).content[0]!.text);
     expect(result.layers.find((row: { id: string }) => row.id === "encrypted_vault").status).toBe("unknown");
@@ -548,8 +559,7 @@ describe("evidence consumer boundaries", () => {
       resolveBrokerProducerKey: async () => ({ keyB64url: null, observation: "unknown" }),
       get stateStore(): StateStore { throw new Error("unavailable"); } });
     const response = JSON.parse((await facade.tools.find(tool => tool.name === "sanctuary_active_protections")!.handler({})).content[0]!.text);
-    expect(response).toHaveProperty("denied", true);
-    expect(response).not.toHaveProperty("layers");
+    expect(response.layers?.find((row: { id: string }) => row.id === "encrypted_vault")?.status).toBe("unknown");
   });
 
   it("Inbound protection remains not built when its separate screening source throws", async () => {
