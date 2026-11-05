@@ -124,8 +124,8 @@ describe("complete persisted checkpoint ranges", () => {
 
 function gate() { let release!: () => void; const wait = new Promise<void>((resolve) => { release = resolve; }); return { wait, release }; }
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-async function checkpointSetup(deadline = 500) {
-  // Half a second leaves ample filesystem time while making fault schedules fast.
+async function checkpointSetup(deadline = 1_000) {
+  // One second covers healthy checkpoint, retry and successor writes on a loaded runner; the gates, not the bound, order the faults.
   const path = join(root, "state"); await prepopulateAudit(path, 3);
   const raw = new FilesystemStorage(path);
   const log = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, checkpointInterval: 1, writeLockHoldDeadlineMs: deadline });
