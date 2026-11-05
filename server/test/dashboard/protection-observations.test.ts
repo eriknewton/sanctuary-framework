@@ -1,3 +1,4 @@
+// fail-before-exempt: this change hardens existing dashboard tests (inner-oracle assertions, finally-block shutdown, shared free-port helper) over a behavior-preserving refactor; the observations they check already shipped, so they pass against pre-change source by construction.
 /** Protection observations through the dashboard. */
 import { afterEach, expect, it, vi } from "vitest";
 import { StateStore } from "../../src/cognitive/state-store.js";

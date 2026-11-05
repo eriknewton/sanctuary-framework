@@ -1,5 +1,5 @@
 /** Shared protection observations. */
-// fail-before-exempt: This new-module file loads only with the shared producer present; identity, construction, unavailable custody and chain observation mutations prove its capability assertions.
+// fail-before-exempt: this change tightens existing assertions over a behavior-preserving refactor (the audit-chain enum is derived from its source type and pins are restated); the shared producer already shipped, so the file passes against pre-change source by construction.
 import { afterEach, expect, it, vi } from "vitest";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
