@@ -4,6 +4,7 @@
  * Verifies layer enforcement, event-type validation, ACK after persist,
  * and metric-batch passthrough.
  */
+// fail-before-exempt: these assertions witness behavior the source already has; each is proven by a named mutation that fails it, so the file passes against unchanged source by construction.
 
 import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach } from "vitest";
@@ -1130,13 +1131,14 @@ for (const [label, scenario] of windowCases) it(`established live window preserv
   for (const enabled of [false, true]) {
     const trace: unknown[][] = []; let fail = false, invocation = 0;
     const counted = new Set<number>();
+    const errors: unknown[] = [];
     const sink: AuditSink = { append(...args) {
       trace.push(["append", invocation, JSON.stringify(args)]);
       if (fail && args[1] === "egress_blocked") throw new Error("fixture primary unavailable");
     }, async flush() { trace.push(["flush", invocation]); } };
     const coalescer = new module!.FlowCoalescer("window-parity", () => FLOW_NOW);
     const consumer = new AuditConsumer(sink, undefined, { pinnedProducerKeyB64url: flowPin, now: () => FLOW_NOW,
-      chainContinuity: "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
+      chainContinuity: scenario === "prior" ? "complete" : "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
     const head = liveEnvelope(0, null);
     await consumer.ingestCritical(head);
     expect(consumer.getWalChainState().lastAckedSeq, "setup head has settled before the trigger").toBe(0);
@@ -1151,6 +1153,7 @@ for (const [label, scenario] of windowCases) it(`established live window preserv
         } }, { classify(kind) { if (kind === "coalesced") counted.add(invocation); } });
         trace.push(["fulfilled", invocation]);
       } catch (error) {
+        errors.push(error);
         trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]);
       }
     };
@@ -1161,7 +1164,7 @@ for (const [label, scenario] of windowCases) it(`established live window preserv
         const malformed = scenario === "malformed" ? next : poisoned;
         await deliver({ ...malformed, event: { ...malformed.event, event_type: "unknown" as CastleWallAuditEvent["event_type"] } }); break;
       }
-      case "missing": await deliver({ ...next, event: { ...next.event, details: {} } }); break;
+      case "missing": { const details = { ...next.event.details }; delete details.seq; await deliver({ ...next, event: { ...next.event, details } }); break; }
       case "regression": case "changed": await deliver(liveEnvelope(0, null, "192.0.2.2")); break;
       case "prior": await deliver(liveEnvelope(1, "different-prior")); break;
       case "number": await deliver(poisoned); break;
@@ -1188,6 +1191,64 @@ for (const [label, scenario] of windowCases) it(`established live window preserv
     if (enabled && ["accepted", "ack", "duplicate", "after-number"].includes(scenario)) {
       expect(delta.coalescedCriticalEvents, "eligible same-key trigger is counted after the settled head").toBe(1);
     }
+    // Exact outcomes precede parity comparison because two matching traces can select the same wrong branch.
+    const records = trace.filter(call => call[0] === "append").map(call => JSON.parse(String(call[2])) as [string, string, string, Record<string, unknown>]);
+    const operations = records.map(record => record[1]);
+    const acks = trace.filter(call => call[0] === "ACK");
+    const chainReason = scenario === "missing" ? "chain_fields_missing" : ["regression", "changed"].includes(scenario) ? "seq_regression" : scenario === "prior" ? "wal_chain_verification_failed" : undefined;
+    if (chainReason) {
+      expect(records.map(record => [record[1], record[3].reason])).toEqual([["wal_chain_verification_failed", chainReason]]);
+      expect(delta.producerSignatureRejections).toBe(0);
+      expect(errors).toHaveLength(1); expect(errors[0]).toMatchObject({ name: "AuditChainError", reason: chainReason });
+      expect(acks).toHaveLength(0); expect(admissions).toBe(0); expect(delta.duplicatesDropped).toBe(0);
+      expect(delta.producerSignatureAccepted).toBe(1);
+      expect(consumer.getWalChainState()).toEqual({ lastAckedSeq: 0, lastEventChainHash: flowHash(head.producer.eventCanonicalJson) });
+    } else if (["malformed", "malformed-number", "number", "repeat-number", "after-number"].includes(scenario)) {
+      const rejected = records.filter(record => record[1] === "audit_event_rejected");
+      const poisonCount = scenario === "repeat-number" ? 2 : 1; // Repeated delivery submits the same poison twice.
+      expect(rejected).toHaveLength(poisonCount);
+      for (const record of rejected) expect(record[3].reason).toBe(scenario.startsWith("malformed") ? "unknown event_type: unknown" : "canonicalization_failed");
+      expect(delta.rejectedEvents).toBe(poisonCount);
+      expect(operations).not.toContain("wal_chain_verification_failed"); expect(errors).toEqual([]);
+      for (const call of trace.filter(call => call[0] === "ACK")) {
+        const delivery = trace.filter(item => item[1] === call[1]);
+        expect(delivery.findIndex(item => item[0] === "flush")).toBeLessThan(delivery.findIndex(item => item[0] === "ACK"));
+      }
+      if (scenario !== "after-number") {
+        expect(delta.producerSignatureAccepted).toBe(0); expect(admissions).toBe(0); expect(acks).toHaveLength(poisonCount);
+        expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(head.producer.eventCanonicalJson));
+      } else {
+        expect(admissions).toBe(1); expect(acks).toHaveLength(poisonCount + 1);
+        expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(next.producer.eventCanonicalJson));
+      }
+    } else if (scenario === "persistence") {
+      const primaries = records.filter(record => record[1] === "egress_blocked");
+      expect(primaries).toHaveLength(2); // Neighboring failed head then the owed continuation.
+      expect(records.filter(record => record[1] === "critical_event_persistence_failed")).toHaveLength(primaries.length);
+      expect(delta.persistenceFailures).toBe(primaries.length); expect(errors).toHaveLength(primaries.length);
+      for (const error of errors) expect(error).toMatchObject({ message: "fixture primary unavailable" });
+      expect(acks).toHaveLength(0); expect(admissions).toBe(0);
+      expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(head.producer.eventCanonicalJson));
+    } else if (scenario === "metric") {
+      expect(operations).toEqual(["egress_metric_batch"]); expect(delta.acceptedMetricBatches).toBe(1);
+      expect(trace.some(call => call[0] === "flush" || call[0] === "ACK")).toBe(false);
+      expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(head.producer.eventCanonicalJson));
+    } else {
+      expect(errors).toEqual([]); expect(delta.rejectedEvents).toBe(0); expect(admissions).toBe(1);
+      expect(delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!).toBe(1);
+      expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(next.producer.eventCanonicalJson));
+      expect(operations).not.toContain("wal_chain_verification_failed");
+      expect(records.filter(record => record[1] === "egress_blocked")).toHaveLength(enabled ? 0 : 1);
+      if (!enabled) {
+        const primary = records.find(record => record[1] === "egress_blocked")!;
+        expect(primary[3].cw_producer_signed_canonical).toBe(next.producer.eventCanonicalJson);
+        expect(trace.findIndex(call => call[0] === "flush")).toBeLessThan(trace.findIndex(call => call[0] === "ACK"));
+      }
+      if (scenario === "ack" || scenario === "duplicate") { expect(operations).toContain("critical_event_ack_failed"); expect(delta.ackFailures).toBe(1); }
+      if (scenario === "duplicate") { expect(operations).toContain("critical_event_duplicate_dropped"); expect(delta.duplicatesDropped).toBe(1); expect(acks).toHaveLength(2); }
+      else expect(acks).toHaveLength(1);
+    }
+    expect(delta.producerSignatureRejections).toBe(0);
     results.push({ trace, counted, delta, admissions, state: consumer.getWalChainState() });
   }
   const [control, counted] = results;
