@@ -7,13 +7,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable, Readable } from "node:stream";
 
 import { runRestoreAttestCommand } from "../../src/cli/restore-attest.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 import {
   establishMaster,
   withCustodyWriteLock,
@@ -48,6 +49,8 @@ interface Seeded {
   storagePath: string;
   home: string;
   recoveryKey: string;
+  masterWriteBarrier: MasterWriteBarrierLease;
+  readerSocketPath: string | undefined;
   cleanup: () => Promise<void>;
 }
 
@@ -62,13 +65,29 @@ async function seed(): Promise<Seeded> {
     firstRun: { installMode: "headless", mintRecoveryKey: true },
     storagePathHint: storagePath,
   });
-  custody.masterKey.fill(0);
-  return {
-    storagePath,
-    home,
-    recoveryKey: custody.mintedRecoveryKey!,
-    cleanup: () => rm(home, { recursive: true, force: true }),
-  };
+  const { masterWriteBarrier } = custody;
+  if (!masterWriteBarrier) {
+    custody.masterKey.fill(0);
+    throw new Error("Seed establishment must return a custody lease");
+  }
+  try {
+    return {
+      storagePath,
+      home,
+      recoveryKey: custody.mintedRecoveryKey!,
+      masterWriteBarrier,
+      readerSocketPath: masterWriteBarrier.socketPath,
+      cleanup: async () => {
+        // Releasing again is a no-op; kept so teardown does not depend on the seed's ordering.
+        await masterWriteBarrier.release();
+        await rm(home, { recursive: true, force: true });
+      },
+    };
+  } finally {
+    custody.masterKey.fill(0);
+    // The namespace must still exist when the seed relinquishes custody.
+    await masterWriteBarrier.release();
+  }
 }
 
 describe("restore-attest --recovery-key-prompt", () => {
@@ -78,6 +97,12 @@ describe("restore-attest --recovery-key-prompt", () => {
   });
   afterEach(async () => {
     await f.cleanup();
+  });
+
+  it("seeded fortress releases its custody lease before teardown", async () => {
+    expect(f.masterWriteBarrier).toBeDefined();
+    expect(f.readerSocketPath).toEqual(expect.any(String));
+    await expect(lstat(f.readerSocketPath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("attests using the recovery key and re-baselines the epoch witness", async () => {
