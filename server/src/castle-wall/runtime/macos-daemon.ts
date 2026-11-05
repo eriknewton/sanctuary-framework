@@ -2086,6 +2086,8 @@ export async function startMacOSCastleWallDaemon(
     let lapsed = false;
     let drainLapsed = false;
     let lapsePhase: string | undefined;
+    let cutoffPhase: string | undefined;
+    let hardPhase: string | undefined;
     daemonStopping = true;
     consumer.closeFlowAdmission();
     phase = "state_STOP_TIMERS";
@@ -2097,6 +2099,7 @@ export async function startMacOSCastleWallDaemon(
     const cleanup = removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     void cleanup.catch(() => undefined);
     const began = performance.now();
+    // One sixth scales the production final-record reserve to an injected budget; min keeps a longer injected budget from enlarging it and floor keeps the slice integral. Must match FLOW_STOP_FINAL_RECORD_RESERVE_MS in castle-wall/constants.ts.
     const finalRecordReserveMs = Math.min(FLOW_STOP_FINAL_RECORD_RESERVE_MS, Math.floor(stopDeadlineMs / 6));
     const drainCutoffMs = stopDeadlineMs - finalRecordReserveMs;
     let timer: ReturnType<typeof setTimeout>;
@@ -2108,6 +2111,7 @@ export async function startMacOSCastleWallDaemon(
     const expired = new Promise<false>(resolve => {
       timer = setTimeout(() => {
         lapsed = true;
+        hardPhase = phase;
         lapsePhase ??= phase;
         fenceConsumer();
         resolve(false);
@@ -2115,6 +2119,7 @@ export async function startMacOSCastleWallDaemon(
     });
     const drainExpired = new Promise<false>(resolve => {
       drainTimer = setTimeout(() => {
+        cutoffPhase ??= phase;
         // Earlier stop phases may still be waiting; their admitted consumer work must also leave the final record its reserved time.
         fenceConsumer();
         resolve(false);
@@ -2128,12 +2133,15 @@ export async function startMacOSCastleWallDaemon(
     };
     const drainStep = async (work: () => Promise<unknown>): Promise<void> => {
       if (lapsed || drainLapsed) return;
+      const entryPhase = phase;
+      const cutoffPassedOnEntry = performance.now() - began >= drainCutoffMs;
       phase = "state_STOP_DRAINS";
       const completed = performance.now() - began < drainCutoffMs && await Promise.race([
         Promise.resolve().then(work).then(() => true), drainExpired, expired,
       ]);
       if (!completed && !lapsed) {
         // Informational drains retain ownership while the final record keeps its reserved time.
+        if (cutoffPassedOnEntry) cutoffPhase ??= entryPhase;
         drainLapsed = true;
         lapsePhase = phase;
         fenceConsumer();
@@ -2171,7 +2179,10 @@ export async function startMacOSCastleWallDaemon(
         const { admission, ingress_loss_pending: loss, coalesced_pending: coalesced, non_agent: nonAgent } = evidence;
         if (lapsePhase || Object.values(loss.counts).some(count => count > 0) || coalesced.coalesced_evidence_pending > 0) {
           // SAFETY: the diagnostic contains bounded counters and a fixed stop-phase name, never flow payloads.
-          console.error(`[castle-wall] ${lapsePhase ? "stop budget lapsed" : "stop pending evidence"} phase=${lapsePhase ?? phase} pending_loss=${JSON.stringify(loss)} pending_coalesced=${coalesced.coalesced_evidence_pending} coalesced_counters_lower_bound=${evidence.coalesced_counters_lower_bound} unadmitted=${admission.unadmitted} active=${admission.active} pending_non_agent=${JSON.stringify(nonAgent)}`);
+          // An already-started final record may settle late; final-phase hard expiry means unconfirmed completion.
+          console.error(lapsePhase
+            ? `[castle-wall] stop budget lapsed phase=${hardPhase ?? cutoffPhase ?? lapsePhase} lapse=${hardPhase ? "hard_expiry" : "drain_cutoff"} cutoff_state=${cutoffPhase ?? "none"} hard_state=${hardPhase ?? "none"} pending_loss=${JSON.stringify(loss)} pending_coalesced=${coalesced.coalesced_evidence_pending} coalesced_counters_lower_bound=${evidence.coalesced_counters_lower_bound} unadmitted=${admission.unadmitted} active=${admission.active} pending_non_agent=${JSON.stringify(nonAgent)}`
+            : `[castle-wall] stop pending evidence phase=${lapsePhase ?? phase} pending_loss=${JSON.stringify(loss)} pending_coalesced=${coalesced.coalesced_evidence_pending} coalesced_counters_lower_bound=${evidence.coalesced_counters_lower_bound} unadmitted=${admission.unadmitted} active=${admission.active} pending_non_agent=${JSON.stringify(nonAgent)}`);
         } else if (evidence.non_agent_pending) {
           // SAFETY: non-agent evidence contains bounded aggregate counters, never flow payloads.
           console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(nonAgent)}`);

@@ -1,4 +1,5 @@
 /** Admitted live flows share counted windows with fixed storage and work bounds. */
+// fail-before-exempt: these assertions witness behavior the source already has; each is proven by a named mutation that fails it, so the file passes against unchanged source by construction.
 import { describe, it, expect, vi } from "vitest";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import type { AuditSink } from "../../../src/castle-wall/runtime/audit-consumer.js";
@@ -649,3 +650,180 @@ it.each(["channel", "pinned"] as const)("detached %s storage settlement preserve
     await f.consumer.drainIngressDrops(); await audit.flush(); spy.mockRestore(); log.mockRestore(); await rm(root, { recursive: true, force: true });
   }
 });
+
+import { AsyncLocalStorage } from "node:async_hooks";
+const SINGLE_OWNER = 1; // One writer owns each immutable reservation until caller and storage settle.
+const HOLD_DEADLINE_MS = 100; // Short real lock hold; setup and cleanup have separate timeout headroom.
+const SERIAL_DEADLINES = 2; // Summary and loss expire independently, in that order.
+const SETUP_TIMEOUT_MS = HOLD_DEADLINE_MS * 100; // Filesystem setup and recovery polling have one hundred hold intervals.
+const OWNER_TIMEOUT_MS = SETUP_TIMEOUT_MS * 3 + SERIAL_DEADLINES * HOLD_DEADLINE_MS; // Setup, schedule and cleanup plus both deadlines.
+const SUMMARY_OPERATION = "castle_wall_flow_decisions_coalesced";
+const LOSS_OPERATION = "castle_wall_ingress_discarded";
+// Caller rejection cannot retire an attempt while its raw entry write still owns storage work.
+function ownershipLedger(audit: AuditLog, storage: FilesystemStorage) {
+  type Attempt = { id: string; operation: string; token: symbol; callerSettled: boolean; children: number; error?: unknown; active: boolean };
+  const context = new AsyncLocalStorage<Attempt>();
+  const attempts: Attempt[] = [];
+  const activeAttempts = new Map<string, number>(), outstandingPhysicalWrites = new Map<string, number>();
+  const highAttempts = new Map<string, number>(), highWrites = new Map<string, number>(), totalPhysicalWrites = new Map<string, number>();
+  const selected = new Map<string, string>(), bytes = new Map<string, string>();
+  const gates = new Map<string, ReturnType<typeof deferred>>(), entries = new Map<string, ReturnType<typeof deferred>>();
+  const recoveries: Array<{ reason: string }> = [];
+  const settled: Promise<unknown>[] = [];
+  const payloads: Array<{ operation: string; details: Record<string, unknown> | undefined }> = [];
+  let hold = true;
+  audit.onWriteLockRecovery(event => { recoveries.push(event); });
+  const increment = (map: Map<string, number>, id: string, amount: number) => map.set(id, (map.get(id) ?? 0) + amount);
+  const retire = (attempt: Attempt) => {
+    if (attempt.active && attempt.callerSettled && attempt.children === 0) {
+      attempt.active = false; increment(activeAttempts, attempt.id, -SINGLE_OWNER);
+    }
+  };
+  for (const operation of [SUMMARY_OPERATION, LOSS_OPERATION]) { gates.set(operation, deferred()); entries.set(operation, deferred()); }
+  const append = audit.append.bind(audit);
+  const appendSpy = vi.spyOn(audit, "append").mockImplementation((...args) => {
+    const operation = args[1], details = args[3]; payloads.push({ operation, details });
+    if (operation !== SUMMARY_OPERATION && operation !== LOSS_OPERATION) return append(...args);
+    const id = JSON.stringify([operation, details!.consumer_instance_id, details!.summary_seq ?? details!.batch_seq]);
+    const serialized = JSON.stringify(details);
+    if (!bytes.has(id)) bytes.set(id, serialized);
+    else expect(serialized, "an identifier retains its original bytes").toBe(bytes.get(id));
+    if (!selected.has(operation)) selected.set(operation, id);
+    const attempt: Attempt = { id, operation, token: Symbol(id), callerSettled: false, children: 0, active: true };
+    attempts.push(attempt); increment(activeAttempts, id, SINGLE_OWNER);
+    highAttempts.set(id, Math.max(highAttempts.get(id) ?? 0, activeAttempts.get(id)!));
+    const original = context.run(attempt, () => append(...args));
+    settled.push(original.then(() => { attempt.callerSettled = true; retire(attempt); }, error => {
+      attempt.error = error; attempt.callerSettled = true; retire(attempt);
+    }));
+    return original;
+  });
+  const write = storage.writeDurable.bind(storage);
+  const writeSpy = vi.spyOn(storage, "writeDurable").mockImplementation(async (...args) => {
+    const attempt = context.getStore();
+    if (!attempt || args[0] !== "_audit" || !args[1].startsWith("entry-")) return write(...args);
+    attempt.children++; increment(outstandingPhysicalWrites, attempt.id, SINGLE_OWNER); increment(totalPhysicalWrites, attempt.id, SINGLE_OWNER);
+    highWrites.set(attempt.id, Math.max(highWrites.get(attempt.id) ?? 0, outstandingPhysicalWrites.get(attempt.id)!));
+    try {
+      if (hold && selected.get(attempt.operation) === attempt.id) {
+        entries.get(attempt.operation)!.resolve();
+        await gates.get(attempt.operation)!.promise;
+        // A late fixture failure leaves the production successor's persisted chain intact.
+        throw new Error("fixture late entry unavailable");
+      }
+      return await write(...args);
+    } finally { attempt.children--; increment(outstandingPhysicalWrites, attempt.id, -SINGLE_OWNER); retire(attempt); }
+  });
+  return {
+    attempts, activeAttempts, outstandingPhysicalWrites, totalPhysicalWrites, highAttempts, highWrites, selected, payloads, recoveries,
+    async deadline(operation: string, count: number) {
+      await vi.waitFor(() => expect(outstandingPhysicalWrites.get(selected.get(operation)!)).toBe(SINGLE_OWNER), { timeout: SETUP_TIMEOUT_MS });
+      await entries.get(operation)!.promise;
+      await vi.waitFor(() => {
+        expect(recoveries).toHaveLength(count);
+        const attempt = attempts.find(item => item.id === selected.get(operation))!;
+        expect(attempt.callerSettled).toBe(true);
+        expect(attempt.error).toMatchObject({ name: "AuditLockHoldDeadlineError", deadlineMs: HOLD_DEADLINE_MS });
+      }, { timeout: SETUP_TIMEOUT_MS });
+      expect(recoveries.at(-1)?.reason).toBe("write_lock_hold_deadline_exceeded");
+    },
+    exclusive(operations = [SUMMARY_OPERATION, LOSS_OPERATION]) {
+      for (const operation of operations) {
+        const id = selected.get(operation)!; expect(id).toBeDefined();
+        expect(activeAttempts.get(id), `${operation} active attempts`).toBe(SINGLE_OWNER);
+        expect(outstandingPhysicalWrites.get(id), `${operation} outstanding entry writes`).toBe(SINGLE_OWNER);
+      }
+      for (const count of highAttempts.values()) expect(count, "exclusive attempt high-water").toBeLessThanOrEqual(SINGLE_OWNER);
+      for (const count of highWrites.values()) expect(count, "exclusive entry-write high-water").toBeLessThanOrEqual(SINGLE_OWNER);
+      expect(new Set(attempts.filter(item => item.active).map(item => item.token)).size).toBe(attempts.filter(item => item.active).length);
+    },
+    release() { hold = false; for (const gate of gates.values()) gate.resolve(); },
+    async join() {
+      await Promise.all(settled);
+      await vi.waitFor(() => {
+        expect([...activeAttempts.values()].every(count => count === 0)).toBe(true);
+        expect([...outstandingPhysicalWrites.values()].every(count => count === 0)).toBe(true);
+      }, { timeout: SETUP_TIMEOUT_MS });
+    },
+    restore() { appendSpy.mockRestore(); writeSpy.mockRestore(); context.disable(); },
+  };
+}
+
+async function ownedFixture(mode: string) {
+  const root = await mkdtemp("/tmp/cw-exclusive-");
+  const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(root, "state"));
+  const audit = new AuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: HOLD_DEADLINE_MS });
+  const f = fixture({ append: (...args) => audit.append(...args), flush: () => audit.flushDurable() }, mode === "pinned" ? Buffer.from(ed25519.getPublicKey(key)).toString("base64url") : undefined);
+  const listener = new MacOSFlowIpcListener({ socketPath: join(root, "unused.sock"), consumer: f.consumer });
+  const boundary = listener as unknown as { dispatchFrame(state: unknown, body: string): void; removeConnection(state: unknown): void; telemetryBytes: number };
+  const connection = (id: string) => ({ subscriberId: id, registered: false, inbound: new Uint8Array(), telemetryBytes: 0, socket: { write() { return true; }, destroy() {} } });
+  let seq = 0, prior: string | null = null;
+  const arrival = (ip = "192.0.2.1") => {
+    const notification = f.frame(ip);
+    if (mode === "channel") return notification;
+    const timestamp = Date.parse(notification.recorded_at);
+    const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: token, result: "blocked",
+      details: { agent_id: token, dest_ip: ip, dest_port: notification.destination.port, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
+    const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: timestamp, seq, prior_sha256_hex: prior,
+      signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, timestamp, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
+    seq++; prior = createHash("sha256").update(body).digest("hex"); return result;
+  };
+  const ledger = ownershipLedger(audit, storage);
+  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+  const module = await load(); expect(module).not.toBeNull();
+  const internals = f.consumer as unknown as { coalescer: InstanceType<NonNullable<typeof module>["FlowCoalescer"]> };
+  const classify = vi.spyOn(internals.coalescer, "classify");
+  const frame = (ip?: string) => JSON.stringify({ jsonrpc: "2.0", method: "castle-wall.flow_decision_recorded", params: arrival(ip) });
+  const origin = connection("settled");
+  const dispatchSettled = async (ip?: string) => {
+    const count = classify.mock.calls.length;
+    boundary.dispatchFrame(origin, frame(ip));
+    await vi.waitFor(() => { expect(classify.mock.calls.length).toBe(count + 1); expect(boundary.telemetryBytes).toBe(0); }, { timeout: SETUP_TIMEOUT_MS, interval: 1 }); // One millisecond polling only joins real I/O.
+  };
+  return { ...f, audit, storage, ledger, listener, boundary, connection, arrival, frame, origin, classify, internals, module: module!, dispatchSettled,
+    async cleanup() {
+      ledger.release(); f.consumer.closeFlowAdmission();
+      await ledger.join(); await f.consumer.drainFlowAdmission(); await f.consumer.drainCoalescedFlowSummaries(); await f.consumer.drainIngressDrops();
+      await audit.flush(); await ledger.join(); ledger.restore(); classify.mockRestore(); stderr.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    } };
+}
+
+it.each(["channel", "pinned"])("exclusive summary and loss attempts survive storage deadlines: %s", async mode => {
+  const f = await ownedFixture(mode); let summary: Promise<void> | undefined;
+  const retriesStarted: Promise<void>[] = [];
+  const retrySummary = () => { retriesStarted.push(f.consumer.flushCoalescedFlowSummaries()); };
+  try {
+    await f.dispatchSettled(); await f.dispatchSettled();
+    expect(f.consumer.getStats().decisionsCoalesced).toBe(1);
+    summary = f.consumer.flushCoalescedFlowSummaries();
+    await f.ledger.deadline(SUMMARY_OPERATION, 1); f.ledger.exclusive([SUMMARY_OPERATION]);
+    retrySummary(); f.consumer.noteIngressDrop("audit_backpressure");
+    await turn(); f.ledger.exclusive([SUMMARY_OPERATION]);
+    await f.ledger.deadline(LOSS_OPERATION, SERIAL_DEADLINES);
+    retrySummary(); f.consumer.noteIngressDrop("audit_backpressure");
+    await turn(); f.ledger.exclusive();
+    const retries = 2; // Repeat both explicit opportunities while the same raw writes remain held.
+    for (let index = 0; index < retries; index++) {
+      retrySummary(); f.consumer.noteIngressDrop("audit_backpressure");
+      await turn(); f.ledger.exclusive();
+    }
+    const pending = f.consumer.getCoalescingSnapshot().coalesced_evidence_pending;
+    const losses = f.consumer.getIngressLossSnapshot().counts.audit_backpressure;
+    expect(pending).toBe(1); expect(losses).toBe(SERIAL_DEADLINES + retries);
+    f.ledger.release(); await summary; await f.ledger.join();
+    await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushIngressDrops(); await f.ledger.join();
+    const snapshot = f.consumer.getCoalescingSnapshot();
+    expect(snapshot.coalesced_evidence_pending).toBe(0); expect(snapshot.coalesced_evidence_confirmed).toBe(pending);
+    expect(snapshot.coalesced_evidence_pending + snapshot.coalesced_evidence_confirmed).toBe(f.consumer.getStats().coalesced);
+    expect(f.consumer.getIngressLossSnapshot().counts.audit_backpressure).toBe(0);
+    for (const id of f.ledger.selected.values()) expect(f.ledger.totalPhysicalWrites.get(id)).toBe(SERIAL_DEADLINES); // Original attempt plus sequential retry.
+    const confirmedLosses = f.ledger.payloads.filter(record => record.operation === LOSS_OPERATION).slice(SINGLE_OWNER)
+      .reduce((sum, record) => sum + (record.details!.counts as Record<string, number>).audit_backpressure!, 0);
+    expect(confirmedLosses + f.consumer.getIngressLossSnapshot().counts.audit_backpressure).toBe(losses);
+    expect(f.ledger.recoveries).toHaveLength(SERIAL_DEADLINES);
+    const before = f.ledger.payloads.length; await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushIngressDrops();
+    expect(f.ledger.payloads).toHaveLength(before);
+    console.info("exclusive attempt ledger", JSON.stringify({ highAttempts: [...f.ledger.highAttempts], highWrites: [...f.ledger.highWrites], totalPhysicalWrites: [...f.ledger.totalPhysicalWrites], pending, losses }));
+  } finally { f.ledger.release(); await summary; await Promise.all(retriesStarted); await f.cleanup(); }
+}, OWNER_TIMEOUT_MS);

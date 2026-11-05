@@ -1,8 +1,6 @@
 /**
  * #1096 rebuild: shared chain basis + one-time LOCAL anchor migration.
- *
  * Three suites:
- *
  *  1. BASIS VECTORS — for each producer writer (Rust WAL via the real drain
  *     envelope builder, macOS flow-decision shape), the consumer's chain head
  *     after event 1 must equal the producer's `prior_sha256_hex` for event 2:
@@ -29,6 +27,7 @@
  *     `cw_chain_basis` fact, and latching a loud stuck state when local
  *     recomputation is impossible (unsigned last entry / integrity findings).
  */
+// fail-before-exempt: these assertions witness behavior the source already has; each is proven by a named mutation that fails it, so the file passes against unchanged source by construction.
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -1971,7 +1970,7 @@ for (const [label, scenario] of basisWindowCases) it(`established chain window p
     const key = scenario === "swift" ? Uint8Array.from({ length: 32 }, (_, index) => index + 1) : daemonPriv; // The Swift fixture specifies seed bytes 1 through 32.
     const pin = toBase64url(ed25519.getPublicKey(key));
     const consumer = new AuditConsumer(sink, undefined, { pinnedProducerKeyB64url: pin, now: () => NOW,
-      chainContinuity: scenario === "complete" ? "complete" : "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
+      chainContinuity: ["prior", "complete"].includes(scenario) ? "complete" : "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
     const canonical = scenario === "swift" ? swift.canonical : macFlowBody({ seq: 0, prior: null, timestamp: new Date(SIGNED_TS).toISOString() });
     const head = scenario === "swift" ? swiftFixtureFlowEnvelope(swift) : macFlowEnvelope({ seq: 0, prior: null, canonical });
     head.producerDelivery = "live";
@@ -1992,14 +1991,16 @@ for (const [label, scenario] of basisWindowCases) it(`established chain window p
     envelope.producerDelivery = scenario === "durable" ? "durable_wal" : "live";
     envelope.producer!.signatureB64url = toBase64url(ed25519.sign(producerSigningBytes(nextCanonical, SIGNED_TS, seq), key));
     if (scenario === "unsigned-gap" || scenario === "control") {
-      envelope.producer = undefined; envelope.event.event_type = "filter_started";
+      envelope.producer = undefined;
+      if (scenario === "control") envelope.event.event_type = "filter_started";
     }
     if (scenario === "operation") envelope.event.event_type = "filter_started";
+    let caught: unknown;
     const before = consumer.getStats(); trace.length = 0; invocation++;
     try {
       await consumer.ingestCritical({ ...envelope, ack: async () => { trace.push(["ACK", invocation]); } }, { classify(kind) { if (kind === "coalesced") counted.add(invocation); } });
       trace.push(["fulfilled", invocation]);
-    } catch (error) { trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]); }
+    } catch (error) { caught = error; trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]); }
     const stats = consumer.getStats();
     const delta = Object.fromEntries(Object.entries(stats).map(([key, value]) => [key, value - before[key as keyof typeof before]]));
     if (enabled && ["swift", "accepted", "subset", "reader", "trailing"].includes(scenario)) expect(delta.coalescedCriticalEvents, "the adjacent live signed trigger is counted").toBe(1);
@@ -2007,6 +2008,36 @@ for (const [label, scenario] of basisWindowCases) it(`established chain window p
       if (scenario === "trailing") entries.push({ operation: "producer_signature_rejected", identity_id: FORTRESS_ID, details: { seq: seq + 1 } });
       const source = buildChainAnchorSourceFromAuditLog({ async query() { return { entries, total: entries.length }; }, async getAuditChainVerdict() { return { status: "verified" } as AuditChainVerdict; } });
       expect(await source(), "the reader retains only durable primary authority").toMatchObject({ kind: "persisted", seq: enabled ? 0 : seq, signedCanonicalJson: enabled ? canonical : nextCanonical });
+    }
+    const records = trace.filter(call => call[0] === "append").map(call => JSON.parse(String(call[2])) as [string, string, string, Record<string, unknown>]);
+    const acks = trace.filter(call => call[0] === "ACK");
+    const chainReason = ["prior", "complete"].includes(scenario) ? "wal_chain_verification_failed" : scenario === "regression" ? "seq_regression" : undefined;
+    const producerReason = scenario === "unsigned-gap" ? "producer_signature_absent" : scenario === "operation" ? "producer_signed_body_operation_event_type_mismatch" : undefined;
+    if (chainReason || producerReason) {
+      const reason = chainReason ?? producerReason;
+      expect(records.map(record => [record[1], record[3].reason])).toEqual([[chainReason ? "wal_chain_verification_failed" : "producer_signature_rejected", reason]]);
+      expect(caught).toMatchObject({ name: "AuditChainError", reason });
+      expect(delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!).toBe(0);
+      expect(delta.producerSignatureRejections).toBe(producerReason ? 1 : 0);
+      expect(delta.producerSignatureAccepted).toBe(chainReason ? 1 : 0);
+      expect(delta.duplicatesDropped).toBe(0);
+      expect(acks).toHaveLength(producerReason ? 1 : 0);
+      expect(consumer.getWalChainState()).toEqual({ lastAckedSeq: 0, lastEventChainHash: sha256Hex(canonical) });
+      if (producerReason) expect(trace.findIndex(call => call[0] === "flush")).toBeLessThan(trace.findIndex(call => call[0] === "ACK"));
+    } else {
+      expect(caught).toBeUndefined(); expect(delta.rejectedEvents).toBe(0); expect(delta.producerSignatureRejections).toBe(0);
+      expect(delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!).toBe(1); expect(acks).toHaveLength(1);
+      const omitted = enabled && !["durable", "control"].includes(scenario);
+      expect(records).toHaveLength(omitted ? 0 : 1);
+      const hash = scenario === "control" ? sha256Hex(canonicalize(envelope.event)) : sha256Hex(nextCanonical);
+      expect(consumer.getWalChainState()).toEqual({ lastAckedSeq: seq, lastEventChainHash: hash });
+      if (!omitted) {
+        expect(records[0]![3].cw_chain_basis).toBe(scenario === "control" ? "event_canonical" : "producer_signed_body");
+        if (scenario !== "control") expect(records[0]![3].cw_producer_signed_canonical).toBe(nextCanonical);
+        if (scenario === "subset") expect(records[0]![3].cw_chain_prior_unconsumed).toBe(true);
+        expect(trace.findIndex(call => call[0] === "flush")).toBeLessThan(trace.findIndex(call => call[0] === "ACK"));
+      }
+      if (scenario === "durable") expect(delta.coalescedCriticalEvents).toBe(0);
     }
     results.push({ trace, counted, delta, state: consumer.getWalChainState() });
   }
