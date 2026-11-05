@@ -11,6 +11,8 @@ import * as custodyFs from "../../../src/storage/custody-fs.js";
 import { generateFullAgentPlist } from "../../../src/cli/castle-wall-full-agent.js";
 // Must match CASTLE_WALL_STOP_TEST_SLACK_MS in test/cli/castle-wall-stop-backstop.test.ts: one fake-clock millisecond.
 const CASTLE_WALL_STOP_TEST_SLACK_MS = 1;
+const D = CASTLE_WALL_STOP_DEADLINE_MS / FLOW_STOP_FINAL_RECORD_RESERVE_MS;
+const EPS = CASTLE_WALL_STOP_TEST_SLACK_MS;
 const BUDGET = 100; // Short injected budget exercised entirely with fake time.
 const UID = 501; // Ordinary fixture principal.
 const TOKEN = Buffer.from(new Uint32Array([0, UID, UID, UID, UID, 123, 1, 1]).buffer).toString("hex");
@@ -24,7 +26,7 @@ function requireSummary() {
   expect(consumer.flushCoalescedFlowSummaries).toBeTypeOf("function");
 }
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.useRealTimers(); });
-async function fixture(held = "none") {
+async function fixture(held = "none", budget = BUDGET) {
   const home = await mkdtemp("/tmp/cw-stop-budget-");
   const gate = deferred(), entered = deferred(), finalEntered = deferred(); const calls: string[] = [];
   let stopping = false, started = false;
@@ -54,7 +56,7 @@ async function fixture(held = "none") {
   const handle = await startMacOSCastleWallDaemon({ fortressPath: home, fortressId: "fixture", masterKey: key, auditLog: audit,
     platform: "darwin", daemonMode: "safe", socketPath: join(home, "fixture.sock"), activeConfigPath: join(home, "active.json"),
     globalPinnedPublicKeyPath: join(home, "pin"), auditProducerPublicKeyPath: join(home, "producer"), auditProducerStatePath: null,
-    stopDeadlineMs: BUDGET, auditHeartbeatIntervalSeconds: 1, resolverLifecycleRefreshIntervalSeconds: 2, // Distinct fixture timer periods.
+    stopDeadlineMs: budget, auditHeartbeatIntervalSeconds: 1, resolverLifecycleRefreshIntervalSeconds: 2, // Distinct fixture timer periods.
     systemResolverProvider: async () => { if (held === "resolver" && started) { entered.resolve(); await gate.promise; } return held === "publication" && started ? ["192.0.2.53"] : []; }, agentEgressProbe: async () => true,
     signerClientInvoke: async (args, data) => ({ code: 0, stderr: "", stdout: Buffer.from(args[0] === "get-pubkey" ? ed25519.getPublicKey(key) : ed25519.sign(data!, key)).toString("base64url") }),
     listenerFactory(opts) { options = opts; return {
@@ -64,6 +66,14 @@ async function fixture(held = "none") {
     }; },
   });
   started = true;
+  if (["head", "loss", "summary", "non-agent"].includes(held)) {
+    const read = custodyFs.readFileCustody;
+    // Single-hold fixtures keep unrelated cleanup prompt so fake time measures the selected hold.
+    vi.spyOn(custodyFs, "readFileCustody").mockImplementation((...args) => {
+      if (stopping && args[0] === join(home, "active.json")) return Promise.reject(Object.assign(new Error("fixture config absent"), { code: "ENOENT" }));
+      return read(...args);
+    });
+  }
   if (held === "cleanup") {
     const read = custodyFs.readFileCustody;
     vi.spyOn(custodyFs, "readFileCustody").mockImplementation(async (...args) => {
@@ -101,7 +111,12 @@ describe("daemon stop budget", () => {
       expect(f.consumer.getFlowAdmissionSnapshot().closed).toBe(true);
       const phase = ({ resolver: "RESOLVER_WAIT", heartbeat: "HEARTBEAT_IDLE", lease: "LEASE_STANDDOWN", listener: "LISTENER", head: "DRAINS", loss: "DRAINS", summary: "DRAINS", "non-agent": "DRAINS", final: "FINAL_RECORD", "final-flush": "FINAL_RECORD", cleanup: "CLEANUP" } as const)[held];
       const diagnostic = log.mock.calls.map(([line]) => String(line)).find(line => line.includes("stop budget lapsed"))!;
-      expect(diagnostic).toContain(`phase=state_STOP_${phase}`);
+      const tokens = diagnostic.split(" ");
+      const drainOnly = phase === "DRAINS";
+      expect(tokens, diagnostic).toContain(`phase=state_STOP_${phase}`);
+      expect(tokens).toContain(`lapse=${drainOnly ? "drain_cutoff" : "hard_expiry"}`);
+      expect(tokens).toContain(`cutoff_state=state_STOP_${phase}`);
+      expect(tokens).toContain(`hard_state=${drainOnly ? "none" : `state_STOP_${phase}`}`);
       expect(diagnostic).toContain(`pending_loss=${JSON.stringify(f.consumer.getIngressLossSnapshot())}`);
       expect(diagnostic).toContain(`pending_coalesced=${f.consumer.getCoalescingSnapshot().coalesced_evidence_pending}`);
       const admission = f.consumer.getFlowAdmissionSnapshot();
@@ -144,11 +159,11 @@ describe("daemon stop budget", () => {
   it("the final-record reserve scales with an injected short stop budget", async () => {
     requireSummary(); const f = await fixture("summary"); vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      expect(FLOW_STOP_FINAL_RECORD_RESERVE_MS).toBe(CASTLE_WALL_STOP_DEADLINE_MS / 6);
+      expect(FLOW_STOP_FINAL_RECORD_RESERVE_MS).toBe(CASTLE_WALL_STOP_DEADLINE_MS / D);
       await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
       const stop = f.stop(); await f.entered.promise;
-      const cutoff = BUDGET - Math.floor(BUDGET / 6);
+      const cutoff = BUDGET - Math.floor(BUDGET / D);
       await vi.advanceTimersByTimeAsync(cutoff - CASTLE_WALL_STOP_TEST_SLACK_MS);
       expect(f.calls, "the short budget keeps a positive drain interval").not.toContain("filter_stopped");
       await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_TEST_SLACK_MS);
@@ -252,4 +267,94 @@ describe("daemon stop budget", () => {
       expect(f.entries.filter(entry => entry.operation === "castle_wall_flow_decisions_coalesced")).toHaveLength(2);
     } finally { await f.cleanup(); }
   });
+});
+
+it("early phase completion inside the reserve preserves final persistence", async () => {
+  const f = await fixture("listener");
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  const admissionDrain = vi.spyOn(f.consumer, "drainFlowAdmission");
+  const summaryDrain = vi.spyOn(f.consumer, "drainCoalescedFlowSummaries");
+  const lossDrain = vi.spyOn(f.consumer, "drainIngressDrops");
+  try {
+    await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+    const pending = f.consumer.getCoalescingSnapshot().coalesced_evidence_pending;
+    expect(pending).toBeGreaterThan(0);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const cutoff = BUDGET - Math.floor(BUDGET / D);
+    let completed = false; const stop = f.stop().then(() => { completed = true; });
+    await f.entered.promise;
+    await vi.advanceTimersByTimeAsync(cutoff + EPS);
+    expect(completed).toBe(false); expect(f.calls).not.toContain("filter_stopped");
+    f.gate.resolve(); await f.finalEntered.promise; await stop;
+    expect(performance.now()).toBeLessThan(BUDGET);
+    expect(admissionDrain).not.toHaveBeenCalled(); expect(summaryDrain).not.toHaveBeenCalled(); expect(lossDrain).not.toHaveBeenCalled();
+    expect(f.calls.slice(f.calls.indexOf("filter_stopped"))).toEqual(["filter_stopped", "flush"]);
+    expect(f.entries.some(entry => entry.operation === "filter_stopped")).toBe(true);
+    expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_pending).toBe(pending);
+    const lines = log.mock.calls.map(([line]) => String(line)).filter(line => line.includes("stop budget lapsed"));
+    expect(lines).toHaveLength(1);
+    const tokens = lines[0]!.split(" ");
+    expect(tokens).toContain("cutoff_state=state_STOP_LISTENER");
+    expect(tokens).toContain("phase=state_STOP_LISTENER");
+    expect(tokens).toContain("lapse=drain_cutoff"); expect(tokens).toContain("hard_state=none");
+  } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+});
+
+it("hard expiry during final persistence reports the final phase", async () => {
+  for (const held of ["final", "final-flush"]) {
+    const f = await fixture(held), drain = deferred(), drainEntered = deferred();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const summary = vi.spyOn(f.consumer, "drainCoalescedFlowSummaries").mockImplementation(() => { drainEntered.resolve(); return drain.promise; });
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      let completed = false; const stop = f.stop().then(() => { completed = true; });
+      await drainEntered.promise;
+      const cutoff = BUDGET - Math.floor(BUDGET / D);
+      await vi.advanceTimersByTimeAsync(cutoff); await f.entered.promise;
+      expect(completed).toBe(false);
+      expect(f.calls).toContain("filter_stopped");
+      if (held === "final") expect(f.calls.slice(f.calls.indexOf("filter_stopped"))).toEqual(["filter_stopped"]);
+      else expect(f.calls.slice(f.calls.indexOf("filter_stopped"))).toEqual(["filter_stopped", "flush"]);
+      await vi.advanceTimersByTimeAsync(BUDGET - cutoff + EPS); await stop;
+      const lines = log.mock.calls.map(([line]) => String(line)).filter(line => line.includes("stop budget lapsed"));
+      expect(lines).toHaveLength(1);
+      const tokens = lines[0]!.split(" ");
+      expect(tokens).toContain("phase=state_STOP_FINAL_RECORD");
+      expect(tokens).toContain("hard_state=state_STOP_FINAL_RECORD");
+      expect(tokens).toContain("cutoff_state=state_STOP_DRAINS"); expect(tokens).toContain("lapse=hard_expiry");
+      const before = [...f.calls]; f.gate.resolve(); drain.resolve(); await turn();
+      expect(f.calls, "late persistence starts no later phase").toEqual(before);
+    } finally { drain.resolve(); f.gate.resolve(); summary.mockRestore(); vi.useRealTimers(); await f.cleanup(); log.mockRestore(); vi.restoreAllMocks(); }
+  }
+});
+
+it("final persistence inside the reserve completes without a lapse", async () => {
+  const f = await fixture("final"); const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const stop = f.stop(); await f.entered.promise;
+    const cutoff = BUDGET - Math.floor(BUDGET / D);
+    await vi.advanceTimersByTimeAsync(cutoff + EPS);
+    f.gate.resolve(); await stop;
+    expect(performance.now()).toBeLessThan(BUDGET);
+    expect(f.calls.slice(f.calls.indexOf("filter_stopped"))).toEqual(["filter_stopped", "flush"]);
+    expect(log.mock.calls.filter(([line]) => String(line).includes("stop budget lapsed"))).toHaveLength(0);
+  } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+});
+
+it("the final-record reserve cap bounds a long injected stop budget", async () => {
+  const productionWindows = 2; // Two windows make the scaled reserve larger than the production cap.
+  const budget = productionWindows * CASTLE_WALL_STOP_DEADLINE_MS;
+  const f = await fixture("summary", budget); vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const stop = f.stop(); await f.entered.promise;
+    const cutoff = budget - FLOW_STOP_FINAL_RECORD_RESERVE_MS;
+    await vi.advanceTimersByTimeAsync(cutoff - EPS);
+    expect(f.calls).not.toContain("filter_stopped");
+    await vi.advanceTimersByTimeAsync(EPS); await f.finalEntered.promise; await stop;
+    expect(performance.now()).toBe(cutoff);
+    expect(f.entries.some(entry => entry.operation === "filter_stopped")).toBe(true);
+  } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
 });

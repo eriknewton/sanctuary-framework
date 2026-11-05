@@ -355,6 +355,7 @@ export const CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS = 12_000 as const;
 export const CASTLE_WALL_STOP_DEADLINE_MS = 12_000;
 /** 2000 = 12000 / 6: one durable audit append measures well under a second on the fixture
  * box, so one sixth of the stop budget leaves a slow disk two seconds for the final record.
+ * Must match finalRecordReserveMs in castle-wall/runtime/macos-daemon.ts, which applies the same divisor to an injected stop budget.
  */
 export const FLOW_STOP_FINAL_RECORD_RESERVE_MS = CASTLE_WALL_STOP_DEADLINE_MS / 6;
 /** Must match CASTLE_WALL_STOP_DEADLINE_MS above: completion precedes launchd's default deadline. */

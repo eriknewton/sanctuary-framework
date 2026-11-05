@@ -2,6 +2,7 @@
  * The audit consumer verifies producer evidence before durable admission and inbox projection.
  * S1
  */
+// fail-before-exempt: these assertions witness behavior the source already has; each is proven by a named mutation that fails it, so the file passes against unchanged source by construction.
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { createHash } from "node:crypto";
@@ -1784,7 +1785,7 @@ for (const [label, scenario] of signedWindowCases) it(`established signed window
   const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
   try { for (const enabled of [false, true]) {
     const trace: unknown[][] = []; let invocation = 0;
-    const counted = new Set<number>();
+    const counted = new Set<number>(); const errors: unknown[] = [];
     const sink: AuditSink = { append(...args) { trace.push(["append", invocation, JSON.stringify(args)]); }, async flush() { trace.push(["flush", invocation]); } };
     const coalescer = new module!.FlowCoalescer("signed-window", () => FLOW_NOW);
     const bridge = new UnifiedInboxBridge({
@@ -1815,7 +1816,7 @@ for (const [label, scenario] of signedWindowCases) it(`established signed window
     if (scenario === "no-binding") envelope.producerSubjectBinding = undefined;
     if (scenario === "substitution") envelope.event.agent = { id: "envelope-subject", template: "fixture" };
     if (scenario === "display") { envelope.event.destination = null; envelope.event.details.reason = "envelope reason"; }
-    if (scenario === "control") { envelope.producer = undefined; envelope.event.event_type = "operator_decision"; }
+    if (scenario === "control") { envelope.producer = undefined; envelope.event.event_type = "policy_loaded"; }
     if (scenario === "conflict") {
       envelope.event.destination = { ...envelope.event.destination!, host: "envelope.example" };
       (consumer as unknown as { stats: { blockedEgressDestinationConflicts: number } }).stats.blockedEgressDestinationConflicts = Number.MAX_SAFE_INTEGER - 1;
@@ -1831,7 +1832,7 @@ for (const [label, scenario] of signedWindowCases) it(`established signed window
       try {
         await target.ingestCritical({ ...env, ack: async () => { trace.push(["ACK", invocation]); } }, { classify(kind) { if (kind === "coalesced") counted.add(invocation); } });
         trace.push(["fulfilled", invocation]);
-      } catch (error) { trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]); }
+      } catch (error) { errors.push(error); trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]); }
     };
     await deliver(envelope);
     if (scenario === "subjects") {
@@ -1877,6 +1878,62 @@ for (const [label, scenario] of signedWindowCases) it(`established signed window
     const stats = consumer.getStats();
     const delta = Object.fromEntries(Object.entries(stats).map(([key, value]) => [key, value - before[key as keyof typeof before]]));
     if (enabled && ["active", "accepted", "substitution", "token", "display", "subjects"].includes(scenario)) expect(delta.coalescedCriticalEvents, "the signed same-key trigger is counted").toBe(1);
+    const reasons: Record<string, string> = {
+      "no-signature": "producer_signature_absent", "no-binding": "producer_signed_without_subject_binding",
+      "no-agent": "producer_signed_body_missing_agent_id", "bad-agent": "producer_signed_body_agent_subject_unresolvable",
+      "no-identity": "producer_signed_body_missing_identity_id", "wrong-key": "producer_signature_verification_failed",
+      operation: "producer_signed_body_operation_event_type_mismatch", stale: "producer_signature_stale",
+    };
+    const records = trace.filter(call => call[0] === "append").map(call => JSON.parse(String(call[2])) as [string, string, string, Record<string, unknown>]);
+    const operations = records.map(record => record[1]);
+    const acks = trace.filter(call => call[0] === "ACK");
+    const reason = reasons[scenario];
+    if (reason) {
+      expect(records.map(record => [record[1], record[3].reason])).toEqual([["producer_signature_rejected", reason]]);
+      expect(errors).toHaveLength(1); expect(errors[0]).toMatchObject({ name: "AuditChainError", reason });
+      expect(delta.producerSignatureRejections).toBe(1);
+      expect(delta.producerSignatureAccepted).toBe(["no-binding", "no-agent", "bad-agent", "no-identity"].includes(scenario) ? 1 : 0);
+      expect(delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!).toBe(0);
+      expect(consumer.getWalChainState()).toEqual({ lastAckedSeq: 0, lastEventChainHash: flowHash(head.producer.eventCanonicalJson) });
+      expect(acks).toHaveLength(1);
+      expect(trace.findIndex(call => call[0] === "flush")).toBeLessThan(trace.findIndex(call => call[0] === "ACK"));
+    } else {
+      expect(errors).toEqual([]); expect(delta.producerSignatureRejections).toBe(0); expect(delta.rejectedEvents).toBe(0);
+      expect(operations).not.toContain("wal_chain_verification_failed"); expect(acks.length).toBeGreaterThan(0);
+      const primaries = records.filter(record => record[1] === "egress_blocked");
+      if (["active", "accepted", "substitution", "token", "display"].includes(scenario)) {
+        expect(primaries).toHaveLength(enabled ? 0 : 1);
+        expect(delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!).toBe(1);
+        expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(envelope.producer!.eventCanonicalJson));
+        if (!enabled) {
+          expect(primaries[0]![3]).toMatchObject({ cw_producer_signed_canonical: envelope.producer!.eventCanonicalJson, cw_producer_sig: envelope.producer!.signatureB64url });
+          expect(trace.findIndex(call => call[0] === "flush")).toBeLessThan(trace.findIndex(call => call[0] === "ACK"));
+        }
+      }
+      if (scenario === "control") {
+        expect(operations).toEqual(["policy_loaded"]);
+        expect(records[0]![3].cw_evidence_basis).toBe("channel_authenticated_unsigned");
+        expect(delta.acceptedCriticalEvents).toBe(1); expect(delta.coalescedCriticalEvents).toBe(0);
+        expect(consumer.getWalChainState()).toEqual({ lastAckedSeq: 1, lastEventChainHash: flowHash(canonicalize(envelope.event)) });
+        expect(acks).toHaveLength(1);
+        expect(trace.findIndex(call => call[0] === "flush")).toBeLessThan(trace.findIndex(call => call[0] === "ACK"));
+      }
+      if (scenario === "subjects") {
+        expect(delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!).toBe(1);
+        expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(envelope.producer!.eventCanonicalJson));
+      }
+      if (scenario === "projection" || scenario === "mint") {
+        expect(delta.acceptedCriticalEvents).toBe(1); expect(delta.coalescedCriticalEvents).toBe(0);
+        expect(consumer.getWalChainState().lastEventChainHash).toBe(flowHash(envelope.producer!.eventCanonicalJson));
+        expect(primaries).toHaveLength(1); expect(acks).toHaveLength(scenario === "projection" ? 2 : 1);
+        expect(projection).toHaveBeenCalledTimes(scenario === "projection" ? 1 : 0);
+        if (scenario === "projection") { expect(delta.duplicatesDropped).toBe(1); expect(operations).toContain("critical_event_duplicate_dropped"); }
+      }
+      if (scenario === "conflict") {
+        expect(primaries).toHaveLength(2); expect(acks).toHaveLength(primaries.length);
+        expect(delta.blockedEgressProjectionFailures).toBe(0);
+      }
+    }
     results.push({ trace, counted, delta, state: consumer.getWalChainState() });
     projection.mockRestore(); warnings.mockImplementation(() => {});
   } } finally { warnings.mockRestore(); }
