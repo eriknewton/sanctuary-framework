@@ -6,7 +6,7 @@ import { AuditLog, type AuditLogConfig } from "../../src/operational/audit-log.j
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
 
-const DEADLINE_MS = 200; // Short fixture hold/load deadline; no production override.
+const DEADLINE_MS = 1_000; // Allow healthy storage work to finish before testing held-operation fencing.
 const OBSERVE_MS = DEADLINE_MS * 3;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const entry = (operation: string) => ({ layer: "l1" as const, operation, identity_id: "fixture", result: "success" as const });

@@ -159,7 +159,7 @@ for (const namespace of ["_audit", "_audit_checkpoints"]) {
 }
 
 it("shares D across 0.6D entry/anchor and 0.6D collection, rejecting before checkpoint persistence", async () => {
-  const deadline = 500; // Two phases of 300 ms each fit separately, but exceed the shared 500 ms hold.
+  const deadline = 1_000; // Two 0.6D phases (600 ms each) fit separately, but exceed the shared 1000 ms hold.
   const { raw, log } = await checkpointSetup(deadline);
   const anchor = (log as any).writeHeadAnchor.bind(log);
   vi.spyOn(log as any, "writeHeadAnchor").mockImplementation(async (...args) => { await anchor(...args); await delay(deadline * 0.6); });
@@ -179,7 +179,7 @@ it("shares D across 0.6D entry/anchor and 0.6D collection, rejecting before chec
 });
 
 it("counts a late-landing checkpoint after settlement and never rewrites that sequence on retry", async () => {
-  const deadline = 500; // The same 0.6D + 0.6D schedule, with expiry during persistence.
+  const deadline = 1_000; // The same 0.6D + 0.6D schedule, with expiry during persistence.
   const { raw, log } = await checkpointSetup(deadline);
   const anchor = (log as any).writeHeadAnchor.bind(log);
   vi.spyOn(log as any, "writeHeadAnchor").mockImplementationOnce(async (...args) => {
