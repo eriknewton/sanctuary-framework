@@ -184,6 +184,7 @@ it("protection surfaces share every observed layer", async () => {
 it("a joined home keeps its runtime sources and composes each snapshot fresh", () => {
   const home = {};
   const runtime = vi.fn(() => ({ ...protectionRuntimeUnavailable }));
+  const SECOND_JOIN_AT = observedAt + 1; // A distinct clock reading proves the second join read the clock again.
   const now = vi.fn(() => observedAt);
   associateProtectionHome(home, { runtime, now });
   const panels = { featureHealth: undefined, custodyExit: undefined, custodyObservation: fresh, auditChain: undefined };
@@ -193,11 +194,19 @@ it("a joined home keeps its runtime sources and composes each snapshot fresh", (
   expect(Object.keys(first.observation).sort()).toEqual(["now", "runtime"]);
   expect(first.observation.runtime).toBe(runtime);
   expect(first.observation.now).toBe(now);
-  // Each join reads the sources again, so its snapshot reflects the runtime at that moment.
-  expect(first.snapshot.encryptedStateStoreConstructed).toBeUndefined();
-  runtime.mockImplementation(() => ({ ...protectionRuntimeUnavailable, stateStore: {} as never }));
+  expect(runtime).toHaveBeenCalledTimes(1);
+  expect(now).toHaveBeenCalledTimes(1);
+  expect(first.snapshot.now).toBe(observedAt);
+  expect(first.snapshot.toolOutputScreenReady).toBeUndefined();
+  // Each join reads the sources again: the second runtime payload's screen is consulted and the second clock reading lands.
+  const assertReady = vi.fn();
+  runtime.mockImplementation(() => ({ ...protectionRuntimeUnavailable, responseScreen: { assertReady } }));
+  now.mockImplementation(() => SECOND_JOIN_AT);
   const second = observeProtectionJoiner(home, panels);
   expect(runtime).toHaveBeenCalledTimes(2);
   expect(now).toHaveBeenCalledTimes(2);
-  expect(second.snapshot.encryptedStateStoreConstructed).toBe(true);
+  expect(assertReady).toHaveBeenCalledTimes(1);
+  expect(second.snapshot.toolOutputScreenReady).toBe(true);
+  expect(second.snapshot.now).toBe(SECOND_JOIN_AT);
+  expect(second.snapshot).not.toBe(first.snapshot);
 });
