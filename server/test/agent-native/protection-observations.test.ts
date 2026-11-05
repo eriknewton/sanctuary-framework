@@ -1,5 +1,4 @@
 /** Shared protection observations. */
-// fail-before-exempt: this change tightens existing assertions over a behavior-preserving refactor (the audit-chain enum is derived from its source type and pins are restated); the shared producer already shipped, so the file passes against pre-change source by construction.
 import { afterEach, expect, it, vi } from "vitest";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
@@ -72,7 +71,7 @@ function status(rows: ProtectionLayerRow[] | undefined, id: string) {
   return rows?.find(row => row.id === id)?.status;
 }
 
-import { observeProtections, protectionRuntimeUnavailable, type QualifiedProtectionPanels } from "../../src/agent-native/protection-observations.js";
+import { associateProtectionHome, observeProtectionJoiner, observeProtections, protectionRuntimeUnavailable, type QualifiedProtectionPanels } from "../../src/agent-native/protection-observations.js";
 import { protectionEvidenceKeys, protectionEvidenceSchema, type ProtectionObservationSnapshot } from "../../src/agent-native/protection-layers.js";
 
 it("protection surfaces share every observed layer", async () => {
@@ -180,4 +179,15 @@ it("protection surfaces share every observed layer", async () => {
     expect(denied.layers).toBeUndefined();
     await f.auditLog.flush();
   } finally { await homeDirectory.cleanup(); }
+});
+
+it("a joined home keeps its runtime sources and composes each snapshot fresh", () => {
+  const home = {};
+  associateProtectionHome(home, { runtime: () => ({ ...protectionRuntimeUnavailable }), now: () => observedAt });
+  const panels = { featureHealth: undefined, custodyExit: undefined, custodyObservation: fresh, auditChain: undefined };
+  const first = observeProtectionJoiner(home, panels);
+  // The association a follower re-registers carries only the sources; a retained snapshot would go stale behind them.
+  expect(first).toHaveProperty("observation");
+  expect(Object.keys(first.observation).sort()).toEqual(["now", "runtime"]);
+  expect(first.snapshot).not.toBe(observeProtectionJoiner(home, panels).snapshot);
 });
