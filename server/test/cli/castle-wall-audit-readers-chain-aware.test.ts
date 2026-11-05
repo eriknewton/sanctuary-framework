@@ -46,6 +46,8 @@ import {
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
+import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -66,7 +68,16 @@ const PASSPHRASE = "test-audit-readers-chain-aware-passphrase";
 
 describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
   const tempDirs: string[] = [];
+  const fixtureLeases: MasterWriteBarrierLease[] = [];
+
+  async function releaseFixtureLeases(): Promise<void> {
+    await releaseCustodyLeases(fixtureLeases);
+  }
+
   afterEach(async () => {
+    // The fixture hands its storage to the case, so its lease lives until
+    // teardown; the namespace must still exist when it relinquishes custody.
+    await releaseFixtureLeases();
     for (const dir of tempDirs.splice(0)) {
       // Restore perms so cleanup can recurse.
       await chmod(join(dir, "state", AUDIT_DAEMON_NAMESPACE), 0o700).catch(() => undefined);
@@ -89,7 +100,10 @@ describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
     expect(code).toBe(0);
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const established = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const lease = takeCustodyLease(established);
+    fixtureLeases.push(lease);
+    const { masterKey } = established;
     await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
 
     const daemonLog = createDaemonAuditLog(storage, masterKey);
@@ -103,12 +117,19 @@ describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
       }));
     }
     await withRootDaemonWriter(() => daemonLog.flush());
-    return { fortressPath, storage, masterKey };
+    return { fortressPath, storage, masterKey, readerSocketPath: lease.socketPath };
   }
 
   const READER_ENV = (fortressPath: string) => ({
     SANCTUARY_STORAGE_PATH: fortressPath,
     SANCTUARY_PASSPHRASE: PASSPHRASE,
+  });
+
+  it("fixture fortress releases its custody lease at teardown", async () => {
+    const { masterKey, readerSocketPath } = await migratedFortressWithDaemonEvents(1);
+    masterKey.fill(0);
+    await releaseFixtureLeases();
+    await expectReaderSocketReleased(readerSocketPath);
   });
 
   it("audit-dump includes daemon-chain entries (tagged _chain) when readable", async () => {
