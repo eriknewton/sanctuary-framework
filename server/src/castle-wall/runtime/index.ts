@@ -34,3 +34,5 @@ export * from "./linux-policy-compatibility.js";
 export * from "./linux-activation-gate.js";
 export * from "./full-supervision-state.js";
 export * from "./full-supervision-exit.js";
+
+export * from "./macos-flow-coalescing.js";

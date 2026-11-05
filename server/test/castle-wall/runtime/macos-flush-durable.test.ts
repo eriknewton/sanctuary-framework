@@ -41,9 +41,10 @@ it("T5 real daemon amortizes 300 flows and heartbeat ticks, then stop seals the 
   try {
     expect(await count()).toBe(1); // Startup seals filter_started; its initial heartbeat remains in the tail.
     for (let index = 0; index < FLOW_COUNT; index++) {
+      if (index === 0) expect(options.consumer.flushCoalescedFlowSummaries).toBeTypeOf("function");
       await options.consumer.handleFlowDecisionRecorded({
         type: "flow_decision_recorded", decision: "drop", agent: { id: SUBJECT, template: "test" },
-        destination: { ip: "192.0.2.1", port: 443, protocol: "tcp", host: null, hostname_source: null, opaque: false },
+        destination: { ip: "192.0.2.1", port: 1024 + index, protocol: "tcp", host: null, hostname_source: null, opaque: false }, // Start above the reserved ports.
         recorded_at: new Date().toISOString(),
       });
       // Catch per-flow checkpointing at the first frame, independently of chain-scan latency.

@@ -1,3 +1,4 @@
+import { CASTLE_WALL_STOP_DEADLINE_MS, FLOW_STOP_FINAL_RECORD_RESERVE_MS } from "../constants.js";
 import { execFile } from "node:child_process";
 import { resolveFortressCreateOwner } from "./fortress-create-owner.js";
 export { resolveFortressCreateOwner };
@@ -434,6 +435,8 @@ export interface MacOSCastleWallDaemonInput {
    * inject a small value to assert the bounded refusal deterministically.
    */
   reloadSignDeadlineMs?: number;
+  /** Positive finite total stop budget; production uses CASTLE_WALL_STOP_DEADLINE_MS. */
+  stopDeadlineMs?: number;
   /**
    * Backstop deadline (ms) for the broadcast phase of a `policy_reload`. Bounds
    * the manifest fan-out to sysext subscribers so a wedged subscriber write
@@ -855,6 +858,8 @@ export async function startMacOSCastleWallDaemon(
   // dead-man `ttl_expired` fail-open never fired (2026-07-05 Mini1 TTL-expiry
   // drill: armed `--ttl 90s`, still enforcing at t+160s). `nowMs` is injectable
   // so the fail-open deadline is testable without a wall-clock sleep.
+  const stopDeadlineMs = input.stopDeadlineMs ?? CASTLE_WALL_STOP_DEADLINE_MS;
+  if (!Number.isFinite(stopDeadlineMs) || stopDeadlineMs <= 0) throw new Error("stopDeadlineMs must be positive and finite");
   const nowMs = input.now ?? (() => Date.now());
   let operatorLeaseDeadlineMs: number | null =
     typeof input.armLeaseTtlSeconds === "number" && input.armLeaseTtlSeconds > 0
@@ -1040,6 +1045,7 @@ export async function startMacOSCastleWallDaemon(
   let resolverLifecycleTimer: NodeJS.Timeout | undefined;
   let resolverLifecycleRefresh: Promise<void> | undefined;
   let daemonStopping = false;
+  let stopBudgetLapsed = false;
   const stopResolverLifecycleTimer = (): void => {
     if (!resolverLifecycleTimer) return;
     clearInterval(resolverLifecycleTimer);
@@ -1132,6 +1138,8 @@ export async function startMacOSCastleWallDaemon(
   // stopped it (mirror of restartLeaseHeartbeat). Defined here, first started
   // in the startup try-block below.
   const startEmissionLivenessTimer = (): void => {
+    // A stop owns the timer lifecycle even when an earlier callback completes later.
+    if (daemonStopping) return;
     if (emissionLivenessTimer) return;
     // Slice M emission-liveness tick: evaluate the decided-vs-emitted
     // divergence on a fixed cadence. Pure counter comparison; the loud
@@ -1280,8 +1288,16 @@ export async function startMacOSCastleWallDaemon(
     // A flow's durability barrier must preserve the daemon's amortized checkpoint cadence.
     // This adapter must match the AuditSink interface in castle-wall/runtime/audit-consumer.ts.
     auditSink: {
-      append: (...args) => input.auditLog.append(...args),
-      flush: () => input.auditLog.flushDurable(),
+      append: (...args) => {
+        // A latched stop permits settlement of started writes, but no dependent audit transaction.
+        if (stopBudgetLapsed) throw new Error("flow audit stop budget lapsed");
+        return input.auditLog.append(...args);
+      },
+      flush: () => {
+        // A late primary remains unconfirmed when its durability barrier could start another checkpoint.
+        if (stopBudgetLapsed) throw new Error("flow audit stop budget lapsed");
+        return input.auditLog.flushDurable();
+      },
     },
     // Restore the producer-signed flow chain's anchor from the fortress's OWN
     // persisted audit log at startup (one-time old-basis migration included).
@@ -1292,6 +1308,8 @@ export async function startMacOSCastleWallDaemon(
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,
     emissionLiveness: emissionLivenessWatchdog,
+    coalesceLiveFlows: true,
+    now: nowMs,
     onVerifiedAvailabilityReport: noteVerifiedAvailabilityReport,
     // Per-connection watchdog state dies with the connection: without this, a
     // below-threshold contradiction count survived a clean disconnect and
@@ -1516,6 +1534,7 @@ export async function startMacOSCastleWallDaemon(
       }
     };
     restartLeaseHeartbeat = (): void => {
+      if (daemonStopping) return;
       if (leaseHeartbeat) return;
       leaseHeartbeat = setInterval(() => {
         if (leaseExpired) {
@@ -1564,6 +1583,7 @@ export async function startMacOSCastleWallDaemon(
       prunePendingRequests();
       void consumer.flushIngressDrops();
       void consumer.flushNonAgentFlowSummary();
+      void consumer.flushCoalescedFlowSummaries();
       // RESERVATION carry (fix-round HIGH): take ownership of the pending
       // units synchronously BEFORE the append, so an overlapping beat (slow
       // append + short interval) reserves 0 and can never double-subtract
@@ -1579,6 +1599,7 @@ export async function startMacOSCastleWallDaemon(
       // never-started tick shows up as a null or stale value against the
       // advancing heartbeat timestamps instead of being invisible.
       const emissionLivenessSnapshot = emissionLivenessWatchdog.snapshot();
+      const evidence = consumer.getPendingEvidenceSnapshot();
       try {
         await input.auditLog.append(
           "l1",
@@ -1599,6 +1620,9 @@ export async function startMacOSCastleWallDaemon(
             ...(leaseDeliveryRecycles > 0
               ? { lease_delivery_recycles: leaseDeliveryRecycles }
               : {}),
+            ingress_loss_pending: evidence.ingress_loss_pending,
+            coalesced_pending: evidence.coalesced_pending,
+            coalesced_counters_lower_bound: evidence.coalesced_counters_lower_bound,
             emission_liveness: {
               decided_total: emissionLivenessSnapshot.decidedTotal,
               emitted_total: emissionLivenessSnapshot.emittedTotal,
@@ -1613,7 +1637,7 @@ export async function startMacOSCastleWallDaemon(
           },
           "success",
         );
-        await input.auditLog.flushDurable();
+        if (!stopBudgetLapsed) await input.auditLog.flushDurable();
       } catch {
         // A heartbeat write failure must never crash the daemon or take down
         // enforcement. The reader's silent-death detection fails toward an
@@ -1624,6 +1648,7 @@ export async function startMacOSCastleWallDaemon(
       }
     };
     const runAuditHeartbeat = (): Promise<void> => {
+      if (daemonStopping) return Promise.resolve();
       if (auditHeartbeatInFlight) return auditHeartbeatInFlight;
       const heartbeat = emitAuditHeartbeat().finally(() => {
         if (auditHeartbeatInFlight === heartbeat) {
@@ -1640,6 +1665,7 @@ export async function startMacOSCastleWallDaemon(
       auditHeartbeat.unref();
     };
     restartAuditHeartbeat = (): void => {
+      if (daemonStopping) return;
       if (auditHeartbeat) return;
       // One immediate best-effort beat so the re-armed wall's liveness (and
       // the watchdog snapshot it carries) is visible without waiting a full
@@ -1935,6 +1961,11 @@ export async function startMacOSCastleWallDaemon(
           resolvers: observedResolvers,
           rollbackLocalStateOnBroadcastFailure: true,
         });
+        if (daemonStopping) {
+          // A completed publication whose outcome row is skipped during stop contributes to the next degraded-write carry.
+          degradedCarry.record();
+          return;
+        }
         recordReloadOutcome(
           "policy_loaded",
           {
@@ -2047,96 +2078,109 @@ export async function startMacOSCastleWallDaemon(
     }
   }
 
-  return {
-    socketPath,
-    reloadPolicy,
-    async stop() {
-      try {
-        daemonStopping = true;
-        if (pendingRequests.size > 0) consumer.noteIngressDrop("approval_shutdown", pendingRequests.size);
-        pendingRequests.clear();
-        stopLeaseHeartbeat();
-        stopResolverLifecycleTimer();
-        await resolverLifecycleRefresh?.catch(() => undefined);
-        // Stop the audit liveness heartbeat in the SAME teardown that stops the
-        // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
-        stopAuditHeartbeat();
-        await waitForAuditHeartbeatIdle();
-        stopAgentEgressProbeTimer();
-        stopEmissionLivenessTimer();
-        await listener.broadcastArmLease(buildArmLease({
-          armed: false,
-          ttlSeconds: null,
-          heartbeatIntervalSeconds,
-        })).catch(() => undefined);
-        await listener.stop();
-        let discardDrainTimer: ReturnType<typeof setTimeout> | undefined;
-        try {
-          // A hung discard write must not block filter_stopped or finally cleanup:
-          // use the same deadline as audit appends, keeping unflushed counts (including
-          // the in-flight reservation) in memory. A late commit may report a count
-          // twice, but it must never be lost or turned into an allow.
-          await Promise.race([
-            // Both drains share the existing race budget. Behind an unsettled
-            // discard write, the final summary append runs next and filter_stopped
-            // waits for it in appendQueue order. This stop path claims no bound on
-            // that wait; the audit layer's admission and hold-callback timeouts do
-            // not cover filesystem settlement or lock release. Ordering stays fixed.
-            Promise.all([consumer.drainIngressDrops(), consumer.drainNonAgentFlowSummary()]),
-            new Promise<void>((resolve) => {
-              discardDrainTimer = setTimeout(() => {
-                resolve();
-              }, input.auditLog.writeLockHoldDeadlineMs);
-            }),
-          ]);
-        } finally {
-          if (discardDrainTimer) clearTimeout(discardDrainTimer);
-        }
-        if (consumer.hasUnpersistedNonAgentFlows()) {
-          // SAFETY: operator-facing stop diagnostic; pending totals stay visible after timeout or fast failure, once per stop.
-          console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
-        }
-        // #912 MED-1: carry any still-pending degraded-write count into the
-        // shutdown audit write too, not only the next heartbeat -- a reload
-        // that drops its audit write shortly before `stop()` must not lose the
-        // marker to a heartbeat that never fires again. Same RESERVATION
-        // semantics as the heartbeat carry (fix-round HIGH; the same
-        // double-subtract race exists against an in-flight beat at teardown):
-        // reserve before the append, restore on append failure.
-        const degradedCountAtStop = degradedCarry.reserve();
-        try {
-          await input.auditLog.append(
-            "l1",
-            "filter_stopped",
-            protectionClaimSubject,
-            {
-              socket_path: socketPath,
-              source: auditSource,
-              fortress_id: input.fortressId,
-              ...(degradedCountAtStop > 0
-                ? { audit_write_degraded_count: degradedCountAtStop }
-                : {}),
-              // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
-              // marker the heartbeat carries so the silent-death reader recognizes
-              // this clean operator stop as an INTENTIONAL stand-down (off on
-              // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
-              // Constructed fields only, marker LAST (no untrusted spread). Gated
-              // read-side on the heartbeat's trust basis; it can only relabel red
-              // to a non-green `unknown`, never manufacture green.
-              [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
-            },
-            "success",
-          );
-          await input.auditLog.flush();
-        } catch (err) {
-          degradedCarry.restore(degradedCountAtStop);
-          throw err;
-        }
-      } finally {
-        await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
+  const stopListener = listener;
+  let stopPromise: Promise<void> | undefined;
+  function stop(): Promise<void> {
+    if (stopPromise) return stopPromise;
+    let phase = "state_STOP_ADMISSION_CLOSED";
+    let lapsed = false;
+    let drainLapsed = false;
+    let lapsePhase: string | undefined;
+    daemonStopping = true;
+    consumer.closeFlowAdmission();
+    phase = "state_STOP_TIMERS";
+    stopLeaseHeartbeat(); stopResolverLifecycleTimer(); stopAuditHeartbeat();
+    stopAgentEgressProbeTimer(); stopEmissionLivenessTimer();
+    if (pendingRequests.size > 0) consumer.noteIngressDrop("approval_shutdown", pendingRequests.size);
+    pendingRequests.clear();
+    // Cleanup initiation is guaranteed; an unsettled cleanup cannot be called complete.
+    const cleanup = removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
+    void cleanup.catch(() => undefined);
+    const began = performance.now();
+    const finalRecordReserveMs = Math.min(FLOW_STOP_FINAL_RECORD_RESERVE_MS, Math.floor(stopDeadlineMs / 6));
+    const drainCutoffMs = stopDeadlineMs - finalRecordReserveMs;
+    let timer: ReturnType<typeof setTimeout>;
+    let drainTimer: ReturnType<typeof setTimeout>;
+    const fenceConsumer = () => {
+      stopBudgetLapsed = true;
+      consumer.lapseStopBudget();
+    };
+    const expired = new Promise<false>(resolve => {
+      timer = setTimeout(() => {
+        lapsed = true;
+        lapsePhase ??= phase;
+        fenceConsumer();
+        resolve(false);
+      }, Math.max(0, stopDeadlineMs - (performance.now() - began)));
+    });
+    const drainExpired = new Promise<false>(resolve => {
+      drainTimer = setTimeout(() => {
+        // Earlier stop phases may still be waiting; their admitted consumer work must also leave the final record its reserved time.
+        fenceConsumer();
+        resolve(false);
+      }, Math.max(0, drainCutoffMs - (performance.now() - began)));
+    });
+    const step = async (state: string, work: () => Promise<unknown>): Promise<boolean> => {
+      if (lapsed) return false;
+      phase = state;
+      // Must match withAuditWriteSettlement in operational/audit-log.ts: expiry never releases write reservations or charges.
+      return Promise.race([Promise.resolve().then(work).then(() => !lapsed), expired]);
+    };
+    const drainStep = async (work: () => Promise<unknown>): Promise<void> => {
+      if (lapsed || drainLapsed) return;
+      phase = "state_STOP_DRAINS";
+      const completed = performance.now() - began < drainCutoffMs && await Promise.race([
+        Promise.resolve().then(work).then(() => true), drainExpired, expired,
+      ]);
+      if (!completed && !lapsed) {
+        // Informational drains retain ownership while the final record keeps its reserved time.
+        drainLapsed = true;
+        lapsePhase = phase;
+        fenceConsumer();
       }
-    },
-  };
+    };
+    stopPromise = (async () => {
+      try {
+        if (!await step("state_STOP_RESOLVER_WAIT", async () => { await resolverLifecycleRefresh?.catch(() => undefined); })) return;
+        if (!await step("state_STOP_HEARTBEAT_IDLE", waitForAuditHeartbeatIdle)) return;
+        if (!await step("state_STOP_LEASE_STANDDOWN", () => stopListener.broadcastArmLease(buildArmLease({ armed: false, ttlSeconds: null, heartbeatIntervalSeconds })).catch(() => undefined))) return;
+        if (!await step("state_STOP_LISTENER", () => stopListener.stop())) return;
+        await drainStep(() => consumer.drainFlowAdmission());
+        await drainStep(() => Promise.all([
+          consumer.drainIngressDrops(() => !lapsed && !drainLapsed), consumer.drainCoalescedFlowSummaries(() => !lapsed && !drainLapsed), consumer.drainNonAgentFlowSummary(() => !lapsed && !drainLapsed),
+        ]));
+        if (lapsed) return;
+        const degradedCountAtStop = degradedCarry.reserve();
+        if (!await step("state_STOP_FINAL_RECORD", async () => {
+          try {
+            // Record the final marker so the silent-death reader recognizes this clean operator stop as an INTENTIONAL stand-down.
+            await input.auditLog.append("l1", "filter_stopped", protectionClaimSubject, {
+              socket_path: socketPath, source: auditSource, fortress_id: input.fortressId,
+              ...(degradedCountAtStop > 0 ? { audit_write_degraded_count: degradedCountAtStop } : {}),
+              [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+            }, "success");
+          } catch (error) { degradedCarry.restore(degradedCountAtStop); throw error; }
+        })) return;
+        if (!await step("state_STOP_FINAL_RECORD", () => input.auditLog.flush())) return;
+        await step("state_STOP_CLEANUP", () => cleanup);
+      } finally {
+        clearTimeout(timer!);
+        clearTimeout(drainTimer!);
+        // stderr is the surface that does not depend on the failing sink; every stop exit reports pending evidence from one snapshot
+        const evidence = consumer.getPendingEvidenceSnapshot();
+        const { admission, ingress_loss_pending: loss, coalesced_pending: coalesced, non_agent: nonAgent } = evidence;
+        if (lapsePhase || Object.values(loss.counts).some(count => count > 0) || coalesced.coalesced_evidence_pending > 0) {
+          // SAFETY: the diagnostic contains bounded counters and a fixed stop-phase name, never flow payloads.
+          console.error(`[castle-wall] ${lapsePhase ? "stop budget lapsed" : "stop pending evidence"} phase=${lapsePhase ?? phase} pending_loss=${JSON.stringify(loss)} pending_coalesced=${coalesced.coalesced_evidence_pending} coalesced_counters_lower_bound=${evidence.coalesced_counters_lower_bound} unadmitted=${admission.unadmitted} active=${admission.active} pending_non_agent=${JSON.stringify(nonAgent)}`);
+        } else if (evidence.non_agent_pending) {
+          // SAFETY: non-agent evidence contains bounded aggregate counters, never flow payloads.
+          console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(nonAgent)}`);
+        }
+      }
+    })();
+    return stopPromise;
+  }
+  return { socketPath, reloadPolicy, stop };
 }
 
 function buildArmLease(input: {

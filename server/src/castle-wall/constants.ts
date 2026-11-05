@@ -348,6 +348,19 @@ export const CASTLE_WALL_RELOAD_DIAGNOSTIC_MAX_ELAPSED_MS =
  */
 export const CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS = 12_000 as const;
 
+/** Twelve seconds of daemon work, four of CLI completion, four of external margin.
+ * Must match the default 20-second launchd window in cli/castle-wall-full-agent.ts,
+ * whose plist supplies no ExitTimeOut; storage lock release retains its own budget.
+ */
+export const CASTLE_WALL_STOP_DEADLINE_MS = 12_000;
+/** 2000 = 12000 / 6: one durable audit append measures well under a second on the fixture
+ * box, so one sixth of the stop budget leaves a slow disk two seconds for the final record.
+ */
+export const FLOW_STOP_FINAL_RECORD_RESERVE_MS = CASTLE_WALL_STOP_DEADLINE_MS / 6;
+/** Must match CASTLE_WALL_STOP_DEADLINE_MS above: completion precedes launchd's default deadline. */
+export const CASTLE_WALL_STOP_EXIT_DEADLINE_MS = 16_000;
+
+
 /**
  * Daemon-side backstop deadline (ms) for the broadcast phase of a policy reload
  * (fanning the freshly-signed manifest to sysext subscribers). A wedged

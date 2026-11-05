@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- macOS Castle Wall counts repeated admitted flow decisions in fixed-size informational summaries and reports pending audit loss through heartbeat and stop diagnostics. Admission memory lasts for one consumer lifetime; restart restores the last durable primary position, so a previously counted fresh sequence can be admitted again.
+
+### Fixed
+
+- Castle Wall daemon stop uses a twelve-second shared budget, with a sixteen-second CLI exit backstop and closed flow admission during teardown.
+
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
 - `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.

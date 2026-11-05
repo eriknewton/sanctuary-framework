@@ -61,6 +61,7 @@ export function generateFullAgentPlist(programArguments: readonly string[]): str
     if (key !== "PATH" || FORBIDDEN_PLIST_ENV.includes(key!)) throw new Error("Forbidden LaunchAgent environment name.");
     assertSafeText(value!);
   }
+  // Must match CASTLE_WALL_STOP_DEADLINE_MS and CASTLE_WALL_STOP_EXIT_DEADLINE_MS in castle-wall/constants.ts: the plist sets no ExitTimeOut, so launchd's default 20-second window applies and STOP < EXIT < that window.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
