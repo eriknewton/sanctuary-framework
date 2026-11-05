@@ -129,7 +129,8 @@ function renderedRows(html: string, home: PostureHome) {
     ${esc}\n${layers}\n${render}\nreturn renderHome;
   `)(document, noop);
   renderHome(home);
-  const decode = (s: string) => s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  // Ampersand is unescaped last so an escaped entity such as "&amp;lt;" decodes once, to "&lt;", never to "<".
+  const decode = (s: string) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
   return Array.from(element.innerHTML.matchAll(/<span class="pill [^"]+">([^<]*)<\/span><span class="name">([^<]*)<\/span><span class="why">([^<]*)<\/span>/g),
     match => ({ name: decode(match[2]!), status: decode(match[1]!), basis: decode(match[3]!) })); // Capture groups follow status, name, basis in markup order.
 }
