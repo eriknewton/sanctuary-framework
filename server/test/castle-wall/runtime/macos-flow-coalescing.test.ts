@@ -567,7 +567,9 @@ it.each(["channel", "pinned"] as const)("detached %s storage settlement preserve
   requireSummary(fixture().consumer); const module = await load(); expect(module).not.toBeNull();
   const root = await mkdtemp("/tmp/cw-reservation-owners-");
   const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(root, "state"));
-  const holdDeadlineMs = 100; // A short real storage deadline separates caller rejection from detached settlement.
+  // A real storage deadline separates caller rejection from detached settlement. Held writes must exceed it and the healthy setup,
+  // control and retry writes run under it too, so one second leaves scheduling headroom for those on a loaded CI runner.
+  const holdDeadlineMs = 1_000;
   const audit = new AuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: holdDeadlineMs });
   const gate = deferred(), entered = deferred(); let hold = false;
   const payloads: Array<{ operation: string; bytes: string }> = [];
@@ -653,9 +655,11 @@ it.each(["channel", "pinned"] as const)("detached %s storage settlement preserve
 
 import { AsyncLocalStorage } from "node:async_hooks";
 const SINGLE_OWNER = 1; // One writer owns each immutable reservation until caller and storage settle.
-const HOLD_DEADLINE_MS = 100; // Short real lock hold; setup and cleanup have separate timeout headroom.
+// Real lock hold. The selected attempts are held past it; every healthy primary and retry also runs under it, so one second
+// leaves scheduling headroom for those on a loaded CI runner. Setup and cleanup have separate timeout headroom.
+const HOLD_DEADLINE_MS = 1_000;
 const SERIAL_DEADLINES = 2; // Summary and loss expire independently, in that order.
-const SETUP_TIMEOUT_MS = HOLD_DEADLINE_MS * 100; // Filesystem setup and recovery polling have one hundred hold intervals.
+const SETUP_TIMEOUT_MS = HOLD_DEADLINE_MS * 10; // Filesystem setup and recovery polling have ten hold intervals (ten seconds, as before).
 const OWNER_TIMEOUT_MS = SETUP_TIMEOUT_MS * 3 + SERIAL_DEADLINES * HOLD_DEADLINE_MS; // Setup, schedule and cleanup plus both deadlines.
 const SUMMARY_OPERATION = "castle_wall_flow_decisions_coalesced";
 const LOSS_OPERATION = "castle_wall_ingress_discarded";
