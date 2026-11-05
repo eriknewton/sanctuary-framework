@@ -1013,7 +1013,7 @@ function toBase64url(bytes: Uint8Array): string {
 }
 const daemonPriv = ed25519.utils.randomPrivateKey();
 const daemonPubB64 = toBase64url(ed25519.getPublicKey(daemonPriv));
-const NOW = 1750000000000;
+const NOW = 1750000000000; // Fixed Unix milliseconds keep signed freshness deterministic.
 const SIGNED_TS = NOW - 1000;
 const FORTRESS_ID = "f";
 const SIGNED_AGENT_UID = 503;
@@ -1153,7 +1153,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
         expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
         expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
     });
-    it("R-1: PERSISTS the signed canonical bytes + captured_at so a reader can re-verify", async () => {
+    it("PERSISTS the signed canonical bytes and captured_at so a reader can re-verify", async () => {
         const event = blockedEvent(0, null);
         const env = signedEnvelope(event, daemonPriv);
         await consumer.ingestCritical(env);
@@ -1176,7 +1176,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
         })();
         expect(ed25519.verify(sigBytes, reBytes, ed25519.getPublicKey(daemonPriv))).toBe(true);
     });
-    it("REJECTS an enforcement event with NO signature (the load-bearing test)", async () => {
+    it("REJECTS an enforcement event with NO signature", async () => {
         const event = blockedEvent(0, null);
         let acked = false;
         const env: CriticalEventEnvelope = {
@@ -1308,7 +1308,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
         const rej = sink.entries.find((e) => e.operation === "producer_signature_rejected");
         expect(rej?.details?.reason).toBe("producer_signed_body_operation_event_type_mismatch");
     });
-    it("REJECTS a STALE genuine signed frame replayed after a restart (freshness)", async () => {
+    it("REJECTS a STALE genuine signed frame replayed after a restart", async () => {
         const fresh = new AuditConsumer(sink, undefined, {
             pinnedProducerKeyB64url: daemonPubB64,
             now: () => NOW,
@@ -1763,4 +1763,128 @@ it("unsupported signed operation and verdict pairs retain primary persistence", 
   }
   expect(f.consumer.getStats()).toMatchObject({ acceptedCriticalEvents: 2, coalescedCriticalEvents: 0 });
   expect(f.coalescer.snapshot().keys).toBe(0);
+});
+
+const signedWindowCases = [
+  ["active enforcement", "active"], ["persisted signature", "accepted"],
+  ["persisted canonical bytes", "accepted"], ["required signature", "no-signature"],
+  ["required subject binding", "no-binding"], ["required signed agent", "no-agent"],
+  ["uid subject derivation", "bad-agent"], ["required signed identity", "no-identity"],
+  ["pinned producer key", "wrong-key"], ["signed evidence fields", "substitution"],
+  ["operation correspondence", "operation"], ["fresh signed evidence", "stale"],
+  ["unsigned control events", "control"], ["accepted projection metadata", "accepted"],
+  ["projection exception commit and ACK", "projection"], ["single read projection token", "token"],
+  ["saturating destination conflicts", "conflict"], ["signed display and envelope reason", "display"],
+  ["mint exception commit and ACK", "mint"], ["distinct enrolled subjects", "subjects"],
+] as const;
+for (const [label, scenario] of signedWindowCases) it(`established signed window preserves ${label}`, async () => {
+  const module = await import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").catch(() => null);
+  expect(module).not.toBeNull();
+  const results = [];
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try { for (const enabled of [false, true]) {
+    const trace: unknown[][] = []; let invocation = 0;
+    const counted = new Set<number>();
+    const sink: AuditSink = { append(...args) { trace.push(["append", invocation, JSON.stringify(args)]); }, async flush() { trace.push(["flush", invocation]); } };
+    const coalescer = new module!.FlowCoalescer("signed-window", () => FLOW_NOW);
+    const bridge = new UnifiedInboxBridge({
+      auditLog: new AuditLog(new MemoryStorage(), new Uint8Array(32)), // AES-256 fixture key length.
+      identityId: "fixture", fortressId: "fixture", now: () => new Date(FLOW_NOW),
+    });
+    const consumer = new AuditConsumer(sink, bridge, { pinnedProducerKeyB64url: flowPin, now: () => FLOW_NOW,
+      chainContinuity: "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
+    const head = liveEnvelope(0, null); await consumer.ingestCritical(head);
+    expect(consumer.getWalChainState().lastAckedSeq, "the signed setup head is settled").toBe(0);
+    if (enabled) expect(coalescer.snapshot().keys, "the verified live subject owns an open window").toBe(1);
+    const needsProjection = ["projection", "conflict", "mint"].includes(scenario);
+    const envelope: CriticalEventEnvelope = liveEnvelope(1, flowHash(head.producer.eventCanonicalJson), needsProjection ? "192.0.2.2" : "192.0.2.1");
+    const body = JSON.parse(envelope.producer!.eventCanonicalJson);
+    let signingKey = flowKey;
+    switch (scenario) {
+      case "no-agent": delete body.details.agent_id; break;
+      case "bad-agent": body.details.agent_id = "non-token-subject"; break;
+      case "no-identity": delete body.identity_id; envelope.producerSubjectBinding = { kind: "signed_identity_id" }; break;
+      case "wrong-key": signingKey = ed25519.utils.randomPrivateKey(); break;
+      case "operation": body.operation = "egress_allowed"; break;
+      case "mint": delete body.timestamp; break;
+    }
+    envelope.producer!.eventCanonicalJson = canonicalize(body);
+    if (scenario === "stale") envelope.producer!.capturedAtUnixMs = FLOW_NOW - 10 * 60_000; // Ten minutes is beyond the five-minute live freshness bound.
+    envelope.producer!.signatureB64url = Buffer.from(ed25519.sign(producerSigningBytes(envelope.producer!.eventCanonicalJson, envelope.producer!.capturedAtUnixMs, envelope.producer!.seq), signingKey)).toString("base64url");
+    if (scenario === "no-signature") envelope.producer = undefined;
+    if (scenario === "no-binding") envelope.producerSubjectBinding = undefined;
+    if (scenario === "substitution") envelope.event.agent = { id: "envelope-subject", template: "fixture" };
+    if (scenario === "display") { envelope.event.destination = null; envelope.event.details.reason = "envelope reason"; }
+    if (scenario === "control") { envelope.producer = undefined; envelope.event.event_type = "operator_decision"; }
+    if (scenario === "conflict") {
+      envelope.event.destination = { ...envelope.event.destination!, host: "envelope.example" };
+      (consumer as unknown as { stats: { blockedEgressDestinationConflicts: number } }).stats.blockedEgressDestinationConflicts = Number.MAX_SAFE_INTEGER - 1;
+      warnings.mockImplementation(() => { throw new Error("fixture logging unavailable"); });
+    }
+    const projection = vi.spyOn(bridge, "ingestBlockedEgress");
+    const reads: Array<ReturnType<typeof readConsumerMintedBlockedEgress>> = [];
+    if (scenario === "projection") projection.mockImplementation(() => { throw new Error("fixture projection unavailable"); });
+    if (scenario === "token") projection.mockImplementation((_input, token) => { reads.push(readConsumerMintedBlockedEgress(token), readConsumerMintedBlockedEgress(token)); return null; });
+    const before = consumer.getStats(); trace.length = 0;
+    const deliver = async (env: CriticalEventEnvelope, target = consumer) => {
+      invocation++;
+      try {
+        await target.ingestCritical({ ...env, ack: async () => { trace.push(["ACK", invocation]); } }, { classify(kind) { if (kind === "coalesced") counted.add(invocation); } });
+        trace.push(["fulfilled", invocation]);
+      } catch (error) { trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]); }
+    };
+    await deliver(envelope);
+    if (scenario === "subjects") {
+      const secondKey = new Uint8Array(32).fill(7); // Deterministic Ed25519 fixture seed, separate from the first producer.
+      const uid = FLOW_UID + 1; // A second enrolled principal owns its own key and window.
+      const subjectToken = Buffer.from(new Uint32Array([0, uid, uid, uid, uid, 123, 1, 1]).buffer).toString("hex");
+      const secondCoalescer = new module!.FlowCoalescer("second-signed-window", () => FLOW_NOW);
+      const second = new AuditConsumer(sink, bridge, { pinnedProducerKeyB64url: Buffer.from(ed25519.getPublicKey(secondKey)).toString("base64url"), now: () => FLOW_NOW,
+        ...(enabled ? { liveFlowCoalescer: secondCoalescer } : {}) });
+      const signedSubject = (seq: number, prior: string | null) => {
+        const env = liveEnvelope(seq, prior), body = JSON.parse(env.producer.eventCanonicalJson);
+        body.details.agent_id = subjectToken; body.identity_id = subjectToken;
+        env.event.agent = { id: subjectToken, template: "fixture" };
+        env.producer.eventCanonicalJson = canonicalize(body);
+        env.producer.signatureB64url = Buffer.from(ed25519.sign(producerSigningBytes(env.producer.eventCanonicalJson, FLOW_NOW, seq), secondKey)).toString("base64url");
+        return env;
+      };
+      const secondHead = signedSubject(0, null), traceLength = trace.length;
+      await second.ingestCritical(secondHead); trace.splice(traceLength);
+      expect(second.getWalChainState().lastAckedSeq).toBe(0);
+      if (enabled) expect(secondCoalescer.snapshot().keys).toBe(1);
+      const next = signedSubject(1, flowHash(secondHead.producer.eventCanonicalJson));
+      await deliver(next, second);
+      expect(second.getStats()).toMatchObject({ acceptedCriticalEvents: enabled ? 1 : 2, coalescedCriticalEvents: enabled ? 1 : 0 });
+      expect(second.getWalChainState().lastEventChainHash).toBe(flowHash(next.producer.eventCanonicalJson));
+      expect(new Set(bridge.list().map(entry => entry.blocked_egress_admission?.origin))).toEqual(new Set([
+        `subject:fixture/uid-${FLOW_UID}`, `subject:fixture/uid-${uid}`,
+      ]));
+    }
+    if (scenario === "projection") await deliver(envelope);
+    if (scenario === "conflict") {
+      const next = liveEnvelope(2, flowHash(envelope.producer!.eventCanonicalJson), "192.0.2.3");
+      next.event.destination = { ...next.event.destination!, host: "envelope.example" };
+      await deliver(next);
+      expect(consumer.getStats().blockedEgressDestinationConflicts, "each conflicting head commits with saturated accounting").toBe(Number.MAX_SAFE_INTEGER);
+      expect(projection).not.toHaveBeenCalled();
+    }
+    if (scenario === "projection" || scenario === "mint") expect(consumer.getStats().blockedEgressProjectionFailures - before.blockedEgressProjectionFailures).toBe(1);
+    if (scenario === "token") {
+      expect(reads).toHaveLength(enabled ? 0 : 2);
+      if (!enabled) { expect(reads[0]).toBeDefined(); expect(reads[1]).toBeUndefined(); }
+    }
+    const stats = consumer.getStats();
+    const delta = Object.fromEntries(Object.entries(stats).map(([key, value]) => [key, value - before[key as keyof typeof before]]));
+    if (enabled && ["active", "accepted", "substitution", "token", "display", "subjects"].includes(scenario)) expect(delta.coalescedCriticalEvents, "the signed same-key trigger is counted").toBe(1);
+    results.push({ trace, counted, delta, state: consumer.getWalChainState() });
+    projection.mockRestore(); warnings.mockImplementation(() => {});
+  } } finally { warnings.mockRestore(); }
+  const [control, counted] = results;
+  expect(counted!.trace, "ordered signed trigger evidence preserves only the coalesced write omission").toEqual(control!.trace.filter(call => !(counted!.counted.has(call[1] as number) && (call[0] === "append" || call[0] === "flush"))));
+  const counters = (result: typeof control) => {
+    const { acceptedCriticalEvents, coalescedCriticalEvents, ...other } = result!.delta;
+    return { ...other, admissions: acceptedCriticalEvents! + coalescedCriticalEvents! };
+  };
+  expect(counters(counted)).toEqual(counters(control)); expect(counted!.state).toEqual(control!.state);
 });

@@ -826,15 +826,30 @@ export class MacOSFlowEventConsumer {
   /** Read current signed-flow floor for ordered-admission diagnostics. */
   getFlowChainState() { return this.producerAuditConsumer?.getWalChainState() ?? null; }
   /** Read all coalesced ownership, including an immutable reservation held in storage. */
-  getCoalescingSnapshot() { return { ...this.coalescer.snapshot(), summary_write_active: this.summaryWrite !== null }; }
+  getCoalescingSnapshot() { return this.publicCoalescingSnapshot(this.coalescer.snapshot()); }
+
+  private publicCoalescingSnapshot(snapshot: ReturnType<FlowCoalescer["snapshot"]>) {
+    const { keys, pending_keys, coalesced_total, keys_overflowed, coalesced_evidence_pending, coalesced_evidence_confirmed, summary_write_failures } = snapshot;
+    return { keys, pending_keys, coalesced_total, keys_overflowed, coalesced_evidence_pending, coalesced_evidence_confirmed, summary_write_failures };
+  }
+
+  /** Capture pending ownership once for heartbeat and sink-independent stop reporting. */
+  getPendingEvidenceSnapshot() {
+    const coalesced = this.coalescer.snapshot();
+    return { ingress_loss_pending: this.ingressLossSnapshot(coalesced), coalesced_pending: this.publicCoalescingSnapshot(coalesced),
+      coalesced_counters_lower_bound: coalesced.counters_lower_bound,
+      admission: this.getFlowAdmissionSnapshot(), non_agent: this.getNonAgentFlowCounters(), non_agent_pending: this.hasUnpersistedNonAgentFlows() };
+  }
 
   /** Close windows on the existing heartbeat; a busy slot never attaches another waiter. */
   flushCoalescedFlowSummaries(): Promise<void> {
     if (this.stopBudgetLapsed) return Promise.resolve();
     this.coalescer.closeWindows();
     if (this.summaryWrite !== null) return Promise.resolve();
+    // Reserve closed windows before yielding so reopened keys keep their new counts in a separate window.
+    const reservations = [...this.coalescer.reservations()];
     const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
-      for (const reservation of this.coalescer.reservations()) {
+      for (const reservation of reservations) {
         if (this.stopBudgetLapsed) return;
         try {
           if (!reservation.appended) {
@@ -883,7 +898,9 @@ export class MacOSFlowEventConsumer {
   }
 
   /** Snapshot live and reserved counts together; ownership transfers do not change pending totals. */
-  getIngressLossSnapshot() {
+  getIngressLossSnapshot() { return this.ingressLossSnapshot(this.coalescer.snapshot()); }
+
+  private ingressLossSnapshot(coalesced: ReturnType<FlowCoalescer["snapshot"]>) {
     const counts = { ...this.ingressDrops };
     let lowerBound = this.stats.counters_lower_bound;
     for (const reason of Object.keys(counts) as MacOSIngressDropReason[]) {
@@ -891,8 +908,8 @@ export class MacOSFlowEventConsumer {
       if (reserved > Number.MAX_SAFE_INTEGER - counts[reason]) lowerBound = true;
       counts[reason] = Math.min(Number.MAX_SAFE_INTEGER, counts[reason] + reserved);
     }
-    return { counts, counters_lower_bound: lowerBound, summary_write_failures: this.coalescer.snapshot().summary_write_failures,
-      coalesced_evidence_pending: this.coalescer.snapshot().coalesced_evidence_pending };
+    return { counts, counters_lower_bound: lowerBound, summary_write_failures: coalesced.summary_write_failures,
+      coalesced_evidence_pending: coalesced.coalesced_evidence_pending };
   }
 
   /** Reserve pending counts before yielding; attempted batches retain their own identity and content. */

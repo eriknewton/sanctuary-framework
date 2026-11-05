@@ -1,4 +1,4 @@
-import { CASTLE_WALL_STOP_DEADLINE_MS } from "../constants.js";
+import { CASTLE_WALL_STOP_DEADLINE_MS, FLOW_STOP_FINAL_RECORD_RESERVE_MS } from "../constants.js";
 import { execFile } from "node:child_process";
 import { resolveFortressCreateOwner } from "./fortress-create-owner.js";
 export { resolveFortressCreateOwner };
@@ -1599,6 +1599,7 @@ export async function startMacOSCastleWallDaemon(
       // never-started tick shows up as a null or stale value against the
       // advancing heartbeat timestamps instead of being invisible.
       const emissionLivenessSnapshot = emissionLivenessWatchdog.snapshot();
+      const evidence = consumer.getPendingEvidenceSnapshot();
       try {
         await input.auditLog.append(
           "l1",
@@ -1619,8 +1620,9 @@ export async function startMacOSCastleWallDaemon(
             ...(leaseDeliveryRecycles > 0
               ? { lease_delivery_recycles: leaseDeliveryRecycles }
               : {}),
-            ingress_loss_pending: consumer.getIngressLossSnapshot(),
-            coalesced_pending: consumer.getCoalescingSnapshot(),
+            ingress_loss_pending: evidence.ingress_loss_pending,
+            coalesced_pending: evidence.coalesced_pending,
+            coalesced_counters_lower_bound: evidence.coalesced_counters_lower_bound,
             emission_liveness: {
               decided_total: emissionLivenessSnapshot.decidedTotal,
               emitted_total: emissionLivenessSnapshot.emittedTotal,
@@ -1959,7 +1961,11 @@ export async function startMacOSCastleWallDaemon(
           resolvers: observedResolvers,
           rollbackLocalStateOnBroadcastFailure: true,
         });
-        if (daemonStopping) return;
+        if (daemonStopping) {
+          // A completed publication whose outcome row is skipped during stop contributes to the next degraded-write carry.
+          degradedCarry.record();
+          return;
+        }
         recordReloadOutcome(
           "policy_loaded",
           {
@@ -2078,6 +2084,8 @@ export async function startMacOSCastleWallDaemon(
     if (stopPromise) return stopPromise;
     let phase = "state_STOP_ADMISSION_CLOSED";
     let lapsed = false;
+    let drainLapsed = false;
+    let lapsePhase: string | undefined;
     daemonStopping = true;
     consumer.closeFlowAdmission();
     phase = "state_STOP_TIMERS";
@@ -2089,17 +2097,28 @@ export async function startMacOSCastleWallDaemon(
     const cleanup = removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     void cleanup.catch(() => undefined);
     const began = performance.now();
+    const finalRecordReserveMs = Math.min(FLOW_STOP_FINAL_RECORD_RESERVE_MS, Math.floor(stopDeadlineMs / 6));
+    const drainCutoffMs = stopDeadlineMs - finalRecordReserveMs;
     let timer: ReturnType<typeof setTimeout>;
+    let drainTimer: ReturnType<typeof setTimeout>;
+    const fenceConsumer = () => {
+      stopBudgetLapsed = true;
+      consumer.lapseStopBudget();
+    };
     const expired = new Promise<false>(resolve => {
       timer = setTimeout(() => {
         lapsed = true;
-        stopBudgetLapsed = true;
-        consumer.lapseStopBudget();
-        const admission = consumer.getFlowAdmissionSnapshot();
-        // SAFETY: independent operator diagnostic contains bounded accounting, never payloads.
-        console.error(`[castle-wall] stop budget lapsed phase=${phase} pending_loss=${JSON.stringify(consumer.getIngressLossSnapshot())} pending_coalesced=${consumer.getCoalescingSnapshot().coalesced_evidence_pending} unadmitted=${admission.unadmitted} active=${admission.active} pending_non_agent=${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
+        lapsePhase ??= phase;
+        fenceConsumer();
         resolve(false);
       }, Math.max(0, stopDeadlineMs - (performance.now() - began)));
+    });
+    const drainExpired = new Promise<false>(resolve => {
+      drainTimer = setTimeout(() => {
+        // Earlier stop phases may still be waiting; their admitted consumer work must also leave the final record its reserved time.
+        fenceConsumer();
+        resolve(false);
+      }, Math.max(0, drainCutoffMs - (performance.now() - began)));
     });
     const step = async (state: string, work: () => Promise<unknown>): Promise<boolean> => {
       if (lapsed) return false;
@@ -2107,23 +2126,34 @@ export async function startMacOSCastleWallDaemon(
       // Must match withAuditWriteSettlement in operational/audit-log.ts: expiry never releases write reservations or charges.
       return Promise.race([Promise.resolve().then(work).then(() => !lapsed), expired]);
     };
+    const drainStep = async (work: () => Promise<unknown>): Promise<void> => {
+      if (lapsed || drainLapsed) return;
+      phase = "state_STOP_DRAINS";
+      const completed = performance.now() - began < drainCutoffMs && await Promise.race([
+        Promise.resolve().then(work).then(() => true), drainExpired, expired,
+      ]);
+      if (!completed && !lapsed) {
+        // Informational drains retain ownership while the final record keeps its reserved time.
+        drainLapsed = true;
+        lapsePhase = phase;
+        fenceConsumer();
+      }
+    };
     stopPromise = (async () => {
       try {
         if (!await step("state_STOP_RESOLVER_WAIT", async () => { await resolverLifecycleRefresh?.catch(() => undefined); })) return;
         if (!await step("state_STOP_HEARTBEAT_IDLE", waitForAuditHeartbeatIdle)) return;
         if (!await step("state_STOP_LEASE_STANDDOWN", () => stopListener.broadcastArmLease(buildArmLease({ armed: false, ttlSeconds: null, heartbeatIntervalSeconds })).catch(() => undefined))) return;
         if (!await step("state_STOP_LISTENER", () => stopListener.stop())) return;
-        if (!await step("state_STOP_DRAINS", () => consumer.drainFlowAdmission())) return;
-        if (!await step("state_STOP_DRAINS", () => Promise.all([
-          consumer.drainIngressDrops(() => !lapsed), consumer.drainCoalescedFlowSummaries(() => !lapsed), consumer.drainNonAgentFlowSummary(() => !lapsed),
-        ]))) return;
-        if (consumer.hasUnpersistedNonAgentFlows()) {
-          // SAFETY: operator-facing accounting remains visible when the summary write fails promptly.
-          console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(consumer.getNonAgentFlowCounters())}`);
-        }
+        await drainStep(() => consumer.drainFlowAdmission());
+        await drainStep(() => Promise.all([
+          consumer.drainIngressDrops(() => !lapsed && !drainLapsed), consumer.drainCoalescedFlowSummaries(() => !lapsed && !drainLapsed), consumer.drainNonAgentFlowSummary(() => !lapsed && !drainLapsed),
+        ]));
+        if (lapsed) return;
         const degradedCountAtStop = degradedCarry.reserve();
         if (!await step("state_STOP_FINAL_RECORD", async () => {
           try {
+            // Record the final marker so the silent-death reader recognizes this clean operator stop as an INTENTIONAL stand-down.
             await input.auditLog.append("l1", "filter_stopped", protectionClaimSubject, {
               socket_path: socketPath, source: auditSource, fortress_id: input.fortressId,
               ...(degradedCountAtStop > 0 ? { audit_write_degraded_count: degradedCountAtStop } : {}),
@@ -2135,6 +2165,17 @@ export async function startMacOSCastleWallDaemon(
         await step("state_STOP_CLEANUP", () => cleanup);
       } finally {
         clearTimeout(timer!);
+        clearTimeout(drainTimer!);
+        // stderr is the surface that does not depend on the failing sink; every stop exit reports pending evidence from one snapshot
+        const evidence = consumer.getPendingEvidenceSnapshot();
+        const { admission, ingress_loss_pending: loss, coalesced_pending: coalesced, non_agent: nonAgent } = evidence;
+        if (lapsePhase || Object.values(loss.counts).some(count => count > 0) || coalesced.coalesced_evidence_pending > 0) {
+          // SAFETY: the diagnostic contains bounded counters and a fixed stop-phase name, never flow payloads.
+          console.error(`[castle-wall] ${lapsePhase ? "stop budget lapsed" : "stop pending evidence"} phase=${lapsePhase ?? phase} pending_loss=${JSON.stringify(loss)} pending_coalesced=${coalesced.coalesced_evidence_pending} coalesced_counters_lower_bound=${evidence.coalesced_counters_lower_bound} unadmitted=${admission.unadmitted} active=${admission.active} pending_non_agent=${JSON.stringify(nonAgent)}`);
+        } else if (evidence.non_agent_pending) {
+          // SAFETY: non-agent evidence contains bounded aggregate counters, never flow payloads.
+          console.error(`[castle-wall] non-agent flow summary not persisted at stop: ${JSON.stringify(nonAgent)}`);
+        }
       }
     })();
     return stopPromise;

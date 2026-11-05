@@ -660,7 +660,7 @@ describe("MacOSFlowIpcListener", () => {
     socket.write(envelope(notif));
 
     // Allow event-loop drain so the consumer side runs.
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     expect(h.audit.entries).toHaveLength(1);
     expect(h.audit.entries[0]?.operation).toBe("egress_blocked");
     expect(h.audit.entries[0]?.identityId).toBe(AGENT_TEST_SUBJECT);
@@ -691,7 +691,7 @@ describe("MacOSFlowIpcListener", () => {
     };
     socket.write(envelope(notif));
 
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     expect(h.approvals.enqueued).toHaveLength(1);
     expect(h.approvals.enqueued[0]?.requestId).toBe("req-pending-1");
     expect(h.approvals.enqueued[0]?.agentId).toBe(AGENT_PENDING_TOKEN);
@@ -707,7 +707,7 @@ describe("MacOSFlowIpcListener", () => {
 
     socket.destroy();
     // Allow event-loop drain for the close event to fire.
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     expect(h.listener.getStats().activeConnections).toBe(0);
   });
 
@@ -807,7 +807,7 @@ describe("MacOSFlowIpcListener", () => {
     // Then write a wrong-namespace envelope.
     socket.write(frame(JSON.stringify({ jsonrpc: "2.0", method: "other-namespace.foo", params: {} })));
 
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     const stats = h.listener.getStats();
     expect(stats.framesRejected).toBeGreaterThanOrEqual(2);
     // Connection survives malformed traffic and is still counted active.
@@ -863,7 +863,7 @@ describe("MacOSFlowIpcListener", () => {
       };
       socket.write(envelope(notif));
 
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
       expect(errorSpy).toHaveBeenCalled();
       const line = String(errorSpy.mock.calls.at(-1)?.[0] ?? "");
       expect(line).toContain("\\n");
@@ -904,9 +904,9 @@ describe("MacOSFlowIpcListener", () => {
       recorded_at: "2026-05-12T13:00:00Z",
     };
     for (let i = 0; i < 5; i++) {
-      socket.write(envelope({ ...flow, destination: { ...flow.destination, port: 1024 + i } }));
+      socket.write(envelope({ ...flow, destination: { ...flow.destination, port: 1024 + i } })); // Start above the reserved ports.
     }
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     expect(h.listener.getStats().framesDecoded).toBe(5);
     expect(h.audit.entries.filter((e) => e.operation === "egress_allowed")).toHaveLength(5);
   });
@@ -947,7 +947,7 @@ describe("MacOSFlowIpcListener", () => {
     for (let i = 0; i < 5; i++) {
       socket.write(envelope(flow));
     }
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     expect(h.listener.getStats().framesDecoded).toBe(5);
     expect(h.audit.entries.filter((e) => e.operation === "egress_allowed")).toHaveLength(1);
     expect(h.consumer.getStats().decisionsCoalesced).toBe(4);
@@ -981,7 +981,7 @@ describe("MacOSFlowIpcListener", () => {
       sockets.push(s);
       liveSockets.push(s);
     }
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 50)); // Fifty milliseconds allows socket dispatch to settle.
     expect(listener.getStats().activeConnections).toBeLessThanOrEqual(2);
   });
 

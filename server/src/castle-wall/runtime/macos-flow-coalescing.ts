@@ -25,6 +25,7 @@ export interface FlowCoalescingMetadata {
 
 /**
  * Informational summary; host represents the first counted arrival and is excluded from the key.
+ * Acceptance parity applies to ordered admissions within one running macOS live-flow consumer: every frame uses the existing consumer admission checks and rejection records unchanged, coalesced acceptance advances the same sequence-and-hash state, and restart restores only the last durable primary position, so a previously coalesced frame above that position may be admitted once again if it still passes freshness and all other admission checks.
  * Coalescing remembers admission only for the lifetime of this consumer. A persisted informational summary does not restore its coalesced sequences. After restart, a previously coalesced sequence above the restored primary position can be accepted again while fresh; subsequent delivery is subject to the ordinary duplicate and regression rules. Repeated restarts can repeat this effect until freshness expires. Unpersisted summary evidence can cover open, pending, and in-flight windows, including merged windows of unrestricted age during a continuing outage. Successfully persisted primary records remain durable; failed or unsettled heads have no durability guarantee.
  */
 export interface FlowCoalescedSummary extends FlowCoalescingMetadata {

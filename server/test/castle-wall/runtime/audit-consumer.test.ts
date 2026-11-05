@@ -781,7 +781,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         sink = new RecordingSink();
         consumer = new AuditConsumer(sink);
     });
-    it("appends + flushes + ACKs in order on a valid event", async () => {
+    it("appends and flushes and ACKs in order on a valid event", async () => {
         const event = buildAuditEvent({
             timestamp: "2026-05-04T00:00:00Z",
             fortress_id: "f",
@@ -828,7 +828,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(acked).toBe(true);
         expect(consumer.getStats().rejectedEvents).toBe(1);
     });
-    it("flattens agent + destination + decision + rule_id into details", async () => {
+    it("flattens agent and destination and decision and rule_id into details", async () => {
         const event = buildAuditEvent({
             timestamp: "2026-05-04T00:00:00Z",
             fortress_id: "f",
@@ -887,7 +887,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(consumer.getWalChainState().lastAckedSeq).toBe(6);
         expect(consumer.getWalChainState().lastEventChainHash).toBe(eventHash(eventSeq6));
     });
-    it("does not ACK or advance chain when critical persistence fails ", async () => {
+    it("does not ACK or advance chain when critical persistence fails", async () => {
         const faultingSink = new FaultingCriticalSink();
         const faultingConsumer = new AuditConsumer(faultingSink);
         const eventSeq5 = chainedEvent(5, null);
@@ -908,7 +908,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(faultingSink.entries[0]!.result).toBe("failure");
         expect(faultingSink.entries[0]!.details?.seq).toBe(5);
     });
-    it("refuses to BOOTSTRAP-accept a later event after a prior event failed to persist ", async () => {
+    it("refuses to BOOTSTRAP-accept a later event after a prior event failed to persist", async () => {
         const faultingSink = new FaultingCriticalSink();
         const faultingConsumer = new AuditConsumer(faultingSink);
         const eventSeq1 = chainedEvent(1, null);
@@ -928,7 +928,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(faultingConsumer.getWalChainState().lastAckedSeq).toBeNull();
         expect(faultingSink.entries.at(-1)!.operation).toBe("wal_chain_verification_failed");
     });
-    it("emits critical_event_ack_failed on ACK exception, does not throw ", async () => {
+    it("emits critical_event_ack_failed on ACK exception, does not throw", async () => {
         const eventSeq5 = chainedEvent(5, null);
         const ackError = new Error("ipc broken pipe");
         await consumer.ingestCritical({
@@ -949,7 +949,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(consumer.getWalChainState().lastAckedSeq).toBe(5);
         expect(consumer.getWalChainState().lastEventChainHash).toBe(eventHash(eventSeq5));
     });
-    it("drops duplicate critical event silently on daemon retry after ACK failure ", async () => {
+    it("drops duplicate critical event silently on daemon retry after ACK failure", async () => {
         const eventSeq5 = chainedEvent(5, null);
         await consumer.ingestCritical({
             event: eventSeq5,
@@ -976,7 +976,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
         expect(secondAcked).toBe(true);
     });
-    it("treats same-seq with different content as a genuine seq_regression (not a duplicate) ", async () => {
+    it("treats same-seq with different content as a genuine seq_regression", async () => {
         const eventSeq5 = chainedEvent(5, null);
         await consumer.ingestCritical({ event: eventSeq5, ack: async () => { } });
         const tampered = buildAuditEvent({
@@ -990,7 +990,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(dupEntries).toHaveLength(0);
     });
     const UNSAFE_INT = 2 ** 53 + 1;
-    it("settles an uncanonicalizable event on the reject (validateEvent-failure) path: recorded rejected + ACKed, never throws ", async () => {
+    it("settles an uncanonicalizable event on the reject path: recorded rejected and ACKed, never throws", async () => {
         const event = buildAuditEvent({
             timestamp: "2026-05-04T00:00:00Z",
             fortress_id: "f",
@@ -1015,7 +1015,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(consumer.getStats().rejectedEvents).toBe(1);
         expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
     });
-    it("settles an uncanonicalizable event on the accept/chain path as a SETTLED rejection, never accepts it, never throws ", async () => {
+    it("settles an uncanonicalizable event on the accept/chain path as a SETTLED rejection, never accepts it, never throws", async () => {
         const event = chainedEvent(5, null);
         const poisoned: CastleWallAuditEvent = {
             ...event,
@@ -1040,7 +1040,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(rejected!.details?.seq).toBe(5);
         expect(rejected!.details?.event_type).toBe("egress_allowed");
     });
-    it("does not wedge on redelivery of the same uncanonicalizable event (repeat delivery)", async () => {
+    it("settles repeated uncanonicalizable delivery", async () => {
         const event = chainedEvent(7, null);
         const poisoned: CastleWallAuditEvent = {
             ...event,
@@ -1065,7 +1065,7 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
         expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
         expect(consumer.getStats().rejectedEvents).toBe(2);
     });
-    it("a genuine event AFTER a settled uncanonicalizable rejection still chains and accepts normally (wall stays armed)", async () => {
+    it("a genuine event AFTER a settled uncanonicalizable rejection still chains and accepts normally", async () => {
         const poisonedSeq5 = {
             ...chainedEvent(5, null),
             details: { seq: 5, prior_sha256_hex: null, poison: UNSAFE_INT },
@@ -1102,4 +1102,103 @@ describe("castle-wall/runtime/audit-consumer : ingestMetricBatch", () => {
         expect(consumer.getStats().acceptedMetricBatches).toBe(1);
     });
 });
+});
+
+// These controls begin after the same signed head has settled in both consumers.
+const windowCases = [
+  ["ordered append flush and ACK", "accepted"],
+  ["malformed event ACK", "malformed"],
+  ["signed record fields", "accepted"],
+  ["missing chain fields", "missing"],
+  ["sequence regression", "regression"],
+  ["prior hash continuity", "prior"],
+  ["valid chain continuation", "accepted"],
+  ["primary failure and owed persistence", "persistence"],
+  ["ACK exception diagnostic", "ack"],
+  ["duplicate after ACK exception", "duplicate"],
+  ["changed content at the same sequence", "changed"],
+  ["uncanonicalizable malformed event", "malformed-number"],
+  ["uncanonicalizable admitted shape", "number"],
+  ["uncanonicalizable repeated delivery", "repeat-number"],
+  ["valid continuation after a settled rejection", "after-number"],
+  ["metric batch persistence", "metric"],
+] as const;
+for (const [label, scenario] of windowCases) it(`established live window preserves ${label}`, async () => {
+  const module = await import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").catch(() => null);
+  expect(module).not.toBeNull();
+  const results = [];
+  for (const enabled of [false, true]) {
+    const trace: unknown[][] = []; let fail = false, invocation = 0;
+    const counted = new Set<number>();
+    const sink: AuditSink = { append(...args) {
+      trace.push(["append", invocation, JSON.stringify(args)]);
+      if (fail && args[1] === "egress_blocked") throw new Error("fixture primary unavailable");
+    }, async flush() { trace.push(["flush", invocation]); } };
+    const coalescer = new module!.FlowCoalescer("window-parity", () => FLOW_NOW);
+    const consumer = new AuditConsumer(sink, undefined, { pinnedProducerKeyB64url: flowPin, now: () => FLOW_NOW,
+      chainContinuity: "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
+    const head = liveEnvelope(0, null);
+    await consumer.ingestCritical(head);
+    expect(consumer.getWalChainState().lastAckedSeq, "setup head has settled before the trigger").toBe(0);
+    if (enabled) expect(coalescer.snapshot().keys, "the signed live head opens the addressed window").toBe(1);
+    trace.length = 0; const before = consumer.getStats();
+    const deliver = async (envelope: ReturnType<typeof liveEnvelope>, ackFailure = false) => {
+      invocation++;
+      try {
+        await consumer.ingestCritical({ ...envelope, ack: async () => {
+          trace.push(["ACK", invocation, envelope.event.details.seq]);
+          if (ackFailure) throw new Error("fixture ACK unavailable");
+        } }, { classify(kind) { if (kind === "coalesced") counted.add(invocation); } });
+        trace.push(["fulfilled", invocation]);
+      } catch (error) {
+        trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]);
+      }
+    };
+    const next = liveEnvelope(1, flowHash(head.producer.eventCanonicalJson));
+    const poisoned = { ...next, event: { ...next.event, details: { ...next.event.details, value: Number.MAX_SAFE_INTEGER + 1 } } };
+    switch (scenario) {
+      case "malformed": case "malformed-number": {
+        const malformed = scenario === "malformed" ? next : poisoned;
+        await deliver({ ...malformed, event: { ...malformed.event, event_type: "unknown" as CastleWallAuditEvent["event_type"] } }); break;
+      }
+      case "missing": await deliver({ ...next, event: { ...next.event, details: {} } }); break;
+      case "regression": case "changed": await deliver(liveEnvelope(0, null, "192.0.2.2")); break;
+      case "prior": await deliver(liveEnvelope(1, "different-prior")); break;
+      case "number": await deliver(poisoned); break;
+      case "repeat-number": await deliver(poisoned); await deliver(poisoned); break;
+      case "after-number": await deliver(poisoned); await deliver(next); break;
+      case "ack": await deliver(next, true); break;
+      case "duplicate": await deliver(next, true); await deliver(next); break;
+      case "persistence": {
+        fail = true;
+        const failed = liveEnvelope(1, flowHash(head.producer.eventCanonicalJson), "192.0.2.2");
+        await deliver(failed);
+        await deliver(liveEnvelope(2, flowHash(failed.producer.eventCanonicalJson)));
+        expect(trace.filter(call => call[0] === "append" && JSON.parse(String(call[2]))[1] === "egress_blocked"),
+          "owed primary attempts persistence beside an established matching window").toHaveLength(2);
+        expect((consumer as unknown as { pendingUnpersistedSeq: number }).pendingUnpersistedSeq).toBe(2);
+        break;
+      }
+      case "metric": consumer.ingestMetricBatch("fixture", { windowStart: "start", windowEnd: "end", byDestination: [] }); break;
+      default: await deliver(next);
+    }
+    const stats = consumer.getStats();
+    const delta = Object.fromEntries(Object.entries(stats).map(([key, value]) => [key, value - before[key as keyof typeof before]]));
+    const admissions = delta.acceptedCriticalEvents! + delta.coalescedCriticalEvents!;
+    if (enabled && ["accepted", "ack", "duplicate", "after-number"].includes(scenario)) {
+      expect(delta.coalescedCriticalEvents, "eligible same-key trigger is counted after the settled head").toBe(1);
+    }
+    results.push({ trace, counted, delta, admissions, state: consumer.getWalChainState() });
+  }
+  const [control, counted] = results;
+  expect(counted!.trace, "trigger evidence bytes and ACK order preserve the admitted write omission").toEqual(control!.trace.filter(call =>
+    !(counted!.counted.has(call[1] as number) && (call[0] === "append" || call[0] === "flush") &&
+      // ACK diagnostics occur after ACK and remain ordinary evidence.
+      (call[0] === "flush" ? control!.trace.indexOf(call) < control!.trace.findIndex(item => item[0] === "ACK" && item[1] === call[1]) : !String(call[2]).includes("critical_event_ack_failed")))));
+  const counters = (result: typeof control) => {
+    const { acceptedCriticalEvents, coalescedCriticalEvents, ...other } = result!.delta;
+    return { ...other, admissions: result!.admissions };
+  };
+  expect(counters(counted)).toEqual(counters(control));
+  expect(counted!.state).toEqual(control!.state);
 });

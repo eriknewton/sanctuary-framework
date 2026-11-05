@@ -5,10 +5,10 @@ import type { AuditSink } from "../../../src/castle-wall/runtime/audit-consumer.
 const load = () => import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").catch(() => null);
 const UID = 501; // Ordinary fixture principal.
 const token = Buffer.from(new Uint32Array([0, UID, UID, UID, UID, 123, 1, 1]).buffer).toString("hex");
-function fixture(sink?: AuditSink) {
+function fixture(sink?: AuditSink, pinnedProducerKeyB64url?: string) {
   let now = Date.parse("2026-11-04T00:00:00Z");
   const entries: Array<{ operation: string; details: Record<string, unknown> | undefined }> = [];
-  const consumer = new MacOSFlowEventConsumer({ fortressId: "fixture", coalesceLiveFlows: true,
+  const consumer = new MacOSFlowEventConsumer({ fortressId: "fixture", coalesceLiveFlows: true, pinnedProducerKeyB64url,
     auditSink: sink ?? { append(_layer, operation, _identity, details) { entries.push({ operation, details }); }, async flush() {} },
     now: () => now, defaultApprovalTimeoutSeconds: 30, approvalQueue: { async enqueue() {} },
     manifestProvider: { currentSnapshot() { throw new Error("unused fixture snapshot"); } },
@@ -18,6 +18,9 @@ function fixture(sink?: AuditSink) {
     destination: { ip, port: 443, protocol: "tcp" as const, host: null, hostname_source: null, opaque: false },
     recorded_at: new Date(now).toISOString(),
   }; } };
+}
+function internalCoalescingSnapshot(consumer: MacOSFlowEventConsumer) {
+  return (consumer as unknown as { coalescer: { snapshot(): ReturnType<import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").FlowCoalescer["snapshot"]> } }).coalescer.snapshot();
 }
 function requireSummary(consumer: MacOSFlowEventConsumer) { expect(consumer.flushCoalescedFlowSummaries).toBeTypeOf("function"); }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -94,7 +97,7 @@ describe("counted flow windows", () => {
       for (let index = 0; index < 3; index++) await f.consumer.handleFlowDecisionRecorded(f.frame());
       await f.consumer.flushCoalescedFlowSummaries();
       expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_pending, "reservation plus mutable observations remain owned").toBe(4);
-      expect(f.consumer.getCoalescingSnapshot().max_records_per_key).toBe(2);
+      expect(internalCoalescingSnapshot(f.consumer).max_records_per_key).toBe(2);
       gate.resolve(); await first;
       expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_pending).toBe(4);
       hold = false; await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushCoalescedFlowSummaries();
@@ -108,7 +111,7 @@ describe("counted flow windows", () => {
     for (let index = 0; index < 3; index++) await f.consumer.handleFlowDecisionRecorded(f.frame());
     for (let attempt = 0; attempt < 3; attempt++) await f.consumer.flushCoalescedFlowSummaries();
     expect(new Set(payloads).size, "retry content and identifier stay stable").toBe(1);
-    expect(f.consumer.getCoalescingSnapshot(), "confirmation retires observations exactly once").toMatchObject({ coalesced_evidence_confirmed: 2, coalesced_evidence_pending: 0, coalescedSummariesWritten: 1, summary_write_failures: 2 });
+    expect(internalCoalescingSnapshot(f.consumer), "confirmation retires observations exactly once").toMatchObject({ coalesced_evidence_confirmed: 2, coalesced_evidence_pending: 0, coalescedSummariesWritten: 1, summary_write_failures: 2 });
   });
   it("retains at most FLOW_COALESCE_MAX_KEYS keys", async () => {
     const f = fixture(); requireSummary(f.consumer); const module = await load(); expect(module).not.toBeNull();
@@ -256,7 +259,7 @@ it("stays within fixed bounds under a sustained same-key stream", async () => {
       expect(primaries, "primary writes equal independently scheduled heads").toBe(expectedHeads);
       if (healthy) expect(summaries).toBe(expectedHeads);
       for (let index = 0; index < FLOW_COALESCE_TEST_DISTINCT_KEYS; index++) await f.consumer.handleFlowDecisionRecorded(f.frame(`198.51.${Math.floor(index / 256)}.${index % 256}`)).catch(() => undefined);
-      const c = f.consumer.getCoalescingSnapshot(), stats = f.consumer.getStats();
+      const c = internalCoalescingSnapshot(f.consumer), stats = f.consumer.getStats();
       expect(c.keys).toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_KEYS);
       expect(c.max_records_per_key).toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_RECORDS_PER_KEY);
       expect(c.retained_bytes).toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_KEYS * (module!.FLOW_COALESCE_MAX_KEY_BYTES + module!.FLOW_COALESCE_MAX_RECORDS_PER_KEY * module!.FLOW_COALESCE_MAX_RECORD_BYTES));
@@ -339,7 +342,7 @@ async function heldListenerWorkload(module: NonNullable<Awaited<ReturnType<typeo
     holding = false; gate.resolve();
     await vi.waitFor(() => expect(charge()).toBe(0), { timeout: 5000 }); // Filesystem settlement allowance, separate from stop tests.
     await f.consumer.drainIngressDrops(); await f.consumer.flushCoalescedFlowSummaries();
-    const stats = f.consumer.getStats(), snapshot = f.consumer.getCoalescingSnapshot();
+    const stats = f.consumer.getStats(), snapshot = internalCoalescingSnapshot(f.consumer);
     // The first held window closed at a scheduled flush; its successor owns the remaining admitted arrivals.
     expect(primaryWrites).toBe(2);
     expect(stats.received).toBe(stats.waiting_or_in_flight + stats.primary_confirmed + stats.coalesced + stats.rejection_confirmed + stats.duplicate_settled + stats.delivery_unconfirmed_or_discarded);
@@ -447,4 +450,202 @@ it("failed bootstrap preserves ordinary refusal and watchdog accounting", async 
     expect(consumer.getStats()).toMatchObject({ decisionsCoalesced: 0, rejection_confirmed: 1, delivery_unconfirmed_or_discarded: 1 });
     expect(watchdog.snapshot()).toMatchObject({ decidedTotal: 2, emittedTotal: 0, rejectedTotal: 2 });
   } finally { await consumer.drainIngressDrops(); log.mockRestore(); }
+});
+
+it("arrivals addressing open keys perform one table lookup each", async () => {
+  requireSummary(fixture().consumer); const module = await load(); expect(module).not.toBeNull();
+  let operations = 0;
+  class CountingMap<K, V> extends Map<K, V> {
+    override get(key: K) { operations++; return super.get(key); }
+    override has(key: K) { operations++; return super.has(key); }
+    override set(key: K, value: V) { operations++; return super.set(key, value); }
+    override *entries(): MapIterator<[K, V]> { for (const entry of super.entries()) { operations++; yield entry; } }
+    override *keys(): MapIterator<K> { for (const key of super.keys()) { operations++; yield key; } }
+    override *values(): MapIterator<V> { for (const value of super.values()) { operations++; yield value; } }
+    override [Symbol.iterator]() { return this.entries(); }
+    override forEach(callback: (value: V, key: K, map: Map<K, V>) => void, thisArg?: unknown) {
+      super.forEach((value, key) => { operations++; callback.call(thisArg, value, key, this); });
+    }
+  }
+  const coalescer = new module!.FlowCoalescer("table-work", () => 0);
+  (coalescer as unknown as { windows: Map<string, unknown> }).windows = new CountingMap();
+  const metadata = (port: number) => ({ subject: "fixture/uid-501", destination: { ip: "192.0.2.1", port, protocol: "tcp" as const, host: null }, decision: "drop" as const });
+  for (let index = 0; index < module!.FLOW_COALESCE_MAX_KEYS; index++) {
+    const head = coalescer.classify(metadata(index)); if (head.kind === "head") head.settled(true);
+  }
+  operations = 0;
+  const arrivals = module!.FLOW_COALESCE_MAX_KEYS * 2; // Two passes address every already-open key.
+  const lookupsPerArrival = 1; // Existing-key classification needs only windows.get, with no table traversal.
+  for (let index = 0; index < arrivals; index++) coalescer.classify(metadata(index % module!.FLOW_COALESCE_MAX_KEYS));
+  expect(operations, "open-key arrivals perform at most one independently counted map operation each").toBeLessThanOrEqual(lookupsPerArrival * arrivals);
+});
+
+it("a key reopened during a held flush keeps its closed reservation and a new window", async () => {
+  const gate = deferred(), entered = deferred(); let hold = true, reject = true;
+  const payloads: Array<Record<string, unknown>> = [];
+  const f = fixture({ async append(_l, operation, _id, details) {
+    if (operation !== "castle_wall_flow_decisions_coalesced") return;
+    payloads.push(structuredClone(details!));
+    if (hold) { entered.resolve(); await gate.promise; }
+    if (reject) throw new Error("fixture summary unavailable");
+  }, async flush() {} }); requireSummary(f.consumer);
+  try {
+    for (const ip of ["192.0.2.1", "192.0.2.2"]) {
+      await f.consumer.handleFlowDecisionRecorded(f.frame(ip)); await f.consumer.handleFlowDecisionRecorded(f.frame(ip));
+    }
+    const writing = f.consumer.flushCoalescedFlowSummaries(); await entered.promise;
+    await f.consumer.handleFlowDecisionRecorded(f.frame("192.0.2.2"));
+    await f.consumer.handleFlowDecisionRecorded(f.frame("192.0.2.2"));
+    gate.resolve(); await writing; hold = false; reject = false;
+    await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushCoalescedFlowSummaries();
+    expect(payloads[1], "retry bytes keep the first immutable reservation").toEqual(payloads[0]);
+    const secondKey = payloads.filter(record => (record.destination as { ip: string }).ip === "192.0.2.2");
+    expect(secondKey.map(record => [record.coalesced_count, record.windows_merged]), "the closed reservation and reopened window each represent one window").toEqual([[1, 1], [1, 1]]);
+    expect(new Set(secondKey.map(record => record.summary_seq)).size).toBe(2);
+    expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_confirmed).toBe(3);
+  } finally { hold = false; reject = false; gate.resolve(); await f.consumer.drainCoalescedFlowSummaries(); }
+});
+
+it("expiry keeps windows and loss reservations unchanged", async () => {
+  const f = fixture(); requireSummary(f.consumer);
+  const module = await load(); expect(module).not.toBeNull();
+  await f.consumer.handleFlowDecisionRecorded(f.frame()); await f.consumer.handleFlowDecisionRecorded(f.frame());
+  f.consumer.lapseStopBudget();
+  const internals = f.consumer as unknown as { coalescer: InstanceType<NonNullable<typeof module>["FlowCoalescer"]>; ingressReservation: unknown };
+  const close = vi.spyOn(internals.coalescer, "closeWindows");
+  const reserve = vi.spyOn(internals.coalescer, "reservations");
+  const before = internals.coalescer.snapshot();
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    f.consumer.noteIngressDrop("audit_backpressure");
+    await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushIngressDrops();
+    expect(close, "expiry closes no further window").not.toHaveBeenCalled();
+    expect(reserve, "expiry creates no further summary reservation").not.toHaveBeenCalled();
+    expect(internals.coalescer.snapshot()).toEqual(before);
+    expect(internals.ingressReservation, "expiry leaves pending loss outside a new reservation").toBeNull();
+  } finally { close.mockRestore(); reserve.mockRestore(); log.mockRestore(); }
+});
+
+it.each(["summary", "loss"] as const)("a held %s append starts no flush after expiry", async kind => {
+  const gate = deferred(), entered = deferred(); const calls: string[] = [];
+  const operation = kind === "summary" ? "castle_wall_flow_decisions_coalesced" : "castle_wall_ingress_discarded";
+  const f = fixture({ async append(_l, op) { calls.push(op); if (op === operation) { entered.resolve(); await gate.promise; } }, async flush() { calls.push("flush"); } });
+  requireSummary(f.consumer); const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    if (kind === "summary") { await f.consumer.handleFlowDecisionRecorded(f.frame()); await f.consumer.handleFlowDecisionRecorded(f.frame()); }
+    const writing = kind === "summary" ? f.consumer.flushCoalescedFlowSummaries() : (f.consumer.noteIngressDrop("audit_backpressure"), f.consumer.drainIngressDrops(() => false));
+    await entered.promise; f.consumer.lapseStopBudget(); const before = [...calls];
+    gate.resolve(); await writing;
+    expect(calls, "late append settlement starts no flush or further evidence write").toEqual(before);
+  } finally { gate.resolve(); await f.consumer.drainIngressDrops(); await f.consumer.drainCoalescedFlowSummaries(); log.mockRestore(); }
+});
+
+it("a pinned coalesced arrival changes no watchdog counter", async () => {
+  const now = Date.now(), key = ed25519.utils.randomPrivateKey();
+  const watchdog = new EmissionLivenessWatchdog({ now: () => now, onStall() {}, onRecovery() {} });
+  const consumer = new MacOSFlowEventConsumer({ fortressId: "fixture", coalesceLiveFlows: true, emissionLiveness: watchdog,
+    pinnedProducerKeyB64url: Buffer.from(ed25519.getPublicKey(key)).toString("base64url"), now: () => now,
+    auditSink: { append() {}, async flush() {} }, defaultApprovalTimeoutSeconds: 30, approvalQueue: { async enqueue() {} },
+    manifestProvider: { currentSnapshot() { throw new Error("unused"); } } });
+  requireSummary(consumer); let prior: string | null = null;
+  const signed = (seq: number) => {
+    const notification = fixture().frame(); notification.recorded_at = new Date(now).toISOString();
+    const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: token, result: "blocked",
+      details: { agent_id: token, dest_ip: notification.destination.ip, dest_port: 443, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
+    const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: now, seq, prior_sha256_hex: prior,
+      signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, now, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
+    prior = createHash("sha256").update(body).digest("hex"); return result;
+  };
+  await consumer.handleFlowDecisionRecorded(signed(0)); const before = watchdog.snapshot();
+  await consumer.handleFlowDecisionRecorded(signed(1));
+  expect(consumer.getStats().decisionsCoalesced).toBe(1);
+  expect(watchdog.snapshot(), "a pinned counted arrival changes no watchdog counter").toEqual(before);
+});
+
+it.each(["channel", "pinned"] as const)("detached %s storage settlement preserves reservation owners through repeated admission and stop", async mode => {
+  requireSummary(fixture().consumer); const module = await load(); expect(module).not.toBeNull();
+  const root = await mkdtemp("/tmp/cw-reservation-owners-");
+  const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(root, "state"));
+  const holdDeadlineMs = 100; // A short real storage deadline separates caller rejection from detached settlement.
+  const audit = new AuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: holdDeadlineMs });
+  const gate = deferred(), entered = deferred(); let hold = false;
+  const payloads: Array<{ operation: string; bytes: string }> = [];
+  const f = fixture({ append(...args) { payloads.push({ operation: args[1], bytes: JSON.stringify(args[3]) }); return audit.append(...args); }, flush: () => audit.flushDurable() }, mode === "pinned" ? Buffer.from(ed25519.getPublicKey(key)).toString("base64url") : undefined);
+  const listener = new MacOSFlowIpcListener({ socketPath: join(root, "unused.sock"), consumer: f.consumer });
+  const connection = { subscriberId: "fixture", registered: false, inbound: new Uint8Array(), telemetryBytes: 0, socket: { write() { return true; }, destroy() {} } };
+  const boundary = listener as unknown as { dispatchFrame(state: unknown, body: string): void; removeConnection(state: unknown): void; telemetryBytes: number };
+  let seq = 0, prior: string | null = null;
+  const arrival = () => {
+    const notification = f.frame();
+    if (mode === "channel") return notification;
+    const timestamp = Date.parse(notification.recorded_at);
+    const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: token, result: "blocked",
+      details: { agent_id: token, dest_ip: notification.destination.ip, dest_port: 443, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
+    const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: timestamp, seq, prior_sha256_hex: prior,
+      signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, timestamp, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
+    seq++; prior = createHash("sha256").update(body).digest("hex"); return result;
+  };
+  const dispatch = () => boundary.dispatchFrame(connection, JSON.stringify({ jsonrpc: "2.0", method: "castle-wall.flow_decision_recorded", params: arrival() }));
+  const internals = f.consumer as unknown as { coalescer: InstanceType<NonNullable<typeof module>["FlowCoalescer"]> };
+  const write = storage.writeDurable.bind(storage);
+  const spy = vi.spyOn(storage, "writeDurable").mockImplementation(async (...args) => {
+    if (hold && args[0] === "_audit" && args[1].startsWith("entry-")) { entered.resolve(); await gate.promise; }
+    return write(...args);
+  });
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  let summary: Promise<void> | undefined;
+  try {
+    await f.consumer.handleFlowDecisionRecorded(arrival()); await f.consumer.handleFlowDecisionRecorded(arrival());
+    hold = true; summary = f.consumer.flushCoalescedFlowSummaries(); await entered.promise;
+    await vi.waitFor(() => expect(audit.getWriteLockRecoveryCount()).toBeGreaterThan(0), { timeout: holdDeadlineMs * 20 }); // Room for filesystem deadline dispatch.
+    const reserved = [...internals.coalescer.reservations()][0]!.record;
+    const bytes = JSON.stringify(reserved);
+    f.consumer.noteIngressDrop("audit_backpressure");
+    const waves = 3, arrivals = module!.FLOW_COALESCE_MAX_KEYS; // Repeated waves cross storage deadlines while the old payload stays held.
+    for (let wave = 0; wave < waves; wave++) {
+      for (let index = 0; index < arrivals; index++) dispatch();
+      await turn(); await f.consumer.flushCoalescedFlowSummaries();
+      if (wave === 0) await vi.waitFor(() => expect(audit.getWriteLockRecoveryCount()).toBeGreaterThanOrEqual(3), { timeout: holdDeadlineMs * 20 });
+      expect(f.consumer.getFlowAdmissionSnapshot().active, "a failed primary retains admission until its detached write settles").toBe(1);
+      const snapshot = internals.coalescer.snapshot();
+      expect(snapshot.keys).toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_KEYS);
+      expect(snapshot.max_records_per_key).toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_RECORDS_PER_KEY);
+      expect(snapshot.retained_bytes).toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_KEYS * (module!.FLOW_COALESCE_MAX_KEY_BYTES + module!.FLOW_COALESCE_MAX_RECORDS_PER_KEY * module!.FLOW_COALESCE_MAX_RECORD_BYTES));
+      expect([...internals.coalescer.reservations()][0]!.record, "one immutable owner retains the reservation identifier").toBe(reserved);
+      expect(JSON.stringify(reserved)).toBe(bytes);
+    }
+    const charged = boundary.telemetryBytes;
+    expect(charged, "the detached head and its queued arrivals retain their listener charges").toBeGreaterThan(0);
+    boundary.removeConnection(connection); await listener.stop();
+    expect(boundary.telemetryBytes, "disconnect and stop retain the admitted storage charge").toBeGreaterThan(0);
+    hold = false; gate.resolve(); await summary; await f.consumer.drainFlowAdmission(); await f.consumer.drainIngressDrops();
+    await vi.waitFor(() => expect(boundary.telemetryBytes).toBe(0));
+    await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushCoalescedFlowSummaries();
+    const snapshot = internals.coalescer.snapshot();
+    expect(snapshot.coalesced_evidence_confirmed + snapshot.coalesced_evidence_pending,
+      "one immutable owner accounts for each observation after late settlement").toBe(f.consumer.getStats().coalesced);
+    expect(snapshot.coalesced_evidence_pending).toBe(0);
+    const summaries = payloads.filter(record => record.operation === "castle_wall_flow_decisions_coalesced");
+    expect(summaries[1]?.bytes, "the uncertain summary retry keeps its identifier and bytes").toBe(summaries[0]?.bytes);
+    const losses = payloads.filter(record => record.operation === "castle_wall_ingress_discarded");
+    const lossOwners = new Map<number, string>();
+    for (const record of losses) {
+      const id = (JSON.parse(record.bytes) as { batch_seq: number }).batch_seq;
+      if (lossOwners.has(id)) expect(record.bytes, "loss retries preserve one immutable reservation identifier").toBe(lossOwners.get(id));
+      lossOwners.set(id, record.bytes);
+    }
+    expect(losses.length, "loss ownership survives disconnect and stop cancellation").toBeGreaterThan(1);
+    const byIdentifier = new Map<number, string>();
+    for (const record of summaries) {
+      expect(Buffer.byteLength(record.bytes), "each settled summary respects the record byte cap").toBeLessThanOrEqual(module!.FLOW_COALESCE_MAX_RECORD_BYTES);
+      const id = (JSON.parse(record.bytes) as { summary_seq: number }).summary_seq;
+      if (byIdentifier.has(id)) expect(record.bytes, "one reservation identifier always denotes one immutable record").toBe(byIdentifier.get(id));
+      byIdentifier.set(id, record.bytes);
+    }
+    const stats = f.consumer.getStats();
+    expect(stats.received).toBe(stats.waiting_or_in_flight + stats.primary_confirmed + stats.coalesced + stats.rejection_confirmed + stats.duplicate_settled + stats.delivery_unconfirmed_or_discarded);
+  } finally {
+    hold = false; gate.resolve(); f.consumer.closeFlowAdmission(); await summary; await f.consumer.drainFlowAdmission();
+    await f.consumer.drainIngressDrops(); await audit.flush(); spy.mockRestore(); log.mockRestore(); await rm(root, { recursive: true, force: true });
+  }
 });

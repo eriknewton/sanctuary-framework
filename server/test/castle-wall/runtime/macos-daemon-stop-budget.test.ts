@@ -6,7 +6,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { startMacOSCastleWallDaemon, type MacOSCastleWallListenerOptions } from "../../../src/castle-wall/runtime/macos-daemon.js";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import type { AuditLog } from "../../../src/operational/audit-log.js";
-import { CASTLE_WALL_STOP_DEADLINE_MS, CASTLE_WALL_STOP_EXIT_DEADLINE_MS } from "../../../src/castle-wall/constants.js";
+import { CASTLE_WALL_STOP_DEADLINE_MS, CASTLE_WALL_STOP_EXIT_DEADLINE_MS, FLOW_STOP_FINAL_RECORD_RESERVE_MS } from "../../../src/castle-wall/constants.js";
 import * as custodyFs from "../../../src/storage/custody-fs.js";
 import { generateFullAgentPlist } from "../../../src/cli/castle-wall-full-agent.js";
 // Must match CASTLE_WALL_STOP_TEST_SLACK_MS in test/cli/castle-wall-stop-backstop.test.ts: one fake-clock millisecond.
@@ -25,8 +25,8 @@ function requireSummary() {
 }
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.useRealTimers(); });
 async function fixture(held = "none") {
-  const home = await mkdtemp("/tmp/cw-stop-budget-"); vi.stubEnv("HOME", home);
-  const gate = deferred(), entered = deferred(); const calls: string[] = [];
+  const home = await mkdtemp("/tmp/cw-stop-budget-");
+  const gate = deferred(), entered = deferred(), finalEntered = deferred(); const calls: string[] = [];
   let stopping = false, started = false;
   const intervals = new Map<number, () => void>();
   const setInterval = globalThis.setInterval;
@@ -39,6 +39,8 @@ async function fixture(held = "none") {
   const audit = { writeLockHoldDeadlineMs: BUDGET, onWriteLockRecovery() {},
     async append(_layer: string, operation: string, _identity: string, details?: Record<string, unknown>) {
       calls.push(operation);
+      if (operation === "filter_stopped") finalEntered.resolve();
+      if (held === "summary-reject" && operation === "castle_wall_flow_decisions_coalesced") throw new Error("fixture summary unavailable");
       if ((held === "final" && operation === "filter_stopped") || (held === "head" && operation === "egress_blocked") || (held === "summary" && operation === "castle_wall_flow_decisions_coalesced") ||
           (held === "loss" && operation === "castle_wall_ingress_discarded") ||
           (held === "non-agent" && operation === "castle_wall_non_agent_flows_observed") ||
@@ -53,11 +55,11 @@ async function fixture(held = "none") {
     platform: "darwin", daemonMode: "safe", socketPath: join(home, "fixture.sock"), activeConfigPath: join(home, "active.json"),
     globalPinnedPublicKeyPath: join(home, "pin"), auditProducerPublicKeyPath: join(home, "producer"), auditProducerStatePath: null,
     stopDeadlineMs: BUDGET, auditHeartbeatIntervalSeconds: 1, resolverLifecycleRefreshIntervalSeconds: 2, // Distinct fixture timer periods.
-    systemResolverProvider: async () => { if (held === "resolver" && started) { entered.resolve(); await gate.promise; } return []; }, agentEgressProbe: async () => true,
+    systemResolverProvider: async () => { if (held === "resolver" && started) { entered.resolve(); await gate.promise; } return held === "publication" && started ? ["192.0.2.53"] : []; }, agentEgressProbe: async () => true,
     signerClientInvoke: async (args, data) => ({ code: 0, stderr: "", stdout: Buffer.from(args[0] === "get-pubkey" ? ed25519.getPublicKey(key) : ed25519.sign(data!, key)).toString("base64url") }),
     listenerFactory(opts) { options = opts; return {
       async start() {}, async stop() { calls.push("listener-stop"); if (held === "listener") { entered.resolve(); await gate.promise; } },
-      async broadcastManifestUpdate() { return 0; }, async broadcastDecisionResponse() { return 0; }, recycleConnection() { return false; },
+      async broadcastManifestUpdate() { if (held === "publication" && started) { entered.resolve(); await gate.promise; } return 0; }, async broadcastDecisionResponse() { return 0; }, recycleConnection() { return false; },
       async broadcastArmLease() { if (stopping) { calls.push("standdown"); if (held === "lease") { entered.resolve(); await gate.promise; } } return 0; },
     }; },
   });
@@ -69,8 +71,8 @@ async function fixture(held = "none") {
       return read(...args);
     });
   }
-  return { consumer: options.consumer, calls, entries, entered, gate,
-    prepareHold() { if (held === "resolver") intervals.get(2000)!(); if (held === "heartbeat") intervals.get(1000)!(); },
+  return { consumer: options.consumer, calls, entries, entered, gate, finalEntered,
+    prepareHold() { if (held === "resolver" || held === "publication") intervals.get(2000)!(); if (held === "heartbeat") intervals.get(1000)!(); },
     stop() { stopping = true; return handle.stop(); }, async cleanup() { gate.resolve(); await handle.stop(); await turn(); await rm(home, { recursive: true, force: true }); } };
 }
 describe("daemon stop budget", () => {
@@ -90,7 +92,7 @@ describe("daemon stop budget", () => {
       if (held === "loss") { f.consumer.noteIngressDrop("audit_backpressure"); await f.entered.promise; }
       if (held === "non-agent") await f.consumer.handleFlowDecisionRecorded({ ...flow(), agent: { id: Buffer.alloc(8 * Uint32Array.BYTES_PER_ELEMENT).toString("hex"), template: "fixture" } });
       if (held === "summary") { await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow()); }
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
       let settled = false; const stop = f.stop().then(() => { settled = true; });
       await f.entered.promise;
       await vi.advanceTimersByTimeAsync(BUDGET + CASTLE_WALL_STOP_TEST_SLACK_MS);
@@ -115,7 +117,7 @@ describe("daemon stop budget", () => {
   it("a late phase release starts no further stop phase", async () => {
     requireSummary(); const f = await fixture("listener"); vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }); const stop = f.stop(); await f.entered.promise;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] }); const stop = f.stop(); await f.entered.promise;
       await vi.advanceTimersByTimeAsync(BUDGET + CASTLE_WALL_STOP_TEST_SLACK_MS); await stop;
       const before = [...f.calls]; f.gate.resolve(); await turn();
       expect(f.calls, "late listener completion cannot start final persistence").toEqual(before);
@@ -128,7 +130,7 @@ describe("daemon stop budget", () => {
     let queuedSettled = false; const queued = f.consumer.handleFlowDecisionRecorded(flow()).then(() => { queuedSettled = true; });
     let later: Promise<void> | undefined;
     try {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }); const stop = f.stop();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] }); const stop = f.stop();
       let laterSettled = false;
       later = f.consumer.handleFlowDecisionRecorded(flow()).then(() => { laterSettled = true; });
       await turn();
@@ -138,6 +140,104 @@ describe("daemon stop budget", () => {
       expect(f.consumer.getFlowAdmissionSnapshot().active).toBe(1);
       await vi.advanceTimersByTimeAsync(BUDGET + CASTLE_WALL_STOP_TEST_SLACK_MS); await stop;
     } finally { f.gate.resolve(); await active; await queued; await later; vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("the final-record reserve scales with an injected short stop budget", async () => {
+    requireSummary(); const f = await fixture("summary"); vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(FLOW_STOP_FINAL_RECORD_RESERVE_MS).toBe(CASTLE_WALL_STOP_DEADLINE_MS / 6);
+      await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const stop = f.stop(); await f.entered.promise;
+      const cutoff = BUDGET - Math.floor(BUDGET / 6);
+      await vi.advanceTimersByTimeAsync(cutoff - CASTLE_WALL_STOP_TEST_SLACK_MS);
+      expect(f.calls, "the short budget keeps a positive drain interval").not.toContain("filter_stopped");
+      await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_TEST_SLACK_MS);
+      await f.finalEntered.promise; await stop;
+      expect(performance.now()).toBe(cutoff);
+      expect(f.entries.some(entry => entry.operation === "filter_stopped")).toBe(true);
+    } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("a drain that outlives its cutoff fences consumer writes and keeps ownership", async () => {
+    requireSummary(); const f = await fixture("summary"); vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const stop = f.stop(); await f.entered.promise;
+      await vi.advanceTimersByTimeAsync(BUDGET - Math.floor(BUDGET / 6));
+      await f.finalEntered.promise; await stop;
+      expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_pending, "the held summary keeps its owned observation").toBe(1);
+      const before = [...f.calls]; f.gate.resolve(); await turn();
+      await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushIngressDrops();
+      expect(f.calls, "consumer settlement cannot start another write or flush").toEqual(before);
+      expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_pending).toBe(1);
+    } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("the final record persists after a lapsed drain", async () => {
+    requireSummary(); const f = await fixture("summary"); vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      let settled = false; const stop = f.stop().then(() => { settled = true; }); await f.entered.promise;
+      await vi.advanceTimersByTimeAsync(BUDGET - Math.floor(BUDGET / 6));
+      // The sink has completed the final append before the remaining hard-deadline slice advances.
+      await turn();
+      expect(f.entries.some(entry => entry.operation === "filter_stopped"), "the reserved slice persists the final record after drain expiry").toBe(true);
+      await f.finalEntered.promise; await stop;
+      expect(f.calls.slice(f.calls.indexOf("filter_stopped"))).toEqual(["filter_stopped", "flush"]);
+      expect(settled).toBe(true);
+      expect(performance.now()).toBeLessThan(BUDGET);
+    } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("a hard expiry before the drains writes no final record and starts no later phase", async () => {
+    requireSummary(); const f = await fixture("listener"); vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const stop = f.stop(); await f.entered.promise;
+      const reserve = Math.floor(BUDGET / 6);
+      await vi.advanceTimersByTimeAsync(BUDGET - reserve);
+      const atCutoff = [...f.calls]; await f.consumer.flushCoalescedFlowSummaries();
+      expect(f.calls, "the drain cutoff fences consumer writes while an earlier phase still waits").toEqual(atCutoff);
+      await vi.advanceTimersByTimeAsync(reserve + CASTLE_WALL_STOP_TEST_SLACK_MS); await stop;
+      expect(f.calls, "hard expiry skips the final record").not.toContain("filter_stopped");
+      const before = [...f.calls]; f.gate.resolve(); await turn();
+      expect(f.calls, "hard expiry skips every later phase").toEqual(before);
+    } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("stop reports pending evidence on a prompt summary failure", async () => {
+    requireSummary(); const f = await fixture("summary-reject"); const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      await f.stop();
+      const lines = log.mock.calls.map(([line]) => String(line)).filter(line => line.includes("pending_coalesced=1"));
+      expect(lines, "prompt summary failure reports pending coalesced evidence once").toHaveLength(1);
+      expect(lines[0]).toContain("coalesced_counters_lower_bound=false");
+      expect(performance.now()).toBeLessThan(BUDGET);
+    } finally { vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("a publication skipped during stop is carried into the final record", async () => {
+    requireSummary(); const f = await fixture("publication");
+    try {
+      f.prepareHold(); await f.entered.promise;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const stop = f.stop(); await turn(); f.gate.resolve(); await stop;
+      expect(f.entries.find(entry => entry.operation === "filter_stopped")?.details?.audit_write_degraded_count,
+        "the final carry includes the completed publication outcome").toBe(1);
+      expect(performance.now()).toBeLessThan(BUDGET);
+    } finally { f.gate.resolve(); vi.useRealTimers(); await f.cleanup(); }
+  });
+  it("the persisted coalesced detail carries exactly the public keys", async () => {
+    requireSummary(); vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] }); const f = await fixture();
+    try {
+      await f.consumer.handleFlowDecisionRecorded(flow()); await f.consumer.handleFlowDecisionRecorded(flow());
+      await vi.advanceTimersByTimeAsync(1000); // One configured heartbeat interval.
+      const detail = f.entries.find(entry => entry.operation === "castle_wall_heartbeat")!.details!;
+      expect(Object.keys(detail.coalesced_pending as object).sort()).toEqual([
+        "keys", "pending_keys", "coalesced_total", "keys_overflowed", "coalesced_evidence_pending", "coalesced_evidence_confirmed", "summary_write_failures",
+      ].sort());
+      expect(detail.coalesced_counters_lower_bound).toBe(false);
+    } finally { await f.cleanup(); }
   });
   it("production composition coalesces, flushes on heartbeat and drains at stop", async () => {
     requireSummary(); vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] }); const f = await fixture();

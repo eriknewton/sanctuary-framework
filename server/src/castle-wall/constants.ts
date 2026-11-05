@@ -353,6 +353,10 @@ export const CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS = 12_000 as const;
  * whose plist supplies no ExitTimeOut; storage lock release retains its own budget.
  */
 export const CASTLE_WALL_STOP_DEADLINE_MS = 12_000;
+/** 2000 = 12000 / 6: one durable audit append measures well under a second on the fixture
+ * box, so one sixth of the stop budget leaves a slow disk two seconds for the final record.
+ */
+export const FLOW_STOP_FINAL_RECORD_RESERVE_MS = CASTLE_WALL_STOP_DEADLINE_MS / 6;
 /** Must match CASTLE_WALL_STOP_DEADLINE_MS above: completion precedes launchd's default deadline. */
 export const CASTLE_WALL_STOP_EXIT_DEADLINE_MS = 16_000;
 

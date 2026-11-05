@@ -15,7 +15,7 @@ import * as producerSignatures from "../../../src/castle-wall/runtime/producer-s
 import { startMacOSCastleWallDaemon, type MacOSCastleWallListenerOptions } from "../../../src/castle-wall/runtime/macos-daemon.js";
 import { EmissionLivenessWatchdog, DEFAULT_EMISSION_STALL_GRACE_MS } from "../../../src/castle-wall/audit/emission-liveness.js";
 import type { FlowDecisionRecordedNotification } from "../../../src/castle-wall/ipc/messages.js";
-import { CASTLE_WALL_STOP_DEADLINE_MS, CASTLE_WALL_AUDIT_PROVENANCE_KEY, CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } from "../../../src/castle-wall/constants.js";
+import { CASTLE_WALL_STOP_DEADLINE_MS, FLOW_STOP_FINAL_RECORD_RESERVE_MS, CASTLE_WALL_AUDIT_PROVENANCE_KEY, CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } from "../../../src/castle-wall/constants.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
@@ -404,25 +404,31 @@ it("T5 bounded stop reports pending totals within its global budget", async () =
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const append = f.audit.append.bind(f.audit);
   let blocked = false;
+  let finalPersisted!: () => void;
+  const finalRecord = new Promise<void>(resolve => { finalPersisted = resolve; });
   vi.spyOn(f.audit, "append").mockImplementation(async (...args) => {
     if (args[1] === SUMMARY) { blocked = true; await gate; blocked = false; }
-    return append(...args);
+    const result = await append(...args);
+    if (args[1] === "filter_stopped") finalPersisted();
+    return result;
   });
   let settled = false;
   try {
     await f.consumer.handleFlowDecisionRecorded(signed());
     expect(f.consumer.flushCoalescedFlowSummaries).toBeTypeOf("function");
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
     void f.stop().then(() => { settled = true; });
     while (!blocked) await turn();
-    await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_DEADLINE_MS + STOP_SLACK_MS);
+    await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_DEADLINE_MS - FLOW_STOP_FINAL_RECORD_RESERVE_MS);
+    await finalRecord;
+    await f.stop();
     expect(settled, "stop settles within the global budget with the summary held").toBe(true);
     vi.useRealTimers();
     expect(blocked).toBe(true);
     const warnings = stderr.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("[castle-wall] stop budget lapsed"));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('"root_verified_total":1');
-    expect((await f.audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(false);
+    expect((await f.audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(true);
     await expect(readFile(join(f.home, "active.json"))).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
     vi.useRealTimers();

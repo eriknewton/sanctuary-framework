@@ -1386,7 +1386,7 @@ function subsetConsumer(sink: AuditSink, extra?: ConstructorParameters<typeof Au
     });
 }
 describe("chain basis vectors: consumer head == producer next-prior", () => {
-    it("Rust WAL writer (real drain envelope): head after event 1 is sha256(signed body 1)", async () => {
+    it("Rust WAL writer : head after event 1 is sha256", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink);
         const body1 = rustWalBody({ seq: 0, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1397,7 +1397,7 @@ describe("chain basis vectors: consumer head == producer next-prior", () => {
         await expect(consumer.ingestCritical(rustDrainEnvelope({ canonical: body2, seq: 1, prior: nextPrior }))).resolves.toBeUndefined();
         expect(consumer.getStats().acceptedCriticalEvents).toBe(2);
     });
-    it("Rust WAL writer: a prior computed over the RECONSTRUCTED event (old basis) forks", async () => {
+    it("Rust WAL writer: a prior computed over the RECONSTRUCTED event forks", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink);
         const body1 = rustWalBody({ seq: 0, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1429,7 +1429,7 @@ describe("chain basis vectors: consumer head == producer next-prior", () => {
         expect(accepted?.details?.[CASTLE_WALL_CHAIN_BASIS_DETAIL_KEY]).toBe(CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY);
         expect(accepted?.details?.[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]).toBe(fixture.canonical);
     });
-    it("macOS flow writer: head after decision 1 is sha256(signed body 1); adjacent decision 2 chains", async () => {
+    it("macOS flow writer: head after decision 1 is sha256; adjacent decision 2 chains", async () => {
         const sink = new RecordingSink();
         const consumer = subsetConsumer(sink);
         const body1 = macFlowBody({ seq: 0, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1466,7 +1466,7 @@ describe("continuity modes: complete vs producer_subset", () => {
         expect(accepted.at(-1)!.details?.[CASTLE_WALL_CHAIN_PRIOR_UNCONSUMED_DETAIL_KEY]).toBe(enabled ? undefined : true);
         expect(consumer.getWalChainState().lastEventChainHash).toBe(sha256Hex(flow2));
     });
-    it("complete mode: the same gap is a hard fork (no self-heal)", async () => {
+    it("complete mode: the same gap is a hard fork", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink);
         const body1 = rustWalBody({ seq: 0, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1478,7 +1478,7 @@ describe("continuity modes: complete vs producer_subset", () => {
         expect(sink.entries.filter((e) => e.operation === "wal_chain_verification_failed")).toHaveLength(2);
         expect(sink.entries.some((e) => e.operation === "chain_reanchored")).toBe(false);
     });
-    it("subset mode: seq regression is still rejected (replay floor holds)", async () => {
+    it("subset mode: seq regression is still rejected", async () => {
         const sink = new RecordingSink();
         const consumer = subsetConsumer(sink);
         const flow1 = macFlowBody({ seq: 5, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1486,7 +1486,7 @@ describe("continuity modes: complete vs producer_subset", () => {
         const old = macFlowBody({ seq: 3, prior: sha256Hex("x"), timestamp: "2026-08-05T00:00:01Z" });
         await expect(consumer.ingestCritical(macFlowEnvelope({ canonical: old, seq: 3, prior: sha256Hex("x") }))).rejects.toThrow("seq_regression");
     });
-    it("subset mode: an UNSIGNED gap claim is refused (gap acceptance is signature-gated)", async () => {
+    it("subset mode: an UNSIGNED gap claim is refused", async () => {
         const sink = new RecordingSink();
         const consumer = subsetConsumer(sink);
         const flow1 = macFlowBody({ seq: 0, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1593,7 +1593,7 @@ describe("anchor restore + one-time basis migration", () => {
     function sourceReturning(value: Awaited<ReturnType<ChainAnchorSource>>): ChainAnchorSource {
         return async () => value;
     }
-    it("old-basis history (no stored basis) migrates exactly once, record flushed BEFORE use", async () => {
+    it("old-basis history migrates exactly once, record flushed BEFORE use", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink, {
             chainAnchorSource: sourceReturning(signedAnchor()),
@@ -1613,7 +1613,7 @@ describe("anchor restore + one-time basis migration", () => {
         expect(migrations[0]!.flushesBeforeAppend).toBeLessThan(acceptedEntry!.flushesBeforeAppend);
         expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
     });
-    it("new-basis history restores silently (no second migration) and closes the restart replay hole", async () => {
+    it("new-basis history restores silently and closes the restart replay hole", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink, {
             chainAnchorSource: sourceReturning(signedAnchor({ chainBasis: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY })),
@@ -1646,7 +1646,7 @@ describe("anchor restore + one-time basis migration", () => {
         expect(acked).toBe(0);
         expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
     });
-    it("REGRESSION : a persisted anchor with an INVALID signature is refused, not adopted", async () => {
+    it("a persisted anchor with an INVALID signature is refused, not adopted", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink, {
             chainAnchorSource: sourceReturning(signedAnchor({
@@ -1663,7 +1663,7 @@ describe("anchor restore + one-time basis migration", () => {
         const latch = sink.entries.find((e) => e.operation === "chain_migration_unavailable");
         expect(String(latch?.details?.reason)).toContain("persisted_anchor_signature_invalid");
     });
-    it("REGRESSION: a genuine signed body re-filed under a CHOSEN seq is refused (seq must be signature-bound)", async () => {
+    it("a genuine signed body re-filed under a CHOSEN seq is refused", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink, {
             chainAnchorSource: sourceReturning(signedAnchor({ seq: 9000 })),
@@ -1672,7 +1672,7 @@ describe("anchor restore + one-time basis migration", () => {
         await expect(consumer.ingestCritical(rustDrainEnvelope({ canonical: body, seq: 9001, prior: anchorHash }))).rejects.toThrow("chain_migration_unavailable");
         expect(sink.entries.find((e) => e.operation === "chain_migration_unavailable")?.details?.reason).toBe("persisted_anchor_seq_not_signature_bound");
     });
-    it("REGRESSION: signature material stripped from the row is refused, never adopted unverified", async () => {
+    it("signature material stripped from the row is refused, never adopted unverified", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink, {
             chainAnchorSource: sourceReturning(signedAnchor({ signatureB64url: null })),
@@ -1759,7 +1759,7 @@ describe("buildChainAnchorSourceFromAuditLog", () => {
             },
         };
     }
-    it("round-trips a REAL consumer-persisted entry (not a hand-built fixture)", async () => {
+    it("round-trips a REAL consumer-persisted entry", async () => {
         const sink = new RecordingSink();
         const consumer = completeConsumer(sink);
         const body = rustWalBody({ seq: 9, prior: null, timestamp: "2026-08-05T00:00:00Z" });
@@ -1777,7 +1777,7 @@ describe("buildChainAnchorSourceFromAuditLog", () => {
             chainBasis: CASTLE_WALL_CHAIN_BASIS_PRODUCER_SIGNED_BODY,
         });
     });
-    it("skips trailing non-chain entries (rejections, metric batches) to find the anchor", async () => {
+    it("skips trailing non-chain entries to find the anchor", async () => {
         const chainEntry = {
             operation: "egress_blocked",
             identity_id: "agent-a",
@@ -1840,7 +1840,7 @@ describe("buildChainAnchorSourceFromAuditLog", () => {
             reason: "audit_log_integrity_findings",
         });
     });
-    it("verified_suffix_only (sealed unreadable at this privilege) does NOT wedge the chain", async () => {
+    it("verified_suffix_only does NOT wedge the chain", async () => {
         const source = buildChainAnchorSourceFromAuditLog(fakeLog([
             {
                 operation: "egress_blocked",
@@ -1940,9 +1940,81 @@ it("same-key durable drain events each persist a primary", async () => {
   const second = rustWalBody({ seq: 1, prior, timestamp: new Date(SIGNED_TS).toISOString() });
   const acks: number[] = [];
   for (const [seq, canonical, previous] of [[0, first, null], [1, second, prior]] as const) {
-    await consumer.ingestCritical(rustDrainEnvelope({ seq, canonical, prior: previous, ack: async () => { acks.push(sink.entries.length); } }));
+    await consumer.ingestCritical({ ...rustDrainEnvelope({ seq, canonical, prior: previous, ack: async () => { acks.push(sink.entries.length); } }), producerDelivery: "durable_wal" });
   }
   expect(sink.entries.map(entry => entry.operation), "each durable drain event keeps its primary receipt").toEqual(["egress_blocked", "egress_blocked"]);
   expect(acks).toEqual([1, 2]);
   expect(consumer.getStats()).toMatchObject({ acceptedCriticalEvents: 2, coalescedCriticalEvents: 0 });
+});
+
+const basisWindowCases = [
+  ["durable writer signed basis", "durable"], ["reconstructed prior refusal", "prior"],
+  ["Swift signed body continuation", "swift"], ["adjacent macOS decisions", "accepted"],
+  ["signed subset gap", "subset"], ["complete chain gap refusal", "complete"],
+  ["sequence replay floor", "regression"], ["unsigned gap refusal", "unsigned-gap"],
+  ["mapped control operation", "operation"], ["persisted signed chain basis", "accepted"],
+  ["unsigned control chain basis", "control"], ["consumer persisted anchor", "reader"],
+  ["trailing non-chain reader entries", "trailing"],
+] as const;
+for (const [label, scenario] of basisWindowCases) it(`established chain window preserves ${label}`, async () => {
+  const module = await import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").catch(() => null);
+  expect(module).not.toBeNull(); const results = [];
+  for (const enabled of [false, true]) {
+    const trace: unknown[][] = []; let invocation = 0; const counted = new Set<number>();
+    const entries: Array<{ operation: string; identity_id: string; details?: Record<string, unknown> }> = [];
+    const sink: AuditSink = { append(...args) {
+      trace.push(["append", invocation, JSON.stringify(args)]);
+      entries.push({ operation: args[1], identity_id: args[2], details: args[3] });
+    }, async flush() { trace.push(["flush", invocation]); } };
+    const coalescer = new module!.FlowCoalescer("chain-window", () => NOW);
+    const swift = loadSwiftFlowDecisionVector();
+    const key = scenario === "swift" ? Uint8Array.from({ length: 32 }, (_, index) => index + 1) : daemonPriv; // The Swift fixture specifies seed bytes 1 through 32.
+    const pin = toBase64url(ed25519.getPublicKey(key));
+    const consumer = new AuditConsumer(sink, undefined, { pinnedProducerKeyB64url: pin, now: () => NOW,
+      chainContinuity: scenario === "complete" ? "complete" : "producer_subset", ...(enabled ? { liveFlowCoalescer: coalescer } : {}) });
+    const canonical = scenario === "swift" ? swift.canonical : macFlowBody({ seq: 0, prior: null, timestamp: new Date(SIGNED_TS).toISOString() });
+    const head = scenario === "swift" ? swiftFixtureFlowEnvelope(swift) : macFlowEnvelope({ seq: 0, prior: null, canonical });
+    head.producerDelivery = "live";
+    await consumer.ingestCritical(head);
+    expect(consumer.getWalChainState().lastEventChainHash, "the settled head uses the exact signed bytes").toBe(sha256Hex(canonical));
+    if (enabled) expect(coalescer.snapshot().keys, "the signed macOS head establishes a live window").toBe(1);
+    let seq = 1, prior = sha256Hex(canonical);
+    if (["subset", "complete", "unsigned-gap"].includes(scenario)) {
+      const interleaved = macAvailabilityBody({ seq, prior, timestamp: new Date(SIGNED_TS).toISOString() });
+      prior = sha256Hex(interleaved); seq++;
+    }
+    if (scenario === "prior") prior = sha256Hex(canonicalize(head.event));
+    if (scenario === "regression") seq = 0;
+    const body = JSON.parse(macFlowBody({ seq, prior, timestamp: new Date(SIGNED_TS).toISOString() }));
+    if (scenario === "operation") body.operation = "unsupported_control";
+    const nextCanonical = scenario === "durable" ? rustWalBody({ seq, prior, timestamp: new Date(SIGNED_TS).toISOString() }) : canonicalize(body);
+    const envelope: CriticalEventEnvelope = scenario === "durable" ? rustDrainEnvelope({ seq, prior, canonical: nextCanonical }) : macFlowEnvelope({ seq, prior, canonical: nextCanonical });
+    envelope.producerDelivery = scenario === "durable" ? "durable_wal" : "live";
+    envelope.producer!.signatureB64url = toBase64url(ed25519.sign(producerSigningBytes(nextCanonical, SIGNED_TS, seq), key));
+    if (scenario === "unsigned-gap" || scenario === "control") {
+      envelope.producer = undefined; envelope.event.event_type = "filter_started";
+    }
+    if (scenario === "operation") envelope.event.event_type = "filter_started";
+    const before = consumer.getStats(); trace.length = 0; invocation++;
+    try {
+      await consumer.ingestCritical({ ...envelope, ack: async () => { trace.push(["ACK", invocation]); } }, { classify(kind) { if (kind === "coalesced") counted.add(invocation); } });
+      trace.push(["fulfilled", invocation]);
+    } catch (error) { trace.push(["thrown", invocation, error instanceof Error ? [error.constructor.name, error.name, error.message] : String(error)]); }
+    const stats = consumer.getStats();
+    const delta = Object.fromEntries(Object.entries(stats).map(([key, value]) => [key, value - before[key as keyof typeof before]]));
+    if (enabled && ["swift", "accepted", "subset", "reader", "trailing"].includes(scenario)) expect(delta.coalescedCriticalEvents, "the adjacent live signed trigger is counted").toBe(1);
+    if (["reader", "trailing"].includes(scenario)) {
+      if (scenario === "trailing") entries.push({ operation: "producer_signature_rejected", identity_id: FORTRESS_ID, details: { seq: seq + 1 } });
+      const source = buildChainAnchorSourceFromAuditLog({ async query() { return { entries, total: entries.length }; }, async getAuditChainVerdict() { return { status: "verified" } as AuditChainVerdict; } });
+      expect(await source(), "the reader retains only durable primary authority").toMatchObject({ kind: "persisted", seq: enabled ? 0 : seq, signedCanonicalJson: enabled ? canonical : nextCanonical });
+    }
+    results.push({ trace, counted, delta, state: consumer.getWalChainState() });
+  }
+  const [control, counted] = results;
+  expect(counted!.trace, "chain trigger bytes and ACK order retain the primary omission").toEqual(control!.trace.filter(call => !(counted!.counted.has(call[1] as number) && (call[0] === "append" || call[0] === "flush"))));
+  const counters = (result: typeof control) => {
+    const { acceptedCriticalEvents, coalescedCriticalEvents, ...other } = result!.delta;
+    return { ...other, admissions: acceptedCriticalEvents! + coalescedCriticalEvents! };
+  };
+  expect(counters(counted)).toEqual(counters(control)); expect(counted!.state).toEqual(control!.state);
 });

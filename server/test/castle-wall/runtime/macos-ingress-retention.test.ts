@@ -12,7 +12,7 @@ import { frame } from "../../../src/castle-wall/ipc/framing.js";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
 import { MacOSFlowIpcListener } from "../../../src/castle-wall/runtime/macos-ipc-listener.js";
 import { startMacOSCastleWallDaemon, type MacOSCastleWallListenerOptions } from "../../../src/castle-wall/runtime/macos-daemon.js";
-import { CASTLE_WALL_STOP_DEADLINE_MS } from "../../../src/castle-wall/constants.js";
+import { CASTLE_WALL_STOP_DEADLINE_MS, FLOW_STOP_FINAL_RECORD_RESERVE_MS } from "../../../src/castle-wall/constants.js";
 import type { AuditSink } from "../../../src/castle-wall/runtime/audit-consumer.js";
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -47,7 +47,6 @@ describe("macOS ingress retention", () => {
     const home = await mkdtemp(join(tmpdir(), "cw-stop-deadline-"));
     vi.stubEnv("HOME", home);
     const writeDeadlineMs = 500; // Short fault-injection deadline with room for healthy startup writes.
-    const schedulingSlackMs = 1; // One fake-clock millisecond beyond the global deadline.
     const key = ed25519.utils.randomPrivateKey();
     const storage = new FilesystemStorage(join(home, "state"));
     const audit = new AuditLog(storage, key, {
@@ -87,17 +86,27 @@ describe("macOS ingress retention", () => {
         await write(namespace, entryKey, data);
       });
       expect(options.consumer.flushCoalescedFlowSummaries).toBeTypeOf("function");
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let finalPersisted!: () => void;
+      const finalRecord = new Promise<void>(resolve => { finalPersisted = resolve; });
+      const appendFinal = audit.append.bind(audit);
+      vi.spyOn(audit, "append").mockImplementation(async (...args) => {
+        const result = await appendFinal(...args);
+        if (args[1] === "filter_stopped") finalPersisted();
+        return result;
+      });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
       let settled = false;
       stopping = handle.stop().then(() => { settled = true; });
       // Filesystem setup reaches the held write before fake time advances.
       while (!hungWriteActive) await turn();
-      await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_DEADLINE_MS + schedulingSlackMs);
+      await vi.advanceTimersByTimeAsync(CASTLE_WALL_STOP_DEADLINE_MS - FLOW_STOP_FINAL_RECORD_RESERVE_MS);
+      await finalRecord;
+      await stopping;
       expect(settled, "stop settles at the global deadline with the storage write held").toBe(true);
       vi.useRealTimers();
       expect(hungWriteActive).toBe(true);
       expect(audit.getWriteLockRecoveryCount()).toBe(1);
-      expect((await audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(false);
+      expect((await audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(true);
       await expect(readFile(activeConfigPath)).rejects.toMatchObject({ code: "ENOENT" });
       expect((await options.adminHandler!.handleDecision({ type: "decision_response", request_id: "stop-pending", decision: "allow_once" })).ok).toBe(false);
       // The storage promise stays unsettled throughout shutdown; release only for fixture cleanup.

@@ -580,6 +580,9 @@ export class AuditConsumer {
    *     payload and emit a `critical_event_duplicate_dropped` diagnostic
    *     entry; the daemon receives a fresh ACK so it stops retrying. Audit
    *     log integrity is preserved (no silent duplicate entries).
+   *
+   * Closed live-flow admission resolves without persistence or ACK; callers use
+   * the invocation observer's shutdown notification to distinguish that outcome.
    */
   async ingestCritical(envelope: CriticalEventEnvelope, observer?: FlowAdmissionObserver): Promise<void> {
     if (!this.liveFlowCoalescer) return this.ingestOrderedCritical(envelope, observer);

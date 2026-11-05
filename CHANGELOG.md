@@ -10,29 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - macOS Castle Wall counts repeated admitted flow decisions in fixed-size informational summaries and reports pending audit loss through heartbeat and stop diagnostics. Admission memory lasts for one consumer lifetime; restart restores the last durable primary position, so a previously counted fresh sequence can be admitted again.
 
-- `sanctuary hermes recover-save` recovers a Hermes save that did not finish, so the memory bridge can start again.
-
-- The Hermes memory bridge serves seven tools: a save into the agent's own memory runs without an approval prompt within the save allowance and is audited with the agent named, `memory_recall` returns a bounded context of matching saved passages with per-call scan work bounded after the key listing, `sign_statement` and `export_memory` answer that they are not available yet, and `protection_rules` is refused; every catalogued refusal is an ordinary tool result.
-- `sanctuary protect --hermes-memory` sets Hermes to save and recall memory through the Sanctuary memory plugin, turns Hermes's built-in memory off, removes the Sanctuary MCP server entry from its config, and `--unwrap` reverts those changes.
-
-- A Hermes plugin pair (a Sanctuary memory provider and a tools plugin) saves and recalls Hermes memory through the Sanctuary memory bridge; `sign_statement` and `export_memory` answer that they are not available yet, and every refusal from a Sanctuary tool is an ordinary tool result.
-
 ### Fixed
 
 - Castle Wall daemon stop uses a twelve-second shared budget, with a sixteen-second CLI exit backstop and closed flow admission during teardown.
-
-- `sanctuary castle-wall` commands end with their own exit code and no longer continue into the default startup path.
-- A holder that lost its lock no longer removes a successor's lock when it exits.
-- Linux-verified audit lock recovery uses exact process identity, serialized removal and a monotonic acquisition budget. Unprovable locks require operator recovery. macOS runtime verification remains pending.
-- Audit discovery reports a typed outcome before sequence allocation. Unknown state requires operator investigation; an authenticated empty suffix continues from its current sealed boundary. Full verification and hold-deadline limits remain unchanged.
-- Audit chains admit writers by their declared role and directory owner. Diagnostic readers preserve lock evidence, and storage listings retain surviving files when another candidate disappears.
-- Audit appends share a names-only listing. Retention pruning now targets a one-percent margin (at least one entry), reducing repeated work at the cap. Pruning advances one authenticated delete at a time within an episode budget.
-- `sanctuary_active_protections` lists every protection layer with an evidence-based status and a plain-English summary, including layers that are off, not built, or unknown.
-- An agent's memory save into its own memory (`memory_insert`, `sanctuary_remember`) runs without an approval prompt under the default policy within a bounded save allowance; beyond it an ordinary Tier 2 approval is requested; every save is audited with the agent named when its identity is known, otherwise marked as unknown, and shows on the dashboard's Evidence page. Set `memory_save_approval: always` in the policy to require approval per insert. Export, delete, signing and reading the policy still ask.
-- the posture home stays up when one panel is slow: each panel has its own time budget and says when it is out of date, and audit-chain re-verification reuses results for entries whose bytes have not changed
-- An SDW import refused by the import handler for an empty or non-string source key reference now leaves a denial row in the audit log, like the other refusals the import handler makes before approval.
-- Lifting a lockdown is refused on a platform where stopping is unsupported, matching the stop.
-- A refused lockdown-lift approval shows the operator the reason it was refused.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
