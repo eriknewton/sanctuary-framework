@@ -42,7 +42,7 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
-import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
+import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
 import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 
 class CaptureStream extends Writable {
@@ -63,7 +63,7 @@ describe("F2 re-gate repros (round 2)", () => {
   const fixtureLeases: MasterWriteBarrierLease[] = [];
 
   async function releaseFixtureLeases(): Promise<void> {
-    for (const lease of fixtureLeases.splice(0)) await lease.release();
+    await releaseCustodyLeases(fixtureLeases);
   }
 
   afterEach(async () => {

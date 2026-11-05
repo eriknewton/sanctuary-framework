@@ -24,6 +24,28 @@ export function takeCustodyLease(
   return masterWriteBarrier;
 }
 
+/**
+ * Release every tracked custody lease, attempting each one even after another
+ * rejects. A lease leaves `leases` only once its release succeeds, so a lease
+ * whose release rejected stays owned: the caller's teardown throws before it
+ * deletes the namespace, and a later teardown retries it rather than treating
+ * the namespace as free.
+ */
+export async function releaseCustodyLeases(leases: MasterWriteBarrierLease[]): Promise<void> {
+  const failures: unknown[] = [];
+  for (const lease of [...leases]) {
+    try {
+      await lease.release();
+      leases.splice(leases.indexOf(lease), 1);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "A custody lease release failed during teardown");
+  }
+}
+
 /** Assert that a released custody lease no longer holds its reader socket. */
 export async function expectReaderSocketReleased(
   readerSocketPath: string | undefined,

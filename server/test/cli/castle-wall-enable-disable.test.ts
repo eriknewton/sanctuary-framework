@@ -7,7 +7,7 @@ import { Writable } from "node:stream";
 
 import { parseFrame } from "../../src/castle-wall/ipc/framing.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
-import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
+import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
 import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -127,7 +127,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
   const caseLeases: MasterWriteBarrierLease[] = [];
 
   async function releaseCaseLeases(): Promise<void> {
-    for (const lease of caseLeases.splice(0)) await lease.release();
+    await releaseCustodyLeases(caseLeases);
   }
 
   afterEach(async () => {

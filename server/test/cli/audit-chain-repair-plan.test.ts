@@ -61,7 +61,7 @@ import {
   type AuditChainRepairPlan,
 } from "../../src/cli/audit-chain-repair-plan.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
-import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
+import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
 import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 
 class CaptureStream extends Writable {
@@ -133,7 +133,7 @@ describe("audit-chain repair-plan", () => {
   const caseLeases: MasterWriteBarrierLease[] = [];
 
   async function releaseCaseLeases(): Promise<void> {
-    for (const lease of caseLeases.splice(0)) await lease.release();
+    await releaseCustodyLeases(caseLeases);
   }
 
   /**
