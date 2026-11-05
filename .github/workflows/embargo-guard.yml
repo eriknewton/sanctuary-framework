@@ -2,6 +2,7 @@
 # Copyright 2026 Erik Newton
 # SPDX-License-Identifier: Apache-2.0
 # The push run is a detector after publication, never a gate on an accepted push.
+# A branch-creation push is not a scanned surface; main is never created by push.
 # A red push run needs operator review; history changes are never automated.
 # A PR editing scripts/disclosure/ or .github/workflows/embargo-guard.yml runs its
 # own copy of the guard. Such a PR merges only after the coordinator's two-family review.
@@ -59,6 +60,11 @@ jobs:
               text_args=(--text "pr-title=$tmp/title" --text "pr-body=$tmp/body")
               ;;
             push)
+              # Forty zero hex digits are Git's branch-creation sentinel, not range evidence.
+              if [[ "$PUSH_BASE" == 0000000000000000000000000000000000000000 ]]; then
+                printf '%s\n' 'ERROR embargo workflow cannot scan a branch-creation push' >&2
+                exit 2
+              fi
               base=$PUSH_BASE
               head=$EVENT_HEAD
               ;;

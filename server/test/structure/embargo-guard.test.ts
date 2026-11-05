@@ -1,8 +1,11 @@
-/** Refuses ranges and PR text that cite listed ids, while retaining private input. */
+/** Refuses ranges and PR text that cite listed ids, while retaining private input.
+ * W24 runs the step under Darwin /bin/bash 3.2; the scanner uses PATH bash.
+ * Linux executes the host bash and witnesses workflow wiring only.
+ */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -219,9 +222,7 @@ describe("embargo guard", () => {
       expect(refs[0]).toMatch(new RegExp(`^\\s+PR_${field.toUpperCase()}:\\s*\\$\\{\\{\\s*github\\.event\\.pull_request\\.${field}\\s*\\}\\}\\s*$`));
     }
   });
-  it("W24 executes push and PR consumers with literal text", () => {
-    copyScripts();
-    seed();
+  const workflowConsumer = () => {
     const flow = yaml.load(readFileSync(workflowPath, "utf8"));
     const consumers = flow.jobs["embargo-guard"].steps.filter((step: any) => step.name === "Scan range and PR text");
     expect(consumers).toHaveLength(1);
@@ -234,12 +235,17 @@ describe("embargo guard", () => {
       expect(version.status).toBe(0);
       expect(version.stdout).toMatch(/^3\.2/);
     }
-    const execute = (event: string, head: string, title = "Fixture title", body = "") => {
-      const result = spawnSync(bash, ["-c", run], { cwd: repo, env: { ...env, VITEST: env.VITEST, EVENT_NAME: event, PR_BASE: base, PR_HEAD: head, PUSH_BASE: base, EVENT_HEAD: head, PR_TITLE: title, PR_BODY: body }, encoding: "utf8" });
+    return (event: string, head: string, title = "Fixture title", body = "", pushBase = base) => {
+      const result = spawnSync(bash, ["-c", run], { cwd: repo, env: { ...env, VITEST: env.VITEST, EVENT_NAME: event, PR_BASE: base, PR_HEAD: head, PUSH_BASE: pushBase, EVENT_HEAD: head, PR_TITLE: title, PR_BODY: body }, encoding: "utf8" });
       completed(result);
       expect(result.stdout + result.stderr).not.toContain(listed);
       return result;
     };
+  };
+  it("W24 executes push and PR consumers with literal text", () => {
+    copyScripts();
+    seed();
+    const execute = workflowConsumer();
     const clean = commit("Clean fixture");
     expect(execute("push", clean).status).toBe(0);
     refusal(execute("push", commit(`Event fixture ${listed}`)), "commit-message");
@@ -303,10 +309,15 @@ describe("embargo guard", () => {
     expect(result.status).toBe(2);
     expect(result.stdout + result.stderr).not.toContain(listed);
   });
-  it("W14 scans text in binary-classified content", () => {
+  it.each(["leading", "before", "after"])("W14 scans %s NUL token boundaries with original indices", (kind) => {
     seed();
-    put("content.bin", `\0\0${listed}\n`);
-    refusal(scan(commit("Add binary fixture")), "added-line");
+    const content = kind === "leading" ? `\0\0${listed}` : kind === "before" ? `word\0${listed}` : `${listed}\0word`;
+    put("content.bin", `Innocuous record\n${content}\n${listed}\n`);
+    const result = scan(commit("Add binary fixture"));
+    refusal(result, "added-line");
+    // The NUL record is second; the unaffected following record remains third.
+    const prefix = digest(listed).slice(0, 12); // Public report uses twelve hex digits.
+    expect(result.stdout).toBe(`FAIL EMB-01 added-line line 2 digest ${prefix}\nFAIL EMB-01 added-line line 3 digest ${prefix}\n`);
   });
   it.each(["addition", "rename"])("W15 scans %s destination paths privately", (kind) => {
     seed();
@@ -334,15 +345,16 @@ describe("embargo guard", () => {
     seed();
     const head = commit("Clean fixture");
     const marker = join(temp, "called");
+    const input = text(allowed);
     let childPath: string;
     if (kind === "tokenizer") {
       const tr = realTool("tr");
-      childPath = fakeTool("tr", `if [[ "$1" == -cs && "$2" == A-Za-z0-9._- ]]; then touch '${marker}'; exit 3; fi\nexec '${tr}' "$@"`);
+      childPath = fakeTool("tr", `if [[ "$1" == a-z_ && "$2" == A-Z- ]]; then touch '${marker}'; exit 3; fi\nexec '${tr}' "$@"`);
     } else {
       childPath = fakeTool("sha256sum", `touch '${marker}'; exit 3`);
       fakeTool("shasum", `touch '${marker}'; exit 3`);
     }
-    expect(scan(head, ["--text", `pr-body=${text(allowed)}`], base, childPath).status).toBe(2);
+    expect(scan(head, ["--text", `pr-body=${input}`], base, childPath).status).toBe(2);
     expect(existsSync(marker)).toBe(true);
   });
   it("W17a requires the head list", () => {
@@ -446,6 +458,123 @@ describe("embargo guard", () => {
     completed(result);
     expect(result.status).toBe(2);
     expect(existsSync(out)).toBe(false);
+  });
+
+  it.each(["text", "pr-title", "pr-body", "extract", "salt"])("W25 acquires complete %s input before parsing", (surface) => {
+    seed();
+    const head = commit("Clean fixture");
+    const original = surface === "extract" ? join(temp, "extract.txt") : surface === "salt" ? join(repo, saltPath) : text("Innocuous text\n");
+    const out = join(temp, "fresh-output");
+    const marker = join(temp, "acquired");
+    const cat = realTool("cat");
+    const childPath = fakeTool("cat", `if [[ $# -eq 2 && "$1" == -- && "$2" == '${original}' ]]; then printf called > '${marker}'; printf 'clean\n'; exit 1; fi\nexec '${cat}' "$@"`);
+    const result = surface === "extract" || surface === "salt"
+      ? spawnSync("bash", [generator, join(temp, "extract.txt"), "--salt", join(repo, saltPath), "--out", out], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: childPath }, encoding: "utf8" })
+      : scan(head, ["--text", `${surface}=${original}`], base, childPath);
+    completed(result);
+    expect(result.status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+    expect(result.stdout + result.stderr).not.toContain(listed);
+    expect(result.stdout + result.stderr).not.toContain(original);
+    expect(result.stderr).toContain(`ERROR embargo ${surface === "extract" || surface === "salt" ? "generator" : "scanner"} cannot run`);
+    expect(existsSync(out)).toBe(false);
+  });
+  // Salt is exactly 64 lowercase hex bytes followed by LF; all other framing is refused.
+  const malformedSalts = [
+    ["NUL", `${salt}\0`], ["missing LF", salt], ["CRLF", `${salt}\r\n`],
+    ["BOM", `\ufeff${salt}\n`], ["extra LF", `${salt}\n\n`],
+  ];
+  it.each(malformedSalts)("W26 validates raw salt framing %s", (_kind, bytes) => {
+    seed();
+    put(saltPath, bytes);
+    const result = scan(commit("Update salt fixture"));
+    expect(result.status).toBe(2);
+    expect(result.stderr).toBe("ERROR embargo scanner cannot run\n");
+    const generated = generate(listed);
+    expect(generated.status).toBe(2);
+    expect(generated.stderr).toBe("ERROR embargo generator cannot run\n");
+    expect(generated.stdout).toBe("");
+  });
+  it("W26 validates raw digest rows before string conversion", () => {
+    seed();
+    const row = digest(listed);
+    put(listPath, `${row.slice(0, 32)}\0${row.slice(32)}\n`); // NUL inserted between the two 32-hex halves.
+    const result = scan(commit("Update row fixture"));
+    expect(result.status).toBe(2);
+    expect(result.stderr).toBe("ERROR embargo scanner cannot run\n");
+  });
+  it("W26 accepts complete salt framing and requires newline extract entries", () => {
+    seed();
+    expect(scan(base).status).toBe(0);
+    const generated = generate(`${listed}\0word\n`);
+    expect(generated.status).toBe(2);
+    expect(generated.stderr).toBe("ERROR embargo generator cannot run\n");
+    expect(generated.stdout).toBe("");
+  });
+  it("W27 requires a scanned push range", () => {
+    copyScripts();
+    seed();
+    const execute = workflowConsumer();
+    const result = execute("push", base, "Fixture title", "", zero);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("ERROR embargo workflow cannot scan a branch-creation push");
+  });
+  it("W28 requires hash readiness even for empty ranges", () => {
+    seed();
+    const bin = join(temp, "ready-bin");
+    mkdirSync(bin);
+    // Resolve every real tool before limiting the child's PATH; no inherited suffix is added.
+    const names = ["bash", "git", "awk", "sort", "tr", "dirname", "mktemp", "unlink", "rmdir", "cat", "cut", "wc", "grep", "sed", "cmp", "basename", "openssl", "cp", "mv"];
+    const resolved = names.map((name) => [name, realTool(name)]);
+    const hashName = platform() === "darwin" ? "shasum" : "sha256sum";
+    const hash = realTool(hashName);
+    for (const [name, path] of resolved) symlinkSync(path, join(bin, name));
+    symlinkSync(hash, join(bin, hashName));
+    expect(scan(base, [], base, bin).status).toBe(0);
+    rmSync(join(bin, hashName));
+    expect(scan(base, [], base, bin).status).toBe(2);
+    const out = join(temp, "fresh-output");
+    const generated = spawnSync(join(bin, "bash"), [generator, join(temp, "extract.txt"), "--salt", join(repo, saltPath), "--out", out], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: bin }, encoding: "utf8" });
+    completed(generated);
+    expect(generated.status).toBe(2);
+    expect(generated.stderr).toBe("ERROR embargo generator cannot run\n");
+    expect(existsSync(out)).toBe(false);
+  });
+  it("W29 preserves added-record indices through bulk normalization", () => {
+    seed();
+    // Five thousand records exercise bulk processing; the sole listed id is penultimate.
+    const records = Array<string>(5000).fill("Innocuous record");
+    records[4998] = listed; // Zero-based index for added-record 4999.
+    put("content.txt", `${records.join("\n")}\n`);
+    const result = scan(commit("Add bulk fixture"));
+    refusal(result, "added-line");
+    expect(result.stdout).toBe(`FAIL EMB-01 added-line line 4999 digest ${digest(listed).slice(0, 12)}\n`); // Twelve-hex report prefix.
+  });
+  it("W30 requires complete membership lookup evidence", () => {
+    seed();
+    const head = commit(`Fixture citation ${listed}`);
+    const grep = realTool("grep");
+    const marker = join(temp, "looked-up");
+    const childPath = fakeTool("grep", `if [[ "$1" == -Fqx ]]; then printf called > '${marker}'; exit 2; fi\nexec '${grep}' "$@"`);
+    const result = scan(head, [], base, childPath);
+    expect(result.status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  it.each(["unlink", "rmdir"])("reports %s cleanup completion for both tools", (tool) => {
+    seed();
+    const marker = join(temp, "cleaned");
+    const real = realTool(tool);
+    const childPath = fakeTool(tool, `printf called > '${marker}'\n'${real}' "$@" || exit 2\nexit 1`);
+    expect(scan(base, [], base, childPath).status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+    rmSync(marker);
+    const result = spawnSync("bash", [generator, join(temp, "extract.txt"), "--salt", join(repo, saltPath)], { cwd: repo, env: { ...env, VITEST: env.VITEST, PATH: childPath }, encoding: "utf8" });
+    completed(result);
+    expect(result.status).toBe(2);
+    expect(existsSync(marker)).toBe(true);
+    // The real removal completes, but the wrapper's failed status still prevents success.
+    expect(readdirSync(temp).filter((name) => name.startsWith("embargo-"))).toEqual([]);
   });
 
 });

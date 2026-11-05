@@ -7,13 +7,16 @@
 # Every non-decoy generator digest has a tokenizer spelling; random hex decoys do not.
 export LC_ALL=C
 
-# The scalar and token-stream callers share the same normalization pipeline.
+# Must match the bulk stage in check-embargo.sh and generate-embargo-digests.sh.
 embargo_normalize_stream() {
-  sed -E 's/^[._-]+//; s/[._-]+$//' | tr 'a-z_' 'A-Z-'
+  tr 'a-z_' 'A-Z-' || return 2
 }
 
-embargo_normalize_id() {
-  printf '%s' "$1" | embargo_normalize_stream
+# The caller supplies normalized in its local scope; no subprocess runs per record.
+embargo_trim_id() {
+  while [[ "$normalized" == [._-]* ]]; do normalized=${normalized#?}; done
+  while [[ "$normalized" == *[._-] ]]; do normalized=${normalized%?}; done
+  return 0
 }
 
 embargo_is_id_shaped() {
@@ -22,6 +25,11 @@ embargo_is_id_shaped() {
   [[ "$value" =~ ^DEFECT\.[A-Z0-9]+([.-][A-Z0-9]+)*$ ]] ||
     { [[ ${#value} -ge 4 && ${#value} -le 64 && "$value" =~ [A-Z] ]] &&
       [[ "$value" =~ ^[A-Z0-9]+(-[A-Z0-9]+)+$ ]]; }
+}
+
+# Readiness must match the unconditional calls in check-embargo.sh and generate-embargo-digests.sh.
+embargo_hash_ready() {
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1
 }
 
 embargo_digest() (
@@ -38,26 +46,22 @@ embargo_digest() (
   printf '%s\n' "$digest"
 )
 
-# The caller owns scratch.raw, scratch.normalized and scratch.ready and cleans them.
-# This contract must match cleanup in scripts/disclosure/check-embargo.sh.
+# The scanner owns all staged files and cleanup; this helper uses only builtins.
+# Must match check-embargo.sh: normalized records, globbing disabled, fixed surface and index.
 embargo_tokens() {
-  local normalized segment rest scratch=$2
-  # Stage every producer before publishing tokens, so partial output is never evidence.
-  tr -cs 'A-Za-z0-9._-' '\n' < "$1" > "$scratch.raw" || return 2
-  embargo_normalize_stream < "$scratch.raw" > "$scratch.normalized" || return 2
-  : > "$scratch.ready" || return 2
-  while IFS= read -r normalized || [[ -n "$normalized" ]]; do
-    # Strip boundaries per token after the shared bulk normalization.
-    while [[ "$normalized" == [._-]* ]]; do normalized=${normalized#?}; done
-    while [[ "$normalized" == *[._-] ]]; do normalized=${normalized%?}; done
+  local line=$1 surface=$2 number=$3 normalized segment rest
+  local IFS=$' \t\n'
+  # Default-IFS splitting follows bulk normalization, preserving the shared alias grammar.
+  for normalized in ${line//[^A-Za-z0-9._-]/ }; do
+    embargo_trim_id || return 2
     if embargo_is_id_shaped "$normalized"; then
-      printf '%s\n' "$normalized" >> "$scratch.ready" || return 2
+      printf '%s\t%s\t%s\n' "$normalized" "$surface" "$number" || return 2
     fi
     if [[ "$normalized" == DEFECT.* ]]; then
       while [[ "${normalized#DEFECT.}" == *.* ]]; do
         normalized=${normalized%.*}
         if embargo_is_id_shaped "$normalized"; then
-          printf '%s\n' "$normalized" >> "$scratch.ready" || return 2
+          printf '%s\t%s\t%s\n' "$normalized" "$surface" "$number" || return 2
         fi
       done
     elif [[ "$normalized" == *.* ]]; then
@@ -65,12 +69,12 @@ embargo_tokens() {
       while [[ -n "$rest" ]]; do
         segment=${rest%%.*}
         if embargo_is_id_shaped "$segment"; then
-          printf '%s\n' "$segment" >> "$scratch.ready" || return 2
+          printf '%s\t%s\t%s\n' "$segment" "$surface" "$number" || return 2
         fi
         [[ "$rest" == *.* ]] || break
         rest=${rest#*.}
       done
     fi
-  done < "$scratch.normalized"
-  cat "$scratch.ready" || return 2
+  done
+  return 0
 }

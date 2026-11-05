@@ -14,15 +14,21 @@
 # scanned; a rewrite too large to be a rename appears as A and is scanned.
 # A PR editing scripts/disclosure/ or .github/workflows/embargo-guard.yml runs its
 # own copy of the guard. Such a PR merges only after the coordinator's two-family review.
+# CLI zero-base mode scans only the head commit; merge-head diffs may be empty.
 # Exit codes: 0 clean, 1 match, 2 cannot run.
 set -euo pipefail
+# Token splitting must never expand input as filesystem patterns.
+set -f
 export LC_ALL=C
 fail() { printf '%s\n' 'ERROR embargo scanner cannot run' >&3; exit 2; }
 exec 3>&2 2>/dev/null
 trap fail ERR
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+script_dir=$(dirname -- "${BASH_SOURCE[0]}") || fail
+script_dir=$(cd -- "$script_dir" && pwd) || fail
 # Parsing and the hash recipe must match embargo-digest-lib.sh, shared with generate-embargo-digests.sh.
-source "$script_dir/embargo-digest-lib.sh"
+source "$script_dir/embargo-digest-lib.sh" || fail
+# Readiness is required even when no token needs hashing.
+embargo_hash_ready || fail
 base=''; head=''; repo=.; format=text
 text_files=(); text_labels=(); text_count=0
 while [[ $# -gt 0 ]]; do
@@ -47,14 +53,19 @@ done
 git -C "$repo" cat-file -e "$head^{commit}" || fail
 zero=0
 if [[ "$base" =~ ^0+$ ]]; then zero=1; else git -C "$repo" cat-file -e "$base^{commit}" || fail; fi
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/embargo-scan.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/embargo-scan.XXXXXX") || fail
 cleanup() {
-  local file
-  # Must match embargo_tokens scratch ownership in embargo-digest-lib.sh.
+  local pending=$? file cleanup_failed=0
+  # Must match scratch ownership in embargo-digest-lib.sh and generate-embargo-digests.sh.
+  # Globbing is enabled only for owned scratch, never for input token splitting.
+  set +f
   for file in "$tmp"/*; do
-    [[ ! -f "$file" ]] || unlink "$file"
+    [[ ! -f "$file" ]] || unlink "$file" || cleanup_failed=1
   done
-  rmdir -- "$tmp"
+  rmdir -- "$tmp" || cleanup_failed=1
+  # Successful cleanup preserves the scan result; incomplete cleanup cannot report readiness.
+  [[ $cleanup_failed -eq 0 ]] || fail
+  exit "$pending"
 }
 trap cleanup EXIT
 salt_path=scripts/disclosure/embargo-salt.txt
@@ -86,7 +97,12 @@ for side in base head; do
   fi
   [[ $has_list -eq 1 ]] || fail
   if [[ $has_salt -eq 1 ]]; then
-    salt=$(git -C "$repo" show "$tree:$salt_path") || fail
+    git -C "$repo" show "$tree:$salt_path" > "$tmp/salt" || fail
+    # Shell strings cannot carry NUL; the bytes are checked before the string exists.
+    LC_ALL=C tr -d '\000' < "$tmp/salt" | cmp -s - "$tmp/salt" || fail
+    salt_bytes=$(wc -c < "$tmp/salt") || fail
+    [[ $salt_bytes -eq 65 ]] || fail # 64 lowercase hex bytes plus exactly one LF.
+    salt=$(cat -- "$tmp/salt") || fail
     [[ "$salt" =~ ^[0-9a-f]{64}$ ]] || fail # 32 bytes in hex.
   else
     [[ "$side" == head && -n "$base_salt" ]] || fail
@@ -94,6 +110,8 @@ for side in base head; do
   fi
   if [[ "$side" == base ]]; then base_salt=$salt; base_present=1; else head_salt=$salt; fi
   git -C "$repo" show "$tree:$list_path" > "$tmp/list" || fail
+  # Evidence bytes are validated without content normalization before row parsing.
+  LC_ALL=C tr -d '\000' < "$tmp/list" | cmp -s - "$tmp/list" || fail
   while IFS= read -r row || [[ -n "$row" ]]; do
     [[ "$row" == \#* || -z "$row" ]] && continue
     [[ "$row" =~ ^[0-9a-f]{64}$ ]] || fail # SHA-256 is 32 bytes in hex.
@@ -107,54 +125,60 @@ sort -u "$tmp/salts.raw" > "$tmp/salts" || fail
 printf '%s\n' 'INFO required PR check gates merging; push scan is a detector after publication.' >&3
 if [[ $zero -eq 1 ]]; then
   printf '%s\n' 'INFO zero base: scanning only the head commit and head tree list.' >&3
-  git -C "$repo" log -1 --format=%H%n%B "$head" > "$tmp/messages"
-  git -C "$repo" diff-tree --root --no-commit-id --no-ext-diff --no-textconv --text --unified=0 -r -p "$head" > "$tmp/raw-diff"
+  git -C "$repo" log -1 --format=%H%n%B "$head" > "$tmp/messages" || fail
+  git -C "$repo" diff-tree --root --no-commit-id --no-ext-diff --no-textconv --text --unified=0 -r -p "$head" > "$tmp/raw-diff" || fail
   git -C "$repo" diff-tree --root --no-commit-id -r -M --name-only --diff-filter=AR -z "$head" -- > "$tmp/paths" || fail
 else
-  git -C "$repo" log --format=%H%n%B "$base..$head" > "$tmp/messages"
+  git -C "$repo" log --format=%H%n%B "$base..$head" > "$tmp/messages" || fail
   ancestor=$(git -C "$repo" merge-base "$base" "$head") || fail
-  git -C "$repo" diff --no-ext-diff --no-textconv --text --unified=0 "$ancestor" "$head" -- > "$tmp/raw-diff"
+  git -C "$repo" diff --no-ext-diff --no-textconv --text --unified=0 "$ancestor" "$head" -- > "$tmp/raw-diff" || fail
   git -C "$repo" diff -M --name-only --diff-filter=AR -z "$ancestor" "$head" -- > "$tmp/paths" || fail
 fi
+# NUL is outside the identifier alphabet; mapping it to a space preserves token
+# boundaries and original line records on both userlands. Path delimiters stay NUL.
+content_bytes() {
+  LC_ALL=C tr '\000' ' ' < "$1" > "$2" || return 2
+}
+content_bytes "$tmp/raw-diff" "$tmp/diff-content" || fail
 # Hunk state distinguishes added content beginning with ++ from +++ path headers.
-awk '/^diff --git / { hunk=0 } /^@@ / { hunk=1; next } hunk && /^\+/ { print substr($0,2) }' "$tmp/raw-diff" > "$tmp/added"
+awk '/^diff --git / { hunk=0 } /^@@ / { hunk=1; next } hunk && /^\+/ { print substr($0,2) }' "$tmp/diff-content" > "$tmp/added" || fail
 # Occurrences retain surface order, while the global set bounds work before hashing.
 : > "$tmp/occurrences"
-stage_record() {
-  local surface=$1 number=$2 token
-  embargo_tokens "$tmp/line" "$tmp/tokenizer" > "$tmp/tokens" || fail
-  while IFS= read -r token; do
-    printf '%s\t%s\t%s\n' "$token" "$surface" "$number" >> "$tmp/occurrences"
-  done < "$tmp/tokens"
-}
 scan() {
-  local surface=$1 file=$2 line number=0
-  [[ -f "$file" && -r "$file" ]] || fail
+  local surface=$1 file=$2 line number
+  content_bytes "$file" "$tmp/content" || fail
+  embargo_normalize_stream < "$tmp/content" > "$tmp/normalized" || fail
+  # Number original records once; normalization preserves LF and embedded token boundaries.
+  awk '{ print NR "\t" $0 }' "$tmp/normalized" > "$tmp/numbered" || fail
   while IFS= read -r line || [[ -n "$line" ]]; do
-    number=$((number + 1))
-    printf '%s\n' "$line" > "$tmp/line"
-    stage_record "$surface" "$number"
-  done < "$file"
+    number=${line%%$'\t'*}; line=${line#*$'\t'}
+    embargo_tokens "$line" "$surface" "$number" >> "$tmp/occurrences" || fail
+  done < "$tmp/numbered"
 }
 scan commit-message "$tmp/messages"
 i=0
 while [[ $i -lt $text_count ]]; do
-  scan "${text_labels[$i]}" "${text_files[$i]}"
+  src=${text_files[$i]}; dst="$tmp/text"
+  # The checked copy establishes complete acquisition before parsing begins.
+  cat -- "$src" > "$dst" || fail
+  scan "${text_labels[$i]}" "$dst"
   i=$((i + 1))
 done
 scan added-line "$tmp/added"
+embargo_normalize_stream < "$tmp/paths" > "$tmp/normalized-paths" || fail
 number=0
 # NUL records preserve one index per path, including names containing newlines.
 while IFS= read -r -d '' path; do
   number=$((number + 1))
-  printf '%s\n' "$path" > "$tmp/line"
-  stage_record added-path "$number"
-done < "$tmp/paths"
+  embargo_tokens "$path" added-path "$number" >> "$tmp/occurrences" || fail
+done < "$tmp/normalized-paths"
 cut -f1 "$tmp/occurrences" > "$tmp/token-column" || fail
 sort -u "$tmp/token-column" > "$tmp/unique" || fail
 count=$(wc -l < "$tmp/unique") || fail
 # 50000 tokens times at most two salts is 100000 hash processes, about 300 s at
-# 3 ms each, plus tokenizer/sort/join overhead inside the 30 minute job bound.
+# 3 ms each, plus hash output processing and bulk tokenizer/sort/join stages.
+# Each surface uses a fixed number of bulk stages; record parsing uses builtins.
+# The combined budget remains inside the 30 minute job bound.
 # This work bound must match timeout-minutes in .github/workflows/embargo-guard.yml.
 EMBARGO_MAX_UNIQUE_TOKENS=50000
 if [[ $count -gt $EMBARGO_MAX_UNIQUE_TOKENS ]]; then
