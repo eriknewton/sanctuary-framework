@@ -183,11 +183,21 @@ it("protection surfaces share every observed layer", async () => {
 
 it("a joined home keeps its runtime sources and composes each snapshot fresh", () => {
   const home = {};
-  associateProtectionHome(home, { runtime: () => ({ ...protectionRuntimeUnavailable }), now: () => observedAt });
+  const runtime = vi.fn(() => ({ ...protectionRuntimeUnavailable }));
+  const now = vi.fn(() => observedAt);
+  associateProtectionHome(home, { runtime, now });
   const panels = { featureHealth: undefined, custodyExit: undefined, custodyObservation: fresh, auditChain: undefined };
   const first = observeProtectionJoiner(home, panels);
-  // The association a follower re-registers carries only the sources; a retained snapshot would go stale behind them.
+  // The association a follower re-registers carries only the registered sources; a retained snapshot would go stale behind them.
   expect(first).toHaveProperty("observation");
   expect(Object.keys(first.observation).sort()).toEqual(["now", "runtime"]);
-  expect(first.snapshot).not.toBe(observeProtectionJoiner(home, panels).snapshot);
+  expect(first.observation.runtime).toBe(runtime);
+  expect(first.observation.now).toBe(now);
+  // Each join reads the sources again, so its snapshot reflects the runtime at that moment.
+  expect(first.snapshot.encryptedStateStoreConstructed).toBeUndefined();
+  runtime.mockImplementation(() => ({ ...protectionRuntimeUnavailable, stateStore: {} as never }));
+  const second = observeProtectionJoiner(home, panels);
+  expect(runtime).toHaveBeenCalledTimes(2);
+  expect(now).toHaveBeenCalledTimes(2);
+  expect(second.snapshot.encryptedStateStoreConstructed).toBe(true);
 });
