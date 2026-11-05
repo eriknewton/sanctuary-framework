@@ -408,6 +408,8 @@ export async function handleRequest(
       {
         readFlightMap: deps.readFlightMap,
         panelStore: deps.panelStore,
+        // Must match composeAggregatorSources in aggregator.ts: preserve the current runtime provider.
+        protectionRuntime: deps.sources.protectionRuntime,
         auditLog: deps.sources.auditLog ?? null,
         originMachine:
           deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",

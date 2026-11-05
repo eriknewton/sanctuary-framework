@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The posture page and sanctuary_active_protections now share one protection-observation path. Identity and Encrypted vault use observed runtime evidence and stay unknown when it is unavailable.
+
 - Castle Wall daemon stop uses a twelve-second shared budget, with a sixteen-second CLI exit backstop and closed flow admission during teardown.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
