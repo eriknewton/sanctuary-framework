@@ -1,0 +1,74 @@
+# Refuse a PR range that cites a listed id once this context is required.
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+# The push run is a detector after publication, never a gate on an accepted push.
+# A branch-creation push is not a scanned surface; main is never created by push.
+# A red push run needs operator review; history changes are never automated.
+# A PR editing scripts/disclosure/ or .github/workflows/embargo-guard.yml runs its
+# own copy of the guard. Such a PR merges only after the coordinator's two-family review.
+# Unscanned surfaces include branch names, tags and tag messages, release notes
+# and GitHub release bodies, content absent from net added lines, unsplittable
+# binary text, word-described or spaced/split ids, ids interrupted by a NUL byte,
+# and bare short slugs.
+# The full surface and path policy is in scripts/disclosure/check-embargo.sh.
+# Keep edited: a title or body can change after the first successful check.
+# No paths filter: commit messages and PR text are independent of changed paths.
+# Use pull_request with read-only access; pull_request_target is unnecessary.
+# Wiring must match W13 in server/test/structure/embargo-guard.test.ts.
+name: embargo-guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  embargo-guard:
+    name: embargo-guard
+    runs-on: ubuntu-latest
+    # Must match the work bound in scripts/disclosure/check-embargo.sh, with full-depth checkout time.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Scan range and PR text
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          EVENT_HEAD: ${{ github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          text_args=()
+          case "$EVENT_NAME" in
+            pull_request)
+              base=$PR_BASE
+              head=$PR_HEAD
+              tmp=$(mktemp -d)
+              trap 'for file in "$tmp/title" "$tmp/body"; do [[ ! -f "$file" ]] || unlink "$file"; done; rmdir "$tmp"' EXIT
+              printf '%s\n' "$PR_TITLE" > "$tmp/title"
+              printf '%s\n' "$PR_BODY" > "$tmp/body"
+              text_args=(--text "pr-title=$tmp/title" --text "pr-body=$tmp/body")
+              ;;
+            push)
+              # Forty zero hex digits are Git's branch-creation sentinel, not range evidence.
+              if [[ "$PUSH_BASE" == 0000000000000000000000000000000000000000 ]]; then
+                printf '%s\n' 'ERROR embargo workflow cannot scan a branch-creation push' >&2
+                exit 2
+              fi
+              base=$PUSH_BASE
+              head=$EVENT_HEAD
+              ;;
+            *) exit 2 ;;
+          esac
+          scripts/disclosure/check-embargo.sh --base "$base" --head "$head" ${text_args[@]+"${text_args[@]}"}
