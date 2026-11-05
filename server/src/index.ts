@@ -1335,6 +1335,10 @@ export async function createSanctuaryServer(options?: {
       baseline,
       auditLog,
       identityManager,
+      // Must match the cooperative tool's runtime sources below; both observe the same bound session.
+      currentSessionBinding,
+      stateStore,
+      responseScreen,
       handshakeResults,
       shrOpts: { config, identityManager, masterKey },
       sanctuaryConfig: config,
