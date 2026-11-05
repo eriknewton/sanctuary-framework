@@ -61,6 +61,8 @@ import {
   type AuditChainRepairPlan,
 } from "../../src/cli/audit-chain-repair-plan.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
+import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -128,8 +130,27 @@ async function fortressTreeHash(root: string): Promise<string> {
 
 describe("audit-chain repair-plan", () => {
   const tempDirs: string[] = [];
+  const caseLeases: MasterWriteBarrierLease[] = [];
+
+  async function releaseCaseLeases(): Promise<void> {
+    await releaseCustodyLeases(caseLeases);
+  }
+
+  /**
+   * Open custody for a case that writes or deletes through `storage` after
+   * unlocking. Its lease is held until teardown, because storage refuses a
+   * later raw mutation once the last lease on it is released.
+   */
+  async function establishCaseCustody(storage: FilesystemStorage): Promise<Uint8Array> {
+    const established = await establishMaster({ storage, passphrase: PASSPHRASE });
+    caseLeases.push(takeCustodyLease(established));
+    return established.masterKey;
+  }
 
   afterEach(async () => {
+    // Every case write has finished by now, and the namespaces must still
+    // exist when the cases relinquish custody.
+    await releaseCaseLeases();
     for (const dir of tempDirs.splice(0)) {
       await chmod(join(dir, "state", AUDIT_DAEMON_NAMESPACE), 0o700).catch(
         () => undefined
@@ -145,6 +166,16 @@ describe("audit-chain repair-plan", () => {
 
   /** Provision a fortress and seed `entries` operator audit entries. */
   async function seededFortress(entries = 4): Promise<string> {
+    return (await seededFortressWithLease(entries)).fortressPath;
+  }
+
+  /**
+   * The seed itself, also returning its released lease's reader socket path so
+   * a case can observe the release.
+   */
+  async function seededFortressWithLease(
+    entries: number,
+  ): Promise<{ fortressPath: string; readerSocketPath: string | undefined }> {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-repair-plan-"));
     tempDirs.push(fortressPath);
     await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
@@ -157,19 +188,27 @@ describe("audit-chain repair-plan", () => {
     expect(code).toBe(0);
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
-    const log = new AuditLog(storage, masterKey);
-    for (let i = 0; i < entries; i++) {
-      await log.appendCritical({
-        layer: "l1",
-        operation: `seed-${i}`,
-        identity_id: "operator",
-        result: "success",
-      });
+    const established = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const lease = takeCustodyLease(established);
+    const { masterKey } = established;
+    try {
+      const log = new AuditLog(storage, masterKey);
+      for (let i = 0; i < entries; i++) {
+        await log.appendCritical({
+          layer: "l1",
+          operation: `seed-${i}`,
+          identity_id: "operator",
+          result: "success",
+        });
+      }
+      await log.flush();
+      return { fortressPath, readerSocketPath: lease.socketPath };
+    } finally {
+      masterKey.fill(0);
+      // The flush above is the seed's last write through this storage, and
+      // the namespace must still exist when the seed relinquishes custody.
+      await lease.release();
     }
-    await log.flush();
-    masterKey.fill(0);
-    return fortressPath;
   }
 
   /** Run the verb, returning its exit code, parsed plan, and streams. */
@@ -217,6 +256,19 @@ describe("audit-chain repair-plan", () => {
       (payload[0] === "A" ? "B" : "A") + payload.slice(1);
     await writeFile(target, JSON.stringify(raw), "utf8");
   }
+
+  it("seeded and case custody leases are released before teardown", async () => {
+    const { fortressPath, readerSocketPath } = await seededFortressWithLease(1);
+    await expectReaderSocketReleased(readerSocketPath);
+
+    const masterKey = await establishCaseCustody(
+      new FilesystemStorage(join(fortressPath, "state")),
+    );
+    masterKey.fill(0);
+    const caseSocketPath = caseLeases.at(-1)?.socketPath;
+    await releaseCaseLeases();
+    await expectReaderSocketReleased(caseSocketPath);
+  });
 
   it("reports a clean chain, exits 0, and leaves the fortress byte-identical", async () => {
     const fortressPath = await seededFortress();
@@ -269,7 +321,7 @@ describe("audit-chain repair-plan", () => {
     }
     const fortressPath = await seededFortress();
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const masterKey = await establishCaseCustody(storage);
     await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
     const daemonLog = createDaemonAuditLog(storage, masterKey);
     await withRootDaemonWriter(() => daemonLog.appendCritical({
@@ -320,7 +372,7 @@ describe("audit-chain repair-plan", () => {
     // reading).
     const fortressPath = await seededFortress();
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const masterKey = await establishCaseCustody(storage);
     await withRootDaemonWriter(() => migrateFortressAuditStoreSplit({ storage, masterKey }));
     const daemonLog = createDaemonAuditLog(storage, masterKey);
     await withRootDaemonWriter(() => daemonLog.appendCritical({
@@ -440,7 +492,7 @@ describe("audit-chain repair-plan", () => {
     // read-only run (no claim that a marker was latched or a floor re-armed).
     const fortressPath = await seededFortress();
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const masterKey = await establishCaseCustody(storage);
     const { storedIdentity } = await seedStoredIdentity(storage, masterKey);
     const writer = new AuditLog(storage, masterKey, { checkpointInterval: 1 });
     await appendCriticalEntries(writer, 3, storedIdentity.identity_id);

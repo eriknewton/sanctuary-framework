@@ -8,6 +8,7 @@ import { runSdwOwnerCommand } from "../../src/cli/sdw-owner.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { readSdwOwnerPin } from "../../src/sdw/memory-isolation.js";
+import { expectReaderSocketReleased, takeCustodyLease } from "../helpers/custody-lease.js";
 
 const PASSPHRASE = "ic16-cli-passphrase";
 const dirs: string[] = [];
@@ -25,7 +26,11 @@ function capture(): { stream: Writable; text: () => string } {
   };
 }
 
-async function fortress(): Promise<{ root: string; masterKey: Uint8Array }> {
+async function fortress(): Promise<{
+  root: string;
+  masterKey: Uint8Array;
+  readerSocketPath: string | undefined;
+}> {
   const root = await mkdtemp(join(tmpdir(), "sanctuary-sdw-owner-cli-"));
   dirs.push(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -36,7 +41,11 @@ async function fortress(): Promise<{ root: string; masterKey: Uint8Array }> {
     storagePathHint: root,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
   });
-  return { root, masterKey: established.masterKey };
+  const lease = takeCustodyLease(established);
+  // The fixture's storage makes no later write (cases read through fresh
+  // storage), and the namespace must still exist when it relinquishes custody.
+  await lease.release();
+  return { root, masterKey: established.masterKey, readerSocketPath: lease.socketPath };
 }
 
 afterEach(async () => {
@@ -44,6 +53,12 @@ afterEach(async () => {
 });
 
 describe("sanctuary sdw-owner", () => {
+  it("fixture fortress releases its custody lease before teardown", async () => {
+    const f = await fortress();
+    await expectReaderSocketReleased(f.readerSocketPath);
+    f.masterKey.fill(0);
+  });
+
   it("claims and transfers only after exact typed confirmation", async () => {
     const f = await fortress();
     const out = capture();

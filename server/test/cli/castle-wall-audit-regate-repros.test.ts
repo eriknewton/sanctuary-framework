@@ -42,6 +42,8 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
+import { expectReaderSocketReleased, releaseCustodyLeases, takeCustodyLease } from "../helpers/custody-lease.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -58,7 +60,16 @@ const PASSPHRASE = "test-f2-regate-repros-passphrase";
 
 describe("F2 re-gate repros (round 2)", () => {
   const tempDirs: string[] = [];
+  const fixtureLeases: MasterWriteBarrierLease[] = [];
+
+  async function releaseFixtureLeases(): Promise<void> {
+    await releaseCustodyLeases(fixtureLeases);
+  }
+
   afterEach(async () => {
+    // The fixture hands its storage to the case, so its lease lives until
+    // teardown; the namespace must still exist when it relinquishes custody.
+    await releaseFixtureLeases();
     for (const dir of tempDirs.splice(0)) {
       await chmod(join(dir, "state", AUDIT_DAEMON_NAMESPACE), 0o700).catch(() => undefined);
       const auditDir = join(dir, "state", "_audit");
@@ -94,7 +105,10 @@ describe("F2 re-gate repros (round 2)", () => {
 
     const statePath = join(fortressPath, "state");
     const storage = new FilesystemStorage(statePath);
-    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const established = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const lease = takeCustodyLease(established);
+    fixtureLeases.push(lease);
+    const { masterKey } = established;
 
     // Seed operator entries BEFORE migration so the sealed region is non-empty.
     const opLog = new AuditLog(storage, masterKey);
@@ -123,7 +137,7 @@ describe("F2 re-gate repros (round 2)", () => {
       }
       await withRootDaemonWriter(() => daemonLog.flush());
     }
-    return { fortressPath, statePath, storage, masterKey };
+    return { fortressPath, statePath, storage, masterKey, readerSocketPath: lease.socketPath };
   }
 
   function sealedEntryFiles(statePath: string): Promise<string[]> {
@@ -131,6 +145,13 @@ describe("F2 re-gate repros (round 2)", () => {
       fs.filter((f) => f.startsWith("entry-")).sort(),
     );
   }
+
+  it("fixture fortress releases its custody lease at teardown", async () => {
+    const { masterKey, readerSocketPath } = await seededMigratedFortress({ operatorEntries: 1 });
+    masterKey.fill(0);
+    await releaseFixtureLeases();
+    await expectReaderSocketReleased(readerSocketPath);
+  });
 
   // ── BLOCKER-R1 ─────────────────────────────────────────────────────────
   it("BLOCKER-R1: audit-findings does NOT report 'verifies clean' when a sealed entry is corrupted in place", async () => {
