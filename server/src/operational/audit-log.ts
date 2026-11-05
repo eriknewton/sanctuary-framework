@@ -3978,9 +3978,10 @@ export class AuditLog {
    * before the listing can only name an entry that was already on disk. It does
    * NOT guarantee the later listing still contains that entry — an adversarial
    * delete or rollback between the two reads removes it — and that case must
-   * fail, not be excused: an entry the anchor names but the listing lacks leaves
-   * `highestChainedSeq < anchor.highest_sequence`, which is reported as
-   * `tail_anchor_invalid` below and fails the load closed.
+   * fail closed: the surviving chain must reach the anchor's sequence, and the
+   * verified source at that sequence must carry the anchored hash. A floor or
+   * hash mismatch produces `tail_anchor_invalid`; an absent entry inside the
+   * verified range is already a chain-gap finding.
    *
    * So the early sample removes only the FALSE verdict. Sampling AFTER the
    * listing instead admits an append that landed mid-pass, raising a floor the
@@ -3991,6 +3992,7 @@ export class AuditLog {
     anchor: HeadAnchorReadResult,
     highestChainedSeq: number,
     highestChainedHash: string,
+    anchorEntryHash: string | undefined,
     hasLegacyEntries: boolean,
     hasChainedEntries: boolean,
     findings: AuditIntegrityFinding[],
@@ -4007,16 +4009,16 @@ export class AuditLog {
         });
         return;
       }
-      if (
-        highestChainedSeq === anchor.highest_sequence &&
-        highestChainedHash !== anchor.head_hash
-      ) {
+      // A valid boundary authenticates the region below its sealed tip; no separate anchor finding belongs there.
+      if (anchor.highest_sequence < sealedTipSequence) return;
+      // The MAC binds its named entry, independent of later entries; the chain walk already reports in-range gaps.
+      if (anchorEntryHash !== undefined && anchorEntryHash !== anchor.head_hash) {
         findings.push({
           kind: "tail_anchor_invalid",
-          sequence: highestChainedSeq,
+          sequence: anchor.highest_sequence,
           expected: anchor.head_hash,
-          actual: highestChainedHash,
-          message: `audit head anchor hash does not match the surviving head at sequence ${highestChainedSeq}`,
+          actual: anchorEntryHash,
+          message: `audit head anchor hash does not match the named entry at sequence ${anchor.highest_sequence}`,
         });
       }
       return;
@@ -4199,7 +4201,7 @@ export class AuditLog {
     splitBoundary: AuditStoreSplitBoundaryLoadResult,
     suppressTofu: boolean,
     findings: AuditIntegrityFinding[]
-  ): Promise<{ expectedSequence: number; expectedPrevHash: string }> {
+  ): Promise<{ expectedSequence: number; expectedPrevHash: string; authenticatedStart: boolean }> {
     const defaultSeedSequence =
       splitBoundary.status === "valid"
         ? splitBoundary.boundary.sealed_tip_sequence + 1
@@ -4213,6 +4215,7 @@ export class AuditLog {
     const defaultSeed = {
       expectedSequence: defaultSeedSequence,
       expectedPrevHash: defaultSeedPrevHash,
+      authenticatedStart: true,
     };
 
     if (chainedEntries.length === 0) {
@@ -4249,6 +4252,7 @@ export class AuditLog {
         return {
           expectedSequence: anchor.base_sequence,
           expectedPrevHash: anchor.base_prev_hash,
+          authenticatedStart: true,
         };
       }
       // The authenticated base does not match the lowest survivor — the head was
@@ -4265,6 +4269,7 @@ export class AuditLog {
       return {
         expectedSequence: lowestChainedSeq,
         expectedPrevHash: head.prev_hash,
+        authenticatedStart: false,
       };
     }
 
@@ -4278,6 +4283,7 @@ export class AuditLog {
       return {
         expectedSequence: lowestChainedSeq,
         expectedPrevHash: head.prev_hash,
+        authenticatedStart: false,
       };
     }
 
@@ -4297,6 +4303,7 @@ export class AuditLog {
       return {
         expectedSequence: lowestChainedSeq,
         expectedPrevHash: head.prev_hash,
+        authenticatedStart: false,
       };
     }
 
@@ -4335,6 +4342,7 @@ export class AuditLog {
     return {
       expectedSequence: lowestChainedSeq,
       expectedPrevHash: head.prev_hash,
+      authenticatedStart: false,
     };
   }
 
@@ -5745,6 +5753,89 @@ export class AuditLog {
     }
   }
 
+  /** Check the authenticated head against one body or an already verified starting point before adoption. */
+  private async assertWriterHeadAnchorBinding(
+    head: HeadAnchorReadResult,
+    keys: string[],
+    boundary: AuditStoreSplitBoundary | undefined,
+    signal: AuditWriteLockAbortSignal,
+  ): Promise<void> {
+    if (head.status !== "valid") return;
+    const sequence = head.highest_sequence;
+    // A valid boundary authenticates the region below its sealed tip without reading sealed bodies.
+    if (boundary && sequence < boundary.sealed_tip_sequence) return;
+    let hash: string | undefined;
+    // Must match loadPersistedEntries: the legacy root was recomputed by the successful load, never inferred from entry count alone.
+    if (boundary && sequence === boundary.sealed_tip_sequence) {
+      hash = boundary.sealed_tip_entry_hash;
+    } else if (this.verifiedLegacyCount > 0 && sequence === this.verifiedLegacyCount) {
+      hash = this.verifiedLegacyRoot;
+    } else {
+      const key = keys.find(key => parseEntryKeySequence(key) === sequence);
+      if (key !== undefined) {
+        // The head was already read by discovery; binding adds at most one entry-body read and no chain scan.
+        const raw = await this.storage.read(AUDIT_NAMESPACE, key);
+        this.assertAuditWriteLockActive(signal);
+        let parsed: unknown;
+        try { parsed = raw === null ? undefined : JSON.parse(bytesToString(raw)); } catch { /* Shape refusal below. */ }
+        if (isPersistedAuditEnvelopeV2(parsed) && parsed.sequence === sequence) {
+          hash = computeAuditEntryHash({
+            sequence: parsed.sequence,
+            prev_hash: parsed.prev_hash,
+            timestamp: parsed.timestamp,
+            encrypted_payload_bytes: parsed.encrypted_payload_bytes,
+            schema_version: parsed.schema_version,
+          });
+          // Discovery adopts the stored hash, so that field must agree with the digest bound to the head.
+          if (hash !== parsed.entry_hash) {
+            throw new AuditIntegrityError([{
+              kind: "entry_hash_mismatch",
+              sequence,
+              expected: hash,
+              actual: parsed.entry_hash,
+              message: `audit named entry hash mismatch at sequence ${sequence}`,
+            }]);
+          }
+        } else {
+          throw new AuditIntegrityError([{
+            kind: raw === null ? "entry_unreadable" : "entry_malformed",
+            sequence,
+            message: raw === null
+              ? `audit head anchor named entry at sequence ${sequence} is absent`
+              : `audit head anchor named entry at sequence ${sequence} is malformed`,
+          }]);
+        }
+      } else {
+        const rotation = await this.loadRotationAnchor([]);
+        this.assertAuditWriteLockActive(signal);
+        if (rotation.status === "valid" && sequence === rotation.base_sequence - 1) {
+          hash = rotation.base_prev_hash;
+        } else if (sequence > Math.max(
+          boundary?.sealed_tip_sequence ?? 0,
+          this.verifiedLegacyCount,
+          rotation.status === "valid" ? rotation.base_sequence - 1 : 0,
+        )) {
+          // A missing named entry inside the walked region is a gap, matching verifyChainedEntries's refusal.
+          throw new AuditIntegrityError([{
+            kind: "sequence_gap_or_reorder",
+            sequence,
+            message: `audit head anchor named entry at sequence ${sequence} is absent`,
+          }]);
+        }
+      }
+    }
+    // The entry the anchor names must carry the anchor's hash before any write that extends the chain.
+    if (hash !== undefined && hash !== head.head_hash) {
+      throw new AuditIntegrityError([{
+        kind: "tail_anchor_invalid",
+        sequence,
+        expected: head.head_hash,
+        actual: hash,
+        message: `audit head anchor hash does not match the named entry at sequence ${sequence}`,
+      }]);
+    }
+  }
+
   private async freshenChainStateFromDisk(signal: AuditWriteLockAbortSignal): Promise<string[]> {
     const outcome = await this.readLatestPersistedChainState(signal);
     // A late evidence read has no authority to publish allocation, history or a sealed floor.
@@ -5816,6 +5907,28 @@ export class AuditLog {
       : (await this.storage.list(AUDIT_NAMESPACE, "entry-")).map((meta) => meta.key);
       this.assertAuditWriteLockActive(signal);
       keys.sort(compareAuditKeys);
+      const bound = async (outcome: AuditDiscoveryOutcome): Promise<AuditDiscoveryOutcome> => {
+        try {
+          await this.assertWriterHeadAnchorBinding(head, keys, boundary, signal);
+        } catch (cause) {
+          // A completed binding read cannot authorize adoption after the write lease ends.
+          this.assertAuditWriteLockActive(signal);
+          // Lenient mode keeps base adoption so operator recovery commands and an operator-overridden daemon keep working.
+          // Lenient logs are constructed only by operator commands and reporters; MCP and tool composition constructs strict logs.
+          // The reviewed file set must match test/structure/audit-construction-sites.test.ts.
+          if (this.integrityMode === "strict") throw cause;
+          const findings: readonly AuditIntegrityFinding[] = cause instanceof AuditIntegrityError
+            ? cause.findings
+            : [{ kind: "storage_unavailable", message: "audit head anchor binding evidence could not be read" }];
+          for (const finding of findings) {
+            // Retain the first finding per kind so repeated recovery appends cannot grow the report without bound.
+            if (!this.integrityFindings.some(existing => existing.kind === finding.kind)) {
+              this.integrityFindings.push(finding);
+            }
+          }
+        }
+        return outcome;
+      };
       let knownTipBodySurvives = false;
       for (let i = keys.length - 1; i >= 0; i--) {
         const key = keys[i]!;
@@ -5833,7 +5946,7 @@ export class AuditLog {
         // D0 keeps shape-based discovery, but a newer authenticated head cannot be overwritten by a lower adopted tip.
         const adoptedTip = Math.max(this.nextSequence - 1, parsed.sequence);
         if (head.status === "valid" && head.highest_sequence > adoptedTip) return { status: "unknown", keys };
-        return { status: "found", keys, sequence: parsed.sequence, hash: parsed.entry_hash, sealedFloor };
+        return await bound({ status: "found", keys, sequence: parsed.sequence, hash: parsed.entry_hash, sealedFloor });
       }
       const unknown = (cause?: unknown): AuditDiscoveryOutcome => ({ status: "unknown", keys, cause });
       const tip = this.nextSequence - 1;
@@ -5878,8 +5991,9 @@ export class AuditLog {
       if (known > sealedFloor && !knownTipBodySurvives) return unknown();
       // D7: suppress a sealed anchor's permission error only for a demonstrably empty suffix.
       if (head.status === "unreadable_sealed" && !(boundary && suffix.status === "absent" && candidates.length === 0 && known <= sealedFloor)) return unknown(head.cause);
+      // D8 retains the cached tip without adopting disk metadata; D2 already checked its equal-sequence head binding.
       if (candidates.length > 0) return { status: "candidates_unusable", keys, sealedFloor }; // D8
-      if (boundary) return { status: "empty_suffix", keys, sealedFloor, sequence: sealedFloor, hash: boundary.sealed_tip_entry_hash }; // D9
+      if (boundary) return await bound({ status: "empty_suffix", keys, sealedFloor, sequence: sealedFloor, hash: boundary.sealed_tip_entry_hash }); // D9
       if (known === 0 && this.verifiedLegacyCount === 0 && tip === 0 && establishment?.established === false && this.lastEntryHash === AUDIT_CHAIN_GENESIS) {
         return { status: "baseline", keys, sealedFloor }; // D10
       }
@@ -5891,6 +6005,8 @@ export class AuditLog {
     } catch (cause) {
       // Acquisition and hold deadlines keep their own types even if an evidence read settles after abort.
       this.assertAuditWriteLockActive(signal);
+      // Binding refusals retain the same class as strict load, including checkpoint-only adoption.
+      if (cause instanceof AuditIntegrityError) throw cause;
       return { status: "unknown", keys, cause };
     }
   }
@@ -6045,9 +6161,10 @@ export class AuditLog {
       // an anchor read here can only name an entry that was already on disk. It
       // does NOT promise the listing taken below still contains that entry — a
       // delete or rollback landing between the two reads removes it — and that
-      // must fail closed, which it does: `verifyHeadAnchor` then sees
-      // `highestChainedSeq < anchor.highest_sequence` and raises
-      // `tail_anchor_invalid`.
+      // must fail closed: `verifyHeadAnchor` checks both the surviving sequence
+      // floor and the hash supplied by the verified source at the named sequence.
+      // Floor/hash mismatches produce `tail_anchor_invalid`; in-range absence
+      // already produces a chain-gap finding.
       // What the early sample removes is only the FALSE verdict: reading the
       // anchor after the listing (the pre-2026-08-05 order) let an append that
       // landed mid-pass raise a floor the just-taken listing could not reach,
@@ -6311,10 +6428,20 @@ export class AuditLog {
         (splitBoundary.status === "valid"
           ? splitBoundary.boundary.sealed_tip_entry_hash
           : legacyAnchorHash);
+      // Must match assertWriterHeadAnchorBinding: entries and authenticated starting points name the same hashes.
+      const anchorEntryHash = headAnchor.status === "valid"
+        ? chainedEntries.find(({ envelope }) => envelope.sequence === headAnchor.highest_sequence)?.envelope.entry_hash
+          ?? (splitBoundary.status === "valid" && headAnchor.highest_sequence === effectiveSealedTip
+            ? splitBoundary.boundary.sealed_tip_entry_hash : undefined)
+          ?? (chainSeed.authenticatedStart && headAnchor.highest_sequence === chainSeed.expectedSequence - 1
+            ? chainSeed.expectedPrevHash : undefined)
+          ?? (headAnchor.highest_sequence === legacyRawEntries.length ? legacyAnchorHash : undefined)
+        : undefined;
       await this.verifyHeadAnchor(
         headAnchor,
         highestChainedSeq,
         highestChainedHash,
+        anchorEntryHash,
         legacyRawEntries.length > 0,
         chainedEntries.length > 0,
         findings,
@@ -6322,8 +6449,8 @@ export class AuditLog {
       );
       // Must match persistChainedEntry and freshenChainStateFromDisk: actual V2 history never comes from a boundary or legacy count.
       this.knownV2HighWater = Math.max(this.knownV2HighWater, highestObservedV2?.sequence ?? 0);
-      if (findings.length === 0) {
-        // A clean verification in any mode establishes legacy history independently of the trimmed RAM window.
+      if (!findings.some(isHardIntegrityFinding)) {
+        // Warn-grade signing posture does not invalidate the recomputed legacy start; hard findings never establish it.
         this.verifiedLegacyCount = legacyRawEntries.length;
         this.verifiedLegacyRoot = legacyAnchorHash;
       }
@@ -7852,9 +7979,13 @@ export class AuditLog {
         this.assertAuditWriteLockActive(signal);
         // The target includes this writer's own persisted high-water, so a stale tip published by an unlocked reload cannot leave this writer's own entries outside the checkpoint.
         const checkpointSequence = Math.max(this.nextSequence - 1, this.ownHighestPersistedSequence);
+        const rotationAnchor = await this.loadRotationAnchor([]);
+        this.assertAuditWriteLockActive(signal);
         const fromSequence = Math.max(
           previousCheckpointSequence + 1,
-          sealedTipSequence + 1
+          sealedTipSequence + 1,
+          // Only the local master-key MAC verified by loadRotationAnchor authorizes this chain's retention cut; filenames cannot authorize omitted leaves.
+          rotationAnchor.status === "valid" ? rotationAnchor.base_sequence : 0
         );
         const collected = await this.collectPersistedEntryHashes(
           fromSequence,
