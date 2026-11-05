@@ -1,3 +1,4 @@
+import { protectionRuntimeUnavailable } from "./agent-native/protection-observations.js";
 /**
  * Sanctuary MCP Server - Standalone Dashboard
  *
@@ -1574,8 +1575,8 @@ async function wireUnlockedDeps(args: {
     await identityManager.save(storedIdentity);
     signingIdentity = storedIdentity;
   }
+  const stateStore = new StateStore(storage, masterKey);
   {
-    const stateStore = new StateStore(storage, masterKey);
     const { hubService } = v11Bindings;
     const taskService = new TaskService({
       stateStore,
@@ -1664,7 +1665,8 @@ async function wireUnlockedDeps(args: {
   // If control reaches this point the unlock is committed; there is no longer
   // any half-unlocked window. Order within the tail is irrelevant for safety
   // (none of these throw), but mirrors the historical sequence for clarity.
-  dashboard.setDependencies(deps);
+  // Must match observeProtections in protection-observations.ts: attach the TaskService consumer only after loads succeed.
+  dashboard.setDependencies({ ...protectionRuntimeUnavailable, ...deps, stateStore });
   dashboard.setV11Bindings(v11Bindings);
   dashboard.setDistressInbox(distressInbox);
   if (enableLoopbackAutoAuth) {

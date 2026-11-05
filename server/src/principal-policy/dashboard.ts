@@ -58,6 +58,7 @@ import type {
 } from "../operational/audit-log.js";
 import { AuditIntegrityError } from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
+import { protectionRuntimeUnavailable, type ProtectionRuntimeSources } from "../agent-native/protection-observations.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import type { SignedSHR } from "../shr/types.js";
@@ -1075,6 +1076,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private baseline: BaselineTracker | null = null;
   private auditLog: AuditLog | null = null;
   private identityManager: IdentityManager | null = null;
+  private stateStore: ProtectionRuntimeSources["stateStore"];
+  private responseScreen: ProtectionRuntimeSources["responseScreen"];
+  private currentSessionBinding: ProtectionRuntimeSources["currentSessionBinding"];
+  // Must match ProtectionRuntimeProvider in protection-observations.ts: resolve current objects on every use.
+  private protectionRuntime = (): ProtectionRuntimeSources => ({
+    ...protectionRuntimeUnavailable,
+    identityManager: this.identityManager,
+    stateStore: this.stateStore,
+    responseScreen: this.responseScreen,
+    currentSessionBinding: this.currentSessionBinding,
+  });
   private handshakeResults: ReadonlyMap<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
   /**
@@ -1581,6 +1593,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     baseline: BaselineTracker;
     auditLog: AuditLog;
     identityManager?: IdentityManager;
+    stateStore?: ProtectionRuntimeSources["stateStore"];
+    responseScreen?: ProtectionRuntimeSources["responseScreen"];
+    currentSessionBinding?: ProtectionRuntimeSources["currentSessionBinding"];
     handshakeResults?: ReadonlyMap<string, HandshakeResult>;
     shrOpts?: SHRGeneratorOptions;
     sanctuaryConfig?: SanctuaryConfig;
@@ -1634,6 +1649,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.baseline = deps.baseline;
     this.auditLog = deps.auditLog;
     if (deps.identityManager) this.identityManager = deps.identityManager;
+    if (deps.stateStore) this.stateStore = deps.stateStore;
+    if (deps.responseScreen) this.responseScreen = deps.responseScreen;
+    if (deps.currentSessionBinding) this.currentSessionBinding = deps.currentSessionBinding;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
     if (deps.storage) this.storage = deps.storage;
@@ -2380,6 +2398,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const loadTimedOut = loadState === "timed_out" || performance.now() - started >= POSTURE_PRELUDE_BUDGET_MS;
       return {
         refreshStreamDeps: buildDeps,
+        protectionRuntime: this.protectionRuntime,
         ...(loadTimedOut || loadState === "failed" ? { producerKeysStatus: {
           state: "unavailable" as const, completed_at: null, age_ms: null, budget_ms: POSTURE_PRELUDE_BUDGET_MS,
           reason: loadTimedOut ? "budget_exceeded" as const : "producer_failed" as const,
@@ -8387,6 +8406,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       serverVersion: PKG_VERSION,
       platform: process.platform,
       identityManager: this.identityManager,
+      protectionRuntime: this.protectionRuntime,
       auditLog: this.auditLog,
       baseline: this.baseline,
       policy: this.policy,

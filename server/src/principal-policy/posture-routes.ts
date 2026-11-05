@@ -49,6 +49,8 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { composeProtectionLayers } from "../agent-native/protection-layers.js";
+import { observeProtections, associateProtectionHome, observeProtectionJoiner, protectionRuntimeUnavailable,
+  type ProtectionRuntimeProvider } from "../agent-native/protection-observations.js";
 import {
   respondWithBoundedDashboardRead,
   type DashboardReadFlightMap,
@@ -162,6 +164,8 @@ export const POSTURE_EVIDENCE_PATH = "/posture/evidence";
  * mirrors the `buildV1AgentsDeps` pattern.
  */
 export interface PostureRouteDeps {
+  /** Must match ProtectionRuntimeProvider in protection-observations.ts; reads current session and consumers. */
+  protectionRuntime?: ProtectionRuntimeProvider;
   /** Encrypted audit log (already unlocked). */
   auditLog: AuditLog | null;
   /** Origin-machine attribution for `/v1`-compatible shapes. */
@@ -1199,16 +1203,23 @@ export const AUDIT_READING_HOME_PANELS = ["castle_wall", "digest", "feature_heal
 
 /** Reconcile a route-flight follower against the audit state at its own arrival. */
 export function reconcilePostureHomeJoiner(home: PostureHome, admissionSequence: number, arrivalSequence: number): PostureHome {
-  if (arrivalSequence <= admissionSequence || !home.panels) return home;
   const result = { ...home, panels: { ...home.panels } };
   // A flight proves its admission sequence only; a newer caller gets a private capped copy.
-  for (const id of AUDIT_READING_HOME_PANELS) {
+  for (const id of arrivalSequence > admissionSequence ? AUDIT_READING_HOME_PANELS : []) {
     Object.assign(result, { [id]: capStalePanel(id, home[id]) });
     result.panels[id] = { ...home.panels[id], state: home.panels[id].state === "unavailable" ? "unavailable" : "stale",
       reason: home.panels[id].reason ?? "observation_superseded" };
   }
-  result.protection_layers = composeProtectionLayers({ featureHealth: result.feature_health, custodyExit: result.custody_exit,
-    custodyObservation: result.panels.custody_exit });
+  // Must match associateProtectionHome in protection-observations.ts: every copy keeps its own qualified snapshot.
+  const observation = observeProtectionJoiner(home, { featureHealth: result.feature_health, custodyExit: result.custody_exit,
+    custodyObservation: result.panels.custody_exit, auditChain: undefined });
+  result.protection_layers = composeProtectionLayers(observation.snapshot);
+  // Reuse requires freshly evaluated whole-row equality; an unchanged audit sequence alone proves no runtime fact.
+  if (arrivalSequence <= admissionSequence && JSON.stringify(result.protection_layers) === JSON.stringify(home.protection_layers)) {
+    associateProtectionHome(home, observation);
+    return home;
+  }
+  associateProtectionHome(result, observation);
   return result;
 }
 
@@ -1336,11 +1347,14 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
   const agentsRaw = buildPostureAgentRows({ originMachine: deps.originMachine, records });
   const agents = roster.status.state === "fresh" ? agentsRaw : capStalePanel("agents", agentsRaw);
   const unwrappedValue = value("unwrapped", unwrapped);
-  return {
+  const runtime = deps.protectionRuntime ?? (() => protectionRuntimeUnavailable);
+  const now = deps.now ?? Date.now;
+  // Page composition has no bounded chain observation; existing panel qualifications remain authoritative.
+  const snapshot = observeProtections(runtime(), { featureHealth, custodyExit: value("custody_exit", custody),
+    custodyObservation: custody.status, now: now(), auditChain: undefined });
+  const home: PostureHome = {
     origin_machine: deps.originMachine, stream_available: deps.streamRegistry !== undefined,
-    // Must match custodyObservation in protection-layers.ts: use the producer status, including fallback and stale reads.
-    protection_layers: composeProtectionLayers({ featureHealth, custodyExit: value("custody_exit", custody),
-      custodyObservation: custody.status, now: deps.now?.() ?? Date.now() }),
+    protection_layers: composeProtectionLayers(snapshot),
     producer_keys: { producer: deps.producerKeyObservation!, broker: deps.brokerProducerKeyObservation!,
       message: [deps.producerKeyObservation, deps.brokerProducerKeyObservation].includes("unknown")
         ? "Producer key state is not yet determined."
@@ -1358,6 +1372,9 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
     protection_detected_count: records.length + unwrappedValue.unwrapped.length,
     enforcement_confirmed_count: agents.filter(a => a.enforcement_active === "active").length,
   };
+  // Must match observeProtectionJoiner in protection-observations.ts: route flights retain this exact object.
+  associateProtectionHome(home, { snapshot, runtime, now });
+  return home;
 }
 
 async function buildFederationSummary(

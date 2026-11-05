@@ -12,6 +12,7 @@ import type { ResponseScreen } from "../proxy/response-screen.js";
 import { buildFeatureHealthPanel, SLICE1_FEATURE_REGISTRY } from "../principal-policy/feature-health.js";
 import type { ProducerKeyObservation } from "../principal-policy/panel-producer.js";
 import { buildCustodyExitPanel } from "../principal-policy/posture.js";
+import { observeProtections } from "./protection-observations.js";
 import { composeProtectionLayers, summarizeProtectionLayers } from "./protection-layers.js";
 import {
   COOPERATIVE_CAPABILITIES,
@@ -967,11 +968,6 @@ export function createAgentNativeCooperativeTools(
         try {
           const identity = active();
           const auditRef = await audit("sanctuary_active_protections");
-          let toolOutputScreenReady: boolean | undefined;
-          if (options.responseScreen) {
-            try { options.responseScreen.assertReady(); toolOutputScreenReady = true; }
-            catch { toolOutputScreenReady = false; }
-          }
           // Must match the dashboard accessor: this key pins broker heartbeat signatures, not agent identity.
           const brokerKey = await Promise.resolve().then(() => options.resolveBrokerProducerKey?.()).catch(() => null);
           // Must match withDerivedKeyRestriction in posture-routes.ts: only observed presence or absence is conclusive.
@@ -991,15 +987,19 @@ export function createAgentNativeCooperativeTools(
             buildCustodyExitPanel({ auditLog: options.auditLog, originMachine: "local" }),
             options.auditLog.getAuditChainVerdict(),
           ]);
-          const layers = composeProtectionLayers({
-            custodyObservation,
-            ...(toolOutputScreenReady === undefined ? {} : { toolOutputScreenReady }),
-            identityLoaded: options.identityManager.get(identity.identity_id) !== undefined,
-            ...(options.stateStore ? { encryptedStateStoreConstructed: true } : {}),
-            ...(health.status === "fulfilled" ? { featureHealth: health.value } : {}),
-            ...(custody.status === "fulfilled" ? { custodyExit: custody.value } : {}),
-            ...(chain.status === "fulfilled" ? { auditChain: chain.value.status } : {}),
-          });
+          // Must match observeProtections in protection-observations.ts: supply raw consumers and qualified reads.
+          const layers = composeProtectionLayers(observeProtections({
+            get identityManager() { return options.identityManager; },
+            currentSessionBinding: () => identity,
+            get stateStore() { return options.stateStore; },
+            get responseScreen() { return options.responseScreen; },
+          }, {
+            custodyObservation: custody.status === "fulfilled" ? custodyObservation : { state: "unavailable", completed_at: null },
+            featureHealth: health.status === "fulfilled" ? health.value : undefined,
+            custodyExit: custody.status === "fulfilled" ? custody.value : undefined,
+            auditChain: chain.status === "fulfilled" ? chain.value.status : undefined,
+            now: Date.now(),
+          }));
           return toolResult({
             guarantees: [
               "state_encrypted_at_rest",
