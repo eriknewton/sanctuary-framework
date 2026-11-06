@@ -46,7 +46,7 @@ describe("macOS ingress retention", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const home = await mkdtemp(join(tmpdir(), "cw-stop-deadline-"));
     vi.stubEnv("HOME", home);
-    const writeDeadlineMs = 500; // Short fault-injection deadline with room for healthy startup writes.
+    const writeDeadlineMs = 1_000; // Fault-injection deadline with room for healthy startup and cleanup writes on a loaded runner; stays below the 10000 ms fake stop advance.
     const key = ed25519.utils.randomPrivateKey();
     const storage = new FilesystemStorage(join(home, "state"));
     const audit = new AuditLog(storage, key, {
