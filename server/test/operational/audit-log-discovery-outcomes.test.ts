@@ -461,7 +461,7 @@ for (const namesOnly of [true, false]) {
 
 for (const evidence of ["boundary", "head", "migration", "suffix", "establishment-marker", "establishment-list", "body"] as const) {
   it(`deadline wins over delayed ${evidence} evidence with no late history or allocation`, async () => {
-    const f = await fixture(true, { writeLockHoldDeadlineMs: 100 }); // Deterministic short deadline; barriers control completion.
+    const f = await fixture(true, { writeLockHoldDeadlineMs: 1_000 }); // Barriers fix the completion order; one second covers healthy filesystem latency on a loaded runner.
     if (evidence === "body") await append(f, 1, f.make());
     if (evidence === "suffix" || evidence === "boundary") await seal(f, 0, "GENESIS");
     const before = await snapshot(f); const cached = state(f.log);

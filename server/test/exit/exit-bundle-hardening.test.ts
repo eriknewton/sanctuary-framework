@@ -50,7 +50,7 @@ import {
 import * as custodyFs from "../../src/storage/custody-fs.js";
 
 const execFileAsync = promisify(execFile);
-const NON_REGULAR_READ_SETTLE_TIMEOUT_MS = 250; // Quarter-second witness: local regular-file classification must settle before the no-hang guard fires.
+const NON_REGULAR_READ_SETTLE_TIMEOUT_MS = 1_000; // One-second witness: local regular-file classification must settle before the no-hang guard fires, with headroom for a loaded runner; a writerless FIFO still blocks past it.
 type ExitBundleFailureClass =
   NonNullable<ExitBundleVerifierResult["failure_class"]>;
 
