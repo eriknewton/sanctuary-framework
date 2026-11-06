@@ -60,7 +60,7 @@ describe("C1: Remote Operator Console", () => {
 
   describe("TLS enforcement for non-loopback", () => {
     it("refuses to start on non-loopback host without TLS or allow_plaintext_remote", async () => {
-      const port = randomTestPort();
+      const port = randomTestPort(); // port-discipline: ignore Non-loopback plaintext refusal throws before HTTP server creation or listen.
       dashboard = new DashboardApprovalChannel({
         port,
         host: "0.0.0.0",
@@ -70,7 +70,7 @@ describe("C1: Remote Operator Console", () => {
       await expect(dashboard.start()).rejects.toThrow(
         /refusing to start on non-loopback interface/i
       );
-      dashboard = null; // start failed, no cleanup needed
+      // Keep the refused channel for afterEach to stop its constructor timer.
     });
 
     it("allows non-loopback with allow_plaintext_remote=true", async () => {

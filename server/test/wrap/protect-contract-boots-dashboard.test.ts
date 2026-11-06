@@ -22,9 +22,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer, type Server } from "node:net";
 
 const castleWallMocks = vi.hoisted(() => ({
   runProvisionPin: vi.fn(async () => 0),
@@ -52,20 +53,31 @@ vi.mock("../../src/castle-wall/runtime/index.js", () => ({
 // NOTE: `src/dashboard-standalone.js` is deliberately NOT mocked here. It is
 // the module under test.
 
-import { parseWrapArgs, runWrap, type RunWrapDeps } from "../../src/wrap/cli.js";
+import {
+  __resetProcessShutdownStateForTest,
+  __processShutdownCleanupCountForTest,
+  handleProcessShutdownSignal,
+  parseWrapArgs,
+  runWrap,
+  type RunWrapDeps,
+} from "../../src/wrap/cli.js";
 import { runInit } from "../../src/wrap/init.js";
 import {
   buildAgentInstallPlan,
   probeCustodyAccess,
   type InstallProbeResult,
 } from "../../src/cli/install.js";
-import { startStandaloneDashboard } from "../../src/dashboard-standalone.js";
-import type { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
+import {
+  __resetStandaloneShutdownStateForTest,
+  handleStandaloneShutdownSignal,
+  startStandaloneDashboard,
+} from "../../src/dashboard-standalone.js";
+import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { readKeychainCustodyKey } from "../../src/wrap/keychain-custody.js";
 import { readStoredPassphrase } from "../../src/wrap/passphrase.js";
 import { getPlatformPaths } from "../../src/wrap/config-reader.js";
 import { toBase64url } from "../../src/core/encoding.js";
-import { randomTestPort } from "../util/port-collision-retry.js";
+import { bindWithRetry, randomTestPort } from "../util/port-collision-retry.js";
 
 const ENV_KEYS = [
   "HOME",
@@ -85,6 +97,13 @@ const DASHBOARD_TOKEN = "protect-contract-dashboard-token-not-a-secret";
 class ProcessExit extends Error {
   constructor(readonly code: number) {
     super(`process.exit(${String(code)})`);
+  }
+}
+
+/** Keep runWrap's adjacent-port fallback from consuming this test's collision. */
+class DashboardBindCollision extends Error {
+  constructor(readonly bindError: NodeJS.ErrnoException) {
+    super("Retry the entire dashboard contract attempt", { cause: bindError });
   }
 }
 
@@ -134,15 +153,21 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
   let originalEnv: Record<EnvKey, string | undefined>;
   let originalStdinIsTTY: boolean | undefined;
   let started: DashboardApprovalChannel[];
+  let captured: DashboardApprovalChannel[];
+  let blocker: Server | undefined;
+  let homes: string[];
+  let teardownErrors: unknown[];
   /** Every port `ensureMainDashboardForWrap` asked the starter to bind. */
   let requestedPorts: number[];
   /** Every port the starter actually bound, in start order. */
   let boundPorts: number[];
 
   beforeEach(async () => {
-    home = await mkdtemp(join(tmpdir(), "a73-protect-dashboard-"));
-    fortress = join(home, "sanctuary-daily");
+    homes = [];
+    teardownErrors = [];
     started = [];
+    captured = [];
+    blocker = undefined;
     requestedPorts = [];
     boundPorts = [];
     originalEnv = Object.fromEntries(
@@ -156,7 +181,6 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
       configurable: true,
       value: true,
     });
-    process.env.HOME = home;
     for (const key of ENV_KEYS) {
       if (key !== "HOME") delete process.env[key];
     }
@@ -166,6 +190,24 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
     castleWallMocks.startMacOSCastleWallDaemon.mockResolvedValue({
       stop: async () => {},
     });
+    // Capture before start: a rejected bind never returns the channel to the
+    // starter, but its timers and standalone dependencies still need teardown.
+    const start = DashboardApprovalChannel.prototype.start;
+    vi.spyOn(DashboardApprovalChannel.prototype, "start").mockImplementation(
+      async function (this: DashboardApprovalChannel, ...args) {
+        captured.push(this);
+        try {
+          await start.apply(this, args);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+            // Only the outer attempt chooses a fresh port. The real bind ran;
+            // changing the error wrapper prevents runWrap walking adjacent ports.
+            throw new DashboardBindCollision(error as NodeJS.ErrnoException);
+          }
+          throw error;
+        }
+      },
+    );
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "info").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -177,24 +219,67 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
     }) as never);
   });
 
-  afterEach(async () => {
-    for (const dashboard of started) {
-      await dashboard.stop().catch(() => undefined);
+  async function stopAttempt(): Promise<void> {
+    const recordFailure = async (cleanup: () => Promise<void>): Promise<void> => {
+      try {
+        await cleanup();
+      } catch (error) {
+        teardownErrors.push(error);
+      }
+    };
+    // Complete channel cleanup before draining the boot and wrap cleanups.
+    // startHttpServer clears its failed server reference before rejecting;
+    // stop still clears the constructor timer for a channel that never bound.
+    const hadStandalone = captured.length > 0;
+    for (const dashboard of captured.splice(0)) {
+      await recordFailure(() => dashboard.stop());
     }
+    const shutdowns = [
+      ...(hadStandalone ? [{ shutdown: handleStandaloneShutdownSignal, reset: __resetStandaloneShutdownStateForTest }] : []),
+      ...(__processShutdownCleanupCountForTest() > 0 ? [{ shutdown: handleProcessShutdownSignal, reset: __resetProcessShutdownStateForTest }] : []),
+    ];
+    for (const { shutdown, reset } of shutdowns) {
+      await recordFailure(async () => {
+        try {
+          await shutdown("SIGTERM");
+        } catch (error) {
+          if (!(error instanceof ProcessExit)) throw error;
+        } finally {
+          reset();
+        }
+      });
+    }
+    await recordFailure(() => new Promise<void>((resolve, reject) => {
+      // A blocker whose bind failed owns no listening handle to close.
+      if (!blocker?.listening) return resolve();
+      blocker.close((error) => error ? reject(error) : resolve());
+    }));
+    blocker = undefined;
     started = [];
     requestedPorts = [];
     boundPorts = [];
-    for (const key of ENV_KEYS) {
-      const value = originalEnv[key];
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+  }
+
+  afterEach(async () => {
+    try {
+      await stopAttempt();
+    } finally {
+      for (const key of ENV_KEYS) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      Object.defineProperty(process.stdin, "isTTY", {
+        configurable: true,
+        value: originalStdinIsTTY,
+      });
+      vi.restoreAllMocks();
+      const removed = await Promise.allSettled(homes.map((path) => rm(path, { recursive: true, force: true })));
+      for (const result of removed) {
+        if (result.status === "rejected") teardownErrors.push(result.reason);
+      }
+      if (teardownErrors.length) throw new AggregateError(teardownErrors, "Attempt teardown failed");
     }
-    Object.defineProperty(process.stdin, "isTTY", {
-      configurable: true,
-      value: originalStdinIsTTY,
-    });
-    vi.restoreAllMocks();
-    await rm(home, { recursive: true, force: true });
   });
 
   /** `sanctuary init` on the documented interactive path: enrolls an OS-keyring custody factor and no passphrase. */
@@ -221,7 +306,7 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
         // OS-keyring custody factor. The PROMPT is stubbed, the CHECK is not:
         // re-entry is what promotes the minted recovery wrap to `verified`,
         // and a fixture that skips it leaves the fortress below the
-        // two-verified-factor custody floor — a different refusal from the
+        // two-verified-factor custody floor - a different refusal from the
         // one this file is about, arriving at the same boot.
         verifyRecoveryKeyReentry: (async (args: {
           check: (entered: string) => Promise<boolean>;
@@ -249,7 +334,7 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
    * `startStandaloneDashboard` that binds EXACTLY the port
    * `ensureMainDashboardForWrap` asked for. Binding a port of the closure's own
    * choosing instead would make the test blind to the contract production
-   * depends on — `ensureMainDashboardForWrap` walks `requestedPort + i` on
+   * depends on - `ensureMainDashboardForWrap` walks `requestedPort + i` on
    * EADDRINUSE and reports the port it believes was bound, so a starter that
    * silently binds elsewhere would emit a URL nothing is listening on and the
    * test would still pass.
@@ -291,52 +376,81 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
     };
   }
 
-  it("runs the emitted argv to completion, dashboard included, and writes no secret into the wrapped config", async () => {
-    await initFortress();
+  it("retries a collided dashboard boot, completes the emitted argv on its requested port, and writes no secret into the wrapped config", async () => {
+    let collisionExercised = false;
+    let collisionRetried = false;
+    const requestedPort = await bindWithRetry(async () => {
+      // resolveDashboardPort returns this verbatim to the real starter.
+      const port = randomTestPort();
+      try {
+        // Every attempt starts from a pristine harness config and new custody.
+        home = await mkdtemp(join(tmpdir(), "a73-protect-dashboard-"));
+        homes.push(home);
+        fortress = join(home, "sanctuary-daily");
+        process.env.HOME = home;
+        const configPath = getPlatformPaths()["claude-code"][0]!;
+        await writeFile(configPath, JSON.stringify({ mcpServers: {} }));
+        await initFortress();
 
-    const observed = await probeCustodyAccess(fortress, process.platform);
-    expect(observed.custodyAccess).toBe("usable");
+        const observed = await probeCustodyAccess(fortress, process.platform);
+        expect(observed.custodyAccess).toBe("usable");
 
-    const plan = buildAgentInstallPlan({
-      profile: "memory",
-      harness: "claude-code",
-      fortress,
-      platform: process.platform,
-      observed: baseProbe(observed),
+        const plan = buildAgentInstallPlan({
+          profile: "memory",
+          harness: "claude-code",
+          fortress,
+          platform: process.platform,
+          observed: baseProbe(observed),
+        });
+        const argv = plan.next_action?.argv;
+        expect(argv).toBeDefined();
+        // The contract forbids adding a credential, so the argv the planner emits
+        // carries none and the dashboard it starts inherits none.
+        const flags = protectFlagsFrom(argv!);
+        expect(flags).not.toContain("--passphrase");
+        // The planner's REAL emission, asserted flag-for-flag rather than by
+        // substring over the joined string: `--no-open` is what keeps this run
+        // non-interactive, and `--no-provision-agent-account` is what keeps it
+        // from reaching agent-account provisioning. A test that ran a flag set the
+        // planner does not emit would prove nothing about the shipped contract,
+        // and `toContain` on the joined string cannot tell `--no-open` apart from
+        // a hypothetical `--no-open-browser`.
+        expect(flags).toContain("--claude-code");
+        expect(flags).toContain("--agent-guided");
+        expect(flags).toContain("--no-open");
+        expect(flags).toContain("--no-provision-agent-account");
+
+        const options = parseWrapArgs(flags);
+        if (!collisionExercised) {
+          // Hold the first requested port to exercise a real EADDRINUSE and
+          // the full failed-boot teardown on every run, without a timing race.
+          blocker = createServer();
+          await new Promise<void>((resolve, reject) => {
+            blocker!.once("error", reject);
+            blocker!.listen(port, "127.0.0.1", resolve);
+          });
+          collisionExercised = true;
+        }
+        await runWrap(
+          { ...options, fortress, protectCommand: true, port },
+          wrapDeps(),
+        );
+        return port;
+      } catch (error) {
+        await stopAttempt();
+        if (error instanceof DashboardBindCollision) {
+          collisionRetried = true;
+          throw error.bindError;
+        }
+        throw error;
+      }
     });
-    const argv = plan.next_action?.argv;
-    expect(argv).toBeDefined();
-    // The contract forbids adding a credential, so the argv the planner emits
-    // carries none and the dashboard it starts inherits none.
-    const flags = protectFlagsFrom(argv!);
-    expect(flags).not.toContain("--passphrase");
-    // The planner's REAL emission, asserted flag-for-flag rather than by
-    // substring over the joined string: `--no-open` is what keeps this run
-    // non-interactive, and `--no-provision-agent-account` is what keeps it
-    // from reaching agent-account provisioning. A test that ran a flag set the
-    // planner does not emit would prove nothing about the shipped contract,
-    // and `toContain` on the joined string cannot tell `--no-open` apart from
-    // a hypothetical `--no-open-browser`.
-    expect(flags).toContain("--claude-code");
-    expect(flags).toContain("--agent-guided");
-    expect(flags).toContain("--no-open");
-    expect(flags).toContain("--no-provision-agent-account");
-
-    const enrolled = await readKeychainCustodyKey(fortress);
-    expect(enrolled).not.toBeNull();
-
-    // Before the fix this reached the dashboard boot and threw "cannot unlock
-    // this fortress ... with the available factors", naming only the
-    // sanctuary-passphrase service: `protect` opened the fortress with the
-    // enrolled factor and the dashboard it started refused the same fortress.
-    const options = parseWrapArgs(flags);
-    // `resolveDashboardPort` returns this verbatim, so it becomes the
-    // `requestedPort` `ensureMainDashboardForWrap` hands the starter.
-    const requestedPort = randomTestPort();
-    await runWrap(
-      { ...options, fortress, protectCommand: true, port: requestedPort },
-      wrapDeps(),
-    );
+    // Teardown must never change which error drives bindWithRetry. Report it
+    // only after the loop; afterEach also reports it if the loop itself throws.
+    expect(teardownErrors, "failed-attempt teardown errors").toEqual([]);
+    expect(new Set(homes).size).toBe(homes.length);
+    expect(collisionExercised).toBe(true);
+    expect(collisionRetried).toBe(true);
 
     // Exit 0: the run completed and never reached a refusal path (every
     // `process.exit` in this suite throws `ProcessExit`, so arriving here is
@@ -344,7 +458,7 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
     expect(started.length).toBe(1);
     expect(started[0]!.isParked()).toBe(false);
 
-    // The starter bound the port it was ASKED for, on the first attempt: no
+    // In the successful attempt the starter bound the port it was ASKED for: no
     // walk, so the URL `ensureMainDashboardForWrap` reports is the URL that is
     // listening.
     expect(requestedPorts).toEqual([requestedPort]);
@@ -364,6 +478,8 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
     expect(await readStoredPassphrase({ storagePath: fortress })).toBeNull();
 
     // No secret in anything the wrap wrote to the harness config.
+    const enrolled = await readKeychainCustodyKey(fortress);
+    expect(enrolled).not.toBeNull();
     const enrolledEncoded = toBase64url(enrolled!);
     for (const path of getPlatformPaths()["claude-code"]) {
       const contents = await readFile(path, "utf-8").catch(() => null);

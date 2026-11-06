@@ -3,7 +3,7 @@
  *
  * Exercises auth, HTML vs JSON routes, health endpoint, and proper 404
  * behaviour. Stubs the per-tenant probe via discovery root (tenants have no
- * listening server so `running` is false everywhere — that's fine, we just
+ * listening server so `running` is false everywhere - that's fine, we just
  * verify the route plumbing).
  */
 
@@ -146,6 +146,7 @@ describe("multi-server", () => {
   }
 
   it("refuses non-loopback plaintext before listening", async () => {
+    // port-discipline: ignore startMultiDashboardServer refuses non-loopback plaintext before listen.
     const port = randomTestPort();
 
     await expect(
@@ -163,6 +164,7 @@ describe("multi-server", () => {
   it("refuses a concrete non-loopback IP through the same guard", async () => {
     await expect(
       startMultiDashboardServer({
+        // port-discipline: ignore startMultiDashboardServer refuses non-loopback plaintext before listen.
         port: randomTestPort(),
         host: "192.0.2.10",
         home,

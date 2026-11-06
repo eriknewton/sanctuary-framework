@@ -1,7 +1,7 @@
 /**
- * Sigma-6 + Sigma-7 test-port-discipline regression gate.
+ * Test-port-discipline regression gate.
  *
- * Scans `server/test/` for two anti-pattern classes:
+ * Scans `server/test/` for three anti-pattern classes:
  *
  *   Sigma-6 detection: `.listen(...)` calls in test files. Each must be
  *   either:
@@ -25,11 +25,25 @@
  *   back via `server.address()`). A local `randomPort` declaration is
  *   therefore a violation.
  *
+ *   Random allocation detection uses the TypeScript AST. Flag every call
+ *   whose callee, after stripping parentheses and non-null assertions, is
+ *   the identifier `randomTestPort`. Exempt a call only when its nearest
+ *   enclosing function-like node is an arrow function or function expression
+ *   passed as the first argument of a call whose callee is the identifier
+ *   `bindWithRetry`, or a same-line or preceding-line single-line comment
+ *   says `port-discipline: ignore <reason>`. No intervening function boundary
+ *   is allowed: nested timer callbacks and other inner functions are flagged.
+ *   This includes template interpolations and direct random listen arguments.
+ *   Returning a port from the attempt is accepted: this is a syntactic rule,
+ *   not dataflow analysis of whether the eventual bind happens in the attempt.
+ *   Named helpers must receive a port allocated inside the inline attempt.
+ *
  * Enforcement: this module exports `scanRepoTests()` which is invoked
  * by the vitest regression test at
  * `server/test/scripts/test-port-discipline.test.ts`. Any new test
  * file that introduces a hardcoded port literal, an unwrapped
- * variable-port listen, or a local randomPort helper will fail that
+ * variable-port listen, a local randomPort helper, or an unprotected
+ * randomTestPort allocation will fail that
  * regression test on the next `npm test` run (which is also the pre-
  * commit hook gate and the CI gate, so it cannot slip through
  * silently).
@@ -45,6 +59,7 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import ts from "typescript";
 
 const SERVER_TEST_DIR = "server/test";
 const WHITELIST_MARKER = "port-discipline: ignore";
@@ -72,9 +87,9 @@ function walkTestFiles(dir: string): string[] {
   return out;
 }
 
-/** Pattern: `.listen(<digits>` — a hardcoded port literal. */
+/** Pattern: `.listen(<digits>` - a hardcoded port literal. */
 const HARDCODED_LISTEN_RE = /\.listen\s*\(\s*([0-9]+)\s*[,)]/;
-/** Pattern: `.listen(<var>` where the var is not literal `0` — needs review. */
+/** Pattern: `.listen(<var>` where the var is not literal `0` - needs review. */
 const VAR_LISTEN_RE = /\.listen\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]/;
 /**
  * Pattern: a `bindWithRetry(` CALL (not just the word). The pre-Sigma-7
@@ -98,6 +113,70 @@ function lineHasWhitelist(line: string): boolean {
 
 function fileUsesBindWithRetry(text: string): boolean {
   return RETRY_CALL_RE.test(text);
+}
+
+function stripCallWrappers(expression: ts.Expression): ts.Expression {
+  while (ts.isParenthesizedExpression(expression) || ts.isNonNullExpression(expression)) {
+    expression = expression.expression;
+  }
+  return expression;
+}
+
+function isRetryAttemptAllocation(call: ts.CallExpression): boolean {
+  let enclosing: ts.Node | undefined = call.parent;
+  while (enclosing && !ts.isFunctionLike(enclosing)) enclosing = enclosing.parent;
+  if (!enclosing || (!ts.isArrowFunction(enclosing) && !ts.isFunctionExpression(enclosing))) {
+    return false;
+  }
+  let argument: ts.Node = enclosing;
+  while (ts.isParenthesizedExpression(argument.parent) || ts.isNonNullExpression(argument.parent)) {
+    argument = argument.parent;
+  }
+  const retry = argument.parent;
+  return ts.isCallExpression(retry) && retry.arguments[0] === argument &&
+    ts.isIdentifier(retry.expression) && retry.expression.text === "bindWithRetry";
+}
+
+function scanRandomAllocations(path: string, source: string): Violation[] {
+  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const ignoredLines = new Set<number>();
+  const allocations: ts.CallExpression[] = [];
+  const collectComment = (pos: number, end: number, kind: ts.CommentKind): void => {
+    if (kind !== ts.SyntaxKind.SingleLineCommentTrivia) return;
+    const commentPrefixLength = "//".length;
+    const comment = source.slice(pos + commentPrefixLength, end).trim();
+    if (!comment.startsWith(WHITELIST_MARKER)) return;
+    const reason = comment.slice(WHITELIST_MARKER.length);
+    if (!reason.startsWith(" ") || !reason.trim()) return;
+    ignoredLines.add(file.getLineAndCharacterOfPosition(pos).line);
+  };
+  const visit = (node: ts.Node): void => {
+    // Parser-owned trivia positions avoid treating strings and regexes as annotations.
+    ts.forEachLeadingCommentRange(source, node.pos, collectComment);
+    ts.forEachTrailingCommentRange(source, node.pos, collectComment);
+    ts.forEachTrailingCommentRange(source, node.end, collectComment);
+    if (ts.isCallExpression(node)) {
+      const callee = stripCallWrappers(node.expression);
+      if (ts.isIdentifier(callee) && callee.text === "randomTestPort") allocations.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+
+  const violations: Violation[] = [];
+  const lines = source.split("\n");
+  for (const call of allocations) {
+    const line = file.getLineAndCharacterOfPosition(call.getStart(file)).line;
+    if (ignoredLines.has(line) || ignoredLines.has(line - 1)) continue;
+    if (isRetryAttemptAllocation(call)) continue;
+    violations.push({
+      file: path,
+      line: line + 1,
+      text: lines[line]!.trim(),
+      reason: "randomTestPort() outside a bindWithRetry attempt; allocate a fresh port inside the retry callback or use port: 0 when the bound port is read back",
+    });
+  }
+  return violations;
 }
 
 export function scanFile(path: string, text?: string): Violation[] {
@@ -137,7 +216,7 @@ export function scanFile(path: string, text?: string): Violation[] {
           file: path,
           line: i + 1,
           text: line.trim(),
-          reason: `.listen(<var>) without bindWithRetry — port collisions will not retry`,
+          reason: `.listen(<var>) without bindWithRetry - port collisions will not retry`,
         });
       }
     }
@@ -159,6 +238,7 @@ export function scanFile(path: string, text?: string): Violation[] {
     }
   }
 
+  violations.push(...scanRandomAllocations(path, source));
   return violations;
 }
 
@@ -180,7 +260,7 @@ export function formatViolations(violations: Violation[]): string {
   return violations
     .map((v) => {
       const rel = relative(process.cwd(), v.file);
-      return `${rel}:${v.line} — ${v.reason}\n    ${v.text}`;
+      return `${rel}:${v.line} - ${v.reason}\n    ${v.text}`;
     })
     .join("\n");
 }

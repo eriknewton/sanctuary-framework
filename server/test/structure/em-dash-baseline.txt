@@ -62,7 +62,6 @@
 3	server/docs/transparency-checkpoints.md
 2	server/electron/README.md
 2	server/examples/dashboard-example.mjs
-2	server/scripts/test-port-discipline.ts
 1	server/src/agent-contract/adapters/claude-code.ts
 2	server/src/agent-contract/adapters/cline.ts
 1	server/src/agent-contract/adapters/mastra.ts
