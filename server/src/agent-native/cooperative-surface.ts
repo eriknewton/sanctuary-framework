@@ -972,7 +972,7 @@ export function createAgentNativeCooperativeTools(
           const brokerKey = await Promise.resolve().then(() => options.resolveBrokerProducerKey?.()).catch(() => null);
           // Must match withDerivedKeyRestriction in posture-routes.ts: only observed presence or absence is conclusive.
           const brokerKeyUnavailable = brokerKey?.observation !== "present" && brokerKey?.observation !== "absent";
-          // Must match custodyObservation in protection-layers.ts: age starts before the audit read.
+          // Must match custodyObservation in protectionEvidenceSchema (protection-layers.ts): age starts before the audit read.
           const custodyObservation = { state: "fresh" as const, completed_at: new Date(Date.now()).toISOString() };
           const [health, custody, chain] = await Promise.allSettled([
             buildFeatureHealthPanel({

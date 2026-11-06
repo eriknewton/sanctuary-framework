@@ -1,4 +1,3 @@
-import { protectionRuntimeUnavailable } from "./agent-native/protection-observations.js";
 /**
  * Sanctuary MCP Server - Standalone Dashboard
  *
@@ -1666,7 +1665,7 @@ async function wireUnlockedDeps(args: {
   // any half-unlocked window. Order within the tail is irrelevant for safety
   // (none of these throw), but mirrors the historical sequence for clarity.
   // Must match observeProtections in protection-observations.ts: attach the TaskService consumer only after loads succeed.
-  dashboard.setDependencies({ ...protectionRuntimeUnavailable, ...deps, stateStore });
+  dashboard.setDependencies({ ...deps, stateStore });
   dashboard.setV11Bindings(v11Bindings);
   dashboard.setDistressInbox(distressInbox);
   if (enableLoopbackAutoAuth) {

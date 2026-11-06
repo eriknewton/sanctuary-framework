@@ -1,5 +1,4 @@
 /** Shared protection observations. */
-// fail-before-exempt: This new-module file loads only with the shared producer present; identity, construction, unavailable custody and chain observation mutations prove its capability assertions.
 import { afterEach, expect, it, vi } from "vitest";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
@@ -14,7 +13,7 @@ import { composeProtectionLayers, type ProtectionLayerRow } from "../../src/agen
 import { buildHome, reconcilePostureHomeJoiner } from "../../src/principal-policy/posture-routes.js";
 import { createPosturePanelStore, capStalePanel } from "../../src/principal-policy/panel-producer.js";
 import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
-import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 const observedAt = Date.parse("2026-11-05T12:00:00Z"); // Shared fixed evaluation instant.
 const FIRST_CONTENT = 0; // The text response occupies the first content block.
@@ -72,7 +71,7 @@ function status(rows: ProtectionLayerRow[] | undefined, id: string) {
   return rows?.find(row => row.id === id)?.status;
 }
 
-import { observeProtections, protectionRuntimeUnavailable, type QualifiedProtectionPanels } from "../../src/agent-native/protection-observations.js";
+import { associateProtectionHome, observeProtectionJoiner, observeProtections, protectionRuntimeUnavailable, type QualifiedProtectionPanels } from "../../src/agent-native/protection-observations.js";
 import { protectionEvidenceKeys, protectionEvidenceSchema, type ProtectionObservationSnapshot } from "../../src/agent-native/protection-layers.js";
 
 it("protection surfaces share every observed layer", async () => {
@@ -116,7 +115,8 @@ it("protection surfaces share every observed layer", async () => {
       featureHealth: { supported: f.health, unavailable: undefined },
       custodyExit: { supported: f.custody, unavailable: undefined },
       custodyObservation: { supported: fresh, unavailable: undefined },
-      now: { supported: observedAt, unavailable: undefined },
+      // First millisecond beyond the shared freshness window, so a supplied instant is distinguishable from the mocked clock.
+      now: { supported: observedAt + custodySource.DEFAULT_ENFORCEMENT_FRESHNESS_MS + 1, unavailable: undefined },
       toolOutputScreenReady: { supported: false, unavailable: undefined },
     };
     expect(Object.keys(fields).sort()).toEqual([...protectionEvidenceKeys].sort());
@@ -126,6 +126,10 @@ it("protection surfaces share every observed layer", async () => {
         expect(protectionEvidenceSchema.parse(evidence)).toEqual(evidence);
         expect(Object.keys(evidence).sort()).toEqual([...protectionEvidenceKeys].sort());
       }
+      // A value of the wrong shape is refused, and every supported value changes the composed rows.
+      expect(protectionEvidenceSchema.safeParse({ ...snapshot, [key]: "not an observation" }).success, `${key} shape`).toBe(false);
+      expect(composeProtectionLayers({ ...snapshot, [key]: fields[key].supported }), `${key} composes`)
+        .not.toEqual(composeProtectionLayers({ ...snapshot, [key]: fields[key].unavailable }));
     }
     expect(status(composeProtectionLayers({ encryptedStateStoreConstructed: false }), "encrypted_vault")).toBe("off");
     const absent = observeProtections(protectionRuntimeUnavailable, { featureHealth: undefined, custodyExit: undefined,
@@ -175,4 +179,34 @@ it("protection surfaces share every observed layer", async () => {
     expect(denied.layers).toBeUndefined();
     await f.auditLog.flush();
   } finally { await homeDirectory.cleanup(); }
+});
+
+it("a joined home keeps its runtime sources and composes each snapshot fresh", () => {
+  const home = {};
+  const runtime = vi.fn(() => ({ ...protectionRuntimeUnavailable }));
+  const SECOND_JOIN_AT = observedAt + 1; // A distinct clock reading proves the second join read the clock again.
+  const now = vi.fn(() => observedAt);
+  associateProtectionHome(home, { runtime, now });
+  const panels = { featureHealth: undefined, custodyExit: undefined, custodyObservation: fresh, auditChain: undefined };
+  const first = observeProtectionJoiner(home, panels);
+  // The association a follower re-registers carries only the registered sources; a retained snapshot would go stale behind them.
+  expect(first).toHaveProperty("observation");
+  expect(Object.keys(first.observation).sort()).toEqual(["now", "runtime"]);
+  expect(first.observation.runtime).toBe(runtime);
+  expect(first.observation.now).toBe(now);
+  expect(runtime).toHaveBeenCalledTimes(1);
+  expect(now).toHaveBeenCalledTimes(1);
+  expect(first.snapshot.now).toBe(observedAt);
+  expect(first.snapshot.toolOutputScreenReady).toBeUndefined();
+  // Each join reads the sources again: the second runtime payload's screen is consulted and the second clock reading lands.
+  const assertReady = vi.fn();
+  runtime.mockImplementation(() => ({ ...protectionRuntimeUnavailable, responseScreen: { assertReady } }));
+  now.mockImplementation(() => SECOND_JOIN_AT);
+  const second = observeProtectionJoiner(home, panels);
+  expect(runtime).toHaveBeenCalledTimes(2);
+  expect(now).toHaveBeenCalledTimes(2);
+  expect(assertReady).toHaveBeenCalledTimes(1);
+  expect(second.snapshot.toolOutputScreenReady).toBe(true);
+  expect(second.snapshot.now).toBe(SECOND_JOIN_AT);
+  expect(second.snapshot).not.toBe(first.snapshot);
 });

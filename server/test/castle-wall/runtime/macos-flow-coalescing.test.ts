@@ -157,6 +157,8 @@ const FLOW_COALESCE_TEST_HEAP_BOUND_BYTES = 32 * 1024 * 1024; // Measured 32 MiB
 const FLOW_COALESCE_TEST_TIMEOUT_MS = 15 * 60_000; // Workload allowance, never an assertion deadline.
 setFlagsFromString("--expose-gc");
 const collectGarbage = runInNewContext("gc") as () => void;
+// Five times vi.waitFor's 1000 ms default, which a loaded CI runner exceeded (1238 ms); four sequential waits (20 s) stay inside the 30 s testTimeout.
+const HELD_HEAD_SETTLE_TIMEOUT_MS = 5_000;
 it("a coalescible frame waits behind a held head", async () => {
   requireSummary(fixture().consumer);
   const root = await mkdtemp("/tmp/cw-held-head-"); vi.stubEnv("HOME", root);
@@ -189,18 +191,18 @@ it("a coalescible frame waits behind a held head", async () => {
   const zero = signed(0, null), one = signed(1, hash(zero.producer.event_canonical_json), "192.0.2.2"), two = signed(2, hash(one.producer.event_canonical_json));
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
-    dispatch(zero); await vi.waitFor(() => expect(consumer.getFlowChainState()?.lastAckedSeq).toBe(0));
+    dispatch(zero); await vi.waitFor(() => expect(consumer.getFlowChainState()?.lastAckedSeq).toBe(0), { timeout: HELD_HEAD_SETTLE_TIMEOUT_MS });
     holding = true; dispatch(one); await entered.promise;
     const charge = connection.telemetryBytes; dispatch(two); await turn();
     expect(consumer.getFlowChainState()?.lastAckedSeq, "later coalescible admission cannot complete before its held predecessor").toBe(0);
     expect(consumer.getStats().decisionsCoalesced).toBe(0);
     expect(connection.telemetryBytes, "waiting admission keeps its listener charge").toBeGreaterThan(charge);
-    gate.resolve(); await vi.waitFor(() => expect(consumer.getFlowChainState()?.lastAckedSeq).toBe(2));
+    gate.resolve(); await vi.waitFor(() => expect(consumer.getFlowChainState()?.lastAckedSeq).toBe(2), { timeout: HELD_HEAD_SETTLE_TIMEOUT_MS });
     expect(consumer.getFlowChainState()?.lastEventChainHash).toBe(hash(two.producer.event_canonical_json));
-    dispatch(two); await vi.waitFor(() => expect(consumer.getStats().duplicate_settled).toBe(1));
+    dispatch(two); await vi.waitFor(() => expect(consumer.getStats().duplicate_settled).toBe(1), { timeout: HELD_HEAD_SETTLE_TIMEOUT_MS });
     expect(consumer.getStats().decisionsCoalesced).toBe(1);
     dispatch(signed(2, two.producer.prior_sha256_hex, "192.0.2.3"));
-    await vi.waitFor(() => expect(consumer.getStats().rejection_confirmed).toBe(1));
+    await vi.waitFor(() => expect(consumer.getStats().rejection_confirmed).toBe(1), { timeout: HELD_HEAD_SETTLE_TIMEOUT_MS });
     expect((await audit.query({ layer: "l1" })).entries.at(-1)?.details?.reason).toBe("seq_regression");
   } finally { holding = false; gate.resolve(); await consumer.drainFlowAdmission(); await audit.flush(); await turn(); writeSpy.mockRestore(); log.mockRestore(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
 });

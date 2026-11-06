@@ -2290,6 +2290,9 @@ export async function verifySealedRegionAt(opts: {
  * `hash_mismatch`/`incomplete`. `key_unavailable` is for callers that have no
  * verifier at all (never produced by `AuditLog.getAuditChainVerdict`, which
  * always has its keys).
+ *
+ * Must match AUDIT_CHAIN_VERDICT_STATUSES in agent-native/protection-layers.ts
+ * (the protection-evidence runtime schema); a new status extends that table too.
  */
 export type AuditChainVerdictStatus =
   | "verified"

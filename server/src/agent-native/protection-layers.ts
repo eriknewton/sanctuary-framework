@@ -3,6 +3,7 @@ import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { FeatureHealthPanel } from "../principal-policy/feature-health.js";
 import { DEFAULT_ENFORCEMENT_FRESHNESS_MS, ENFORCEMENT_FUTURE_SKEW_MS, type CustodyExitPanel } from "../principal-policy/posture.js";
 import type { PosturePanelStatus } from "../principal-policy/panel-producer.js";
+import type { AuditChainVerdictStatus } from "../operational/audit-log.js";
 
 /** A layer's observed state; unknown includes unavailable or inconclusive evidence. */
 export type ProtectionLayerStatus = "on" | "off" | "not_built" | "unknown";
@@ -15,15 +16,25 @@ export interface ProtectionLayerRow {
   basis: string;
 }
 
+// Must match AuditChainVerdictStatus in operational/audit-log.ts; the Record type rejects a missing or extra status at compile time.
+const AUDIT_CHAIN_VERDICT_STATUSES: Record<AuditChainVerdictStatus, true> = {
+  verified: true,
+  verified_suffix_only: true,
+  findings: true,
+  key_unavailable: true,
+};
+
 /** Runtime schema for the qualified observations consumed by every protection surface. */
 export const protectionEvidenceSchema = z.object({
   identityLoaded: z.boolean().optional(),
   encryptedStateStoreConstructed: z.boolean().optional(),
-  auditChain: z.enum(["verified", "verified_suffix_only", "findings", "key_unavailable"]).optional(),
+  auditChain: z.enum(Object.keys(AUDIT_CHAIN_VERDICT_STATUSES) as [AuditChainVerdictStatus, ...AuditChainVerdictStatus[]]).optional(),
   featureHealth: z.custom<Pick<FeatureHealthPanel, "rows" | "audit_integrity_ok" | "window_end">>(
     value => typeof value === "object" && value !== null && "rows" in value && "audit_integrity_ok" in value && "window_end" in value).optional(),
   custodyExit: z.custom<CustodyExitPanel>(
     value => typeof value === "object" && value !== null && "exit_state" in value && "audit_integrity_ok" in value).optional(),
+  // Must match the custody producer observation in cooperative-surface.ts and buildHome in posture-routes.ts:
+  // each surface passes its producer status, including fallback and stale reads, and the tool stamps age before its audit read.
   custodyObservation: z.custom<Pick<PosturePanelStatus, "state" | "completed_at">>(
     value => typeof value === "object" && value !== null && "state" in value && "completed_at" in value).optional(),
   now: z.number().finite().optional(),

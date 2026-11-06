@@ -27,8 +27,9 @@ async function setup(cap = Number.MAX_SAFE_INTEGER) {
 describe("listing and accounting fault schedules", () => {
   it("discards a readdir that completes after the hold deadline without allocating a sequence", async () => {
     const { raw, path } = await setup();
-    // A short injected hold bound applies only after the cold load has finished.
-    const log = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, writeLockHoldDeadlineMs: 100 });
+    // The injected hold bound applies only after the cold load has finished; the readdir barrier, not the bound, makes the
+    // readdir late, and one second lets ordinary in-lock discovery reach that barrier on a loaded runner.
+    const log = new AuditLog(raw, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, writeLockHoldDeadlineMs: 1_000 });
     await log.query({ limit: 1 });
     // Complete the once-per-instance stale-temp sweep before delaying the
     // in-lock discovery readdir, which is the fault schedule under test.
@@ -91,7 +92,7 @@ describe("listing and accounting fault schedules", () => {
     const { raw } = await setup();
     const log = new AuditLog(raw, MEASURE_MASTER_KEY, {
       ...MEASURE_CONFIG, maxEntries: 5, // Three initial entries plus two appends fit without prune I/O.
-      writeLockHoldDeadlineMs: 100, // Short bound isolates the delayed recount after a cold load.
+      writeLockHoldDeadlineMs: 1_000, // The gate isolates the delayed recount after a cold load; one second covers the healthy successor on a loaded runner.
     });
     await log.query({ limit: 1 });
     // Force the recount under test without spending its short hold on pruning.
@@ -641,7 +642,7 @@ it("lets the original writer continue after a separate strict reader detects a m
 it("marks a timed-out entry write unknown after its late landing and recounts next append", async () => {
   const { raw } = await setup();
   const counted = countedStorage(raw);
-  const log = new AuditLog(counted.storage, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, writeLockHoldDeadlineMs: 200 });
+  const log = new AuditLog(counted.storage, MEASURE_MASTER_KEY, { ...MEASURE_CONFIG, writeLockHoldDeadlineMs: 1_000 }); // The entry-write gate decides lateness; one second covers real discovery under load.
   await log.query({ limit: 1 });
   const write = raw.writeDurable.bind(raw); const hold = gate(); const entered = gate(); const settled = gate();
   let pause = true;
