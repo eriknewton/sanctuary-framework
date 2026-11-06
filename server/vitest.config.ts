@@ -1,7 +1,9 @@
 import { defineConfig } from "vitest/config";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const barrierModule = fileURLToPath(new URL("./src/storage/cross-process-lock.ts", import.meta.url));
+const barrierModule = realpathSync(fileURLToPath(new URL("./src/storage/cross-process-lock.ts", import.meta.url)));
+export const leaseGuardHookTimeoutMs = 10_000; // Preserve Vitest's default hook budget.
 
 export default defineConfig({
   plugins: [{
@@ -11,6 +13,10 @@ export default defineConfig({
       if (id.split("?")[0] !== barrierModule) return;
       const declaration = "export async function acquireMasterWriteBarrier(";
       if (!source.includes(declaration)) throw new Error("Master-write lease acquisition chokepoint moved");
+      const withoutDeclaration = source.replace(declaration, "");
+      if (/\bacquireMasterWriteBarrier\s*\(/u.test(withoutDeclaration)) {
+        throw new Error("Master-write lease acquisition has a same-module call");
+      }
       // Observe the actual acquisition so partial mocks and module resets cannot bypass tracking.
       return source.replace(declaration, "async function acquireUnobservedMasterWriteBarrier(") + `
 export async function acquireMasterWriteBarrier(...args: Parameters<typeof acquireUnobservedMasterWriteBarrier>) {
@@ -24,6 +30,7 @@ export async function acquireMasterWriteBarrier(...args: Parameters<typeof acqui
   }],
   test: {
     globals: true,
+    hookTimeout: leaseGuardHookTimeoutMs,
     // Installs an in-memory credential store for every test so nothing ever
     // writes to the operator's real login keychain. See src/wrap/keychain-exec.ts.
     // Under a shared worker THREAD (the Stryker runner's `pool: 'threads',
@@ -33,7 +40,7 @@ export async function acquireMasterWriteBarrier(...args: Parameters<typeof acqui
     // env, as it does in a process. See test/setup/homedir-follows-env.ts and
     // register row TEST-ISOLATION-SINGLE-WORKER-01.
     setupFiles: ["./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts", "./test/setup/master-write-leases.ts"],
-    // Stack order runs the setup guard after the file's own teardown hooks.
+    // Stack order runs the guard after every afterAll, but before beforeAll-returned cleanups, file-scoped fixture teardown and the file's own aroundAll teardown, none of which current tests use.
     sequence: { setupFiles: "list", hooks: "stack" },
     // Leaves a marker directory at the package root for the whole run. setupFiles
     // covers this process and children inherit VITEST by default, but a child

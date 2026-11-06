@@ -39,6 +39,7 @@ describe("CLI stop completion fence", () => {
         const result = await establish(...args); const barrier = result.masterWriteBarrier;
         const release = barrier?.release.bind(barrier);
         // Retain the real release so teardown can close sessions after the simulated exit fence.
+        // Repeated release calls reuse the lease's cached close promise.
         sessionCleanup.push(async () => {
           try { await release?.(); }
           finally { result.masterKey.fill(0); }

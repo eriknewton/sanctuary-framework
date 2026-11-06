@@ -1,15 +1,22 @@
 import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import * as nodePath from "node:path";
+import * as nodeUrl from "node:url";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
+import { createRequire } from "node:module";
 import { expect, it } from "vitest";
-import config from "../../vitest.config.js";
+import config, { leaseGuardHookTimeoutMs } from "../../vitest.config.js";
 
+const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
 const serverRoot = fileURLToPath(new URL("../../", import.meta.url));
-// Thirty seconds bounds each fixture child so a broken guard cannot hang its parent.
-const childTimeoutMs = 30_000;
+const childStartupHeadroomMs = 30_000; // Allow module loading on a loaded runner.
+const childExitHeadroomMs = 10_000; // Allow reporting and worker shutdown after teardown.
+const parentHeadroomMs = 30_000; // Allow fixture filesystem work outside the child budgets.
+const childTimeoutMs = childStartupHeadroomMs + (config.test?.testTimeout ?? childStartupHeadroomMs) + leaseGuardHookTimeoutMs + childExitHeadroomMs;
 const scenarios = ["leaked", "released", "failed-teardown"] as const;
-const fixtureTimeoutMs = childTimeoutMs * scenarios.length;
+const fixtureTimeoutMs = childTimeoutMs * scenarios.length + parentHeadroomMs;
 
 it("reaps and reports unclosed leases after file teardown while accepting released leases", async () => {
   expect(config.test?.setupFiles).toEqual([
@@ -43,7 +50,10 @@ afterAll(async () => {
   session?.masterKey.fill(0);
   if (${release}) await session?.masterWriteBarrier?.release();
   process.stdout.write("fixture teardown completed\\n");
-  if (${name === "failed-teardown"}) throw new Error("fixture teardown failure");
+  if (${name === "failed-teardown"}) {
+    process.stdout.write("ORIGINAL teardown error: fixture teardown failure\\n");
+    throw new Error("fixture teardown failure");
+  }
 });
 it("holds a master session through the test body", async () => {
   vi.resetModules();
@@ -70,7 +80,11 @@ it("holds a master session through the test body", async () => {
         expect(output).toContain("Master-write lease acquired here");
         expect(output).toContain(`${name}.test.ts`);
       }
-      if (name === "failed-teardown") expect(output).toContain("fixture teardown failure");
+      if (name === "failed-teardown") {
+        expect(output).toContain("fixture teardown failure");
+        expect(output).toContain("ORIGINAL teardown error: fixture teardown failure");
+        expect(output).toMatch(/Error: fixture teardown failure/u);
+      }
       const socketPath = await readFile(socketRecord, "utf8");
       await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
     }
@@ -78,3 +92,82 @@ it("holds a master session through the test body", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 }, fixtureTimeoutMs);
+
+it("rejects same-module acquisition calls before renaming the declaration", async () => {
+  const plugin = config.plugins?.find(plugin => plugin && "name" in plugin && plugin.name === "test-master-write-lease-observer");
+  if (!plugin || !("transform" in plugin) || typeof plugin.transform !== "function") throw new Error("Lease transform missing");
+  const transform = plugin.transform as (source: string, id: string) => unknown;
+  const modulePath = join(serverRoot, "src/storage/cross-process-lock.ts");
+  const source = await readFile(modulePath, "utf8");
+  expect(transform(source, modulePath)).toBeTypeOf("string");
+  expect(() => transform(`${source}\nacquireMasterWriteBarrier(storage, namespace, name);`, modulePath)).toThrow("same-module call");
+  expect(() => transform(`${source}\nacquireMasterWriteBarrier \n(storage, namespace, name);`, modulePath)).toThrow("same-module call");
+  expect(() => transform("export const moved = true;", modulePath)).toThrow("chokepoint moved");
+  expect(transform(source, `${modulePath}.unrelated`)).toBeUndefined();
+});
+
+async function guardHarness() {
+  type Lease = { release: () => Promise<void> };
+  type Observer = (acquire: () => Promise<Lease>, stack: string) => Promise<Lease>;
+  let around!: (run: () => Promise<void>) => Promise<void>;
+  let after!: () => Promise<void>;
+  let clock = 0;
+  let scheduledDelay: number | undefined;
+  const setupPath = join(serverRoot, "test/setup/master-write-leases.ts");
+  const source = (await readFile(setupPath, "utf8")).replaceAll("import.meta.url", JSON.stringify(nodeUrl.pathToFileURL(setupPath).href));
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const sandbox = {
+    URL,
+    exports: {},
+    require(id: string) {
+      if (id === "vitest") return {
+        afterAll: (hook: typeof after) => { after = hook; },
+        aroundAll: (hook: typeof around) => { around = hook; },
+        expect: { getState: () => ({ testPath: join(serverRoot, "test/guard-regression.test.ts") }) },
+      };
+      if (id === "node:path") return nodePath;
+      if (id === "node:url") return nodeUrl;
+      if (id === "../../vitest.config.js") return { leaseGuardHookTimeoutMs };
+      if (id === "node:perf_hooks") return { performance: { now: () => clock } };
+      if (id === "node:timers") return {
+        setTimeout: (callback: () => void, delay: number) => {
+          scheduledDelay = delay;
+          return setTimeout(() => { clock += delay; callback(); });
+        },
+        clearTimeout,
+      };
+      throw new Error(`Unexpected guard import: ${id}`);
+    },
+  };
+  // Running the actual setup with captured hooks exercises rejected callbacks independently of Vitest's error serialization.
+  const observer = runInNewContext(`${compiled}\nglobalThis[Symbol.for("sanctuary.test.master-write-lease-observer")];`, sandbox, { filename: setupPath }) as Observer;
+  return { observer, around: (run: () => Promise<void>) => around(run), after: () => after(), delay: () => scheduledDelay };
+}
+
+it("preserves the original teardown rejection before the guard failure", async () => {
+  const guard = await guardHarness();
+  let released = false;
+  await guard.observer(async () => ({ async release() { released = true; } }), "aggregate acquisition stack");
+  const original = new Error("ORIGINAL fixture teardown rejection");
+  const result = await guard.around(async () => { throw original; }).catch(error => error);
+  expect(result.name).toBe("AggregateError");
+  expect(result.errors).toHaveLength(2);
+  expect(result.errors[0]).toBe(original);
+  expect(result.errors[1].message).toContain("1 master-write lease(s) left open");
+  expect(released).toBe(true);
+});
+
+it("reports pending acquisition stacks at its deadline and releases acquired leases", async () => {
+  const guard = await guardHarness();
+  let released = false;
+  await guard.observer(async () => ({ async release() { released = true; } }), "completed acquisition stack");
+  void guard.observer(() => new Promise(() => {}), "PENDING acquisition stack");
+  const result = await guard.after().catch(error => error);
+  expect(result.message).toContain("1 master-write acquisition(s) still pending");
+  expect(result.message).toContain("PENDING acquisition stack");
+  expect(result.message).toContain("completed acquisition stack");
+  expect(result.message).toContain("guard-regression.test.ts");
+  expect(guard.delay()).toBeGreaterThan(0);
+  expect(guard.delay()).toBeLessThan(leaseGuardHookTimeoutMs);
+  expect(released).toBe(true);
+});

@@ -1,4 +1,7 @@
 import { afterAll, aroundAll, expect } from "vitest";
+import { setTimeout as setRealTimeout, clearTimeout as clearRealTimeout } from "node:timers";
+import { performance } from "node:perf_hooks";
+import { leaseGuardHookTimeoutMs } from "../../vitest.config.js";
 import { relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
@@ -119,7 +122,9 @@ const observers = globalThis as typeof globalThis & {
   [observerKey]?: (acquire: Acquisition, stack: string | undefined) => Promise<MasterWriteBarrierLease>;
 };
 const leases = new Map<MasterWriteBarrierLease, string>();
-const pending = new Set<Promise<MasterWriteBarrierLease>>();
+const pending = new Map<Promise<MasterWriteBarrierLease>, string>();
+const pendingAcquisitionMarginMs = 1_000; // Reserve one second for lease release and failure reporting.
+const pendingAcquisitionDeadlineMs = leaseGuardHookTimeoutMs - pendingAcquisitionMarginMs;
 const serverRoot = fileURLToPath(new URL("../../", import.meta.url));
 
 observers[observerKey] = (acquire, stack) => {
@@ -132,21 +137,36 @@ observers[observerKey] = (acquire, stack) => {
     };
     return lease;
   });
-  pending.add(acquisition);
+  pending.set(acquisition, stack ?? "Acquisition stack unavailable");
   void acquisition.then(() => pending.delete(acquisition), () => pending.delete(acquisition));
   return acquisition;
 };
 
 async function finishFile(): Promise<void> {
   // Await acquisitions already started by a failing test before taking the teardown snapshot.
-  while (pending.size > 0) await Promise.allSettled([...pending]);
+  const deadline = performance.now() + pendingAcquisitionDeadlineMs;
+  let timer: ReturnType<typeof setRealTimeout> | undefined;
+  const expired = new Promise<void>(resolve => {
+    timer = setRealTimeout(resolve, pendingAcquisitionDeadlineMs);
+  });
+  try {
+    while (pending.size > 0 && performance.now() < deadline) {
+      await Promise.race([Promise.allSettled([...pending.keys()]), expired]);
+    }
+  } finally {
+    clearRealTimeout(timer);
+  }
+  const stillPending = [...pending.values()];
   const leaked = [...leases];
   const results = await Promise.allSettled(leaked.map(([lease]) => lease.release()));
   const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
   const file = relative(serverRoot, expect.getState().testPath ?? "").replaceAll("\\", "/");
   delete observers[observerKey];
-  if (failures.length > 0 || (leaked.length > 0 && !existingLeaseOwners.has(file))) {
-    throw new Error(`${leaked.length} master-write lease(s) left open in ${file}\n${leaked.map(([, stack]) => stack).join("\n\n")}`, {
+  if (stillPending.length > 0 || failures.length > 0 || (leaked.length > 0 && !existingLeaseOwners.has(file))) {
+    const pendingDiagnostic = stillPending.length > 0
+      ? `\n${stillPending.length} master-write acquisition(s) still pending after ${pendingAcquisitionDeadlineMs}ms\n${stillPending.join("\n\n")}`
+      : "";
+    throw new Error(`${leaked.length} master-write lease(s) left open in ${file}\n${leaked.map(([, stack]) => stack).join("\n\n")}${pendingDiagnostic}`, {
       ...(failures.length > 0 ? { cause: new AggregateError(failures, "Lease teardown failed") } : {}),
     });
   }
@@ -158,6 +178,11 @@ afterAll(finishOnce);
 
 // A throwing file hook skips later afterAll hooks, so the outer wrapper still performs teardown.
 aroundAll(async runSuite => {
+  const errors: unknown[] = [];
   try { await runSuite(); }
-  finally { if (!finishing) await finishOnce(); }
+  catch (error) { errors.push(error); }
+  try { if (!finishing) await finishOnce(); }
+  catch (error) { errors.push(error); }
+  if (errors.length > 1) throw new AggregateError(errors, "File teardown and master-write lease guard failed");
+  if (errors.length > 0) throw errors[0];
 });
