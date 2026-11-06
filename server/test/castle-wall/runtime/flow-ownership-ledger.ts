@@ -6,14 +6,15 @@ import type { FilesystemStorage } from "../../../src/storage/filesystem.js";
 // The audit log's default hold deadline; the two selected holds each last that full deadline while every other storage operation runs under the same default.
 export const WAVES_HOLD_DEADLINE_MS = DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS;
 import { FLOW_STOP_FINAL_RECORD_RESERVE_MS } from "../../../src/castle-wall/constants.js";
+import { FLOW_COALESCE_SUMMARY_OPERATION } from "../../../src/castle-wall/runtime/macos-flow-coalescing.js";
 const FIXTURE_RESERVE_SPLIT = 2;
 // Test setting: the fixture hold budget is half the final-record reserve, sized for this small store; it states no production timing.
 export const SHORT_HOLD_DEADLINE_MS = FLOW_STOP_FINAL_RECORD_RESERVE_MS / FIXTURE_RESERVE_SPLIT;
 export const SINGLE_OWNER = 1; // One writer per immutable reservation.
 export const HELD_SUMMARY_COUNT = 1; // One selected summary supplies the first recovery and summary failure.
 export const SERIAL_DEADLINES = 2; // Summary then loss expire independently.
-// Must match the summary append operation in macos-flow-events.ts.
-export const SUMMARY_OPERATION = "castle_wall_flow_decisions_coalesced";
+// The production summary operation, imported so a rename fails here instead of drifting.
+export const SUMMARY_OPERATION = FLOW_COALESCE_SUMMARY_OPERATION;
 // Must match the ingress-loss append operation in macos-flow-events.ts.
 export const LOSS_OPERATION = "castle_wall_ingress_discarded";
 export const POLL_INTERVAL_MS = 1; // One millisecond polling joins real I/O without delaying admission.
@@ -23,6 +24,12 @@ export function reactionTurn(): Promise<void> {
     const timer = setTimeout(() => reject(new Error("fixture reaction turn did not complete")), REACTION_TURN_TIMEOUT_MS);
     setImmediate(() => { clearTimeout(timer); resolve(); });
   });
+}
+// Joins every started operation before reporting, so no settlement is left running, and a rejection still fails the caller.
+export async function joinAll(promises: readonly (Promise<unknown> | undefined)[]): Promise<void> {
+  const outcomes = await Promise.allSettled(promises);
+  const rejected = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+  if (rejected) throw rejected.reason;
 }
 // Cleanup completes even when the body fails, and the body's assertion remains the reported failure.
 export async function withFixtureCleanup<T>(body: () => Promise<T>, cleanup: () => Promise<void>): Promise<T> {

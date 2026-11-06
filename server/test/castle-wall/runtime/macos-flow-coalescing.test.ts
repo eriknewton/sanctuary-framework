@@ -660,7 +660,7 @@ const SETUP_TIMEOUT_MS = HOLD_DEADLINE_MS * 10; // Filesystem setup and recovery
 const OWNER_TIMEOUT_MS = SETUP_TIMEOUT_MS * 3 + SERIAL_DEADLINES * HOLD_DEADLINE_MS; // Setup, schedule and cleanup plus both deadlines.
 const WRITES_PER_HELD_RESERVATION = SINGLE_OWNER + 1; // The held original plus one sequential retry after release.
 const HELD_LOSS_PAYLOADS = 1; // The first loss payload is the held, failed attempt.
-import { ownershipLedger, reactionTurn, withFixtureCleanup, WAVES_HOLD_DEADLINE_MS, SHORT_HOLD_DEADLINE_MS, SINGLE_OWNER, SERIAL_DEADLINES, HELD_SUMMARY_COUNT, SUMMARY_OPERATION, LOSS_OPERATION, POLL_INTERVAL_MS, type LedgerPolicy } from "./flow-ownership-ledger.js";
+import { joinAll, ownershipLedger, reactionTurn, withFixtureCleanup, WAVES_HOLD_DEADLINE_MS, SHORT_HOLD_DEADLINE_MS, SINGLE_OWNER, SERIAL_DEADLINES, HELD_SUMMARY_COUNT, SUMMARY_OPERATION, LOSS_OPERATION, POLL_INTERVAL_MS, type LedgerPolicy } from "./flow-ownership-ledger.js";
 
 async function ownedFixture(mode: string, policy: LedgerPolicy = { holdMs: HOLD_DEADLINE_MS, setupMs: SETUP_TIMEOUT_MS, slackMs: SETUP_TIMEOUT_MS - HOLD_DEADLINE_MS, cleanupMs: SETUP_TIMEOUT_MS, operations: [SUMMARY_OPERATION, LOSS_OPERATION] }) {
   const root = await mkdtemp("/tmp/cw-exclusive-");
@@ -760,7 +760,7 @@ it.each(["channel", "pinned"])("exclusive summary and loss attempts survive stor
     expect(f.ledger.payloads).toHaveLength(before);
   }, async () => {
     f.ledger.release();
-    await withFixtureCleanup(async () => { await Promise.allSettled([summary, ...retriesStarted]); }, f.cleanup);
+    await withFixtureCleanup(async () => { await joinAll([summary, ...retriesStarted]); }, f.cleanup);
   });
 }, OWNER_TIMEOUT_MS);
 
@@ -855,7 +855,7 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
       highAttempts: [...f.ledger.highAttempts], highWrites: [...f.ledger.highWrites] }; });
   }, async () => {
     f.ledger.release(); f.consumer.closeFlowAdmission();
-    await withFixtureCleanup(async () => { await Promise.allSettled(started); await f.ledger.join(); }, f.cleanup);
+    await withFixtureCleanup(async () => { await joinAll(started); await f.ledger.join(); }, f.cleanup);
   });
 }, WAVES_CASE_TIMEOUT_MS);
 

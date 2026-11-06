@@ -368,7 +368,7 @@ import { MacOSFlowIpcListener } from "../../../src/castle-wall/runtime/macos-ipc
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import { CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } from "../../../src/castle-wall/constants.js";
-import { ownershipLedger, reactionTurn, withFixtureCleanup, SHORT_HOLD_DEADLINE_MS, SINGLE_OWNER, SERIAL_DEADLINES, HELD_SUMMARY_COUNT, SUMMARY_OPERATION, LOSS_OPERATION, POLL_INTERVAL_MS } from "./flow-ownership-ledger.js";
+import { joinAll, ownershipLedger, reactionTurn, withFixtureCleanup, SHORT_HOLD_DEADLINE_MS, SINGLE_OWNER, SERIAL_DEADLINES, HELD_SUMMARY_COUNT, SUMMARY_OPERATION, LOSS_OPERATION, POLL_INTERVAL_MS } from "./flow-ownership-ledger.js";
 const DAEMON_CASE_TIMEOUT_MS = 60_000; // Fixed case cap: 60 seconds * 1,000 milliseconds per second.
 const DAEMON_SLACK_MS = 1_000; // Observe stop after the shared stop budget.
 const MS_PER_SECOND = 1000;
@@ -471,7 +471,7 @@ async function storageDaemon(mode: string, holdListener: boolean) {
     const diagnostics = () => stderr.mock.calls.map(([line]) => String(line)).filter(line => line.includes("stop budget lapsed"));
     return { audit, storage, ledger, consumer: activeConsumer, cutoff, cutoffTimes, admissionDrain, summaryDrain, listenerEntered, listenerStopGate, prepare, retry, diagnostics,
       stop: () => handle!.stop(),
-      async settle() { listenerStopGate.resolve(); ledger.release(); await Promise.allSettled(pending); await ledger.join(); },
+      async settle() { listenerStopGate.resolve(); ledger.release(); await joinAll(pending); await ledger.join(); },
       cleanup,
     };
   } catch (error) {
