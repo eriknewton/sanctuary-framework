@@ -39,6 +39,7 @@ const existingLeaseOwners = new Set<string>([
   "test/cli/sdw-owner.test.ts",
   "test/cli/secrets-surrogate-operator.test.ts",
   "test/cli/secrets-surrogate.test.ts",
+  "test/cli/secrets.test.ts",
   "test/cli/singleton-audit-writes.test.ts",
   "test/cli/verify-transparency-counter-floor.test.ts",
   "test/dashboard-slice2-park.test.ts",
@@ -151,7 +152,9 @@ async function finishFile(): Promise<void> {
   const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
   const file = relative(serverRoot, expect.getState().testPath ?? "").replaceAll("\\", "/");
   delete observers[observerKey];
-  if (stillPending.length > 0 || failures.length > 0 || (leaked.length > 0 && !existingLeaseOwners.has(file))) {
+  // A listed owner already leaks by exemption, so its best-effort reap may reject (one fixture breaks its own lease on purpose).
+  const reapFailed = failures.length > 0 && !existingLeaseOwners.has(file);
+  if (stillPending.length > 0 || reapFailed || (leaked.length > 0 && !existingLeaseOwners.has(file))) {
     const pendingDiagnostic = stillPending.length > 0
       ? `\n${stillPending.length} master-write acquisition(s) still pending after ${pendingAcquisitionDeadlineMs}ms\n${stillPending.join("\n\n")}`
       : "";
