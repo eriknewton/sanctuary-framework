@@ -22,7 +22,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:net";
@@ -55,6 +55,7 @@ vi.mock("../../src/castle-wall/runtime/index.js", () => ({
 
 import {
   __resetProcessShutdownStateForTest,
+  __processShutdownCleanupCountForTest,
   handleProcessShutdownSignal,
   parseWrapArgs,
   runWrap,
@@ -154,14 +155,16 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
   let started: DashboardApprovalChannel[];
   let captured: DashboardApprovalChannel[];
   let blocker: Server | undefined;
+  let homes: string[];
+  let teardownErrors: unknown[];
   /** Every port `ensureMainDashboardForWrap` asked the starter to bind. */
   let requestedPorts: number[];
   /** Every port the starter actually bound, in start order. */
   let boundPorts: number[];
 
   beforeEach(async () => {
-    home = await mkdtemp(join(tmpdir(), "a73-protect-dashboard-"));
-    fortress = join(home, "sanctuary-daily");
+    homes = [];
+    teardownErrors = [];
     started = [];
     captured = [];
     blocker = undefined;
@@ -178,7 +181,6 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
       configurable: true,
       value: true,
     });
-    process.env.HOME = home;
     for (const key of ENV_KEYS) {
       if (key !== "HOME") delete process.env[key];
     }
@@ -218,33 +220,40 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
   });
 
   async function stopAttempt(): Promise<void> {
-    const results = await Promise.allSettled([
-      ...captured.map((dashboard) => dashboard.stop()),
-      ...[
-        { shutdown: handleStandaloneShutdownSignal, reset: __resetStandaloneShutdownStateForTest },
-        { shutdown: handleProcessShutdownSignal, reset: __resetProcessShutdownStateForTest },
-      ].map(async ({ shutdown, reset }) => {
+    const recordFailure = async (cleanup: () => Promise<void>): Promise<void> => {
+      try {
+        await cleanup();
+      } catch (error) {
+        teardownErrors.push(error);
+      }
+    };
+    // Complete channel cleanup before draining the boot and wrap cleanups.
+    // startHttpServer clears its failed server reference before rejecting;
+    // stop still clears the constructor timer for a channel that never bound.
+    const hadStandalone = captured.length > 0;
+    for (const dashboard of captured.splice(0)) {
+      await recordFailure(() => dashboard.stop());
+    }
+    const shutdowns = [
+      ...(hadStandalone ? [{ shutdown: handleStandaloneShutdownSignal, reset: __resetStandaloneShutdownStateForTest }] : []),
+      ...(__processShutdownCleanupCountForTest() > 0 ? [{ shutdown: handleProcessShutdownSignal, reset: __resetProcessShutdownStateForTest }] : []),
+    ];
+    for (const { shutdown, reset } of shutdowns) {
+      await recordFailure(async () => {
         try {
-          // Await distress shutdown, runtime removal, baseline save, custody
-          // release and wrap audit/daemon cleanup. process.exit is mocked.
           await shutdown("SIGTERM");
         } catch (error) {
           if (!(error instanceof ProcessExit)) throw error;
         } finally {
           reset();
         }
-      }),
-      new Promise<void>((resolve, reject) => {
-        if (!blocker?.listening) return resolve();
-        blocker.close((error) => error ? reject(error) : resolve());
-      }),
-    ]);
-    const failures = results.filter((result) => result.status === "rejected");
-    if (failures.length > 0) {
-      // Do not start another attempt if any owned resource failed to close.
-      throw new AggregateError(failures.map((result) => result.reason), "Attempt teardown failed");
+      });
     }
-    captured = [];
+    await recordFailure(() => new Promise<void>((resolve, reject) => {
+      // A blocker whose bind failed owns no listening handle to close.
+      if (!blocker?.listening) return resolve();
+      blocker.close((error) => error ? reject(error) : resolve());
+    }));
     blocker = undefined;
     started = [];
     requestedPorts = [];
@@ -265,7 +274,11 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
         value: originalStdinIsTTY,
       });
       vi.restoreAllMocks();
-      await rm(home, { recursive: true, force: true });
+      const removed = await Promise.allSettled(homes.map((path) => rm(path, { recursive: true, force: true })));
+      for (const result of removed) {
+        if (result.status === "rejected") teardownErrors.push(result.reason);
+      }
+      if (teardownErrors.length) throw new AggregateError(teardownErrors, "Attempt teardown failed");
     }
   });
 
@@ -364,50 +377,50 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
   }
 
   it("retries a collided dashboard boot, completes the emitted argv on its requested port, and writes no secret into the wrapped config", async () => {
-    await initFortress();
-
-    const observed = await probeCustodyAccess(fortress, process.platform);
-    expect(observed.custodyAccess).toBe("usable");
-
-    const plan = buildAgentInstallPlan({
-      profile: "memory",
-      harness: "claude-code",
-      fortress,
-      platform: process.platform,
-      observed: baseProbe(observed),
-    });
-    const argv = plan.next_action?.argv;
-    expect(argv).toBeDefined();
-    // The contract forbids adding a credential, so the argv the planner emits
-    // carries none and the dashboard it starts inherits none.
-    const flags = protectFlagsFrom(argv!);
-    expect(flags).not.toContain("--passphrase");
-    // The planner's REAL emission, asserted flag-for-flag rather than by
-    // substring over the joined string: `--no-open` is what keeps this run
-    // non-interactive, and `--no-provision-agent-account` is what keeps it
-    // from reaching agent-account provisioning. A test that ran a flag set the
-    // planner does not emit would prove nothing about the shipped contract,
-    // and `toContain` on the joined string cannot tell `--no-open` apart from
-    // a hypothetical `--no-open-browser`.
-    expect(flags).toContain("--claude-code");
-    expect(flags).toContain("--agent-guided");
-    expect(flags).toContain("--no-open");
-    expect(flags).toContain("--no-provision-agent-account");
-
-    const enrolled = await readKeychainCustodyKey(fortress);
-    expect(enrolled).not.toBeNull();
-
-    // Before the fix this reached the dashboard boot and threw "cannot unlock
-    // this fortress ... with the available factors", naming only the
-    // sanctuary-passphrase service: `protect` opened the fortress with the
-    // enrolled factor and the dashboard it started refused the same fortress.
-    const options = parseWrapArgs(flags);
     let collisionExercised = false;
     let collisionRetried = false;
     const requestedPort = await bindWithRetry(async () => {
       // resolveDashboardPort returns this verbatim to the real starter.
       const port = randomTestPort();
       try {
+        // Every attempt starts from a pristine harness config and new custody.
+        home = await mkdtemp(join(tmpdir(), "a73-protect-dashboard-"));
+        homes.push(home);
+        fortress = join(home, "sanctuary-daily");
+        process.env.HOME = home;
+        const configPath = getPlatformPaths()["claude-code"][0]!;
+        await writeFile(configPath, JSON.stringify({ mcpServers: {} }));
+        await initFortress();
+
+        const observed = await probeCustodyAccess(fortress, process.platform);
+        expect(observed.custodyAccess).toBe("usable");
+
+        const plan = buildAgentInstallPlan({
+          profile: "memory",
+          harness: "claude-code",
+          fortress,
+          platform: process.platform,
+          observed: baseProbe(observed),
+        });
+        const argv = plan.next_action?.argv;
+        expect(argv).toBeDefined();
+        // The contract forbids adding a credential, so the argv the planner emits
+        // carries none and the dashboard it starts inherits none.
+        const flags = protectFlagsFrom(argv!);
+        expect(flags).not.toContain("--passphrase");
+        // The planner's REAL emission, asserted flag-for-flag rather than by
+        // substring over the joined string: `--no-open` is what keeps this run
+        // non-interactive, and `--no-provision-agent-account` is what keeps it
+        // from reaching agent-account provisioning. A test that ran a flag set the
+        // planner does not emit would prove nothing about the shipped contract,
+        // and `toContain` on the joined string cannot tell `--no-open` apart from
+        // a hypothetical `--no-open-browser`.
+        expect(flags).toContain("--claude-code");
+        expect(flags).toContain("--agent-guided");
+        expect(flags).toContain("--no-open");
+        expect(flags).toContain("--no-provision-agent-account");
+
+        const options = parseWrapArgs(flags);
         if (!collisionExercised) {
           // Hold the first requested port to exercise a real EADDRINUSE and
           // the full failed-boot teardown on every run, without a timing race.
@@ -432,6 +445,10 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
         throw error;
       }
     });
+    // Teardown must never change which error drives bindWithRetry. Report it
+    // only after the loop; afterEach also reports it if the loop itself throws.
+    expect(teardownErrors, "failed-attempt teardown errors").toEqual([]);
+    expect(new Set(homes).size).toBe(homes.length);
     expect(collisionExercised).toBe(true);
     expect(collisionRetried).toBe(true);
 
@@ -461,6 +478,8 @@ describe("the install-emitted protect argv boots the real dashboard", () => {
     expect(await readStoredPassphrase({ storagePath: fortress })).toBeNull();
 
     // No secret in anything the wrap wrote to the harness config.
+    const enrolled = await readKeychainCustodyKey(fortress);
+    expect(enrolled).not.toBeNull();
     const enrolledEncoded = toBase64url(enrolled!);
     for (const path of getPlatformPaths()["claude-code"]) {
       const contents = await readFile(path, "utf-8").catch(() => null);

@@ -25,24 +25,18 @@
  *   back via `server.address()`). A local `randomPort` declaration is
  *   therefore a violation.
  *
- *   Random allocation detection: match the exact call spelling
- *   `randomTestPort` followed by empty parentheses (whitespace allowed),
- *   including assignments whose value may later reach an internal bind.
- *   This is textual, not dataflow analysis: every such allocation needs
- *   protection, even if this scanner cannot see its consumer. Comments and
- *   quoted strings (including template literals) are masked for this class;
- *   interpolated template expressions and aliases are not analyzed.
- *   Accept only allocations in the body of an inline, zero-argument arrow
- *   callback passed as the first argument to `bindWithRetry`, or directly
- *   in the first argument of `.listen(randomTestPort(), ...)`, which the
- *   existing listen rules already accept. Named retry helpers should move
- *   their allocation into an inline callback and receive the port explicitly.
- *   Block and expression callbacks use balanced (), [] and {} delimiters:
- *   no line window or depth cap is needed, so there is no empirical constant
- *   that can exempt a neighboring call or reject a long attempt. A comma at
- *   the retry-call level ends an expression callback, excluding retry options.
- *   The existing same-line or preceding-line `// port-discipline: ignore
- *   <reason>` annotation also exempts allocations that never bind.
+ *   Random allocation detection uses the TypeScript AST. Flag every call
+ *   whose callee, after stripping parentheses and non-null assertions, is
+ *   the identifier `randomTestPort`. Exempt a call only when its nearest
+ *   enclosing function-like node is an arrow function or function expression
+ *   passed as the first argument of a call whose callee is the identifier
+ *   `bindWithRetry`, or a same-line or preceding-line single-line comment
+ *   says `port-discipline: ignore <reason>`. No intervening function boundary
+ *   is allowed: nested timer callbacks and other inner functions are flagged.
+ *   This includes template interpolations and direct random listen arguments.
+ *   Returning a port from the attempt is accepted: this is a syntactic rule,
+ *   not dataflow analysis of whether the eventual bind happens in the attempt.
+ *   Named helpers must receive a port allocated inside the inline attempt.
  *
  * Enforcement: this module exports `scanRepoTests()` which is invoked
  * by the vitest regression test at
@@ -65,6 +59,7 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import ts from "typescript";
 
 const SERVER_TEST_DIR = "server/test";
 const WHITELIST_MARKER = "port-discipline: ignore";
@@ -120,55 +115,64 @@ function fileUsesBindWithRetry(text: string): boolean {
   return RETRY_CALL_RE.test(text);
 }
 
-/** Mask non-code without moving offsets or line numbers; no AST is needed. */
-function maskQuotedTextAndComments(source: string): string {
-  return source.replace(
-    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`/g,
-    (text) => text.replace(/[^\n]/g, " "),
-  );
+function stripCallWrappers(expression: ts.Expression): ts.Expression {
+  while (ts.isParenthesizedExpression(expression) || ts.isNonNullExpression(expression)) {
+    expression = expression.expression;
+  }
+  return expression;
 }
 
-/** Find the end of a callback body, with no line or nesting limit. */
-function callbackEnd(code: string, start: number): number {
-  const closers: string[] = [];
-  const pairs: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
-  const block = code[start] === "{";
-  for (let i = start; i < code.length; i += 1) {
-    const char = code[i]!;
-    if (closers.length === 0 && (char === "," || char === ")")) return i;
-    if (pairs[char]) {
-      closers.push(pairs[char]!);
-    } else if (char === ")" || char === "]" || char === "}") {
-      if (closers.pop() !== char) return start; // malformed: grant no exemption
-      if (block && closers.length === 0) return i;
-    }
+function isRetryAttemptAllocation(call: ts.CallExpression): boolean {
+  let enclosing: ts.Node | undefined = call.parent;
+  while (enclosing && !ts.isFunctionLike(enclosing)) enclosing = enclosing.parent;
+  if (!enclosing || (!ts.isArrowFunction(enclosing) && !ts.isFunctionExpression(enclosing))) {
+    return false;
   }
-  return start; // unterminated: grant no exemption
+  let argument: ts.Node = enclosing;
+  while (ts.isParenthesizedExpression(argument.parent) || ts.isNonNullExpression(argument.parent)) {
+    argument = argument.parent;
+  }
+  const retry = argument.parent;
+  return ts.isCallExpression(retry) && retry.arguments[0] === argument &&
+    ts.isIdentifier(retry.expression) && retry.expression.text === "bindWithRetry";
 }
 
 function scanRandomAllocations(path: string, source: string): Violation[] {
-  const code = maskQuotedTextAndComments(source);
-  const attempts = Array.from(
-    code.matchAll(/\bbindWithRetry\s*\(\s*(?:async\s*)?\(\s*\)\s*=>\s*/g),
-    (match) => {
-      const start = match.index + match[0].length;
-      return { start, end: callbackEnd(code, start) };
-    },
-  );
+  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const ignoredLines = new Set<number>();
+  const allocations: ts.CallExpression[] = [];
+  const collectComment = (pos: number, end: number, kind: ts.CommentKind): void => {
+    if (kind !== ts.SyntaxKind.SingleLineCommentTrivia) return;
+    const commentPrefixLength = "//".length;
+    const comment = source.slice(pos + commentPrefixLength, end).trim();
+    if (!comment.startsWith(WHITELIST_MARKER)) return;
+    const reason = comment.slice(WHITELIST_MARKER.length);
+    if (!reason.startsWith(" ") || !reason.trim()) return;
+    ignoredLines.add(file.getLineAndCharacterOfPosition(pos).line);
+  };
+  const visit = (node: ts.Node): void => {
+    // Parser-owned trivia positions avoid treating strings and regexes as annotations.
+    ts.forEachLeadingCommentRange(source, node.pos, collectComment);
+    ts.forEachTrailingCommentRange(source, node.pos, collectComment);
+    ts.forEachTrailingCommentRange(source, node.end, collectComment);
+    if (ts.isCallExpression(node)) {
+      const callee = stripCallWrappers(node.expression);
+      if (ts.isIdentifier(callee) && callee.text === "randomTestPort") allocations.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+
   const violations: Violation[] = [];
   const lines = source.split("\n");
-  for (const match of code.matchAll(/\brandomTestPort\s*\(\s*\)/g)) {
-    const offset = match.index;
-    const line = code.slice(0, offset).split("\n").length;
-    if (lineHasWhitelist(lines[line - 1]!) ||
-        (line > 1 && lineHasWhitelist(lines[line - 2]!))) continue;
-    if (attempts.some(({ start, end }) => start <= offset && offset < end)) continue;
-    // Preserve Sigma-6's existing acceptance of a direct call argument.
-    if (/\.listen\s*\(\s*$/.test(code.slice(0, offset))) continue;
+  for (const call of allocations) {
+    const line = file.getLineAndCharacterOfPosition(call.getStart(file)).line;
+    if (ignoredLines.has(line) || ignoredLines.has(line - 1)) continue;
+    if (isRetryAttemptAllocation(call)) continue;
     violations.push({
       file: path,
-      line,
-      text: lines[line - 1]!.trim(),
+      line: line + 1,
+      text: lines[line]!.trim(),
       reason: "randomTestPort() outside a bindWithRetry attempt; allocate a fresh port inside the retry callback or use port: 0 when the bound port is read back",
     });
   }

@@ -14,8 +14,8 @@
  *     annotation).
  */
 
-import { describe, it, expect } from "vitest";
-import { writeFileSync, mkdtempSync } from "node:fs";
+import { afterEach, describe, it, expect } from "vitest";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,8 +35,14 @@ const REPO_TEST_DIR = resolve(
   "..",
 );
 
+const fixtureDirs: string[] = [];
+afterEach(() => {
+  for (const dir of fixtureDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 function writeTempTest(content: string): string {
   const dir = mkdtempSync(join(tmpdir(), "port-discipline-test-"));
+  fixtureDirs.push(dir);
   const path = join(dir, "fixture.test.ts");
   writeFileSync(path, content, "utf-8");
   return path;
@@ -264,8 +270,76 @@ describe("random port allocation discipline", () => {
     expect(scanFile("fixture.test.ts", source)).toEqual([]);
   });
 
-  it("preserves existing acceptance of a direct random listen argument", () => {
+  it("flags a direct random listen argument outside an attempt", () => {
     const source = "server.listen(randomTestPort());";
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ line: 1, text: source }),
+    ]);
+  });
+
+  const regexCases = [
+    { name: "quote", literal: String.raw`/"/` },
+    { name: "brace", literal: String.raw`/}/` },
+    { name: "comment opener", literal: String.raw`/[/*]/` },
+    { name: "escaped slash", literal: String.raw`/a\//` },
+  ];
+  const positions = ["before", "after", "same line"] as const;
+  const regexFixtures = regexCases.flatMap(({ name, literal }) => positions.map((position) => {
+    // Pin bare and parenthesized callees together so each case detects an AST
+    // regression as well as proving that both spellings have the same result.
+    const allocation = "const port = randomTestPort(), wrapped = (randomTestPort)();";
+    const regex = `const pattern = ${literal};`;
+    const lines = position === "same line" ? [`${regex} ${allocation}`] :
+      position === "before" ? [regex, allocation] : [allocation, regex];
+    lines.push('const label = "done"; /* terminates misleading comment text */');
+    return { name, position, source: lines.join("\n"), line: lines.findIndex((line) => line.includes(allocation)) + 1 };
+  }));
+
+  it.each(regexFixtures)("flags allocations with a $name regex $position", ({ source, line }) => {
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ line, text: source.split("\n")[line - 1] }),
+      expect.objectContaining({ line, text: source.split("\n")[line - 1] }),
+    ]);
+  });
+
+  it.each(regexFixtures)("accepts attempt allocations with a $name regex $position", ({ source }) => {
+    expect(scanFile("fixture.test.ts", `bindWithRetry(() => {\n${source}\n});`)).toEqual([]);
+  });
+
+  const rejectedSyntax = [
+    { name: "division outside an attempt", source: "const port = randomTestPort() / divisor + (randomTestPort)() / divisor;", count: 2 }, // Both calls are unprotected.
+    { name: "template interpolation outside an attempt", source: "const url = `http://localhost:${randomTestPort()}`;", count: 1 },
+    { name: "parenthesized callee outside an attempt", source: "(randomTestPort)();", count: 1 },
+    { name: "non-null callee outside an attempt", source: "randomTestPort!();", count: 1 },
+    { name: "nested timer callback inside an attempt", source: "bindWithRetry(() => { setTimeout(() => startServer({ port: randomTestPort() }), delay); });", count: 1 },
+    { name: "inner function expression inside an attempt", source: "bindWithRetry(() => { consume(function () { return randomTestPort(); }); });", count: 1 },
+    { name: "inner method inside an attempt", source: "bindWithRetry(() => { return { later() { return randomTestPort(); } }; });", count: 1 },
+    { name: "allocation outside an attempt that only returns a port for a later bind", source: "const port = (randomTestPort)(); const allocated = bindWithRetry(() => port); startServer({ port: allocated });", count: 1 },
+    { name: "parenthesized allocation in retry options", source: "bindWithRetry(() => startServer(), { jitterMs: (randomTestPort)() });", count: 1 },
+    { name: "annotation text in a string", source: 'const label = "// port-discipline: ignore example"; randomTestPort();', count: 1 },
+    { name: "annotation without a reason", source: "randomTestPort(); // port-discipline: ignore", count: 1 },
+    { name: "block comment annotation", source: "randomTestPort(); /* port-discipline: ignore example */", count: 1 },
+  ];
+  it.each(rejectedSyntax)("flags $name", ({ source, count }) => {
+    expect(scanFile("fixture.test.ts", source)).toEqual(Array.from({ length: count }, () =>
+      expect.objectContaining({ line: 1, text: source, reason: expect.stringContaining("randomTestPort() outside") }),
+    ));
+  });
+
+  it.each([
+    { name: "division", source: "bindWithRetry(() => startServer({ port: randomTestPort() / divisor }));" },
+    { name: "template interpolation", source: "bindWithRetry(() => startServer({ url: `http://localhost:${randomTestPort()}` }));" },
+    { name: "parenthesized and non-null callees", source: "bindWithRetry(() => { (randomTestPort)(); randomTestPort!(); });" },
+    { name: "an arrow return type", source: "bindWithRetry(async (): Promise<Handle> => startServer({ port: randomTestPort() }));" },
+    { name: "a generic expression body with a comma", source: "bindWithRetry(() => startServer<Options, Handle>({ port: randomTestPort() }));" },
+    { name: "generic retry type arguments", source: "bindWithRetry<Handle>(() => startServer({ port: randomTestPort() }));" },
+    { name: "a function expression attempt", source: "bindWithRetry(async function () { return startServer({ port: randomTestPort() }); });" },
+    { name: "a parenthesized attempt", source: "bindWithRetry((() => startServer({ port: randomTestPort() })));" },
+    { name: "a direct random listen inside an attempt", source: "bindWithRetry(() => server.listen(randomTestPort()));" },
+    // The nearest function is the attempt. The AST rule cannot follow the
+    // returned value to prove that a later bind is protected by the retry.
+    { name: "an attempt that only returns a port for a later bind", source: "const port = await bindWithRetry(async () => randomTestPort()); await startServer({ port });" },
+  ])("accepts $name inside the nearest attempt", ({ source }) => {
     expect(scanFile("fixture.test.ts", source)).toEqual([]);
   });
 

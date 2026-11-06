@@ -4,8 +4,8 @@
  * Tests the standalone dashboard mode that runs without the MCP server.
  */
 
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
-import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { startStandaloneDashboard, handleStandaloneShutdownSignal, __resetStandaloneShutdownStateForTest } from "../src/dashboard-standalone.js";
 import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -68,7 +68,7 @@ describe("Standalone Dashboard", () => {
       home: discoveryHome,
       env: {},
     };
-    // Ensure test environment flags are set (auto-open is skipped in test)
+    captureStandaloneResources();
     process.env.VITEST = "true";
     // Durable-fix: off-host recovery escrow target for first-run mints, so the
     // provisioning gate is satisfied non-interactively (no tty in CI). In a
@@ -77,21 +77,21 @@ describe("Standalone Dashboard", () => {
   });
 
   afterEach(async () => {
-    if (dashboard) {
-      await dashboard.stop();
+    try {
+      await stopStandaloneResources(dashboard);
+    } finally {
       dashboard = null;
+      await Promise.all([tempDir, escrowDir].map(
+        (path) => rm(path, { recursive: true, force: true })));
+      // Restore this test's environment even when resource teardown fails.
+      delete process.env.SANCTUARY_STORAGE_PATH;
+      delete process.env.SANCTUARY_DASHBOARD_ENABLED;
+      delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+      delete process.env.SANCTUARY_DASHBOARD_PORT;
+      delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
+      delete process.env.SANCTUARY_RECOVERY_OUT;
+      isolatedDiscoveryOptions = undefined;
     }
-    // Clean up temp storage
-    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
-    await rm(escrowDir, { recursive: true, force: true }).catch(() => {});
-    // Clean up env vars
-    delete process.env.SANCTUARY_STORAGE_PATH;
-    delete process.env.SANCTUARY_DASHBOARD_ENABLED;
-    delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
-    delete process.env.SANCTUARY_DASHBOARD_PORT;
-    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
-    delete process.env.SANCTUARY_RECOVERY_OUT;
-    isolatedDiscoveryOptions = undefined;
   });
 
   it("starts a standalone dashboard HTTP server", async () => {
@@ -934,4 +934,59 @@ async function startHostedOptionalPanelDashboardOnce(port: number): Promise<{
     authToken,
     baseUrl: `http://127.0.0.1:${port}`,
   };
+}
+
+// Keep resource ownership in the test: refused starts never return a channel.
+// Helpers live here to preserve the existing diagnostic baseline's line anchors.
+import { DistressListener } from "../src/distress/listener.js";
+
+let capturedChannels: DashboardApprovalChannel[] = [];
+let distressListeners: DistressListener[] = [];
+
+function captureStandaloneResources(): void {
+  capturedChannels = [];
+  distressListeners = [];
+  const startChannel = DashboardApprovalChannel.prototype.start;
+  vi.spyOn(DashboardApprovalChannel.prototype, "start").mockImplementation(function (this: DashboardApprovalChannel, ...args) {
+    capturedChannels.push(this);
+    return startChannel.apply(this, args);
+  });
+  const startDistress = DistressListener.prototype.start;
+  vi.spyOn(DistressListener.prototype, "start").mockImplementation(function (this: DistressListener, ...args) {
+    distressListeners.push(this);
+    return startDistress.apply(this, args);
+  });
+}
+
+async function stopStandaloneResources(dashboard: DashboardApprovalChannel | null): Promise<void> {
+  const failures: unknown[] = [];
+  const channels = new Set(capturedChannels);
+  if (dashboard) channels.add(dashboard);
+  try {
+    for (const cleanup of [
+      // stop clears the constructor interval even when the HTTP bind refused.
+      ...Array.from(channels, (channel) => () => channel.stop()),
+      ...distressListeners.map((listener) => async () => {
+        await listener.stop();
+        expect(listener.address()).toBeNull();
+      }),
+    ]) {
+      try { await cleanup(); } catch (error) { failures.push(error); }
+    }
+    if (capturedChannels.length || distressListeners.length) {
+      // Await runtime removal and custody release without exiting Vitest.
+      const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+      try {
+        await handleStandaloneShutdownSignal("SIGTERM");
+      } catch (error) {
+        failures.push(error);
+      } finally {
+        exit.mockRestore();
+        __resetStandaloneShutdownStateForTest();
+      }
+    }
+  } finally {
+    vi.restoreAllMocks();
+  }
+  if (failures.length) throw new AggregateError(failures, "Standalone teardown failed");
 }
