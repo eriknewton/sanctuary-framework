@@ -1,5 +1,5 @@
 /**
- * Sigma-6 self-tests for the test-port-discipline regression gate
+ * Self-tests for the test-port-discipline regression gate
  * (server/scripts/test-port-discipline.ts).
  *
  * Coverage:
@@ -8,6 +8,7 @@
  *   - Flags variable-port .listen() in files that don't use bindWithRetry.
  *   - Honors a same-line whitelist comment.
  *   - Honors a comment-above whitelist comment.
+ *   - Rejects randomTestPort allocations outside retry attempts.
  *   - Returns zero violations on the actual repo (sanity gate; this
  *     test fails if anyone re-introduces a hardcoded port without an
  *     annotation).
@@ -41,9 +42,9 @@ function writeTempTest(content: string): string {
   return path;
 }
 
-describe("Sigma-6 test-port-discipline gate — fixture-level checks", () => {
+describe("Sigma-6 test-port-discipline gate - fixture-level checks", () => {
   it("flags a hardcoded port literal", () => {
-    // port-discipline: ignore — fixture string for the gate's own self-test
+    // port-discipline: ignore - fixture string for the gate's own self-test
     const fixturePort = "s.listen(36970, \"127.0.0.1\");\n";
     const path = writeTempTest(
       `import { createServer } from "node:http";\n` +
@@ -92,7 +93,7 @@ describe("Sigma-6 test-port-discipline gate — fixture-level checks", () => {
   });
 
   it("honors same-line whitelist comment", () => {
-    // port-discipline: ignore — fixture asserts the whitelist annotation works
+    // port-discipline: ignore - fixture asserts the whitelist annotation works
     const fixtureLine =
       "s.listen(36970, \"127.0.0.1\"); // port-discipline: ignore - fixture port for unit test\n";
     const path = writeTempTest(
@@ -105,7 +106,7 @@ describe("Sigma-6 test-port-discipline gate — fixture-level checks", () => {
   });
 
   it("honors comment-above whitelist", () => {
-    // port-discipline: ignore — fixture asserts the whitelist annotation works
+    // port-discipline: ignore - fixture asserts the whitelist annotation works
     const fixtureLine = "s.listen(36970, \"127.0.0.1\");\n";
     const path = writeTempTest(
       `import { createServer } from "node:http";\n` +
@@ -178,13 +179,146 @@ describe("Sigma-6 test-port-discipline gate — fixture-level checks", () => {
   });
 });
 
-describe("Sigma-6 test-port-discipline gate — repo-level check", () => {
-  it("the live repo passes the gate (catches regressions if a new hardcoded port lands)", () => {
+describe("random port allocation discipline", () => {
+  it("flags a bare random port option passed to an internal binder", () => {
+    const source = "startServer({ port: randomTestPort() });";
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({
+        line: 1, // The allocation is on the only fixture line.
+        text: source,
+        reason: expect.stringContaining("randomTestPort() outside a bindWithRetry attempt"),
+      }),
+    ]);
+  });
+
+  it("flags a port assigned before a retry and then passed to an internal binder", () => {
+    const allocation = "const port = randomTestPort();";
+    const source = [
+      allocation,
+      "await bindWithRetry(async () => startServer({ port }));",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ line: 1, text: allocation }),
+    ]);
+  });
+
+  it("flags a random option in a sibling callback after a completed retry", () => {
+    const source = [
+      "await bindWithRetry(async () => { await startServer({ port: randomTestPort() }); });",
+      "it('next bind', async () => { await startServer({ port: randomTestPort() }); });",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ line: 2 }), // Only the second fixture line is unsafe.
+    ]);
+  });
+
+  it("flags an allocation after a retry closes on the same line", () => {
+    const source = "await bindWithRetry(async () => {}); startServer({ port: randomTestPort() });";
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ text: source }),
+    ]);
+  });
+
+  it("flags a random allocation despite retry text in comments and strings", () => {
+    const source = [
+      "// bindWithRetry(async () => {",
+      'const example = "bindWithRetry(async () => {";',
+      "startServer({ port: randomTestPort() });",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ text: "startServer({ port: randomTestPort() });" }),
+    ]);
+  });
+
+  it("flags random allocations in retry options outside the attempt", () => {
+    const source = "bindWithRetry(() => startServer(), { jitterMs: randomTestPort() });";
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ text: source }),
+    ]);
+  });
+
+  it("accepts a random option inside a block attempt despite nested delimiters", () => {
+    const source = [
+      "await bindWithRetry(async () => {",
+      '  const punctuation = "});"; // });',
+      "  if (ready) { await startServer({ ports: [randomTestPort()] }); }",
+      "});",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("accepts a random option inside an expression attempt", () => {
+    const source = "bindWithRetry(() => startServer({ port: randomTestPort() }));";
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("accepts multiline retry and allocation spellings", () => {
+    const source = [
+      "bindWithRetry(",
+      "  async ( ) => {",
+      "    return startServer({ port: randomTestPort (",
+      "    ) });",
+      "  },",
+      ");",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("preserves existing acceptance of a direct random listen argument", () => {
+    const source = "server.listen(randomTestPort());";
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("accepts an allocation annotated on the same line", () => {
+    const source = "refuse({ port: randomTestPort() }); // port-discipline: ignore refuses before listen";
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("accepts an allocation annotated on the preceding line", () => {
+    const source = [
+      "// port-discipline: ignore refuses before listen",
+      "refuse({ port: randomTestPort() });",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("ignores random allocation examples in comments and quoted strings", () => {
+    const source = [
+      "// randomTestPort()",
+      "/* randomTestPort() */",
+      'const example = "randomTestPort()";',
+      "const template = `randomTestPort()`;",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([]);
+  });
+
+  it("still rejects hardcoded listens inside retry attempts", () => {
+    // port-discipline: ignore fixture text verifies the original literal rule.
+    const source = "bindWithRetry(async () => { server.listen(12345); });";
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ reason: expect.stringContaining("hardcoded port literal") }),
+    ]);
+  });
+
+  it("still rejects local randomPort helpers inside retry attempts", () => {
+    const source = [
+      "bindWithRetry(async () => {",
+      "  const randomPort = () => candidatePort;",
+      "});",
+    ].join("\n");
+    expect(scanFile("fixture.test.ts", source)).toEqual([
+      expect.objectContaining({ reason: expect.stringContaining("local randomPort helper") }),
+    ]);
+  });
+});
+
+describe("Sigma-6 test-port-discipline gate - repo-level check", () => {
+  it("keeps every repo test free of listen, local-helper, and random-allocation violations", () => {
     const violations = scanRepoTests(REPO_TEST_DIR);
     if (violations.length > 0) {
       // Surface what failed so a regression author sees it directly.
       const summary = violations
-        .map((v) => `${v.file}:${v.line} — ${v.reason}\n  ${v.text}`)
+        .map((v) => `${v.file}:${v.line} - ${v.reason}\n  ${v.text}`)
         .join("\n");
       // eslint-disable-next-line no-console
       console.error("port-discipline violations:\n" + summary);

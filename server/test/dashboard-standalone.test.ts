@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — Standalone Dashboard Tests
+ * Sanctuary MCP Server - Standalone Dashboard Tests
  *
  * Tests the standalone dashboard mode that runs without the MCP server.
  */
@@ -137,7 +137,7 @@ describe("Standalone Dashboard", () => {
       startStandaloneDashboard({
         passphrase: "test-passphrase-remote-refuse",
         host: "0.0.0.0",
-        port: randomTestPort(),
+        port: randomTestPort(), // port-discipline: ignore DashboardApprovalChannel refuses non-loopback plaintext before listen.
         distressPort: 0,
         noConfirm: true,
         discoveryOptions: isolatedDiscoveryOptions,
@@ -278,8 +278,8 @@ describe("Standalone Dashboard", () => {
 
     // Second run: no credentials should fail. The expected failure is at the
     // credentials-resolution stage which runs before any port is bound, so
-    // EADDRINUSE retry is irrelevant here. We still pick a random port for
-    // forward compatibility with code paths that may bind earlier.
+    // this allocation cannot reach the dashboard listener. If this path ever
+    // binds, move the allocation and startup into the retry helper.
     delete process.env.SANCTUARY_PASSPHRASE;
     delete process.env.SANCTUARY_RECOVERY_KEY;
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
@@ -287,7 +287,7 @@ describe("Standalone Dashboard", () => {
     let dashboard2: DashboardApprovalChannel | null = null;
     try {
       dashboard2 = await startStandaloneDashboard({
-        port: randomTestPort(),
+        port: randomTestPort(), // port-discipline: ignore Missing credentials throw before dashboard construction or listen.
         host: "127.0.0.1",
         distressPort: 0,
         discoveryOptions: isolatedDiscoveryOptions,
@@ -319,7 +319,7 @@ describe("Standalone Dashboard", () => {
     expect(text).toContain("Sanctuary");
   });
 
-  // v0.10.2 regression — dashboard must auto-load the per-tenant passphrase
+  // v0.10.2 regression - dashboard must auto-load the per-tenant passphrase
   // from the same persistence the wrap CLI writes (Keychain on macOS, encrypted
   // fallback file everywhere else) when no explicit passphrase is supplied.
   // The pre-fix behaviour was to demand SANCTUARY_PASSPHRASE and report
@@ -342,7 +342,7 @@ describe("Standalone Dashboard", () => {
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     delete process.env.SANCTUARY_PASSPHRASE;
 
-    // Boot with NO explicit passphrase — the dashboard must find the
+    // Boot with NO explicit passphrase - the dashboard must find the
     // persisted fallback-file entry by storage path and boot successfully.
     const result = await startDashboardOnFreePort({
       host: "127.0.0.1",
@@ -353,7 +353,7 @@ describe("Standalone Dashboard", () => {
     expect(res.status).toBe(200);
   });
 
-  // v0.10.2 regression — after the supplied passphrase decrypts at least one
+  // v0.10.2 regression - after the supplied passphrase decrypts at least one
   // identity, loopback callers skip the dashboard login prompt. The operator
   // has already proved principalship on the command line; re-prompting in the
   // auto-opened browser just trains users to paste secrets into web forms.
@@ -371,7 +371,7 @@ describe("Standalone Dashboard", () => {
     const { FilesystemStorage } = await import("../src/storage/filesystem.js");
     const { derivePurposeKey } = await import("../src/core/key-derivation.js");
     const { createIdentity } = await import("../src/core/identity.js");
-    // Sovereign-custody build: unlock through the unified path — a local
+    // Sovereign-custody build: unlock through the unified path - a local
     // Argon2id re-derivation from key-params would produce a DIFFERENT
     // master than the envelope holds (the exact divergence class the
     // custody envelope ended; its MAC check catches the attempt).
@@ -392,7 +392,7 @@ describe("Standalone Dashboard", () => {
     await idMgr.save(storedIdentity);
     await seed.dashboard.stop();
 
-    // Real boot — auth token is set, but loopback callers should bypass it.
+    // Real boot - auth token is set, but loopback callers should bypass it.
     const result = await startDashboardOnFreePort({
       passphrase: "autoauth-tenant-passphrase",
       host: "127.0.0.1",
@@ -824,10 +824,10 @@ async function startHostedOptionalPanelDashboard(): Promise<{
   baseUrl: string;
 }> {
   // A random port can collide under parallel suites; each retry builds a fresh channel on a fresh port.
-  return bindWithRetry(startHostedOptionalPanelDashboardOnce);
+  return bindWithRetry(() => startHostedOptionalPanelDashboardOnce(randomTestPort()));
 }
 
-async function startHostedOptionalPanelDashboardOnce(): Promise<{
+async function startHostedOptionalPanelDashboardOnce(port: number): Promise<{
   dashboard: DashboardApprovalChannel;
   authToken: string;
   baseUrl: string;
@@ -838,7 +838,6 @@ async function startHostedOptionalPanelDashboardOnce(): Promise<{
   const auditLog = new AuditLog(storage, masterKey);
   const fortressId = "hosted_optional_panel_fortress";
   const identityId = "hosted_optional_panel_operator";
-  const port = randomTestPort();
   const dashboard = new DashboardApprovalChannel({
     port,
     host: "127.0.0.1",

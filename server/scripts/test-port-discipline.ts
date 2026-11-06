@@ -1,7 +1,7 @@
 /**
- * Sigma-6 + Sigma-7 test-port-discipline regression gate.
+ * Test-port-discipline regression gate.
  *
- * Scans `server/test/` for two anti-pattern classes:
+ * Scans `server/test/` for three anti-pattern classes:
  *
  *   Sigma-6 detection: `.listen(...)` calls in test files. Each must be
  *   either:
@@ -25,11 +25,31 @@
  *   back via `server.address()`). A local `randomPort` declaration is
  *   therefore a violation.
  *
+ *   Random allocation detection: match the exact call spelling
+ *   `randomTestPort` followed by empty parentheses (whitespace allowed),
+ *   including assignments whose value may later reach an internal bind.
+ *   This is textual, not dataflow analysis: every such allocation needs
+ *   protection, even if this scanner cannot see its consumer. Comments and
+ *   quoted strings (including template literals) are masked for this class;
+ *   interpolated template expressions and aliases are not analyzed.
+ *   Accept only allocations in the body of an inline, zero-argument arrow
+ *   callback passed as the first argument to `bindWithRetry`, or directly
+ *   in the first argument of `.listen(randomTestPort(), ...)`, which the
+ *   existing listen rules already accept. Named retry helpers should move
+ *   their allocation into an inline callback and receive the port explicitly.
+ *   Block and expression callbacks use balanced (), [] and {} delimiters:
+ *   no line window or depth cap is needed, so there is no empirical constant
+ *   that can exempt a neighboring call or reject a long attempt. A comma at
+ *   the retry-call level ends an expression callback, excluding retry options.
+ *   The existing same-line or preceding-line `// port-discipline: ignore
+ *   <reason>` annotation also exempts allocations that never bind.
+ *
  * Enforcement: this module exports `scanRepoTests()` which is invoked
  * by the vitest regression test at
  * `server/test/scripts/test-port-discipline.test.ts`. Any new test
  * file that introduces a hardcoded port literal, an unwrapped
- * variable-port listen, or a local randomPort helper will fail that
+ * variable-port listen, a local randomPort helper, or an unprotected
+ * randomTestPort allocation will fail that
  * regression test on the next `npm test` run (which is also the pre-
  * commit hook gate and the CI gate, so it cannot slip through
  * silently).
@@ -72,9 +92,9 @@ function walkTestFiles(dir: string): string[] {
   return out;
 }
 
-/** Pattern: `.listen(<digits>` — a hardcoded port literal. */
+/** Pattern: `.listen(<digits>` - a hardcoded port literal. */
 const HARDCODED_LISTEN_RE = /\.listen\s*\(\s*([0-9]+)\s*[,)]/;
-/** Pattern: `.listen(<var>` where the var is not literal `0` — needs review. */
+/** Pattern: `.listen(<var>` where the var is not literal `0` - needs review. */
 const VAR_LISTEN_RE = /\.listen\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]/;
 /**
  * Pattern: a `bindWithRetry(` CALL (not just the word). The pre-Sigma-7
@@ -98,6 +118,61 @@ function lineHasWhitelist(line: string): boolean {
 
 function fileUsesBindWithRetry(text: string): boolean {
   return RETRY_CALL_RE.test(text);
+}
+
+/** Mask non-code without moving offsets or line numbers; no AST is needed. */
+function maskQuotedTextAndComments(source: string): string {
+  return source.replace(
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`/g,
+    (text) => text.replace(/[^\n]/g, " "),
+  );
+}
+
+/** Find the end of a callback body, with no line or nesting limit. */
+function callbackEnd(code: string, start: number): number {
+  const closers: string[] = [];
+  const pairs: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+  const block = code[start] === "{";
+  for (let i = start; i < code.length; i += 1) {
+    const char = code[i]!;
+    if (closers.length === 0 && (char === "," || char === ")")) return i;
+    if (pairs[char]) {
+      closers.push(pairs[char]!);
+    } else if (char === ")" || char === "]" || char === "}") {
+      if (closers.pop() !== char) return start; // malformed: grant no exemption
+      if (block && closers.length === 0) return i;
+    }
+  }
+  return start; // unterminated: grant no exemption
+}
+
+function scanRandomAllocations(path: string, source: string): Violation[] {
+  const code = maskQuotedTextAndComments(source);
+  const attempts = Array.from(
+    code.matchAll(/\bbindWithRetry\s*\(\s*(?:async\s*)?\(\s*\)\s*=>\s*/g),
+    (match) => {
+      const start = match.index + match[0].length;
+      return { start, end: callbackEnd(code, start) };
+    },
+  );
+  const violations: Violation[] = [];
+  const lines = source.split("\n");
+  for (const match of code.matchAll(/\brandomTestPort\s*\(\s*\)/g)) {
+    const offset = match.index;
+    const line = code.slice(0, offset).split("\n").length;
+    if (lineHasWhitelist(lines[line - 1]!) ||
+        (line > 1 && lineHasWhitelist(lines[line - 2]!))) continue;
+    if (attempts.some(({ start, end }) => start <= offset && offset < end)) continue;
+    // Preserve Sigma-6's existing acceptance of a direct call argument.
+    if (/\.listen\s*\(\s*$/.test(code.slice(0, offset))) continue;
+    violations.push({
+      file: path,
+      line,
+      text: lines[line - 1]!.trim(),
+      reason: "randomTestPort() outside a bindWithRetry attempt; allocate a fresh port inside the retry callback or use port: 0 when the bound port is read back",
+    });
+  }
+  return violations;
 }
 
 export function scanFile(path: string, text?: string): Violation[] {
@@ -137,7 +212,7 @@ export function scanFile(path: string, text?: string): Violation[] {
           file: path,
           line: i + 1,
           text: line.trim(),
-          reason: `.listen(<var>) without bindWithRetry — port collisions will not retry`,
+          reason: `.listen(<var>) without bindWithRetry - port collisions will not retry`,
         });
       }
     }
@@ -159,6 +234,7 @@ export function scanFile(path: string, text?: string): Violation[] {
     }
   }
 
+  violations.push(...scanRandomAllocations(path, source));
   return violations;
 }
 
@@ -180,7 +256,7 @@ export function formatViolations(violations: Violation[]): string {
   return violations
     .map((v) => {
       const rel = relative(process.cwd(), v.file);
-      return `${rel}:${v.line} — ${v.reason}\n    ${v.text}`;
+      return `${rel}:${v.line} - ${v.reason}\n    ${v.text}`;
     })
     .join("\n");
 }
