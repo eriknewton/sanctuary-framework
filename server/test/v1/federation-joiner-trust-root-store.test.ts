@@ -4,7 +4,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
-
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -54,13 +53,14 @@ import type {
   PrincipalCertificate,
   NodeIdentityCertificate,
 } from "../../src/mesh/types.js";
-
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+const custodySessions = createCustodySessionTracker();
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
-  const { masterKey } = await establishMaster({
+  const { masterKey } = custodySessions.track(await establishMaster({
     storage,
     passphrase: `slice3a-${randomBytes(6).toString("hex")}`,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
+  }));
   return masterKey;
 }
 
@@ -1003,11 +1003,11 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
     const dir = await mkdtemp(join(tmpdir(), "joiner-lock-"));
     try {
       const storage = new FilesystemStorage(join(dir, "state"));
-      const { masterKey } = await establishMaster({
+      const { masterKey } = custodySessions.track(await establishMaster({
         storage,
         passphrase: `lock-${randomBytes(6).toString("hex")}`,
         firstRun: { installMode: "headless", mintRecoveryKey: false },
-      });
+      }));
       const { record } = buildJoinerRecord();
       const deadA = toBase64url(randomBytes(32));
       const deadB = toBase64url(randomBytes(32));
@@ -1041,6 +1041,7 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
       expect(loaded?.record.revoked_root_pubkeys?.has(deadB)).toBe(true);
       expect(loaded?.record.highest_revocation_serial).toBe(5);
     } finally {
+      await custodySessions.release();
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -1089,11 +1090,11 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
     const dir = await mkdtemp(join(tmpdir(), "joiner-chokepoint-"));
     try {
       const storage = new FilesystemStorage(join(dir, "state"));
-      const { masterKey } = await establishMaster({
+      const { masterKey } = custodySessions.track(await establishMaster({
         storage,
         passphrase: `cp-${randomBytes(6).toString("hex")}`,
         firstRun: { installMode: "headless", mintRecoveryKey: false },
-      });
+      }));
       const { record, home } = buildJoinerRecord();
       const k1Pub = record.pinned_master_pubkey.public_key;
       // Seed the base record (pin=K1, no revoked).
@@ -1138,6 +1139,7 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
       rotationAdopt.newIssuingPrincipalPrivateKey.fill(0);
       rotationRejoin.newIssuingPrincipalPrivateKey.fill(0);
     } finally {
+      await custodySessions.release();
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -1536,8 +1538,12 @@ interface TestDaemon {
 const running: TestDaemon[] = [];
 
 afterEach(async () => {
-  while (running.length > 0) {
-    await running.pop()!.stop();
+  try {
+    while (running.length > 0) {
+      await running.pop()!.stop();
+    }
+  } finally {
+    await custodySessions.release();
   }
 });
 

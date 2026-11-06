@@ -21,7 +21,7 @@
  *      material on the wire.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -45,13 +45,18 @@ import {
   type WrapFederationReadState,
 } from "../../src/wrap/fleet-roster-provider.js";
 import { absentFleetRoster } from "../../src/principal-policy/fleet-roster.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+
+const custodySessions = createCustodySessionTracker();
+
+afterEach(() => custodySessions.release());
 
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
-  const { masterKey } = await establishMaster({
+  const { masterKey } = custodySessions.track(await establishMaster({
     storage,
     passphrase: `wrap-fleet-${randomBytes(6).toString("hex")}`,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
+  }));
   return masterKey;
 }
 

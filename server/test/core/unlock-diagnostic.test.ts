@@ -9,7 +9,7 @@
  * recovery command — never an on-disk key location.
  */
 
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
@@ -21,6 +21,11 @@ import {
   CustodyCredentialMissingError,
 } from "../../src/core/master-custody.js";
 import { fromBase64url } from "../../src/core/encoding.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+
+const custodySessions = createCustodySessionTracker();
+
+afterEach(() => custodySessions.release());
 
 describe("buildActionableUnlockMessage — element 2", () => {
   it("lists enrolled factors, the keychain-locked guidance, and the literal SANCTUARY_RECOVERY_KEY hint", () => {
@@ -70,11 +75,11 @@ describe("buildActionableUnlockMessage — element 2", () => {
 describe("readEnrolledFactors", () => {
   it("reports the distinct factor types from a fortress envelope", async () => {
     const storage = new MemoryStorage();
-    await establishMaster({
+    custodySessions.track(await establishMaster({
       storage,
       passphrase: "correct horse battery staple",
       firstRun: { installMode: "interactive", mintRecoveryKey: true },
-    });
+    }));
     const factors = await readEnrolledFactors(storage);
     expect(factors.hasPassphraseFactor).toBe(true);
     expect(factors.enrolledFactors).toContain("passphrase");
@@ -93,11 +98,11 @@ describe("NO disk-fallback + backward-compat", () => {
   it("a fortress with a stray on-disk recovery-key.txt is NOT auto-unlocked without the env factor", async () => {
     const storage = new MemoryStorage();
     // Provision a passphrase fortress with a minted recovery key.
-    await establishMaster({
+    custodySessions.track(await establishMaster({
       storage,
       passphrase: "the-fortress-passphrase",
       firstRun: { installMode: "interactive", mintRecoveryKey: true },
-    });
+    }));
     // Even with a stray recovery-key.txt sitting somewhere, the unlock path
     // takes NO credential from disk: establishMaster with no credential throws.
     await expect(
@@ -107,15 +112,15 @@ describe("NO disk-fallback + backward-compat", () => {
 
   it("backward compat: an existing fortress still unlocks with its existing passphrase factor", async () => {
     const storage = new MemoryStorage();
-    const created = await establishMaster({
+    const created = custodySessions.track(await establishMaster({
       storage,
       passphrase: "an-existing-passphrase",
       firstRun: { installMode: "interactive", mintRecoveryKey: true },
-    });
-    const reopened = await establishMaster({
+    }));
+    const reopened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "an-existing-passphrase",
-    });
+    }));
     expect(Buffer.from(reopened.masterKey)).toEqual(
       Buffer.from(created.masterKey),
     );
@@ -123,11 +128,11 @@ describe("NO disk-fallback + backward-compat", () => {
 
   it("backward compat: an existing fortress still unlocks with its minted recovery key", async () => {
     const storage = new MemoryStorage();
-    const created = await establishMaster({
+    const created = custodySessions.track(await establishMaster({
       storage,
       passphrase: "p",
       firstRun: { installMode: "interactive", mintRecoveryKey: true },
-    });
+    }));
     const minted = created.mintedRecoveryKey!;
     expect(minted).toBeTruthy();
     const envelope = await readCustodyEnvelope(storage);
