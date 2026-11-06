@@ -9,13 +9,28 @@ import { FLOW_STOP_FINAL_RECORD_RESERVE_MS } from "../../../src/castle-wall/cons
 const FIXTURE_RESERVE_SPLIT = 2;
 // Test setting: the fixture hold budget is half the final-record reserve, sized for this small store; it states no production timing.
 export const SHORT_HOLD_DEADLINE_MS = FLOW_STOP_FINAL_RECORD_RESERVE_MS / FIXTURE_RESERVE_SPLIT;
-const SINGLE_OWNER = 1; // One writer per immutable reservation.
-const REACTION_TURN_TIMEOUT_MS = 1_000; // Bound a later event-loop turn independently of storage holds.
+export const SINGLE_OWNER = 1; // One writer per immutable reservation.
+export const HELD_SUMMARY_COUNT = 1; // One selected summary supplies the first recovery and summary failure.
+export const SERIAL_DEADLINES = 2; // Summary then loss expire independently.
+// Must match the summary append operation in macos-flow-events.ts.
+export const SUMMARY_OPERATION = "castle_wall_flow_decisions_coalesced";
+// Must match the ingress-loss append operation in macos-flow-events.ts.
+export const LOSS_OPERATION = "castle_wall_ingress_discarded";
+export const POLL_INTERVAL_MS = 1; // One millisecond polling joins real I/O without delaying admission.
+const REACTION_TURN_TIMEOUT_MS = SHORT_HOLD_DEADLINE_MS; // Bound a later event-loop turn independently of storage holds.
 export function reactionTurn(): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("fixture reaction turn did not complete")), REACTION_TURN_TIMEOUT_MS);
     setImmediate(() => { clearTimeout(timer); resolve(); });
   });
+}
+// Cleanup completes even when the body fails, and the body's assertion remains the reported failure.
+export async function withFixtureCleanup<T>(body: () => Promise<T>, cleanup: () => Promise<void>): Promise<T> {
+  const [result] = await Promise.allSettled([Promise.resolve().then(body)]);
+  const [teardown] = await Promise.allSettled([Promise.resolve().then(cleanup)]);
+  if (result.status === "rejected") throw result.reason;
+  if (teardown.status === "rejected") throw teardown.reason;
+  return result.value;
 }
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; };
 export interface LedgerPolicy {
@@ -39,6 +54,7 @@ export function ownershipLedger(audit: AuditLog, storage: FilesystemStorage, pol
   const settled: Promise<unknown>[] = [];
   const payloads: Array<{ operation: string; details: Record<string, unknown> | undefined }> = [];
   const appendEvents: Array<{ operation: string; started: number; completed?: number; failed?: number }> = [];
+  const flushEvents: Array<{ started: number; completed?: number; failed?: number }> = [];
   const observeAppend = (operation: string, started: number, original: Promise<unknown>) => {
     const event = { operation, started } as typeof appendEvents[number]; appendEvents.push(event);
     observations.push(original.then(() => { event.completed = performance.now(); }, () => { event.failed = performance.now(); }));
@@ -50,7 +66,18 @@ export function ownershipLedger(audit: AuditLog, storage: FilesystemStorage, pol
   const watched = audit as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
   const store = storage as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
   const auditMethods = ["withAuditWriteLock", "persistChainedEntry", "maybeRotate", "writeCheckpointIfNeeded", "collectPersistedEntryHashes", "flush", "flushDurable"];
-  const monitors = [...auditMethods.map(method => ({ method, spy: vi.spyOn(watched, method), seen: 0 })),
+  const flush = audit.flush.bind(audit);
+  const monitors = [...auditMethods.map(method => {
+    const spy = vi.spyOn(watched, method);
+    if (method === "flush") spy.mockImplementation(() => {
+      const event: typeof flushEvents[number] = { started: performance.now() };
+      flushEvents.push(event);
+      const original = flush();
+      observations.push(original.then(() => { event.completed = performance.now(); }, () => { event.failed = performance.now(); }));
+      return original;
+    });
+    return { method, spy, seen: 0 };
+  }),
     ...["list", "listKeys", "read"].map(method => ({ method, spy: vi.spyOn(store, method), seen: 0 }))];
   const observe = (method: string, promise: Promise<unknown>) => {
     observations.push(promise.then(() => undefined, error => { errors.push({ method, error }); }));
@@ -113,7 +140,7 @@ export function ownershipLedger(audit: AuditLog, storage: FilesystemStorage, pol
     return original;
   });
   return {
-    attempts, activeAttempts, outstandingPhysicalWrites, totalPhysicalWrites, highAttempts, highWrites, selected, payloads, recoveries, byteMismatches, errors, harvest, appendEvents,
+    attempts, activeAttempts, outstandingPhysicalWrites, totalPhysicalWrites, highAttempts, highWrites, selected, payloads, recoveries, byteMismatches, errors, harvest, appendEvents, flushEvents,
     auditCalls(method: string) { return monitors.find(monitor => monitor.method === method)!.spy.mock.calls.length; },
     async completedCalls(method: string, from: number) {
       const monitor = monitors.find(item => item.method === method)!;

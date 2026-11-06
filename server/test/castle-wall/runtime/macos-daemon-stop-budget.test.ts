@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi, onTestFinished } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { ed25519 } from "@noble/curves/ed25519";
 import { startMacOSCastleWallDaemon, type MacOSCastleWallListenerOptions } from "../../../src/castle-wall/runtime/macos-daemon.js";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
@@ -367,92 +368,115 @@ import { MacOSFlowIpcListener } from "../../../src/castle-wall/runtime/macos-ipc
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import { CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } from "../../../src/castle-wall/constants.js";
-import { ownershipLedger, reactionTurn, SHORT_HOLD_DEADLINE_MS } from "./flow-ownership-ledger.js";
-const HELD_SUMMARY_COUNT = 1; // One selected summary supplies the first recovery and summary failure.
-const DAEMON_CASE_TIMEOUT_MS = 60_000; // Include serial holds, stop, and joined raw settlement.
+import { ownershipLedger, reactionTurn, withFixtureCleanup, SHORT_HOLD_DEADLINE_MS, SINGLE_OWNER, SERIAL_DEADLINES, HELD_SUMMARY_COUNT, SUMMARY_OPERATION, LOSS_OPERATION, POLL_INTERVAL_MS } from "./flow-ownership-ledger.js";
+const DAEMON_CASE_TIMEOUT_MS = 60_000; // Fixed case cap: 60 seconds * 1,000 milliseconds per second.
 const DAEMON_SLACK_MS = 1_000; // Observe stop after the shared stop budget.
 const MS_PER_SECOND = 1000;
 const FIXTURE_PERIOD_SECONDS = Math.ceil((DAEMON_CASE_TIMEOUT_MS + DAEMON_SLACK_MS) / MS_PER_SECOND);
 const DAEMON_SETUP_MS = 2_000; // Bound each startup and entry observation.
 const DAEMON_WAVE_MS = 1_000; // Bound each admitted head and continuation.
 const DAEMON_CLEANUP_MS = 2_000; // Bound each late settlement join.
-const SUMMARY_OPERATION = "castle_wall_flow_decisions_coalesced";
-const LOSS_OPERATION = "castle_wall_ingress_discarded";
-const SINGLE_OWNER = 1; // One caller and raw entry owner per immutable reservation.
-const SERIAL_DEADLINES = 2; // Summary then loss, with no concurrent lock acquisition.
+import { FLOW_COALESCE_MAX_RECORDS_PER_KEY } from "../../../src/castle-wall/runtime/macos-flow-coalescing.js";
+const ARRIVALS_PER_KEY = 2; // One persisted head and one counted continuation.
+const FIXTURE_KEY_COUNT = 1; // Repeated admission revisits the selected key.
 
 async function storageDaemon(mode: string, holdListener: boolean) {
-  const home = await mkdtemp(join(process.env.HOME!, "flow-stop-"));
-  const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(home, "state"));
-  const audit = new StorageAuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: SHORT_HOLD_DEADLINE_MS });
-  const producerPath = join(home, "producer");
-  if (mode === "pinned") await writeFile(producerPath, ed25519.getPublicKey(key));
-  const ledger = ownershipLedger(audit, storage, { holdMs: SHORT_HOLD_DEADLINE_MS, setupMs: DAEMON_SETUP_MS, slackMs: DAEMON_SLACK_MS, cleanupMs: DAEMON_CLEANUP_MS, operations: [SUMMARY_OPERATION, LOSS_OPERATION] });
-  const listenerStopGate = deferred(), listenerEntered = deferred();
-  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
-  let consumer!: MacOSFlowEventConsumer;
-  const handle = await startMacOSCastleWallDaemon({ fortressPath: home, fortressId: "fixture", masterKey: key, auditLog: audit,
-    platform: "darwin", daemonMode: "safe", socketPath: join(home, "fixture.sock"), activeConfigPath: join(home, "active.json"),
-    globalPinnedPublicKeyPath: join(home, "pin"), auditProducerPublicKeyPath: producerPath, auditProducerStatePath: null,
-    armLeaseHeartbeatIntervalSeconds: FIXTURE_PERIOD_SECONDS, auditHeartbeatIntervalSeconds: FIXTURE_PERIOD_SECONDS,
-    resolverLifecycleRefreshIntervalSeconds: FIXTURE_PERIOD_SECONDS, agentEgressProbeIntervalSeconds: FIXTURE_PERIOD_SECONDS,
-    emissionLivenessTickSeconds: FIXTURE_PERIOD_SECONDS,
-    agentEgressProbe: async () => true, systemResolverProvider: async () => [],
-    signerClientInvoke: async (args, data) => ({ code: 0, stderr: "", stdout: Buffer.from(args[0] === "get-pubkey" ? ed25519.getPublicKey(key) : ed25519.sign(data!, key)).toString("base64url") }),
-    listenerFactory(options) { consumer = options.consumer; return {
-      async start() {}, async stop() { listenerEntered.resolve(); if (holdListener) await listenerStopGate.promise; },
-      async broadcastManifestUpdate() { return 0; }, async broadcastDecisionResponse() { return 0; }, recycleConnection() { return false; }, async broadcastArmLease() { return 0; },
-    }; },
-  });
-  await audit.flush(); await ledger.join(); ledger.clean(0);
-  const listener = new MacOSFlowIpcListener({ socketPath: join(home, "routing.sock"), consumer });
-  const boundary = listener as unknown as { dispatchFrame(state: unknown, body: string): void; telemetryBytes: number };
-  const connection = { subscriberId: "producer", registered: false, inbound: new Uint8Array(), telemetryBytes: 0, socket: { write() { return true; }, destroy() {} } };
-  const coalescer = (consumer as unknown as { coalescer: import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").FlowCoalescer }).coalescer;
-  const classify = vi.spyOn(coalescer, "classify"), cutoff = vi.spyOn(consumer, "lapseStopBudget");
-  const admissionDrain = vi.spyOn(consumer, "drainFlowAdmission"), summaryDrain = vi.spyOn(consumer, "drainCoalescedFlowSummaries");
+  const home = await mkdtemp(join(tmpdir(), "cw-flow-stop-"));
   const pending: Promise<void>[] = [];
-  let seq = 0, prior: string | null = null;
-  const frame = () => {
-    const notification = flow();
-    if (mode === "channel") return notification;
-    const timestamp = Date.parse(notification.recorded_at);
-    const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: TOKEN, result: "blocked",
-      details: { agent_id: TOKEN, dest_ip: notification.destination.ip, dest_port: notification.destination.port, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
-    const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: timestamp, seq, prior_sha256_hex: prior,
-      signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, timestamp, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
-    seq++; prior = createHash("sha256").update(body).digest("hex"); return result;
-  };
-  const dispatch = async () => {
-    const before = classify.mock.calls.length;
-    boundary.dispatchFrame(connection, JSON.stringify({ jsonrpc: "2.0", method: "castle-wall.flow_decision_recorded", params: frame() }));
-    await vi.waitFor(() => { expect(classify.mock.calls.length).toBe(before + 1); expect(boundary.telemetryBytes).toBe(0); }, { timeout: DAEMON_WAVE_MS, interval: 1 });
-  };
-  const retry = async () => { pending.push(consumer.flushCoalescedFlowSummaries(), consumer.flushIngressDrops()); await reactionTurn(); };
-  const prepare = async (exclusive: (operations: string[]) => void) => {
-    await dispatch(); await dispatch(); expect(consumer.getStats().decisionsCoalesced).toBe(1);
-    pending.push(consumer.flushCoalescedFlowSummaries()); await ledger.deadline(SUMMARY_OPERATION, HELD_SUMMARY_COUNT);
-    expect(consumer.getCoalescingSnapshot().summary_write_failures).toBe(HELD_SUMMARY_COUNT);
-    pending.push(consumer.flushCoalescedFlowSummaries()); await reactionTurn(); exclusive([SUMMARY_OPERATION]);
-    consumer.noteIngressDrop("audit_backpressure"); await ledger.deadline(LOSS_OPERATION, SERIAL_DEADLINES);
-    await retry(); exclusive([SUMMARY_OPERATION, LOSS_OPERATION]);
-    await dispatch(); await dispatch();
-    expect(classify).toHaveBeenCalledTimes(4); // Two head/continuation pairs reach classification.
-    expect(coalescer.snapshot()).toMatchObject({ keys: 1, records: 2, coalesced_evidence_pending: 2 });
-    await retry(); exclusive([SUMMARY_OPERATION, LOSS_OPERATION]);
-    expect(ledger.payloads.filter(record => record.operation === "castle_wall_heartbeat").every(record => !record.details?.audit_write_degraded_count)).toBe(true);
-  };
-  const diagnostics = () => stderr.mock.calls.map(([line]) => String(line)).filter(line => line.includes("stop budget lapsed"));
-  return { audit, storage, ledger, consumer, cutoff, admissionDrain, summaryDrain, listenerEntered, listenerStopGate, prepare, retry, diagnostics,
-    stop: () => handle.stop(),
-    async settle() { listenerStopGate.resolve(); ledger.release(); await Promise.all(pending); await ledger.join(); },
-    async cleanup() {
-      listenerStopGate.resolve(); ledger.release(); consumer.closeFlowAdmission();
-      try { await Promise.all(pending); await handle.stop(); await ledger.join(); }
-      finally { ledger.restore(); classify.mockRestore(); cutoff.mockRestore(); admissionDrain.mockRestore(); summaryDrain.mockRestore(); stderr.mockRestore(); }
-      await rm(home, { recursive: true, force: true });
-    },
-  };
+  const restores: Array<() => void> = [];
+  let handle: Awaited<ReturnType<typeof startMacOSCastleWallDaemon>> | undefined;
+  let cleanupLedger: ReturnType<typeof ownershipLedger> | undefined;
+  let consumer: MacOSFlowEventConsumer | undefined;
+  const listenerStopGate = deferred(), listenerEntered = deferred();
+  const cleanup = async () => {
+    listenerStopGate.resolve(); cleanupLedger?.release(); consumer?.closeFlowAdmission();
+    try {
+        try { await Promise.allSettled(pending); }
+        finally { await withFixtureCleanup(async () => { await handle?.stop(); }, async () => { await cleanupLedger?.join(); }); }
+      } finally {
+        try { for (const restore of restores.reverse()) restore(); }
+        finally { await rm(home, { recursive: true, force: true }); }
+      }
+    };
+    try {
+    vi.stubEnv("HOME", home);
+    const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(home, "state"));
+    const audit = new StorageAuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: SHORT_HOLD_DEADLINE_MS });
+    const producerPath = join(home, "producer");
+    if (mode === "pinned") await writeFile(producerPath, ed25519.getPublicKey(key));
+    const ledger = ownershipLedger(audit, storage, { holdMs: SHORT_HOLD_DEADLINE_MS, setupMs: DAEMON_SETUP_MS, slackMs: DAEMON_SLACK_MS, cleanupMs: DAEMON_CLEANUP_MS, operations: [SUMMARY_OPERATION, LOSS_OPERATION] });
+    cleanupLedger = ledger; restores.push(() => ledger.restore());
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    restores.push(() => stderr.mockRestore());
+    handle = await startMacOSCastleWallDaemon({ fortressPath: home, fortressId: "fixture", masterKey: key, auditLog: audit,
+      platform: "darwin", daemonMode: "safe", socketPath: join(home, "fixture.sock"), activeConfigPath: join(home, "active.json"),
+      globalPinnedPublicKeyPath: join(home, "pin"), auditProducerPublicKeyPath: producerPath, auditProducerStatePath: null,
+      armLeaseHeartbeatIntervalSeconds: FIXTURE_PERIOD_SECONDS, auditHeartbeatIntervalSeconds: FIXTURE_PERIOD_SECONDS,
+      resolverLifecycleRefreshIntervalSeconds: FIXTURE_PERIOD_SECONDS, agentEgressProbeIntervalSeconds: FIXTURE_PERIOD_SECONDS,
+      emissionLivenessTickSeconds: FIXTURE_PERIOD_SECONDS,
+      agentEgressProbe: async () => true, systemResolverProvider: async () => [],
+      signerClientInvoke: async (args, data) => ({ code: 0, stderr: "", stdout: Buffer.from(args[0] === "get-pubkey" ? ed25519.getPublicKey(key) : ed25519.sign(data!, key)).toString("base64url") }),
+      listenerFactory(options) { consumer = options.consumer; return {
+        // Startup cleanup can stop the listener before a daemon handle is returned.
+        async start() {}, async stop() { listenerEntered.resolve(); if (holdListener && handle) await listenerStopGate.promise; },
+        async broadcastManifestUpdate() { return 0; }, async broadcastDecisionResponse() { return 0; }, recycleConnection() { return false; }, async broadcastArmLease() { return 0; },
+      }; },
+    });
+    await audit.flush(); await ledger.join(); ledger.clean(0);
+    const listener = new MacOSFlowIpcListener({ socketPath: join(home, "routing.sock"), consumer: consumer! });
+    const boundary = listener as unknown as { dispatchFrame(state: unknown, body: string): void; telemetryBytes: number };
+    const connection = { subscriberId: "producer", registered: false, inbound: new Uint8Array(), telemetryBytes: 0, socket: { write() { return true; }, destroy() {} } };
+    const coalescer = (consumer as unknown as { coalescer: import("../../../src/castle-wall/runtime/macos-flow-coalescing.js").FlowCoalescer }).coalescer;
+    const classify = vi.spyOn(coalescer, "classify"); restores.push(() => classify.mockRestore());
+    const activeConsumer = consumer!;
+    const cutoffTimes: number[] = [], lapseStopBudget = activeConsumer.lapseStopBudget.bind(activeConsumer);
+    const cutoff = vi.spyOn(activeConsumer, "lapseStopBudget").mockImplementation((...args) => {
+      cutoffTimes.push(performance.now()); return lapseStopBudget(...args);
+    });
+    restores.push(() => cutoff.mockRestore());
+    const admissionDrain = vi.spyOn(activeConsumer, "drainFlowAdmission"); restores.push(() => admissionDrain.mockRestore());
+    const summaryDrain = vi.spyOn(activeConsumer, "drainCoalescedFlowSummaries"); restores.push(() => summaryDrain.mockRestore());
+    let seq = 0, prior: string | null = null;
+    const frame = () => {
+      const notification = flow();
+      if (mode === "channel") return notification;
+      const timestamp = Date.parse(notification.recorded_at);
+      const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: TOKEN, result: "blocked",
+        details: { agent_id: TOKEN, dest_ip: notification.destination.ip, dest_port: notification.destination.port, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
+      const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: timestamp, seq, prior_sha256_hex: prior,
+        signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, timestamp, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
+      seq++; prior = createHash("sha256").update(body).digest("hex"); return result;
+    };
+    const dispatch = async () => {
+      const before = classify.mock.calls.length;
+      boundary.dispatchFrame(connection, JSON.stringify({ jsonrpc: "2.0", method: "castle-wall.flow_decision_recorded", params: frame() }));
+      await vi.waitFor(() => { expect(classify.mock.calls.length).toBe(before + 1); expect(boundary.telemetryBytes).toBe(0); }, { timeout: DAEMON_WAVE_MS, interval: POLL_INTERVAL_MS });
+    };
+    const retry = async () => { pending.push(activeConsumer.flushCoalescedFlowSummaries(), activeConsumer.flushIngressDrops()); await reactionTurn(); };
+    const prepare = async (exclusive: (operations: string[]) => void) => {
+      await dispatch(); await dispatch(); expect(activeConsumer.getStats().decisionsCoalesced).toBe(1);
+      pending.push(activeConsumer.flushCoalescedFlowSummaries()); await ledger.deadline(SUMMARY_OPERATION, HELD_SUMMARY_COUNT);
+      expect(activeConsumer.getCoalescingSnapshot().summary_write_failures).toBe(HELD_SUMMARY_COUNT);
+      pending.push(activeConsumer.flushCoalescedFlowSummaries()); await reactionTurn(); exclusive([SUMMARY_OPERATION]);
+      activeConsumer.noteIngressDrop("audit_backpressure"); await ledger.deadline(LOSS_OPERATION, SERIAL_DEADLINES);
+      await retry(); exclusive([SUMMARY_OPERATION, LOSS_OPERATION]);
+      await dispatch(); await dispatch();
+      expect(classify).toHaveBeenCalledTimes(FIXTURE_KEY_COUNT * FLOW_COALESCE_MAX_RECORDS_PER_KEY * ARRIVALS_PER_KEY);
+      expect(coalescer.snapshot()).toMatchObject({ keys: FIXTURE_KEY_COUNT, records: FIXTURE_KEY_COUNT * FLOW_COALESCE_MAX_RECORDS_PER_KEY,
+        coalesced_evidence_pending: FIXTURE_KEY_COUNT * FLOW_COALESCE_MAX_RECORDS_PER_KEY * (ARRIVALS_PER_KEY - 1) });
+      await retry(); exclusive([SUMMARY_OPERATION, LOSS_OPERATION]);
+      const firstSelected = ledger.payloads.findIndex(record => record.operation === SUMMARY_OPERATION);
+      expect(ledger.payloads.slice(firstSelected).filter(record => record.operation === "castle_wall_heartbeat"), "no heartbeat after the first selected append").toHaveLength(0);
+    };
+    const diagnostics = () => stderr.mock.calls.map(([line]) => String(line)).filter(line => line.includes("stop budget lapsed"));
+    return { audit, storage, ledger, consumer: activeConsumer, cutoff, cutoffTimes, admissionDrain, summaryDrain, listenerEntered, listenerStopGate, prepare, retry, diagnostics,
+      stop: () => handle!.stop(),
+      async settle() { listenerStopGate.resolve(); ledger.release(); await Promise.allSettled(pending); await ledger.join(); },
+      cleanup,
+    };
+  } catch (error) {
+    return withFixtureCleanup(async () => { throw error; }, cleanup);
+  }
 }
 
 it.each(["channel", "pinned"])("daemon expiry retains summary and loss attempts through late storage settlement: %s", async mode => {
@@ -465,7 +489,7 @@ it.each(["channel", "pinned"])("daemon expiry retains summary and loss attempts 
     }
     f.ledger.exclusive(operations);
   };
-  try {
+  await withFixtureCleanup(async () => {
     await f.prepare(exclusive);
     const before = f.ledger.payloads.length, pending = f.consumer.getPendingEvidenceSnapshot();
     const flushesBefore = f.ledger.auditCalls("flush"), durableBefore = f.ledger.auditCalls("flushDurable");
@@ -473,9 +497,9 @@ it.each(["channel", "pinned"])("daemon expiry retains summary and loss attempts 
     const stop = f.stop().then(() => { stopped = true; });
     expect(f.consumer.getFlowAdmissionSnapshot().closed).toBe(true);
     await f.listenerEntered.promise;
-    await vi.waitFor(() => expect(f.cutoff).toHaveBeenCalled(), { timeout: CASTLE_WALL_STOP_DEADLINE_MS + DAEMON_SLACK_MS, interval: 1 });
+    await vi.waitFor(() => expect(f.cutoff).toHaveBeenCalled(), { timeout: CASTLE_WALL_STOP_DEADLINE_MS + DAEMON_SLACK_MS, interval: POLL_INTERVAL_MS });
     await f.retry(); expect(f.ledger.payloads).toHaveLength(before); f.ledger.exclusive();
-    await vi.waitFor(() => expect(stopped).toBe(true), { timeout: CASTLE_WALL_STOP_DEADLINE_MS + DAEMON_SLACK_MS, interval: 1 });
+    await vi.waitFor(() => expect(stopped).toBe(true), { timeout: CASTLE_WALL_STOP_DEADLINE_MS + DAEMON_SLACK_MS, interval: POLL_INTERVAL_MS });
     await stop; await reactionTurn();
     const afterStop = { final: f.ledger.payloads.filter(record => record.operation === "filter_stopped").length, drains: f.admissionDrain.mock.calls.length + f.summaryDrain.mock.calls.length };
     expect(afterStop.final, "no final record after hard expiry").toBe(0);
@@ -500,7 +524,7 @@ it.each(["channel", "pinned"])("daemon expiry retains summary and loss attempts 
     const completedHistory = f.ledger.payloads.filter((_, index) => f.ledger.appendEvents[index]?.completed !== undefined);
     onTestFinished(({ task }) => { (task.meta as Record<string, unknown>).flow = { mode, entries, checkpoints, completedHistory, pending, stopMs: performance.now() - began, recoveries: f.ledger.recoveries.length,
       appendEvents: f.ledger.appendEvents, highAttempts: [...f.ledger.highAttempts], highWrites: [...f.ledger.highWrites] }; });
-  } finally { await f.cleanup(); }
+  }, f.cleanup);
 }, DAEMON_CASE_TIMEOUT_MS);
 
 it.each(["channel", "pinned"])("daemon reserve lands the final record while summary and loss attempts stay detached: %s", async mode => {
@@ -513,27 +537,33 @@ it.each(["channel", "pinned"])("daemon reserve lands the final record while summ
     }
     f.ledger.exclusive(operations);
   };
-  try {
+  await withFixtureCleanup(async () => {
     await f.prepare(exclusive);
     const before = f.ledger.payloads.length, pending = f.consumer.getPendingEvidenceSnapshot();
     const flushesBefore = f.ledger.auditCalls("flush"), durableBefore = f.ledger.auditCalls("flushDurable");
-    const began = performance.now(); let stopped = false;
-    const stop = f.stop().then(() => { stopped = true; });
+    const began = performance.now(); let stopped = false, stoppedAt: number | undefined;
+    const stop = f.stop().then(() => { stoppedAt = performance.now(); stopped = true; });
     expect(f.consumer.getFlowAdmissionSnapshot().closed).toBe(true);
     await f.listenerEntered.promise;
-    await vi.waitFor(() => expect(f.summaryDrain).toHaveBeenCalled(), { timeout: DAEMON_SETUP_MS, interval: 1 });
-    await vi.waitFor(() => expect(f.cutoff).toHaveBeenCalled(), { timeout: CASTLE_WALL_STOP_DEADLINE_MS + DAEMON_SLACK_MS, interval: 1 });
+    await vi.waitFor(() => expect(f.summaryDrain).toHaveBeenCalled(), { timeout: DAEMON_SETUP_MS, interval: POLL_INTERVAL_MS });
+    await vi.waitFor(() => expect(f.cutoff).toHaveBeenCalled(), { timeout: CASTLE_WALL_STOP_DEADLINE_MS + DAEMON_SLACK_MS, interval: POLL_INTERVAL_MS });
     await f.retry(); f.ledger.exclusive();
-    await vi.waitFor(() => expect(stopped).toBe(true), { timeout: FLOW_STOP_FINAL_RECORD_RESERVE_MS + DAEMON_SLACK_MS, interval: 1 });
+    await vi.waitFor(() => expect(stopped).toBe(true), { timeout: FLOW_STOP_FINAL_RECORD_RESERVE_MS + DAEMON_SLACK_MS, interval: POLL_INTERVAL_MS });
     await stop;
-    const elapsed = performance.now() - began;
-    expect(elapsed).toBeGreaterThanOrEqual(CASTLE_WALL_STOP_DEADLINE_MS - FLOW_STOP_FINAL_RECORD_RESERVE_MS);
-    expect(elapsed).toBeLessThan(CASTLE_WALL_STOP_DEADLINE_MS);
-    expect(await f.ledger.completedCalls("flush", flushesBefore)).toBe(1);
-    const finalEvent = f.ledger.appendEvents.find(event => event.operation === "filter_stopped")!;
-    expect(finalEvent.started).toBeLessThanOrEqual(finalEvent.completed!);
-    expect(finalEvent.completed).toBeDefined();
-    expect(finalEvent.completed! - began).toBeLessThan(CASTLE_WALL_STOP_DEADLINE_MS);
+    const finalEvent = f.ledger.appendEvents.find(event => event.operation === "filter_stopped");
+    expect(finalEvent, "final record is present").toBeDefined();
+    expect(f.cutoffTimes[0], "production cutoff was observed").toBeDefined();
+    expect(finalEvent!.started, "final append starts after the production cutoff").toBeGreaterThanOrEqual(f.cutoffTimes[0]!);
+    expect(finalEvent!.completed, "final append completed").toBeDefined();
+    expect(finalEvent!.started).toBeLessThanOrEqual(finalEvent!.completed!);
+    expect(finalEvent!.completed!, "final append completed before stop deadline").toBeLessThan(began + CASTLE_WALL_STOP_DEADLINE_MS);
+    const finalFlushes = f.ledger.flushEvents.slice(flushesBefore);
+    expect(finalFlushes, "one final flush").toHaveLength(1);
+    const finalFlush = finalFlushes[0]!;
+    expect(finalFlush.started, "final flush follows final append").toBeGreaterThanOrEqual(finalEvent!.completed!);
+    expect(finalFlush.completed, "final flush settled before stop resolved").toBeDefined();
+    expect(finalFlush.completed!, "final flush settled before stop resolved").toBeLessThanOrEqual(stoppedAt!);
+    expect(finalFlush.completed!, "final flush settled before stop deadline").toBeLessThan(began + CASTLE_WALL_STOP_DEADLINE_MS);
     const final = f.ledger.payloads.slice(before);
     expect(final).toHaveLength(1); expect(final[0]!.operation).toBe("filter_stopped");
     expect(final[0]!.details?.audit_write_degraded_count).toBe(SERIAL_DEADLINES);
@@ -554,6 +584,6 @@ it.each(["channel", "pinned"])("daemon reserve lands the final record while summ
     const checkpoints = (await f.storage.list("_audit_checkpoints")).filter(entry => entry.key.startsWith("audit-checkpoint-")).length;
     const completedHistory = f.ledger.payloads.filter((_, index) => f.ledger.appendEvents[index]?.completed !== undefined);
     onTestFinished(({ task }) => { (task.meta as Record<string, unknown>).flow = { mode, entries, checkpoints, completedHistory, pending, stopMs: performance.now() - began, recoveries: f.ledger.recoveries.length,
-      appendEvents: f.ledger.appendEvents, highAttempts: [...f.ledger.highAttempts], highWrites: [...f.ledger.highWrites] }; });
-  } finally { await f.cleanup(); }
+      appendEvents: f.ledger.appendEvents, flushEvents: f.ledger.flushEvents, stoppedAt, cutoffTimes: f.cutoffTimes, highAttempts: [...f.ledger.highAttempts], highWrites: [...f.ledger.highWrites] }; });
+  }, f.cleanup);
 }, DAEMON_CASE_TIMEOUT_MS);

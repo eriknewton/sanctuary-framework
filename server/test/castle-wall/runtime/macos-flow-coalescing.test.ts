@@ -653,69 +653,81 @@ it.each(["channel", "pinned"] as const)("detached %s storage settlement preserve
   }
 });
 
-const SINGLE_OWNER = 1; // One writer owns each immutable reservation until caller and storage settle.
 // Real lock hold. The selected attempts are held past it; every healthy primary and retry also runs under it, so one second
 // leaves scheduling headroom for those on a loaded CI runner. Setup and cleanup have separate timeout headroom.
 const HOLD_DEADLINE_MS = 1_000;
-const SERIAL_DEADLINES = 2; // Summary and loss expire independently, in that order.
 const SETUP_TIMEOUT_MS = HOLD_DEADLINE_MS * 10; // Filesystem setup and recovery polling have ten hold intervals (ten seconds, as before).
 const OWNER_TIMEOUT_MS = SETUP_TIMEOUT_MS * 3 + SERIAL_DEADLINES * HOLD_DEADLINE_MS; // Setup, schedule and cleanup plus both deadlines.
 const WRITES_PER_HELD_RESERVATION = SINGLE_OWNER + 1; // The held original plus one sequential retry after release.
 const HELD_LOSS_PAYLOADS = 1; // The first loss payload is the held, failed attempt.
-const SUMMARY_OPERATION = "castle_wall_flow_decisions_coalesced";
-const LOSS_OPERATION = "castle_wall_ingress_discarded";
-import { ownershipLedger, reactionTurn, WAVES_HOLD_DEADLINE_MS, SHORT_HOLD_DEADLINE_MS, type LedgerPolicy } from "./flow-ownership-ledger.js";
+import { ownershipLedger, reactionTurn, withFixtureCleanup, WAVES_HOLD_DEADLINE_MS, SHORT_HOLD_DEADLINE_MS, SINGLE_OWNER, SERIAL_DEADLINES, HELD_SUMMARY_COUNT, SUMMARY_OPERATION, LOSS_OPERATION, POLL_INTERVAL_MS, type LedgerPolicy } from "./flow-ownership-ledger.js";
 
 async function ownedFixture(mode: string, policy: LedgerPolicy = { holdMs: HOLD_DEADLINE_MS, setupMs: SETUP_TIMEOUT_MS, slackMs: SETUP_TIMEOUT_MS - HOLD_DEADLINE_MS, cleanupMs: SETUP_TIMEOUT_MS, operations: [SUMMARY_OPERATION, LOSS_OPERATION] }) {
   const root = await mkdtemp("/tmp/cw-exclusive-");
-  const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(root, "state"));
-  const audit = new AuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: policy.holdMs });
-  const f = fixture({ append: (...args) => audit.append(...args), flush: () => audit.flushDurable() }, mode === "pinned" ? Buffer.from(ed25519.getPublicKey(key)).toString("base64url") : undefined);
-  const listener = new MacOSFlowIpcListener({ socketPath: join(root, "unused.sock"), consumer: f.consumer });
-  const boundary = listener as unknown as { dispatchFrame(state: unknown, body: string): void; removeConnection(state: unknown): void; telemetryBytes: number };
-  const connection = (id: string) => ({ subscriberId: id, registered: false, inbound: new Uint8Array(), telemetryBytes: 0, socket: { write() { return true; }, destroy() {} } });
-  let seq = 0, prior: string | null = null;
-  const arrival = (ip = "192.0.2.1") => {
-    const notification = f.frame(ip);
-    if (mode === "channel") return notification;
-    const timestamp = Date.parse(notification.recorded_at);
-    const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: token, result: "blocked",
-      details: { agent_id: token, dest_ip: ip, dest_port: notification.destination.port, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
-    const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: timestamp, seq, prior_sha256_hex: prior,
-      signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, timestamp, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
-    seq++; prior = createHash("sha256").update(body).digest("hex"); return result;
+  const restores: Array<() => void> = [];
+  let settle = async () => {};
+  const cleanup = async () => {
+    try { await settle(); }
+    finally {
+      try { for (const restore of restores.reverse()) restore(); }
+      finally { await rm(root, { recursive: true, force: true }); }
+    }
   };
-  const ledger = ownershipLedger(audit, storage, policy);
-  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
-  const module = await load(); expect(module).not.toBeNull();
-  const internals = f.consumer as unknown as { coalescer: InstanceType<NonNullable<typeof module>["FlowCoalescer"]> };
-  const classify = vi.spyOn(internals.coalescer, "classify");
-  const frame = (ip?: string) => JSON.stringify({ jsonrpc: "2.0", method: "castle-wall.flow_decision_recorded", params: arrival(ip) });
-  const origin = connection("settled");
-  const dispatchSettled = async (ip?: string) => {
-    const count = classify.mock.calls.length;
-    boundary.dispatchFrame(origin, frame(ip));
-    await vi.waitFor(() => { expect(classify.mock.calls.length).toBe(count + 1); expect(boundary.telemetryBytes).toBe(0); }, { timeout: policy.setupMs, interval: 1 }); // One millisecond polling only joins real I/O.
-  };
-  return { ...f, root, audit, storage, ledger, listener, boundary, connection, arrival, frame, origin, classify, internals, module: module!, dispatchSettled,
-    async cleanup() {
+  try {
+    const key = ed25519.utils.randomPrivateKey(), storage = new FilesystemStorage(join(root, "state"));
+    const audit = new AuditLog(storage, key, { checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: policy.holdMs });
+    const f = fixture({ append: (...args) => audit.append(...args), flush: () => audit.flushDurable() }, mode === "pinned" ? Buffer.from(ed25519.getPublicKey(key)).toString("base64url") : undefined);
+    const listener = new MacOSFlowIpcListener({ socketPath: join(root, "unused.sock"), consumer: f.consumer });
+    const boundary = listener as unknown as { dispatchFrame(state: unknown, body: string): void; removeConnection(state: unknown): void; telemetryBytes: number };
+    const connection = (id: string) => ({ subscriberId: id, registered: false, inbound: new Uint8Array(), telemetryBytes: 0, socket: { write() { return true; }, destroy() {} } });
+    let seq = 0, prior: string | null = null;
+    const arrival = (ip = "192.0.2.1") => {
+      const notification = f.frame(ip);
+      if (mode === "channel") return notification;
+      const timestamp = Date.parse(notification.recorded_at);
+      const body = canonicalize({ timestamp: notification.recorded_at, layer: "l1", operation: "egress_blocked", identity_id: token, result: "blocked",
+        details: { agent_id: token, dest_ip: ip, dest_port: notification.destination.port, dest_protocol: "tcp", decision: "drop", seq, prior_sha256_hex: prior } });
+      const result = { ...notification, producer: { event_canonical_json: body, captured_at_unix_ms: timestamp, seq, prior_sha256_hex: prior,
+        signature_b64url: Buffer.from(ed25519.sign(producerSigningBytes(body, timestamp, seq), key)).toString("base64url"), key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 } };
+      seq++; prior = createHash("sha256").update(body).digest("hex"); return result;
+    };
+    const ledger = ownershipLedger(audit, storage, policy);
+    restores.push(() => ledger.restore());
+    settle = async () => {
       const expectedRecoveries = ledger.recoveries.length;
       ledger.release(); f.consumer.closeFlowAdmission();
-      try {
-        await ledger.join(); await f.consumer.drainFlowAdmission(); await f.consumer.drainCoalescedFlowSummaries();
+      await withFixtureCleanup(async () => { await ledger.join(); }, async () => {
+        await f.consumer.drainFlowAdmission(); await f.consumer.drainCoalescedFlowSummaries();
         await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.drainIngressDrops();
         await audit.flush(); await ledger.join(); ledger.clean(expectedRecoveries);
         expect(f.consumer.getCoalescingSnapshot().coalesced_evidence_pending).toBe(0);
-      } finally { ledger.restore(); classify.mockRestore(); stderr.mockRestore(); }
-      await rm(root, { recursive: true, force: true });
-    } };
+      });
+    };
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    restores.push(() => stderr.mockRestore());
+    const module = await load(); expect(module).not.toBeNull();
+    const internals = f.consumer as unknown as { coalescer: InstanceType<NonNullable<typeof module>["FlowCoalescer"]> };
+    const classify = vi.spyOn(internals.coalescer, "classify");
+    restores.push(() => classify.mockRestore());
+    const frame = (ip?: string) => JSON.stringify({ jsonrpc: "2.0", method: "castle-wall.flow_decision_recorded", params: arrival(ip) });
+    const origin = connection("settled");
+    const dispatchSettled = async (ip?: string, budget = policy.setupMs) => {
+      const count = classify.mock.calls.length;
+      boundary.dispatchFrame(origin, frame(ip));
+      await vi.waitFor(() => { expect(classify.mock.calls.length).toBe(count + 1); expect(boundary.telemetryBytes).toBe(0); }, { timeout: budget, interval: POLL_INTERVAL_MS });
+    };
+    return { ...f, root, audit, storage, ledger, listener, boundary, connection, arrival, frame, origin, classify, internals, module: module!, dispatchSettled,
+      cleanup };
+  } catch (error) {
+    return withFixtureCleanup(async () => { throw error; }, cleanup);
+  }
 }
 
 it.each(["channel", "pinned"])("exclusive summary and loss attempts survive storage deadlines: %s", async mode => {
   const f = await ownedFixture(mode); let summary: Promise<void> | undefined;
   const retriesStarted: Promise<void>[] = [];
   const retrySummary = () => { retriesStarted.push(f.consumer.flushCoalescedFlowSummaries()); };
-  try {
+  await withFixtureCleanup(async () => {
     await f.dispatchSettled(); await f.dispatchSettled();
     expect(f.consumer.getStats().decisionsCoalesced).toBe(1);
     summary = f.consumer.flushCoalescedFlowSummaries();
@@ -746,16 +758,18 @@ it.each(["channel", "pinned"])("exclusive summary and loss attempts survive stor
     expect(f.ledger.recoveries).toHaveLength(SERIAL_DEADLINES);
     const before = f.ledger.payloads.length; await f.consumer.flushCoalescedFlowSummaries(); await f.consumer.flushIngressDrops();
     expect(f.ledger.payloads).toHaveLength(before);
-  } finally { f.ledger.release(); await summary; await Promise.all(retriesStarted); await f.cleanup(); }
+  }, async () => {
+    f.ledger.release();
+    await withFixtureCleanup(async () => { await Promise.allSettled([summary, ...retriesStarted]); }, f.cleanup);
+  });
 }, OWNER_TIMEOUT_MS);
 
-const HELD_SUMMARY_COUNT = 1; // One selected summary supplies the first recovery and summary failure.
 const HELD_PRIMARY_COUNT = 1; // One selected primary supplies the pressure schedule's recovery and failed delivery.
 const WAVES_WORK_MS = 30_000; // Bound one admission wait during the repeated windows.
 const WAVES_SETUP_MS = 5_000; // Bound each initial admission and selected entry wait.
 const WAVES_CLEANUP_MS = 20_000; // Bound each final persistence wait.
 const WAVES_SLACK_MS = 5_000; // Observe a selected caller after its hold expires.
-const WAVES_CASE_TIMEOUT_MS = 240_000; // Two full holds plus admitted windows and final persistence.
+const WAVES_CASE_TIMEOUT_MS = 240_000; // Fixed case cap: 240 seconds * 1,000 milliseconds per second.
 const WAVE_COUNT = 3; // Reopen every retained key three times.
 
 it.each(["channel", "pinned"])("admitted waves reach every retained key while storage remains detached: %s", async mode => {
@@ -771,7 +785,7 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
     let finished = false, failure: unknown;
     started.push(promise);
     void promise.then(() => { finished = true; }, error => { failure = error; finished = true; });
-    await vi.waitFor(() => expect(finished).toBe(true), { timeout: budget, interval: 1 });
+    await vi.waitFor(() => expect(finished).toBe(true), { timeout: budget, interval: POLL_INTERVAL_MS });
     if (failure) throw failure;
   };
   const retry = async () => {
@@ -780,7 +794,7 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
     started.push(f.consumer.flushIngressDrops());
     await reactionTurn(); f.ledger.exclusive();
   };
-  try {
+  await withFixtureCleanup(async () => {
     for (let key = 0; key < keyCount; key++) for (let arrival = 0; arrival < arrivalsPerKey; arrival++) await f.dispatchSettled(destination(key));
     expect(f.classify).toHaveBeenCalledTimes(keyCount * arrivalsPerKey);
     expect(f.internals.coalescer.snapshot().keys, "retained key occupancy").toBe(keyCount);
@@ -795,10 +809,9 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
     const before = f.internals.coalescer.snapshot(), classifiedBefore = f.classify.mock.calls.length;
     const lossBefore = f.consumer.getIngressLossSnapshot().counts.audit_backpressure;
     const wavesBegan = performance.now();
-    policy.setupMs = WAVES_WORK_MS;
     for (let wave = 0; wave < WAVE_COUNT; wave++) {
-      for (let key = 0; key < keyCount; key++) for (let arrival = 0; arrival < arrivalsPerKey; arrival++) await f.dispatchSettled(destination(key));
-      await f.dispatchSettled(destination(keyCount + wave));
+      for (let key = 0; key < keyCount; key++) for (let arrival = 0; arrival < arrivalsPerKey; arrival++) await f.dispatchSettled(destination(key), WAVES_WORK_MS);
+      await f.dispatchSettled(destination(keyCount + wave), WAVES_WORK_MS);
       const completedWaves = wave + 1, expectedFrames = completedWaves * (keyCount * arrivalsPerKey + 1);
       const snapshot = f.internals.coalescer.snapshot();
       expect(f.classify.mock.calls.length - classifiedBefore, "every dispatched frame reaches classification").toBe(expectedFrames);
@@ -817,6 +830,7 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
     const retained = f.internals.coalescer.snapshot(), wavesMs = performance.now() - wavesBegan;
     const cleanupBegan = performance.now();
     const pending = f.consumer.getCoalescingSnapshot().coalesced_evidence_pending;
+    const losses = f.consumer.getIngressLossSnapshot().counts.audit_backpressure;
     f.ledger.release(); await bounded(Promise.all(started).then(() => undefined), WAVES_CLEANUP_MS); await f.ledger.join();
     // Each pass retires one reserved record per key before the next mutable record is reserved.
     for (let pass = 0; pass < f.module.FLOW_COALESCE_MAX_RECORDS_PER_KEY; pass++) await bounded(f.consumer.flushCoalescedFlowSummaries(), WAVES_CLEANUP_MS);
@@ -826,6 +840,11 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
     expect(snapshot.coalesced_evidence_pending).toBe(0);
     expect(snapshot.coalesced_evidence_confirmed).toBe(pending);
     expect(snapshot.coalesced_evidence_pending + snapshot.coalesced_evidence_confirmed).toBe(f.consumer.getStats().coalesced);
+    const pendingLosses = f.consumer.getIngressLossSnapshot().counts.audit_backpressure;
+    expect(pendingLosses).toBe(0);
+    const confirmedLosses = f.ledger.payloads.filter(record => record.operation === LOSS_OPERATION).slice(HELD_LOSS_PAYLOADS)
+      .reduce((sum, record) => sum + (record.details!.counts as Record<string, number>).audit_backpressure!, 0);
+    expect(confirmedLosses + pendingLosses, "loss conservation").toBe(losses);
     for (const id of f.ledger.selected.values()) expect(f.ledger.totalPhysicalWrites.get(id)).toBe(WRITES_PER_HELD_RESERVATION);
     const entries = (await f.storage.list("_audit")).filter(entry => entry.key.startsWith("entry-"));
     const checkpoints = (await f.storage.list("_audit_checkpoints")).filter(entry => entry.key.startsWith("audit-checkpoint-"));
@@ -834,14 +853,13 @@ it.each(["channel", "pinned"])("admitted waves reach every retained key while st
     onTestFinished(({ task }) => { (task.meta as Record<string, unknown>).flow = { mode, retained, entries: entries.length, checkpoints: checkpoints.length, setupMs, wavesMs,
       cleanupMs: performance.now() - cleanupBegan, holds: f.ledger.appendEvents.filter(event => event.failed !== undefined), recoveries: f.ledger.recoveries.length,
       highAttempts: [...f.ledger.highAttempts], highWrites: [...f.ledger.highWrites] }; });
-  } finally {
+  }, async () => {
     f.ledger.release(); f.consumer.closeFlowAdmission();
-    await Promise.all(started); await f.ledger.join();
-    await f.cleanup();
-  }
+    await withFixtureCleanup(async () => { await Promise.allSettled(started); await f.ledger.join(); }, f.cleanup);
+  });
 }, WAVES_CASE_TIMEOUT_MS);
 
-const PRESSURE_CASE_TIMEOUT_MS = 10_000; // One selected hold plus bounded admission and final persistence.
+const PRESSURE_CASE_TIMEOUT_MS = 10_000; // Fixed case cap: 10 seconds * 1,000 milliseconds per second.
 const SMALL_SETUP_MS = 2_000; // Bound each setup operation.
 const SMALL_WORK_MS = 2_000; // Bound each admission observation.
 const SMALL_CLEANUP_MS = 3_000; // Bound each cleanup operation.
@@ -856,6 +874,7 @@ const PRESSURE_PADDING_CHARACTERS = Math.floor(PRESSURE_CONNECTION_BYTES / (2 * 
 it.each(["channel", "pinned"])("listener pressure retains bounded charges through disconnect and stop: %s", async mode => {
   let selected = false;
   const f = await ownedFixture(mode, { holdMs: SHORT_HOLD_DEADLINE_MS, setupMs: SMALL_SETUP_MS, slackMs: SMALL_SLACK_MS, cleanupMs: SMALL_CLEANUP_MS,
+    // Only one primary enters while selected; queued arrivals are closed before that primary settles.
     operations: ["egress_blocked"], select: () => selected });
   const drops = vi.spyOn(f.consumer, "noteFlowIngressDrop");
   const first = f.connection("first");
@@ -863,7 +882,7 @@ it.each(["channel", "pinned"])("listener pressure retains bounded charges throug
   const frame = () => f.frame("192.0.2.2") + " ".repeat(PRESSURE_PADDING_CHARACTERS);
   let injected = 0, refused = 0;
   const dispatch = (connection: ReturnType<typeof f.connection>, body: string) => { injected++; f.boundary.dispatchFrame(connection, body); };
-  try {
+  await withFixtureCleanup(async () => {
     await f.dispatchSettled(); await f.dispatchSettled();
     expect(f.consumer.getStats().decisionsCoalesced).toBe(1);
     await f.consumer.flushCoalescedFlowSummaries(); await f.audit.flush();
@@ -884,7 +903,9 @@ it.each(["channel", "pinned"])("listener pressure retains bounded charges throug
     expect(firstRefusal.rejected, "connection refusal").toBe(1);
     expect(firstRefusal.charge, "connection charge unchanged").toBe(connectionCharge);
     expect(first.telemetryBytes).toBeLessThanOrEqual(PRESSURE_CONNECTION_BYTES);
+    const globalChargeAtDisconnect = f.boundary.telemetryBytes;
     f.boundary.removeConnection(first);
+    expect(f.boundary.telemetryBytes, "global charge retained at disconnect").toBe(globalChargeAtDisconnect);
     expect(first.telemetryBytes).toBe(connectionCharge); f.ledger.exclusive(["egress_blocked"]);
     next = frame();
     while (f.boundary.telemetryBytes + charge(next) <= PRESSURE_GLOBAL_BYTES) {
@@ -900,7 +921,7 @@ it.each(["channel", "pinned"])("listener pressure retains bounded charges throug
     expect(f.listener.getStats().framesRejected - rejectedBefore).toBe(refused);
     expect(f.boundary.telemetryBytes).toBe(retained); expect(retained).toBeLessThanOrEqual(PRESSURE_GLOBAL_BYTES);
     await f.listener.stop();
-    await vi.waitFor(() => { expect(f.consumer.getFlowAdmissionSnapshot().unadmitted).toBe(0); expect(f.boundary.telemetryBytes).toBe(primaryCharge); }, { timeout: SMALL_WORK_MS, interval: 1 });
+    await vi.waitFor(() => { expect(f.consumer.getFlowAdmissionSnapshot().unadmitted).toBe(0); expect(f.boundary.telemetryBytes).toBe(primaryCharge); }, { timeout: SMALL_WORK_MS, interval: POLL_INTERVAL_MS });
     f.ledger.exclusive(["egress_blocked"]);
     next = frame(); expect(f.boundary.telemetryBytes + charge(next)).toBeLessThan(PRESSURE_GLOBAL_BYTES);
     const shutdownBefore = f.consumer.getStats().delivery_unconfirmed_or_discarded;
@@ -908,7 +929,7 @@ it.each(["channel", "pinned"])("listener pressure retains bounded charges throug
     expect(f.consumer.getFlowAdmissionSnapshot().closed).toBe(true);
     expect(f.consumer.getStats().delivery_unconfirmed_or_discarded).toBe(shutdownBefore + 1);
     f.ledger.release(); await f.consumer.drainFlowAdmission(); await f.consumer.drainIngressDrops(); await f.ledger.join();
-    await vi.waitFor(() => expect(f.boundary.telemetryBytes).toBe(0), { timeout: SMALL_CLEANUP_MS, interval: 1 });
+    await vi.waitFor(() => expect(f.boundary.telemetryBytes).toBe(0), { timeout: SMALL_CLEANUP_MS, interval: POLL_INTERVAL_MS });
     await f.audit.flush(); await f.ledger.join();
     const losses = (await f.audit.query({ layer: "l1" })).entries.filter(entry => entry.operation === LOSS_OPERATION);
     const total = (reason: "audit_backpressure" | "audit_persist_failed" | "flow_shutdown") => losses.reduce((sum, entry) => sum + Number((entry.details?.counts as Record<string, number>)?.[reason] ?? 0), 0) + f.consumer.getIngressLossSnapshot().counts[reason];
@@ -922,5 +943,10 @@ it.each(["channel", "pinned"])("listener pressure retains bounded charges throug
     const completedHistory = f.ledger.payloads.filter((_, index) => f.ledger.appendEvents[index]?.completed !== undefined);
     onTestFinished(({ task }) => { (task.meta as Record<string, unknown>).flow = { mode, injected, refused, connectionCharge, retained, entries: entryPopulation, checkpoints: checkpointPopulation, completedHistory,
       recoveries: f.ledger.recoveries.length, finalCharge: f.boundary.telemetryBytes }; });
-  } finally { f.ledger.release(); f.consumer.closeFlowAdmission(); await f.consumer.drainFlowAdmission(); await f.ledger.join(); drops.mockRestore(); await f.cleanup(); }
+  }, async () => {
+    f.ledger.release(); f.consumer.closeFlowAdmission();
+    await withFixtureCleanup(async () => { await f.consumer.drainFlowAdmission(); await f.ledger.join(); }, async () => {
+      try { await f.cleanup(); } finally { drops.mockRestore(); }
+    });
+  });
 }, PRESSURE_CASE_TIMEOUT_MS);
