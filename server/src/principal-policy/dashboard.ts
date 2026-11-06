@@ -58,7 +58,7 @@ import type {
 } from "../operational/audit-log.js";
 import { AuditIntegrityError } from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
-import { protectionRuntimeUnavailable, type ProtectionRuntimeSources } from "../agent-native/protection-observations.js";
+import type { ProtectionRuntimeSources } from "../agent-native/protection-observations.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import type { SignedSHR } from "../shr/types.js";
@@ -1081,7 +1081,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private currentSessionBinding: ProtectionRuntimeSources["currentSessionBinding"];
   // Must match ProtectionRuntimeProvider in protection-observations.ts: resolve current objects on every use.
   private protectionRuntime = (): ProtectionRuntimeSources => ({
-    ...protectionRuntimeUnavailable,
     identityManager: this.identityManager,
     stateStore: this.stateStore,
     responseScreen: this.responseScreen,

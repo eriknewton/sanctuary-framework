@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only reorders a clock freeze in an existing test so its audit entry is never timestamped after the frozen now; the source under test is unchanged, so the test passes against pre-change source by construction.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -136,9 +137,10 @@ describe("protection layers", () => {
     const { createPosturePanelStore } = await import("../../src/principal-policy/panel-producer.js");
     const { createDashboardReadFlightMap } = await import("../../src/dashboard/read-response.js");
     const { auditLog, binding, primitives, stateStore } = await setup();
-    vi.spyOn(Date, "now").mockReturnValue(Date.now());
     await auditLog.appendCritical({ layer: "l2", operation: "cross_harness_approval_resolved",
       identity_id: binding!.identity_id!, result: "success", details: {} });
+    // Freeze the clock after the append: feature health skips entries timestamped past now.
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
     const home = await buildHome({ auditLog, originMachine: "test", listAgents: () => [],
       detectInstalledHarnesses: async () => [], resolvePinnedProducerKey: () => null,
       resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(),
