@@ -823,6 +823,15 @@ async function startHostedOptionalPanelDashboard(): Promise<{
   authToken: string;
   baseUrl: string;
 }> {
+  // A random port can collide under parallel suites; each retry builds a fresh channel on a fresh port.
+  return bindWithRetry(startHostedOptionalPanelDashboardOnce);
+}
+
+async function startHostedOptionalPanelDashboardOnce(): Promise<{
+  dashboard: DashboardApprovalChannel;
+  authToken: string;
+  baseUrl: string;
+}> {
   const authToken = "hosted-optional-panel-token";
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
@@ -914,7 +923,13 @@ async function startHostedOptionalPanelDashboard(): Promise<{
     }),
   });
 
-  await dashboard.start();
+  try {
+    await dashboard.start();
+  } catch (error) {
+    // bindWithRetry requires a failed attempt to leave no listener behind before the next port is tried.
+    await dashboard.stop().catch(() => undefined);
+    throw error;
+  }
   return {
     dashboard,
     authToken,
