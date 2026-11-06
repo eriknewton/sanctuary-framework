@@ -13,8 +13,9 @@ export function createCustodySessionTracker() {
       const results = await Promise.allSettled([...sessions].map(async session => {
         try {
           await session.masterWriteBarrier?.release();
-          sessions.delete(session);
         } finally {
+          // A rejected close belongs to this teardown and must not recur in later tests.
+          sessions.delete(session);
           session.masterKey.fill(0);
         }
       }));
