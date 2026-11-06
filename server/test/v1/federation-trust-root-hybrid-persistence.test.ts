@@ -26,7 +26,7 @@
  * mint + persist + load path is exercised end to end.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 
@@ -49,13 +49,18 @@ import {
   type FederationTrustRootRecord,
 } from "../../src/mesh/federation-trust-root-store.js";
 import { verifyCertChainV2Hybrid } from "../../src/mesh/trust-root-hybrid.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+
+const custodySessions = createCustodySessionTracker();
+
+afterEach(() => custodySessions.release());
 
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
-  const { masterKey } = await establishMaster({
+  const { masterKey } = custodySessions.track(await establishMaster({
     storage,
     passphrase: `pqc3-${randomBytes(6).toString("hex")}`,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
+  }));
   return masterKey;
 }
 

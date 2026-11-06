@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
-
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -40,27 +39,28 @@ import {
 } from "../../src/v1/federation-client.js";
 import type { FederationContext, FederationEvent } from "../../src/v1/federation.js";
 import { OPERATOR, stubIdentityManager } from "./rig.js";
-
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+const custodySessions = createCustodySessionTracker();
 interface TestDaemon {
   dashboard: DashboardApprovalChannel;
   baseUrl: string;
   auditLog: AuditLog;
   stop(): Promise<void>;
 }
-
 const running: TestDaemon[] = [];
-
 afterEach(async () => {
-  while (running.length > 0) {
-    await running.pop()!.stop();
+  try {
+    while (running.length > 0) {
+      await running.pop()!.stop();
+    }
+  } finally {
+    await custodySessions.release();
   }
 });
-
 describe("FederationTrustRootStore", () => {
   it("does not mint without the explicit mint flag", async () => {
     const storage = new MemoryStorage();
     const masterKey = await testMasterKey(storage);
-
     const loaded = await provisionOrLoadFederationTrustRoot({
       storage,
       masterKey,
@@ -269,11 +269,11 @@ describe("FederationTrustRootStore", () => {
 });
 
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
-  const { masterKey } = await establishMaster({
+  const { masterKey } = custodySessions.track(await establishMaster({
     storage,
     passphrase: `slice1-${randomBytes(6).toString("hex")}`,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
+  }));
   return masterKey;
 }
 

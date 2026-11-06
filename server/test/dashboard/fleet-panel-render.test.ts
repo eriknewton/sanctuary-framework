@@ -20,9 +20,7 @@
  *     - PRESENCE: with a provider wired to a REAL provisioned roster, the route
  *       serves `available:true` with the real rows the panel renders.
  */
-
 import { afterEach, describe, expect, it } from "vitest";
-
 import {
   renderPostureHomeHTML,
 } from "../../src/principal-policy/posture-home-html.js";
@@ -35,10 +33,10 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { randomBytes } from "node:crypto";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
-
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+const custodySessions = createCustodySessionTracker();
 describe("wrap dashboard fleet panel - read-only markup", () => {
   const html = renderPostureHomeHTML();
-
   it("renders the fleet panel and reuses the SHARED posture tokens (single :root)", () => {
     // The panel exists and fetches the read-only posture fleet route.
     expect(html).toContain('id="fleet-section"');
@@ -50,7 +48,6 @@ describe("wrap dashboard fleet panel - read-only markup", () => {
     const rootBlocks = html.split(":root {").length - 1;
     expect(rootBlocks).toBe(1);
   });
-
   it("uses SEE / MONITOR copy, not manage", () => {
     // Scope to the fleet section's documentation + heading region.
     const seeMonitor = /SEE\s*\/\s*MONITOR only/i.test(html);
@@ -58,7 +55,6 @@ describe("wrap dashboard fleet panel - read-only markup", () => {
     // The panel must not describe itself as a management surface.
     expect(/manage (the |your )?fleet/i.test(html)).toBe(false);
   });
-
   it("exposes NO mutation controls in the fleet panel (view-only)", () => {
     // Isolate the fleet section markup so an admit/revoke control elsewhere on
     // the page (there are none today, but be precise) cannot mask a regression.
@@ -83,11 +79,11 @@ describe("wrap dashboard fleet panel - read-only markup", () => {
 
 async function testAuditLog(): Promise<AuditLog> {
   const storage = new MemoryStorage();
-  const { masterKey } = await establishMaster({
+  const { masterKey } = custodySessions.track(await establishMaster({
     storage,
     passphrase: `fleet-panel-${randomBytes(6).toString("hex")}`,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
+  }));
   return new AuditLog(storage, masterKey);
 }
 
@@ -160,9 +156,13 @@ describe("wrap dashboard fleet panel - end-to-end /api/posture/fleet", () => {
   let handle: DashboardHandle | null = null;
 
   afterEach(async () => {
-    if (handle) {
-      await handle.stop();
-      handle = null;
+    try {
+      if (handle) {
+        await handle.stop();
+        handle = null;
+      }
+    } finally {
+      await custodySessions.release();
     }
   });
 

@@ -9,7 +9,7 @@
  * finding-free (or loud-correct) load, never wrongly-TAMPERED and never
  * silently-clean-on-tamper.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import type { AuditIntegrityFinding } from "../../src/operational/audit-log.js";
@@ -29,17 +29,22 @@ import {
   findingsOfKind,
   seedStoredIdentity,
 } from "../helpers/signing-fixture.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+
+const custodySessions = createCustodySessionTracker();
+
+afterEach(() => custodySessions.release());
 
 const PASSPHRASE = "ic05dg-rotation-passphrase";
 const FORTRESS_ID = "fortress-ic05dg-rotation";
 
 async function buildArmedFortress() {
   const storage = new MemoryStorage();
-  const est = await establishMaster({
+  const est = custodySessions.track(await establishMaster({
     storage,
     passphrase: PASSPHRASE,
     firstRun: { installMode: "interactive", mintRecoveryKey: true },
-  });
+  }));
   const master = est.masterKey;
   const { storedIdentity } = await seedStoredIdentity(storage, master);
   const writer = new AuditLog(storage, master, { checkpointInterval: 1 });
@@ -97,7 +102,7 @@ describe("IC-05-DG §f-12: rotation schedule", () => {
     );
 
     await rotateMaster(rotateOpts(storage));
-    const est = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage, passphrase: PASSPHRASE }));
     const newMaster = est.masterKey;
 
     // Both records now authenticate under the NEW master: same incident
@@ -189,7 +194,7 @@ describe("IC-05-DG §f-12: rotation schedule", () => {
       });
       expect(resumed.rotation_id).toBeTruthy();
 
-      const est = await establishMaster({ storage, passphrase: PASSPHRASE });
+      const est = custodySessions.track(await establishMaster({ storage, passphrase: PASSPHRASE }));
       const findings = await lenientSigningFindings(storage, est.masterKey);
       // Finding-free except the incident evidence this fixture carries on
       // purpose: never wrongly-TAMPERED, never a recovery (nothing lost),

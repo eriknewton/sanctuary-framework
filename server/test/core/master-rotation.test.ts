@@ -11,7 +11,7 @@
  * wraps only under the other.
  */
 
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,6 +141,11 @@ import {
 } from "../../src/core/config-baseline.js";
 import { defaultConfig } from "../../src/config.js";
 import { FLEET_ACTIVATION_META_KEY } from "../../src/entitlement/activation.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+
+const custodySessions = createCustodySessionTracker();
+
+afterEach(() => custodySessions.release());
 
 const PASSPHRASE = "rotation-test-passphrase";
 const KID = "agent-rotate-1";
@@ -155,11 +160,11 @@ interface Fortress {
 
 async function buildFortress(): Promise<Fortress> {
   const storage = new MemoryStorage();
-  const est = await establishMaster({
+  const est = custodySessions.track(await establishMaster({
     storage,
     passphrase: PASSPHRASE,
     firstRun: { installMode: "interactive", mintRecoveryKey: true },
-  });
+  }));
   const master = est.masterKey;
 
   // A resident identity (outer record AND inner private key under the
@@ -351,7 +356,7 @@ async function verifyRotated(
   expect(await storage.read("_meta", "key-params")).toBeNull();
   expect(await storage.read("_meta", "recovery-key-hash")).toBeNull();
 
-  const est = await establishMaster({ storage, passphrase });
+  const est = custodySessions.track(await establishMaster({ storage, passphrase }));
   const newMaster = est.masterKey;
   expect(toBase64url(newMaster)).not.toBe(toBase64url(fortress.master));
 
@@ -365,10 +370,10 @@ async function verifyRotated(
   ).rejects.toThrow(CustodyUnlockError);
   // The NEW recovery key unlocks the SAME new master.
   if (opts?.newRecoveryKey) {
-    const viaRecovery = await establishMaster({
+    const viaRecovery = custodySessions.track(await establishMaster({
       storage,
       recoveryKey: opts.newRecoveryKey,
-    });
+    }));
     expect(toBase64url(viaRecovery.masterKey)).toBe(toBase64url(newMaster));
   }
 
@@ -490,10 +495,10 @@ describe("master rotation: happy path", () => {
     );
 
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const rotatedStore = new StateStore(fortress.storage, est.masterKey);
 
     const before = await rotatedStore.read("notes", "k1");
@@ -523,10 +528,10 @@ describe("master rotation: happy path", () => {
     );
 
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const rotatedStore = new StateStore(fortress.storage, est.masterKey);
 
     const retained = await rotatedStore.read("notes", "k1");
@@ -547,10 +552,10 @@ describe("master rotation: happy path", () => {
       pinned_at: "2026-09-01T00:00:00.000Z",
     });
     await rotateMaster(rotateOpts(fortress));
-    const established = await establishMaster({
+    const established = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect((await readSdwOwnerPin(fortress.storage, fortress.master)).status).toBe(
       "invalid",
     );
@@ -598,16 +603,17 @@ describe("master rotation: happy path", () => {
           cleanupFreshInitRecoveryResidue: async () => false,
         },
       }));
-      const est = await establishMaster({
+      const est = custodySessions.track(await establishMaster({
         storage: fortress.storage,
         passphrase: PASSPHRASE,
-      });
+      }));
       const pin = JSON.parse(
         await readFile(join(dir, "castle-pinned-privkey.enc"), "utf-8")
       ) as EncryptedPayload;
       expect(() => decrypt(pin, fortress.master)).toThrow();
       expect(toBase64url(decrypt(pin, est.masterKey))).toBe(toBase64url(seed));
     } finally {
+      await custodySessions.release();
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -616,10 +622,10 @@ describe("master rotation: happy path", () => {
     const fortress = await buildFortress();
     await rotateMaster(rotateOpts(fortress));
     // Append an entry in epoch 1, then rotate again.
-    const est1 = await establishMaster({
+    const est1 = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const audit1 = new AuditLog(fortress.storage, est1.masterKey);
     await audit1.appendCritical({
       layer: "l1",
@@ -630,10 +636,10 @@ describe("master rotation: happy path", () => {
     await audit1.flush();
 
     await rotateMaster(rotateOpts(fortress));
-    const est2 = await establishMaster({
+    const est2 = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const audit2 = new AuditLog(fortress.storage, est2.masterKey);
     const result = await audit2.query({ limit: 100 });
     expect(result.integrity_findings).toEqual([]);
@@ -878,11 +884,11 @@ describe("master rotation: storage namespace discovery", () => {
     const dir = await mkdtemp(join(tmpdir(), "sanctuary-rotate-name-"));
     try {
       const storage = new FilesystemStorage(dir);
-      const est = await establishMaster({
+      const est = custodySessions.track(await establishMaster({
         storage,
         passphrase: PASSPHRASE,
         firstRun: { installMode: "interactive", mintRecoveryKey: true },
-      });
+      }));
       await est.masterWriteBarrier?.release();
       await mkdir(join(dir, "ns-!4E2D"), { recursive: true, mode: 0o700 });
       await writeFile(join(dir, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
@@ -899,13 +905,14 @@ describe("master rotation: storage namespace discovery", () => {
         /storage name this version cannot address/,
       );
 
-      const stillOld = await establishMaster({
+      const stillOld = custodySessions.track(await establishMaster({
         storage,
         recoveryKey: est.mintedRecoveryKey!,
-      });
+      }));
       expect(toBase64url(stillOld.masterKey)).toBe(toBase64url(est.masterKey));
       await stillOld.masterWriteBarrier?.release();
     } finally {
+      await custodySessions.release();
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -918,10 +925,10 @@ describe("master rotation: Tier-1 gate and capture rules", () => {
       rotateMaster(rotateOpts(fortress, { approve: async () => false }))
     ).rejects.toThrow(RotationPreflightError);
     // Fortress untouched: old credentials still unlock; no rotation artifacts.
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
     expect(
       await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
@@ -939,10 +946,10 @@ describe("master rotation: Tier-1 gate and capture rules", () => {
       await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
     ).toBeNull();
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -959,10 +966,10 @@ describe("master rotation: Tier-1 gate and capture rules", () => {
         })
       )
     ).rejects.toThrow(RotationPreflightError);
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -991,10 +998,10 @@ describe("master rotation: Tier-1 gate and capture rules", () => {
       RotationPreflightError
     );
     // Fortress untouched: old credentials still unlock; no rotation artifacts.
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
     expect(
       await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
@@ -1145,10 +1152,10 @@ describe("master rotation: fail-closed coverage", () => {
     await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
       RotationPreflightError
     );
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -1188,10 +1195,10 @@ describe("master rotation: fail-closed coverage", () => {
     expect((caught as Error).message).toMatch(/_audit-daemon|writer-split|Castle Wall daemon/);
     expect((caught as Error).message).not.toMatch(/no registered rotation recipe/);
     // Nothing mutated: the master still establishes from the original passphrase.
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -1223,10 +1230,10 @@ describe("master rotation: fail-closed coverage", () => {
     );
 
     await rotateMaster(rotateOpts(fortress));
-    const rotated = await establishMaster({
+    const rotated = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const rotatedStore = new StateStore(fortress.storage, rotated.masterKey);
     const read = await rotatedStore.read(MEMORY_HANDLE_REGISTRY_NAMESPACE, KID, true);
     expect(read?.signature_verified).toBe(true);
@@ -1259,10 +1266,10 @@ describe("master rotation: fail-closed coverage", () => {
     }
     expect(caught).toBeInstanceOf(RotationPreflightError);
     expect((caught as Error).message).toMatch(/writer-split|audit-store-split-established/);
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -1282,10 +1289,10 @@ describe("master rotation: fail-closed coverage", () => {
       )
     );
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const raw = JSON.parse(
       bytesToString(
         (await fortress.storage.read(
@@ -1326,10 +1333,10 @@ describe("master rotation: fail-closed coverage", () => {
       )
     );
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const raw = JSON.parse(
       bytesToString(
         (await fortress.storage.read(
@@ -1370,10 +1377,10 @@ describe("master rotation: fail-closed coverage", () => {
     // real primitive (validateRecord re-derives the ML-DSA public from the secret
     // and re-runs the cert-chain coherence checks, so a stranded/garbled secret
     // would throw here).
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const reloaded = await provisionOrLoadFederationTrustRoot({
       storage: fortress.storage,
       masterKey: est.masterKey,
@@ -1415,10 +1422,10 @@ describe("master rotation: fail-closed coverage", () => {
       )
     );
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const raw = JSON.parse(
       bytesToString(
         (await fortress.storage.read(
@@ -1470,10 +1477,10 @@ describe("master rotation: fail-closed coverage", () => {
       )
     );
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const issuerRaw = JSON.parse(
       bytesToString(
         (await fortress.storage.read(
@@ -1614,10 +1621,10 @@ describe("master rotation: fail-closed coverage", () => {
 
     // Without the two new infos this throws RotationPreflightError (strand).
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
 
     // Every one decrypts + reads back under the NEW master.
     for (const r of records) {
@@ -1660,10 +1667,10 @@ describe("master rotation: fail-closed coverage", () => {
     // Without the two new classifications, convertMeta hits `default -> null ->
     // throw` and rotation is DENIED. It must now SUCCEED.
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
 
     // Both `_meta` keys are still present (not deleted by rotation).
     expect(
@@ -1710,10 +1717,10 @@ describe("master rotation: fail-closed coverage", () => {
 
     // Preflight classifies the record and rotation completes end to end.
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const newMaster = est.masterKey;
 
     // Restamped, not deleted and not left alone: the authenticated body is
@@ -1780,10 +1787,10 @@ describe("master rotation: fail-closed coverage", () => {
     });
 
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
 
     // The epoch advanced AND every latch survived with its exact value.
     const after = await readEpochWitness(fortress.storage, est.masterKey);
@@ -1844,7 +1851,7 @@ describe("master rotation: fail-closed coverage", () => {
     ).toBe(bytesToString(stripped));
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
     expect(await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)).toBeNull();
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -1859,7 +1866,7 @@ describe("master rotation: fail-closed coverage", () => {
       new RegExp(`_meta/${FLEET_ACTIVATION_META_KEY} is not a record this rotation engine recognizes`)
     );
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -1906,7 +1913,7 @@ describe("master rotation: fail-closed coverage", () => {
     expect(bytesToString(afterResume!)).toBe(bytesToString(afterCrash!));
 
     await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     const next = await crossCheckConfigBaseline({
       storage: fortress.storage,
       master: est.masterKey,
@@ -1924,7 +1931,7 @@ describe("master rotation: fail-closed coverage", () => {
   }
 
   async function expectLatchesSurvived(fortress: Fortress): Promise<void> {
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     const witness = await readEpochWitness(fortress.storage, est.masterKey);
     expect(witness.status).toBe("valid");
     if (witness.status !== "valid") throw new Error("unreachable");
@@ -2011,7 +2018,7 @@ describe("master rotation: fail-closed coverage", () => {
     const journalBytes = await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY);
     expect(journalBytes).not.toBeNull();
     await fortress.storage.delete("_meta", ROTATION_JOURNAL_KEY);
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     await fortress.storage.write("_meta", ROTATION_JOURNAL_KEY, journalBytes!);
     expect(toBase64url(est.masterKey)).not.toBe(toBase64url(fortress.master));
     await writeEpochWitness(
@@ -2070,7 +2077,7 @@ describe("master rotation: fail-closed coverage", () => {
     await simulateRestoreAttestRemedy(fortress);
     await resume();
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     const witness = await readEpochWitness(fortress.storage, est.masterKey);
     expect(witness.status).toBe("valid");
     if (witness.status !== "valid") throw new Error("unreachable");
@@ -2105,7 +2112,7 @@ describe("master rotation: fail-closed coverage", () => {
       fortressId: FORTRESS_ID,
       passphrase: PASSPHRASE,
     });
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     const witness = await readEpochWitness(fortress.storage, est.masterKey);
     expect(witness.status).toBe("valid");
     if (witness.status !== "valid") throw new Error("unreachable");
@@ -2147,7 +2154,7 @@ describe("master rotation: fail-closed coverage", () => {
     await simulateRestoreAttestRemedy(fortress);
     await resume();
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     const witness = await readEpochWitness(fortress.storage, est.masterKey);
     expect(witness.status).toBe("valid");
     if (witness.status !== "valid") throw new Error("unreachable");
@@ -2168,7 +2175,7 @@ describe("master rotation: fail-closed coverage", () => {
       revocation_floor: 0,
     });
     await rotateMaster(rotateOpts(fortress));
-    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const est = custodySessions.track(await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE }));
     const witness = await readEpochWitness(fortress.storage, est.masterKey);
     expect(witness.status).toBe("valid");
     if (witness.status !== "valid") throw new Error("unreachable");
@@ -2220,10 +2227,10 @@ describe("master rotation: fail-closed coverage", () => {
     await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
       /operator-prefs/
     );
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -2237,10 +2244,10 @@ describe("master rotation: fail-closed coverage", () => {
     await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
       RotationPreflightError
     );
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 
@@ -2314,10 +2321,10 @@ describe("master rotation: fail-closed coverage", () => {
       )
     ).rejects.toThrow(RotationPreflightError);
     expect(captureCalled).toBe(false);
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
   });
 });
@@ -2568,10 +2575,10 @@ describe("master rotation: crash safety (journaled two-phase, forward resume)", 
     // No journal → normal boot works and yields the OLD master. An ordinary
     // exception runs rollback; hard-crash residue is covered separately by
     // the process-death tests.
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
     expect(
       await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
@@ -2911,14 +2918,14 @@ describe("master rotation: custody floor on the rotated fortress", () => {
     const envelope = await readCustodyEnvelope(fortress.storage);
     expect(envelope!.wraps.some((w) => w.type === "keychain")).toBe(true);
     // And it unwraps the SAME new master.
-    const viaKeychain = await establishMaster({
+    const viaKeychain = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       keychainKey: custodyKey,
-    });
-    const viaPassphrase = await establishMaster({
+    }));
+    const viaPassphrase = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     expect(toBase64url(viaKeychain.masterKey)).toBe(
       toBase64url(viaPassphrase.masterKey)
     );
@@ -2940,10 +2947,10 @@ describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
     const newEnvelope = await readCustodyEnvelope(fortress.storage);
     expect(envelopeEpochOf(newEnvelope)).toBe(1);
 
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const witness = await readEpochWitness(fortress.storage, est.masterKey);
     expect(witness.status).toBe("valid");
     if (witness.status === "valid") {
@@ -2959,10 +2966,10 @@ describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
 
     expect(await readEnvelopeEpoch(fortress.storage)).toBe(2);
 
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     const epochKeys = deriveAuditEpochKeys(est.masterKey);
     const count = await readCustodyEpochCount(fortress.storage, {
       epochMacKey: epochKeys.epochMacKey,
@@ -2977,10 +2984,10 @@ describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
     const fortress = await buildFortress();
     await rotateMaster(rotateOpts(fortress));
 
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
-    });
+    }));
     // Re-run the exact boot cross-check the server runs: observe the witnesses,
     // compare against the on-disk envelope epoch. The rotation advanced BOTH the
     // envelope epoch and the witness in lockstep, so the verdict is OK.
@@ -3018,7 +3025,7 @@ describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
     // the audit head anchor is restamped under the NEW master.
     await rotateMaster(rotateOpts(fortress));
     const newMaster = (
-      await establishMaster({ storage, passphrase: PASSPHRASE })
+      custodySessions.track(await establishMaster({ storage, passphrase: PASSPHRASE }))
     ).masterKey;
 
     // ── The attack: restore ONLY the old custody files (swap the master back),
@@ -3030,7 +3037,7 @@ describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
     await storage.delete("_audit_checkpoints", AUDIT_EPOCH_KEYS_KEY);
 
     // Boot now establishes the OLD (retired) master from the restored envelope.
-    const spliced = await establishMaster({ storage, passphrase: PASSPHRASE });
+    const spliced = custodySessions.track(await establishMaster({ storage, passphrase: PASSPHRASE }));
     expect(toBase64url(spliced.masterKey)).toBe(toBase64url(fortress.master));
     expect(toBase64url(spliced.masterKey)).not.toBe(toBase64url(newMaster));
 
@@ -3094,11 +3101,11 @@ describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
 
   it("head-anchor probe is absent (neutral) on a genuinely never-audited fortress", async () => {
     const storage = new MemoryStorage();
-    const est = await establishMaster({
+    const est = custodySessions.track(await establishMaster({
       storage,
       passphrase: PASSPHRASE,
       firstRun: { installMode: "interactive", mintRecoveryKey: false },
-    });
+    }));
     // No audit chain written → no head anchor, no established marker.
     const probe = await probeAuditHeadAnchor(storage, est.masterKey);
     expect(probe.status).toBe("absent");
