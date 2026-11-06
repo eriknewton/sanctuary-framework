@@ -16,7 +16,7 @@ import { MEASURE_CONFIG, MEASURE_MASTER_KEY, measureEntry, prepopulateAudit } fr
 // Three admissions is the empirical production budget; must match
 // AUDIT_CHECKPOINT_READ_CONCURRENCY in operational/audit-log.ts.
 const P = 3;
-const HOLD_MS = 500; // Real hold used to distinguish prompt completion from retirement.
+const HOLD_MS = 1_000; // Real hold used to distinguish prompt completion from retirement.
 const OBSERVE_MS = HOLD_MS / 10;
 const POPULATION = 64; // Several full windows before and after the fifth body.
 const CHECKPOINTS = 3 * P;
