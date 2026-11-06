@@ -503,10 +503,12 @@ it("T7 audit-dump lists informational summary records", async () => {
   const home = await mkdtemp(join(tmpdir(), "cw-summary-dump-"));
   vi.stubEnv("HOME", home);
   const passphrase = "isolated-root-summary-dump-fixture";
+  let established: Awaited<ReturnType<typeof establishMaster>> | undefined;
   try {
     await initializeTestCustody(home, { passphrase });
     const storage = new FilesystemStorage(join(home, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase });
+    established = await establishMaster({ storage, passphrase });
+    const { masterKey } = established;
     const audit = new AuditLog(storage, masterKey);
     const f = fixture({ pinnedProducerKeyB64url: PIN, auditSink: audit });
     await f.consumer.handleFlowDecisionRecorded(signed());
@@ -522,5 +524,10 @@ it("T7 audit-dump lists informational summary records", async () => {
     const summary = entries.find((entry) => entry.operation === SUMMARY);
     expect(summary.details).toMatchObject({ root_verified_total: 1, summary_seq: 1 });
     expect(summary.details).not.toHaveProperty(CASTLE_WALL_AUDIT_PROVENANCE_KEY);
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally {
+    // Release the reader before deleting the directory whose identity scopes it.
+    try { await established?.masterWriteBarrier?.release(); }
+    finally { established?.masterKey.fill(0); }
+    await rm(home, { recursive: true, force: true });
+  }
 });
