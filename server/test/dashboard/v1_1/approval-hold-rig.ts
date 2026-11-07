@@ -1,9 +1,9 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DashboardApprovalChannel } from '../../../src/principal-policy/dashboard.js';
-import { buildV11Bindings } from '../../../src/dashboard/v1_1/wiring.js';
 import { MemoryStorage } from '../../../src/storage/memory.js';
 import { AuditLog } from '../../../src/operational/audit-log.js';
 import { BaselineTracker } from '../../../src/principal-policy/baseline.js';
@@ -25,7 +25,7 @@ export async function approvalHoldRig(timeoutSeconds = 20, options: { port?: num
   const policy = parsePolicy(JSON.stringify({ ...DEFAULT_POLICY, memory_save_approval: "always" }));
   channel.setDependencies({ policy, baseline, auditLog });
   await channel.setOperatorAuthorizationSpentStore(OperatorAuthorizationSpentStore.durableFromBoot(storage, masterKey));
-  const bindings = buildV11Bindings({ identityId: 'approval-test', fortressId: 'approval-fortress', storage, masterKey, auditLog, storagePath, warnProducerKeyUnavailable: () => {} });
+  const bindings = await buildV11Bindings({ identityId: 'approval-test', fortressId: 'approval-fortress', storage, masterKey, auditLog, storagePath, warnProducerKeyUnavailable: () => {} });
   channel.setV11Bindings(bindings);
   const gate = new ApprovalGate(policy, baseline, channel, auditLog);
   await channel.start();

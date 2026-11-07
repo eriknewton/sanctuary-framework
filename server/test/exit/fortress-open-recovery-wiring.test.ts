@@ -247,6 +247,7 @@ describe("structural pin: every named fortress-open call site routes through rec
 describe("recovery through the REAL fortress-open path, not a direct call", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
@@ -422,7 +423,7 @@ describe("recovery through the REAL fortress-open path, not a direct call", () =
     const targetPassphrase = TEST_PASSPHRASE;
     await mkdir(join(targetDir, "state"), { recursive: true, mode: 0o700 });
     const targetStorage = new FilesystemStorage(join(targetDir, "state"));
-    const targetMasterKey = await resolveCliMasterKey(targetStorage, {
+    const targetMasterKey = await resolveFixtureMasterKey(targetStorage, {
       passphrase: targetPassphrase,
       bootstrap: true,
       storagePathHint: targetDir,
@@ -487,3 +488,16 @@ describe("recovery through the REAL fortress-open path, not a direct call", () =
     expect(await reopenedStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
   }
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

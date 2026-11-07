@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { writeFileCustody } from "../../storage/custody-fs.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
 import { loadConfig } from "../../config.js";
-import { resolveCliMasterKey } from "../../core/master-custody.js";
+import { transferCliMasterKeySession, type CliMasterKeySession, closeCliMasterKeySession, resolveCliMasterKey } from "../../core/master-custody.js";
 import { AuditLog, BROKER_OPS } from "../../operational/audit-log.js";
 import { getOrCreatePassphrase } from "../../wrap/passphrase.js";
 import { KeychainBackend } from "./keychain-backend.js";
@@ -61,6 +61,7 @@ export interface OpenBrokerOptions {
 async function openFortressContext(opts: OpenBrokerOptions): Promise<{
   storagePath: string;
   passphrase: string;
+  session: CliMasterKeySession;
   auditLog: AuditLog;
 }> {
   // 1. Resolve or load Sanctuary config for storage path
@@ -77,17 +78,24 @@ async function openFortressContext(opts: OpenBrokerOptions): Promise<{
 
   // 3. Resolve master key.
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase,
     bootstrap: true,
     storagePathHint: storagePath,
   });
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  // 4. Audit log — shares storage with the main server so `sanctuary audit`
-  //    sees broker entries alongside L1/L2/L4 entries.
-  const auditLog = new AuditLog(storage, masterKey);
+    // 4. Audit log — shares storage with the main server so `sanctuary audit`
+    //    sees broker entries alongside L1/L2/L4 entries.
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
 
-  return { storagePath, passphrase, auditLog };
+    return { session, storagePath, passphrase, auditLog };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
@@ -102,50 +110,49 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
   auditLog: AuditLog;
   close: () => Promise<void>;
 }> {
-  const { storagePath, passphrase, auditLog } = await openFortressContext(opts);
+  const { storagePath, passphrase, auditLog, session } = await openFortressContext(opts);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  // 5. Keychain backend (macOS only; throws BackendUnavailableError elsewhere).
-  const backend = opts.backend ?? new KeychainBackend({ storagePath });
-  await backend.ensureInitialized(passphrase);
+    // 5. Keychain backend (macOS only; throws BackendUnavailableError elsewhere).
+    const backend = opts.backend ?? new KeychainBackend({ storagePath });
+    await backend.ensureInitialized(passphrase);
 
-  // 6. Load BOTH policy files and reconcile them before any grant reaches the
-  //    issuer. The audit log is already built (step 4), which is why the loads
-  //    live here: a load failure has to be recordable, and a broker that cannot
-  //    say why it served nothing is indistinguishable from one that had nothing
-  //    to serve.
-  const { grants, bindings } = await loadBrokerAndSurrogatePolicies(storagePath, auditLog, {
-    principalIdentityId: opts.principalIdentityId ?? "sanctuary-broker",
-  });
+    // 6. Load BOTH policy files and reconcile them before any grant reaches the
+    //    issuer. The audit log is already built (step 4), which is why the loads
+    //    live here: a load failure has to be recordable, and a broker that cannot
+    //    say why it served nothing is indistinguishable from one that had nothing
+    //    to serve.
+    const { grants, bindings } = await loadBrokerAndSurrogatePolicies(storagePath, auditLog, {
+      principalIdentityId: opts.principalIdentityId ?? "sanctuary-broker",
+    });
 
-  const broker = new Broker({
-    backend,
-    auditLog,
-    grants,
-    // Required, never optional (AGENTS.md rule 3): the set is how the broker
-    // refuses a bound name even when a policy file somehow names it. An empty
-    // set is the honest "no bindings" value and still has to be passed.
-    surrogateBoundSecrets: surrogateBoundSecretNames(bindings),
-    principalIdentityId: opts.principalIdentityId ?? "sanctuary-broker",
-  });
+    const broker = new Broker({
+      backend,
+      auditLog,
+      grants,
+      // Required, never optional (AGENTS.md rule 3): the set is how the broker
+      // refuses a bound name even when a policy file somehow names it. An empty
+      // set is the honest "no bindings" value and still has to be passed.
+      surrogateBoundSecrets: surrogateBoundSecretNames(bindings),
+      principalIdentityId: opts.principalIdentityId ?? "sanctuary-broker",
+    });
 
-  // Hardening wave 6 finding #86: fortress-unlock fires expiry pruning so
-  // any tokens that survived a prior process restart-as-cache scenario
-  // are dropped before the operator can issue or read against them.
-  // pruneExpired is idempotent and synchronous; failures bubble (none
-  // expected, purely in-memory map iteration).
-  broker.pruneExpiredTokens();
+    // Hardening wave 6 finding #86: fortress-unlock fires expiry pruning so
+    // any tokens that survived a prior process restart-as-cache scenario
+    // are dropped before the operator can issue or read against them.
+    // pruneExpired is idempotent and synchronous; failures bubble (none
+    // expected, purely in-memory map iteration).
+    broker.pruneExpiredTokens();
 
-  return {
-    broker,
-    auditLog,
-    close: async () => {
-      // Drain pending audit writes before the caller exits — without this,
-      // CLI invocations that call `process.exit()` immediately after a
-      // broker mutation drop the audit entry mid-write. Storage is FS so
-      // no socket close is needed.
-      await auditLog.flush();
-    },
-  };
+    return {
+      broker,
+      auditLog,
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      close: () => closeCliMasterKeySession(session, () => auditLog.flush()),
+    };
+
+  }, () => auditLog.flush());
 }
 
 /** Path where broker policy is stored. JSON for now — YAML coverage is
@@ -433,24 +440,27 @@ export async function openSurrogateStore(opts: OpenSurrogateStoreOptions = {}): 
   auditLog: AuditLog;
   close: () => Promise<void>;
 }> {
-  const { storagePath, passphrase, auditLog } = await openFortressContext(opts);
+  const { storagePath, passphrase, auditLog, session } = await openFortressContext(opts);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  const store = new SurrogateValueStore({
-    storagePath,
-    home: opts.home,
-    backend: opts.backend,
-  });
-  await store.ensureInitialized(passphrase);
+    const store = new SurrogateValueStore({
+      storagePath,
+      home: opts.home,
+      backend: opts.backend,
+    });
+    await store.ensureInitialized(passphrase);
 
-  return {
-    store,
-    storagePath,
-    auditLog,
-    // Drains pending audit writes for the same reason `openBroker.close` does:
-    // a surrogate verb that calls `process.exit()` right after `SURROGATE_BOUND`
-    // would otherwise drop the entry mid-write.
-    close: async () => {
-      await auditLog.flush();
-    },
-  };
+    return {
+      store,
+      storagePath,
+      auditLog,
+      // Drains pending audit writes for the same reason `openBroker.close` does:
+      // a surrogate verb that calls `process.exit()` right after `SURROGATE_BOUND`
+      // would otherwise drop the entry mid-write.
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      close: () => closeCliMasterKeySession(session, () => auditLog.flush()),
+    };
+
+  }, () => auditLog.flush());
 }

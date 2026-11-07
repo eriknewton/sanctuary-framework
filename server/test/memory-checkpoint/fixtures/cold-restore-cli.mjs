@@ -7,7 +7,7 @@ const custodyUrl = new URL('../../../src/core/master-custody.ts', import.meta.ur
 const custody = await import(custodyUrl.href);
 mock.module(custodyUrl.href, { namedExports: {
   ...custody,
-  resolveCliMasterKey: async () => Buffer.from(process.env.CHECKPOINT_TEST_MASTER_KEY, 'hex'),
+  resolveCliMasterKey: async () => ({ masterKey: Buffer.from(process.env.CHECKPOINT_TEST_MASTER_KEY, 'hex'), masterWriteBarrier: { filesystemBacked: false, assertSessionHeld: () => {}, assertHeld: () => {}, release: async () => {}, signal: new AbortController().signal } }),
 } });
 const { ApprovalGate } = await import('../../../src/principal-policy/gate.ts');
 mock.method(ApprovalGate.prototype, 'evaluate', async () => ({ allowed: true }));

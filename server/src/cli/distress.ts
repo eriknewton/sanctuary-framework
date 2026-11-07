@@ -29,7 +29,7 @@ import {
 } from "../cognitive/tools.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { readDistressConfig } from "../distress/config.js";
 import {
@@ -209,137 +209,140 @@ async function cmdSend(
     return 1;
   }
 
-  let masterKey: Uint8Array | undefined;
   try {
     const config = await loadConfig();
     await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
     const storage = new FilesystemStorage(join(config.storage_path, "state"));
 
     // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-    masterKey = await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       storagePathHint: config.storage_path,
     });
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
 
-    const auditLog = new AuditLog(storage, masterKey);
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
 
-    // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import
-    // left interrupted by a prior hard kill before this verb reads or
-    // writes anything else. See index.ts's matching call site for the
-    // full rationale.
-    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+      // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import
+      // left interrupted by a prior hard kill before this verb reads or
+      // writes anything else. See index.ts's matching call site for the
+      // full rationale.
+      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
-    // Load identities so the emission is signed when an identity exists. A
-    // fresh fortress with no identity still emits (signing_unavailable: true) —
-    // distress availability outranks signature completeness, same as the tool.
-    const identityManager = new IdentityManager(storage, masterKey);
-    await identityManager.load();
-    const defaultIdentity = identityManager.getDefault();
+      // Load identities so the emission is signed when an identity exists. A
+      // fresh fortress with no identity still emits (signing_unavailable: true) —
+      // distress availability outranks signature completeness, same as the tool.
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.load();
+      const defaultIdentity = identityManager.getDefault();
 
-    // Present-but-invalid distress.json throws here (fail closed) — same as the
-    // server boot path. A missing file means the local-only default lane.
-    const distressConfig = await readDistressConfig(config.storage_path);
+      // Present-but-invalid distress.json throws here (fail closed) — same as the
+      // server boot path. A missing file means the local-only default lane.
+      const distressConfig = await readDistressConfig(config.storage_path);
 
-    // Build the REAL distress tool against this fortress and invoke its handler.
-    // This is the shared emission path: no copy of the envelope/audit/webhook
-    // logic lives in the CLI.
-    const { tools } = createDistressTools({
-      auditLog,
-      signingHelpers: createInternalIdentitySigningHelpers(
-        identityManager,
-        masterKey,
-        auditLog
-      ),
-      config: distressConfig,
-      fortressPath: config.storage_path,
-      currentActorId: () => defaultIdentity?.identity_id,
-    });
-    const distressTool = tools.find((t) => t.name === "sanctuary_distress");
-    if (!distressTool) {
-      write(err, "Error: distress tool not available.\n");
-      return 1;
-    }
+      // Build the REAL distress tool against this fortress and invoke its handler.
+      // This is the shared emission path: no copy of the envelope/audit/webhook
+      // logic lives in the CLI.
+      const { tools } = createDistressTools({
+        auditLog,
+        signingHelpers: createInternalIdentitySigningHelpers(
+          identityManager,
+          masterKey,
+          auditLog
+        ),
+        config: distressConfig,
+        fortressPath: config.storage_path,
+        currentActorId: () => defaultIdentity?.identity_id,
+      });
+      const distressTool = tools.find((t) => t.name === "sanctuary_distress");
+      if (!distressTool) {
+        write(err, "Error: distress tool not available.\n");
+        return 1;
+      }
 
-    const handlerArgs: Record<string, unknown> = { reason, severity };
-    if (detail !== undefined) handlerArgs.detail = detail;
-    const raw = await distressTool.handler(handlerArgs);
-    const result = JSON.parse(raw.content[0]!.text) as {
-      ok: boolean;
-      event_id?: string;
-      audit_ref?: string;
-      rate_limited?: boolean;
-      retry_after_seconds?: number;
-      error?: string;
-      signed?: boolean;
-      remaining_this_hour?: number;
-      delivered?: {
-        audit: boolean;
-        operator_notification: boolean;
-        local_listener?: "not_wired" | "delivered" | "failed";
-        webhook: "not_configured" | "delivered" | "failed";
+      const handlerArgs: Record<string, unknown> = { reason, severity };
+      if (detail !== undefined) handlerArgs.detail = detail;
+      const raw = await distressTool.handler(handlerArgs);
+      const result = JSON.parse(raw.content[0]!.text) as {
+        ok: boolean;
+        event_id?: string;
+        audit_ref?: string;
+        rate_limited?: boolean;
+        retry_after_seconds?: number;
+        error?: string;
+        signed?: boolean;
+        remaining_this_hour?: number;
+        delivered?: {
+          audit: boolean;
+          operator_notification: boolean;
+          local_listener?: "not_wired" | "delivered" | "failed";
+          webhook: "not_configured" | "delivered" | "failed";
+        };
       };
-    };
 
-    if (json) {
-      write(out, JSON.stringify(result, null, 2) + "\n");
-    }
+      if (json) {
+        write(out, JSON.stringify(result, null, 2) + "\n");
+      }
 
-    if (!result.ok) {
-      if (result.rate_limited) {
-        if (!json) {
-          write(
-            err,
-            `Distress rate limit reached. Retry after ${result.retry_after_seconds ?? "?"}s ` +
+      if (!result.ok) {
+        if (result.rate_limited) {
+          if (!json) {
+            write(
+              err,
+              `Distress rate limit reached. Retry after ${result.retry_after_seconds ?? "?"}s ` +
               `(audit_ref ${result.audit_ref ?? "n/a"}).\n`
-          );
+            );
+          }
+          // Distinct exit code so scripts can tell "rate limited" from "error".
+          return 3;
         }
-        // Distinct exit code so scripts can tell "rate limited" from "error".
-        return 3;
+        if (!json) {
+          write(err, `Error: ${result.error ?? "distress emission failed"}.\n`);
+        }
+        return 1;
       }
-      if (!json) {
-        write(err, `Error: ${result.error ?? "distress emission failed"}.\n`);
-      }
-      return 1;
-    }
 
-    if (!json) {
-      const webhook = result.delivered?.webhook ?? "not_configured";
-      write(out, `Distress signal emitted.\n`);
-      write(out, `  event_id:   ${result.event_id ?? "n/a"}\n`);
-      write(out, `  audit_ref:  ${result.audit_ref ?? "n/a"}\n`);
-      write(out, `  signed:     ${result.signed ? "yes" : "no (no identity yet)"}\n`);
-      write(out, `  audit:      ${result.delivered?.audit ? "persisted" : "FAILED"}\n`);
-      write(
-        out,
-        `  local:      ${result.delivered?.operator_notification ? "notified" : "FAILED"}\n`
-      );
-      write(
-        out,
-        `  webhook:    ${
-          webhook === "not_configured"
+      if (!json) {
+        const webhook = result.delivered?.webhook ?? "not_configured";
+        write(out, `Distress signal emitted.\n`);
+        write(out, `  event_id:   ${result.event_id ?? "n/a"}\n`);
+        write(out, `  audit_ref:  ${result.audit_ref ?? "n/a"}\n`);
+        write(out, `  signed:     ${result.signed ? "yes" : "no (no identity yet)"}\n`);
+        write(out, `  audit:      ${result.delivered?.audit ? "persisted" : "FAILED"}\n`);
+        write(
+          out,
+          `  local:      ${result.delivered?.operator_notification ? "notified" : "FAILED"}\n`
+        );
+        write(
+          out,
+          `  webhook:    ${webhook === "not_configured"
             ? "not configured"
             : webhook === "delivered"
               ? "delivered"
               : "FAILED (audited, non-fatal)"
-        }\n`
-      );
-      if (result.remaining_this_hour !== undefined) {
-        write(out, `  remaining this hour: ${result.remaining_this_hour}\n`);
+          }\n`
+        );
+        if (result.remaining_this_hour !== undefined) {
+          write(out, `  remaining this hour: ${result.remaining_this_hour}\n`);
+        }
       }
-    }
 
-    // A configured-but-failed webhook is reported non-zero so an operator
-    // testing wiring sees the failure, but the local lane already delivered.
-    if (result.delivered?.webhook === "failed") return 4;
-    return 0;
+      // A configured-but-failed webhook is reported non-zero so an operator
+      // testing wiring sees the failure, but the local lane already delivered.
+      if (result.delivered?.webhook === "failed") return 4;
+      return 0;
+
+    }, () => sessionAuditLog?.flush() ?? Promise.resolve());
   } catch (error) {
     write(
       err,
       error instanceof Error ? `Error: ${error.message}\n` : `Error: ${String(error)}\n`
     );
     return 1;
-  } finally {
-    masterKey?.fill(0);
   }
 }

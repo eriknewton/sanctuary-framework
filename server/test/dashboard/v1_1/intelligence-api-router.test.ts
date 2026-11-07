@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 // fail-before-exempt: intelligence API harness now creates and cleans a temp storagePath for v1.1 bindings; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * Sanctuary v1.1 Dashboard — Intelligence API Router tests
@@ -47,7 +48,6 @@ import {
 } from "../../../src/dashboard/v1_1/intelligence-api-router.js";
 import { dispatchV11Request } from "../../../src/dashboard/v1_1/dispatch.js";
 import {
-  buildV11Bindings,
   type V11Bindings,
 } from "../../../src/dashboard/v1_1/wiring.js";
 
@@ -92,7 +92,7 @@ async function startHarness(opts: { withSelector?: boolean } = {}): Promise<Harn
         } else {
           // Exercise the dispatch layer with a selector-less binding
           // to assert the 503 fallback.
-          const bindings: V11Bindings = buildV11Bindings({
+          const bindings: V11Bindings = await buildV11Bindings({
             identityId: IDENTITY,
             fortressId: "fortress-test",
             auditLog,

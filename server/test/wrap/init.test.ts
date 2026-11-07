@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture teardown releases the write barrier before scrubbing the key; behaviour under test is unchanged on the base.
 /**
  * sanctuary init — fortress isolation tests (v1.1.1 hotfix Findings S + T)
  *
@@ -1804,7 +1805,8 @@ describe("--no-identity (default operator-identity seed)", () => {
       const sig = signer.signPayload("federation_enable", { fortress_id: "x" });
       expect(sig).toMatch(/^[A-Za-z0-9_-]+$/);
     } finally {
-      signer.masterKey.fill(0);
+      try { await signer.masterWriteBarrier?.release(); }
+      finally { signer.masterKey.fill(0); }
     }
   });
 

@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs, { mkdtemp, rm } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -15,7 +16,7 @@ afterEach(async () => { vi.restoreAllMocks(); syncBuiltinESMExports(); vi.unstub
 
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const decode = (value: Uint8Array) => JSON.parse(new TextDecoder().decode(value));
-const checkpointKey = (sequence: number) => `audit-checkpoint-${String(sequence).padStart(20, "0")}`;
+const checkpointKey = (sequence: number) => `audit-checkpoint-${String(sequence).padStart(20, "0")}`; // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
 
 describe("complete persisted checkpoint ranges", () => {
   it("shares one audit listing and reads every checkpoint among a thousand", async () => {
@@ -86,7 +87,7 @@ describe("complete persisted checkpoint ranges", () => {
         // The out-of-range name is the job-851 witness: only a full body pass
         // can see this copy's in-range envelope sequence. Range-first must fail.
         const copyKey = shape === "out-of-range"
-          ? `entry-${String(900).padStart(20, "0")}-copy` : `${source}-copy`;
+          ? `entry-${String(900).padStart(20, "0")}-copy` : `${source}-copy`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
         const copy = shape === "different" ? encode({ ...decode(bytes), entry_hash: "a".repeat(64) }) : bytes;
         await storage.write("_audit", copyKey, copy);
       }
@@ -107,7 +108,7 @@ describe("complete persisted checkpoint ranges", () => {
     const writer = new AuditLog(storage, MEASURE_MASTER_KEY, MEASURE_CONFIG);
     for (let index = 0; index < 3; index++) await writer.appendCritical(measureEntry(index));
     const keys = await storage.listKeys("_audit");
-    const mismatched = `entry-${String(1).padStart(20, "0")}-z`;
+    const mismatched = `entry-${String(1).padStart(20, "0")}-z`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await storage.write("_audit", mismatched, (await storage.read("_audit", keys[1]!))!);
     await storage.delete("_audit", keys[1]!);
     const counted = vi.spyOn(storage, "listKeys");
@@ -135,7 +136,7 @@ async function checkpointSetup(deadline = 1_000) {
 async function anchored(raw: FilesystemStorage, sequence: number) {
   const anchor = decode((await raw.read("_audit_checkpoints", "__head_anchor"))!);
   expect(anchor.data.highest_sequence).toBe(sequence);
-  const tailKey = (await raw.list("_audit")).map((meta) => meta.key).find((key) => key.startsWith(`entry-${String(sequence).padStart(20, "0")}-`))!;
+  const tailKey = (await raw.list("_audit")).map((meta) => meta.key).find((key) => key.startsWith(`entry-${String(sequence).padStart(20, "0")}-`))!; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
   expect(decode((await raw.read("_audit", tailKey))!).entry_hash).toBe(anchor.data.head_hash);
 }
 
@@ -337,7 +338,7 @@ it.each(["fallback forward", "fallback reverse", "reversed listKeys"])(
     const canonical = (await source.list("_audit")).map((meta) => meta.key);
     const envelopes = await Promise.all(canonical.map(async (key) => (await source.read("_audit", key))!));
     // Filename sequence nine lies beyond the three genuine envelope sequences.
-    const prefix = `entry-${String(9).padStart(20, "0")}-`;
+    const prefix = `entry-${String(9).padStart(20, "0")}-`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     // Soft hyphen is collation-ignorable but has a distinct code-unit order.
     const ties = [`${prefix}z\u00ad`, `${prefix}z`];
     expect(ties[0]!.localeCompare(ties[1]!)).toBe(0);
@@ -376,7 +377,7 @@ it("uses a total order for collation ties across memory insertion orders and fil
   const first = (await source.read("_audit", canonical[0]!))!;
   const second = (await source.read("_audit", canonical[1]!))!;
   const third = (await source.read("_audit", canonical[2]!))!;
-  const prefix = `entry-${String(9).padStart(20, "0")}-`;
+  const prefix = `entry-${String(9).padStart(20, "0")}-`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
   // Soft hyphen is collation-ignorable and round-trips through the byte-sized filesystem codec.
   const ties = [`${prefix}z\u00ad`, `${prefix}z`];
   expect(ties[0]!.localeCompare(ties[1]!)).toBe(0);

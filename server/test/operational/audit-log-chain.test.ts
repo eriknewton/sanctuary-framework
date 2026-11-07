@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { mkdir, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -426,7 +427,7 @@ describe("AuditLog tamper-evident chain", () => {
     await appendCritical(writer, "op-3");
     await writer.flush();
 
-    const corruptKey = `entry-${String(99).padStart(20, "0")}-9999999999999-0`;
+    const corruptKey = `entry-${String(99).padStart(20, "0")}-9999999999999-0`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await storage.write("_audit", corruptKey, stringToBytes("not valid json"));
 
     await appendCritical(writer, "op-4");

@@ -38,6 +38,7 @@
  * AGENTS.md #5). `verify` never touches custody at all.
  */
 
+import { withCliMasterKeySession } from "../core/master-custody.js";
 import type { Writable } from "node:stream";
 import { writeFile } from "node:fs/promises";
 import { fromBase64urlStrict } from "../core/encoding.js";
@@ -272,104 +273,106 @@ async function runExport(
   }
 
   try {
-    const now = Math.floor(Date.now() / 1000);
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(issuer, async () => {
+      const now = Math.floor(Date.now() / 1000);
 
-    // Resolve the license/activation view. ABSENT/INVALID both honestly
-    // collapse to community (fail-closed by construction - see activation.ts);
-    // this NEVER refuses to attest an unlicensed fortress (spec §4).
-    const record = await readFleetActivation(issuer.storage, issuer.masterKey);
-    let resolution: ReturnType<typeof resolveEntitlement>;
-    let claims: EntitlementClaimsV2 | null = null;
-    if (record.status === "valid") {
-      resolution = resolveEntitlement({
-        token: record.data.token,
-        issuerPublicKey: issuer.issuerPublicKey,
-        now,
-      });
-      if (record.data.token.claims.version === 2) {
-        claims = record.data.token.claims as EntitlementClaimsV2;
+      // Resolve the license/activation view. ABSENT/INVALID both honestly
+      // collapse to community (fail-closed by construction - see activation.ts);
+      // this NEVER refuses to attest an unlicensed fortress (spec §4).
+      const record = await readFleetActivation(issuer.storage, issuer.masterKey);
+      let resolution: ReturnType<typeof resolveEntitlement>;
+      let claims: EntitlementClaimsV2 | null = null;
+      if (record.status === "valid") {
+        resolution = resolveEntitlement({
+          token: record.data.token,
+          issuerPublicKey: issuer.issuerPublicKey,
+          now,
+        });
+        if (record.data.token.claims.version === 2) {
+          claims = record.data.token.claims as EntitlementClaimsV2;
+        }
+      } else {
+        resolution = resolveEntitlement({
+          token: undefined,
+          issuerPublicKey: issuer.issuerPublicKey,
+          now,
+        });
       }
-    } else {
-      resolution = resolveEntitlement({
-        token: undefined,
-        issuerPublicKey: issuer.issuerPublicKey,
-        now,
-      });
-    }
-    // ── Revocation-aware resolution (the A2 fix). A license can be VALID by
-    // its own token claims (in-window, well-signed) yet have been REVOKED by
-    // the issuer afterward (refund, compromise, kill) - the revocation rail
-    // is a SEPARATE signed record `resolveEntitlement` never consults. This
-    // mirrors the SAME fail-closed logic `runFleetReResolve` uses (re-
-    // resolve.ts) so export can never sign a REVOKED-but-in-window license as
-    // "active": consult the single {@link revocationVerifiability} chokepoint
-    // (present-clean / absent / CORRUPT-or-unverifiable) and, on a clean
-    // list, {@link isLicenseRevoked} for this specific license id. Any of
-    // "revoked" OR "the revocation list itself is unverifiable" forces the
-    // resolution to community/revoked - this is READ-ONLY (no write, no log
-    // append, no wall/enforcement touch): export never mutates fleet state.
-    const licenseIdForRevocationCheck =
-      typeof resolution.licenseId === "string" ? resolution.licenseId : null;
-    const verifiability = await revocationVerifiability(issuer.storage, issuer.masterKey);
-    let revoked = false;
-    if (verifiability.status === "clean") {
-      const status = await isLicenseRevoked(
-        issuer.storage,
-        issuer.masterKey,
-        licenseIdForRevocationCheck,
+      // ── Revocation-aware resolution (the A2 fix). A license can be VALID by
+      // its own token claims (in-window, well-signed) yet have been REVOKED by
+      // the issuer afterward (refund, compromise, kill) - the revocation rail
+      // is a SEPARATE signed record `resolveEntitlement` never consults. This
+      // mirrors the SAME fail-closed logic `runFleetReResolve` uses (re-
+      // resolve.ts) so export can never sign a REVOKED-but-in-window license as
+      // "active": consult the single {@link revocationVerifiability} chokepoint
+      // (present-clean / absent / CORRUPT-or-unverifiable) and, on a clean
+      // list, {@link isLicenseRevoked} for this specific license id. Any of
+      // "revoked" OR "the revocation list itself is unverifiable" forces the
+      // resolution to community/revoked - this is READ-ONLY (no write, no log
+      // append, no wall/enforcement touch): export never mutates fleet state.
+      const licenseIdForRevocationCheck =
+        typeof resolution.licenseId === "string" ? resolution.licenseId : null;
+      const verifiability = await revocationVerifiability(issuer.storage, issuer.masterKey);
+      let revoked = false;
+      if (verifiability.status === "clean") {
+        const status = await isLicenseRevoked(
+          issuer.storage,
+          issuer.masterKey,
+          licenseIdForRevocationCheck,
+        );
+        revoked = status.revoked;
+      }
+      const revocationListUnverifiable = verifiability.status === "unverifiable";
+      const effectiveResolution =
+        resolution.granted && (revoked || revocationListUnverifiable)
+          ? resolveEntitlement({ token: undefined, issuerPublicKey: issuer.issuerPublicKey, now })
+          : resolution;
+      const effectiveClaims =
+        resolution.granted && (revoked || revocationListUnverifiable) ? null : claims;
+
+      const grandfatheredBaseline =
+        record.status === "valid" ? record.data.grandfatheredBaseline : 0;
+      const cap = resolveFleetCap(
+        {
+          granted: effectiveResolution.granted,
+          tier: effectiveResolution.tier,
+          ...(effectiveResolution.entitledCount !== undefined
+            ? { entitledCount: effectiveResolution.entitledCount }
+            : {}),
+          ...(effectiveResolution.pricingUnit !== undefined
+            ? { pricingUnit: effectiveResolution.pricingUnit }
+            : {}),
+          ...(effectiveResolution.graceActive !== undefined
+            ? { graceActive: effectiveResolution.graceActive }
+            : {}),
+          ...(effectiveResolution.reason !== undefined
+            ? { reason: effectiveResolution.reason }
+            : {}),
+        },
+        grandfatheredBaseline,
       );
-      revoked = status.revoked;
-    }
-    const revocationListUnverifiable = verifiability.status === "unverifiable";
-    const effectiveResolution =
-      resolution.granted && (revoked || revocationListUnverifiable)
-        ? resolveEntitlement({ token: undefined, issuerPublicKey: issuer.issuerPublicKey, now })
-        : resolution;
-    const effectiveClaims =
-      resolution.granted && (revoked || revocationListUnverifiable) ? null : claims;
+      const licenseView = buildLicenseView({
+        resolution: effectiveResolution,
+        claims: effectiveClaims,
+      });
 
-    const grandfatheredBaseline =
-      record.status === "valid" ? record.data.grandfatheredBaseline : 0;
-    const cap = resolveFleetCap(
-      {
-        granted: effectiveResolution.granted,
-        tier: effectiveResolution.tier,
-        ...(effectiveResolution.entitledCount !== undefined
-          ? { entitledCount: effectiveResolution.entitledCount }
-          : {}),
-        ...(effectiveResolution.pricingUnit !== undefined
-          ? { pricingUnit: effectiveResolution.pricingUnit }
-          : {}),
-        ...(effectiveResolution.graceActive !== undefined
-          ? { graceActive: effectiveResolution.graceActive }
-          : {}),
-        ...(effectiveResolution.reason !== undefined
-          ? { reason: effectiveResolution.reason }
-          : {}),
-      },
-      grandfatheredBaseline,
-    );
-    const licenseView = buildLicenseView({
-      resolution: effectiveResolution,
-      claims: effectiveClaims,
-    });
-
-    let roster: Awaited<ReturnType<PostureFetcher>>;
-    try {
-      roster = await fetchPosture();
-    } catch (cause) {
-      if (cause instanceof DaemonPostureAuthError) {
-        // The daemon is UP and REFUSED us. Falling through to the
-        // roster-unavailable zeros here would sign a document asserting "no
-        // roster was found" when the truth is "a roster exists and we were not
-        // allowed to read it" - a silently DEGRADED attestation, which is the
-        // security downgrade AGENTS.md constraint 5 forbids. Fail loudly,
-        // non-zero, printing no document at all (the same posture this command
-        // already takes when custody will not unlock), and name the credential
-        // channel so the operator can fix it in one step.
-        write(
-          err,
-          "attest export: the local daemon refused the fleet-posture read " +
+      let roster: Awaited<ReturnType<PostureFetcher>>;
+      try {
+        roster = await fetchPosture();
+      } catch (cause) {
+        if (cause instanceof DaemonPostureAuthError) {
+          // The daemon is UP and REFUSED us. Falling through to the
+          // roster-unavailable zeros here would sign a document asserting "no
+          // roster was found" when the truth is "a roster exists and we were not
+          // allowed to read it" - a silently DEGRADED attestation, which is the
+          // security downgrade AGENTS.md constraint 5 forbids. Fail loudly,
+          // non-zero, printing no document at all (the same posture this command
+          // already takes when custody will not unlock), and name the credential
+          // channel so the operator can fix it in one step.
+          write(
+            err,
+            "attest export: the local daemon refused the fleet-posture read " +
             "(operator credential required).\n" +
             "  Export will NOT emit a degraded attestation that reports an " +
             "unmeasured roster as absent.\n" +
@@ -377,16 +380,16 @@ async function runExport(
             "token and re-run, or stop the daemon to attest the honestly " +
             "roster-unavailable posture.\n" +
             `  Detail: ${(cause as Error).message}\n`,
-        );
-        return 1;
+          );
+          return 1;
+        }
+        // The posture fetcher must never abort or corrupt an export; any OTHER
+        // failure (network, parse, unexpected shape) falls through to the
+        // honest roster-unavailable zeros below.
+        roster = null;
       }
-      // The posture fetcher must never abort or corrupt an export; any OTHER
-      // failure (network, parse, unexpected shape) falls through to the
-      // honest roster-unavailable zeros below.
-      roster = null;
-    }
-    const postureView: AttestationPostureView = roster
-      ? {
+      const postureView: AttestationPostureView = roster
+        ? {
           centralNodesTotal: roster.centralNodesTotal,
           admitted: roster.admitted,
           revoked: roster.revoked,
@@ -397,7 +400,7 @@ async function runExport(
           policyDistribution: roster.policyDistribution,
           bannerState: roster.bannerState,
         }
-      : {
+        : {
           // No posture source reachable at all: centralNodesTotal/admitted
           // are honestly 0 (a MEASURED fact - no roster was found), but
           // revoked/untrusted/evictionSerial/policyDistribution are `null`
@@ -413,26 +416,26 @@ async function runExport(
           bannerState: "roster_unavailable",
         };
 
-    const body = buildAttestationBody({
-      fortressId: issuer.issuerId,
-      issuerFingerprint: generateIdentityId(issuer.issuerPublicKey),
-      license: licenseView,
-      posture: postureView,
-      now: new Date(now * 1000).toISOString(),
-    });
-    const document = serializeSignedAttestation(body, issuer.sign, issuer.issuerPublicKey);
-    const rendered = JSON.stringify(document, null, 2);
+      const body = buildAttestationBody({
+        fortressId: issuer.issuerId,
+        issuerFingerprint: generateIdentityId(issuer.issuerPublicKey),
+        license: licenseView,
+        posture: postureView,
+        now: new Date(now * 1000).toISOString(),
+      });
+      const document = serializeSignedAttestation(body, issuer.sign, issuer.issuerPublicKey);
+      const rendered = JSON.stringify(document, null, 2);
 
-    if (flags.out) {
-      await writeFile(flags.out, `${rendered}\n`, "utf8");
-    }
-    write(out, `${rendered}\n`);
-    return 0;
+      if (flags.out) {
+        await writeFile(flags.out, `${rendered}\n`, "utf8");
+      }
+      write(out, `${rendered}\n`);
+      return 0;
+
+    });
   } catch (e) {
     write(err, `attest export: ${(e as Error).message}\n`);
     return 1;
-  } finally {
-    issuer.masterKey.fill(0);
   }
 }
 

@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /** Production home routes keep independent panels available across repeated producer waves. */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
@@ -275,7 +276,7 @@ it("measures the production route on a 10000-entry chain with a separate one-sec
       const encrypted_payload_bytes = toBase64url(stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(entry)), encryptionKey))));
       const envelope = { sequence, timestamp, prev_hash: previous, schema_version: AUDIT_CHAIN_SCHEMA_VERSION, encrypted_payload_bytes };
       const entry_hash = computeAuditEntryHash(envelope); previous = entry_hash;
-      pendingWrites.push(storage.write("_audit", `entry-${String(sequence).padStart(20, "0")}-fixture`, stringToBytes(JSON.stringify({ ...envelope, entry_hash }))));
+      pendingWrites.push(storage.write("_audit", `entry-${String(sequence).padStart(20, "0")}-fixture`, stringToBytes(JSON.stringify({ ...envelope, entry_hash })))); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       if (pendingWrites.length === FIXTURE_WRITE_CONCURRENCY) await Promise.all(pendingWrites.splice(0));
     }
     await Promise.all(pendingWrites);

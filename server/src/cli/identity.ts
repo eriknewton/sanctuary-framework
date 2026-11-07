@@ -21,7 +21,7 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { createIdentity } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import {
   consumeFlagValue,
@@ -217,61 +217,66 @@ async function cmdShow(
     const storage = new FilesystemStorage(stateStoragePath);
 
     // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-    const masterKey = await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       storagePathHint: config.storage_path,
     });
+    const masterKey = session.masterKey;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
 
-    const identityManager = new IdentityManager(storage, masterKey);
-    const loadResult = await identityManager.load();
+      const identityManager = new IdentityManager(storage, masterKey);
+      const loadResult = await identityManager.load();
 
-    if (loadResult.loaded === 0) {
-      write(
-        err,
-        loadResult.total > 0
-          ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
-          : "No identities found in this fortress.\n"
-      );
-      return 1;
-    }
+      if (loadResult.loaded === 0) {
+        write(
+          err,
+          loadResult.total > 0
+            ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
+            : "No identities found in this fortress.\n"
+        );
+        return 1;
+      }
 
-    const primary = identityManager.getDefault();
-    if (!primary) {
-      write(err, "No primary identity set.\n");
-      return 1;
-    }
+      const primary = identityManager.getDefault();
+      if (!primary) {
+        write(err, "No primary identity set.\n");
+        return 1;
+      }
 
-    if (json) {
-      write(
-        out,
-        JSON.stringify(
-          {
-            identity_id: primary.identity_id,
-            did: primary.did,
-            public_key: primary.public_key,
-            label: primary.label,
-            key_type: primary.key_type,
-            created_at: primary.created_at,
-            storage_path: config.storage_path,
-            total_identities: loadResult.loaded,
-          },
-          null,
-          2
-        ) + "\n"
-      );
-    } else {
-      write(out, `identity_id:      ${primary.identity_id}\n`);
-      write(out, `did:              ${primary.did}\n`);
-      write(out, `public_key:       ${primary.public_key}\n`);
-      write(out, `label:            ${primary.label}\n`);
-      write(out, `key_type:         ${primary.key_type}\n`);
-      write(out, `created_at:       ${primary.created_at}\n`);
-      write(out, `storage_path:     ${config.storage_path}\n`);
-      write(out, `total_identities: ${loadResult.loaded}\n`);
-    }
+      if (json) {
+        write(
+          out,
+          JSON.stringify(
+            {
+              identity_id: primary.identity_id,
+              did: primary.did,
+              public_key: primary.public_key,
+              label: primary.label,
+              key_type: primary.key_type,
+              created_at: primary.created_at,
+              storage_path: config.storage_path,
+              total_identities: loadResult.loaded,
+            },
+            null,
+            2
+          ) + "\n"
+        );
+      } else {
+        write(out, `identity_id:      ${primary.identity_id}\n`);
+        write(out, `did:              ${primary.did}\n`);
+        write(out, `public_key:       ${primary.public_key}\n`);
+        write(out, `label:            ${primary.label}\n`);
+        write(out, `key_type:         ${primary.key_type}\n`);
+        write(out, `created_at:       ${primary.created_at}\n`);
+        write(out, `storage_path:     ${config.storage_path}\n`);
+        write(out, `total_identities: ${loadResult.loaded}\n`);
+      }
 
-    return 0;
+      return 0;
+
+    });
   } catch (error) {
     write(
       err,
@@ -320,15 +325,25 @@ async function cmdCreate(
     await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
     const stateStoragePath = join(config.storage_path, "state");
     const storage = new FilesystemStorage(stateStoragePath);
+    const pendingWrites: Promise<void>[] = [];
+    const writeStorage = storage.write.bind(storage);
+    // Identity creation schedules primary metadata independently of saveNew.
+    // Retain custody until those writes settle, including on an output error.
+    storage.write = (...args) => {
+      const pending = writeStorage(...args);
+      pendingWrites.push(pending.then(() => undefined, () => undefined));
+      return pending;
+    };
 
     // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-    const masterKey = await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       storagePathHint: config.storage_path,
     });
-
-    try {
+    const masterKey = session.masterKey;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
       const identityManager = new IdentityManager(storage, masterKey);
       // Load any existing identities so we can report whether this is the
       // first (becomes primary) and so saveNew's conflict check has the
@@ -351,10 +366,7 @@ async function cmdCreate(
         ));
         await identityManager.saveNew(storedIdentity);
       } finally {
-        // Zero the symmetric key that wraps the new private key as soon as
-        // it has done its job (success or error), mirroring how the raw
-        // private key is zeroed inside createIdentity. masterKey itself is
-        // zeroed by the outer finally below.
+        // The derived wrapping key is no longer needed after identity persistence.
         identityEncKey.fill(0);
       }
 
@@ -393,16 +405,15 @@ async function cmdCreate(
           write(
             out,
             `\nNote: this fortress already had a default identity, so the new\n` +
-              `identity was added without changing the primary. Run\n` +
-              `"sanctuary identity show" to see the active (primary) identity.\n`
+            `identity was added without changing the primary. Run\n` +
+            `"sanctuary identity show" to see the active (primary) identity.\n`
           );
         }
       }
 
       return 0;
-    } finally {
-      masterKey.fill(0);
-    }
+
+    }, async () => { await Promise.all(pendingWrites); });
   } catch (error) {
     write(
       err,

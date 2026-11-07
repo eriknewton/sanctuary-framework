@@ -38,7 +38,7 @@ import { AuditLog } from "../operational/audit-log.js";
 import { MemoryStorage } from "../storage/memory.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { generateRandomKey } from "../core/random.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliFinalization, type CliMasterKeySession, closeCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import {
   EnglishPolicyCompiler,
   type CompiledPolicy,
@@ -176,82 +176,93 @@ SANCTUARY_POLICY_API_TOKEN.
  * passphrase is unavailable, or intelligence is not configured.
  */
 async function tryLoadSubstrateSelector(storagePath: string): Promise<{
+  session: CliMasterKeySession;
   selector: SubstrateSelector;
   auditLog: AuditLog;
   fortressId: string;
 } | null> {
-  try {
-    const intelligenceDir = resolve(storagePath, "state", "_intelligence");
-    if (!existsSync(intelligenceDir)) return null;
+  let session: CliMasterKeySession | undefined;
+  let sessionAuditLog: AuditLog | undefined;
+  let transferred = false;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return withCliFinalization(async () => {
+    try {
+      const intelligenceDir = resolve(storagePath, "state", "_intelligence");
+      if (!existsSync(intelligenceDir)) return null;
 
-    const passphrase = process.env["SANCTUARY_PASSPHRASE"];
-    if (!passphrase) {
-      // Don't attempt keychain resolution in a compile-preview command;
-      // require the env var for non-interactive substrate access.
+      const passphrase = process.env["SANCTUARY_PASSPHRASE"];
+      if (!passphrase) {
+        // Don't attempt keychain resolution in a compile-preview command;
+        // require the env var for non-interactive substrate access.
+        return null;
+      }
+
+      const storage = new FilesystemStorage(`${storagePath}/state`);
+      // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+      session = await resolveCliMasterKey(storage, {
+        passphrase,
+        bootstrap: true,
+        storagePathHint: storagePath,
+      });
+      const masterKey = session.masterKey;
+
+      const fortressId = `fortress:${storagePath}`;
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      const compiledContextRuntime = createCompiledContextRuntime({
+        storage,
+        masterKey,
+        auditLog,
+        fortressId: fortressIdFromStoragePath(storagePath),
+        identityId: fortressId,
+      });
+      const selector = new SubstrateSelector({
+        storage,
+        masterKey,
+        auditLog,
+        identityId: fortressId,
+        compiledContextScanner: compiledContextRuntime.scanner,
+      });
+      await selector.load();
+      // Rho-2.5 (privacy-leak class fix): the English-policy compile path
+      // routes LLM-assist through the frontier substrate, so the operator's
+      // English policy text could egress UNSCRUBBED if they opted into Tier
+      // B. Install the consent-gated redactor via THE shared chokepoint.
+      // The config store binds to the HASHED fortress id (the same id the
+      // dashboard route uses when the operator records their Tier B
+      // preference), NOT the raw `fortress:${storagePath}` identity id, so
+      // the live scrub reads the operator's actual persisted config.
+      installConsentGatedRedactor({
+        selector,
+        storage,
+        masterKey,
+        fortressId: fortressIdFromStoragePath(storagePath),
+      });
+      transferred = true;
+      return { session, selector, auditLog, fortressId };
+    } catch (cause) {
+      // NOT a blanket swallow. "Intelligence is not configured here" and "this
+      // fortress refused to load its intelligence state" are opposite facts, and
+      // returning null for both turned a refusal into a silent unarm: the
+      // compile preview would quietly proceed without LLM assist and never say
+      // that a tampered or unreadable record was the reason. Every refusal the
+      // load checkpoint raises is typed, so it propagates and the caller reports
+      // it, remedy verb included. Everything else (no fortress, no passphrase,
+      // unreadable custody) stays the honest "not available here" null.
+      //
+      // ONE class covers both refusal families because
+      // `IntelligenceConfigUnreadableError` (corrupt or version-too-new record)
+      // EXTENDS `LocalIntegrityStateLoadError` (armed record failed Q5
+      // validation); see the declaration in `../intelligence/policy-store.ts`.
+      // If those classes are ever separated, this line silently stops covering
+      // the unreadable case and the swallow returns. The tripwire is
+      // "pins the inheritance the compile-preview rethrow depends on" in
+      // `test/policy-engine/english-policy-compiler.test.ts`.
+      if (cause instanceof LocalIntegrityStateLoadError) throw cause;
       return null;
     }
 
-    const storage = new FilesystemStorage(`${storagePath}/state`);
-    // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-    const masterKey = await resolveCliMasterKey(storage, {
-      passphrase,
-      bootstrap: true,
-      storagePathHint: storagePath,
-    });
-
-    const fortressId = `fortress:${storagePath}`;
-    const auditLog = new AuditLog(storage, masterKey);
-    const compiledContextRuntime = createCompiledContextRuntime({
-      storage,
-      masterKey,
-      auditLog,
-      fortressId: fortressIdFromStoragePath(storagePath),
-      identityId: fortressId,
-    });
-    const selector = new SubstrateSelector({
-      storage,
-      masterKey,
-      auditLog,
-      identityId: fortressId,
-      compiledContextScanner: compiledContextRuntime.scanner,
-    });
-    await selector.load();
-    // Rho-2.5 (privacy-leak class fix): the English-policy compile path
-    // routes LLM-assist through the frontier substrate, so the operator's
-    // English policy text could egress UNSCRUBBED if they opted into Tier
-    // B. Install the consent-gated redactor via THE shared chokepoint.
-    // The config store binds to the HASHED fortress id (the same id the
-    // dashboard route uses when the operator records their Tier B
-    // preference), NOT the raw `fortress:${storagePath}` identity id, so
-    // the live scrub reads the operator's actual persisted config.
-    installConsentGatedRedactor({
-      selector,
-      storage,
-      masterKey,
-      fortressId: fortressIdFromStoragePath(storagePath),
-    });
-    return { selector, auditLog, fortressId };
-  } catch (cause) {
-    // NOT a blanket swallow. "Intelligence is not configured here" and "this
-    // fortress refused to load its intelligence state" are opposite facts, and
-    // returning null for both turned a refusal into a silent unarm: the
-    // compile preview would quietly proceed without LLM assist and never say
-    // that a tampered or unreadable record was the reason. Every refusal the
-    // load checkpoint raises is typed, so it propagates and the caller reports
-    // it, remedy verb included. Everything else (no fortress, no passphrase,
-    // unreadable custody) stays the honest "not available here" null.
-    //
-    // ONE class covers both refusal families because
-    // `IntelligenceConfigUnreadableError` (corrupt or version-too-new record)
-    // EXTENDS `LocalIntegrityStateLoadError` (armed record failed Q5
-    // validation); see the declaration in `../intelligence/policy-store.ts`.
-    // If those classes are ever separated, this line silently stops covering
-    // the unreadable case and the swallow returns. The tripwire is
-    // "pins the inheritance the compile-preview rethrow depends on" in
-    // `test/policy-engine/english-policy-compiler.test.ts`.
-    if (cause instanceof LocalIntegrityStateLoadError) throw cause;
-    return null;
-  }
+  }, async () => { if (session && !transferred) await closeCliMasterKeySession(session, () => sessionAuditLog?.flush() ?? Promise.resolve()); });
 }
 
 async function cmdCompile(
@@ -272,38 +283,43 @@ async function cmdCompile(
     ctx.storagePath ?? resolveStoragePath(),
   );
 
-  const storage = fortress ? undefined : new MemoryStorage();
-  const masterKey = fortress ? undefined : generateRandomKey();
-  const auditLog = fortress?.auditLog ?? new AuditLog(storage!, masterKey!);
-  const fortressId = fortress?.fortressId ?? "cli-local";
 
-  const compiler = new EnglishPolicyCompiler({
-    auditLog,
-    fortressId,
-    selector: fortress?.selector ?? null,
-  });
-  const compiled = await compiler.compile({
-    english_text: englishText,
-    observed_at: new Date().toISOString(),
-    operator_id: "cli-operator",
-  });
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return withCliFinalization(async () => {
+    const storage = fortress ? undefined : new MemoryStorage();
+    const masterKey = fortress ? undefined : generateRandomKey();
+    const auditLog = fortress?.auditLog ?? new AuditLog(storage!, masterKey!);
+    const fortressId = fortress?.fortressId ?? "cli-local";
 
-  // v1.3.0 (BBBBB): surface a clearer message when LLM-assist is unavailable.
-  if (
-    !fortress?.selector &&
-    compiled.compile_warnings?.some((w: string) => w.includes("LLM-assist disabled"))
-  ) {
-    ctx.err.write(
-      "LLM-assist requires intelligence substrate. " +
+    const compiler = new EnglishPolicyCompiler({
+      auditLog,
+      fortressId,
+      selector: fortress?.selector ?? null,
+    });
+    const compiled = await compiler.compile({
+      english_text: englishText,
+      observed_at: new Date().toISOString(),
+      operator_id: "cli-operator",
+    });
+
+    // v1.3.0 (BBBBB): surface a clearer message when LLM-assist is unavailable.
+    if (
+      !fortress?.selector &&
+      compiled.compile_warnings?.some((w: string) => w.includes("LLM-assist disabled"))
+    ) {
+      ctx.err.write(
+        "LLM-assist requires intelligence substrate. " +
         "Set SANCTUARY_PASSPHRASE, then pick a model in the dashboard " +
         "Intelligence picker or set a substrate env var " +
         "(OLLAMA_HOST for local, or VENICE_API_KEY / ANTHROPIC_API_KEY / " +
         "OPENAI_API_KEY for a hosted model).\n",
-    );
-  }
+      );
+    }
 
-  ctx.out.write(formatCompiledHumanReadable(compiled) + "\n");
-  return 0;
+    ctx.out.write(formatCompiledHumanReadable(compiled) + "\n");
+    return 0;
+
+  }, async () => { if (fortress) await closeCliMasterKeySession(fortress.session, () => fortress.auditLog.flush()); });
 }
 
 async function cmdDrafts(
@@ -378,78 +394,85 @@ async function cmdDraftsActivate(
 
   // Audit BEFORE the HTTP call so a partial-failure (audit succeeds but
   // HTTP fails) still leaves a record of the intent.
+  const draftId = parsed.draftId;
   let auditLog: AuditLog | null = null;
   let auditIdentityId = "cli";
-  try {
-    const storagePath = ctx.storagePath ?? (await loadConfig()).storage_path;
-    const storage = new FilesystemStorage(`${storagePath}/state`);
-    let passphrase = process.env["SANCTUARY_PASSPHRASE"];
-    if (!passphrase) {
-      // Scope the passphrase lookup to the fortress this command already
-      // resolved. Calling with no argument re-resolves ambiently from the
-      // environment, which reads and can create the HOME fortress's
-      // passphrase (and its keyring entry) even when the caller selected a
-      // different fortress with --fortress.
-      const resolved = await getOrCreatePassphrase({ storagePath });
-      passphrase = resolved.value;
-    }
-    // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-    const masterKey = await resolveCliMasterKey(storage, {
-      passphrase,
-      bootstrap: true,
-      storagePathHint: storagePath,
-    });
-    auditLog = new AuditLog(storage, masterKey);
-    const fortressId = fortressIdFromStoragePath(storagePath);
-    auditIdentityId = `fortress:${fortressId}`;
-    await auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
-      draft_id: parsed.draftId,
-      api_base: base,
-      acknowledge_conflicts: parsed.acknowledgeConflicts,
-    });
-  } catch { /* audit best-effort */ }
-
-  const res = await fetch(
-    `${base}/api/policy/drafts/${encodeURIComponent(parsed.draftId)}/activate`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
+  let session: CliMasterKeySession | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return withCliFinalization(async () => {
+    try {
+      const storagePath = ctx.storagePath ?? (await loadConfig()).storage_path;
+      const storage = new FilesystemStorage(`${storagePath}/state`);
+      let passphrase = process.env["SANCTUARY_PASSPHRASE"];
+      if (!passphrase) {
+        // Scope the passphrase lookup to the fortress this command already
+        // resolved. Calling with no argument re-resolves ambiently from the
+        // environment, which reads and can create the HOME fortress's
+        // passphrase (and its keyring entry) even when the caller selected a
+        // different fortress with --fortress.
+        const resolved = await getOrCreatePassphrase({ storagePath });
+        passphrase = resolved.value;
+      }
+      // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+      session = await resolveCliMasterKey(storage, {
+        passphrase,
+        bootstrap: true,
+        storagePathHint: storagePath,
+      });
+      const masterKey = session.masterKey;
+      auditLog = new AuditLog(storage, masterKey);
+      const fortressId = fortressIdFromStoragePath(storagePath);
+      auditIdentityId = `fortress:${fortressId}`;
+      await auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
+        draft_id: parsed.draftId,
+        api_base: base,
         acknowledge_conflicts: parsed.acknowledgeConflicts,
-        force_conflict_ids: parsed.forceConflictIds,
-      }),
-    },
-  );
-  const body = await res.json() as {
-    ok: boolean;
-    error?: string;
-    detail?: string;
-    data?: { record?: { status?: string } };
-  };
-  if (!res.ok || !body.ok) {
-    if (auditLog) {
-      // Awaited so the entry is durable before the CLI exits, but kept
-      // best-effort to match the intent-audit above: an audit-storage error
-      // (e.g. lock contention with a live daemon) must not mask the
-      // activation failure being reported to the operator.
-      try {
-        await auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
-          draft_id: parsed.draftId,
-          api_base: base,
-          http_status: res.status,
-          error: body.error ?? res.statusText,
-        }, "failure");
-      } catch { /* audit best-effort */ }
+      });
+    } catch { /* audit best-effort */ }
+
+    const res = await fetch(
+      `${base}/api/policy/drafts/${encodeURIComponent(draftId)}/activate`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          acknowledge_conflicts: parsed.acknowledgeConflicts,
+          force_conflict_ids: parsed.forceConflictIds,
+        }),
+      },
+    );
+    const body = await res.json() as {
+      ok: boolean;
+      error?: string;
+      detail?: string;
+      data?: { record?: { status?: string } };
+    };
+    if (!res.ok || !body.ok) {
+      if (auditLog) {
+        // Awaited so the entry is durable before the CLI exits, but kept
+        // best-effort to match the intent-audit above: an audit-storage error
+        // (e.g. lock contention with a live daemon) must not mask the
+        // activation failure being reported to the operator.
+        try {
+          await auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
+            draft_id: parsed.draftId,
+            api_base: base,
+            http_status: res.status,
+            error: body.error ?? res.statusText,
+          }, "failure");
+        } catch { /* audit best-effort */ }
+      }
+      ctx.err.write(`activation failed: ${body.error ?? res.statusText}\n`);
+      if (body.detail) ctx.err.write(`${body.detail}\n`);
+      return 1;
     }
-    ctx.err.write(`activation failed: ${body.error ?? res.statusText}\n`);
-    if (body.detail) ctx.err.write(`${body.detail}\n`);
-    return 1;
-  }
-  ctx.out.write(`activated: ${body.data?.record?.status ?? "activated"}\n`);
-  return 0;
+    ctx.out.write(`activated: ${body.data?.record?.status ?? "activated"}\n`);
+    return 0;
+
+  }, async () => { if (session) await closeCliMasterKeySession(session, async () => { try { await auditLog?.flush(); } catch { /* audit best-effort */ } }); });
 }
 
 interface ParsedDraftCommandArgs {

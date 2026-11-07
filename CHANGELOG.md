@@ -6,16 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Added
-
-- macOS Castle Wall counts repeated admitted flow decisions in fixed-size informational summaries and reports pending audit loss through heartbeat and stop diagnostics. Admission memory lasts for one consumer lifetime; restart restores the last durable primary position, so a previously counted fresh sequence can be admitted again.
-
-### Fixed
-
-- The posture page and sanctuary_active_protections now share one protection-observation path. Identity and Encrypted vault use observed runtime evidence and stay unknown when it is unavailable.
-
-- Castle Wall daemon stop uses a twelve-second shared budget, with a sixteen-second CLI exit backstop and closed flow admission during teardown.
-
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
 - `sanctuary-linux policy-install`, `start` and `enable` refuse a policy whose `scope.agent_ids` entries are not the confined `uid-<agent uid>` form for the installed agent uid. An install carrying another form must re-sign its policy with the `uid-<uid>` form and reinstall it; `start` and `enable` refuse until then.
@@ -23,6 +13,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### `@sanctuary-framework/quickstart` 0.2.0 (separate npm package, not in this release)
 
 - `@sanctuary-framework/quickstart` 0.2.0: publishing is opt-in. In a terminal it shows the destination and the exact request body and asks `[y/N]` (default No); `--publish` publishes without asking, `--no-publish` never publishes, and a run without a terminal does not publish unless `--publish` is given. The local identity exists before the publish decision in every case. A saved identity in `~/.sanctuary/quickstart-identity.json` is reused and never rewritten; `--new-identity` mints a fresh one after copying the old file to a backup.
+
+## [1.9.0-rc.4] - 2026-11-07
+
+Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 until 1.9.0 ships. Makes shutdown and error reporting more dependable across the CLI, the dashboard, `sanctuary protect` and Hermes save recovery, and carries the Castle Wall and posture work merged since rc.3. No signed macOS app is attached to this preview yet; the v1.8.4 app does not pair with it. CI and test-only changes carry no notes line. Everything else in the rc.3, rc.2 and rc.1 notes below still applies.
+
+### Shutdown and error reporting
+
+- **A command that cannot release the fortress says so.** If a command cannot release the fortress cleanly when it finishes, it prints "Fortress custody could not be released cleanly; any work the command already reported as complete was committed." followed by the error detail, and exits with status 1. Every other failure keeps its existing message.
+- **A fatal dashboard unlock failure ends with a nonzero exit.** When an unlock on a parked dashboard fails in a way that requires shutdown, the dashboard stops and exits with a nonzero status, even if the stop itself fails. A wrong credential still leaves the dashboard parked for another try. If cleanup fails during an unlock, the dashboard prints "Sanctuary Dashboard: cleanup failed." and refuses further unlocks until it is restarted. A stop that a signal started leaves the exit status to the signal handler.
+- **`sanctuary protect` shows its reason first.** When protect has started the dashboard and then refuses or fails, the refusal or error message is printed before the dashboard shuts down, so the reason stays on screen while shutdown finishes.
+
+### Hermes memory
+
+- **Save recovery reports a cleanup failure as one.** When `sanctuary hermes recover-save` held the fortress, changed nothing, and the release then fails, it prints the custody release sentence above instead of the refusal for a live bridge. If the command refused for its own reason first, that refusal is printed, followed by the custody release sentence. The exit status is 1 in both cases. After an `--apply` action has begun, its existing messages are unchanged.
+- **Save recovery proceeds after a crashed holder in one run.** When a process that held the fortress has exited and left its lock behind, `recover-save` cleans the lock up once and continues, instead of refusing the first time. A live holder is still refused at once.
+- **Custody refusals carry a typed local diagnostic.** A recovery refused for exclusive custody also records a typed in-process diagnostic for code running in the same process. Nothing leaves the process.
+
+### Castle Wall and posture
+
+- **Repeated admitted flows are summarized (macOS).** Castle Wall counts repeated admitted flow decisions in fixed-size informational summaries and reports pending audit loss through heartbeat and stop diagnostics. Admission memory lasts for one consumer lifetime; restart restores the last durable primary position, so a previously counted fresh sequence can be admitted again.
+- **The posture page and `sanctuary_active_protections` share one observation path.** Identity and Encrypted vault use observed runtime evidence and stay unknown when it is unavailable.
+- **Castle Wall stop has one budget.** The daemon stop uses a twelve-second shared budget, with a sixteen-second CLI exit backstop and closed flow admission during teardown.
+
+### Other
+
+- The MCP SDK dependency is updated to 1.32.2, with other minor and patch dependency updates.
+
+### Security
+
+- Fortress custody and shutdown hardening; a notice with affected and fixed versions follows under the coordinated-disclosure terms in SECURITY.md.
+
+### Capability bounds
+
+- In `sanctuary hermes recover-save`, the message can be less specific than either failure alone when two happen together. A recovery step that fails and is then followed by a release failure prints only the recovery step's message. A custody check that fails as the command finishes is described as a release failure, even when the release itself succeeded. The exit status is 1 in both cases, and no failure reads as success.
+- Release failures while a server starts (the MCP server, the broker server or `sanctuary dashboard`) still print the general start-failure message, with the full error detail, and exit with status 1.
 
 ## [1.9.0-rc.3] - 2026-11-05
 

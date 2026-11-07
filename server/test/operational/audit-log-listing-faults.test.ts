@@ -1,4 +1,4 @@
-// fail-before-exempt: A1a root_daemon fixture identity and recount schedule updates; survivor assertions cover the listing change, existing base fault schedules remain.
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -407,7 +407,7 @@ describe("metadata observation contract on real files", () => {
 
   it("skips a dangling name and seeds the recount from surviving entries", async () => {
     const { raw, log, path } = await setup(3);
-    await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-00000000000000000000-dangling.enc"));
+    await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-00000000000000000000-dangling.enc")); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     const seed = vi.spyOn(log as any, "seedRetention");
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
     await log.appendCritical(measureEntry(3));
@@ -428,7 +428,7 @@ describe("metadata observation contract on real files", () => {
       injectRecountEnoent(raw, path, schedule);
       await log.appendCritical(measureEntry(3));
       expect(seed).not.toHaveBeenCalled();
-      const tail = (await raw.listKeys("_audit")).filter((key) => key.startsWith("entry-00000000000000000004-"))[0]!;
+      const tail = (await raw.listKeys("_audit")).filter((key) => key.startsWith("entry-00000000000000000004-"))[0]!; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       expect((log as any).retainedBytesEstimate).toBe(before + (await raw.read("_audit", tail))!.length);
       expect((log as any).bytesProvenance).toBe("unknown");
       expect(recountLines(diagnostic)).toEqual([[`${AUDIT_RECOUNT_DIAGNOSTIC_PREFIX} failed`]]);
@@ -468,7 +468,7 @@ describe("metadata observation contract on real files", () => {
     const { raw, log, path } = await setup();
     const b = new AuditLog(new FilesystemStorage(path), MEASURE_MASTER_KEY, MEASURE_CONFIG);
     await b.appendCritical(measureEntry(3));
-    await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-00000000000000000000-dangling.enc"));
+    await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-00000000000000000000-dangling.enc")); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     const original = fs.stat;
     const stats = vi.spyOn(fs, "stat").mockImplementation(original); syncBuiltinESMExports();
     const discovery = (log as any).freshenChainStateFromDisk.bind(log);
@@ -496,7 +496,7 @@ describe("metadata observation contract on real files", () => {
       if (args[1] === "__head_anchor") injectFsFault("readdir", join(path, "_audit"));
     });
     await log.appendCritical(measureEntry(3));
-    expect(await raw.read("_audit_checkpoints", "audit-checkpoint-00000000000000000004")).not.toBeNull();
+    expect(await raw.read("_audit_checkpoints", "audit-checkpoint-00000000000000000004")).not.toBeNull(); // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
     await expect(new AuditLog(raw, MEASURE_MASTER_KEY, MEASURE_CONFIG).query({ limit: 1 }))
       .rejects.toMatchObject({ name: "AuditIntegrityError", findings: expect.arrayContaining([expect.objectContaining({ kind: "storage_unavailable" })]) });
   });
@@ -506,7 +506,7 @@ it("skips an absent listed tail body and continues backward to the real tail", a
   const { raw, log, path } = await setup();
   const b = new AuditLog(new FilesystemStorage(path), MEASURE_MASTER_KEY, MEASURE_CONFIG);
   await b.appendCritical(measureEntry(3));
-  const vanishedKey = "entry-99999999999999999999-vanished";
+  const vanishedKey = "entry-99999999999999999999-vanished"; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
   await raw.write("_audit", vanishedKey, encode({ malformed: true }));
   const names = raw.listKeys.bind(raw);
   vi.spyOn(raw, "listKeys").mockImplementation(async (ns, prefix) => {
@@ -520,7 +520,7 @@ it("skips an absent listed tail body and continues backward to the real tail", a
 
 it("retains the custody refusal when the tail candidate itself is a dangling symlink", async () => {
   const { log, path } = await setup();
-  await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-99999999999999999999-dangling.enc"));
+  await fs.symlink(join(root, "missing"), join(path, "_audit", "entry-99999999999999999999-dangling.enc")); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
   await expect(log.appendCritical(measureEntry(3))).rejects.toMatchObject({ code: "symlink_rejected" });
   expect(log.currentInMemorySequence()).toBe(3);
 });
@@ -548,7 +548,7 @@ for (const collapse of [false, true]) {
       expect((log as any).retainedBytesEstimate).toBe(seedBefore);
       expect(recountLines(diagnostic)).toHaveLength(1);
     } else {
-      const suffix = (await raw.list("_audit")).filter((meta) => meta.key.startsWith("entry-00000000000000000005-"));
+      const suffix = (await raw.list("_audit")).filter((meta) => meta.key.startsWith("entry-00000000000000000005-")); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       expect(suffix).toHaveLength(1);
       expect((log as any).retainedCountExpected).toBe(1);
       expect((log as any).retainedBytesEstimate).toBe(suffix[0]!.size_bytes);

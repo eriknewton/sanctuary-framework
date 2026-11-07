@@ -134,11 +134,13 @@ describe("runCortexExportCommand: fortress-backed sink wiring", () => {
     // Bootstrap a real passphrase-mode fortress so the CLI's unbootstrapped
     // `resolveCliMasterKey` unlocks the existing custody envelope.
     const storage = new FilesystemStorage(join(fortress, "state"));
-    await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
     });
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
   });
 
   afterEach(() => {

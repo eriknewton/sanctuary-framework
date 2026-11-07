@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * IC-05-DG rule-12 fault-injection schedules: §f-9 (crash-ordering matrix),
  * §f-10 (the LD6 delayed-completion / BP-DEADLINE class), and §f-11 (the
@@ -54,7 +55,7 @@ describe("IC-05-DG §f-9: crash-ordering matrix (arm / signed-pair / incident-pa
     // audit record)...
     const record = await storage.read(
       CHECKPOINT_NAMESPACE,
-      "audit-checkpoint-" + String(1).padStart(20, "0")
+      "audit-checkpoint-" + String(1).padStart(20, "0") // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
     );
     expect(record).not.toBeNull();
     // ...and the recovery pass is hard once, warn thereafter (a §d-named

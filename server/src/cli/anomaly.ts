@@ -31,7 +31,7 @@
 
 import { loadConfig } from "../config.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, withCliMasterKeySession, closeCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
@@ -215,17 +215,27 @@ async function cmdSubscribe(
   const storagePath = await resolveStoragePath(ctx.args);
   const entry = findCatalogEntry(detectorId, classifierId);
   if (!entry) {
+    let session: CliMasterKeySession | undefined;
+    let auditLog: AuditLog | undefined;
     try {
-      const masterKey = await deriveFortressMasterKey(ctx);
+      session = await deriveFortressMasterKey(ctx);
+      const masterKey = session.masterKey;
       const storage = new FilesystemStorage(`${storagePath}/state`);
       const fortressId = fortressIdFromStoragePath(storagePath);
-      const auditLog = new AuditLog(storage, masterKey);
+      auditLog = new AuditLog(storage, masterKey);
       await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
         detector_id: detectorId,
         classifier_id: classifierId,
         subscription_path: `${storagePath}/anomaly-subscriptions.json`,
       }, "failure");
-    } catch { /* audit best-effort; do not mask the original error */ }
+    } catch (error) {
+      if (error instanceof MasterEstablishmentReleaseError) throw error;
+      // Ordinary audit failures preserve the command outcome.
+    }
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    if (session) await closeCliMasterKeySession(session, async () => {
+      try { await auditLog?.flush(); } catch { /* audit best-effort */ }
+    });
     ctx.err.write(
       `Unknown detector/classifier pair: ${detectorId} / ${classifierId}\n`,
     );
@@ -243,26 +253,33 @@ async function cmdSubscribe(
     return 0;
   }
   subscribed.push({ detector_id: detectorId, classifier_id: classifierId });
-  const masterKey = await deriveFortressMasterKey(ctx);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  const auditLog = new AuditLog(storage, masterKey);
-  // LOW-G (coordinator gate, 2026-08-22): moved BEFORE
-  // saveAnomalySubscriptions - the file below is not itself encrypted
-  // fortress state, but recovery must still run before ANY further write
-  // this verb makes, not only before the audit append that used to follow
-  // it. See index.ts's matching call site for the full rationale.
-  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-  await saveAnomalySubscriptions(storagePath, subscribed);
-  await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
-    detector_id: detectorId,
-    classifier_id: classifierId,
-    subscription_path: `${storagePath}/anomaly-subscriptions.json`,
-  });
-  ctx.out.write(
-    `Subscribed: ${detectorId} [classifier: ${classifierId}]\nRestart Sanctuary or wait for the next dispatcher tick.\n`,
-  );
-  return 0;
+  const session = await deriveFortressMasterKey(ctx);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    // LOW-G (coordinator gate, 2026-08-22): moved BEFORE
+    // saveAnomalySubscriptions - the file below is not itself encrypted
+    // fortress state, but recovery must still run before ANY further write
+    // this verb makes, not only before the audit append that used to follow
+    // it. See index.ts's matching call site for the full rationale.
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    await saveAnomalySubscriptions(storagePath, subscribed);
+    await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
+      detector_id: detectorId,
+      classifier_id: classifierId,
+      subscription_path: `${storagePath}/anomaly-subscriptions.json`,
+    });
+    ctx.out.write(
+      `Subscribed: ${detectorId} [classifier: ${classifierId}]\nRestart Sanctuary or wait for the next dispatcher tick.\n`,
+    );
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdUnsubscribe(
@@ -295,23 +312,30 @@ async function cmdUnsubscribe(
     );
     return 0;
   }
-  const masterKey = await deriveFortressMasterKey(ctx);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  const auditLog = new AuditLog(storage, masterKey);
-  // LOW-G (coordinator gate, 2026-08-22): moved BEFORE
-  // saveAnomalySubscriptions; see cmdSubscribe's matching call.
-  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-  await saveAnomalySubscriptions(storagePath, filtered);
-  await auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
-    detector_id: detectorId,
-    classifier_id: classifierId,
-    subscription_path: `${storagePath}/anomaly-subscriptions.json`,
-  });
-  ctx.out.write(
-    `Unsubscribed: ${detectorId} [classifier: ${classifierId}]\n`,
-  );
-  return 0;
+  const session = await deriveFortressMasterKey(ctx);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    // LOW-G (coordinator gate, 2026-08-22): moved BEFORE
+    // saveAnomalySubscriptions; see cmdSubscribe's matching call.
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    await saveAnomalySubscriptions(storagePath, filtered);
+    await auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
+      detector_id: detectorId,
+      classifier_id: classifierId,
+      subscription_path: `${storagePath}/anomaly-subscriptions.json`,
+    });
+    ctx.out.write(
+      `Unsubscribed: ${detectorId} [classifier: ${classifierId}]\n`,
+    );
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdFindings(
@@ -326,54 +350,62 @@ async function cmdFindings(
     return await cmdFindingsShow(argv.slice(1), ctx);
   }
   const filters = parseFindingFilters(argv);
-  const masterKey = await deriveFortressMasterKey(ctx);
-  const storagePath = await resolveStoragePath(ctx.args);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  // Codex gate net-new (2026-08-22): a read verb, but it derives a master
-  // key, so it was missed by the mechanical fortress-open recovery pin.
-  // An AuditLog constructed for this sole purpose is cheap.
-  await recoverInterruptedExitImportsOrThrow(storage, new AuditLog(storage, masterKey));
-  const store = new SentinelFindingStore({
-    storage,
-    masterKey,
-    fortressId,
-  });
-  const filterSentinelId =
-    filters.detectorId !== undefined
-      ? `${ANOMALY_SENTINEL_ID_PREFIX}${filters.detectorId}`
-      : undefined;
-  const allFindings = await store.listFindings({
-    limit: filters.limit ?? 100,
-    ...(filters.since !== undefined ? { since: filters.since } : {}),
-    ...(filters.severity !== undefined ? { severity: filters.severity } : {}),
-    ...(filterSentinelId !== undefined
-      ? { sentinelId: filterSentinelId }
-      : {}),
-    ...(filters.agentId !== undefined ? { agentId: filters.agentId } : {}),
-  });
-  // Always narrow to anomaly:* prefix when no detector filter was set
-  // so this CLI does not surface Phi-1 sentinel findings.
-  const anomalyFindings =
-    filterSentinelId !== undefined
-      ? allFindings
-      : allFindings.filter((f) =>
+  const session = await deriveFortressMasterKey(ctx);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const storagePath = await resolveStoragePath(ctx.args);
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    // Codex gate net-new (2026-08-22): a read verb, but it derives a master
+    // key, so it was missed by the mechanical fortress-open recovery pin.
+    // An AuditLog constructed for this sole purpose is cheap.
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    const store = new SentinelFindingStore({
+      storage,
+      masterKey,
+      fortressId,
+    });
+    const filterSentinelId =
+      filters.detectorId !== undefined
+        ? `${ANOMALY_SENTINEL_ID_PREFIX}${filters.detectorId}`
+        : undefined;
+    const allFindings = await store.listFindings({
+      limit: filters.limit ?? 100,
+      ...(filters.since !== undefined ? { since: filters.since } : {}),
+      ...(filters.severity !== undefined ? { severity: filters.severity } : {}),
+      ...(filterSentinelId !== undefined
+        ? { sentinelId: filterSentinelId }
+        : {}),
+      ...(filters.agentId !== undefined ? { agentId: filters.agentId } : {}),
+    });
+    // Always narrow to anomaly:* prefix when no detector filter was set
+    // so this CLI does not surface Phi-1 sentinel findings.
+    const anomalyFindings =
+      filterSentinelId !== undefined
+        ? allFindings
+        : allFindings.filter((f) =>
           f.sentinel_id.startsWith(ANOMALY_SENTINEL_ID_PREFIX),
         );
-  if (anomalyFindings.length === 0) {
-    ctx.out.write("(no findings)\n");
+    if (anomalyFindings.length === 0) {
+      ctx.out.write("(no findings)\n");
+      return 0;
+    }
+    for (const finding of anomalyFindings) {
+      const detectorId =
+        (finding.details["detector_id"] as string | undefined) ?? "";
+      const score = finding.details["anomaly_score"];
+      const scoreStr = typeof score === "number" ? ` score=${score.toFixed(2)}` : "";
+      ctx.out.write(
+        `[${finding.observed_at}] ${finding.severity.toUpperCase()} ${detectorId}${finding.agent_id ? ` (agent ${finding.agent_id})` : ""}${scoreStr}: ${finding.summary}\n`,
+      );
+    }
     return 0;
-  }
-  for (const finding of anomalyFindings) {
-    const detectorId =
-      (finding.details["detector_id"] as string | undefined) ?? "";
-    const score = finding.details["anomaly_score"];
-    const scoreStr = typeof score === "number" ? ` score=${score.toFixed(2)}` : "";
-    ctx.out.write(
-      `[${finding.observed_at}] ${finding.severity.toUpperCase()} ${detectorId}${finding.agent_id ? ` (agent ${finding.agent_id})` : ""}${scoreStr}: ${finding.summary}\n`,
-    );
-  }
-  return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdFindingsShow(
@@ -389,25 +421,33 @@ async function cmdFindingsShow(
     ctx.err.write("findings show requires a finding-id\n");
     return 2;
   }
-  const masterKey = await deriveFortressMasterKey(ctx);
-  const storagePath = await resolveStoragePath(ctx.args);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  await recoverInterruptedExitImportsOrThrow(storage, new AuditLog(storage, masterKey));
-  const store = new SentinelFindingStore({ storage, masterKey, fortressId });
-  const finding = await store.loadFinding(findingId);
-  if (!finding) {
-    ctx.err.write(`Finding not found: ${findingId}\n`);
-    return 1;
-  }
-  if (!finding.sentinel_id.startsWith(ANOMALY_SENTINEL_ID_PREFIX)) {
-    ctx.err.write(
-      `Finding ${findingId} is not an anomaly finding; try sanctuary sentinel findings.\n`,
-    );
-    return 1;
-  }
-  ctx.out.write(JSON.stringify(finding, null, 2) + "\n");
-  return 0;
+  const session = await deriveFortressMasterKey(ctx);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const storagePath = await resolveStoragePath(ctx.args);
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    const store = new SentinelFindingStore({ storage, masterKey, fortressId });
+    const finding = await store.loadFinding(findingId);
+    if (!finding) {
+      ctx.err.write(`Finding not found: ${findingId}\n`);
+      return 1;
+    }
+    if (!finding.sentinel_id.startsWith(ANOMALY_SENTINEL_ID_PREFIX)) {
+      ctx.err.write(
+        `Finding ${findingId} is not an anomaly finding; try sanctuary sentinel findings.\n`,
+      );
+      return 1;
+    }
+    ctx.out.write(JSON.stringify(finding, null, 2) + "\n");
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdClassifierState(
@@ -435,35 +475,43 @@ async function cmdClassifierState(
     );
     return 2;
   }
-  const masterKey = await deriveFortressMasterKey(ctx);
-  const storagePath = await resolveStoragePath(ctx.args);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  await recoverInterruptedExitImportsOrThrow(storage, new AuditLog(storage, masterKey));
-  const stateStore = new ClassifierStateStore({
-    storage,
-    masterKey,
-    fortressId,
-  });
-  const agentIds = await stateStore.listAgents(classifierId);
-  if (agentIds.length === 0) {
-    ctx.out.write("(no classifier state yet)\n");
-    return 0;
-  }
-  for (const agentId of agentIds) {
-    try {
-      const raw = await stateStore.loadState<{
-        sample_count?: number;
-      }>(classifierId, agentId);
-      if (raw === null) continue;
-      const sampleCount =
-        typeof raw.sample_count === "number" ? raw.sample_count : "?";
-      ctx.out.write(`${agentId}: sample_count=${sampleCount}\n`);
-    } catch {
-      ctx.out.write(`${agentId}: (load failed)\n`);
+  const session = await deriveFortressMasterKey(ctx);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const storagePath = await resolveStoragePath(ctx.args);
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    const stateStore = new ClassifierStateStore({
+      storage,
+      masterKey,
+      fortressId,
+    });
+    const agentIds = await stateStore.listAgents(classifierId);
+    if (agentIds.length === 0) {
+      ctx.out.write("(no classifier state yet)\n");
+      return 0;
     }
-  }
-  return 0;
+    for (const agentId of agentIds) {
+      try {
+        const raw = await stateStore.loadState<{
+          sample_count?: number;
+        }>(classifierId, agentId);
+        if (raw === null) continue;
+        const sampleCount =
+          typeof raw.sample_count === "number" ? raw.sample_count : "?";
+        ctx.out.write(`${agentId}: sample_count=${sampleCount}\n`);
+      } catch {
+        ctx.out.write(`${agentId}: (load failed)\n`);
+      }
+    }
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 interface FindingFilters {
@@ -505,7 +553,7 @@ async function resolveStoragePath(args: AnomalyArgs): Promise<string> {
 
 async function deriveFortressMasterKey(ctx: {
   args: AnomalyArgs;
-}): Promise<Uint8Array> {
+}): Promise<CliMasterKeySession> {
   const storagePath = await resolveStoragePath(ctx.args);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   let passphrase = ctx.args.passphrase ?? process.env["SANCTUARY_PASSPHRASE"];
@@ -519,12 +567,12 @@ async function deriveFortressMasterKey(ctx: {
     passphrase = resolved.value;
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase,
     bootstrap: true,
     storagePathHint: storagePath,
   });
-  return masterKey;
+  return session;
 }
 
 export type { AnomalySubscriptionTuple };

@@ -29,7 +29,7 @@ import {
   AuditLog,
 } from "../operational/audit-log.js";
 import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, withCliFinalization, closeCliMasterKeySession, withCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { bytesToString, fromBase64url, toBase64url } from "../core/encoding.js";
 import { resolveStoragePath } from "../paths.js";
 import {
@@ -168,7 +168,6 @@ async function runAnchorCommand(
     return 2;
   }
 
-  let masterKey: Uint8Array | undefined;
   try {
     // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
     // refuse, never silently resolve the default fortress; anchoring against
@@ -198,210 +197,222 @@ async function runAnchorCommand(
     if (verb === "status") {
       // Status needs the master key only to AUTHENTICATE the config; a
       // tampered config must be reported, not summarized.
-      masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
-      // Codex gate net-new (2026-08-22): this verb derives a master key
-      // and reads storage but never constructed an AuditLog, so it was
-      // missed by the mechanical fortress-open recovery pin. Construct one
-      // here (cheap) so recovery can run before the read below.
-      const statusAuditLog = new AuditLog(storage, masterKey);
-      await recoverInterruptedExitImportsOrThrow(storage, statusAuditLog);
-      const state = await readAnchorConfig({
-        storage,
-        masterKey,
-        abortState: TRANSPARENCY_NEVER_ABORTED,
-      });
-      const receipts =
-        state.status === "absent" ? [] : await readAnchorReceipts(storage);
-      const anchored = receipts.filter((r) => r.status === "anchored");
-      const failed = receipts.filter((r) => r.status === "failed");
-      const payload = {
-        anchoring:
-          state.status === "absent" ? "off (never enabled; default)" : state.status,
-        ...(state.status !== "absent"
-          ? {
+      const session = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+      const masterKey = session.masterKey;
+      let sessionAuditLog: AuditLog | undefined;
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      return await withCliMasterKeySession(session, async () => {
+        // Codex gate net-new (2026-08-22): this verb derives a master key
+        // and reads storage but never constructed an AuditLog, so it was
+        // missed by the mechanical fortress-open recovery pin. Construct one
+        // here (cheap) so recovery can run before the read below.
+        const statusAuditLog = new AuditLog(storage, masterKey);
+        sessionAuditLog = statusAuditLog;
+        await recoverInterruptedExitImportsOrThrow(storage, statusAuditLog);
+        const state = await readAnchorConfig({
+          storage,
+          masterKey,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
+        });
+        const receipts =
+          state.status === "absent" ? [] : await readAnchorReceipts(storage);
+        const anchored = receipts.filter((r) => r.status === "anchored");
+        const failed = receipts.filter((r) => r.status === "failed");
+        const payload = {
+          anchoring:
+            state.status === "absent" ? "off (never enabled; default)" : state.status,
+          ...(state.status !== "absent"
+            ? {
               rekor_url: state.config.rekor_url,
               // Surfaced unconditionally so the unsafe-URL override can
               // never be silently on.
               allow_unsafe_rekor_url: state.config.allow_unsafe_url,
             }
-          : {}),
-        receipts: {
-          anchored: anchored.length,
-          failed: failed.length,
-          latest_anchored_counter: anchored.at(-1)?.counter ?? null,
-        },
-      };
-      if (opts.flags["--json"]) {
-        write(out, JSON.stringify(payload, null, 2) + "\n");
-      } else {
-        write(out, `Anchoring: ${payload.anchoring}\n`);
-        if (state.status !== "absent") {
-          write(out, `Rekor log: ${state.config.rekor_url}\n`);
-          if (state.config.allow_unsafe_url) {
-            write(
-              out,
-              `WARNING: --allow-unsafe-rekor-url is in effect for this log URL (http and loopback/private/metadata addresses permitted). Re-run "anchor enable" without the flag to restore the default URL guard.\n`
-            );
+            : {}),
+          receipts: {
+            anchored: anchored.length,
+            failed: failed.length,
+            latest_anchored_counter: anchored.at(-1)?.counter ?? null,
+          },
+        };
+        if (opts.flags["--json"]) {
+          write(out, JSON.stringify(payload, null, 2) + "\n");
+        } else {
+          write(out, `Anchoring: ${payload.anchoring}\n`);
+          if (state.status !== "absent") {
+            write(out, `Rekor log: ${state.config.rekor_url}\n`);
+            if (state.config.allow_unsafe_url) {
+              write(
+                out,
+                `WARNING: --allow-unsafe-rekor-url is in effect for this log URL (http and loopback/private/metadata addresses permitted). Re-run "anchor enable" without the flag to restore the default URL guard.\n`
+              );
+            }
           }
-        }
-        write(
-          out,
-          `Receipts: ${anchored.length} anchored, ${failed.length} failed` +
+          write(
+            out,
+            `Receipts: ${anchored.length} anchored, ${failed.length} failed` +
             (anchored.length > 0
               ? ` (latest anchored checkpoint: ${anchored.at(-1)!.counter})`
               : "") +
             `\n`
-        );
-        if (failed.length > 0) {
-          write(
-            out,
-            `Retry failed anchors with: sanctuary transparency anchor now\n`
           );
+          if (failed.length > 0) {
+            write(
+              out,
+              `Retry failed anchors with: sanctuary transparency anchor now\n`
+            );
+          }
         }
-      }
-      return 0;
+        return 0;
+
+      }, () => sessionAuditLog?.flush() ?? Promise.resolve());
     }
 
-    masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
-    const auditLog = new AuditLog(storage, masterKey);
-    // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
-    // interrupted by a prior hard kill before this verb touches storage
-    // further. See index.ts's matching call site for the full rationale.
-    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-    const fortressId = fortressIdFromStoragePath(storagePath);
+    const session = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
+      // interrupted by a prior hard kill before this verb touches storage
+      // further. See index.ts's matching call site for the full rationale.
+      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+      const fortressId = fortressIdFromStoragePath(storagePath);
 
-    if (verb === "export") {
-      const doc = await buildAnchorsExport({
-        storage,
-        masterKey,
-        fortressId,
-        abortState: TRANSPARENCY_NEVER_ABORTED,
-      });
-      const anchored = doc.receipts.filter((r) => r.status === "anchored").length;
-      const json = JSON.stringify(doc, null, 2) + "\n";
-      if (opts.values["--output"]) {
-        await writeFile(opts.values["--output"]!, json, "utf8");
-        write(
-          err,
-          `Exported anchor evidence for ${doc.receipts.length} receipt(s) (${anchored} anchored) to ${opts.values["--output"]}\n` +
+      if (verb === "export") {
+        const doc = await buildAnchorsExport({
+          storage,
+          masterKey,
+          fortressId,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
+        });
+        const anchored = doc.receipts.filter((r) => r.status === "anchored").length;
+        const json = JSON.stringify(doc, null, 2) + "\n";
+        if (opts.values["--output"]) {
+          await writeFile(opts.values["--output"]!, json, "utf8");
+          write(
+            err,
+            `Exported anchor evidence for ${doc.receipts.length} receipt(s) (${anchored} anchored) to ${opts.values["--output"]}\n` +
             `This file contains the LOCAL commitment salt: whoever holds it can link this fortress's\n` +
             `public anchors to its checkpoint history. Hand it to auditors deliberately, with the bundle:\n` +
             `  sanctuary verify-transparency --input bundle.json --public-key <key> --check-anchors ${opts.values["--output"]}\n` +
             `Nothing was transmitted.\n`
-        );
-      } else {
-        write(out, json);
-      }
-      return 0;
-    }
-
-    if (verb === "enable") {
-      write(out, `\n${ANCHOR_CONSENT_TEXT}\n\n`);
-      if (!opts.flags["--yes"]) {
-        const confirmed = await confirmInteractive(
-          out,
-          "Enable transparency anchoring? [y/N] "
-        );
-        if (confirmed === null) {
-          write(
-            err,
-            "Not enabled: anchoring requires explicit consent. Re-run with --yes after reading the statement above, or answer interactively on a terminal.\n"
           );
-          return 2;
+        } else {
+          write(out, json);
         }
-        if (!confirmed) {
-          write(err, "Not enabled (operator declined). Nothing was transmitted or changed.\n");
-          return 2;
-        }
+        return 0;
       }
-      const config = await enableAnchoring({
-        storage,
-        masterKey,
-        auditLog,
-        fortressId,
-        abortState: TRANSPARENCY_NEVER_ABORTED,
-        ...(opts.values["--rekor-url"]
-          ? { rekorUrl: opts.values["--rekor-url"] }
-          : {}),
-        ...(opts.flags["--allow-unsafe-rekor-url"]
-          ? { allowUnsafeRekorUrl: true }
-          : {}),
-      });
-      write(
-        out,
-        `Anchoring ENABLED (log: ${config.rekor_url}). Consent recorded in the audit log.\n` +
+
+      if (verb === "enable") {
+        write(out, `\n${ANCHOR_CONSENT_TEXT}\n\n`);
+        if (!opts.flags["--yes"]) {
+          const confirmed = await confirmInteractive(
+            out,
+            "Enable transparency anchoring? [y/N] "
+          );
+          if (confirmed === null) {
+            write(
+              err,
+              "Not enabled: anchoring requires explicit consent. Re-run with --yes after reading the statement above, or answer interactively on a terminal.\n"
+            );
+            return 2;
+          }
+          if (!confirmed) {
+            write(err, "Not enabled (operator declined). Nothing was transmitted or changed.\n");
+            return 2;
+          }
+        }
+        const config = await enableAnchoring({
+          storage,
+          masterKey,
+          auditLog,
+          fortressId,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
+          ...(opts.values["--rekor-url"]
+            ? { rekorUrl: opts.values["--rekor-url"] }
+            : {}),
+          ...(opts.flags["--allow-unsafe-rekor-url"]
+            ? { allowUnsafeRekorUrl: true }
+            : {}),
+        });
+        write(
+          out,
+          `Anchoring ENABLED (log: ${config.rekor_url}). Consent recorded in the audit log.\n` +
           `Each future checkpoint emission publishes a salted hash commitment to the public log.\n` +
           `Anchor existing checkpoints now with: sanctuary transparency anchor now\n`
-      );
-      if (config.allow_unsafe_url) {
+        );
+        if (config.allow_unsafe_url) {
+          write(
+            out,
+            `WARNING: --allow-unsafe-rekor-url is in effect: the URL guard (https-only, no loopback/private/link-local/metadata addresses) is bypassed for this log URL. The override is recorded in the config and the audit log, and "anchor status" reports it.\n`
+          );
+        }
+        return 0;
+      }
+
+      if (verb === "disable") {
+        const config = await disableAnchoring({
+          storage,
+          masterKey,
+          auditLog,
+          fortressId,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
+        });
         write(
           out,
-          `WARNING: --allow-unsafe-rekor-url is in effect: the URL guard (https-only, no loopback/private/link-local/metadata addresses) is bypassed for this log URL. The override is recorded in the config and the audit log, and "anchor status" reports it.\n`
+          `Anchoring DISABLED. Nothing will be transmitted. Previously published anchors remain in the public log (${config.rekor_url}) and stay verifiable.\n`
         );
+        return 0;
       }
-      return 0;
-    }
 
-    if (verb === "disable") {
-      const config = await disableAnchoring({
+      // verb === "now": anchor every checkpoint lacking a success receipt.
+      const result = await anchorPendingCheckpoints({
         storage,
         masterKey,
         auditLog,
-        fortressId,
         abortState: TRANSPARENCY_NEVER_ABORTED,
+        ...(fetchFn ? { fetchFn } : {}),
       });
-      write(
-        out,
-        `Anchoring DISABLED. Nothing will be transmitted. Previously published anchors remain in the public log (${config.rekor_url}) and stay verifiable.\n`
-      );
-      return 0;
-    }
-
-    // verb === "now": anchor every checkpoint lacking a success receipt.
-    const result = await anchorPendingCheckpoints({
-      storage,
-      masterKey,
-      auditLog,
-      abortState: TRANSPARENCY_NEVER_ABORTED,
-      ...(fetchFn ? { fetchFn } : {}),
-    });
-    if ("status" in result && result.status === "disabled") {
-      write(
-        err,
-        "Anchoring is not enabled (it is off by default). Enable it first: sanctuary transparency anchor enable\n"
-      );
-      return 1;
-    }
-    const summary = result as Exclude<typeof result, { status: "disabled" }>;
-    write(
-      out,
-      `Anchored ${summary.anchored} checkpoint(s); ${summary.already_anchored} already anchored; ${summary.failed} failed.\n`
-    );
-    for (const item of summary.outcomes) {
-      if (item.outcome.status === "anchored") {
-        write(
-          out,
-          `  checkpoint ${item.counter}: anchored (Rekor index ${item.outcome.receipt.rekor.log_index})\n`
-        );
-      } else if (item.outcome.status === "failed") {
+      if ("status" in result && result.status === "disabled") {
         write(
           err,
-          `  checkpoint ${item.counter}: FAILED, ${item.outcome.error}\n`
+          "Anchoring is not enabled (it is off by default). Enable it first: sanctuary transparency anchor enable\n"
         );
+        return 1;
       }
-    }
-    if (summary.failed > 0) {
+      const summary = result as Exclude<typeof result, { status: "disabled" }>;
       write(
-        err,
-        `Anchor coverage is incomplete (loud by design; emission is never blocked). Re-run "sanctuary transparency anchor now" when the log is reachable.\n`
+        out,
+        `Anchored ${summary.anchored} checkpoint(s); ${summary.already_anchored} already anchored; ${summary.failed} failed.\n`
       );
-      return 1;
-    }
-    return 0;
+      for (const item of summary.outcomes) {
+        if (item.outcome.status === "anchored") {
+          write(
+            out,
+            `  checkpoint ${item.counter}: anchored (Rekor index ${item.outcome.receipt.rekor.log_index})\n`
+          );
+        } else if (item.outcome.status === "failed") {
+          write(
+            err,
+            `  checkpoint ${item.counter}: FAILED, ${item.outcome.error}\n`
+          );
+        }
+      }
+      if (summary.failed > 0) {
+        write(
+          err,
+          `Anchor coverage is incomplete (loud by design; emission is never blocked). Re-run "sanctuary transparency anchor now" when the log is reachable.\n`
+        );
+        return 1;
+      }
+      return 0;
+
+    }, () => sessionAuditLog?.flush() ?? Promise.resolve());
   } catch (error) {
     return reportError(err, `transparency anchor ${verb}`, error);
-  } finally {
-    masterKey?.fill(0);
   }
 }
 
@@ -436,7 +447,6 @@ async function runCheckpoint(
   env: NodeJS.ProcessEnv,
   fetchFn?: FetchLike
 ): Promise<number> {
-  let masterKey: Uint8Array | undefined;
   try {
     // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
     // refuse, never silently resolve the default fortress; a checkpoint emitted
@@ -452,114 +462,119 @@ async function runCheckpoint(
     ], ["--local-sign", "--json"]);
     const storagePath = consumedFortress.value ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
-    masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
-    const auditLog = new AuditLog(storage, masterKey);
-    // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call site
-    // above for the full rationale.
-    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-    const signer = await resolveTransparencySigner({
-      fortressPath: storagePath,
-      masterKey,
-      env,
-      mode: opts.flags["--local-sign"] ? "local" : "auto",
-      abortState: TRANSPARENCY_NEVER_ABORTED,
-    });
-    const binaryPath =
-      opts.values["--binary"] ?? realpathSync(process.argv[1] ?? "");
-    const record = await emitEnforcementCheckpoint({
-      storage,
-      auditLog,
-      fortressId: fortressIdFromStoragePath(storagePath),
-      fortressPath: storagePath,
-      masterKey,
-      signer,
-      binaryPath,
-      version: PKG_VERSION,
-      abortState: TRANSPARENCY_NEVER_ABORTED,
-    });
-    // Record the emission in the audit log (covered by the NEXT checkpoint).
-    await auditLog.appendCritical({
-      layer: "l2",
-      operation: "transparency_checkpoint_emitted",
-      identity_id: record.fortress_id,
-      result: "success",
-      details: {
-        counter: record.counter,
-        merkle_root: record.audit.merkle_root,
-        highest_sequence: record.audit.highest_sequence,
-        signer_kid: record.signer_kid,
-      },
-    });
-    // Opt-in external anchoring (default OFF; nothing transmitted unless
-    // the operator enabled it). FAIL LOUD: an anchor failure is reported
-    // and exits nonzero, but the emitted checkpoint above stands; local
-    // evidence never depends on a third party's uptime.
-    let anchorFailed = false;
-    try {
-      const { anchorCheckpoint, readAnchorConfig } = await import(
-        "../transparency/anchoring.js"
-      );
-      const anchorState = await readAnchorConfig({
-        storage,
+    const session = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call site
+      // above for the full rationale.
+      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+      const signer = await resolveTransparencySigner({
+        fortressPath: storagePath,
         masterKey,
+        env,
+        mode: opts.flags["--local-sign"] ? "local" : "auto",
         abortState: TRANSPARENCY_NEVER_ABORTED,
       });
-      if (anchorState.status === "enabled") {
-        const outcome = await anchorCheckpoint({
+      const binaryPath =
+        opts.values["--binary"] ?? realpathSync(process.argv[1] ?? "");
+      const record = await emitEnforcementCheckpoint({
+        storage,
+        auditLog,
+        fortressId: fortressIdFromStoragePath(storagePath),
+        fortressPath: storagePath,
+        masterKey,
+        signer,
+        binaryPath,
+        version: PKG_VERSION,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
+      // Record the emission in the audit log (covered by the NEXT checkpoint).
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "transparency_checkpoint_emitted",
+        identity_id: record.fortress_id,
+        result: "success",
+        details: {
+          counter: record.counter,
+          merkle_root: record.audit.merkle_root,
+          highest_sequence: record.audit.highest_sequence,
+          signer_kid: record.signer_kid,
+        },
+      });
+      // Opt-in external anchoring (default OFF; nothing transmitted unless
+      // the operator enabled it). FAIL LOUD: an anchor failure is reported
+      // and exits nonzero, but the emitted checkpoint above stands; local
+      // evidence never depends on a third party's uptime.
+      let anchorFailed = false;
+      try {
+        const { anchorCheckpoint, readAnchorConfig } = await import(
+          "../transparency/anchoring.js"
+        );
+        const anchorState = await readAnchorConfig({
           storage,
           masterKey,
-          auditLog,
-          record,
           abortState: TRANSPARENCY_NEVER_ABORTED,
-          ...(fetchFn ? { fetchFn } : {}),
         });
-        if (outcome.status === "anchored") {
-          write(
-            out,
-            `[anchor] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`
-          );
-        } else if (outcome.status === "already_anchored") {
-          write(
-            out,
-            `[anchor] checkpoint ${record.counter} was already anchored (Rekor index ${outcome.receipt.rekor.log_index}).\n`
-          );
-        } else if (outcome.status === "failed") {
-          anchorFailed = true;
-          write(
-            err,
-            `[anchor] checkpoint ${record.counter} emission succeeded but ANCHORING FAILED: ${outcome.error}\n` +
+        if (anchorState.status === "enabled") {
+          const outcome = await anchorCheckpoint({
+            storage,
+            masterKey,
+            auditLog,
+            record,
+            abortState: TRANSPARENCY_NEVER_ABORTED,
+            ...(fetchFn ? { fetchFn } : {}),
+          });
+          if (outcome.status === "anchored") {
+            write(
+              out,
+              `[anchor] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`
+            );
+          } else if (outcome.status === "already_anchored") {
+            write(
+              out,
+              `[anchor] checkpoint ${record.counter} was already anchored (Rekor index ${outcome.receipt.rekor.log_index}).\n`
+            );
+          } else if (outcome.status === "failed") {
+            anchorFailed = true;
+            write(
+              err,
+              `[anchor] checkpoint ${record.counter} emission succeeded but ANCHORING FAILED: ${outcome.error}\n` +
               `[anchor] The failure was recorded in the audit log. Retry with: sanctuary transparency anchor now\n`
-          );
+            );
+          }
         }
+      } catch (anchorError) {
+        // Config tamper or receipt-store failure: refuse to anchor, say so
+        // loudly, and exit nonzero. The emitted checkpoint above stands.
+        anchorFailed = true;
+        write(
+          err,
+          `[anchor] checkpoint ${record.counter} emission succeeded but ANCHORING REFUSED: ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`
+        );
       }
-    } catch (anchorError) {
-      // Config tamper or receipt-store failure: refuse to anchor, say so
-      // loudly, and exit nonzero. The emitted checkpoint above stands.
-      anchorFailed = true;
-      write(
-        err,
-        `[anchor] checkpoint ${record.counter} emission succeeded but ANCHORING REFUSED: ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`
-      );
-    }
-    if (opts.flags["--json"]) {
-      write(out, JSON.stringify(record, null, 2) + "\n");
-    } else {
-      write(
-        out,
-        `Enforcement checkpoint ${record.counter} emitted.\n` +
+      if (opts.flags["--json"]) {
+        write(out, JSON.stringify(record, null, 2) + "\n");
+      } else {
+        write(
+          out,
+          `Enforcement checkpoint ${record.counter} emitted.\n` +
           `  audit root     ${record.audit.merkle_root}\n` +
           `  audit window   seq ${record.audit.lowest_sequence}..${record.audit.highest_sequence} (${record.audit.entry_count} entries)\n` +
           `  policy rules   ${record.policy.rules_count} (rules hash ${record.policy.rules_sha256.slice(0, 16)}...)\n` +
           `  enforcement    ${record.enforcement.total_allowed} allowed / ${record.enforcement.total_blocked} blocked\n` +
           `  signer         ${record.signer_kid}\n` +
           `Export a publishable bundle with: sanctuary transparency export\n`
-      );
-    }
-    return anchorFailed ? 1 : 0;
+        );
+      }
+      return anchorFailed ? 1 : 0;
+
+    }, () => sessionAuditLog?.flush() ?? Promise.resolve());
   } catch (error) {
     return reportError(err, "transparency checkpoint", error);
-  } finally {
-    masterKey?.fill(0);
   }
 }
 
@@ -639,412 +654,431 @@ export async function runVerifyTransparencyCommand(
   }
 
   let masterKey: Uint8Array | undefined;
+  let session: CliMasterKeySession | undefined;
+  const sessionAuditLogs: AuditLog[] = [];
   try {
-    // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
-    // refuse, never silently resolve the default fortress; verifying against
-    // the wrong fortress's pinned key/anchors is a constraint-5 violation.
-    const consumedFortress = consumeFlagValue(argv, "--fortress");
-    if (consumedFortress.error !== undefined) {
-      write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
-      return FORTRESS_FLAG_USAGE_EXIT_CODE;
-    }
-    const opts = parseFlags(
-      consumedFortress.argv,
-      [
-        "--input",
-        "--public-key",
-        "--public-key-file",
-        "--passphrase",
-        "--check-anchors",
-        "--rekor-public-key-file",
-        "--expect-fresh",
-        "--compare",
-      ],
-      [
-        "--trust-embedded",
-        "--against-log",
-        "--allow-partial",
-        "--json",
-        "--fetch-anchors",
-        "--allow-unsafe-rekor-url",
-        "--check-counter-floor",
-      ]
-    );
-    const inputPath = opts.values["--input"];
-    if (!inputPath) {
-      write(err, "Error: --input <path> is required\n");
-      printVerifyUsage(err);
-      return 2;
-    }
-    // Anchor-dependent flags fail closed at usage time: a run that silently
-    // ignored --expect-fresh would read as fresher than it proved.
-    for (const dependent of ["--expect-fresh", "--rekor-public-key-file"] as const) {
-      if (opts.values[dependent] && !opts.values["--check-anchors"]) {
-        write(err, `Error: ${dependent} requires --check-anchors <anchors.json>\n`);
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliFinalization(async () => {
+      // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+      // refuse, never silently resolve the default fortress; verifying against
+      // the wrong fortress's pinned key/anchors is a constraint-5 violation.
+      const consumedFortress = consumeFlagValue(argv, "--fortress");
+      if (consumedFortress.error !== undefined) {
+        write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+        return FORTRESS_FLAG_USAGE_EXIT_CODE;
+      }
+      const opts = parseFlags(
+        consumedFortress.argv,
+        [
+          "--input",
+          "--public-key",
+          "--public-key-file",
+          "--passphrase",
+          "--check-anchors",
+          "--rekor-public-key-file",
+          "--expect-fresh",
+          "--compare",
+        ],
+        [
+          "--trust-embedded",
+          "--against-log",
+          "--allow-partial",
+          "--json",
+          "--fetch-anchors",
+          "--allow-unsafe-rekor-url",
+          "--check-counter-floor",
+        ]
+      );
+      const inputPath = opts.values["--input"];
+      if (!inputPath) {
+        write(err, "Error: --input <path> is required\n");
+        printVerifyUsage(err);
         return 2;
       }
-    }
-    if (opts.flags["--fetch-anchors"] && !opts.values["--check-anchors"]) {
-      write(err, "Error: --fetch-anchors requires --check-anchors <anchors.json>\n");
-      return 2;
-    }
-    let expectFreshMs: number | undefined;
-    if (opts.values["--expect-fresh"]) {
-      try {
-        expectFreshMs = parseFreshnessWindow(opts.values["--expect-fresh"]!);
-      } catch (error) {
-        write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+      // Anchor-dependent flags fail closed at usage time: a run that silently
+      // ignored --expect-fresh would read as fresher than it proved.
+      for (const dependent of ["--expect-fresh", "--rekor-public-key-file"] as const) {
+        if (opts.values[dependent] && !opts.values["--check-anchors"]) {
+          write(err, `Error: ${dependent} requires --check-anchors <anchors.json>\n`);
+          return 2;
+        }
+      }
+      if (opts.flags["--fetch-anchors"] && !opts.values["--check-anchors"]) {
+        write(err, "Error: --fetch-anchors requires --check-anchors <anchors.json>\n");
         return 2;
       }
-    }
+      let expectFreshMs: number | undefined;
+      if (opts.values["--expect-fresh"]) {
+        try {
+          expectFreshMs = parseFreshnessWindow(opts.values["--expect-fresh"]!);
+        } catch (error) {
+          write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+          return 2;
+        }
+      }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(inputPath, "utf8"));
-    } catch (error) {
-      write(
-        err,
-        `Error reading ${inputPath}: ${error instanceof Error ? error.message : String(error)}\n`
-      );
-      return 1;
-    }
-
-    const key = await resolveVerificationKey(opts, consumedFortress.value, env, err);
-    if (key.status === "error") return 1;
-
-    const report = verifyTransparencyCheckpoints(parsed, {
-      ...(key.publicKey ? { publicKey: key.publicKey } : {}),
-      ...(opts.flags["--trust-embedded"] ? { trustEmbedded: true } : {}),
-      ...(opts.flags["--allow-partial"] ? { allowPartial: true } : {}),
-    });
-
-    let hostResult = null;
-    if (opts.flags["--against-log"] && report.checkpoints_verified > 0) {
-      const storagePath = consumedFortress.value ?? resolveStoragePath(env);
-      const storage = new FilesystemStorage(join(storagePath, "state"));
-      // Counter recount needs decryption; optional, honestly noted when absent.
-      let auditLog: AuditLog | undefined;
+      let parsed: unknown;
       try {
-        masterKey = await resolveMasterKey(
-          storage,
-          opts.values["--passphrase"],
-          env
-        );
-      } catch {
-        masterKey = undefined;
-      }
-      if (masterKey) {
-        // HIGH-2 (coordinator gate, 2026-08-22): once a master key IS
-        // available, roll back any interrupted exit-import BEFORE trusting
-        // this fortress's audit log for a counter recount. Deliberately
-        // OUTSIDE the credential-resolution try/catch above: a resolved
-        // master key with a FAILED recovery must stop this operation
-        // (rule 5, AGENTS.md), never silently fall into the
-        // "no credential available" degraded path below.
-        auditLog = new AuditLog(storage, masterKey);
-        await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-      }
-      const records = extractRecords(parsed);
-      hostResult = await verifyAgainstLog({
-        records,
-        storage,
-        ...(auditLog ? { auditLog } : {}),
-      });
-      report.findings.push(...hostResult.findings);
-      if (report.findings.length > 0) report.verdict = "FAIL";
-      // Host recomputation upgrades (removes) the corresponding offline caveat.
-      if (hostResult.merkle_root_recomputed) {
-        report.not_checked = report.not_checked.filter(
-          (item) => !item.startsWith("audit-log contents:")
-        );
-      }
-      for (const note of hostResult.notes) report.not_checked.push(note);
-    } else if (opts.flags["--against-log"]) {
-      report.not_checked.push(
-        "host check skipped: no schema-valid checkpoints to check against the log"
-      );
-    }
-
-    // ---- --check-anchors: auditor-side anchor verification ------------------
-    let anchorsCoverage: AnchorCoverage | null = null;
-    if (opts.values["--check-anchors"]) {
-      const anchorsPath = opts.values["--check-anchors"]!;
-      let anchorsDoc: unknown;
-      try {
-        anchorsDoc = JSON.parse(await readFile(anchorsPath, "utf8"));
+        parsed = JSON.parse(await readFile(inputPath, "utf8"));
       } catch (error) {
         write(
           err,
-          `Error reading ${anchorsPath}: ${error instanceof Error ? error.message : String(error)}\n`
+          `Error reading ${inputPath}: ${error instanceof Error ? error.message : String(error)}\n`
         );
         return 1;
       }
-      let rekorPublicKeyPem: string | undefined;
-      if (opts.values["--rekor-public-key-file"]) {
+
+      const key = await resolveVerificationKey(opts, consumedFortress.value, env, err);
+      if (key.status === "error") return 1;
+
+      const report = verifyTransparencyCheckpoints(parsed, {
+        ...(key.publicKey ? { publicKey: key.publicKey } : {}),
+        ...(opts.flags["--trust-embedded"] ? { trustEmbedded: true } : {}),
+        ...(opts.flags["--allow-partial"] ? { allowPartial: true } : {}),
+      });
+
+      let hostResult = null;
+      if (opts.flags["--against-log"] && report.checkpoints_verified > 0) {
+        const storagePath = consumedFortress.value ?? resolveStoragePath(env);
+        const storage = new FilesystemStorage(join(storagePath, "state"));
+        // Counter recount needs decryption; optional, honestly noted when absent.
+        let auditLog: AuditLog | undefined;
         try {
-          rekorPublicKeyPem = await readFile(
-            opts.values["--rekor-public-key-file"]!,
-            "utf8"
+          session = await resolveMasterKey(
+            storage,
+            opts.values["--passphrase"],
+            env
           );
+          masterKey = session.masterKey;
+        } catch (error) {
+          // Optional credentials cannot hide a failed establishment release.
+          if (error instanceof MasterEstablishmentReleaseError) throw error;
+          masterKey = undefined;
+        }
+        if (masterKey) {
+          // HIGH-2 (coordinator gate, 2026-08-22): once a master key IS
+          // available, roll back any interrupted exit-import BEFORE trusting
+          // this fortress's audit log for a counter recount. Deliberately
+          // OUTSIDE the credential-resolution try/catch above: a resolved
+          // master key with a FAILED recovery must stop this operation
+          // (rule 5, AGENTS.md), never silently fall into the
+          // "no credential available" degraded path below.
+          auditLog = new AuditLog(storage, masterKey);
+          sessionAuditLogs.push(auditLog);
+          await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+        }
+        const records = extractRecords(parsed);
+        hostResult = await verifyAgainstLog({
+          records,
+          storage,
+          ...(auditLog ? { auditLog } : {}),
+        });
+        report.findings.push(...hostResult.findings);
+        if (report.findings.length > 0) report.verdict = "FAIL";
+        // Host recomputation upgrades (removes) the corresponding offline caveat.
+        if (hostResult.merkle_root_recomputed) {
+          report.not_checked = report.not_checked.filter(
+            (item) => !item.startsWith("audit-log contents:")
+          );
+        }
+        for (const note of hostResult.notes) report.not_checked.push(note);
+      } else if (opts.flags["--against-log"]) {
+        report.not_checked.push(
+          "host check skipped: no schema-valid checkpoints to check against the log"
+        );
+      }
+
+      // ---- --check-anchors: auditor-side anchor verification ------------------
+      let anchorsCoverage: AnchorCoverage | null = null;
+      if (opts.values["--check-anchors"]) {
+        const anchorsPath = opts.values["--check-anchors"]!;
+        let anchorsDoc: unknown;
+        try {
+          anchorsDoc = JSON.parse(await readFile(anchorsPath, "utf8"));
         } catch (error) {
           write(
             err,
-            `Error reading Rekor public key: ${error instanceof Error ? error.message : String(error)}\n`
+            `Error reading ${anchorsPath}: ${error instanceof Error ? error.message : String(error)}\n`
           );
           return 1;
         }
-      }
-      const records = extractRecords(parsed);
-      const fetchedEntries = new Map<number, FetchedAnchorEntry>();
-      if (opts.flags["--fetch-anchors"]) {
-        const { fetchAnchorEntries, validateRekorUrl } = await import(
-          "../transparency/anchoring.js"
-        );
-        const { isTransparencyAnchorsExport } = await import(
-          "../transparency/anchor-verify.js"
-        );
-        if (!isTransparencyAnchorsExport(anchorsDoc)) {
-          report.findings.push({
-            kind: "anchors_input_invalid",
-            message: `${anchorsPath} is not a SANCTUARY_TRANSPARENCY_ANCHORS_V1 export; cannot fetch entries for it`,
-          });
-        } else {
-          // Same SSRF posture as anchoring itself: validate the log URL
-          // fail-closed before any request, with the same explicit unsafe
-          // escape hatch for local/dev logs.
-          validateRekorUrl(
-            anchorsDoc.rekor_url,
-            opts.flags["--allow-unsafe-rekor-url"] === true
+        let rekorPublicKeyPem: string | undefined;
+        if (opts.values["--rekor-public-key-file"]) {
+          try {
+            rekorPublicKeyPem = await readFile(
+              opts.values["--rekor-public-key-file"]!,
+              "utf8"
+            );
+          } catch (error) {
+            write(
+              err,
+              `Error reading Rekor public key: ${error instanceof Error ? error.message : String(error)}\n`
+            );
+            return 1;
+          }
+        }
+        const records = extractRecords(parsed);
+        const fetchedEntries = new Map<number, FetchedAnchorEntry>();
+        if (opts.flags["--fetch-anchors"]) {
+          const { fetchAnchorEntries, validateRekorUrl } = await import(
+            "../transparency/anchoring.js"
           );
-          const { HttpRekorClient } = await import(
-            "../transparency/rekor-client.js"
+          const { isTransparencyAnchorsExport } = await import(
+            "../transparency/anchor-verify.js"
           );
-          const client = new HttpRekorClient({
-            baseUrl: anchorsDoc.rekor_url,
-            ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}),
-          });
-          const outcomes = await fetchAnchorEntries({
-            receipts: anchorsDoc.receipts,
-            client,
-          });
-          for (const outcome of outcomes) {
-            if (outcome.status === "fetched") {
-              fetchedEntries.set(outcome.counter, outcome.entry);
-            } else if (outcome.status === "not_found") {
-              report.findings.push({
-                kind: "anchor_entry_not_found",
-                counter: outcome.counter,
-                message: `the log at ${anchorsDoc.rekor_url} denies that the anchor entry for checkpoint ${outcome.counter} exists (UUID ${outcome.uuid}); the receipt's anchored claim is refuted by the log`,
-              });
-            } else {
-              report.not_checked.push(
-                `anchor entry fetch for checkpoint ${outcome.counter}: log unreachable (${outcome.message}); fell back to receipt-embedded material where present`
-              );
+          if (!isTransparencyAnchorsExport(anchorsDoc)) {
+            report.findings.push({
+              kind: "anchors_input_invalid",
+              message: `${anchorsPath} is not a SANCTUARY_TRANSPARENCY_ANCHORS_V1 export; cannot fetch entries for it`,
+            });
+          } else {
+            // Same SSRF posture as anchoring itself: validate the log URL
+            // fail-closed before any request, with the same explicit unsafe
+            // escape hatch for local/dev logs.
+            validateRekorUrl(
+              anchorsDoc.rekor_url,
+              opts.flags["--allow-unsafe-rekor-url"] === true
+            );
+            const { HttpRekorClient } = await import(
+              "../transparency/rekor-client.js"
+            );
+            const client = new HttpRekorClient({
+              baseUrl: anchorsDoc.rekor_url,
+              ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}),
+            });
+            const outcomes = await fetchAnchorEntries({
+              receipts: anchorsDoc.receipts,
+              client,
+            });
+            for (const outcome of outcomes) {
+              if (outcome.status === "fetched") {
+                fetchedEntries.set(outcome.counter, outcome.entry);
+              } else if (outcome.status === "not_found") {
+                report.findings.push({
+                  kind: "anchor_entry_not_found",
+                  counter: outcome.counter,
+                  message: `the log at ${anchorsDoc.rekor_url} denies that the anchor entry for checkpoint ${outcome.counter} exists (UUID ${outcome.uuid}); the receipt's anchored claim is refuted by the log`,
+                });
+              } else {
+                report.not_checked.push(
+                  `anchor entry fetch for checkpoint ${outcome.counter}: log unreachable (${outcome.message}); fell back to receipt-embedded material where present`
+                );
+              }
             }
           }
         }
+        const anchorResult = verifyAnchorEvidence(records, anchorsDoc, {
+          ...(rekorPublicKeyPem ? { rekorPublicKeyPem } : {}),
+          ...(expectFreshMs !== undefined ? { expectFreshMs } : {}),
+          ...(args.now ? { now: args.now } : {}),
+          ...(fetchedEntries.size > 0 ? { fetchedEntries } : {}),
+        });
+        report.findings.push(...anchorResult.findings);
+        report.not_checked.push(...anchorResult.not_checked);
+        anchorsCoverage = anchorResult.coverage;
       }
-      const anchorResult = verifyAnchorEvidence(records, anchorsDoc, {
-        ...(rekorPublicKeyPem ? { rekorPublicKeyPem } : {}),
-        ...(expectFreshMs !== undefined ? { expectFreshMs } : {}),
-        ...(args.now ? { now: args.now } : {}),
-        ...(fetchedEntries.size > 0 ? { fetchedEntries } : {}),
-      });
-      report.findings.push(...anchorResult.findings);
-      report.not_checked.push(...anchorResult.not_checked);
-      anchorsCoverage = anchorResult.coverage;
-    }
 
-    // ---- --check-counter-floor: anti-rollback Stage 2 (host-side) -----------
-    // The Rekor counter-floor cross-check. Unlike the auditor-side
-    // --check-anchors (which verifies an operator-supplied EXPORT file), this
-    // reads the fortress's OWN local state (the MAC'd transparency counter
-    // floor and the local anchor receipts) and compares the on-disk floor
-    // against the highest LOCALLY-RECORDED anchored counter (the highest counter
-    // for which a valid local anchor receipt — whose counter the external Rekor
-    // log also remembers — survives on disk). It runs on the HOST (needs the
-    // master key) and, on a regression, freezes trust-bearing writes via the
-    // same Stage-1 chokepoint (restore-attest clears it). OFFLINE-ONLY: it
-    // catches a floor rollback that PRESERVES the receipts; a coordinated
-    // rollback that also deletes the higher receipts needs online Rekor
-    // enumeration (Stage 2b) or the hardware counter (Stage 4).
-    let counterFloorSummary:
-      | {
+      // ---- --check-counter-floor: anti-rollback Stage 2 (host-side) -----------
+      // The Rekor counter-floor cross-check. Unlike the auditor-side
+      // --check-anchors (which verifies an operator-supplied EXPORT file), this
+      // reads the fortress's OWN local state (the MAC'd transparency counter
+      // floor and the local anchor receipts) and compares the on-disk floor
+      // against the highest LOCALLY-RECORDED anchored counter (the highest counter
+      // for which a valid local anchor receipt — whose counter the external Rekor
+      // log also remembers — survives on disk). It runs on the HOST (needs the
+      // master key) and, on a regression, freezes trust-bearing writes via the
+      // same Stage-1 chokepoint (restore-attest clears it). OFFLINE-ONLY: it
+      // catches a floor rollback that PRESERVES the receipts; a coordinated
+      // rollback that also deletes the higher receipts needs online Rekor
+      // enumeration (Stage 2b) or the hardware counter (Stage 4).
+      let counterFloorSummary:
+        | {
           verdict: "CONSISTENT" | "SUSPECTED-ROLLBACK" | "NOT-APPLICABLE";
           on_disk_transparency_floor: number | null;
           highest_externally_anchored_counter: number | null;
           frozen: boolean;
         }
-      | null = null;
-    if (opts.flags["--check-counter-floor"]) {
-      const storagePath = consumedFortress.value ?? resolveStoragePath(env);
-      const storage = new FilesystemStorage(join(storagePath, "state"));
-      try {
-        masterKey =
-          masterKey ??
-          (await resolveMasterKey(storage, opts.values["--passphrase"], env));
-      } catch (error) {
-        write(
-          err,
-          `Error: --check-counter-floor runs on the fortress host and needs the master key ` +
+        | null = null;
+      if (opts.flags["--check-counter-floor"]) {
+        const storagePath = consumedFortress.value ?? resolveStoragePath(env);
+        const storage = new FilesystemStorage(join(storagePath, "state"));
+        try {
+          session =
+            session ??
+            (await resolveMasterKey(storage, opts.values["--passphrase"], env));
+          masterKey = session.masterKey;
+        } catch (error) {
+          write(
+            err,
+            `Error: --check-counter-floor runs on the fortress host and needs the master key ` +
             `(SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY): ` +
             `${error instanceof Error ? error.message : String(error)}\n`
+          );
+          return 1;
+        }
+        const fortressId = fortressIdFromStoragePath(storagePath);
+        const auditLog = new AuditLog(storage, masterKey);
+        sessionAuditLogs.push(auditLog);
+        // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call
+        // site above for the full rationale.
+        await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+        const { evaluateAndEnforceRekorCounterFloor } = await import(
+          "../core/anti-rollback.js"
         );
-        return 1;
-      }
-      const fortressId = fortressIdFromStoragePath(storagePath);
-      const auditLog = new AuditLog(storage, masterKey);
-      // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call
-      // site above for the full rationale.
-      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-      const { evaluateAndEnforceRekorCounterFloor } = await import(
-        "../core/anti-rollback.js"
-      );
-      const floorResult = await evaluateAndEnforceRekorCounterFloor({
-        storage,
-        master: masterKey,
-        fortressId,
-        ...(args.now ? { now: args.now } : {}),
-      });
-      const v = floorResult.verdict;
-      if (v.kind === "not-applicable") {
-        counterFloorSummary = {
-          verdict: "NOT-APPLICABLE",
-          on_disk_transparency_floor: null,
-          highest_externally_anchored_counter: null,
-          frozen: floorResult.frozen,
-        };
-        report.not_checked.push(
-          "anti-rollback Stage 2 (Rekor counter-floor): no anchor receipts are present and transparency anchoring is not enabled on this fortress, so Stage 2 does not apply (nothing has been anchored to compare a floor against)"
-        );
-      } else {
-        counterFloorSummary = {
-          verdict:
-            v.kind === "consistent" ? "CONSISTENT" : "SUSPECTED-ROLLBACK",
-          on_disk_transparency_floor: v.onDiskFloor,
-          highest_externally_anchored_counter: v.highestAnchoredCounter,
-          frozen: floorResult.frozen,
-        };
-        if (v.kind === "rollback-suspected") {
-          report.findings.push({
-            kind: "counter_rollback",
-            counter: v.highestAnchoredCounter,
-            expected: `on-disk transparency floor >= ${v.highestAnchoredCounter}`,
-            actual: `on-disk transparency floor ${v.onDiskFloor}`,
-            message:
-              `anti-rollback Stage 2: the on-disk transparency counter floor (${v.onDiskFloor}) is below the ` +
-              `highest checkpoint this fortress holds a valid local anchor receipt for (${v.highestAnchoredCounter}); ` +
-              "the local anchor receipts (whose counters the external Rekor log also remembers) prove an anchoring " +
-              "the on-disk checkpoint store no longer reflects (suspected transparency-floor rollback of an anchored " +
-              "fortress that preserved those receipts). " +
-              (v.notes[0] ?? "") +
-              " Trust-bearing writes are now FROZEN; run `sanctuary restore-attest` to acknowledge and unfreeze.",
-          });
-          await auditLog.appendCritical({
-            layer: "l2",
-            operation: "custody_rollback_suspected",
-            identity_id: fortressId,
-            result: "failure",
-            details: {
-              stage: 2,
-              witness_source: "external Rekor transparency counter floor",
-              on_disk_transparency_floor: v.onDiskFloor,
-              highest_externally_anchored_counter: v.highestAnchoredCounter,
-              notes: v.notes,
-              trust_bearing_writes_frozen: true,
-              remediation:
-                "sanctuary restore-attest (fortress passphrase required)",
-            },
-          });
+        const floorResult = await evaluateAndEnforceRekorCounterFloor({
+          storage,
+          master: masterKey,
+          fortressId,
+          ...(args.now ? { now: args.now } : {}),
+        });
+        const v = floorResult.verdict;
+        if (v.kind === "not-applicable") {
+          counterFloorSummary = {
+            verdict: "NOT-APPLICABLE",
+            on_disk_transparency_floor: null,
+            highest_externally_anchored_counter: null,
+            frozen: floorResult.frozen,
+          };
+          report.not_checked.push(
+            "anti-rollback Stage 2 (Rekor counter-floor): no anchor receipts are present and transparency anchoring is not enabled on this fortress, so Stage 2 does not apply (nothing has been anchored to compare a floor against)"
+          );
+        } else {
+          counterFloorSummary = {
+            verdict:
+              v.kind === "consistent" ? "CONSISTENT" : "SUSPECTED-ROLLBACK",
+            on_disk_transparency_floor: v.onDiskFloor,
+            highest_externally_anchored_counter: v.highestAnchoredCounter,
+            frozen: floorResult.frozen,
+          };
+          if (v.kind === "rollback-suspected") {
+            report.findings.push({
+              kind: "counter_rollback",
+              counter: v.highestAnchoredCounter,
+              expected: `on-disk transparency floor >= ${v.highestAnchoredCounter}`,
+              actual: `on-disk transparency floor ${v.onDiskFloor}`,
+              message:
+                `anti-rollback Stage 2: the on-disk transparency counter floor (${v.onDiskFloor}) is below the ` +
+                `highest checkpoint this fortress holds a valid local anchor receipt for (${v.highestAnchoredCounter}); ` +
+                "the local anchor receipts (whose counters the external Rekor log also remembers) prove an anchoring " +
+                "the on-disk checkpoint store no longer reflects (suspected transparency-floor rollback of an anchored " +
+                "fortress that preserved those receipts). " +
+                (v.notes[0] ?? "") +
+                " Trust-bearing writes are now FROZEN; run `sanctuary restore-attest` to acknowledge and unfreeze.",
+            });
+            await auditLog.appendCritical({
+              layer: "l2",
+              operation: "custody_rollback_suspected",
+              identity_id: fortressId,
+              result: "failure",
+              details: {
+                stage: 2,
+                witness_source: "external Rekor transparency counter floor",
+                on_disk_transparency_floor: v.onDiskFloor,
+                highest_externally_anchored_counter: v.highestAnchoredCounter,
+                notes: v.notes,
+                trust_bearing_writes_frozen: true,
+                remediation:
+                  "sanctuary restore-attest (fortress passphrase required)",
+              },
+            });
+          }
         }
       }
-    }
 
-    // ---- --compare: multi-bundle split-view detection ------------------------
-    let compareSummary:
-      | (Pick<CompareChainsResult, "relation" | "divergent_counter" | "overlap"> & {
+      // ---- --compare: multi-bundle split-view detection ------------------------
+      let compareSummary:
+        | (Pick<CompareChainsResult, "relation" | "divergent_counter" | "overlap"> & {
           input: string;
           other_verdict: TransparencyVerifyReport["verdict"];
         })
-      | null = null;
-    if (opts.values["--compare"]) {
-      const comparePath = opts.values["--compare"]!;
-      let otherParsed: unknown;
-      try {
-        otherParsed = JSON.parse(await readFile(comparePath, "utf8"));
-      } catch (error) {
-        write(
-          err,
-          `Error reading ${comparePath}: ${error instanceof Error ? error.message : String(error)}\n`
-        );
-        return 1;
-      }
-      // The comparison bundle is verified under the SAME key basis; a
-      // suffix fragment is fine for fork detection, so partial is allowed
-      // for it regardless of the primary's --allow-partial.
-      const otherReport = verifyTransparencyCheckpoints(otherParsed, {
-        ...(key.publicKey ? { publicKey: key.publicKey } : {}),
-        ...(opts.flags["--trust-embedded"] ? { trustEmbedded: true } : {}),
-        allowPartial: true,
-      });
-      if (otherReport.verdict === "FAIL") {
-        report.findings.push({
-          kind: "compare_input_invalid",
-          message: `the comparison bundle ${comparePath} fails verification on its own (${otherReport.findings.length} finding(s): ${[...new Set(otherReport.findings.map((f) => f.kind))].join(", ")}); refusing to draw fork conclusions from unverified evidence`,
+        | null = null;
+      if (opts.values["--compare"]) {
+        const comparePath = opts.values["--compare"]!;
+        let otherParsed: unknown;
+        try {
+          otherParsed = JSON.parse(await readFile(comparePath, "utf8"));
+        } catch (error) {
+          write(
+            err,
+            `Error reading ${comparePath}: ${error instanceof Error ? error.message : String(error)}\n`
+          );
+          return 1;
+        }
+        // The comparison bundle is verified under the SAME key basis; a
+        // suffix fragment is fine for fork detection, so partial is allowed
+        // for it regardless of the primary's --allow-partial.
+        const otherReport = verifyTransparencyCheckpoints(otherParsed, {
+          ...(key.publicKey ? { publicKey: key.publicKey } : {}),
+          ...(opts.flags["--trust-embedded"] ? { trustEmbedded: true } : {}),
+          allowPartial: true,
         });
-      } else {
-        const comparison = compareTransparencyChains(
-          extractRecords(parsed),
-          extractRecords(otherParsed)
-        );
-        report.findings.push(...comparison.findings);
-        report.not_checked.push(...comparison.notes);
-        compareSummary = {
-          input: comparePath,
-          other_verdict: otherReport.verdict,
-          relation: comparison.relation,
-          divergent_counter: comparison.divergent_counter,
-          overlap: comparison.overlap,
-        };
+        if (otherReport.verdict === "FAIL") {
+          report.findings.push({
+            kind: "compare_input_invalid",
+            message: `the comparison bundle ${comparePath} fails verification on its own (${otherReport.findings.length} finding(s): ${[...new Set(otherReport.findings.map((f) => f.kind))].join(", ")}); refusing to draw fork conclusions from unverified evidence`,
+          });
+        } else {
+          const comparison = compareTransparencyChains(
+            extractRecords(parsed),
+            extractRecords(otherParsed)
+          );
+          report.findings.push(...comparison.findings);
+          report.not_checked.push(...comparison.notes);
+          compareSummary = {
+            input: comparePath,
+            other_verdict: otherReport.verdict,
+            relation: comparison.relation,
+            divergent_counter: comparison.divergent_counter,
+            overlap: comparison.overlap,
+          };
+        }
       }
-    }
 
-    // Verdict reassembly after every evidence source contributed findings.
-    if (report.findings.length > 0) report.verdict = "FAIL";
+      // Verdict reassembly after every evidence source contributed findings.
+      if (report.findings.length > 0) report.verdict = "FAIL";
 
-    const payload = {
-      ...report,
-      ...(key.source ? { public_key_source: key.source } : {}),
-      ...(hostResult
-        ? {
+      const payload = {
+        ...report,
+        ...(key.source ? { public_key_source: key.source } : {}),
+        ...(hostResult
+          ? {
             against_log: {
               checked_counter: hostResult.checked_counter,
               merkle_root_recomputed: hostResult.merkle_root_recomputed,
               counters_recomputed: hostResult.counters_recomputed,
             },
           }
-        : {}),
-      ...(anchorsCoverage ? { anchors: anchorsCoverage } : {}),
-      ...(counterFloorSummary ? { counter_floor: counterFloorSummary } : {}),
-      ...(compareSummary ? { compare: compareSummary } : {}),
-    };
-    if (opts.flags["--json"]) {
-      write(out, JSON.stringify(payload, null, 2) + "\n");
-    } else {
-      printHumanReport(out, payload);
-    }
-    // Exit-code mapping. 0 is reserved EXCLUSIVELY for a clean PASS
-    // (complete-from-genesis, authentic genesis sentinel, zero findings). A
-    // PARTIAL suffix (verified internally but not genesis-rooted, accepted via
-    // --allow-partial) returns the dedicated code 10 so automation can never
-    // read it as a complete verification. Everything else (FAIL) is 1.
-    if (report.verdict === "PASS") return 0;
-    if (report.verdict === "PARTIAL") return EXIT_PARTIAL;
-    return 1;
+          : {}),
+        ...(anchorsCoverage ? { anchors: anchorsCoverage } : {}),
+        ...(counterFloorSummary ? { counter_floor: counterFloorSummary } : {}),
+        ...(compareSummary ? { compare: compareSummary } : {}),
+      };
+      if (opts.flags["--json"]) {
+        write(out, JSON.stringify(payload, null, 2) + "\n");
+      } else {
+        printHumanReport(out, payload);
+      }
+      // Exit-code mapping. 0 is reserved EXCLUSIVELY for a clean PASS
+      // (complete-from-genesis, authentic genesis sentinel, zero findings). A
+      // PARTIAL suffix (verified internally but not genesis-rooted, accepted via
+      // --allow-partial) returns the dedicated code 10 so automation can never
+      // read it as a complete verification. Everything else (FAIL) is 1.
+      if (report.verdict === "PASS") return 0;
+      if (report.verdict === "PARTIAL") return EXIT_PARTIAL;
+      return 1;
+
+    }, async () => {
+      if (session) await closeCliMasterKeySession(session, async () => {
+        const errors: unknown[] = [];
+        for (const log of sessionAuditLogs) {
+          try { await log.flush(); } catch (error) { errors.push(error); }
+        }
+        if (errors.length === 1) throw errors[0];
+        if (errors.length > 1) throw new AggregateError(errors, "CLI audit finalization failed");
+      });
+    });
   } catch (error) {
     return reportError(err, "verify-transparency", error);
-  } finally {
-    masterKey?.fill(0);
   }
 }
 
@@ -1304,7 +1338,7 @@ async function resolveMasterKey(
   storage: FilesystemStorage,
   passphraseFlag: string | undefined,
   env: NodeJS.ProcessEnv
-): Promise<Uint8Array> {
+): Promise<CliMasterKeySession> {
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (env.SANCTUARY_RECOVERY_KEY) {
     return resolveCliMasterKey(storage, {

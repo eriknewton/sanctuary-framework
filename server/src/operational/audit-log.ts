@@ -3191,6 +3191,8 @@ export class AuditLog {
               // Non-fatal; retried on the next suffix append.
             }
           }
+          // In-memory append publication runs only while that append's write lease is still active.
+          this.assertAuditWriteLockActive(signal);
         } catch (err) {
           // A timed-out durable write may finish after its lease: no stale
           // continuation can establish accounting for a later lock holder.

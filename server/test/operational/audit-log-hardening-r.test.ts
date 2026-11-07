@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /** Audit log operational witnesses, set R. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -132,7 +133,7 @@ describe("audit log witnesses R", () => {
     await append(log);
     const retained = await storage.list("_audit");
     // Persisted audit-entry names encode their sequence in twenty decimal digits.
-    const base = retained.find(({ key }) => key.startsWith(`entry-${String(3).padStart(20, "0")}-`))!;
+    const base = retained.find(({ key }) => key.startsWith(`entry-${String(3).padStart(20, "0")}-`))!; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await storage.delete("_audit", base.key);
     const writes = vi.spyOn(storage, "write");
     vi.spyOn(console, "error").mockImplementation(() => {});

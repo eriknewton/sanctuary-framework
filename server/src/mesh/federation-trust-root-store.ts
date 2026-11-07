@@ -350,6 +350,7 @@ export function federationContextFromTrustRootRecord(
     nodeId: record.node_id,
     pinnedMasterPubkey: { ...record.pinned_master_pubkey },
     issuingPrincipalCert: clonePrincipalCert(record.issuing_principal_cert),
+    // Renewal owns these copies and wipes them after synchronous signing.
     getIssuingPrincipalPrivateKey: () =>
       Uint8Array.from(record.issuing_principal_private_key),
     getFortressMasterSecret: () => Uint8Array.from(record.master_secret),
@@ -1110,7 +1111,8 @@ function cloneNodeCert(cert: NodeIdentityCertificate): NodeIdentityCertificate {
   };
 }
 
-function zeroRecordSecrets(record: FederationTrustRootRecord): void {
+// Session finalization scrubs this inventory after federation work settles.
+export function zeroRecordSecrets(record: FederationTrustRootRecord): void {
   record.master_secret.fill(0);
   record.master_private_key?.fill(0);
   record.issuing_principal_private_key.fill(0);

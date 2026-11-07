@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /** Ordered checkpoint decisions, shared read admission and lock retirement. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs, { mkdtemp, rm } from "node:fs/promises";
@@ -30,8 +31,8 @@ type PersistedEntryHashCollection =
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const bytesToString = (value: Uint8Array) => new TextDecoder().decode(value);
 // Storage keys use a 20-digit sequence; hashes use 64 hex digits for SHA-256.
-const checkpointKey = (n: number) => `audit-checkpoint-${String(n).padStart(20, "0")}`;
-const entryKey = (n: number) => `entry-${String(n).padStart(20, "0")}-fixture`;
+const checkpointKey = (n: number) => `audit-checkpoint-${String(n).padStart(20, "0")}`; // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
+const entryKey = (n: number) => `entry-${String(n).padStart(20, "0")}-fixture`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
 const entry = (sequence: number, hash = "a") => encode({ schema_version: AUDIT_CHAIN_SCHEMA_VERSION, sequence,
   prev_hash: "GENESIS", entry_hash: hash.repeat(64), timestamp: "fixture", encrypted_payload_bytes: "" });
 const checkpoint = (sequence: number) => encode({ schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION, checkpoint_kind: "audit-checkpoint",
@@ -52,14 +53,14 @@ function compareAuditKeys(a: string, b: string): number {
 }
 
 function parseEntryKeySequence(key: string): number | null {
-  const match = /^entry-(\d{20})-/.exec(key);
+  const match = /^entry-(\d{20})-/.exec(key); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
   if (!match) return null;
   const seq = Number(match[1]);
   return Number.isSafeInteger(seq) ? seq : null;
 }
 
 function parseCheckpointKeySequence(key: string): number | null {
-  const match = /-(\d{20})$/.exec(key);
+  const match = /-(\d{20})$/.exec(key); // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
   if (!match) return null;
   const seq = Number(match[1]);
   return Number.isSafeInteger(seq) ? seq : null;

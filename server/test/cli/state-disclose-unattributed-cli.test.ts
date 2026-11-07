@@ -52,6 +52,9 @@ import { runInit as runInitRaw, type InitOptions } from "../../src/wrap/init.js"
 import type { ExecResult } from "../../src/wrap/passphrase.js";
 
 
+import { withExclusiveMasterRotationBarrier } from "../../src/storage/cross-process-lock.js";
+import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME } from "../../src/core/master-custody.js";
+
 // Delegate custody acquisition unchanged; this in-process harness owns every returned lease.
 const { custodyLeases } = vi.hoisted(() => ({
   custodyLeases: [] as import("../../src/storage/cross-process-lock.js").MasterWriteBarrierLease[],
@@ -197,7 +200,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
 
   async function plantEntry(overrides: Partial<Record<string, unknown>> = {}, content: string = CONTENT, namespace: string = NAMESPACE): Promise<void> {
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -233,7 +236,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       "state_disclose_unattributed_delivery"
     );
     const storage = new FilesystemStorage(join(root, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: root,
     });
@@ -305,9 +308,11 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   });
 
   afterEach(async () => {
+    await closeFixtureSessions();
     try {
       await releaseCustodyLeases();
     } finally {
+      await closeFixtureSessions();
       delete process.env.SANCTUARY_STORAGE_PATH;
       delete process.env.SANCTUARY_RECOVERY_KEY;
       try {
@@ -325,7 +330,15 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   });
 
   it("writes the content to a private file, prints a receipt without it, and audits the call", async () => {
+    await closeFixtureSessions();
+    await releaseCustodyLeases();
     const { code, out, channel } = await runCommand();
+    expect(custodyLeases.length).toBeGreaterThan(0);
+    for (const lease of custodyLeases) expect(lease.signal.aborted).toBe(true);
+    await expect(withExclusiveMasterRotationBarrier(
+      new FilesystemStorage(join(fortressPath, "state")), CUSTODY_WRITE_LOCK_NAMESPACE,
+      MASTER_ROTATION_BARRIER_NAME, async () => "entered", { timeoutMs: 0 },
+    )).resolves.toBe("entered");
 
     expect(code).toBe(0);
     expect(channel.calls).toBe(1);
@@ -367,7 +380,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     );
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -549,7 +562,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(channel.calls).toBe(0);
     await expect(readdir(join(fortressPath, "disclosures"))).rejects.toThrow();
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -1334,3 +1347,16 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     await expect(readdir(join(fortressPath, "disclosures"))).rejects.toThrow();
   });
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

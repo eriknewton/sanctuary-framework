@@ -26,8 +26,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 // fail-before-exempt: C4 adds subprocess help assertions that execute the already-built dist/cli.js, which source-only reversal intentionally leaves in place; live C4 admission, authority, Tier-1, and structural tests fail against pre-C4 source. This file also retains its C3 fixture-only durable-state resolver wiring, covered by the C3 migration and contract suites.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import * as crossProcessLock from "../../src/storage/cross-process-lock.js";
+import * as custody from "../../src/core/master-custody.js";
+import * as localUnlock from "../../src/cli/local-fortress-unlock.js";
+import * as baselineModule from "../../src/principal-policy/baseline.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
+import { kernelBackedCrossProcessLockPlatformSupported, withExclusiveMasterRotationBarrier, type MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -37,9 +43,12 @@ import {
   runMemoryArchiveExportCommand,
   runMemoryArchiveImportCommand,
   runMemoryProvenancePruneSignersCommand,
+  runMemoryProvenanceMarkBadSignerCommand,
+  runMemoryProvenanceClearBadSignerCommand,
   type MemoryArchiveDialogRunner,
   type PrivateMemoryArchiveInteraction,
 } from "../../src/cli/memory-archive.js";
+import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import type { ApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import type {
@@ -67,10 +76,6 @@ const FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/basic/", import.meta.url),
 );
 const PASSPHRASE = "exit-v2-memory-cli-disposable-passphrase";
-// One second bounds the fixture-only wait for IdentityManager's documented
-// fire-and-forget primary-identity pointer write (100 attempts * 10 ms).
-const PRIMARY_IDENTITY_SETTLE_ATTEMPTS = 100;
-const PRIMARY_IDENTITY_SETTLE_MS = 10;
 // Must match the memory archive artifact path written by runMemoryArchiveExportCommand.
 const MEMORY_ARCHIVE_ARTIFACT_PATH = "artifacts/sdw-memory-archive.json";
 const OVER_CAP_SENTINEL_BYTES = 1; // One byte over the artifact ceiling must be refused.
@@ -173,7 +178,23 @@ interface Fortress {
   readonly archiveId?: string;
 }
 
+const rescueLeases: MasterWriteBarrierLease[] = [];
+beforeEach(() => {
+  const acquire = crossProcessLock.acquireMasterWriteBarrier;
+  vi.spyOn(crossProcessLock, "acquireMasterWriteBarrier").mockImplementation(async (...args) => {
+    const lease = await acquire(...args);
+    rescueLeases.push(lease);
+    return lease;
+  });
+});
+
 afterEach(async () => {
+  // Rescue runs after assertions so retained fixture sessions cannot affect another case.
+  try {
+    await Promise.all(rescueLeases.splice(0).map(lease => lease.release()));
+  } finally {
+    vi.restoreAllMocks();
+  }
   delete process.env.SANCTUARY_STORAGE_PATH;
   while (cleanup.length > 0) {
     await rm(cleanup.pop()!, { recursive: true, force: true });
@@ -199,8 +220,19 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
     derivePurposeKey(masterKey, "identity-encryption"),
     "passphrase",
   );
-  await identityManager.save(storedIdentity);
-  await waitForPrimaryIdentityPointer(storage);
+  const writes: Promise<void>[] = [];
+  const write = storage.write.bind(storage);
+  const spy = vi.spyOn(storage, "write").mockImplementation((...args) => {
+    const pending = write(...args);
+    writes.push(pending);
+    return pending;
+  });
+  try {
+    await identityManager.save(storedIdentity);
+  } finally {
+    await Promise.all(writes);
+    spy.mockRestore();
+  }
   if (!withArchive) {
     await completeMemoryMigration(storage, masterKey, path, ownerRef);
     return { path, storage, masterKey };
@@ -256,14 +288,6 @@ async function productionAdapter(
     resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
     resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
   });
-}
-
-async function waitForPrimaryIdentityPointer(storage: FilesystemStorage): Promise<void> {
-  for (let attempt = 0; attempt < PRIMARY_IDENTITY_SETTLE_ATTEMPTS; attempt++) {
-    if (await storage.read("_meta", "primary_identity_id") !== null) return;
-    await delay(PRIMARY_IDENTITY_SETTLE_MS);
-  }
-  throw new Error("disposable fortress primary identity pointer did not settle");
 }
 
 function fortressId(path: string): string {
@@ -1127,5 +1151,395 @@ describe("Rung 1 memory-archive stored-custody wiring (F6)", () => {
     // No fortress secret leaked to stdout/JSON.
     expect(out.text()).not.toContain(PASSPHRASE);
     expect(out.text()).not.toContain(secretText(exported.terminal));
+  });
+});
+
+function custodyDeferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function withArchiveCustody(
+  withIdentity: boolean,
+  check: (fixture: {
+    path: string;
+    outputPath: string;
+    exclusive: () => Promise<string>;
+    lease: () => MasterWriteBarrierLease;
+    release: ReturnType<typeof vi.fn<() => Promise<void>>>;
+    failRelease: (error: unknown) => void;
+  }) => Promise<void>,
+): Promise<void> {
+  const home = await createTempHome("archive-custody");
+  const path = home.defaultFortressPath;
+  const storage = new FilesystemStorage(join(path, "state"));
+  const leases: MasterWriteBarrierLease[] = [];
+  let releaseOutcome: { ok: true } | { ok: false; error: unknown } = { ok: true };
+  try {
+    const seed = await custody.establishMaster({
+      storage, passphrase: PASSPHRASE, storagePathHint: path,
+      firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
+    });
+    try {
+      if (withIdentity) {
+        const identities = new IdentityManager(storage, seed.masterKey);
+        const identityKey = derivePurposeKey(seed.masterKey, "identity-encryption");
+        try {
+          const { storedIdentity } = createIdentity("archive-custody", identityKey, "passphrase");
+          const writes: Promise<void>[] = [];
+          const write = storage.write.bind(storage);
+          const spy = vi.spyOn(storage, "write").mockImplementation((...args) => {
+            const pending = write(...args);
+            writes.push(pending);
+            return pending;
+          });
+          try {
+            await identities.save(storedIdentity);
+          } finally {
+            await Promise.all(writes);
+            spy.mockRestore();
+          }
+        } finally { identityKey.fill(0); }
+      }
+    } finally {
+      seed.masterKey.fill(0);
+      await seed.masterWriteBarrier?.release();
+    }
+    const outputPath = join(home.home, "existing-output");
+    await mkdir(outputPath);
+    const unlock = localUnlock.unlockLocalFortress;
+    const release = vi.fn(async () => {
+      await leases.at(-1)!.release();
+      if (!releaseOutcome.ok) throw releaseOutcome.error;
+    });
+    vi.spyOn(localUnlock, "unlockLocalFortress").mockImplementation(async options => {
+      const result = await unlock(options);
+      if (!result.ok || !result.barrier) return result;
+      leases.push(result.barrier);
+      return { ...result, barrier: { ...result.barrier, release } };
+    });
+    await check({
+      path, outputPath, release,
+      lease: () => leases.at(-1)!,
+      failRelease: error => { releaseOutcome = { ok: false, error }; },
+      exclusive: () => withExclusiveMasterRotationBarrier(
+        new FilesystemStorage(join(path, "state")),
+        custody.CUSTODY_WRITE_LOCK_NAMESPACE, custody.MASTER_ROTATION_BARRIER_NAME,
+        async () => "entered", { timeoutMs: 0 },
+      ),
+    });
+  } finally {
+    for (const lease of leases) await lease.release();
+    vi.restoreAllMocks();
+    await home.cleanup();
+  }
+}
+
+// Archive identifiers contain 32 lowercase hexadecimal digits.
+function custodyExportArgs(path: string, outputPath: string, terminal: TestTerminal) {
+  return {
+    argv: ["--archive-id", "a".repeat(32), "--out", outputPath, "--owner-ref", "owner-a", "--fortress", path],
+    ...sinkPair(), env: { SANCTUARY_PASSPHRASE: PASSPHRASE }, interaction: terminal,
+  };
+}
+
+describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform))("archive custody cleanup", () => {
+  it.each(["zero identities", "no default identity"])("bootstrap releases custody with %s", async mode => {
+    await withArchiveCustody(false, async fixture => {
+      if (mode === "no default identity") {
+        vi.spyOn(IdentityManager.prototype, "load").mockResolvedValue({ total: 1, loaded: 1, failed: 0 });
+        vi.spyOn(IdentityManager.prototype, "getDefault").mockReturnValue(undefined);
+      }
+      const terminal = new TestTerminal();
+      const close = vi.spyOn(terminal, "close");
+      const args = custodyExportArgs(fixture.path, fixture.outputPath, terminal);
+      expect(await runMemoryArchiveExportCommand(args)).toBe(1);
+      expect(args.err.text()).toBe("Error: fortress identity is unavailable.\n");
+      expect(fixture.lease().signal.aborted).toBe(true);
+      await expect(fixture.exclusive()).resolves.toBe("entered");
+      expect(fixture.release).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each(["observer", "undefined observer", "baseline"])("bootstrap releases custody after failed %s construction", async mode => {
+    await withArchiveCustody(true, async fixture => {
+      const error = mode.startsWith("undefined") ? undefined : new Error("fixture construction");
+      if (mode === "baseline") vi.spyOn(baselineModule, "BaselineTracker").mockImplementation(function () { throw error; });
+      const args = custodyExportArgs(fixture.path, fixture.outputPath, new TestTerminal());
+      expect(await runMemoryArchiveExportCommand({
+        ...args,
+        ...(mode === "baseline" ? {} : { observeMasterKey: () => { throw error; } }),
+      })).toBe(1);
+      expect(fixture.lease().signal.aborted).toBe(true);
+      await expect(fixture.exclusive()).resolves.toBe("entered");
+      expect(fixture.release).toHaveBeenCalledOnce();
+      expect(args.err.text()).toBe("Error: could not open or unlock the fortress.\n");
+    });
+  });
+
+  it.each(["identity", "observer", "undefined observer"])("bootstrap reports release failure after %s refusal", async mode => {
+    await withArchiveCustody(false, async fixture => {
+      const operationError = mode.startsWith("undefined") ? undefined : new Error("fixture observer");
+      const releaseError = new Error("fixture release");
+      fixture.failRelease(releaseError);
+      const terminal = new TestTerminal();
+      const close = vi.spyOn(terminal, "close");
+      const result = await runMemoryArchiveExportCommand({
+        ...custodyExportArgs(fixture.path, fixture.outputPath, terminal),
+        ...(mode === "identity" ? {} : { observeMasterKey: () => { throw operationError; } }),
+      }).then(code => ({ code }), error => ({ error }));
+      expect(fixture.lease().signal.aborted).toBe(true);
+      await expect(fixture.exclusive()).resolves.toBe("entered");
+      expect(result).toHaveProperty("error");
+      if ("error" in result) {
+        if (mode === "identity") expect(result.error).toBe(releaseError);
+        else {
+          expect(result.error).toBeInstanceOf(AggregateError);
+          expect(result.error.errors).toEqual([operationError, releaseError]);
+        }
+      }
+      expect(close).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each(["normal", "flush", "release", "flush and release", "operation and release", "release and close"])(
+    "command finalization preserves %s outcomes", async mode => {
+      await withArchiveCustody(true, async fixture => {
+        const operationError = new Error("fixture operation");
+        const flushError = new Error("fixture flush");
+        const releaseError = new Error("fixture release");
+        const closeError = new Error("fixture close");
+        const terminal = new TestTerminal();
+        const close = vi.spyOn(terminal, "close").mockImplementation(() => {
+          if (mode.includes("close")) throw closeError;
+        });
+        if (mode.includes("release")) fixture.failRelease(releaseError);
+        const args = custodyExportArgs(fixture.path, fixture.outputPath, terminal);
+        if (mode.includes("operation")) vi.spyOn(args.err, "write").mockImplementation(() => { throw operationError; });
+        const flush = AuditLog.prototype.flush;
+        const flushSpy = vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async function (this: AuditLog) {
+          expect(fixture.lease().signal.aborted).toBe(false);
+          await flush.call(this);
+          if (mode.includes("flush")) throw flushError;
+        });
+        const result = await runMemoryArchiveExportCommand(args).then(code => ({ code }), error => ({ error }));
+        expect(fixture.lease().signal.aborted).toBe(true);
+        await expect(fixture.exclusive()).resolves.toBe("entered");
+        expect(fixture.release).toHaveBeenCalledOnce();
+        expect(flushSpy).toHaveBeenCalledOnce();
+        expect(close).toHaveBeenCalledOnce();
+        const errors = [
+          ...(mode.includes("operation") ? [operationError] : []),
+          ...(mode.includes("flush") ? [flushError] : []),
+          ...(mode.includes("release") ? [releaseError] : []),
+          ...(mode.includes("close") ? [closeError] : []),
+        ];
+        if (errors.length === 0) expect(result).toEqual({ code: 1 });
+        else {
+          expect(result).toHaveProperty("error");
+          if ("error" in result) {
+            if (errors.length === 1) expect(result.error).toBe(errors[0]);
+            else {
+              expect(result.error).toBeInstanceOf(AggregateError);
+              expect(result.error.errors).toEqual(errors);
+            }
+          }
+        }
+      });
+    },
+  );
+
+  it("command retains custody until pending final persistence completes", async () => {
+    await withArchiveCustody(true, async fixture => {
+      const entered = custodyDeferred();
+      const finish = custodyDeferred();
+      const flush = AuditLog.prototype.flush;
+      vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async function (this: AuditLog) {
+        entered.resolve();
+        await finish.promise;
+        await flush.call(this);
+      });
+      const run = runMemoryArchiveExportCommand(custodyExportArgs(fixture.path, fixture.outputPath, new TestTerminal()));
+      try {
+        await entered.promise;
+        expect(fixture.lease().signal.aborted).toBe(false);
+        expect(fixture.release).not.toHaveBeenCalled();
+        await expect(fixture.exclusive()).rejects.toMatchObject({ kind: "contention" });
+        finish.resolve();
+        expect(await run).toBe(1);
+        expect(fixture.lease().signal.aborted).toBe(true);
+        await expect(fixture.exclusive()).resolves.toBe("entered");
+      } finally {
+        finish.resolve();
+        await run.catch(() => undefined);
+      }
+    });
+  });
+});
+
+
+function rejectArchiveRelease(error: Error) {
+  const unlock = localUnlock.unlockLocalFortress;
+  const release = vi.fn<() => Promise<void>>();
+  let captured: MasterWriteBarrierLease | undefined;
+  vi.spyOn(localUnlock, "unlockLocalFortress").mockImplementation(async options => {
+    const result = await unlock(options);
+    if (!result.ok || !result.barrier) return result;
+    captured = result.barrier;
+    release.mockImplementation(async () => {
+      await result.barrier!.release();
+      throw error;
+    });
+    return { ...result, barrier: { ...result.barrier, release } };
+  });
+  return {
+    release,
+    async expectReleased(path: string) {
+      expect(release).toHaveBeenCalledOnce();
+      expect(captured?.signal.aborted).toBe(true);
+      await expect(withExclusiveMasterRotationBarrier(
+        new FilesystemStorage(join(path, "state")),
+        custody.CUSTODY_WRITE_LOCK_NAMESPACE, custody.MASTER_ROTATION_BARRIER_NAME,
+        async () => "entered", { timeoutMs: 0 },
+      )).resolves.toBe("entered");
+    },
+  };
+}
+
+describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform))("archive finalizer release witnesses", () => {
+  it("reports the committed export and rejects when final release fails", async () => {
+    const source = await fortress("release-export", "owner-a", true);
+    const releaseError = new Error("fixture final release");
+    const release = rejectArchiveRelease(releaseError);
+    const bundle = join(await tempDir("release-export-bundle"), "bundle");
+    const terminal = new TestTerminal();
+    const close = vi.spyOn(terminal, "close");
+    const args = custodyExportArgs(source.path, bundle, terminal);
+    args.argv[args.argv.indexOf("--archive-id") + 1] = source.archiveId!;
+    await expect(runMemoryArchiveExportCommand(args)).rejects.toBe(releaseError);
+    expect(args.out.text()).toBe(`memory_archive_export: wrote ${bundle}\n`);
+    expect(args.err.text()).toBe("");
+    expect(JSON.parse(await readFile(join(bundle, "manifest.json"), "utf8"))).toHaveProperty("body");
+    expect(await readFile(join(bundle, MEMORY_ARCHIVE_ARTIFACT_PATH))).not.toHaveLength(0);
+    expect(terminal.secretWrites).toHaveLength(1);
+    expect(close).toHaveBeenCalledOnce();
+    await release.expectReleased(source.path);
+  });
+
+  it.each(["before commit", "after commit"])("keeps the import message and both failures %s", async phase => {
+    const source = await fortress("release-import-source", "owner-a", true);
+    const exported = await exportBundle(source);
+    expect(exported.code, exported.err.text()).toBe(0);
+    const destination = await fortress("release-import-destination", "owner-a", false);
+    const releaseError = new Error("fixture final release");
+    const operationError = new Error("fixture import operation");
+    const release = rejectArchiveRelease(releaseError);
+    const terminal = new TestTerminal();
+    terminal.hiddenValue = Buffer.from(secretText(exported.terminal), "ascii");
+    const close = vi.spyOn(terminal, "close");
+    const { out, err } = sinkPair();
+    if (phase === "before commit") vi.spyOn(terminal, "readHidden").mockResolvedValueOnce(Uint8Array.from(terminal.hiddenValue)).mockRejectedValueOnce(operationError);
+    else vi.spyOn(out, "write").mockImplementation(() => { throw operationError; });
+    const result = runMemoryArchiveImportCommand({
+      argv: ["--in", exported.bundle, "--owner-ref", "owner-a", "--fortress", destination.path],
+      out, err, env: { SANCTUARY_PASSPHRASE: PASSPHRASE }, interaction: terminal,
+    });
+    await expect(result).rejects.toMatchObject({ errors: [operationError, releaseError] });
+    expect(err.text()).toBe(phase === "after commit"
+      ? "memory_archive_import failed after the archive was imported; a post-import step (audit logging or receipt output) failed. Re-running memory_archive_import with the same bundle is safe.\n"
+      : "memory_archive_import failed: archive authentication or validation failed\n");
+    const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
+    if (phase === "after commit") expect(await adapter.countPassages()).toBeGreaterThan(0);
+    else expect(await adapter.countPassages()).toBe(0);
+    expect(close).toHaveBeenCalledOnce();
+    await release.expectReleased(destination.path);
+  });
+
+  it.each([
+    ["prune", runMemoryProvenancePruneSignersCommand],
+    ["mark", runMemoryProvenanceMarkBadSignerCommand],
+    ["clear", runMemoryProvenanceClearBadSignerCommand],
+  ] as const)("finalizes the %s command without losing release failure", async (action, run) => {
+    const destination = await fortress(`release-${action}`, "owner-a", false);
+    const releaseError = new Error("fixture final release");
+    const release = rejectArchiveRelease(releaseError);
+    const terminal = new TestTerminal();
+    const close = vi.spyOn(terminal, "close");
+    const { out, err } = sinkPair();
+    // A SHA-256 fingerprint contains 64 hexadecimal digits.
+    const signerArgs = ["--signer-did", "did:key:fixture", "--public-key-sha256", "a".repeat(64)];
+    const result = run({
+      argv: ["--owner-ref", "owner-a", "--fortress", destination.path,
+        ...(action === "prune" ? [] : signerArgs), ...(action === "mark" ? ["--reason", "fixture"] : [])],
+      out, err, env: { SANCTUARY_PASSPHRASE: PASSPHRASE }, interaction: terminal,
+    });
+    if (action === "prune") {
+      await expect(result).rejects.toBe(releaseError);
+      expect(out.text()).toContain("deleted");
+      expect(err.text()).toBe("");
+    } else {
+      await expect(result).rejects.toMatchObject({ errors: [
+        expect.objectContaining({ message: action === "mark" ? "foreign signer mapping is unknown" : "foreign signer is not marked" }),
+        releaseError,
+      ] });
+      expect(err.text()).toBe(`memory_provenance_${action}_bad_signer failed\n`);
+    }
+    expect(close).toHaveBeenCalledOnce();
+    await release.expectReleased(destination.path);
+  });
+
+  it("keeps a caught export error with release failure when the error writer returns normally", async () => {
+    await withArchiveCustody(true, async fixture => {
+      const operationError = new Error("fixture export operation");
+      const releaseError = new Error("fixture final release");
+      fixture.failRelease(releaseError);
+      const terminal = new TestTerminal();
+      const close = vi.spyOn(terminal, "close");
+      const args = custodyExportArgs(fixture.path, join(fixture.path, "new-output"), terminal);
+      vi.spyOn(ApprovalGate.prototype, "evaluate").mockRejectedValue(operationError);
+      await expect(runMemoryArchiveExportCommand(args)).rejects.toMatchObject({ errors: [operationError, releaseError] });
+      expect(args.err.text()).toBe("memory_archive_export failed\n");
+      expect(fixture.release).toHaveBeenCalledOnce();
+      expect(fixture.lease().signal.aborted).toBe(true);
+      await expect(fixture.exclusive()).resolves.toBe("entered");
+      expect(close).toHaveBeenCalledOnce();
+    });
+  });
+});
+
+describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform))("archive aggregate grouping", () => {
+  it.each(["bootstrap", "operation"])("preserves a lease aggregate and close error during %s failure", async phase => {
+    await withArchiveCustody(true, async fixture => {
+      const operationError = new Error("fixture operation");
+      const leaseCauses = [new Error("fixture listener"), new Error("fixture reaper")];
+      const releaseError = new AggregateError(leaseCauses, "fixture lease grouping");
+      const closeError = new Error("fixture interaction close");
+      fixture.failRelease(releaseError);
+      const terminal = new TestTerminal();
+      vi.spyOn(terminal, "close").mockImplementation(() => { throw closeError; });
+      const args = custodyExportArgs(fixture.path, join(fixture.path, "new-output"), terminal);
+      if (phase === "operation") vi.spyOn(ApprovalGate.prototype, "evaluate").mockRejectedValue(operationError);
+      const result = await runMemoryArchiveExportCommand({
+        ...args, ...(phase === "bootstrap" ? { observeMasterKey: () => { throw operationError; } } : {}),
+      }).catch((error: unknown) => error);
+      expect(result).toBeInstanceOf(AggregateError);
+      // Each phase keeps its own aggregate, including the lease's original grouping message.
+      const expected = phase === "bootstrap"
+        ? [expect.objectContaining({ errors: [operationError, releaseError] }), closeError]
+        : [operationError, releaseError, closeError];
+      expect((result as AggregateError).errors).toEqual(expected);
+      const [firstFailure, secondFailure] = (result as AggregateError).errors;
+      const [operationFailure, leaseFailure] = phase === "bootstrap"
+        ? (firstFailure as AggregateError).errors : [firstFailure, secondFailure];
+      expect(operationFailure).toBe(operationError);
+      expect(leaseFailure).toBe(releaseError);
+      expect((leaseFailure as AggregateError).errors).toEqual(leaseCauses);
+      expect(releaseError.message).toBe("fixture lease grouping");
+      expect(fixture.release).toHaveBeenCalledOnce();
+      expect(fixture.lease().signal.aborted).toBe(true);
+      await expect(fixture.exclusive()).resolves.toBe("entered");
+    });
   });
 });

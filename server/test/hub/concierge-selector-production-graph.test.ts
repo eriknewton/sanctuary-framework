@@ -1,9 +1,9 @@
+import { buildV11Bindings } from "../dashboard/construction-work-fixture.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { IdentityManager } from "../../src/cognitive/tools.js";
-import { buildV11Bindings } from "../../src/dashboard/v1_1/wiring.js";
 import { handleHubRoute } from "../../src/hub/api-router.js";
 import type { SubstrateSelector } from "../../src/intelligence/selector.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -60,7 +60,7 @@ describe("daemon hub stateless concierge production graph", () => {
       listWithRotationCount: () => [],
       list: () => [],
     } as unknown as IdentityManager;
-    const { hubService } = buildV11Bindings({
+    const { hubService } = await buildV11Bindings({
       identityId: "operator",
       fortressId: "fortress-test",
       auditLog,

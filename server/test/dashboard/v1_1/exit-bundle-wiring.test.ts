@@ -1,9 +1,9 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-
-import { buildV11Bindings, fortressIdFromStoragePath } from "../../../src/dashboard/v1_1/wiring.js";
+import { fortressIdFromStoragePath } from "../../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
@@ -41,7 +41,7 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
       .find((tool) => tool.name === "identity_create")!
       .handler({ label: "exit-wire-source" });
 
-    const { hubService } = buildV11Bindings({
+    const { hubService } = await buildV11Bindings({
       identityId: "operator-exit-wire",
       fortressId: fortressIdFromStoragePath(storagePath),
       auditLog,
@@ -91,7 +91,7 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
       .find((t) => t.name === "identity_create")!
       .handler({ label: "a7-source" });
 
-    const { hubService } = buildV11Bindings({
+    const { hubService } = await buildV11Bindings({
       identityId: "operator-a7",
       fortressId: fortressIdFromStoragePath(storagePath),
       auditLog,
@@ -149,7 +149,7 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
           can_lockdown: false, can_chat: false, can_change_template: false },
       };
       writePersistedLocalAgents(storagePath, [record]);
-      const { hubService } = buildV11Bindings({ identityId, fortressId, auditLog, storagePath });
+      const { hubService } = await buildV11Bindings({ identityId, fortressId, auditLog, storagePath });
       const items = hubService.listInbox();
       expect(items.map((item) => item.kind)).toEqual(["budget_warning", "agent_error"]);
       for (const item of items) {
@@ -173,7 +173,7 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime("2026-10-26T12:00:00.000Z");
     try {
-      const { hubService } = buildV11Bindings({ identityId: "operator-stream",
+      const { hubService } = await buildV11Bindings({ identityId: "operator-stream",
         fortressId: fortressIdFromStoragePath(storagePath), auditLog, storagePath, streamPublisher });
       const enqueued = hubService.enqueueFortressLockdown();
       expect(streamPublisher.publishInbox).toHaveBeenCalledTimes(1);
@@ -222,7 +222,7 @@ describe("v1.1 dashboard exit-bundle wiring", () => {
           last_activity_at: timestamp, wrapped_at: timestamp, budget_summary: { last_refreshed_at: timestamp },
           capabilities: { can_pause: false, can_resume: false, can_restart: false, can_unwrap: false,
             can_lockdown: false, can_chat: false, can_change_template: false } }]);
-        const { hubService } = buildV11Bindings({ identityId: "operator-stream",
+        const { hubService } = await buildV11Bindings({ identityId: "operator-stream",
           fortressId: fortressIdFromStoragePath(storagePath), auditLog, storagePath,
           streamPublisher: { publishInbox: (frame) => channel.broadcastSSE("inbox", frame),
             publishAgentStatus: (snapshot) => channel.broadcastSSE("agent_status", snapshot) } });

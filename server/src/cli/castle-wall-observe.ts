@@ -45,7 +45,7 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { StateStore } from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, type CliMasterKeySession, transferCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import type { EncryptedPayload } from "../core/encryption.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
@@ -298,6 +298,7 @@ async function bestEffortAudit(
 }
 
 interface Bootstrapped {
+  session: CliMasterKeySession;
   fortressPath: string;
   storage: FilesystemStorage;
   masterKey: Uint8Array;
@@ -344,39 +345,46 @@ async function bootstrap(
   const stateStoragePath = join(fortressPath, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     ...(passphrase !== undefined ? { passphrase } : {}),
     ...(recoveryKey !== undefined ? { recoveryKey } : {}),
     storagePathHint: fortressPath,
   });
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  if (loadResult.loaded === 0) {
-    write(
-      err,
-      loadResult.total > 0
-        ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
-        : "No identities found in this fortress. Run `sanctuary identity create` first.\n",
-    );
-    return 1;
-  }
-  const primary = identityManager.getDefault();
-  if (!primary) {
-    write(err, "No primary identity set.\n");
-    return 1;
-  }
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) {
+      write(
+        err,
+        loadResult.total > 0
+          ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
+          : "No identities found in this fortress. Run `sanctuary identity create` first.\n",
+      );
+      return 1;
+    }
+    const primary = identityManager.getDefault();
+    if (!primary) {
+      write(err, "No primary identity set.\n");
+      return 1;
+    }
 
-  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-  const stateStore = new StateStore(storage, masterKey);
-  const auditLog = new AuditLog(storage, masterKey);
-  const observeStore = new ObserveStore(stateStore, {
-    identityId: primary.identity_id,
-    encryptedPrivateKey: primary.encrypted_private_key,
-    identityEncryptionKey: identityEncKey,
-  });
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const stateStore = new StateStore(storage, masterKey);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    const observeStore = new ObserveStore(stateStore, {
+      identityId: primary.identity_id,
+      encryptedPrivateKey: primary.encrypted_private_key,
+      identityEncryptionKey: identityEncKey,
+    });
 
-  return { fortressPath, storage, masterKey, auditLog, observeStore, primary };
+    return { session, fortressPath, storage, masterKey, auditLog, observeStore, primary };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function bootAuditRootHasSegments(fortressPath: string): Promise<boolean> {
@@ -553,31 +561,38 @@ export async function runObserveStart(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  const now = new Date();
-  const prior = await boot.observeStore.getState();
-  const startedAt = prior.enabled ? prior.started_at : now.toISOString();
-  await boot.observeStore.setState({
-    enabled: true,
-    started_at: startedAt,
-    updated_at: now.toISOString(),
+    const now = new Date();
+    const prior = await boot.observeStore.getState();
+    const startedAt = prior.enabled ? prior.started_at : now.toISOString();
+    await boot.observeStore.setState({
+      enabled: true,
+      started_at: startedAt,
+      updated_at: now.toISOString(),
+    });
+
+    await bestEffortAudit(boot.auditLog, {
+      identity_id: boot.primary.identity_id,
+      operation: "castle_wall_observe_start",
+      details: { started_at: startedAt },
+    });
+
+    write(
+      out,
+      "Observe mode is ON. Your wall is still armed. I am recording the destinations your agent reaches so I can suggest allow rules. Nothing new is being permitted.\n",
+    );
+    write(
+      out,
+      "Run your agent normally, then review what it reached with `sanctuary castle-wall observe candidates`.\n",
+    );
+    return 0;
+
+  }, () => {
+    // Audit failure preserves the verb outcome while session release still propagates.
+    return boot.auditLog.flush().catch(() => undefined);
   });
-
-  await bestEffortAudit(boot.auditLog, {
-    identity_id: boot.primary.identity_id,
-    operation: "castle_wall_observe_start",
-    details: { started_at: startedAt },
-  });
-
-  write(
-    out,
-    "Observe mode is ON. Your wall is still armed. I am recording the destinations your agent reaches so I can suggest allow rules. Nothing new is being permitted.\n",
-  );
-  write(
-    out,
-    "Run your agent normally, then review what it reached with `sanctuary castle-wall observe candidates`.\n",
-  );
-  return 0;
 }
 
 export async function runObserveStatus(
@@ -591,69 +606,76 @@ export async function runObserveStatus(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  const stateRead = await observeSourceState(boot.observeStore);
-  if (stateRead.source.status !== "read-and-verified") {
-    write(
-      err,
-      `Error: could not read observe mode state (${stateRead.source.reason}).\n`,
-    );
-    return 1;
-  }
-  if (stateRead.state === undefined) {
-    write(err, "Error: observe mode state read completed without returning state.\n");
-    return 1;
-  }
-  const census = await observeCandidateCensus(boot.observeStore);
-  if (census.source.status !== "read-and-verified") {
-    write(
-      err,
-      `Error: could not read pending candidate census (${census.source.reason}).\n`,
-    );
-    return 1;
-  }
-  const candidateCount = census.candidates.length;
-  if (candidateCount === 0 && census.emptyVerified === undefined) {
-    const pendingCandidateWitness = `Pending candidates: ${formatPendingCandidateCount(census)}`;
-    write(err, `Error: ${pendingCandidateWitness}; the empty candidate set was not verified.\n`);
-    return 1;
-  }
-  const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
-  const structuralUndeterminedReason = await storeOnlyStructuralUndeterminedReason(boot.fortressPath);
-  const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
+    const stateRead = await observeSourceState(boot.observeStore);
+    if (stateRead.source.status !== "read-and-verified") {
+      write(
+        err,
+        `Error: could not read observe mode state (${stateRead.source.reason}).\n`,
+      );
+      return 1;
+    }
+    if (stateRead.state === undefined) {
+      write(err, "Error: observe mode state read completed without returning state.\n");
+      return 1;
+    }
+    const census = await observeCandidateCensus(boot.observeStore);
+    if (census.source.status !== "read-and-verified") {
+      write(
+        err,
+        `Error: could not read pending candidate census (${census.source.reason}).\n`,
+      );
+      return 1;
+    }
+    const candidateCount = census.candidates.length;
+    if (candidateCount === 0 && census.emptyVerified === undefined) {
+      const pendingCandidateWitness = `Pending candidates: ${formatPendingCandidateCount(census)}`;
+      write(err, `Error: ${pendingCandidateWitness}; the empty candidate set was not verified.\n`);
+      return 1;
+    }
+    const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+    const structuralUndeterminedReason = await storeOnlyStructuralUndeterminedReason(boot.fortressPath);
+    const claim = candidateStoreClaim(candidateCount, lastRefresh, structuralUndeterminedReason);
 
-  if (json) {
+    if (json) {
+      write(
+        out,
+        JSON.stringify(
+          {
+            observe_mode: stateRead.state.enabled ? "on" : "off",
+            started_at: stateRead.state.started_at,
+            pending_candidates: candidateCount,
+            candidate_status: claim.status,
+            definitive_empty: claim.definitiveEmpty,
+            store_state_only: true,
+            last_refresh: lastRefreshForJson(lastRefresh),
+            gate_denials: gateDenialsForJson(structuralUndeterminedReason),
+            ...(claim.undeterminedReason !== null
+              ? { undetermined_reason: claim.undeterminedReason }
+              : {}),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      return 0;
+    }
+
     write(
       out,
-      JSON.stringify(
-        {
-          observe_mode: stateRead.state.enabled ? "on" : "off",
-          started_at: stateRead.state.started_at,
-          pending_candidates: candidateCount,
-          candidate_status: claim.status,
-          definitive_empty: claim.definitiveEmpty,
-          store_state_only: true,
-          last_refresh: lastRefreshForJson(lastRefresh),
-          gate_denials: gateDenialsForJson(structuralUndeterminedReason),
-          ...(claim.undeterminedReason !== null
-            ? { undetermined_reason: claim.undeterminedReason }
-            : {}),
-        },
-        null,
-        2,
-      ) + "\n",
+      stateRead.state.enabled
+        ? `Observe mode: ON (since ${stateRead.state.started_at})\n`
+        : "Observe mode: OFF\n",
     );
+    writeStoreCandidateClaim(out, candidateCount, lastRefresh, claim);
     return 0;
-  }
 
-  write(
-    out,
-    stateRead.state.enabled
-      ? `Observe mode: ON (since ${stateRead.state.started_at})\n`
-      : "Observe mode: OFF\n",
-  );
-  writeStoreCandidateClaim(out, candidateCount, lastRefresh, claim);
-  return 0;
+  }, () => {
+    // Audit failure preserves the verb outcome while session release still propagates.
+    return boot.auditLog.flush().catch(() => undefined);
+  });
 }
 
 export async function runObserveCandidates(
@@ -669,251 +691,258 @@ export async function runObserveCandidates(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  let sourceReads: ObserveAuditSourceReadOutcome[] = [];
-  let quarantinedSources: ObserveQuarantinedSourceState[] = [];
-  let refreshAttempted = false;
-  let refreshComplete = false;
-  let refreshIncompleteReason: string | null = noRefresh
-    ? "refresh was skipped, so audit-source reads were not witnessed"
-    : null;
+    let sourceReads: ObserveAuditSourceReadOutcome[] = [];
+    let quarantinedSources: ObserveQuarantinedSourceState[] = [];
+    let refreshAttempted = false;
+    let refreshComplete = false;
+    let refreshIncompleteReason: string | null = noRefresh
+      ? "refresh was skipped, so audit-source reads were not witnessed"
+      : null;
 
-  if (!noRefresh) {
-    refreshAttempted = true;
-    const producerKey = await loadFortressProducerKey(boot.fortressPath);
-    if (producerKey.status === "unreadable") {
-      write(
-        err,
-        `Error: could not refresh candidates -- Castle Wall audit-producer key is unreadable (${producerKey.reason}). ` +
+    if (!noRefresh) {
+      refreshAttempted = true;
+      const producerKey = await loadFortressProducerKey(boot.fortressPath);
+      if (producerKey.status === "unreadable") {
+        write(
+          err,
+          `Error: could not refresh candidates -- Castle Wall audit-producer key is unreadable (${producerKey.reason}). ` +
           "Nothing was changed. Refusing to fold agent-scoped candidates without verified producer attribution.\n",
-      );
-      return 1;
-    }
-    let outcome;
-    let lockHolderDescription = "";
-    try {
-      outcome = await refreshCandidatesFromAudit({
-        auditLog: boot.auditLog,
-        auditSources: await resolveObserveAuditSources(boot, ctx),
-        store: boot.observeStore,
-        readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
-        lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
-          lockHolderDescription = holder;
-        }),
-        now: new Date(),
-        pinnedProducerKeyB64url:
-          producerKey.status === "present" ? producerKey.keyB64url : null,
-        subjectFortressId: fortressIdFromStoragePath(boot.fortressPath),
-      });
-    } catch (error) {
-      // streamVerifiedChain's strict verification failed: the audit chain
-      // does not verify. Nothing was folded or written (all refresh writes
-      // happen only after a clean verified pass); fail loud, never fold
-      // over an unverified chain.
-      write(
-        err,
-        `Error: could not refresh candidates -- the audit log failed verification (${(error as Error).message}). ` +
+        );
+        return 1;
+      }
+      let outcome;
+      let lockHolderDescription = "";
+      try {
+        outcome = await refreshCandidatesFromAudit({
+          auditLog: boot.auditLog,
+          auditSources: await resolveObserveAuditSources(boot, ctx),
+          store: boot.observeStore,
+          readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
+          lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
+            lockHolderDescription = holder;
+          }),
+          now: new Date(),
+          pinnedProducerKeyB64url:
+            producerKey.status === "present" ? producerKey.keyB64url : null,
+          subjectFortressId: fortressIdFromStoragePath(boot.fortressPath),
+        });
+      } catch (error) {
+        // streamVerifiedChain's strict verification failed: the audit chain
+        // does not verify. Nothing was folded or written (all refresh writes
+        // happen only after a clean verified pass); fail loud, never fold
+        // over an unverified chain.
+        write(
+          err,
+          `Error: could not refresh candidates -- the audit log failed verification (${(error as Error).message}). ` +
           "Nothing was changed. Run `sanctuary castle-wall audit-verify` to investigate.\n",
-      );
-      return 1;
-    }
-    if (outcome.status === "source_read_incomplete") {
-      sourceReads = outcome.source_reads;
-      quarantinedSources = outcome.quarantined_sources;
-      refreshIncompleteReason = outcome.reason;
-      write(
-        err,
-        `Warning: observe could not read every audit source (${outcome.reason}). ` +
+        );
+        return 1;
+      }
+      if (outcome.status === "source_read_incomplete") {
+        sourceReads = outcome.source_reads;
+        quarantinedSources = outcome.quarantined_sources;
+        refreshIncompleteReason = outcome.reason;
+        write(
+          err,
+          `Warning: observe could not read every audit source (${outcome.reason}). ` +
           "No candidate-store changes were made; an empty listing below is UNDETERMINED, not verified empty.\n",
-      );
-    }
-    if (outcome.status === "refresh_in_progress") {
-      write(
-        err,
-        "Error: another `observe candidates` refresh holds this fortress's refresh lock" +
+        );
+      }
+      if (outcome.status === "refresh_in_progress") {
+        write(
+          err,
+          "Error: another `observe candidates` refresh holds this fortress's refresh lock" +
           (lockHolderDescription ? ` (${lockHolderDescription})` : "") +
           ". Nothing was changed (a concurrent double-fold would inflate the Seen counts). " +
           "If the holder is still running, wait for it and re-run. This lock is never broken " +
           "automatically.\n",
-      );
-      return 1;
-    }
-    if (outcome.status === "allowlist_unverified") {
-      write(
-        err,
-        `Error: could not refresh candidates -- the live allowlist manifest did not verify (${outcome.reason}). ` +
+        );
+        return 1;
+      }
+      if (outcome.status === "allowlist_unverified") {
+        write(
+          err,
+          `Error: could not refresh candidates -- the live allowlist manifest did not verify (${outcome.reason}). ` +
           "Nothing was changed. Refusing to fold with an unverifiable policy; investigate the egress manifest before reviewing candidates.\n",
-      );
-      return 1;
-    }
-    if (outcome.status === "refreshed") {
-      sourceReads = outcome.source_reads;
-      quarantinedSources = outcome.quarantined_sources;
-      refreshComplete = true;
-    }
-    if (outcome.status === "refreshed" && outcome.removed_now_allowed > 0) {
-      write(
-        out,
-        `Removed ${outcome.removed_now_allowed} candidate(s) your policy now permits (already-allowed destinations are never pending review).\n`,
-      );
-    }
-  }
-
-  const census = await observeCandidateCensus(boot.observeStore);
-  if (census.source.status !== "read-and-verified") {
-    write(
-      err,
-      `Error: could not read candidate census (${census.source.reason}).\n`,
-    );
-    return 1;
-  }
-  const candidates = census.candidates;
-
-  // Round-3 R2(b): on an exclusive-routing fortress, a candidate whose
-  // destination is already covered by an observe-promoted, CURRENT-gate-uid
-  // scoped rule was promoted and is awaiting the re-arm that loads the gate's
-  // rules snapshot (F2 deliberately keeps such rows visible; without this
-  // marking they were indistinguishable from never-promoted rows). Computed
-  // before BOTH output modes so scripted `--json` consumers see it too
-  // (round-3 L2: additive `promoted_awaiting_rearm` field, present only when
-  // true). Best-effort: a malformed marker or unverifiable allowlist skips
-  // the marking with a warning (the listing itself still works; promote
-  // refuses loud on the same states).
-  let awaitingRearmRules: readonly AllowlistRule[] = [];
-  let awaitingRearmGateUid: number | null = null;
-  let exclusiveGateDenialsUnavailable = false;
-  let routingWitnessComplete = true;
-  try {
-    const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
-    if (marker !== null) {
-      exclusiveGateDenialsUnavailable = true;
-      if (candidates.length > 0) {
-        const allowlist = await readAllowlistForRefresh(boot.fortressPath);
-        if (allowlist.status === "ok") {
-          awaitingRearmRules = allowlist.rules;
-          awaitingRearmGateUid = marker.gate_uid;
-        } else {
-          write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
-        }
+        );
+        return 1;
+      }
+      if (outcome.status === "refreshed") {
+        sourceReads = outcome.source_reads;
+        quarantinedSources = outcome.quarantined_sources;
+        refreshComplete = true;
+      }
+      if (outcome.status === "refreshed" && outcome.removed_now_allowed > 0) {
+        write(
+          out,
+          `Removed ${outcome.removed_now_allowed} candidate(s) your policy now permits (already-allowed destinations are never pending review).\n`,
+        );
       }
     }
-  } catch {
-    routingWitnessComplete = false;
-    write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
-  }
-  const isAwaitingRearm = (candidate: CandidateObservation): boolean =>
-    awaitingRearmGateUid !== null &&
-    candidatePromotedAwaitingRearm(awaitingRearmRules, candidate, awaitingRearmGateUid);
-  const rows = candidates.map((candidate) =>
-    isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
-  );
-  const completeReadWitness =
-    refreshAttempted &&
-    refreshComplete &&
-    routingWitnessComplete &&
-    sourceReads.every(sourceReadSupportsDefinitiveEmpty) &&
-    quarantinedSources.length === 0;
-  const canClaimEmpty =
-    candidates.length === 0 && completeReadWitness && !exclusiveGateDenialsUnavailable;
-  const undeterminedReason = candidateListingUndeterminedReason({
-    noRefresh,
-    refreshIncompleteReason,
-    routingWitnessComplete,
-    exclusiveGateDenialsUnavailable,
-  });
-  let rowsForJson = rows;
-  if (canClaimEmpty) {
-    if (census.emptyVerified === undefined) {
-      write(err, "Error: candidate census could not verify the empty candidate set.\n");
+
+    const census = await observeCandidateCensus(boot.observeStore);
+    if (census.source.status !== "read-and-verified") {
+      write(
+        err,
+        `Error: could not read candidate census (${census.source.reason}).\n`,
+      );
       return 1;
     }
-    rowsForJson = claimFromVerifiedEmpty(census.emptyVerified, rows);
-  }
+    const candidates = census.candidates;
 
-  if (json) {
-    write(
-      out,
-      JSON.stringify(
-        {
-          status:
-            candidates.length > 0
-              ? completeReadWitness
-                ? "populated"
-                : "partial"
-              : canClaimEmpty
-                ? "empty_verified"
-                : "undetermined",
-          definitive_empty: canClaimEmpty,
-          candidates: rowsForJson,
-          source_reads: sourceReads,
-          quarantined_sources: quarantinedSources,
-          gate_denials: exclusiveGateDenialsUnavailable
-            ? {
-                status: "structurally_unavailable",
-                reason: EXCLUSIVE_GATE_DENIALS_UNAVAILABLE,
-              }
-            : { status: "not_applicable" },
-          ...(undeterminedReason !== null ? { undetermined_reason: undeterminedReason } : {}),
-        },
-        null,
-        2,
-      ) + "\n",
+    // Round-3 R2(b): on an exclusive-routing fortress, a candidate whose
+    // destination is already covered by an observe-promoted, CURRENT-gate-uid
+    // scoped rule was promoted and is awaiting the re-arm that loads the gate's
+    // rules snapshot (F2 deliberately keeps such rows visible; without this
+    // marking they were indistinguishable from never-promoted rows). Computed
+    // before BOTH output modes so scripted `--json` consumers see it too
+    // (round-3 L2: additive `promoted_awaiting_rearm` field, present only when
+    // true). Best-effort: a malformed marker or unverifiable allowlist skips
+    // the marking with a warning (the listing itself still works; promote
+    // refuses loud on the same states).
+    let awaitingRearmRules: readonly AllowlistRule[] = [];
+    let awaitingRearmGateUid: number | null = null;
+    let exclusiveGateDenialsUnavailable = false;
+    let routingWitnessComplete = true;
+    try {
+      const marker = await loadExclusiveRoutingMarker(boot.fortressPath);
+      if (marker !== null) {
+        exclusiveGateDenialsUnavailable = true;
+        if (candidates.length > 0) {
+          const allowlist = await readAllowlistForRefresh(boot.fortressPath);
+          if (allowlist.status === "ok") {
+            awaitingRearmRules = allowlist.rules;
+            awaitingRearmGateUid = marker.gate_uid;
+          } else {
+            write(err, "Warning: could not read the verified allowlist; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
+          }
+        }
+      }
+    } catch {
+      routingWitnessComplete = false;
+      write(err, "Warning: the exclusive-routing marker is unreadable; the promoted-awaiting-re-arm marking is unavailable for this listing.\n");
+    }
+    const isAwaitingRearm = (candidate: CandidateObservation): boolean =>
+      awaitingRearmGateUid !== null &&
+      candidatePromotedAwaitingRearm(awaitingRearmRules, candidate, awaitingRearmGateUid);
+    const rows = candidates.map((candidate) =>
+      isAwaitingRearm(candidate) ? { ...candidate, promoted_awaiting_rearm: true } : candidate,
     );
-    return 0;
-  }
-
-  if (exclusiveGateDenialsUnavailable) {
-    write(out, `Exclusive routing: ${EXCLUSIVE_GATE_DENIALS_UNAVAILABLE}; this listing covers master-audit and boot-audit only.\n`);
-  }
-  if (candidates.length > 0 && !completeReadWitness) {
-    write(out, "UNDETERMINED: observe could not verify every source read, so this candidate listing may be incomplete.\n");
-    for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
-  }
-
-  if (candidates.length === 0) {
+    const completeReadWitness =
+      refreshAttempted &&
+      refreshComplete &&
+      routingWitnessComplete &&
+      sourceReads.every(sourceReadSupportsDefinitiveEmpty) &&
+      quarantinedSources.length === 0;
+    const canClaimEmpty =
+      candidates.length === 0 && completeReadWitness && !exclusiveGateDenialsUnavailable;
+    const undeterminedReason = candidateListingUndeterminedReason({
+      noRefresh,
+      refreshIncompleteReason,
+      routingWitnessComplete,
+      exclusiveGateDenialsUnavailable,
+    });
+    let rowsForJson = rows;
     if (canClaimEmpty) {
       if (census.emptyVerified === undefined) {
         write(err, "Error: candidate census could not verify the empty candidate set.\n");
         return 1;
       }
+      rowsForJson = claimFromVerifiedEmpty(census.emptyVerified, rows);
+    }
+
+    if (json) {
       write(
         out,
-        claimFromVerifiedEmpty(
-          census.emptyVerified,
-          "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
-        ),
+        JSON.stringify(
+          {
+            status:
+              candidates.length > 0
+                ? completeReadWitness
+                  ? "populated"
+                  : "partial"
+                : canClaimEmpty
+                  ? "empty_verified"
+                  : "undetermined",
+            definitive_empty: canClaimEmpty,
+            candidates: rowsForJson,
+            source_reads: sourceReads,
+            quarantined_sources: quarantinedSources,
+            gate_denials: exclusiveGateDenialsUnavailable
+              ? {
+                status: "structurally_unavailable",
+                reason: EXCLUSIVE_GATE_DENIALS_UNAVAILABLE,
+              }
+              : { status: "not_applicable" },
+            ...(undeterminedReason !== null ? { undetermined_reason: undeterminedReason } : {}),
+          },
+          null,
+          2,
+        ) + "\n",
       );
-    } else {
-      write(
-        out,
-        `UNDETERMINED: no candidates are listed, but this is not verified empty (${undeterminedReason ?? "source reads were not complete"}).\n`,
-      );
+      return 0;
+    }
+
+    if (exclusiveGateDenialsUnavailable) {
+      write(out, `Exclusive routing: ${EXCLUSIVE_GATE_DENIALS_UNAVAILABLE}; this listing covers master-audit and boot-audit only.\n`);
+    }
+    if (candidates.length > 0 && !completeReadWitness) {
+      write(out, "UNDETERMINED: observe could not verify every source read, so this candidate listing may be incomplete.\n");
       for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
     }
-    return 0;
-  }
 
-  const col = (value: string, width: number): string => `${value.padEnd(width)}  `;
-  write(out, `${col("Destination", 22)}${col("Agent", 15)}${col("Times", 5)}${col("First seen", 20)}${col("Last seen", 20)}Note\n`);
-  for (const candidate of candidates) {
-    const notes: string[] = [];
-    if (candidate.exfil_risk) notes.push("EXFIL-RISK, not pre-selected");
-    if (isAwaitingRearm(candidate)) {
-      notes.push("promoted, awaiting re-arm");
+    if (candidates.length === 0) {
+      if (canClaimEmpty) {
+        if (census.emptyVerified === undefined) {
+          write(err, "Error: candidate census could not verify the empty candidate set.\n");
+          return 1;
+        }
+        write(
+          out,
+          claimFromVerifiedEmpty(
+            census.emptyVerified,
+            "No candidates. Turn on observe mode (`sanctuary castle-wall observe start`), run your agent, then re-run this command.\n",
+          ),
+        );
+      } else {
+        write(
+          out,
+          `UNDETERMINED: no candidates are listed, but this is not verified empty (${undeterminedReason ?? "source reads were not complete"}).\n`,
+        );
+        for (const line of sourceWitnessLines(sourceReads, quarantinedSources)) write(out, `${line}\n`);
+      }
+      return 0;
+    }
+
+    const col = (value: string, width: number): string => `${value.padEnd(width)}  `;
+    write(out, `${col("Destination", 22)}${col("Agent", 15)}${col("Times", 5)}${col("First seen", 20)}${col("Last seen", 20)}Note\n`);
+    for (const candidate of candidates) {
+      const notes: string[] = [];
+      if (candidate.exfil_risk) notes.push("EXFIL-RISK, not pre-selected");
+      if (isAwaitingRearm(candidate)) {
+        notes.push("promoted, awaiting re-arm");
+      }
+      write(
+        out,
+        `${col(destinationLabel(candidate), 22)}${col(candidate.agent_template, 15)}${col(
+          String(candidate.times_seen),
+          5,
+        )}${col(candidate.first_seen, 20)}${col(candidate.last_seen, 20)}${notes.join("; ")}\n`,
+      );
     }
     write(
       out,
-      `${col(destinationLabel(candidate), 22)}${col(candidate.agent_template, 15)}${col(
-        String(candidate.times_seen),
-        5,
-      )}${col(candidate.first_seen, 20)}${col(candidate.last_seen, 20)}${notes.join("; ")}\n`,
+      "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
     );
-  }
-  write(
-    out,
-    "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
-  );
-  return 0;
+    return 0;
+
+  }, () => {
+    // Audit failure preserves the verb outcome while session release still propagates.
+    return boot.auditLog.flush().catch(() => undefined);
+  });
 }
 
 const EXCLUSIVE_GATE_DENIALS_UNAVAILABLE =
@@ -1744,339 +1773,346 @@ export async function runObservePromote(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  // Resolve the scope routing FIRST (before even looking at the selection): a
-  // malformed exclusive-routing marker refuses the promote outright. The
-  // signing daemon refuses to compose a manifest under an unreadable routing
-  // marker, so promoting into that state could only make the outage wider;
-  // fail closed, never guess a mode (fix-round F7 pins this branch).
-  let routing: PromoteRouting;
-  try {
-    routing = await resolvePromoteRouting(boot.fortressPath);
-  } catch (error) {
-    const reason =
-      error instanceof ExclusiveRoutingMarkerError ? error.message : (error as Error).message;
-    write(
-      err,
-      `Error: could not resolve this fortress's egress routing mode (${reason}). ` +
+    // Resolve the scope routing FIRST (before even looking at the selection): a
+    // malformed exclusive-routing marker refuses the promote outright. The
+    // signing daemon refuses to compose a manifest under an unreadable routing
+    // marker, so promoting into that state could only make the outage wider;
+    // fail closed, never guess a mode (fix-round F7 pins this branch).
+    let routing: PromoteRouting;
+    try {
+      routing = await resolvePromoteRouting(boot.fortressPath);
+    } catch (error) {
+      const reason =
+        error instanceof ExclusiveRoutingMarkerError ? error.message : (error as Error).message;
+      write(
+        err,
+        `Error: could not resolve this fortress's egress routing mode (${reason}). ` +
         "Nothing was changed. The signing daemon refuses to compose a manifest under an unreadable " +
         "routing marker, so promoting would not reach enforcement either; repair the marker first.\n",
-    );
-    return 1;
-  }
-
-  const candidatesByKey = await boot.observeStore.listCandidates();
-  const granularity = granularityFlag as ObserveGranularity | undefined;
-  const selection: PromoteSelectionRow[] = [];
-  // Round-3 R5: a repeated `--destination X --destination X` (or overlapping
-  // matches) must select each candidate row ONCE. Duplicate selection rows
-  // synthesized two same-id rules, and the publisher's duplicate-rule-id
-  // guard then threw AFTER approval (an unhandled crash, nothing published).
-  const selectedKeys = new Set<string>();
-  const pushSelection = (key: string): void => {
-    if (selectedKeys.has(key)) return;
-    selectedKeys.add(key);
-    selection.push({ key, granularity });
-  };
-
-  if (all) {
-    for (const [key, candidate] of candidatesByKey) {
-      if (candidate.exfil_risk && !includeRisky) {
-        write(
-          out,
-          `Skipping EXFIL-RISK destination ${destinationLabel(candidate)} (pass --include-risky to promote it deliberately).\n`,
-        );
-        continue;
-      }
-      pushSelection(key);
-    }
-  } else {
-    for (const destination of [...new Set(destinations)]) {
-      const matches = [...candidatesByKey.entries()].filter(
-        ([, candidate]) => destinationLabel(candidate) === destination,
       );
-      if (matches.length === 0) {
-        write(err, `Warning: no pending candidate matches ${destination}\n`);
-        continue;
-      }
-      // FIX 4: a bare host:port can match candidates from more than one agent
-      // template or protocol. Echo exactly which (template, protocol) rows a
-      // --destination selected so the fan-out is visible BEFORE the approval
-      // prompt (the approval context itself also lists every synthesized rule
-      // + its scope, so the human sees each grant before approving).
-      if (matches.length > 1) {
-        const rows = matches
-          .map(([, candidate]) => `${candidate.agent_template}/${candidate.protocol}`)
-          .join(", ");
-        write(out, `Note: ${destination} matches ${matches.length} candidate row(s): ${rows}\n`);
-      }
-      for (const [key, candidate] of matches) {
+      return 1;
+    }
+
+    const candidatesByKey = await boot.observeStore.listCandidates();
+    const granularity = granularityFlag as ObserveGranularity | undefined;
+    const selection: PromoteSelectionRow[] = [];
+    // Round-3 R5: a repeated `--destination X --destination X` (or overlapping
+    // matches) must select each candidate row ONCE. Duplicate selection rows
+    // synthesized two same-id rules, and the publisher's duplicate-rule-id
+    // guard then threw AFTER approval (an unhandled crash, nothing published).
+    const selectedKeys = new Set<string>();
+    const pushSelection = (key: string): void => {
+      if (selectedKeys.has(key)) return;
+      selectedKeys.add(key);
+      selection.push({ key, granularity });
+    };
+
+    if (all) {
+      for (const [key, candidate] of candidatesByKey) {
         if (candidate.exfil_risk && !includeRisky) {
           write(
             out,
-            `Skipping EXFIL-RISK destination ${destination} (pass --include-risky to promote it deliberately).\n`,
+            `Skipping EXFIL-RISK destination ${destinationLabel(candidate)} (pass --include-risky to promote it deliberately).\n`,
           );
           continue;
         }
         pushSelection(key);
       }
-    }
-  }
-
-  if (selection.length === 0) {
-    if (routing.mode !== "exclusive") {
-      const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
-      if (json) {
-        writePromoteNoSelectionJson(out, candidatesByKey.size, lastRefresh, false);
-      } else if (candidatesByKey.size === 0) {
-        writePromoteNoSelectionText(out, 0, lastRefresh, false);
-      } else {
-        write(out, "Nothing selected to promote.\n");
+    } else {
+      for (const destination of [...new Set(destinations)]) {
+        const matches = [...candidatesByKey.entries()].filter(
+          ([, candidate]) => destinationLabel(candidate) === destination,
+        );
+        if (matches.length === 0) {
+          write(err, `Warning: no pending candidate matches ${destination}\n`);
+          continue;
+        }
+        // FIX 4: a bare host:port can match candidates from more than one agent
+        // template or protocol. Echo exactly which (template, protocol) rows a
+        // --destination selected so the fan-out is visible BEFORE the approval
+        // prompt (the approval context itself also lists every synthesized rule
+        // + its scope, so the human sees each grant before approving).
+        if (matches.length > 1) {
+          const rows = matches
+            .map(([, candidate]) => `${candidate.agent_template}/${candidate.protocol}`)
+            .join(", ");
+          write(out, `Note: ${destination} matches ${matches.length} candidate row(s): ${rows}\n`);
+        }
+        for (const [key, candidate] of matches) {
+          if (candidate.exfil_risk && !includeRisky) {
+            write(
+              out,
+              `Skipping EXFIL-RISK destination ${destination} (pass --include-risky to promote it deliberately).\n`,
+            );
+            continue;
+          }
+          pushSelection(key);
+        }
       }
-      return 0;
     }
-    // Round-3 R3: on an exclusive fortress an EMPTY selection still proceeds,
-    // because promote is the product path that re-scopes stale (pre-exclusive)
-    // promoted rules to the gate principal -- and the coarse-era promote
-    // REMOVED its candidates, so the bricked state has nothing to select.
-    write(
-      out,
-      "No pending candidates selected; checking for promoted rules that need re-scoping to this fortress's exclusive routing.\n",
-    );
-  }
 
-  const egressDir = join(boot.fortressPath, "policy", "egress");
-
-  const pinnedPublicKey = await loadPinnedPublicKey(boot.fortressPath, err);
-  if (!pinnedPublicKey) return 1;
-
-  const signer = await loadPinnedManifestSigner(boot.fortressPath, boot.masterKey, err);
-  if (!signer) return 1;
-
-  const fortressId = fortressIdFromStoragePath(boot.fortressPath);
-  const manifestStorage = new FilesystemManifestStorage(egressDir);
-
-  const policy = await loadPrincipalPolicy(boot.fortressPath);
-  const baseline = new BaselineTracker(boot.storage, boot.masterKey);
-  const channel = ctx.approvalChannel ?? new CastleWallObservePromptApprovalChannel();
-  const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
-
-  // Round-3 R1: cross-process publish lock (see promote.ts `publishLock`).
-  let promoteLockHolder = "";
-  const publishLock = observePromoteFileLock(boot.fortressPath, (holder) => {
-    promoteLockHolder = holder;
-  });
-  const publishManifest = selectObservePromotePublisher(ctx.platform ?? process.platform);
-
-  let outcome: PromoteOutcome;
-  try {
-    outcome = await promoteCandidates(selection, candidatesByKey, {
-      readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
-      approve: (operation, context) => gate.evaluate(operation, context),
-      publish: (rules, descriptors) =>
-        publishManifest(
-          {
-            fortressId,
-            issuedAt: new Date().toISOString(),
-            rules,
-            signer,
-            // Carry the VERIFIED manifest-level descriptors through so a re-sign
-            // preserves operator_baseline + agent_origin (#897 P1). buildSignedManifest
-            // re-runs each through its fail-closed validator (idempotent for an
-            // already-signed descriptor), so a carried-forward value is emitted
-            // faithfully and a malformed one would still be dropped.
-            ...(descriptors.agentOrigin !== undefined ? { agentOrigin: descriptors.agentOrigin } : {}),
-            ...(descriptors.operatorBaseline !== undefined
-              ? { operatorBaseline: descriptors.operatorBaseline }
-              : {}),
-          },
-          manifestStorage,
-        ),
-      auditPromotedCandidate: async (row) => {
-        await boot.auditLog.appendCritical({
-          layer: "l1",
-          operation: "castle_wall_observe_promote",
-          identity_id: boot.primary.identity_id,
-          result: "success",
-          details: {
-            candidate_key: row.key,
-            rule_id: row.rule_id,
-            destination: destinationLabel(row.candidate),
-            routing_mode: routing.mode,
-          },
-        });
-      },
-      now: new Date(),
-      routing,
-      // Fix-round F5: the Tier-1 approval can block on a human; re-resolve the
-      // marker after it returns so a mode flip in that window aborts instead of
-      // signing rules scoped for the fortress as it no longer is.
-      reresolveRouting: () => resolvePromoteRouting(boot.fortressPath),
-      publishLock,
-    });
-  } catch (error) {
-    if (isLinuxPolicyCompatibilityRefusal(error)) {
-      const message = error.message;
+    if (selection.length === 0) {
+      if (routing.mode !== "exclusive") {
+        const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+        if (json) {
+          writePromoteNoSelectionJson(out, candidatesByKey.size, lastRefresh, false);
+        } else if (candidatesByKey.size === 0) {
+          writePromoteNoSelectionText(out, 0, lastRefresh, false);
+        } else {
+          write(out, "Nothing selected to promote.\n");
+        }
+        return 0;
+      }
+      // Round-3 R3: on an exclusive fortress an EMPTY selection still proceeds,
+      // because promote is the product path that re-scopes stale (pre-exclusive)
+      // promoted rules to the gate principal -- and the coarse-era promote
+      // REMOVED its candidates, so the bricked state has nothing to select.
       write(
-        err,
-        `Aborted: observe promote cannot publish this ruleset on Linux: ${message}. ` +
+        out,
+        "No pending candidates selected; checking for promoted rules that need re-scoping to this fortress's exclusive routing.\n",
+      );
+    }
+
+    const egressDir = join(boot.fortressPath, "policy", "egress");
+
+    const pinnedPublicKey = await loadPinnedPublicKey(boot.fortressPath, err);
+    if (!pinnedPublicKey) return 1;
+
+    const signer = await loadPinnedManifestSigner(boot.fortressPath, boot.masterKey, err);
+    if (!signer) return 1;
+
+    const fortressId = fortressIdFromStoragePath(boot.fortressPath);
+    const manifestStorage = new FilesystemManifestStorage(egressDir);
+
+    const policy = await loadPrincipalPolicy(boot.fortressPath);
+    const baseline = new BaselineTracker(boot.storage, boot.masterKey);
+    const channel = ctx.approvalChannel ?? new CastleWallObservePromptApprovalChannel();
+    const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
+
+    // Round-3 R1: cross-process publish lock (see promote.ts `publishLock`).
+    let promoteLockHolder = "";
+    const publishLock = observePromoteFileLock(boot.fortressPath, (holder) => {
+      promoteLockHolder = holder;
+    });
+    const publishManifest = selectObservePromotePublisher(ctx.platform ?? process.platform);
+
+    let outcome: PromoteOutcome;
+    try {
+      outcome = await promoteCandidates(selection, candidatesByKey, {
+        readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
+        approve: (operation, context) => gate.evaluate(operation, context),
+        publish: (rules, descriptors) =>
+          publishManifest(
+            {
+              fortressId,
+              issuedAt: new Date().toISOString(),
+              rules,
+              signer,
+              // Carry the VERIFIED manifest-level descriptors through so a re-sign
+              // preserves operator_baseline + agent_origin (#897 P1). buildSignedManifest
+              // re-runs each through its fail-closed validator (idempotent for an
+              // already-signed descriptor), so a carried-forward value is emitted
+              // faithfully and a malformed one would still be dropped.
+              ...(descriptors.agentOrigin !== undefined ? { agentOrigin: descriptors.agentOrigin } : {}),
+              ...(descriptors.operatorBaseline !== undefined
+                ? { operatorBaseline: descriptors.operatorBaseline }
+                : {}),
+            },
+            manifestStorage,
+          ),
+        auditPromotedCandidate: async (row) => {
+          await boot.auditLog.appendCritical({
+            layer: "l1",
+            operation: "castle_wall_observe_promote",
+            identity_id: boot.primary.identity_id,
+            result: "success",
+            details: {
+              candidate_key: row.key,
+              rule_id: row.rule_id,
+              destination: destinationLabel(row.candidate),
+              routing_mode: routing.mode,
+            },
+          });
+        },
+        now: new Date(),
+        routing,
+        // Fix-round F5: the Tier-1 approval can block on a human; re-resolve the
+        // marker after it returns so a mode flip in that window aborts instead of
+        // signing rules scoped for the fortress as it no longer is.
+        reresolveRouting: () => resolvePromoteRouting(boot.fortressPath),
+        publishLock,
+      });
+    } catch (error) {
+      if (isLinuxPolicyCompatibilityRefusal(error)) {
+        const message = error.message;
+        write(
+          err,
+          `Aborted: observe promote cannot publish this ruleset on Linux: ${message}. ` +
           "Nothing changed; no manifest was re-signed. " +
           `${linuxObservePromoteRemedy(routing.mode)}\n`,
-      );
+        );
+        return 1;
+      }
+      throw error;
+    }
+
+    if (outcome.status === "no_candidates") {
+      if (selection.length === 0) {
+        // The exclusive-mode empty-selection rescope check (round-3 R3) found
+        // nothing needing re-scope: an honest no-op, not an error.
+        const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
+        if (json) {
+          writePromoteNoSelectionJson(
+            out,
+            candidatesByKey.size,
+            lastRefresh,
+            true,
+            routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
+          );
+        } else {
+          writePromoteNoSelectionText(
+            out,
+            candidatesByKey.size,
+            lastRefresh,
+            true,
+            routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
+          );
+        }
+        return 0;
+      }
+      write(err, "No valid candidates to promote (not found, or the synthesized rule failed validation).\n");
+      for (const dropped of outcome.dropped) write(err, `  ${dropped.key}: ${dropped.reason}\n`);
       return 1;
     }
-    throw error;
-  }
-
-  if (outcome.status === "no_candidates") {
-    if (selection.length === 0) {
-      // The exclusive-mode empty-selection rescope check (round-3 R3) found
-      // nothing needing re-scope: an honest no-op, not an error.
-      const lastRefresh = await boot.observeStore.getLastRefreshOutcome();
-      if (json) {
-        writePromoteNoSelectionJson(
-          out,
-          candidatesByKey.size,
-          lastRefresh,
-          true,
-          routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
-        );
-      } else {
-        writePromoteNoSelectionText(
-          out,
-          candidatesByKey.size,
-          lastRefresh,
-          true,
-          routing.mode === "exclusive" ? EXCLUSIVE_GATE_DENIALS_UNAVAILABLE : null,
-        );
-      }
-      return 0;
-    }
-    write(err, "No valid candidates to promote (not found, or the synthesized rule failed validation).\n");
-    for (const dropped of outcome.dropped) write(err, `  ${dropped.key}: ${dropped.reason}\n`);
-    return 1;
-  }
-  if (outcome.status === "publish_in_progress") {
-    write(
-      err,
-      "Error: another egress-policy writer (an `observe promote`, or a provisioning publish/revoke/restore) " +
+    if (outcome.status === "publish_in_progress") {
+      write(
+        err,
+        "Error: another egress-policy writer (an `observe promote`, or a provisioning publish/revoke/restore) " +
         "is writing to this fortress" +
         (promoteLockHolder ? ` (${promoteLockHolder})` : "") +
         ". Nothing was changed (concurrent writers could silently drop each other's rules). " +
         "Wait for it to finish and re-run. This lock is never broken automatically.\n",
-    );
-    return 1;
-  }
-  if (outcome.status === "already_promoted") {
+      );
+      return 1;
+    }
+    if (outcome.status === "already_promoted") {
+      write(
+        out,
+        "The selected destination(s) are already in your wall's signed ruleset with the current-mode scope; nothing needed re-signing.\n",
+      );
+      if (routing.mode === "exclusive") {
+        write(
+          out,
+          "If you have re-armed since promoting, the gate is already serving them; remove the rows with " +
+          "`sanctuary castle-wall observe discard`. If you have not re-armed yet, re-arm to apply them " +
+          `(for example: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}).\n`,
+        );
+      }
+      return 0;
+    }
+    if (outcome.status === "tampered_manifest") {
+      write(
+        err,
+        `Aborted: the existing Castle Wall manifest did not verify against the pinned key (${outcome.reason}). ` +
+        `Nothing changed. Refusing to re-sign an unverified ruleset; investigate ${join(egressDir, "manifest.json")} ` +
+        `before promoting.\n`,
+      );
+      return 1;
+    }
+    if (outcome.status === "manifest_changed") {
+      write(
+        err,
+        "Aborted: the Castle Wall manifest changed while you were reviewing this promote. Nothing changed. " +
+        "Re-run `sanctuary castle-wall observe promote` so your approval applies to the current ruleset.\n",
+      );
+      return 1;
+    }
+    if (outcome.status === "denied") {
+      write(
+        err,
+        `Denied: promote was not approved (${outcome.reason}). Nothing changed` +
+        (selection.length > 0
+          ? "; the selected destinations stay blocked.\n"
+          : "; no rules were re-scoped.\n"),
+      );
+      return 1;
+    }
+    if (outcome.status === "routing_changed") {
+      write(
+        err,
+        `Aborted: this fortress's egress routing changed while you were reviewing this promote (${outcome.reason}). ` +
+        "Nothing changed. Re-run `sanctuary castle-wall observe promote` so the rules are scoped for the " +
+        "fortress as it now stands.\n",
+      );
+      return 1;
+    }
+
+    // Fix-round F1(b): in EXCLUSIVE mode the promoted candidates stay in the
+    // pending list. The gate daemon loads its destination rules only at arming,
+    // gate denials are not folded into the audit chain, and a removed row would
+    // therefore vanish with nothing to re-mint it -- reporting "done" for a
+    // destination the agent still cannot reach (the original defect's shape).
+    // Round-3 R2: NOTHING clears these rows automatically -- no composable
+    // rule can cover the agent's direct path on an exclusive fortress (that is
+    // exactly what the compose-time assertion forbids), so the refresh prune
+    // can never fire for them. The row leaves the list when the OPERATOR
+    // discards it after re-arming; the listing marks it "promoted, awaiting
+    // re-arm" and the copy below says so plainly.
+    if (routing.mode !== "exclusive") {
+      for (const key of outcome.promotedKeys) {
+        const candidate = candidatesByKey.get(key);
+        if (!candidate) continue;
+        await boot.observeStore.removeCandidateAfterReview(
+          candidate,
+          "promote",
+          new Date().toISOString(),
+        );
+      }
+    }
+
+    const summary: string[] = [];
+    if (outcome.addedRules.length > 0) summary.push(`added ${outcome.addedRules.length} allow rule(s)`);
+    if (outcome.rewrittenRules.length > 0) {
+      summary.push(
+        `re-scoped ${outcome.rewrittenRules.length} existing promoted rule(s) to this fortress's routing mode`,
+      );
+    }
     write(
       out,
-      "The selected destination(s) are already in your wall's signed ruleset with the current-mode scope; nothing needed re-signing.\n",
+      `Promote complete: ${summary.join(" and ")}. Your wall's manifest was re-signed and republished to the rule source the enforcement daemons read.\n`,
     );
     if (routing.mode === "exclusive") {
       write(
         out,
-        "If you have re-armed since promoting, the gate is already serving them; remove the rows with " +
-          "`sanctuary castle-wall observe discard`. If you have not re-armed yet, re-arm to apply them " +
-          `(for example: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}).\n`,
+        "This fortress runs exclusive routing: the rule(s) are bound to the sanctuary-gate principal (your agent's only sanctioned off-box path is the gate).\n",
       );
-    }
-    return 0;
-  }
-  if (outcome.status === "tampered_manifest") {
-    write(
-      err,
-      `Aborted: the existing Castle Wall manifest did not verify against the pinned key (${outcome.reason}). ` +
-        `Nothing changed. Refusing to re-sign an unverified ruleset; investigate ${join(egressDir, "manifest.json")} ` +
-        `before promoting.\n`,
-    );
-    return 1;
-  }
-  if (outcome.status === "manifest_changed") {
-    write(
-      err,
-      "Aborted: the Castle Wall manifest changed while you were reviewing this promote. Nothing changed. " +
-        "Re-run `sanctuary castle-wall observe promote` so your approval applies to the current ruleset.\n",
-    );
-    return 1;
-  }
-  if (outcome.status === "denied") {
-    write(
-      err,
-      `Denied: promote was not approved (${outcome.reason}). Nothing changed` +
-        (selection.length > 0
-          ? "; the selected destinations stay blocked.\n"
-          : "; no rules were re-scoped.\n"),
-    );
-    return 1;
-  }
-  if (outcome.status === "routing_changed") {
-    write(
-      err,
-      `Aborted: this fortress's egress routing changed while you were reviewing this promote (${outcome.reason}). ` +
-        "Nothing changed. Re-run `sanctuary castle-wall observe promote` so the rules are scoped for the " +
-        "fortress as it now stands.\n",
-    );
-    return 1;
-  }
-
-  // Fix-round F1(b): in EXCLUSIVE mode the promoted candidates stay in the
-  // pending list. The gate daemon loads its destination rules only at arming,
-  // gate denials are not folded into the audit chain, and a removed row would
-  // therefore vanish with nothing to re-mint it -- reporting "done" for a
-  // destination the agent still cannot reach (the original defect's shape).
-  // Round-3 R2: NOTHING clears these rows automatically -- no composable
-  // rule can cover the agent's direct path on an exclusive fortress (that is
-  // exactly what the compose-time assertion forbids), so the refresh prune
-  // can never fire for them. The row leaves the list when the OPERATOR
-  // discards it after re-arming; the listing marks it "promoted, awaiting
-  // re-arm" and the copy below says so plainly.
-  if (routing.mode !== "exclusive") {
-    for (const key of outcome.promotedKeys) {
-      const candidate = candidatesByKey.get(key);
-      if (!candidate) continue;
-      await boot.observeStore.removeCandidateAfterReview(
-        candidate,
-        "promote",
-        new Date().toISOString(),
-      );
-    }
-  }
-
-  const summary: string[] = [];
-  if (outcome.addedRules.length > 0) summary.push(`added ${outcome.addedRules.length} allow rule(s)`);
-  if (outcome.rewrittenRules.length > 0) {
-    summary.push(
-      `re-scoped ${outcome.rewrittenRules.length} existing promoted rule(s) to this fortress's routing mode`,
-    );
-  }
-  write(
-    out,
-    `Promote complete: ${summary.join(" and ")}. Your wall's manifest was re-signed and republished to the rule source the enforcement daemons read.\n`,
-  );
-  if (routing.mode === "exclusive") {
-    write(
-      out,
-      "This fortress runs exclusive routing: the rule(s) are bound to the sanctuary-gate principal (your agent's only sanctioned off-box path is the gate).\n",
-    );
-    write(
-      out,
-      "IMPORTANT: the running gate daemon loads its destination rules only when the gate is armed, so your agent " +
+      write(
+        out,
+        "IMPORTANT: the running gate daemon loads its destination rules only when the gate is armed, so your agent " +
         "CANNOT reach the approved destination(s) yet. Re-arm to apply them, for example: " +
         `${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}. The destination(s) stay listed in ` +
         "`observe candidates` (marked as promoted, awaiting re-arm); nothing clears them automatically. " +
         "Once the re-armed gate is serving them, remove them with `sanctuary castle-wall observe discard`.\n",
-    );
-  } else {
-    write(
-      out,
-      "Run `sanctuary castle-wall reload` (or restart the daemon) so a running Castle Wall daemon picks up the new rules immediately.\n",
-    );
-  }
-  if (outcome.dropped.length > 0) {
-    write(out, `${outcome.dropped.length} row(s) were skipped:\n`);
-    for (const dropped of outcome.dropped) write(out, `  ${dropped.key}: ${dropped.reason}\n`);
-  }
-  return 0;
+      );
+    } else {
+      write(
+        out,
+        "Run `sanctuary castle-wall reload` (or restart the daemon) so a running Castle Wall daemon picks up the new rules immediately.\n",
+      );
+    }
+    if (outcome.dropped.length > 0) {
+      write(out, `${outcome.dropped.length} row(s) were skipped:\n`);
+      for (const dropped of outcome.dropped) write(out, `  ${dropped.key}: ${dropped.reason}\n`);
+    }
+    return 0;
+
+  }, () => {
+    // Audit failure preserves the verb outcome while session release still propagates.
+    return boot.auditLog.flush().catch(() => undefined);
+  });
 }
 
 export async function runObserveDiscard(
@@ -2096,52 +2132,59 @@ export async function runObserveDiscard(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  const candidatesByKey = await boot.observeStore.listCandidates();
-  const keysToRemove = all
-    ? [...candidatesByKey.keys()]
-    : [...candidatesByKey.entries()]
+    const candidatesByKey = await boot.observeStore.listCandidates();
+    const keysToRemove = all
+      ? [...candidatesByKey.keys()]
+      : [...candidatesByKey.entries()]
         .filter(([, candidate]) => destinations.includes(destinationLabel(candidate)))
         .map(([key]) => key);
 
-  if (keysToRemove.length > 0) {
-    // The discard audit entry is the REVIEW MARKER the refresh chokepoint's
-    // recompute heal depends on to not resurrect discarded candidates from
-    // retained history (castle-wall/observe/refresh.ts guarantee 3; Codex
-    // two-family gate round 2, HIGH). It is therefore written CRITICALLY and
-    // BEFORE the rows are removed: if the append fails, the discard aborts
-    // with the rows intact (fail-closed; the operator retries). A crash
-    // between the append and the removals is harmless -- the marker only
-    // bounds what a recompute may MINT for keys absent from the store, and
-    // the still-present rows heal normally.
-    const reviewedAt = new Date().toISOString();
-    try {
-      await boot.auditLog.appendCritical({
-        timestamp: reviewedAt,
-        layer: "l1",
-        operation: "castle_wall_observe_discard",
-        identity_id: boot.primary.identity_id,
-        result: "success",
-        details: { discarded_count: keysToRemove.length },
-      });
-    } catch (error) {
-      write(
-        err,
-        `Error: the discard could not be recorded in the audit log (${(error as Error).message}). ` +
+    if (keysToRemove.length > 0) {
+      // The discard audit entry is the REVIEW MARKER the refresh chokepoint's
+      // recompute heal depends on to not resurrect discarded candidates from
+      // retained history (castle-wall/observe/refresh.ts guarantee 3; Codex
+      // two-family gate round 2, HIGH). It is therefore written CRITICALLY and
+      // BEFORE the rows are removed: if the append fails, the discard aborts
+      // with the rows intact (fail-closed; the operator retries). A crash
+      // between the append and the removals is harmless -- the marker only
+      // bounds what a recompute may MINT for keys absent from the store, and
+      // the still-present rows heal normally.
+      const reviewedAt = new Date().toISOString();
+      try {
+        await boot.auditLog.appendCritical({
+          timestamp: reviewedAt,
+          layer: "l1",
+          operation: "castle_wall_observe_discard",
+          identity_id: boot.primary.identity_id,
+          result: "success",
+          details: { discarded_count: keysToRemove.length },
+        });
+      } catch (error) {
+        write(
+          err,
+          `Error: the discard could not be recorded in the audit log (${(error as Error).message}). ` +
           "Nothing was discarded; the discard record is what prevents a discarded destination " +
           "from reappearing out of retained history, so it must land first. Re-run after " +
           "resolving the audit-log failure.\n",
-      );
-      return 1;
+        );
+        return 1;
+      }
+
+      for (const key of keysToRemove) {
+        const candidate = candidatesByKey.get(key);
+        if (!candidate) continue;
+        await boot.observeStore.removeCandidateAfterReview(candidate, "discard", reviewedAt);
+      }
     }
 
-    for (const key of keysToRemove) {
-      const candidate = candidatesByKey.get(key);
-      if (!candidate) continue;
-      await boot.observeStore.removeCandidateAfterReview(candidate, "discard", reviewedAt);
-    }
-  }
+    write(out, `Discarded ${keysToRemove.length} candidate(s).\n`);
+    return 0;
 
-  write(out, `Discarded ${keysToRemove.length} candidate(s).\n`);
-  return 0;
+  }, () => {
+    // Audit failure preserves the verb outcome while session release still propagates.
+    return boot.auditLog.flush().catch(() => undefined);
+  });
 }

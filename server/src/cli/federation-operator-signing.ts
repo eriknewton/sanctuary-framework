@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { IdentityManager } from "../cognitive/tools.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { type CliMasterKeySession, transferCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { sign } from "../core/identity.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
@@ -67,6 +67,7 @@ export interface OperatorSigner {
   storage: StorageBackend;
   /** The unlocked custody master key (reused by join --persist for the joiner store). */
   masterKey: Uint8Array;
+  masterWriteBarrier: CliMasterKeySession["masterWriteBarrier"];
   /**
    * Sign the canonical operator payload for `action` and return the base64url
    * signature ready to attach as `operator_signature` in the request body.
@@ -88,8 +89,8 @@ export interface OperatorSigner {
  * Open the local fortress headless (keychain-safe), resolve the DEFAULT
  * operator identity, and return a signer bound to it. Throws
  * `OperatorSigningError` (fail closed) when custody cannot be unlocked or no
- * default operator identity exists. The caller owns zeroing the returned
- * `masterKey` after use.
+ * default operator identity exists. The caller retains custody through final
+ * persistence, then scrubs `masterKey` and awaits `masterWriteBarrier` release.
  */
 export async function openOperatorSigner(
   opts: OperatorSignerOptions,
@@ -97,8 +98,8 @@ export async function openOperatorSigner(
   if (!opts.passphrase && !opts.recoveryKey) {
     throw new OperatorSigningError(
       "an unlocked operator identity is required: set SANCTUARY_PASSPHRASE, " +
-        "--passphrase, or SANCTUARY_RECOVERY_KEY (this verb never prompts the " +
-        "macOS keychain in a headless session)",
+      "--passphrase, or SANCTUARY_RECOVERY_KEY (this verb never prompts the " +
+      "macOS keychain in a headless session)",
     );
   }
   // --fortress override: loadConfig() reads SANCTUARY_STORAGE_PATH directly.
@@ -113,80 +114,83 @@ export async function openOperatorSigner(
 
   // Unified custody: never derive a fortress master verb-locally. This is the
   // no-modal headless unlock path (passphrase / recovery key only).
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     ...(opts.passphrase !== undefined ? { passphrase: opts.passphrase } : {}),
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     storagePathHint: config.storage_path,
   });
+  const masterKey = session.masterKey;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  if (loadResult.loaded === 0) {
-    masterKey.fill(0);
-    throw new OperatorSigningError(
-      loadResult.total > 0
-        ? "operator identity files found but none could be decrypted (wrong passphrase?)"
-        : "no operator identity in this fortress: federation admin verbs require " +
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) {
+      throw new OperatorSigningError(
+        loadResult.total > 0
+          ? "operator identity files found but none could be decrypted (wrong passphrase?)"
+          : "no operator identity in this fortress: federation admin verbs require " +
           "a default operator identity (run `sanctuary identity create`, or " +
           "re-run `sanctuary init` without --no-identity)",
-    );
-  }
-
-  const identity = identityManager.getDefault();
-  if (!identity?.encrypted_private_key || !identity.public_key) {
-    masterKey.fill(0);
-    throw new OperatorSigningError(
-      "no default operator identity is set in this fortress",
-    );
-  }
-
-  const operatorPublicKey = decodePublicKey(identity.public_key);
-  if (operatorPublicKey === null) {
-    masterKey.fill(0);
-    throw new OperatorSigningError("default operator identity public key is malformed");
-  }
-
-  // The identity private key is encrypted under derivePurposeKey(master,
-  // "identity-encryption") (see IdentityManager.encryptionKey). sign() decrypts
-  // it transiently and zeroes it in a finally (constraint 6).
-  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const encryptedPrivateKey = identity.encrypted_private_key;
-
-  return {
-    operatorPublicKey,
-    storage,
-    masterKey,
-    signPayload(action: string, payload: unknown): string {
-      const message = buildOperatorSignedMessage(action, payload);
-      const signature = sign(message, encryptedPrivateKey, identityEncryptionKey);
-      try {
-        return toBase64url(signature);
-      } finally {
-        signature.fill(0);
-      }
-    },
-    signAttestation(clientPubkey: Uint8Array, issuedAtMs: number): OperatorEd25519Attestation {
-      // Reuse the SAME encrypted-key sign() path (constraint 6: the private key
-      // is decrypted transiently and zeroed in sign()'s finally; never exposed
-      // here). Mirrors signOperatorAttestation but without a raw private key.
-      const message = buildOperatorAttestationMessage(
-        operatorPublicKey,
-        clientPubkey,
-        issuedAtMs,
       );
-      const signature = sign(message, encryptedPrivateKey, identityEncryptionKey);
-      try {
-        return {
-          type: "operator_ed25519",
-          operator_pubkey: toBase64url(operatorPublicKey),
-          issued_at: issuedAtMs,
-          signature: toBase64url(signature),
-        };
-      } finally {
-        signature.fill(0);
-      }
-    },
-  };
+    }
+
+    const identity = identityManager.getDefault();
+    if (!identity?.encrypted_private_key || !identity.public_key) {
+      throw new OperatorSigningError(
+        "no default operator identity is set in this fortress",
+      );
+    }
+
+    const operatorPublicKey = decodePublicKey(identity.public_key);
+    if (operatorPublicKey === null) {
+      throw new OperatorSigningError("default operator identity public key is malformed");
+    }
+
+    // The identity private key is encrypted under derivePurposeKey(master,
+    // "identity-encryption") (see IdentityManager.encryptionKey). sign() decrypts
+    // it transiently and zeroes it in a finally (constraint 6).
+    const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+    const encryptedPrivateKey = identity.encrypted_private_key;
+
+    return {
+      masterWriteBarrier: session.masterWriteBarrier,
+      operatorPublicKey,
+      storage,
+      masterKey,
+      signPayload(action: string, payload: unknown): string {
+        const message = buildOperatorSignedMessage(action, payload);
+        const signature = sign(message, encryptedPrivateKey, identityEncryptionKey);
+        try {
+          return toBase64url(signature);
+        } finally {
+          signature.fill(0);
+        }
+      },
+      signAttestation(clientPubkey: Uint8Array, issuedAtMs: number): OperatorEd25519Attestation {
+        // Reuse the SAME encrypted-key sign() path (constraint 6: the private key
+        // is decrypted transiently and zeroed in sign()'s finally; never exposed
+        // here). Mirrors signOperatorAttestation but without a raw private key.
+        const message = buildOperatorAttestationMessage(
+          operatorPublicKey,
+          clientPubkey,
+          issuedAtMs,
+        );
+        const signature = sign(message, encryptedPrivateKey, identityEncryptionKey);
+        try {
+          return {
+            type: "operator_ed25519",
+            operator_pubkey: toBase64url(operatorPublicKey),
+            issued_at: issuedAtMs,
+            signature: toBase64url(signature),
+          };
+        } finally {
+          signature.fill(0);
+        }
+      },
+    };
+
+  });
 }
 
 function decodePublicKey(b64: string): Uint8Array | null {

@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createRequire } from "node:module";
@@ -171,7 +172,7 @@ it("repairs a step-three throwing delete on the very next append below the cap",
   await log.appendCritical(measureEntry(CAP));
   expect((log as any).bytesProvenance).toBe("unknown");
   expect(await belowCut(raw)).toEqual([3]);
-  expect((log as any).unconfirmedPruneCutKey).toContain("00000000000000000004");
+  expect((log as any).unconfirmedPruneCutKey).toContain("00000000000000000004"); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
   await log.appendCritical(measureEntry(CAP + 1));
   // Keep this first: ignoring the recorded cut must fail with rotation_anchor_invalid.
   await strict(raw);

@@ -15,9 +15,9 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { establishMaster } from "../../src/core/master-custody.js";
+import { establishMaster, MasterEstablishmentReleaseError } from "../../src/core/master-custody.js";
 import { unlockLocalFortress } from "../../src/cli/local-fortress-unlock.js";
 import {
   withExclusiveMasterRotationBarrier,
@@ -115,5 +115,90 @@ describe.skipIf(!supported)("writeIntent unlock holds the rotation barrier (S1)"
     // No reader is held, so the exclusive side drains immediately and runs.
     const allowed = await tryExclusive(storage, 3000);
     expect(allowed).toBe("ran");
+  });
+});
+
+
+describe.skipIf(!supported)("legacy migration session ownership", () => {
+  it.each([false, true])("retains the consumer lease after migration with write intent %s", async (writeIntent) => {
+    const { deriveMasterKey } = await import("../../src/core/key-derivation.js");
+    const { stringToBytes } = await import("../../src/core/encoding.js");
+    const locks = await import("../../src/storage/cross-process-lock.js");
+    const root = await mkdtemp(join(tmpdir(), "legacy-cli-session-"));
+    const leases: import("../../src/storage/cross-process-lock.js").MasterWriteBarrierLease[] = [];
+    let key: Uint8Array | undefined;
+    let acquisition: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const storage = new FilesystemStorage(join(root, "state"));
+      const derived = await deriveMasterKey(PASSPHRASE);
+      try { await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(derived.params))); }
+      finally { derived.key.fill(0); }
+      const acquire = locks.acquireMasterWriteBarrier;
+      acquisition = vi.spyOn(locks, "acquireMasterWriteBarrier").mockImplementation(async (...args) => {
+        const lease = await acquire(...args);
+        leases.push(lease);
+        return lease;
+      });
+      const result = await unlockLocalFortress({ storage, storagePath: root, env: { SANCTUARY_PASSPHRASE: PASSPHRASE }, writeIntent });
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("fixture unlock refused");
+      key = result.masterKey;
+      expect(result.barrier).toBeDefined();
+      expect(result.barrier!.signal.aborted).toBe(false);
+      const outerAndMigrationSessions = 2;
+      expect(leases).toHaveLength(writeIntent ? outerAndMigrationSessions : 1);
+      if (writeIntent) expect(leases.at(-1)!.signal.aborted).toBe(true);
+      const exclusive = () => withExclusiveMasterRotationBarrier(
+        new FilesystemStorage(join(root, "state")), NS, BARRIER, async () => "entered", { timeoutMs: 0 },
+      );
+      await expect(exclusive()).rejects.toMatchObject({ kind: "contention" });
+      await result.barrier!.release();
+      await expect(exclusive()).resolves.toBe("entered");
+    } finally {
+      acquisition?.mockRestore();
+      try { for (const lease of leases) await lease.release(); }
+      finally { key?.fill(0); await rm(root, { recursive: true, force: true }); }
+    }
+  });
+
+  it("reports nested migration release failure after releasing the outer session", async () => {
+    const { deriveMasterKey } = await import("../../src/core/key-derivation.js");
+    const { stringToBytes } = await import("../../src/core/encoding.js");
+    const locks = await import("../../src/storage/cross-process-lock.js");
+    const root = await mkdtemp(join(tmpdir(), "legacy-cli-release-"));
+    const leases: import("../../src/storage/cross-process-lock.js").MasterWriteBarrierLease[] = [];
+    let acquisition: ReturnType<typeof vi.spyOn> | undefined;
+    const sentinel = new Error("nested release rejected");
+    try {
+      const storage = new FilesystemStorage(join(root, "state"));
+      const derived = await deriveMasterKey(PASSPHRASE);
+      try { await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(derived.params))); }
+      finally { derived.key.fill(0); }
+      const acquire = locks.acquireMasterWriteBarrier;
+      acquisition = vi.spyOn(locks, "acquireMasterWriteBarrier").mockImplementation(async (...args) => {
+        const lease = await acquire(...args);
+        leases.push(lease);
+        const outerAndMigrationSessions = 2;
+        return leases.length === outerAndMigrationSessions
+          ? { ...lease, release: async () => { await lease.release(); throw sentinel; } }
+          : lease;
+      });
+      const operation = unlockLocalFortress({ storage, storagePath: root, env: { SANCTUARY_PASSPHRASE: PASSPHRASE }, writeIntent: true });
+      const error = await operation.catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(MasterEstablishmentReleaseError);
+      const releaseFailure = error as MasterEstablishmentReleaseError;
+      expect(releaseFailure.message).toBe("Session release after migration failed");
+      expect(releaseFailure.cause).toBe(sentinel);
+      expect(releaseFailure.errors).toHaveLength(1); // The release is the sole failure.
+      expect(releaseFailure.errors[0]).toBe(sentinel);
+      for (const lease of leases) expect(lease.signal.aborted).toBe(true);
+      await expect(withExclusiveMasterRotationBarrier(
+        new FilesystemStorage(join(root, "state")), NS, BARRIER, async () => "entered", { timeoutMs: 0 },
+      )).resolves.toBe("entered");
+    } finally {
+      acquisition?.mockRestore();
+      try { for (const lease of leases) await lease.release(); }
+      finally { await rm(root, { recursive: true, force: true }); }
+    }
   });
 });

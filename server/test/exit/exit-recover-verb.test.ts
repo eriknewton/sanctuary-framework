@@ -130,14 +130,18 @@ async function snapshotTree(root: string): Promise<string> {
 }
 
 /** Bootstrap real custody on a temp fortress (test setup only - not part of any no-diff window). */
-async function bootstrapFortress(storagePath: string): Promise<FilesystemStorage> {
+async function bootstrapFortress(storagePath: string, seed?: (storage: FilesystemStorage) => Promise<void>): Promise<FilesystemStorage> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
-  await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase: TEST_PASSPHRASE,
     bootstrap: true,
     storagePathHint: storagePath,
   });
-  return storage;
+  try { await seed?.(storage); return storage; }
+  finally {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
 }
 
 describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)", () => {
@@ -535,7 +539,6 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
   it("WIRED CONSUMER: actually rolls back a planted interrupted-import journal entry and reports the count", async () => {
     const tempFortress = await createTempFortress("sanctuary-recover-planted");
     try {
-      const storage = await bootstrapFortress(tempFortress.storagePath);
 
       // Plant a well-formed but interrupted-looking journal entry with an
       // EMPTY snapshot list, so restoring it is a trivial no-op success
@@ -551,11 +554,11 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
         started_at: new Date().toISOString(),
         snapshots: [],
       };
-      await storage.write(
+      const storage = await bootstrapFortress(tempFortress.storagePath, (storage) => storage.write(
         EXIT_IMPORT_JOURNAL_NAMESPACE,
         importId,
         Buffer.from(JSON.stringify(journalRecord) + "\n", "utf8")
-      );
+      ));
       expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
 
       const out = new StringWritable();
