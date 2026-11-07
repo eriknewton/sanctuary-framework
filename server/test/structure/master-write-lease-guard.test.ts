@@ -106,7 +106,7 @@ it("rejects same-module acquisition calls before renaming the declaration", asyn
   expect(transform(source, `${modulePath}.unrelated`)).toBeUndefined();
 });
 
-async function guardHarness() {
+async function guardHarness(testPath = "test/guard-regression.test.ts") {
   type Lease = { release: () => Promise<void> };
   type Observer = (acquire: () => Promise<Lease>, stack: string) => Promise<Lease>;
   let around!: (run: () => Promise<void>) => Promise<void>;
@@ -123,7 +123,7 @@ async function guardHarness() {
       if (id === "vitest") return {
         afterAll: (hook: typeof after) => { after = hook; },
         aroundAll: (hook: typeof around) => { around = hook; },
-        expect: { getState: () => ({ testPath: join(serverRoot, "test/guard-regression.test.ts") }) },
+        expect: { getState: () => ({ testPath: join(serverRoot, testPath) }) },
       };
       if (id === "node:path") return nodePath;
       if (id === "node:url") return nodeUrl;
@@ -170,4 +170,27 @@ it("reports pending acquisition stacks at its deadline and releases acquired lea
   expect(guard.delay()).toBeGreaterThan(0);
   expect(guard.delay()).toBeLessThan(leaseGuardHookTimeoutMs);
   expect(released).toBe(true);
+});
+
+it("reports rejected releases for files without a reap exemption", async () => {
+  const paths = ["test/guard-regression.test.ts", "test/cli/secrets.test.ts"];
+  for (const testPath of paths) {
+    const guard = await guardHarness(testPath);
+    const reapError = new Error("fixture release rejection");
+    let attempted = false;
+    await guard.observer(async () => ({ async release() { attempted = true; throw reapError; } }), "rejecting acquisition stack");
+    await expect(guard.after()).rejects.toMatchObject({
+      message: expect.stringContaining(`1 master-write lease(s) left open in ${testPath}`),
+      cause: { name: "AggregateError", errors: [reapError] },
+    });
+    expect(attempted).toBe(true);
+  }
+});
+
+it("accepts rejected releases for the fixture with a reap exemption", async () => {
+  const guard = await guardHarness("test/hermes-memory-bridge/process-shell.test.ts");
+  let attempted = false;
+  await guard.observer(async () => ({ async release() { attempted = true; throw new Error("fixture release rejection"); } }), "expected rejecting acquisition stack");
+  await expect(guard.after()).resolves.toBeUndefined();
+  expect(attempted).toBe(true);
 });

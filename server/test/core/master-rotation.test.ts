@@ -614,8 +614,18 @@ describe("master rotation: happy path", () => {
       expect(() => decrypt(pin, fortress.master)).toThrow();
       expect(toBase64url(decrypt(pin, est.masterKey))).toBe(toBase64url(seed));
     } finally {
-      await custodySessions.release();
-      await rm(dir, { recursive: true, force: true });
+      const errors: unknown[] = [];
+      try {
+        await custodySessions.release();
+      } catch (error) { errors.push(error); }
+      finally {
+        // Remove fixture directories even when release rejects, preserving the release error first.
+        try {
+          await rm(dir, { recursive: true, force: true });
+        } catch (error) { errors.push(error); }
+      }
+      if (errors.length > 1) throw new AggregateError(errors, "Custody session and directory cleanup failed");
+      if (errors.length > 0) throw errors[0];
     }
   });
 
@@ -913,8 +923,18 @@ describe("master rotation: storage namespace discovery", () => {
       expect(toBase64url(stillOld.masterKey)).toBe(toBase64url(est.masterKey));
       await stillOld.masterWriteBarrier?.release();
     } finally {
-      await custodySessions.release();
-      await rm(dir, { recursive: true, force: true });
+      const errors: unknown[] = [];
+      try {
+        await custodySessions.release();
+      } catch (error) { errors.push(error); }
+      finally {
+        // Remove fixture directories even when release rejects, preserving the release error first.
+        try {
+          await rm(dir, { recursive: true, force: true });
+        } catch (error) { errors.push(error); }
+      }
+      if (errors.length > 1) throw new AggregateError(errors, "Custody session and directory cleanup failed");
+      if (errors.length > 0) throw errors[0];
     }
   });
 });

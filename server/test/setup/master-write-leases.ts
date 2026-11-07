@@ -106,6 +106,11 @@ const existingLeaseOwners = new Set<string>([
   "test/wrap/protect-uses-enrolled-custody.test.ts",
 ]);
 
+// test/hermes-memory-bridge/process-shell.test.ts deliberately unlinks its lease socket before release.
+const expectedReapFailureOwners = new Set<string>([
+  "test/hermes-memory-bridge/process-shell.test.ts",
+]);
+
 const observerKey = Symbol.for("sanctuary.test.master-write-lease-observer");
 type Acquisition = () => Promise<MasterWriteBarrierLease>;
 const observers = globalThis as typeof globalThis & {
@@ -152,8 +157,8 @@ async function finishFile(): Promise<void> {
   const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
   const file = relative(serverRoot, expect.getState().testPath ?? "").replaceAll("\\", "/");
   delete observers[observerKey];
-  // A listed owner already leaks by exemption, so its best-effort reap may reject (one fixture breaks its own lease on purpose).
-  const reapFailed = failures.length > 0 && !existingLeaseOwners.has(file);
+  // Only fixtures that deliberately break their lease may tolerate a rejected reap.
+  const reapFailed = failures.length > 0 && !expectedReapFailureOwners.has(file);
   if (stillPending.length > 0 || reapFailed || (leaked.length > 0 && !existingLeaseOwners.has(file))) {
     const pendingDiagnostic = stillPending.length > 0
       ? `\n${stillPending.length} master-write acquisition(s) still pending after ${pendingAcquisitionDeadlineMs}ms\n${stillPending.join("\n\n")}`
