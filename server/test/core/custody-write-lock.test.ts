@@ -25,9 +25,19 @@ const custodySessions = createCustodySessionTracker();
 describe("shared custody/master lock domain", () => {
   const cleanups: string[] = [];
   afterEach(async () => {
-    await custodySessions.release();
-    await Promise.all(cleanups.splice(0).map((path) =>
-      rm(path, { recursive: true, force: true })));
+    const errors: unknown[] = [];
+    try {
+      await custodySessions.release();
+    } catch (error) { errors.push(error); }
+    finally {
+      // Remove fixture directories even when release rejects, preserving the release error first.
+      try {
+        await Promise.all(cleanups.splice(0).map((path) =>
+          rm(path, { recursive: true, force: true })));
+      } catch (error) { errors.push(error); }
+    }
+    if (errors.length > 1) throw new AggregateError(errors, "Custody session and directory cleanup failed");
+    if (errors.length > 0) throw errors[0];
   });
 
   async function storage(label: string): Promise<FilesystemStorage> {

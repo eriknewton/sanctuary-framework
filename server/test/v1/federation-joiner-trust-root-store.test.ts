@@ -1041,8 +1041,18 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
       expect(loaded?.record.revoked_root_pubkeys?.has(deadB)).toBe(true);
       expect(loaded?.record.highest_revocation_serial).toBe(5);
     } finally {
-      await custodySessions.release();
-      await rm(dir, { recursive: true, force: true });
+      const errors: unknown[] = [];
+      try {
+        await custodySessions.release();
+      } catch (error) { errors.push(error); }
+      finally {
+        // Remove fixture directories even when release rejects, preserving the release error first.
+        try {
+          await rm(dir, { recursive: true, force: true });
+        } catch (error) { errors.push(error); }
+      }
+      if (errors.length > 1) throw new AggregateError(errors, "Custody session and directory cleanup failed");
+      if (errors.length > 0) throw errors[0];
     }
   });
 
@@ -1139,8 +1149,18 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
       rotationAdopt.newIssuingPrincipalPrivateKey.fill(0);
       rotationRejoin.newIssuingPrincipalPrivateKey.fill(0);
     } finally {
-      await custodySessions.release();
-      await rm(dir, { recursive: true, force: true });
+      const errors: unknown[] = [];
+      try {
+        await custodySessions.release();
+      } catch (error) { errors.push(error); }
+      finally {
+        // Remove fixture directories even when release rejects, preserving the release error first.
+        try {
+          await rm(dir, { recursive: true, force: true });
+        } catch (error) { errors.push(error); }
+      }
+      if (errors.length > 1) throw new AggregateError(errors, "Custody session and directory cleanup failed");
+      if (errors.length > 0) throw errors[0];
     }
   });
 });
