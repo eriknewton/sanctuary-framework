@@ -18,10 +18,14 @@ import {
   establishMaster,
   withCustodyWriteLock,
 } from "../../src/core/master-custody.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+
+const custodySessions = createCustodySessionTracker();
 
 describe("shared custody/master lock domain", () => {
   const cleanups: string[] = [];
   afterEach(async () => {
+    await custodySessions.release();
     await Promise.all(cleanups.splice(0).map((path) =>
       rm(path, { recursive: true, force: true })));
   });
@@ -103,11 +107,11 @@ describe("shared custody/master lock domain", () => {
 
   it("unlocks an existing envelope through a read-only wrapper without requiring write-lock capability", async () => {
     const base = new MemoryStorage();
-    const created = await establishMaster({
+    const created = custodySessions.track(await establishMaster({
       storage: base,
       passphrase: "existing-envelope-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     created.masterKey.fill(0);
     const wrapper: StorageBackend = {
       write: async () => { throw new Error("read-only wrapper write reached"); },
@@ -117,21 +121,21 @@ describe("shared custody/master lock domain", () => {
       exists: (...args) => base.exists(...args),
       totalSize: () => base.totalSize(),
     };
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage: wrapper,
       passphrase: "existing-envelope-passphrase",
-    });
+    }));
     expect(opened.origin).toBe("envelope");
     opened.masterKey.fill(0);
   });
 
   it("preserves authenticated Windows reads while fencing every master-derived filesystem write", async () => {
     const source = new MemoryStorage();
-    const created = await establishMaster({
+    const created = custodySessions.track(await establishMaster({
       storage: source,
       passphrase: "windows-read-only-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     created.masterKey.fill(0);
     const target = await storage("windows-read-only");
     await target.write(
@@ -144,11 +148,11 @@ describe("shared custody/master lock domain", () => {
       CUSTODY_SENTINEL_KEY,
       (await source.read("_meta", CUSTODY_SENTINEL_KEY))!,
     );
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage: target,
       passphrase: "windows-read-only-passphrase",
       __testMasterWriteBarrierOptions: { __testPlatform: "win32" },
-    });
+    }));
     expect(opened.origin).toBe("envelope");
     await expect(
       target.write("notes", "refused", new Uint8Array([1])),
@@ -160,11 +164,11 @@ describe("shared custody/master lock domain", () => {
 
   it("rejects a lock-free unlock when the envelope vanishes during the authenticated read", async () => {
     const base = new MemoryStorage();
-    const created = await establishMaster({
+    const created = custodySessions.track(await establishMaster({
       storage: base,
       passphrase: "snapshot-change-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     created.masterKey.fill(0);
     let envelopeReads = 0;
     const racing: StorageBackend = {

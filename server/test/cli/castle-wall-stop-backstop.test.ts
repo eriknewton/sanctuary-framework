@@ -30,19 +30,26 @@ describe("CLI stop completion fence", () => {
     const gate = deferred(), entered = deferred(); const order: string[] = []; let releases = 0;
     const prior = new Map(["SIGINT", "SIGTERM"].map(signal => [signal, new Set(process.rawListeners(signal))]));
     let run: Promise<number> | undefined;
+    const sessionCleanup: Array<() => Promise<void>> = [];
     try {
       await initializeTestCustody(root, { passphrase });
       expect(await runProvisionPin(["--fortress", root], { out: new Capture(), err: new Capture(), env: { HOME: home, SANCTUARY_PASSPHRASE: passphrase }, globalPinnedPublicKeyPath: join(root, "pin") })).toBe(0);
       const establish = custody.establishMaster;
       vi.spyOn(custody, "establishMaster").mockImplementation(async (...args) => {
         const result = await establish(...args); const barrier = result.masterWriteBarrier;
+        const release = barrier?.release.bind(barrier);
+        // Retain the real release so teardown can close sessions after the simulated exit fence.
+        // Repeated release calls reuse the lease's cached close promise.
+        sessionCleanup.push(async () => {
+          try { await release?.(); }
+          finally { result.masterKey.fill(0); }
+        });
         if (barrier) {
-          const release = barrier.release.bind(barrier);
           barrier.release = async () => {
             releases++; order.push("release");
             if (held === "cleanup" && releases === 1) throw new Error("fixture first release retry");
             if (held === "session" || held === "cleanup") { entered.resolve(); await gate.promise; }
-            return release();
+            return release!();
           };
         }
         return result;
@@ -85,8 +92,15 @@ describe("CLI stop completion fence", () => {
       }
     } finally {
       gate.resolve(); vi.useRealTimers();
-      for (const signal of ["SIGINT", "SIGTERM"]) for (const listener of process.rawListeners(signal)) if (!prior.get(signal)!.has(listener)) { Reflect.apply(listener, process, []); process.removeListener(signal, listener); }
-      await run; await rm(root, { recursive: true, force: true });
+      try {
+        for (const signal of ["SIGINT", "SIGTERM"]) for (const listener of process.rawListeners(signal)) if (!prior.get(signal)!.has(listener)) { Reflect.apply(listener, process, []); process.removeListener(signal, listener); }
+        await run;
+      } finally {
+        const results = await Promise.allSettled(sessionCleanup.map(cleanup => cleanup()));
+        const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+        if (failures.length > 0) throw new AggregateError(failures, "Stop fixture session cleanup failed");
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 });

@@ -1,6 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import {
@@ -39,7 +38,9 @@ import {
   validateJoinedNodeRecord,
   type OperatorCloudJoinedNodeAuditEvent,
 } from "../../src/mesh/operator-cloud-joined-node-store.js";
-
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+const custodySessions = createCustodySessionTracker();
+afterEach(() => custodySessions.release());
 /**
  * Keychain-free master seed (the approved unit-test seam). `establishMaster`
  * with the headless install mode + no recovery key never touches the macOS
@@ -47,14 +48,13 @@ import {
  * spawn a real Sanctuary server, never call the default-HOME keychain path.)
  */
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
-  const { masterKey } = await establishMaster({
+  const { masterKey } = custodySessions.track(await establishMaster({
     storage,
     passphrase: `oc-slice3-${randomBytes(6).toString("hex")}`,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
-  });
+  }));
   return masterKey;
 }
-
 /**
  * Build a real operator_cloud JOINED-NODE record: mint an issuer fortress,
  * issue an operator_cloud node cert chaining to its master, and wrap the node

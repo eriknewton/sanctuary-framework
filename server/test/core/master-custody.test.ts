@@ -7,12 +7,10 @@
  * The envelope stores ONE master per fortress, only as wraps; every test
  * here closes one leg of that incident.
  */
-
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   establishMaster,
@@ -41,7 +39,6 @@ import {
   CUSTODY_SENTINEL_KEY, CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX,
   CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT, type CustodyEnvelope,
 } from "../../src/core/master-custody.js";
-
 import {
   deriveMasterKey,
   derivePurposeKey,
@@ -54,15 +51,18 @@ import {
   stringToBytes,
   bytesToString,
 } from "../../src/core/encoding.js";
+import { createCustodySessionTracker } from "../helpers/custody-sessions.js";
+const custodySessions = createCustodySessionTracker();
+afterEach(() => custodySessions.release());
 
 describe("read-only custody sentinel", () => {
   async function seeded(): Promise<MemoryStorage> {
     const storage = new MemoryStorage();
-    const result = await establishMaster({
+    const result = custodySessions.track(await establishMaster({
       storage,
       passphrase: "sentinel-read-only-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     result.masterKey.fill(0);
     return storage;
   }
@@ -176,38 +176,38 @@ describe("custody wraps", () => {
 describe("establishMaster — first run", () => {
   it("passphrase first run mints a recovery key that unlocks the SAME master (incident regression)", async () => {
     const storage = new MemoryStorage();
-    const first = await establishMaster({
+    const first = custodySessions.track(await establishMaster({
       storage,
       passphrase: "fortress-passphrase",
       firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
-    });
+    }));
     expect(first.origin).toBe("first-run");
     expect(first.mintedRecoveryKey).toBeDefined();
 
     // The printed recovery key reconstructs the one true master — exactly
     // what failed in the 2026-06-12 drill.
-    const viaRecovery = await establishMaster({
+    const viaRecovery = custodySessions.track(await establishMaster({
       storage,
       recoveryKey: first.mintedRecoveryKey!,
-    });
+    }));
     expect(b64(viaRecovery.masterKey)).toBe(b64(first.masterKey));
 
     // And the passphrase unlocks the same master too.
-    const viaPassphrase = await establishMaster({
+    const viaPassphrase = custodySessions.track(await establishMaster({
       storage,
       passphrase: "fortress-passphrase",
-    });
+    }));
     expect(b64(viaPassphrase.masterKey)).toBe(b64(first.masterKey));
     expect(viaPassphrase.origin).toBe("envelope");
   });
 
   it("the master is never stored bare and key-params is not written for new fortresses", async () => {
     const storage = new MemoryStorage();
-    const result = await establishMaster({
+    const result = custodySessions.track(await establishMaster({
       storage,
       passphrase: "fortress-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     const envelopeRaw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
     expect(envelopeRaw).not.toBeNull();
     expect(bytesToString(envelopeRaw!)).not.toContain(b64(result.masterKey));
@@ -217,11 +217,11 @@ describe("establishMaster — first run", () => {
 
   it("scrubs decoded recovery and unwrapped master bytes when the post-unlock snapshot read throws", async () => {
     const storage = new MemoryStorage();
-    const first = await establishMaster({
+    const first = custodySessions.track(await establishMaster({
       storage,
       passphrase: "snapshot-failure-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: true },
-    });
+    }));
     const recoveryKey = first.mintedRecoveryKey!;
     first.masterKey.fill(0);
 
@@ -356,7 +356,7 @@ describe("establishMaster — legacy migration", () => {
     const storage = new MemoryStorage();
     const legacyMaster = await seedLegacyPassphraseFortress(storage, "legacy-pass");
 
-    const migrated = await establishMaster({ storage, passphrase: "legacy-pass" });
+    const migrated = custodySessions.track(await establishMaster({ storage, passphrase: "legacy-pass" }));
     expect(migrated.origin).toBe("migrated-passphrase");
     // Same master — no data was re-encrypted, nothing is lost.
     expect(b64(migrated.masterKey)).toBe(b64(legacyMaster));
@@ -370,7 +370,7 @@ describe("establishMaster — legacy migration", () => {
     // Legacy markers are KEPT (no un-unlockable window) and the envelope
     // now short-circuits: second unlock comes from the envelope.
     expect(await storage.read("_meta", "key-params")).not.toBeNull();
-    const second = await establishMaster({ storage, passphrase: "legacy-pass" });
+    const second = custodySessions.track(await establishMaster({ storage, passphrase: "legacy-pass" }));
     expect(second.origin).toBe("envelope");
     expect(b64(second.masterKey)).toBe(b64(legacyMaster));
     expect(second.envelope.install_mode).toBe("legacy-migrated");
@@ -387,7 +387,7 @@ describe("establishMaster — legacy migration", () => {
     // The fortress stays pure-legacy: no envelope captured a wrong master,
     // so the right passphrase still works.
     expect(await readCustodyEnvelope(storage)).toBeNull();
-    const recovered = await establishMaster({ storage, passphrase: "right-pass" });
+    const recovered = custodySessions.track(await establishMaster({ storage, passphrase: "right-pass" }));
     expect(recovered.origin).toBe("migrated-passphrase");
   });
 
@@ -408,7 +408,7 @@ describe("establishMaster — legacy migration", () => {
     );
 
     // Even a wrong passphrase must NOT get captured into an envelope here.
-    const result = await establishMaster({ storage, passphrase: "any-pass" });
+    const result = custodySessions.track(await establishMaster({ storage, passphrase: "any-pass" }));
     expect(result.origin).toBe("legacy-deferred");
     expect(result.envelope).toBeNull();
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toBeNull();
@@ -422,7 +422,7 @@ describe("establishMaster — legacy migration", () => {
       "key-params",
       stringToBytes(JSON.stringify(params))
     );
-    const result = await establishMaster({ storage, passphrase: "fresh-pass" });
+    const result = custodySessions.track(await establishMaster({ storage, passphrase: "fresh-pass" }));
     expect(result.origin).toBe("migrated-passphrase");
     expect(result.envelope).not.toBeNull();
   });
@@ -436,17 +436,17 @@ describe("establishMaster — legacy migration", () => {
       stringToBytes(hashToString(legacyMaster))
     );
 
-    const migrated = await establishMaster({
+    const migrated = custodySessions.track(await establishMaster({
       storage,
       recoveryKey: b64(legacyMaster),
-    });
+    }));
     expect(migrated.origin).toBe("migrated-recovery-key");
     expect(b64(migrated.masterKey)).toBe(b64(legacyMaster));
 
-    const second = await establishMaster({
+    const second = custodySessions.track(await establishMaster({
       storage,
       recoveryKey: b64(legacyMaster),
-    });
+    }));
     expect(second.origin).toBe("envelope");
   });
 
@@ -491,7 +491,7 @@ describe("establishMaster — legacy migration", () => {
       stringToBytes(hashToString(orphanMaster))
     );
 
-    const migrated = await establishMaster({ storage, passphrase: "live-pass" });
+    const migrated = custodySessions.track(await establishMaster({ storage, passphrase: "live-pass" }));
     expect(b64(migrated.masterKey)).toBe(b64(passphraseMaster));
 
     // The orphaned init-time recovery key cannot capture the fortress: its
@@ -648,11 +648,11 @@ describe("two-factor custody floor", () => {
 
   it("establishMaster refuses a tampered envelope at unlock (codex H2)", async () => {
     const storage = new MemoryStorage();
-    const first = await establishMaster({
+    const first = custodySessions.track(await establishMaster({
       storage,
       passphrase: "pass",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
     const tampered = JSON.parse(bytesToString(raw!));
     tampered.install_mode = "interactive";
@@ -742,7 +742,7 @@ describe("two-factor custody floor", () => {
       "key-params",
       stringToBytes(JSON.stringify(params))
     );
-    const migrated = await establishMaster({ storage, passphrase: "legacy-pass" });
+    const migrated = custodySessions.track(await establishMaster({ storage, passphrase: "legacy-pass" }));
     expect(migrated.origin).toBe("migrated-passphrase");
 
     // Attacker deletes the envelope; legacy markers remain. Re-migration
@@ -774,11 +774,11 @@ describe("two-factor custody floor", () => {
 describe("recovery wrap lifecycle", () => {
   it("mintRecoveryWrap adds a wrap of the live master; re-entry verification proves end-to-end unlock", async () => {
     const storage = new MemoryStorage();
-    const established = await establishMaster({
+    const established = custodySessions.track(await establishMaster({
       storage,
       passphrase: "pass",
       firstRun: { installMode: "interactive", mintRecoveryKey: false },
-    });
+    }));
 
     const minted = await mintRecoveryWrap(
       storage,
@@ -806,20 +806,20 @@ describe("recovery wrap lifecycle", () => {
     expect(countVerifiedWraps(verified)).toBe(2);
 
     // The minted key unlocks the same master.
-    const viaRecovery = await establishMaster({
+    const viaRecovery = custodySessions.track(await establishMaster({
       storage,
       recoveryKey: minted.recoveryKey,
-    });
+    }));
     expect(b64(viaRecovery.masterKey)).toBe(b64(established.masterKey));
   });
 
   it("re-entry marks ONLY the wrap the entered key decrypts (codex M1)", async () => {
     const storage = new MemoryStorage();
-    const established = await establishMaster({
+    const established = custodySessions.track(await establishMaster({
       storage,
       passphrase: "pass",
       firstRun: { installMode: "interactive", mintRecoveryKey: false },
-    });
+    }));
     expect(established.envelope).not.toBeNull();
     const firstMint = await mintRecoveryWrap(
       storage,
@@ -914,10 +914,10 @@ describe("custody-pair commit schedule", () => {
     failTarget: typeof CUSTODY_ENVELOPE_KEY | typeof CUSTODY_SENTINEL_KEY;
     envelope?: CustodyEnvelope;
   }): Promise<void> {
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage: args.storage,
       passphrase: args.passphrase,
-    });
+    }));
     const envelope = args.envelope ?? await readCustodyEnvelope(args.storage);
     expect(envelope).not.toBeNull();
     const originalWrite = args.storage.write.bind(args.storage);
@@ -945,11 +945,11 @@ describe("custody-pair commit schedule", () => {
 
   async function seedConsistentPair(passphrase: string): Promise<MemoryStorage> {
     const storage = new MemoryStorage();
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase,
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     opened.masterKey.fill(0);
     return storage;
   }
@@ -1050,10 +1050,10 @@ describe("custody-pair commit schedule", () => {
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).not.toBeNull();
     expect(await storage.read("_meta", CUSTODY_SENTINEL_KEY)).toBeNull();
 
-    const reopened = await establishMaster({
+    const reopened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "interrupted-custody-pair-passphrase",
-    });
+    }));
     reopened.masterKey.fill(0);
 
     const readOnly = await unlockExistingMasterReadOnly(storage, {
@@ -1116,13 +1116,13 @@ describe("custody-pair commit schedule", () => {
         firstRun: { installMode: "headless", mintRecoveryKey: false },
       })).rejects.toThrow(/injected custody .* schedule/);
 
-      const reopened = await establishMaster({
+      const reopened = custodySessions.track(await establishMaster({
         storage,
         passphrase: "custody-pair-schedule-passphrase",
         ...(retryNeedsFirstRun
           ? { firstRun: { installMode: "headless" as const, mintRecoveryKey: false } }
           : {}),
-      });
+      }));
       reopened.masterKey.fill(0);
 
       expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).not.toBeNull();
@@ -1161,10 +1161,10 @@ describe("custody-pair commit schedule", () => {
       firstRun: { installMode: "headless", mintRecoveryKey: false },
     })).rejects.toThrow("injected custody cleanup schedule");
 
-    const reopened = await establishMaster({
+    const reopened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-clear-schedule-passphrase",
-    });
+    }));
     reopened.masterKey.fill(0);
 
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
@@ -1225,11 +1225,11 @@ describe("custody-pair commit schedule", () => {
       "../../src/storage/read-only-guard.js"
     );
     const storage = new MemoryStorage();
-    await establishMaster({
+    custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-read-only-pending-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     await leavePendingCustodyPair({
       storage,
       passphrase: "custody-read-only-pending-passphrase",
@@ -1272,10 +1272,10 @@ describe("custody-pair commit schedule", () => {
       mutate(raw),
     );
 
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-corrupt-journal-passphrase",
-    });
+    }));
     opened.masterKey.fill(0);
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
       .toBeNull();
@@ -1295,10 +1295,10 @@ describe("custody-pair commit schedule", () => {
         failTarget: CUSTODY_SENTINEL_KEY,
       });
       await storage.write("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, stringToBytes("{"));
-      const opened = await establishMaster({
+      const opened = custodySessions.track(await establishMaster({
         storage,
         passphrase: "custody-quarantine-retention-passphrase",
-      });
+      }));
       opened.masterKey.fill(0);
     }
 
@@ -1309,11 +1309,11 @@ describe("custody-pair commit schedule", () => {
 
   it("refuses an unreadable custody-pair journal beside a custody pair that does not authenticate", async () => {
     const storage = new MemoryStorage();
-    await establishMaster({
+    custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-mixed-journal-passphrase",
       firstRun: { installMode: "headless", mintRecoveryKey: false },
-    });
+    }));
     await storage.write(
       "_meta",
       CUSTODY_SENTINEL_KEY,
@@ -1388,10 +1388,10 @@ describe("custody-pair commit schedule", () => {
     },
   ])("raises a stale snapshot error when recovery advances the pair before the $name continues", async ({ write }) => {
     const storage = await seedConsistentPair("custody-stale-base-passphrase");
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-stale-base-passphrase",
-    });
+    }));
     const staleEnvelope = await readCustodyEnvelope(storage);
     expect(staleEnvelope).not.toBeNull();
     const staleBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
@@ -1415,10 +1415,10 @@ describe("custody-pair commit schedule", () => {
 
   it("refuses a recovered pair whose requested envelope matches but sentinel authenticates under another master", async () => {
     const storage = await seedConsistentPair("custody-mixed-sentinel-passphrase");
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-mixed-sentinel-passphrase",
-    });
+    }));
     const requestedEnvelope = await readCustodyEnvelope(storage);
     expect(requestedEnvelope).not.toBeNull();
     await leavePendingCustodyPair({
@@ -1439,10 +1439,10 @@ describe("custody-pair commit schedule", () => {
 
   it("refuses a recovered pair whose envelope bytes came from a concurrent writer", async () => {
     const storage = await seedConsistentPair("custody-concurrent-writer-passphrase");
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-concurrent-writer-passphrase",
-    });
+    }));
     const requestedEnvelope = await readCustodyEnvelope(storage);
     expect(requestedEnvelope).not.toBeNull();
     await leavePendingCustodyPair({
@@ -1463,10 +1463,10 @@ describe("custody-pair commit schedule", () => {
 
   it("refuses a recovered envelope with identical parsed content but different bytes", async () => {
     const storage = await seedConsistentPair("custody-exact-envelope-bytes-passphrase");
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-exact-envelope-bytes-passphrase",
-    });
+    }));
     const requestedEnvelope = await readCustodyEnvelope(storage);
     expect(requestedEnvelope).not.toBeNull();
     const requestedBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
@@ -1533,10 +1533,10 @@ describe("custody-pair commit schedule", () => {
     "same parsed envelope content has different bytes",
   ])("raw restore refuses when the recovered %s", async (scenario) => {
     const storage = await seedConsistentPair(`custody-restore-${scenario}`);
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: `custody-restore-${scenario}`,
-    });
+    }));
     const requestedEnvelope = await readCustodyEnvelope(storage);
     expect(requestedEnvelope).not.toBeNull();
     const requestedBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
@@ -1639,10 +1639,10 @@ describe("custody-pair commit schedule", () => {
 
   it("accepts an interrupted restore when the replayed pair matches the requested bytes", async () => {
     const storage = await seedConsistentPair("custody-restore-retry-passphrase");
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-restore-retry-passphrase",
-    });
+    }));
     const priorBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
     const priorEnvelope = await readCustodyEnvelope(storage);
     expect(priorEnvelope).not.toBeNull();
@@ -1685,10 +1685,10 @@ describe("custody-pair commit schedule", () => {
 
   it("raw restore converges when the retry publish is interrupted after the accepted replay", async () => {
     const storage = await seedConsistentPair("custody-restore-resume-passphrase");
-    const opened = await establishMaster({
+    const opened = custodySessions.track(await establishMaster({
       storage,
       passphrase: "custody-restore-resume-passphrase",
-    });
+    }));
     const priorBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
     const priorEnvelope = await readCustodyEnvelope(storage);
     expect(priorEnvelope).not.toBeNull();

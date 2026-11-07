@@ -20,7 +20,7 @@ import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
-import { establishMaster } from "../../../src/core/master-custody.js";
+import { acquireFortressMasterWriteBarrier, establishMaster } from "../../../src/core/master-custody.js";
 import { runAuditDump } from "../../../src/cli/castle-wall.js";
 import { initializeTestCustody } from "../../helpers/custody-fixture.js";
 import { availabilitySnapshot } from "./availability-report-helper.js";
@@ -503,10 +503,14 @@ it("T7 audit-dump lists informational summary records", async () => {
   const home = await mkdtemp(join(tmpdir(), "cw-summary-dump-"));
   vi.stubEnv("HOME", home);
   const passphrase = "isolated-root-summary-dump-fixture";
+  let established: Awaited<ReturnType<typeof establishMaster>> | undefined;
+  let barrier: Awaited<ReturnType<typeof acquireFortressMasterWriteBarrier>> | undefined;
   try {
     await initializeTestCustody(home, { passphrase });
     const storage = new FilesystemStorage(join(home, "state"));
-    const { masterKey } = await establishMaster({ storage, passphrase });
+    barrier = await acquireFortressMasterWriteBarrier(storage);
+    established = await establishMaster({ storage, passphrase, heldBarrier: barrier });
+    const { masterKey } = established;
     const audit = new AuditLog(storage, masterKey);
     const f = fixture({ pinnedProducerKeyB64url: PIN, auditSink: audit });
     await f.consumer.handleFlowDecisionRecorded(signed());
@@ -522,5 +526,12 @@ it("T7 audit-dump lists informational summary records", async () => {
     const summary = entries.find((entry) => entry.operation === SUMMARY);
     expect(summary.details).toMatchObject({ root_verified_total: 1, summary_seq: 1 });
     expect(summary.details).not.toHaveProperty(CASTLE_WALL_AUDIT_PROVENANCE_KEY);
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally {
+    // Release the reader before deleting the directory whose identity scopes it.
+    try { await barrier?.release(); }
+    finally {
+      try { established?.masterKey.fill(0); }
+      finally { await rm(home, { recursive: true, force: true }); }
+    }
+  }
 });
