@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * F3 — audit-log rotation checkpoint (signed base anchor) regression tests.
  *
@@ -273,7 +274,7 @@ describe("AuditLog F3 rotation checkpoint", () => {
 
     const checkpointKeys = (await storage.list("_audit_checkpoints")).map((m) => m.key);
     // Sanity: checkpoints below the rotation floor really were written.
-    expect(checkpointKeys).toContain("audit-checkpoint-00000000000000000003");
+    expect(checkpointKeys).toContain("audit-checkpoint-00000000000000000003"); // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
 
     const reader = new AuditLog(storage, masterKey, { checkpointInterval: 3 });
     const result = await reader.query({ limit: 100 });

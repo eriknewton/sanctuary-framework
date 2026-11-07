@@ -19,7 +19,7 @@
 # change) passes this gate. The pull-request diff is the compensating control.
 #
 # Rules are documented at the top of scripts/check-disclosure.sh.
-D1-ANCHOR 6
+D1-ANCHOR 4
 D10-MECHANISM 1
 D2-CODEPATH 28
 D3-CONFIGPATH 12

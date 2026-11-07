@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -95,9 +96,9 @@ for (const namesOnly of [true, false]) describe(namesOnly ? "names-only discover
   it("S0 adopts a foreign usable tail, skipping malformed newer names", async () => {
     const f = await fixture(namesOnly); await append(f);
     await append(f, 1, f.make()); const previous = await envelope(f);
-    await f.storage.write("_audit", `entry-${String(99).padStart(20, "0")}-malformed`, Buffer.from("{"));
+    await f.storage.write("_audit", `entry-${String(99).padStart(20, "0")}-malformed`, Buffer.from("{")); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await append(f);
-    const written = await envelope(f, (await keys(f)).find(key => key.startsWith("entry-00000000000000000003"))!);
+    const written = await envelope(f, (await keys(f)).find(key => key.startsWith("entry-00000000000000000003"))!); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     expect(written).toMatchObject({ sequence: 3, prev_hash: previous.entry_hash });
   });
   it.each(["EIO", "invalid"])("D0 retains usable-tail continuation with head %s", async kind => {
@@ -174,8 +175,8 @@ for (const namesOnly of [true, false]) describe(namesOnly ? "names-only discover
     const first = (await f.storage.read("_audit", original[0]!))!;
     const second = (await f.storage.read("_audit", original[1]!))!;
     await erase(f);
-    await f.storage.write("_audit", "entry-00000000000000000001-a", second);
-    await f.storage.write("_audit", "entry-00000000000000000001-z", first);
+    await f.storage.write("_audit", "entry-00000000000000000001-a", second); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
+    await f.storage.write("_audit", "entry-00000000000000000001-z", first); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     f.log = f.make({ integrityMode: "lenient" });
     expect((await f.log.getIntegrityFindings()).length).toBeGreaterThan(0);
     expect(state(f.log)[0]).toBe(3); // T = 2, so the next allocation would be 3.
@@ -280,7 +281,7 @@ for (const namesOnly of [true, false]) describe(namesOnly ? "names-only discover
     await refuses(f);
   });
   it.each([false, true])("S5 unseen malformed candidate refuses, vanishes=%s", async vanishes => {
-    const f = await fixture(namesOnly); const key = "entry-00000000000000000001-planted";
+    const f = await fixture(namesOnly); const key = "entry-00000000000000000001-planted"; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await f.storage.write("_audit", key, Buffer.from("{"));
     if (vanishes) { const read = f.storage.read.bind(f.storage); vi.spyOn(f.storage, "read").mockImplementation((ns, name) => ns === "_audit" && name === key ? Promise.resolve(null) : read(ns, name)); }
     await refuses(f);

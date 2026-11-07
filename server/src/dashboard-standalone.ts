@@ -21,6 +21,7 @@
  * historical data via the audit log API.
  */
 
+import { ConstructionWork } from "./dashboard/construction-work.js";
 import { mkdir } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -93,7 +94,7 @@ import {
   loadOrCreateLocalListenerSecret,
   DistressLocalSecretError,
 } from "./distress/local-secret.js";
-import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
+import { provisionOrLoadFederationTrustRoot, zeroRecordSecrets } from "./mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
 import { provisionOrLoadOperatorCloudJoinedNode } from "./mesh/operator-cloud-joined-node-store.js";
 import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
@@ -104,6 +105,65 @@ import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
 } from "./mesh/lifecycle/index.js";
+
+const STANDALONE_CLEANUP_FAILURE = "Sanctuary Dashboard: cleanup failed.";
+
+function throwCleanupErrors(errors: unknown[]): void {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, STANDALONE_CLEANUP_FAILURE);
+}
+
+async function collectCleanup(errors: unknown[], action: () => unknown): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+type StandaloneSession = {
+  constructionWork: ConstructionWork;
+  disposeFederation: () => Promise<void>;
+  scrubFederationRecords: (() => void)[];
+  custody: EstablishMasterResult;
+  auditLog?: AuditLog;
+  baseline?: BaselineTracker;
+  saveBaseline: boolean;
+  attached: boolean;
+  distressListener?: DistressListener;
+  clearRuntime?: () => Promise<void>;
+  preserveRuntime: boolean;
+  cleanup?: Promise<void>;
+  exitCode?: 2;
+  cancelEscrow?: () => void;
+  releaseFailed?: boolean;
+};
+
+function finalizeStandaloneSession(session: StandaloneSession): Promise<void> {
+  // The standalone owner retains each acquired session through its serving work and final persistence, then awaits release before stopping or abandoning that session.
+  return session.cleanup ??= Promise.resolve().then(async () => {
+    const errors: unknown[] = [];
+    // Federation disposal precedes record scrubbing, final persistence and custody release.
+    await collectCleanup(errors, session.disposeFederation);
+    for (const scrub of session.scrubFederationRecords.splice(0)) await collectCleanup(errors, scrub);
+    // Finalization drains best-effort construction work before the key is zeroed; task rejection is not a cleanup failure.
+    await collectCleanup(errors, () => session.constructionWork.drain());
+    await collectCleanup(errors, () => session.distressListener?.stop());
+    if (!session.preserveRuntime) await collectCleanup(errors, () => session.clearRuntime?.());
+    if (session.saveBaseline) await collectCleanup(errors, () => session.baseline?.save());
+    await collectCleanup(errors, () => session.auditLog?.flush());
+    session.custody.masterKey.fill(0);
+    await collectCleanup(errors, async () => {
+      try {
+        await session.custody.masterWriteBarrier?.release();
+      } catch (error) {
+        session.releaseFailed = true;
+        throw error;
+      }
+    });
+    throwCleanupErrors(errors);
+  });
+}
 
 type StandaloneProcessCleanup = () => void | Promise<void>;
 
@@ -122,9 +182,13 @@ async function runStandaloneSignalCleanups(): Promise<void> {
   while (standaloneSignalCleanups.size > 0) {
     const cleanups = [...standaloneSignalCleanups];
     standaloneSignalCleanups.clear();
-    await Promise.allSettled(cleanups.map(async (cleanup) => {
+    const outcomes = await Promise.allSettled(cleanups.map(async (cleanup) => {
       await cleanup();
     }));
+    if (outcomes.some((outcome) => outcome.status === "rejected")) {
+      // SAFETY: stderr is the operator-facing channel for standalone cleanup failure; the fixed string carries no state.
+      console.error(STANDALONE_CLEANUP_FAILURE);
+    }
   }
 }
 
@@ -259,6 +323,8 @@ function assertStandaloneTestHookAllowed(name: string): void {
 }
 
 export interface StandaloneDashboardOptions {
+  // This contract must match the protect starter's processLifecycle in cli.ts.
+  processLifecycle?: { registerCleanup(cleanup: () => Promise<void>): () => void };
   passphrase?: string;
   port?: number;
   host?: string;
@@ -468,7 +534,8 @@ export function renderTenantDiscoveryHint(tenants: TenantDescriptor[]): string {
 export async function startStandaloneDashboard(
   options: StandaloneDashboardOptions = {}
 ): Promise<DashboardApprovalChannel> {
-  installStandaloneProcessListeners();
+  // A hosted dashboard leaves signals to its host so each exit has one owner.
+  if (!options.processLifecycle) installStandaloneProcessListeners();
 
   // Force dashboard enabled for this mode
   process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
@@ -709,6 +776,11 @@ export async function startStandaloneDashboard(
         storagePathHint: config.storage_path,
       });
     } catch (err) {
+      if (err instanceof AggregateError) {
+        // SAFETY: stderr is the operator-facing channel for standalone cleanup failure; the fixed string carries no state.
+        console.error(STANDALONE_CLEANUP_FAILURE);
+        throw err;
+      }
       // A SUPPLIED credential that fails to verify stays fail-closed (no boot
       // with a wrong master - that silently splits state). Carry the v0.10.4
       // diagnostics in the error: the per-tenant Keychain service name and the
@@ -810,17 +882,88 @@ export async function startStandaloneDashboard(
     bootKeychainKey?.fill(0);
   }
 
+  let session: StandaloneSession | undefined = custody ? {
+    constructionWork: new ConstructionWork(),
+    disposeFederation: async () => {}, scrubFederationRecords: [],
+    custody, saveBaseline: false, attached: false, preserveRuntime: false,
+  } : undefined;
+  let policyExit = false;
+  let stopping = false;
+  let unlockAttempt: Promise<boolean> | undefined;
+  let initialWiring: Promise<void> | undefined;
+  let wiringFailed = false;
+  let binding: Promise<void> | undefined;
+  const cancellation = new AbortController();
+  let signalStopped = false;
+  const reportedCleanupErrors = new Set<unknown>();
+  const reportCleanup = (error: unknown) => {
+    if (reportedCleanupErrors.has(error)) return;
+    reportedCleanupErrors.add(error);
+    // SAFETY: stderr is the operator-facing channel for standalone cleanup failure; the fixed string carries no state.
+    console.error(STANDALONE_CLEANUP_FAILURE);
+  };
+  const signalCleanup = async () => {
+    signalStopped = true;
+    // Process exit closes the terminal prompt while stop joins the session's owned work.
+    session?.cancelEscrow?.();
+    // Stop reports cleanup errors separately from any joined operation failure.
+    await stop().catch(() => undefined);
+  };
+  let unregisterHostedCleanup: (() => void) | undefined;
+  let stopPromise: Promise<void> | undefined;
+  let stopChannel: (() => Promise<void>) | undefined;
+  let sealFederation: (() => void) | undefined;
+  const exitBookkeeping = () => {
+    if (!session?.preserveRuntime) void session?.clearRuntime?.().catch(() => undefined);
+  };
+  const stop = (): Promise<void> => {
+    stopping = true;
+    // Stop seals federation admission before yielding to pending wiring.
+    sealFederation?.();
+    cancellation.abort();
+    return stopPromise ??= Promise.resolve().then(async () => {
+      standaloneExitCleanups.delete(exitBookkeeping);
+      const errors: unknown[] = [];
+      const cleanupErrors: unknown[] = [];
+      try {
+        // A pending bind must settle before closing its eventual listener.
+        await binding?.catch(() => undefined);
+        // Closing admission and joining unlock run together because an HTTP unlock can be in flight.
+        const channelClosed = collectCleanup(cleanupErrors, () => stopChannel?.());
+        await collectCleanup(errors, () => unlockAttempt);
+        await initialWiring;
+        await channelClosed;
+        if (session) await collectCleanup(cleanupErrors, () => finalizeStandaloneSession(session!));
+        for (const error of cleanupErrors) reportCleanup(error);
+        throwCleanupErrors([...new Set([...errors, ...cleanupErrors])]);
+      } finally {
+        // Signals must join this cached stop until all cleanup phases settle.
+        standaloneSignalCleanups.delete(signalCleanup);
+        unregisterHostedCleanup?.();
+        if (options.processLifecycle) process.removeListener("exit", exitBookkeeping);
+      }
+    });
+  };
+  if (options.processLifecycle) {
+    // Hosted registration precedes any await so signals can join stop during boot.
+    unregisterHostedCleanup = options.processLifecycle.registerCleanup(signalCleanup);
+    process.on("exit", exitBookkeeping);
+  }
+
+  try {
   // 6. Load principal policy (NO master key needed, safe in park too). This
   // is the one non-encrypted dep park constructs so the approval-channel
   // config (timeouts) is valid and the unlock/login UI can serve (Q1).
   let policy: PrincipalPolicy;
   try {
     policy = await loadPrincipalPolicy(config.storage_path);
+    // Boot must not resume after stop has finalized the session.
+    cancellation.signal.throwIfAborted();
   } catch (err) {
     if (err instanceof MalformedPrincipalPolicyError) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\nSanctuary cannot start.\n${err.message}\n`);
-      process.exit(1);
+      policyExit = true;
     }
     throw err;
   }
@@ -856,6 +999,13 @@ export async function startStandaloneDashboard(
     allow_plaintext_remote:
       options.allowPlaintextRemote ?? config.dashboard.allow_plaintext_remote,
   });
+  stopChannel = dashboard.stop.bind(dashboard);
+  sealFederation = () => dashboard.sealFederationWork();
+  dashboard.stop = stop;
+  if (!options.processLifecycle) {
+    registerStandaloneProcessCleanup(signalCleanup);
+    standaloneExitCleanups.add(exitBookkeeping);
+  }
   dashboard.setStandaloneMode(true);
 
   // ── Slice 2: PARK BOOT (no master key) ──────────────────────────────────
@@ -873,66 +1023,84 @@ export async function startStandaloneDashboard(
     // verified master wins; later attempts that arrive while one is in flight
     // (or after success) are rejected without re-wiring.
     let unlockInFlightOrDone = false;
-    dashboard.setUnlockHandler(async (credential) => {
-      if (unlockInFlightOrDone) return false;
+    dashboard.setUnlockHandler((credential) => {
+      if (stopping || unlockInFlightOrDone) return Promise.resolve(false);
       unlockInFlightOrDone = true;
-      // Re-run the SAME establishMaster the boot path runs, just deferred to
-      // unlock time. No new derivation, no weaker KDF, no fallback credential.
-      // A wrong credential throws (or returns a non-unlocking master that fails
-      // the envelope MAC verify) and is reported as a generic failure by the
-      // endpoint; the process stays parked.
-      let unlockCustody: EstablishMasterResult;
-      try {
-        unlockCustody = await establishMaster({
-          storage,
-          ...("passphrase" in credential
-            ? { passphrase: credential.passphrase }
-            : { recoveryKey: credential.recoveryKey }),
-          storagePathHint: config.storage_path,
-        });
-      } catch {
-        // Wrong credential / unverifiable envelope: stay parked, fail closed.
-        // Release the single-shot guard so the operator can retry with the
-        // correct credential.
-        unlockInFlightOrDone = false;
-        return false;
-      }
-      // Wire the unlocked deps onto the already-running dashboard. After this
-      // returns, `/api/readiness` flips to `serving` (identity manager set).
-      try {
-        await wireUnlockedDeps({
-          dashboard,
-          custody: unlockCustody,
-          storage,
-          config,
-          policy,
-          options,
-          dashboardHost,
-          dashboardPort,
-          // On the deferred-unlock path the operator authenticated the unlock
-          // over the wire; treat the supplied passphrase as the unlock source
-          // for the loopback auto-auth decision the same way the boot path does.
-          passphrase: "passphrase" in credential ? credential.passphrase : undefined,
-          passphraseSource: "passphrase" in credential ? "option" : null,
-        });
-      } catch {
-        // The credential WAS valid but dependency wiring failed (e.g. a
-        // malformed baseline). Stay parked, release the guard for a retry, and
-        // fail closed generically rather than serving a half-wired surface.
-        await unlockCustody.masterWriteBarrier?.release().catch(() => undefined);
-        unlockCustody.masterKey.fill(0);
-        unlockInFlightOrDone = false;
-        return false;
-      }
-      dashboard.setParked(false);
-      return true;
+      unlockAttempt = (async () => {
+        let unlockCustody: EstablishMasterResult;
+        try {
+          // Use the same custody derivation so deferred unlock has no weaker credential path.
+          unlockCustody = await establishMaster({
+            storage,
+            ...("passphrase" in credential
+              ? { passphrase: credential.passphrase }
+              : { recoveryKey: credential.recoveryKey }),
+            storagePathHint: config.storage_path,
+          });
+        } catch (error) {
+          // Establishment aggregates its operation and release errors; retry requires completed cleanup.
+          if (error instanceof AggregateError) {
+            stopping = true;
+            reportCleanup(error);
+            throw error;
+          } else {
+            // A wrong credential leaves the channel parked without attaching dependencies.
+            unlockInFlightOrDone = false;
+          }
+          return false;
+        }
+        const attemptSession: StandaloneSession = {
+          constructionWork: new ConstructionWork(),
+          disposeFederation: async () => {}, scrubFederationRecords: [],
+          custody: unlockCustody, saveBaseline: false, attached: false, preserveRuntime: false,
+        };
+        session = attemptSession;
+        try {
+          if (!stopping) {
+            await wireUnlockedDeps({
+              dashboard, custody: unlockCustody, session: attemptSession, isStopping: () => stopping,
+              storage, config, policy, options, dashboardHost, dashboardPort,
+              passphrase: "passphrase" in credential ? credential.passphrase : undefined,
+              passphraseSource: "passphrase" in credential ? "option" : null,
+            });
+          }
+          if (stopping) return false;
+          dashboard.setParked(false);
+          return true;
+        } catch (error) {
+          if (attemptSession.attached || attemptSession.exitCode !== undefined) {
+            // Fatal provisioning and committed routes require shutdown, never retry admission.
+            // stop() joins this failing attempt, so it always rejects here; it has already reported any real cleanup failure, and the status must stay nonzero.
+            void stop().catch(() => undefined).then(() => {
+              process.exit(attemptSession.exitCode ?? 1); // General failure unless provisioning selected a status.
+            });
+            throw error;
+          }
+          try {
+            await finalizeStandaloneSession(attemptSession);
+          } catch (cleanupError) {
+            stopping = true;
+            reportCleanup(cleanupError);
+            throw error;
+          }
+          // Retry requires completed disposal so partial wiring cannot become a serving session.
+          session = undefined;
+          unlockInFlightOrDone = false;
+          return false;
+        }
+      })();
+      // HTTP keeps its generic refusal while stop retains the attempt's rejected outcome.
+      return unlockAttempt.catch(() => false);
     });
 
-    await dashboard.start({ exitCleanOnAddrInUse: true });
+    binding = dashboard.start({ exitCleanOnAddrInUse: true });
+    await binding;
+    cancellation.signal.throwIfAborted();
     if (dashboard.addrInUse()) {
       // Single-owner: another instance already holds the port. Exit 0 so
       // KeepAlive treats this as a successful run (no churn). The owning
       // process serves the dashboard.
+      await stop();
       return dashboard;
     }
 
@@ -953,34 +1121,14 @@ export async function startStandaloneDashboard(
     return dashboard;
   }
 
-  // ── Unlocked boot path (credential present): wire the master deps now ────
-  try {
-    await wireUnlockedDeps({
-      dashboard,
-      custody,
-      storage,
-      config,
-      policy,
-      options,
-      dashboardHost,
-      dashboardPort,
-      passphrase,
-      passphraseSource,
-    });
-  } catch (error) {
-    try {
-      await custody.masterWriteBarrier?.release();
-    } catch (releaseError) {
-      custody.masterKey.fill(0);
-      throw new AggregateError(
-        [error, releaseError],
-        "dashboard dependency wiring failed and its master-write barrier did not release cleanly",
-        { cause: releaseError },
-      );
-    }
-    custody.masterKey.fill(0);
-    throw error;
-  }
+  const wiring = wireUnlockedDeps({
+    dashboard, custody, session: session!, isStopping: () => stopping,
+    storage, config, policy, options, dashboardHost, dashboardPort,
+    passphrase, passphraseSource,
+  });
+  initialWiring = wiring.then(() => undefined, () => { wiringFailed = true; });
+  await wiring;
+  cancellation.signal.throwIfAborted();
 
   // Fix round 1, F3 (dashboard fold): `wireUnlockedDeps` above wrote this
   // tenant's runtime.json BEFORE the listener binds. If the bind FAILS
@@ -995,7 +1143,8 @@ export async function startStandaloneDashboard(
   // SAME-tenant Sanctuary dashboard, so a surviving record that resolves to
   // it stays truthful.
   try {
-    await dashboard.start({ exitCleanOnAddrInUse: !!options.allowPark });
+    binding = dashboard.start({ exitCleanOnAddrInUse: !!options.allowPark });
+    await binding;
   } catch (err) {
     try {
       await clearTenantRuntime(config.storage_path);
@@ -1005,9 +1154,15 @@ export async function startStandaloneDashboard(
     throw err;
   }
   if (options.allowPark && dashboard.addrInUse()) {
-    // Single-owner on the supervised unlocked path too: stand down cleanly.
+    // Stand-down must preserve the runtime record used by the port owner.
+    session!.preserveRuntime = true;
+    // A stop during the bind still rejects startup, but only after the owner's record is marked preserved.
+    cancellation.signal.throwIfAborted();
+    await stop();
     return dashboard;
   }
+  // Outside the bind-failure catch, so cancellation never clears a runtime record this bind did not fail on.
+  cancellation.signal.throwIfAborted();
   if (generatedParkAuthToken && authToken) {
     // Fix round 1, F1: a minted token must reach the operator on the
     // UNLOCKED boot path too (the park path already prints it). Loopback
@@ -1017,6 +1172,32 @@ export async function startStandaloneDashboard(
     console.error(`Operator token: ${authToken}`);
   }
   return dashboard;
+  } catch (error) {
+    const errors: unknown[] = [error];
+    try {
+      await stop();
+    } catch (cleanupError) {
+      // An in-guard stop already carries its cleanup outcome; do not wrap it twice.
+      if (cleanupError !== error) errors.push(cleanupError);
+    }
+    // A signal-started stop leaves the exit to the signal handler; settling here would reach the CLI's start-failure exit first.
+    if (signalStopped) return await new Promise<never>(() => undefined);
+    const exitCode = policyExit ? 1 : session?.exitCode;
+    if (exitCode !== undefined) {
+      process.exit(exitCode);
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        wiringFailed && session?.releaseFailed
+          ? "dashboard dependency wiring failed and its master-write barrier did not release cleanly"
+          : STANDALONE_CLEANUP_FAILURE,
+        { cause: error },
+      );
+    }
+    throwCleanupErrors(errors);
+    throw error;
+  }
 }
 
 /**
@@ -1036,6 +1217,8 @@ export async function startStandaloneDashboard(
 async function wireUnlockedDeps(args: {
   dashboard: DashboardApprovalChannel;
   custody: EstablishMasterResult;
+  session: StandaloneSession;
+  isStopping: () => boolean;
   storage: FilesystemStorage;
   config: Awaited<ReturnType<typeof loadConfig>>;
   policy: PrincipalPolicy;
@@ -1055,6 +1238,8 @@ async function wireUnlockedDeps(args: {
   const {
     dashboard,
     custody,
+    session,
+    isStopping,
     storage,
     config,
     policy,
@@ -1065,6 +1250,9 @@ async function wireUnlockedDeps(args: {
     passphraseSource,
   } = args;
   const masterKey = custody.masterKey;
+  session.disposeFederation = () => dashboard.disposeFederation();
+  // Retry opens federation admission after the prior attempt finishes disposal.
+  await dashboard.beginFederationSession();
 
   // Durable off-host escrow for a freshly minted recovery key (the core fix).
   // The recovery key is NEVER written inside the fortress dir and NEVER printed
@@ -1093,7 +1281,14 @@ async function wireUnlockedDeps(args: {
         escrowOpts.recoveryOut = options.recoveryOut;
       }
       if (options.noConfirm) escrowOpts.noConfirm = true;
-      await escrowBootRecoveryKey(escrowOpts);
+      // Terminal confirmation need not finish to stop; no master-derived work may follow cancellation.
+      const cancelled = new Promise<void>((resolve) => { session.cancelEscrow = resolve; });
+      try {
+        await Promise.race([escrowBootRecoveryKey(escrowOpts), cancelled]);
+      } finally {
+        delete session.cancelEscrow;
+      }
+      if (isStopping()) return;
     } catch (err) {
       if (
         err instanceof BootRecoveryKeyEscrowRequiredError ||
@@ -1102,7 +1297,7 @@ async function wireUnlockedDeps(args: {
         // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
         // The error message NEVER contains the recovery key itself.
         console.error(`\nSanctuary Dashboard: ${err.message}\n`);
-        process.exit(2);
+        session.exitCode = 2;
       }
       throw err;
     }
@@ -1110,6 +1305,7 @@ async function wireUnlockedDeps(args: {
 
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
+  session.auditLog = auditLog;
 
   // G-2 (coordinator gate, 2026-08-22): roll back any exit-import left
   // interrupted by a prior hard kill on THIS fortress before the dashboard
@@ -1228,6 +1424,7 @@ async function wireUnlockedDeps(args: {
 
   // 6. Baseline (master-key-derived; policy already loaded by the caller).
   const baseline = new BaselineTracker(storage, masterKey);
+  session.baseline = baseline;
   await baseline.load();
 
   // 9. Initialize IdentityManager (reads existing identities from encrypted storage)
@@ -1325,6 +1522,8 @@ async function wireUnlockedDeps(args: {
         },
       });
   if (federationRoot !== null) {
+    session.scrubFederationRecords.push(() => zeroRecordSecrets(federationRoot.record));
+    if (isStopping()) return;
     // The real operator-approval gate for a LOCAL / sovereign_tee join. Model:
     // token-as-approval: the operator's live Tier-1 decision already happened at
     // the OPERATOR_SIGNED `authorize/init` that minted the bootstrap token, and
@@ -1340,7 +1539,8 @@ async function wireUnlockedDeps(args: {
     // (createAutoApprove / createAutoDeny are tests-only and must never appear
     // here.)
     const nonceStore = BootstrapNonceStore.durableFromBoot(storage, masterKey);
-    dashboard.setFederationContext({
+    // Trust-root getters transfer owned copies so renewal may wipe them after signing.
+    await dashboard.setFederationContext({
       ...federationRoot.context,
       approver: createStandaloneJoinApprover({
         pinned_master_pubkey: federationRoot.context.pinnedMasterPubkey,
@@ -1350,7 +1550,7 @@ async function wireUnlockedDeps(args: {
         getMasterPrivateKey: federationRoot.context.getMasterPrivateKey,
         nonceStore,
       }),
-    });
+    }, "owned");
   } else if (!federationRotating) {
     // Federation Slice 3a: the JOINER half. A second machine that ran a real
     // join persists a NON-ISSUER joiner trust root; production boot loads it
@@ -1380,8 +1580,10 @@ async function wireUnlockedDeps(args: {
       },
     });
     if (joinerRoot !== null) {
+      session.scrubFederationRecords.push(() => joinerRoot.record.local_node_private_key.fill(0));
+      if (isStopping()) return;
       // No approver: a joiner is a non-issuer and cannot run the approval gate.
-      dashboard.setFederationContext(joinerRoot.context);
+      await dashboard.setFederationContext(joinerRoot.context);
     } else {
       // Operator Cloud (Slice 3 boot-wire): the operator_cloud JOINED-NODE half.
       // A cloud node that completed a real operator_cloud join persists a
@@ -1415,11 +1617,12 @@ async function wireUnlockedDeps(args: {
         },
       });
       if (operatorCloudNode !== null) {
+        if (isStopping()) return;
         // No approver: operator_cloud is structurally non-issuer and cannot run
         // the approval gate. The generalized non-issuer guard inside
         // setFederationContext re-asserts that this context carries no issuer
         // authority.
-        dashboard.setFederationContext(operatorCloudNode.context);
+        await dashboard.setFederationContext(operatorCloudNode.context);
       }
     }
   }
@@ -1429,6 +1632,7 @@ async function wireUnlockedDeps(args: {
   // This store is separate from federation sync state so protect/unprotect do
   // not require federation provisioning, while a durable write failure still
   // denies before any authorized effect.
+  if (isStopping()) return;
   await dashboard.setOperatorAuthorizationSpentStore(
     OperatorAuthorizationSpentStore.durableFromBoot(storage, masterKey),
   );
@@ -1444,10 +1648,12 @@ async function wireUnlockedDeps(args: {
   // serves normally. Skipped while a rotate-root journal exists (federation is
   // held off) and when federation never provisioned. The store mirrors the #741
   // durable replay stores: AES-256-GCM under a custody-master purpose key.
+  if (isStopping()) return;
   if (!federationRotating && dashboard.isFederationProvisioned()) {
     await dashboard.setFederationSyncStateStore(
       new FederationSyncStateStore({ storage, masterKey }),
     );
+    if (isStopping()) return;
     await dashboard.setFederationReissueChallengeStore(
       FederationReissueChallengeStore.durableFromBoot(storage, masterKey),
     );
@@ -1516,6 +1722,7 @@ async function wireUnlockedDeps(args: {
     throw err;
   }
   const v11Bindings = buildV11Bindings({
+    constructionWork: session.constructionWork,
     streamPublisher: {
       publishInbox: (frame) => dashboard.broadcastSSE("inbox", frame),
       publishAgentStatus: (snapshot) => dashboard.broadcastSSE("agent_status", snapshot),
@@ -1635,6 +1842,7 @@ async function wireUnlockedDeps(args: {
   // aggregator. Best-effort, cleaned up on graceful shutdown.
   // This is the LAST throwing await before the synchronous ATTACH TAIL: if it
   // throws, NOTHING has been attached and the dashboard stays cleanly parked.
+  session.clearRuntime = () => clearTenantRuntime(config.storage_path);
   await writeTenantRuntime(config.storage_path, {
     version: SANCTUARY_VERSION,
     pid: process.pid,
@@ -1658,6 +1866,9 @@ async function wireUnlockedDeps(args: {
     await options.__testFaultAfterLoads();
   }
 
+  // A stopping owner cannot attach dependencies that its finalizer is about to release.
+  if (isStopping()) return;
+
   // ── ATTACH TAIL (synchronous, non-throwing) ──────────────────────────────
   // Every throwing await is above this line. From here on we only mutate the
   // dashboard channel with the fully-constructed, fully-loaded local values.
@@ -1665,6 +1876,7 @@ async function wireUnlockedDeps(args: {
   // any half-unlocked window. Order within the tail is irrelevant for safety
   // (none of these throw), but mirrors the historical sequence for clarity.
   // Must match observeProtections in protection-observations.ts: attach the TaskService consumer only after loads succeed.
+  session.attached = true;
   dashboard.setDependencies({ ...deps, stateStore });
   dashboard.setV11Bindings(v11Bindings);
   dashboard.setDistressInbox(distressInbox);
@@ -1678,10 +1890,9 @@ async function wireUnlockedDeps(args: {
   // attach, done above) and never throws out, so it cannot re-open a
   // half-unlocked window. A bad secret mode or port conflict logs and leaves the
   // dashboard fully unlocked; the in-process distress lane is unaffected.
-  let distressListener: DistressListener | undefined;
   try {
     const localSecret = await loadOrCreateLocalListenerSecret(config.storage_path);
-    distressListener = new DistressListener({
+    const distressListener = new DistressListener({
       inbox: distressInbox,
       auditLog,
       localSecret,
@@ -1690,6 +1901,7 @@ async function wireUnlockedDeps(args: {
       // (8741). Tests pass 0 for an ephemeral, contention-free bind.
       port: options.distressPort,
     });
+    session.distressListener = distressListener;
     await distressListener.start();
   } catch (err) {
     // A bad secret mode (group/world-readable) or any setup failure must not
@@ -1705,22 +1917,7 @@ async function wireUnlockedDeps(args: {
       `[SANCTUARY DISTRESS] local listener not started: ${detail}\n` +
         `  The in-process distress lane (stderr + audit) is unaffected.`,
     );
-    distressListener = undefined;
   }
-
-  const clearRuntime = async () => {
-    try {
-      await clearTenantRuntime(config.storage_path);
-    } catch {
-      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
-    }
-    try {
-      await distressListener?.stop();
-    } catch {
-      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
-    }
-  };
-  registerStandaloneProcessCleanup(clearRuntime, { runOnExit: true });
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
@@ -1812,19 +2009,5 @@ async function wireUnlockedDeps(args: {
     );
   }
 
-  // 12. Save baseline on exit
-  const saveBaseline = async () => {
-    try {
-      await baseline.save();
-    } catch {
-      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
-    } finally {
-      try {
-        await custody.masterWriteBarrier?.release();
-      } catch {
-        /* process death is the final crash-recoverable barrier release */
-      }
-    }
-  };
-  registerStandaloneProcessCleanup(saveBaseline);
+  session.saveBaseline = true;
 }

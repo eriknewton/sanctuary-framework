@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * Castle Wall arm-BADGE eager-read path - perf + never-fake-green honesty.
  *
@@ -119,7 +120,7 @@ async function buildChainWithFreshArmEvidence(
       timestamp,
       encrypted_payload_bytes: encryptedPayloadBytes,
     };
-    const key = `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`;
+    const key = `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await storage.write("_audit", key, stringToBytes(JSON.stringify(envelope)));
     prevHash = entryHash;
   }

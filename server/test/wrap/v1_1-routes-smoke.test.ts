@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../dashboard/construction-work-fixture.js";
 // fail-before-exempt: wrap-auto smoke harness adapts v1.1 bindings and DID-web route expectations, not stop-button enforcement; real coverage is in agent-stop, egress, and controller tests.
 /**
  * v1.1.2 hotfix (Finding V) — wrap-auto dashboard exposes v1.1 surfaces
@@ -34,7 +35,6 @@ import { randomBytes } from "node:crypto";
 
 import { startDashboard, type DashboardHandle } from "../../src/dashboard/index.js";
 import {
-  buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -79,7 +79,7 @@ async function startWrapAutoRigWithRetry(): Promise<WrapAutoTestRig> {
       const auditLog = new AuditLog(storage, masterKey);
       handle.updateSources({ auditLog });
       handle.setV11Bindings(
-        buildV11Bindings({
+        await buildV11Bindings({
           identityId: IDENTITY_ID,
           fortressId: fortressIdFromStoragePath(tmpFortress),
           auditLog,

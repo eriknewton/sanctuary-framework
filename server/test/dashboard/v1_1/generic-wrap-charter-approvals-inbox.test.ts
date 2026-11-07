@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 // fail-before-exempt: this change opts the real insert-hold fixture into always; W3 proves opt-in enforcement.
 /**
  * Sanctuary v1.1 dashboard. Live Tier 1 approval cards for a generic wrap.
@@ -48,7 +49,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DashboardApprovalChannel } from "../../../src/principal-policy/dashboard.js";
 import {
   buildConciergeContextProviders,
-  buildV11Bindings,
   type V11Bindings,
 } from "../../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
@@ -101,7 +101,7 @@ interface Rig {
   /** The live v1.1 bindings, so a test can reach the same hub the routes use. */
   bindings: V11Bindings;
   /** Build a second, independent binding set for rebind/detach cases. */
-  buildSpareBindings: () => V11Bindings;
+  buildSpareBindings: () => Promise<V11Bindings>;
   stop: () => Promise<void>;
 }
 
@@ -145,8 +145,8 @@ async function startRig(): Promise<Rig> {
   // no named agent, so the hub agent registry rehydrates empty. Any inbox
   // admission that depends on a registry row would be invisible here, which
   // is the point of this rig.
-  const buildSpareBindings = (): V11Bindings =>
-    buildV11Bindings({
+  const buildSpareBindings = async (): Promise<V11Bindings> =>
+    await buildV11Bindings({
       identityId: IDENTITY_ID,
       fortressId: FORTRESS_ID,
       auditLog,
@@ -155,7 +155,7 @@ async function startRig(): Promise<Rig> {
       storagePath,
       warnProducerKeyUnavailable: () => {},
     });
-  const bindings = buildSpareBindings();
+  const bindings = await buildSpareBindings();
   dashboard.setV11Bindings(bindings);
 
   await dashboard.start();
@@ -635,7 +635,7 @@ describe("the reserved Charter item-id namespace is not a naming convention", ()
   it("refuses a reserved id on a hub with no bridge installed", async () => {
     // A hub built but never handed to a channel: exactly the state a
     // composition root leaves behind when the v1.1 surface is off.
-    const bridgeless = rig.buildSpareBindings().hubService;
+    const bridgeless = (await rig.buildSpareBindings()).hubService;
     await expect(
       bridgeless.resolveInboxItem(charterApprovalItemId("forged"), "approve"),
     ).rejects.toThrow(/inbox item/);
@@ -654,7 +654,7 @@ describe("the reserved Charter item-id namespace is not a naming convention", ()
 
     // Rebinding hands the surface to a different hub. The old object may still
     // be held by a caller; it must no longer reach this channel's queue.
-    const secondBindings = rig.buildSpareBindings();
+    const secondBindings = await rig.buildSpareBindings();
     rig.dashboard.setV11Bindings(secondBindings);
 
     expect(firstHub.listInbox()).toEqual([]);

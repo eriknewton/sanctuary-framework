@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 // Snapshot restoration preserves file-specific refusal reasons. IC-11.
 // The controller preserves the lift platform refusal and stopped state. IC-11.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -20,7 +21,6 @@ import {
   type StopAgentEgressObservation,
 } from "../../../src/castle-wall/provision/agent-stop.js";
 import {
-  buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../../src/dashboard/v1_1/wiring.js";
 import { CastleWallAgentController } from "../../../src/dashboard/v1_1/castle-wall-agent-controller.js";
@@ -177,7 +177,7 @@ describe("CastleWallAgentController", () => {
       writePersistedLocalAgents(storagePath, [record]);
 
       let captured: StopAgentEgressInput | null = null;
-      const { hubService } = buildV11Bindings({
+      const { hubService } = await buildV11Bindings({
         identityId,
         fortressId,
         storagePath,
@@ -285,7 +285,7 @@ describe("per-agent lockdown lift controller IC-11", () => {
         reload_confirmed: reloadConfirmed, snapshot_path: join(storagePath, "private-snapshot.json"),
       }));
       const auditLog = makeAuditLog();
-      const { hubService } = buildV11Bindings({
+      const { hubService } = await buildV11Bindings({
         identityId: record.identity_id, fortressId, storagePath, auditLog,
         liftAgentEgressStop: lift,
       });

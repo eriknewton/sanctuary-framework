@@ -155,6 +155,7 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
   });
 
   afterEach(async () => {
+    await closeFixtureSessions();
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_RECOVERY_KEY;
     try {
@@ -172,7 +173,7 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     // in this non-interactive test process).
     const stateStoragePath = join(fortressPath, "state");
     const storage = new FilesystemStorage(stateStoragePath);
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -245,7 +246,7 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     // Same fortress/identity seeding as the previous test.
     const stateStoragePath = join(fortressPath, "state");
     const storage = new FilesystemStorage(stateStoragePath);
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -343,7 +344,7 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
   it("refuses a mint when the reconcile that precedes it does not converge (FG-RECONCILE-SIBLINGS-01)", async () => {
     const stateStoragePath = join(fortressPath, "state");
     const storage = new FilesystemStorage(stateStoragePath);
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -408,3 +409,16 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     expect(err.text).not.toContain("at process.processTicksAndRejections");
   });
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

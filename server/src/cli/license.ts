@@ -34,6 +34,7 @@
  * past, negative node count, unknown licenseId on revoke.
  */
 
+import { withCliMasterKeySession } from "../core/master-custody.js";
 import type { Writable } from "node:stream";
 import { toBase64url } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
@@ -228,8 +229,8 @@ async function runIssue(
       write(
         err,
         `issue: --plan ${planName} conflicts with explicit ${conflicting.join(", ")} ` +
-          "(a plan preset fills these); drop --plan and use raw flags, or drop " +
-          "the conflicting flag(s) and let --plan fill them\n",
+        "(a plan preset fills these); drop --plan and use raw flags, or drop " +
+        "the conflicting flag(s) and let --plan fill them\n",
       );
       return 1;
     }
@@ -351,99 +352,101 @@ async function runIssue(
   }
 
   try {
-    const ledgerPath = await resolveLedgerPath();
-    // Serialize the WHOLE load -> verify+freshness -> mutate -> save -> advance
-    // anchor sequence under the advisory lock so two concurrent `issue`/`revoke`
-    // cannot lost-update the ledger or race the anchor (spec §5).
-    const encoded = await withLedgerMutationLock(ledgerPath, async () => {
-      const ledger = await loadLedger(ledgerPath);
-      // Verify integrity AND freshness BEFORE appending: never extend a tampered
-      // OR rolled-back ledger (fail-closed, spec §6). checkLedgerFreshness pins
-      // the fortress issuer key (NOT the ledger file) and compares the ledger
-      // generation against the external master-MAC'd anchor.
-      const fresh = await checkLedgerFreshness(
-        ledger,
-        issuer.issuerPublicKey,
-        issuer.storage,
-        issuer.masterKey,
-      );
-      if (!fresh.ok) {
-        throw new LedgerFailClosed(
-          `existing license ledger failed its integrity/freshness check (${fresh.reason}); refusing to append`,
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(issuer, async () => {
+      const ledgerPath = await resolveLedgerPath();
+      // Serialize the WHOLE load -> verify+freshness -> mutate -> save -> advance
+      // anchor sequence under the advisory lock so two concurrent `issue`/`revoke`
+      // cannot lost-update the ledger or race the anchor (spec §5).
+      const encoded = await withLedgerMutationLock(ledgerPath, async () => {
+        const ledger = await loadLedger(ledgerPath);
+        // Verify integrity AND freshness BEFORE appending: never extend a tampered
+        // OR rolled-back ledger (fail-closed, spec §6). checkLedgerFreshness pins
+        // the fortress issuer key (NOT the ledger file) and compares the ledger
+        // generation against the external master-MAC'd anchor.
+        const fresh = await checkLedgerFreshness(
+          ledger,
+          issuer.issuerPublicKey,
+          issuer.storage,
+          issuer.masterKey,
         );
-      }
+        if (!fresh.ok) {
+          throw new LedgerFailClosed(
+            `existing license ledger failed its integrity/freshness check (${fresh.reason}); refusing to append`,
+          );
+        }
 
-      // Freshness coordinate: bump strictly above BOTH the on-disk ledger
-      // generation and the external anchor, so a rolled-back on-disk ledger
-      // cannot re-issue at a stale generation the anchor already passed.
-      //
-      // HONEST RESIDUAL - the one-mutation self-healing lag (issuer-local, NOT a
-      // token bypass): the durable blob write below lands BEFORE the anchor bump.
-      // If the process crashes AFTER the durable blob (gen N+1) but BEFORE the
-      // anchor advances, the anchor lags at N. The ledger (N+1 >= N) still
-      // verifies (benign lag under the `>=` freshness rule), but that LAST
-      // mutation is not yet rollback-protected until the NEXT mutation, whose
-      // `max(ledgerGen, anchorGen) + 1` self-heals the anchor to N+2, after
-      // which replaying the N or N+1 snapshot reads as tampered. This is the
-      // inherent one-mutation bound of an on-disk monotonic anchor (the same
-      // class `core/anti-rollback.ts` documents as its Stage-1 residual). It is
-      // issuer-local bookkeeping and does NOT forge a customer token: the token
-      // layer gates enforcement and verifies against the real issuer key.
-      const anchor = await readLedgerGenerationAnchor(
-        issuer.storage,
-        issuer.masterKey,
-      );
-      const anchorGen = anchor.status === "valid" ? anchor.data.generation : 0;
-      const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
+        // Freshness coordinate: bump strictly above BOTH the on-disk ledger
+        // generation and the external anchor, so a rolled-back on-disk ledger
+        // cannot re-issue at a stale generation the anchor already passed.
+        //
+        // HONEST RESIDUAL - the one-mutation self-healing lag (issuer-local, NOT a
+        // token bypass): the durable blob write below lands BEFORE the anchor bump.
+        // If the process crashes AFTER the durable blob (gen N+1) but BEFORE the
+        // anchor advances, the anchor lags at N. The ledger (N+1 >= N) still
+        // verifies (benign lag under the `>=` freshness rule), but that LAST
+        // mutation is not yet rollback-protected until the NEXT mutation, whose
+        // `max(ledgerGen, anchorGen) + 1` self-heals the anchor to N+2, after
+        // which replaying the N or N+1 snapshot reads as tampered. This is the
+        // inherent one-mutation bound of an on-disk monotonic anchor (the same
+        // class `core/anti-rollback.ts` documents as its Stage-1 residual). It is
+        // issuer-local bookkeeping and does NOT forge a customer token: the token
+        // layer gates enforcement and verifies against the real issuer key.
+        const anchor = await readLedgerGenerationAnchor(
+          issuer.storage,
+          issuer.masterKey,
+        );
+        const anchorGen = anchor.status === "valid" ? anchor.data.generation : 0;
+        const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
 
-      const { token, row } = issueLicense(
-        {
-          licenseId: generateLicenseId(),
-          subject,
-          tier,
-          pricingUnit,
-          entitledCount,
-          period,
+        const { token, row } = issueLicense(
+          {
+            licenseId: generateLicenseId(),
+            subject,
+            tier,
+            pricingUnit,
+            entitledCount,
+            period,
+            notBefore,
+            notAfter,
+            graceUntil,
+            featureFlags: featureList,
+            issuer: issuer.issuerId,
+          },
+          issuer.sign,
           notBefore,
-          notAfter,
-          graceUntil,
-          featureFlags: featureList,
-          issuer: issuer.issuerId,
-        },
-        issuer.sign,
-        notBefore,
-      );
-      const nextLedger = appendRow(
-        ledger,
-        row,
-        issuer.sign,
-        issuer.issuerPublicKey,
-        nextGeneration,
-      );
-      // WRITE ORDERING (spec §4, the F1 failure class): persist the BLOB (durable
-      // rename) FIRST, THEN advance the anchor. A crash between leaves
-      // ledger.generation >= anchor.generation -> verify uses `>=` -> benign lag,
-      // never a false-brick. The dangerous order (anchor first) would leave
-      // ledger.generation < anchor.generation on a crash and false-brick.
-      await saveLedger(ledgerPath, nextLedger);
-      await writeLedgerGenerationAnchor(
-        issuer.storage,
-        issuer.masterKey,
-        nextGeneration,
-      );
+        );
+        const nextLedger = appendRow(
+          ledger,
+          row,
+          issuer.sign,
+          issuer.issuerPublicKey,
+          nextGeneration,
+        );
+        // WRITE ORDERING (spec §4, the F1 failure class): persist the BLOB (durable
+        // rename) FIRST, THEN advance the anchor. A crash between leaves
+        // ledger.generation >= anchor.generation -> verify uses `>=` -> benign lag,
+        // never a false-brick. The dangerous order (anchor first) would leave
+        // ledger.generation < anchor.generation on a crash and false-brick.
+        await saveLedger(ledgerPath, nextLedger);
+        await writeLedgerGenerationAnchor(
+          issuer.storage,
+          issuer.masterKey,
+          nextGeneration,
+        );
 
-      // The license token the operator pastes into Activate: base64url of the
-      // JSON {claims,signature}. NEVER any secret-key material.
-      return toBase64url(new TextEncoder().encode(JSON.stringify(token)));
+        // The license token the operator pastes into Activate: base64url of the
+        // JSON {claims,signature}. NEVER any secret-key material.
+        return toBase64url(new TextEncoder().encode(JSON.stringify(token)));
+      });
+
+      write(out, `${encoded}\n`);
+      return 0;
+
     });
-
-    write(out, `${encoded}\n`);
-    return 0;
   } catch (e) {
     write(err, `issue: ${(e as Error).message}\n`);
     return 1;
-  } finally {
-    issuer.masterKey.fill(0);
   }
 }
 
@@ -517,34 +520,36 @@ async function runList(
       return 1;
     }
     try {
-      const ledgerPath = await resolveLedgerPath();
-      const ledger = await loadLedger(ledgerPath);
-      // Freshness (integrity + external anti-rollback anchor). An empty ledger
-      // passes integrity but its generation is 0, so an empty substitution is
-      // caught here when the anchor is non-zero.
-      const fresh = await checkLedgerFreshness(
-        ledger,
-        verifier.issuerPublicKey,
-        verifier.storage,
-        verifier.masterKey,
-      );
-      if (!fresh.ok) {
-        write(
-          err,
-          "WARNING: license ledger FAILED its integrity/freshness check " +
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      return await withCliMasterKeySession(verifier, async () => {
+        const ledgerPath = await resolveLedgerPath();
+        const ledger = await loadLedger(ledgerPath);
+        // Freshness (integrity + external anti-rollback anchor). An empty ledger
+        // passes integrity but its generation is 0, so an empty substitution is
+        // caught here when the anchor is non-zero.
+        const fresh = await checkLedgerFreshness(
+          ledger,
+          verifier.issuerPublicKey,
+          verifier.storage,
+          verifier.masterKey,
+        );
+        if (!fresh.ok) {
+          write(
+            err,
+            "WARNING: license ledger FAILED its integrity/freshness check " +
             `(${fresh.reason}` +
             (fresh.rowIndex !== undefined ? ` at row ${fresh.rowIndex}` : "") +
             "). This ledger has been TAMPERED with or ROLLED BACK and is NOT " +
             "trustworthy; refusing to display it as valid.\n",
-        );
-        return 1;
-      }
-      return emitList(listLicenses(ledger), asJson, out, /*unverified*/ false, err);
+          );
+          return 1;
+        }
+        return emitList(listLicenses(ledger), asJson, out, /*unverified*/ false, err);
+
+      });
     } catch (e) {
       write(err, `list: ${(e as Error).message}\n`);
       return 1;
-    } finally {
-      verifier.masterKey.fill(0);
     }
   }
 
@@ -669,62 +674,64 @@ async function runRevoke(
   }
 
   try {
-    const ledgerPath = await resolveLedgerPath();
-    // Serialize the whole sequence under the advisory lock (spec §5).
-    await withLedgerMutationLock(ledgerPath, async () => {
-      const ledger = await loadLedger(ledgerPath);
-      // Verify integrity AND freshness before mutating: never modify a tampered
-      // OR rolled-back ledger (fail-closed, spec §6). Pins the fortress issuer
-      // key + the external anti-rollback anchor.
-      const fresh = await checkLedgerFreshness(
-        ledger,
-        issuer.issuerPublicKey,
-        issuer.storage,
-        issuer.masterKey,
-      );
-      if (!fresh.ok) {
-        throw new LedgerFailClosed(
-          `license ledger failed its integrity/freshness check (${fresh.reason}); refusing to modify`,
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(issuer, async () => {
+      const ledgerPath = await resolveLedgerPath();
+      // Serialize the whole sequence under the advisory lock (spec §5).
+      await withLedgerMutationLock(ledgerPath, async () => {
+        const ledger = await loadLedger(ledgerPath);
+        // Verify integrity AND freshness before mutating: never modify a tampered
+        // OR rolled-back ledger (fail-closed, spec §6). Pins the fortress issuer
+        // key + the external anti-rollback anchor.
+        const fresh = await checkLedgerFreshness(
+          ledger,
+          issuer.issuerPublicKey,
+          issuer.storage,
+          issuer.masterKey,
         );
-      }
+        if (!fresh.ok) {
+          throw new LedgerFailClosed(
+            `license ledger failed its integrity/freshness check (${fresh.reason}); refusing to modify`,
+          );
+        }
 
-      // Self-healing anchor: `max(ledgerGen, anchorGen) + 1` heals a
-      // one-mutation crash lag (durable blob at N+1, anchor still at N) up to
-      // N+2 on this next mutation. See the fuller HONEST RESIDUAL note on the
-      // `issue` path above: the last pre-crash mutation is benign-lagged, not
-      // rollback-protected, until the next mutation self-heals; issuer-local,
-      // NOT a customer-token bypass.
-      const anchor = await readLedgerGenerationAnchor(
-        issuer.storage,
-        issuer.masterKey,
-      );
-      const anchorGen = anchor.status === "valid" ? anchor.data.generation : 0;
-      const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
+        // Self-healing anchor: `max(ledgerGen, anchorGen) + 1` heals a
+        // one-mutation crash lag (durable blob at N+1, anchor still at N) up to
+        // N+2 on this next mutation. See the fuller HONEST RESIDUAL note on the
+        // `issue` path above: the last pre-crash mutation is benign-lagged, not
+        // rollback-protected, until the next mutation self-heals; issuer-local,
+        // NOT a customer-token bypass.
+        const anchor = await readLedgerGenerationAnchor(
+          issuer.storage,
+          issuer.masterKey,
+        );
+        const anchorGen = anchor.status === "valid" ? anchor.data.generation : 0;
+        const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
 
-      const next = revokeLicense(
-        ledger,
-        licenseId,
-        Math.floor(Date.now() / 1000),
-        reason,
-        issuer.sign,
-        issuer.issuerPublicKey,
-        nextGeneration,
-      );
-      // WRITE ORDERING (spec §4): durable blob FIRST, then advance the anchor.
-      await saveLedger(ledgerPath, next);
-      await writeLedgerGenerationAnchor(
-        issuer.storage,
-        issuer.masterKey,
-        nextGeneration,
-      );
+        const next = revokeLicense(
+          ledger,
+          licenseId,
+          Math.floor(Date.now() / 1000),
+          reason,
+          issuer.sign,
+          issuer.issuerPublicKey,
+          nextGeneration,
+        );
+        // WRITE ORDERING (spec §4): durable blob FIRST, then advance the anchor.
+        await saveLedger(ledgerPath, next);
+        await writeLedgerGenerationAnchor(
+          issuer.storage,
+          issuer.masterKey,
+          nextGeneration,
+        );
+      });
+      write(out, `Revoked license ${formatShortId(licenseId)}.\n`);
+      return 0;
+
     });
-    write(out, `Revoked license ${formatShortId(licenseId)}.\n`);
-    return 0;
   } catch (e) {
     write(err, `revoke: ${(e as Error).message}\n`);
     return 1;
-  } finally {
-    issuer.masterKey.fill(0);
   }
 }
 

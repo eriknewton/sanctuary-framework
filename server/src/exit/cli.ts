@@ -16,12 +16,7 @@ import { IdentityManager } from "../cognitive/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
-import {
-  resolveCliMasterKey,
-  readCustodyEnvelope,
-  envelopeMissingButSentinelPresent,
-  CUSTODY_SENTINEL_KEY,
-} from "../core/master-custody.js";
+import { withCliMasterKeySession, transferCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey, readCustodyEnvelope, envelopeMissingButSentinelPresent, CUSTODY_SENTINEL_KEY } from "../core/master-custody.js";
 import {
   exportExitBundle,
   importExitBundle,
@@ -164,6 +159,7 @@ export interface ExitCommandArgs {
 }
 
 interface ExitContext {
+  session: CliMasterKeySession;
   storagePath: string;
   stateStoragePath: string;
   storage: FilesystemStorage;
@@ -241,18 +237,18 @@ async function openExitContext(
   const stateStoragePath = join(config.storage_path, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
-  let masterKey: Uint8Array;
+  let session: CliMasterKeySession;
   let keySource: ExitContext["keySource"];
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (passphrase) {
-    masterKey = await resolveCliMasterKey(storage, {
+    session = await resolveCliMasterKey(storage, {
       passphrase,
       bootstrap: true,
       storagePathHint: config.storage_path,
     });
     keySource = "passphrase";
   } else if (recoveryKey) {
-    masterKey = await resolveCliMasterKey(storage, {
+    session = await resolveCliMasterKey(storage, {
       recoveryKey,
       bootstrap: true,
       storagePathHint: config.storage_path,
@@ -264,35 +260,43 @@ async function openExitContext(
     );
   }
 
-  const auditLog = new AuditLog(storage, masterKey);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
 
-  // F1 (Exit V2 drill D1, 2026-08-22): "fortress open" for every `sanctuary
-  // exit` subcommand, run BEFORE identityManager.load() or any other
-  // reader below touches storage (LOW-G, coordinator gate, 2026-08-22:
-  // moved earlier in this function - a killed import can leave identity
-  // or state data mid-write, and the checks below should see the
-  // RECOVERED fortress, not the half-applied one). `...OrThrow` (MEDIUM-3,
-  // coordinator gate, 2026-08-22) so a partial/unparseable rollback stops
-  // fortress open instead of silently proceeding against a possibly
-  // half-applied target.
-  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    // F1 (Exit V2 drill D1, 2026-08-22): "fortress open" for every `sanctuary
+    // exit` subcommand, run BEFORE identityManager.load() or any other
+    // reader below touches storage (LOW-G, coordinator gate, 2026-08-22:
+    // moved earlier in this function - a killed import can leave identity
+    // or state data mid-write, and the checks below should see the
+    // RECOVERED fortress, not the half-applied one). `...OrThrow` (MEDIUM-3,
+    // coordinator gate, 2026-08-22) so a partial/unparseable rollback stops
+    // fortress open instead of silently proceeding against a possibly
+    // half-applied target.
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
-  const stateStore = new StateStore(storage, masterKey);
-  const identityManager = new IdentityManager(storage, masterKey);
-  await identityManager.load();
-  const reputationStore = new ReputationStore(storage, masterKey);
-  void stateStore;
+    const stateStore = new StateStore(storage, masterKey);
+    const identityManager = new IdentityManager(storage, masterKey);
+    await identityManager.load();
+    const reputationStore = new ReputationStore(storage, masterKey);
+    void stateStore;
 
-  return {
-    storagePath: config.storage_path,
-    stateStoragePath,
-    storage,
-    masterKey,
-    auditLog,
-    identityManager,
-    reputationStore,
-    keySource,
-  };
+    return {
+      session,
+      storagePath: config.storage_path,
+      stateStoragePath,
+      storage,
+      masterKey,
+      auditLog,
+      identityManager,
+      reputationStore,
+      keySource,
+    };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 /**
@@ -489,14 +493,14 @@ async function openFortressForRecoveryOnly(
     throw error;
   }
 
-  let masterKey: Uint8Array;
+  let session: CliMasterKeySession;
   if (passphrase) {
-    masterKey = await resolveCliMasterKey(storage, {
+    session = await resolveCliMasterKey(storage, {
       passphrase,
       storagePathHint: storagePath,
     });
   } else if (recoveryKey) {
-    masterKey = await resolveCliMasterKey(storage, {
+    session = await resolveCliMasterKey(storage, {
       recoveryKey,
       storagePathHint: storagePath,
     });
@@ -506,11 +510,18 @@ async function openFortressForRecoveryOnly(
     );
   }
 
-  const auditLog = new AuditLog(storage, masterKey);
-  // The ONLY write this function's success path can perform, and only
-  // once `recoverInterruptedExitImportsOrThrow` has acquired the
-  // exit-admission lock internally (storage/exit-import-journal.ts).
-  return recoverInterruptedExitImportsOrThrow(storage, auditLog);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    // The ONLY write this function's success path can perform, and only
+    // once `recoverInterruptedExitImportsOrThrow` has acquired the
+    // exit-admission lock internally (storage/exit-import-journal.ts).
+    return await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 export function printExitHelp(out: Writable = process.stdout): void {
@@ -882,205 +893,212 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       }
       const config = await loadConfig();
       const ctx = await openExitContext(argv, env);
-      let policy;
-      try {
-        policy = await loadPrincipalPolicy(ctx.storagePath);
-      } catch (policyErr) {
-        if (policyErr instanceof MalformedPrincipalPolicyError) {
-          write(err, `\nSanctuary cannot proceed.\n${policyErr.message}\n`);
-          return 1;
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      return await withCliMasterKeySession(ctx.session, async () => {
+        let policy;
+        try {
+          policy = await loadPrincipalPolicy(ctx.storagePath);
+        } catch (policyErr) {
+          if (policyErr instanceof MalformedPrincipalPolicyError) {
+            write(err, `\nSanctuary cannot proceed.\n${policyErr.message}\n`);
+            return 1;
+          }
+          throw policyErr;
         }
-        throw policyErr;
-      }
-      // Recognition-Layer Path C primary did:web binding resolution.
-      //
-      // Build 2 shipped CLI-explicit override: operator passes
-      // --did-web + --did-web-authority-host to embed a did:web
-      // binding in the manifest's identity_binding.
-      //
-      // Build 3 adds fortress-config auto-inclusion: if `did-web issue`
-      // has been run on this fortress, `<storage>/recognition/did-web.json`
-      // exists and is treated as the operator's registered did:web
-      // identifier. Subsequent exit-bundle exports auto-include it
-      // without requiring any --did-web flag.
-      //
-      // Resolution order:
-      //   1. --no-did-web (alias: --include-did-web=false)
-      //        → explicit operator opt-out, no binding embedded.
-      //   2. --did-web <identifier> [--did-web-authority-host <host>]
-      //        → explicit CLI override; bypasses fortress-config.
-      //   3. fortress-config record present
-      //        → auto-include with the registered identifier +
-      //          authority_host. Operator may add
-      //          --did-web-published-at to claim a publication time.
-      //   4. neither flags nor record
-      //        → silent skip (no binding embedded; backward compat).
-      const includeDidWebFlag = flagValue(argv, "--include-did-web");
-      const explicitOptOut =
-        hasFlag(argv, "--no-did-web") || includeDidWebFlag === "false";
-      const didWebIdentifier = flagValue(argv, "--did-web");
-      const didWebAuthorityHost = flagValue(argv, "--did-web-authority-host");
-      const didWebPublishedAt = flagValue(argv, "--did-web-published-at");
-      let exportDidWeb: ExitBundleDidWebBinding | undefined;
-      let didWebSource:
-        | "cli-override"
-        | "fortress-config"
-        | "opted-out"
-        | "no-record"
-        | undefined;
-      if (explicitOptOut) {
-        didWebSource = "opted-out";
-      } else if (didWebIdentifier !== undefined) {
-        if (didWebAuthorityHost === undefined) {
-          write(
-            err,
-            "Error: --did-web requires --did-web-authority-host=<host>\n",
-          );
-          return 2;
-        }
-        exportDidWeb = {
-          identifier: didWebIdentifier,
-          authority_host: didWebAuthorityHost,
-          ...(didWebPublishedAt !== undefined
-            ? { published_at: didWebPublishedAt }
-            : {}),
-        };
-        didWebSource = "cli-override";
-      } else {
-        const record = await loadFortressDidWebRecord(ctx.storagePath);
-        if (record !== null) {
+        // Recognition-Layer Path C primary did:web binding resolution.
+        //
+        // Build 2 shipped CLI-explicit override: operator passes
+        // --did-web + --did-web-authority-host to embed a did:web
+        // binding in the manifest's identity_binding.
+        //
+        // Build 3 adds fortress-config auto-inclusion: if `did-web issue`
+        // has been run on this fortress, `<storage>/recognition/did-web.json`
+        // exists and is treated as the operator's registered did:web
+        // identifier. Subsequent exit-bundle exports auto-include it
+        // without requiring any --did-web flag.
+        //
+        // Resolution order:
+        //   1. --no-did-web (alias: --include-did-web=false)
+        //        → explicit operator opt-out, no binding embedded.
+        //   2. --did-web <identifier> [--did-web-authority-host <host>]
+        //        → explicit CLI override; bypasses fortress-config.
+        //   3. fortress-config record present
+        //        → auto-include with the registered identifier +
+        //          authority_host. Operator may add
+        //          --did-web-published-at to claim a publication time.
+        //   4. neither flags nor record
+        //        → silent skip (no binding embedded; backward compat).
+        const includeDidWebFlag = flagValue(argv, "--include-did-web");
+        const explicitOptOut =
+          hasFlag(argv, "--no-did-web") || includeDidWebFlag === "false";
+        const didWebIdentifier = flagValue(argv, "--did-web");
+        const didWebAuthorityHost = flagValue(argv, "--did-web-authority-host");
+        const didWebPublishedAt = flagValue(argv, "--did-web-published-at");
+        let exportDidWeb: ExitBundleDidWebBinding | undefined;
+        let didWebSource:
+          | "cli-override"
+          | "fortress-config"
+          | "opted-out"
+          | "no-record"
+          | undefined;
+        if (explicitOptOut) {
+          didWebSource = "opted-out";
+        } else if (didWebIdentifier !== undefined) {
+          if (didWebAuthorityHost === undefined) {
+            write(
+              err,
+              "Error: --did-web requires --did-web-authority-host=<host>\n",
+            );
+            return 2;
+          }
           exportDidWeb = {
-            identifier: record.identifier.did,
-            authority_host: record.identifier.authority_host,
+            identifier: didWebIdentifier,
+            authority_host: didWebAuthorityHost,
             ...(didWebPublishedAt !== undefined
               ? { published_at: didWebPublishedAt }
               : {}),
           };
-          didWebSource = "fortress-config";
+          didWebSource = "cli-override";
         } else {
-          didWebSource = "no-record";
+          const record = await loadFortressDidWebRecord(ctx.storagePath);
+          if (record !== null) {
+            exportDidWeb = {
+              identifier: record.identifier.did,
+              authority_host: record.identifier.authority_host,
+              ...(didWebPublishedAt !== undefined
+                ? { published_at: didWebPublishedAt }
+                : {}),
+            };
+            didWebSource = "fortress-config";
+          } else {
+            didWebSource = "no-record";
+          }
         }
-      }
-      // `--state-namespace` is repeatable and OPTIONAL. When the operator names
-      // none, `flagValues` returns [], which must NOT be forwarded:
-      // passing an empty selection meant "export nothing" and produced a signed
-      // bundle with zero state entries. Spread it conditionally so "named none"
-      // reaches the exporter as an absent option, which is its contract for
-      // "discover and export every namespace." Same shape as
-      // `didWebAllowedHosts` on the import path below; `exportEncryptedState`
-      // now throws on an empty array so this cannot silently regress.
-      const stateNamespaces = flagValues(argv, "--state-namespace");
-      const result = await exportExitBundle({
-        bundleDir: outDir,
-        storage: ctx.storage,
-        masterKey: ctx.masterKey,
-        identityManager: ctx.identityManager,
-        auditLog: ctx.auditLog,
-        reputationStore: ctx.reputationStore,
-        policy,
-        config,
-        stateStoragePath: ctx.stateStoragePath,
-        ...(stateNamespaces.length > 0 ? { stateNamespaces } : {}),
-        keySource: ctx.keySource,
-        // The CLI is an operator terminal: safe to mint + display the
-        // bundle re-key key (it is never written into the bundle).
-        mintStateRekeyKey: true,
-        // Operator-driven full-fortress export: the ownership partition (exit
-        // machinery Slice 1) is deliberately not applied here. Named, auditable
-        // acknowledgement, not a silent skip.
-        unpartitionedLegacyExport: true,
-        ...(exportDidWeb !== undefined ? { didWeb: exportDidWeb } : {}),
-      });
-      if (json) {
-        write(
-          out,
-          JSON.stringify(
-            { ...result, did_web_source: didWebSource },
-            null,
-            2,
-          ) + "\n",
-        );
-      } else {
-        write(out, `exported: ${result.bundle_dir}\n`);
-        write(out, `manifest_hash: ${result.manifest_hash}\n`);
-        // How much state actually travelled is the one number an operator needs
-        // to sanity-check an exit bundle, and until now the export path printed
-        // neither it nor `result.warnings` (verify and import both print
-        // warnings). A successful-looking export with no state count is how a
-        // silently-empty bundle passed for a good one.
-        write(out, `state_entries: ${result.state_entry_count}\n`);
-        if (didWebSource === "fortress-config" && exportDidWeb) {
+        // `--state-namespace` is repeatable and OPTIONAL. When the operator names
+        // none, `flagValues` returns [], which must NOT be forwarded:
+        // passing an empty selection meant "export nothing" and produced a signed
+        // bundle with zero state entries. Spread it conditionally so "named none"
+        // reaches the exporter as an absent option, which is its contract for
+        // "discover and export every namespace." Same shape as
+        // `didWebAllowedHosts` on the import path below; `exportEncryptedState`
+        // now throws on an empty array so this cannot silently regress.
+        const stateNamespaces = flagValues(argv, "--state-namespace");
+        const result = await exportExitBundle({
+          bundleDir: outDir,
+          storage: ctx.storage,
+          masterKey: ctx.masterKey,
+          identityManager: ctx.identityManager,
+          auditLog: ctx.auditLog,
+          reputationStore: ctx.reputationStore,
+          policy,
+          config,
+          stateStoragePath: ctx.stateStoragePath,
+          ...(stateNamespaces.length > 0 ? { stateNamespaces } : {}),
+          keySource: ctx.keySource,
+          // The CLI is an operator terminal: safe to mint + display the
+          // bundle re-key key (it is never written into the bundle).
+          mintStateRekeyKey: true,
+          // Operator-driven full-fortress export: the ownership partition (exit
+          // machinery Slice 1) is deliberately not applied here. Named, auditable
+          // acknowledgement, not a silent skip.
+          unpartitionedLegacyExport: true,
+          ...(exportDidWeb !== undefined ? { didWeb: exportDidWeb } : {}),
+        });
+        if (json) {
           write(
             out,
-            `did:web: auto-included from fortress config (${exportDidWeb.identifier})\n`,
+            JSON.stringify(
+              { ...result, did_web_source: didWebSource },
+              null,
+              2,
+            ) + "\n",
           );
-        } else if (didWebSource === "cli-override" && exportDidWeb) {
-          write(
-            out,
-            `did:web: included via CLI override (${exportDidWeb.identifier})\n`,
-          );
-        } else if (didWebSource === "opted-out") {
-          write(out, `did:web: skipped (operator opt-out via --no-did-web)\n`);
-        } else if (didWebSource === "no-record") {
-          write(
-            out,
-            `did:web: not included (no fortress config; run "sanctuary did-web issue" to register)\n`,
-          );
+        } else {
+          write(out, `exported: ${result.bundle_dir}\n`);
+          write(out, `manifest_hash: ${result.manifest_hash}\n`);
+          // How much state actually travelled is the one number an operator needs
+          // to sanity-check an exit bundle, and until now the export path printed
+          // neither it nor `result.warnings` (verify and import both print
+          // warnings). A successful-looking export with no state count is how a
+          // silently-empty bundle passed for a good one.
+          write(out, `state_entries: ${result.state_entry_count}\n`);
+          if (didWebSource === "fortress-config" && exportDidWeb) {
+            write(
+              out,
+              `did:web: auto-included from fortress config (${exportDidWeb.identifier})\n`,
+            );
+          } else if (didWebSource === "cli-override" && exportDidWeb) {
+            write(
+              out,
+              `did:web: included via CLI override (${exportDidWeb.identifier})\n`,
+            );
+          } else if (didWebSource === "opted-out") {
+            write(out, `did:web: skipped (operator opt-out via --no-did-web)\n`);
+          } else if (didWebSource === "no-record") {
+            write(
+              out,
+              `did:web: not included (no fortress config; run "sanctuary did-web issue" to register)\n`,
+            );
+          }
+          for (const warning of result.warnings ?? []) {
+            write(out, `warning: ${warning}\n`);
+          }
+          for (const item of result.unsupported_artifacts) {
+            write(out, `unsupported: ${item}\n`);
+          }
+          if (result.state_rekey_key !== undefined) {
+            write(
+              out,
+              [
+                "",
+                "BUNDLE RE-KEY KEY (displayed once, NOT stored in the bundle):",
+                `  ${result.state_rekey_key}`,
+                "Store it separately from the bundle directory. Importing this",
+                "bundle's encrypted state requires it:",
+                "  sanctuary exit import <dir> --activate --import-state \\",
+                "    --source-recovery-key <key>",
+                "If it is lost, re-export the bundle from the source fortress.",
+                "",
+              ].join("\n")
+            );
+          }
         }
-        for (const warning of result.warnings ?? []) {
-          write(out, `warning: ${warning}\n`);
-        }
-        for (const item of result.unsupported_artifacts) {
-          write(out, `unsupported: ${item}\n`);
-        }
-        if (result.state_rekey_key !== undefined) {
+        // Outside the --json branch on purpose: a zero-state export is the one
+        // outcome an operator must not be able to miss, and it goes to stderr so
+        // it survives `sanctuary exit export --json > bundle.json`. Symmetric with
+        // the import path's "NO STATE was imported" block below. It is a WARNING,
+        // not a failure: a fresh fortress with no state has nothing to export, and
+        // the bundle still carries a usable identity, policy set, and audit
+        // receipts. The exporter no longer has a silent way to reach zero, so a
+        // zero here means the source fortress really is empty.
+        if (result.state_entry_count === 0) {
           write(
-            out,
+            err,
             [
               "",
-              "BUNDLE RE-KEY KEY (displayed once, NOT stored in the bundle):",
-              `  ${result.state_rekey_key}`,
-              "Store it separately from the bundle directory. Importing this",
-              "bundle's encrypted state requires it:",
-              "  sanctuary exit import <dir> --activate --import-state \\",
-              "    --source-recovery-key <key>",
-              "If it is lost, re-export the bundle from the source fortress.",
+              "WARNING: NO STATE was exported. This bundle carries zero state entries.",
+              stateNamespaces.length > 0
+                ? `The named namespaces matched nothing: ${stateNamespaces.join(", ")}`
+                : "Every namespace under the fortress state directory was searched.",
+              "It can restore identity, policy, and audit receipts, but no memory or",
+              "namespace data, and no bundle re-key key was minted (nothing to re-key).",
+              "Confirm the source fortress is genuinely empty before treating this as",
+              // A concrete path the operator can list, not a CLI command: state
+              // enumeration is an MCP tool (state_list), so naming a `sanctuary
+              // state ...` command here would send them to something that does
+              // not exist.
+              `a complete exit. Each namespace is a directory under:`,
+              `  ${ctx.stateStoragePath}`,
               "",
             ].join("\n")
           );
         }
-      }
-      // Outside the --json branch on purpose: a zero-state export is the one
-      // outcome an operator must not be able to miss, and it goes to stderr so
-      // it survives `sanctuary exit export --json > bundle.json`. Symmetric with
-      // the import path's "NO STATE was imported" block below. It is a WARNING,
-      // not a failure: a fresh fortress with no state has nothing to export, and
-      // the bundle still carries a usable identity, policy set, and audit
-      // receipts. The exporter no longer has a silent way to reach zero, so a
-      // zero here means the source fortress really is empty.
-      if (result.state_entry_count === 0) {
-        write(
-          err,
-          [
-            "",
-            "WARNING: NO STATE was exported. This bundle carries zero state entries.",
-            stateNamespaces.length > 0
-              ? `The named namespaces matched nothing: ${stateNamespaces.join(", ")}`
-              : "Every namespace under the fortress state directory was searched.",
-            "It can restore identity, policy, and audit receipts, but no memory or",
-            "namespace data, and no bundle re-key key was minted (nothing to re-key).",
-            "Confirm the source fortress is genuinely empty before treating this as",
-            // A concrete path the operator can list, not a CLI command: state
-            // enumeration is an MCP tool (state_list), so naming a `sanctuary
-            // state ...` command here would send them to something that does
-            // not exist.
-            `a complete exit. Each namespace is a directory under:`,
-            `  ${ctx.stateStoragePath}`,
-            "",
-          ].join("\n")
-        );
-      }
-      return 0;
+        return 0;
+
+      }, () => {
+        // Final audit failure preserves the export outcome while session release still propagates.
+        return ctx.auditLog.flush().catch(() => undefined);
+      });
     }
 
     if (command === "import" || command === "import-exit-bundle") {
@@ -1129,7 +1147,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(
           err,
           "--legacy-source-master requires --source-recovery-key (it confirms " +
-            "how that key is interpreted)\n",
+          "how that key is interpreted)\n",
         );
         return 2;
       }
@@ -1156,7 +1174,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         write(
           err,
           "--import-state requires --source-passphrase or --source-recovery-key " +
-            "(the source fortress credentials that decrypt the exported state)\n"
+          "(the source fortress credentials that decrypt the exported state)\n"
         );
         return 2;
       }
@@ -1176,143 +1194,150 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
       }
       const ctx = await openExitContext(argv, env);
-      const conflict =
-        (flagValue(argv, "--conflict") as "skip" | "overwrite" | "version" | undefined) ??
-        "skip";
-      if (!["skip", "overwrite", "version"].includes(conflict)) {
-        write(err, "--conflict must be skip, overwrite, or version\n");
-        return 2;
-      }
-      // Recognition-Layer Path C primary build 2: did:web import-side
-      // flags. --did-web-allowed-host is repeatable; an empty list
-      // means the importer refuses to leave the fortress (no-outbound-
-      // by-default) and surfaces a warning if the manifest carries a
-      // did_web binding. --skip-did-web-verify is the explicit
-      // operator override for accepting the manifest signature alone.
-      const didWebAllowedHosts = flagValues(
-        argv,
-        "--did-web-allowed-host",
-      );
-      const skipDidWebVerify = hasFlag(argv, "--skip-did-web-verify");
-      const acceptCompromisedRotationKeys = hasFlag(
-        argv,
-        "--accept-compromised-rotation-keys",
-      );
-      let result;
-      try {
-        result = await importExitBundle({
-          bundleDir: dir,
-          storage: ctx.storage,
-          masterKey: ctx.masterKey,
-          identityManager: ctx.identityManager,
-          auditLog: ctx.auditLog,
-          reputationStore: ctx.reputationStore,
-          activate,
-          forceRebind,
-          conflictResolution: conflict,
-          ...(importState && sourcePassphrase
-            ? { sourcePassphrase }
-            : {}),
-          ...(importState && sourceRecoveryKey
-            ? { sourceRecoveryKey }
-            : {}),
-          ...(importState && sourceRecoveryKey && legacySourceMaster
-            ? { legacyRecoveryKeyIsMaster: true }
-            : {}),
-          destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
-          ...(didWebAllowedHosts.length > 0
-            ? { didWebAllowedHosts }
-            : {}),
-          skipDidWebVerify,
-          acceptCompromisedRotationKeys,
-        });
-      } catch (e) {
-        if (e instanceof InvalidExitBundleError) {
-          write(err, `Error: ${e.message}\n`);
-          return 1;
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      return await withCliMasterKeySession(ctx.session, async () => {
+        const conflict =
+          (flagValue(argv, "--conflict") as "skip" | "overwrite" | "version" | undefined) ??
+          "skip";
+        if (!["skip", "overwrite", "version"].includes(conflict)) {
+          write(err, "--conflict must be skip, overwrite, or version\n");
+          return 2;
         }
-        if (e instanceof ExitBundleStateImportIncompleteError) {
-          if (json) {
-            write(
-              out,
-              JSON.stringify(
-                { verdict: "FAIL", code: e.code, error: e.message, state: e.state },
-                null,
-                2,
-              ) + "\n",
-            );
-          } else {
-            writeStateSkippedCounters(err, e.state);
-          }
-          write(err, `Error: ${e.message}\n`);
-          return 1;
-        }
-        if (e instanceof ExitBundleImportError) {
-          if (json) {
-            write(
-              out,
-              JSON.stringify(
-                { verdict: "FAIL", code: e.code, error: e.message },
-                null,
-                2,
-              ) + "\n",
-            );
-          } else {
-            write(err, `Error [${e.code}]: ${e.message}\n`);
-          }
-          return 1;
-        }
-        throw e;
-      }
-      if (json) {
-        const verdict = result.verified ? "PASS" : "FAIL";
-        write(
-          out,
-          JSON.stringify(
-            {
-              verdict,
-              ...(!result.verified
-                ? { code: "BUNDLE_VERIFICATION_FAILED" }
-                : {}),
-              ...result,
-            },
-            null,
-            2,
-          ) + "\n",
+        // Recognition-Layer Path C primary build 2: did:web import-side
+        // flags. --did-web-allowed-host is repeatable; an empty list
+        // means the importer refuses to leave the fortress (no-outbound-
+        // by-default) and surfaces a warning if the manifest carries a
+        // did_web binding. --skip-did-web-verify is the explicit
+        // operator override for accepting the manifest signature alone.
+        const didWebAllowedHosts = flagValues(
+          argv,
+          "--did-web-allowed-host",
         );
-      } else {
-        write(out, `verdict: ${result.verified ? "PASS" : "FAIL"}\n`);
-        write(out, `verified: ${result.verified}\n`);
-        write(out, `activated: ${result.activated}\n`);
-        write(out, `state_conflicts: ${result.conflicts.state_conflicts.length}\n`);
-        write(out, `reputation_conflicts: ${result.conflicts.reputation_conflicts.length}\n`);
-        write(out, `state_status: ${result.state.status}\n`);
-        write(out, `state_imported_keys: ${result.state.imported_keys}\n`);
-        writeStateSkippedCounters(out, result.state);
-        write(out, `reputation_imported_attestations: ${result.reputation.imported_attestations}\n`);
-        for (const warning of result.warnings) write(out, `warning: ${warning}\n`);
-        for (const item of result.unsupported_artifacts) {
-          write(out, `unsupported: ${item}\n`);
-        }
-      }
-      if (
-        activate &&
-        result.activated &&
-        result.state.status === "not_requested" &&
-        result.state.imported_keys === 0
-      ) {
-        write(
-          err,
-          [
-            "WARNING: Bundle activated but NO STATE was imported to the target fortress.",
-            "Identity, audit chain, and did-web entries were NOT transferred.",
-            "To import state, re-run with: sanctuary exit import <dir> --activate --import-state",
-            "Without --import-state, only the manifest binding is activated.",
-            "",
-          ].join("\n")
+        const skipDidWebVerify = hasFlag(argv, "--skip-did-web-verify");
+        const acceptCompromisedRotationKeys = hasFlag(
+          argv,
+          "--accept-compromised-rotation-keys",
         );
-      }
-      return result.verified ? 0 : 1;
+        let result;
+        try {
+          result = await importExitBundle({
+            bundleDir: dir,
+            storage: ctx.storage,
+            masterKey: ctx.masterKey,
+            identityManager: ctx.identityManager,
+            auditLog: ctx.auditLog,
+            reputationStore: ctx.reputationStore,
+            activate,
+            forceRebind,
+            conflictResolution: conflict,
+            ...(importState && sourcePassphrase
+              ? { sourcePassphrase }
+              : {}),
+            ...(importState && sourceRecoveryKey
+              ? { sourceRecoveryKey }
+              : {}),
+            ...(importState && sourceRecoveryKey && legacySourceMaster
+              ? { legacyRecoveryKeyIsMaster: true }
+              : {}),
+            destinationSignerIdentityId: flagValue(argv, "--destination-identity-id"),
+            ...(didWebAllowedHosts.length > 0
+              ? { didWebAllowedHosts }
+              : {}),
+            skipDidWebVerify,
+            acceptCompromisedRotationKeys,
+          });
+        } catch (e) {
+          if (e instanceof InvalidExitBundleError) {
+            write(err, `Error: ${e.message}\n`);
+            return 1;
+          }
+          if (e instanceof ExitBundleStateImportIncompleteError) {
+            if (json) {
+              write(
+                out,
+                JSON.stringify(
+                  { verdict: "FAIL", code: e.code, error: e.message, state: e.state },
+                  null,
+                  2,
+                ) + "\n",
+              );
+            } else {
+              writeStateSkippedCounters(err, e.state);
+            }
+            write(err, `Error: ${e.message}\n`);
+            return 1;
+          }
+          if (e instanceof ExitBundleImportError) {
+            if (json) {
+              write(
+                out,
+                JSON.stringify(
+                  { verdict: "FAIL", code: e.code, error: e.message },
+                  null,
+                  2,
+                ) + "\n",
+              );
+            } else {
+              write(err, `Error [${e.code}]: ${e.message}\n`);
+            }
+            return 1;
+          }
+          throw e;
+        }
+        if (json) {
+          const verdict = result.verified ? "PASS" : "FAIL";
+          write(
+            out,
+            JSON.stringify(
+              {
+                verdict,
+                ...(!result.verified
+                  ? { code: "BUNDLE_VERIFICATION_FAILED" }
+                  : {}),
+                ...result,
+              },
+              null,
+              2,
+            ) + "\n",
+          );
+        } else {
+          write(out, `verdict: ${result.verified ? "PASS" : "FAIL"}\n`);
+          write(out, `verified: ${result.verified}\n`);
+          write(out, `activated: ${result.activated}\n`);
+          write(out, `state_conflicts: ${result.conflicts.state_conflicts.length}\n`);
+          write(out, `reputation_conflicts: ${result.conflicts.reputation_conflicts.length}\n`);
+          write(out, `state_status: ${result.state.status}\n`);
+          write(out, `state_imported_keys: ${result.state.imported_keys}\n`);
+          writeStateSkippedCounters(out, result.state);
+          write(out, `reputation_imported_attestations: ${result.reputation.imported_attestations}\n`);
+          for (const warning of result.warnings) write(out, `warning: ${warning}\n`);
+          for (const item of result.unsupported_artifacts) {
+            write(out, `unsupported: ${item}\n`);
+          }
+        }
+        if (
+          activate &&
+          result.activated &&
+          result.state.status === "not_requested" &&
+          result.state.imported_keys === 0
+        ) {
+          write(
+            err,
+            [
+              "WARNING: Bundle activated but NO STATE was imported to the target fortress.",
+              "Identity, audit chain, and did-web entries were NOT transferred.",
+              "To import state, re-run with: sanctuary exit import <dir> --activate --import-state",
+              "Without --import-state, only the manifest binding is activated.",
+              "",
+            ].join("\n")
+          );
+        }
+        return result.verified ? 0 : 1;
+
+      }, () => {
+        // A best-effort audit failure cannot undo the committed import outcome.
+        return ctx.auditLog.flush().catch(() => undefined);
+      });
     }
 
     write(err, `Unknown exit command: ${argvTokenForDisplay(command)}\n`);

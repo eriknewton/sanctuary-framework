@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 // fail-before-exempt: real-browser drill harness now creates and cleans a temp storagePath for v1.1 bindings; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * Sanctuary v1.1 Dashboard — Intelligence Real-Browser Drill
@@ -64,7 +65,6 @@ import {
   getClientScript,
 } from "../../../src/dashboard/v1_1/index.js";
 import { dispatchV11Request } from "../../../src/dashboard/v1_1/dispatch.js";
-import { buildV11Bindings } from "../../../src/dashboard/v1_1/wiring.js";
 
 const IDENTITY = "operator-drill";
 const FORTRESS = "fortress-drill";
@@ -91,7 +91,7 @@ async function bootDrill(): Promise<Drill> {
     identityId: IDENTITY,
   });
   await selector.load();
-  const bindings = buildV11Bindings({
+  const bindings = await buildV11Bindings({
     identityId: IDENTITY,
     fortressId: FORTRESS,
     auditLog,

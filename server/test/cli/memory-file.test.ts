@@ -132,6 +132,7 @@ async function copyFixtureSet(name: string, prefix: string): Promise<string> {
 
 describe("memory file CLI: argument parsing", () => {
   afterEach(async () => {
+    await closeFixtureSessions();
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
   });
 
@@ -243,6 +244,7 @@ describe("memory file CLI: credential gate", () => {
   });
 
   afterEach(async () => {
+    await closeFixtureSessions();
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
@@ -316,7 +318,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     // resolveCliMasterKey unlocks an existing custody envelope. Failure mode if
     // this is skipped: the command fails on unlock, which looks like a CLI bug.
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
@@ -331,6 +333,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
   });
 
   afterEach(async () => {
+    await closeFixtureSessions();
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
@@ -340,7 +343,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     Array<{ operation: string; details: Record<string, unknown> }>
   > {
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       storagePathHint: fortress,
     });
@@ -891,7 +894,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
 
     async function fortressAdapterForCheckOnly(): Promise<SdwMemoryBackendAdapter> {
       const storage = new FilesystemStorage(join(fortress, "state"));
-      const masterKey = await resolveCliMasterKey(storage, {
+      const masterKey = await resolveFixtureMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
       });
@@ -921,7 +924,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       // target: a commit-phase corpus-write failure, not the unrelated
       // owner-pin machinery (covered by memory-file-owner-pin.test.ts).
       const storage = new FilesystemStorage(join(fortress, "state"));
-      const masterKey = await resolveCliMasterKey(storage, {
+      const masterKey = await resolveFixtureMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
       });
@@ -1153,6 +1156,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
   });
   afterEach(async () => {
+    await closeFixtureSessions();
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
@@ -1162,7 +1166,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     const fortress = join(await tempDir(prefix), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
@@ -1262,7 +1266,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
     // Bootstrap custody but store NO credential in the keyring.
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
@@ -1285,7 +1289,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     const fortress = join(await tempDir("memfile-f6-mismatch"), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
@@ -1344,3 +1348,16 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     expect(captured[0]!.every((b) => b === 0)).toBe(true);
   });
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

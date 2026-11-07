@@ -95,10 +95,7 @@ import {
 } from "../mesh/federation-rotate-root.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { parsePolicy, principalPolicyPath } from "../principal-policy/loader.js";
-import {
-  CustodyUnlockError,
-  CustodyRotationInProgressError,
-} from "../core/master-custody.js";
+import { withCliMasterKeySession, CustodyUnlockError, CustodyRotationInProgressError } from "../core/master-custody.js";
 import {
   buildFederationReissueNodeCertProofMessage,
   federationEventHash,
@@ -610,8 +607,8 @@ function parsePinnedMaster(json: string): FortressMasterPublicKey | null {
  * the joiner's own custody master. The pinned master is the OUT-OF-BAND trust
  * anchor; `persistFederationJoinerTrustRoot` re-runs the full cert-chain
  * verification and refuses a cert that does not chain to it (constraint 4).
- * The node private key is zeroed by the caller's `finally`; the master key is
- * zeroed here after the write.
+ * Session finalization follows trust-root persistence so the write retains custody.
+ * The node private key is zeroed by the caller's `finally`.
  */
 export async function persistJoinerTrustRootFromJoin(opts: {
   pinnedMaster: FortressMasterPublicKey;
@@ -630,7 +627,9 @@ export async function persistJoinerTrustRootFromJoin(opts: {
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
   });
-  try {
+
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
     await persistFederationJoinerTrustRoot({
       storage: signer.storage,
       masterKey: signer.masterKey,
@@ -639,9 +638,9 @@ export async function persistJoinerTrustRootFromJoin(opts: {
       localNodeCert: opts.localNodeCert,
       localNodePrivateKey: opts.localNodePrivateKey,
     });
-  } finally {
-    signer.masterKey.fill(0);
-  }
+
+  });
+
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -920,7 +919,9 @@ export async function performPlannedAdoptFromCli(opts: {
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
   });
-  try {
+
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
     return await adoptFederationJoinerPlannedRoot({
       storage: signer.storage,
       masterKey: signer.masterKey,
@@ -929,9 +930,9 @@ export async function performPlannedAdoptFromCli(opts: {
       reissue: (req) =>
         reissueNodeCertViaHttp(req, opts.fortressUrl, opts.request),
     });
-  } finally {
-    signer.masterKey.fill(0);
-  }
+
+  });
+
 }
 
 /**
@@ -1372,7 +1373,9 @@ export async function persistRejoinedJoinerTrustRootFromJoin(opts: {
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
   });
-  try {
+
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
     await persistFederationJoinerTrustRoot({
       storage: signer.storage,
       masterKey: signer.masterKey,
@@ -1383,9 +1386,9 @@ export async function persistRejoinedJoinerTrustRootFromJoin(opts: {
       revokedRootPubkeys: [opts.revokedOldMasterPubkey],
       highestRevocationSerial: opts.revocationSerial,
     });
-  } finally {
-    signer.masterKey.fill(0);
-  }
+
+  });
+
 }
 
 function parsePositiveInt(raw: string | undefined): number | null {
@@ -1546,7 +1549,7 @@ async function resolveAdminSessionToken(
 /**
  * Open the operator signer (keychain-safe) for an admin verb, mapping the
  * fail-closed `OperatorSigningError` to a clear message + non-zero exit. The
- * caller MUST zero `signer.masterKey` after use.
+ * caller retains the signer session until its finalization completes.
  */
 async function openAdminSigner(
   verb: string,
@@ -1728,35 +1731,37 @@ export async function runFederationEnableDisable(args: {
   const signer = await openAdminSigner(verb, flags, err);
   if (typeof signer === "number") return signer;
   try {
-    const sessionToken = await resolveAdminSessionToken(verb, flags, signer, err, openSession);
-    if (typeof sessionToken === "number") return sessionToken;
-    // The signed payload MUST match the server's reconstruction exactly: the
-    // server includes idempotency_key only when it is a string.
-    const signedPayload: Record<string, unknown> = {};
-    if (flags.idempotencyKey !== undefined) {
-      signedPayload.idempotency_key = flags.idempotencyKey;
-    }
-    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
-    const operatorSignature = signer.signPayload(action, authorizedPayload);
-    const body = { ...authorizedPayload, operator_signature: operatorSignature };
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(signer, async () => {
+      const sessionToken = await resolveAdminSessionToken(verb, flags, signer, err, openSession);
+      if (typeof sessionToken === "number") return sessionToken;
+      // The signed payload MUST match the server's reconstruction exactly: the
+      // server includes idempotency_key only when it is a string.
+      const signedPayload: Record<string, unknown> = {};
+      if (flags.idempotencyKey !== undefined) {
+        signedPayload.idempotency_key = flags.idempotencyKey;
+      }
+      const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+      const operatorSignature = signer.signPayload(action, authorizedPayload);
+      const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
-    const response = (await request(
-      action,
-      { method: "POST", body: JSON.stringify(body) },
-      adminRequestContext(flags, sessionToken),
-    )) as { enabled?: unknown };
-    out.write(`${JSON.stringify({ enabled: response.enabled === true }, null, 2)}\n`);
-    if (args.enable && response.enabled === true) {
-      err.write(
-        "sanctuary federation enable: enabled state was durably recorded and " +
+      const response = (await request(
+        action,
+        { method: "POST", body: JSON.stringify(body) },
+        adminRequestContext(flags, sessionToken),
+      )) as { enabled?: unknown };
+      out.write(`${JSON.stringify({ enabled: response.enabled === true }, null, 2)}\n`);
+      if (args.enable && response.enabled === true) {
+        err.write(
+          "sanctuary federation enable: enabled state was durably recorded and " +
           "will be restored on endpoint restart.\n",
-      );
-    }
-    return 0;
+        );
+      }
+      return 0;
+
+    });
   } catch (cause) {
     return mapAdminRequestError(verb, cause, flags.fortressUrl, err);
-  } finally {
-    signer.masterKey.fill(0);
   }
 }
 
@@ -1806,33 +1811,35 @@ export async function runFederationAuthorize(args: {
   const signer = await openAdminSigner("authorize", flags, err);
   if (typeof signer === "number") return signer;
   try {
-    const sessionToken = await resolveAdminSessionToken("authorize", flags, signer, err, openSession);
-    if (typeof sessionToken === "number") return sessionToken;
-    const signedPayload: Record<string, unknown> = {
-      intended_node_id: flags.nodeId,
-      intended_node_mode: flags.nodeMode,
-    };
-    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
-    const operatorSignature = signer.signPayload(action, authorizedPayload);
-    const body = { ...authorizedPayload, operator_signature: operatorSignature };
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(signer, async () => {
+      const sessionToken = await resolveAdminSessionToken("authorize", flags, signer, err, openSession);
+      if (typeof sessionToken === "number") return sessionToken;
+      const signedPayload: Record<string, unknown> = {
+        intended_node_id: flags.nodeId,
+        intended_node_mode: flags.nodeMode,
+      };
+      const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+      const operatorSignature = signer.signPayload(action, authorizedPayload);
+      const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
-    const response = (await request(
-      action,
-      { method: "POST", body: JSON.stringify(body) },
-      adminRequestContext(flags, sessionToken),
-    )) as { bootstrap_token?: unknown };
-    if (typeof response.bootstrap_token !== "object" || response.bootstrap_token === null) {
-      err.write("sanctuary federation authorize: fortress returned no bootstrap token\n");
-      return 3;
-    }
-    // The bootstrap token is the intended output of authorize (NOT a secret to
-    // suppress): hand it to the joiner's `federation join --bootstrap-token`.
-    out.write(`${JSON.stringify({ bootstrap_token: response.bootstrap_token }, null, 2)}\n`);
-    return 0;
+      const response = (await request(
+        action,
+        { method: "POST", body: JSON.stringify(body) },
+        adminRequestContext(flags, sessionToken),
+      )) as { bootstrap_token?: unknown };
+      if (typeof response.bootstrap_token !== "object" || response.bootstrap_token === null) {
+        err.write("sanctuary federation authorize: fortress returned no bootstrap token\n");
+        return 3;
+      }
+      // The bootstrap token is the intended output of authorize (NOT a secret to
+      // suppress): hand it to the joiner's `federation join --bootstrap-token`.
+      out.write(`${JSON.stringify({ bootstrap_token: response.bootstrap_token }, null, 2)}\n`);
+      return 0;
+
+    });
   } catch (cause) {
     return mapAdminRequestError("authorize", cause, flags.fortressUrl, err);
-  } finally {
-    signer.masterKey.fill(0);
   }
 }
 
@@ -1874,55 +1881,57 @@ export async function runFederationRevoke(args: {
   const signer = await openAdminSigner("revoke", flags, err);
   if (typeof signer === "number") return signer;
   try {
-    const sessionToken = await resolveAdminSessionToken("revoke", flags, signer, err, openSession);
-    if (typeof sessionToken === "number") return sessionToken;
-    const signedPayload: Record<string, unknown> = {
-      node_id: flags.nodeId,
-      reason: flags.reason ?? "operator_revoked",
-    };
-    if (flags.idempotencyKey !== undefined) {
-      signedPayload.idempotency_key = flags.idempotencyKey;
-    }
-    const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
-    const operatorSignature = signer.signPayload(action, authorizedPayload);
-    const body = { ...authorizedPayload, operator_signature: operatorSignature };
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(signer, async () => {
+      const sessionToken = await resolveAdminSessionToken("revoke", flags, signer, err, openSession);
+      if (typeof sessionToken === "number") return sessionToken;
+      const signedPayload: Record<string, unknown> = {
+        node_id: flags.nodeId,
+        reason: flags.reason ?? "operator_revoked",
+      };
+      if (flags.idempotencyKey !== undefined) {
+        signedPayload.idempotency_key = flags.idempotencyKey;
+      }
+      const authorizedPayload = addOperatorAuthorizationFields(signedPayload);
+      const operatorSignature = signer.signPayload(action, authorizedPayload);
+      const body = { ...authorizedPayload, operator_signature: operatorSignature };
 
-    const response = (await request(
-      action,
-      { method: "POST", body: JSON.stringify(body) },
-      adminRequestContext(flags, sessionToken),
-    )) as {
-      revoked?: unknown;
-      node_id?: unknown;
-      event_id?: unknown;
-      eviction_serial?: unknown;
-    };
-    if (
-      response.revoked !== true ||
-      response.node_id !== flags.nodeId ||
-      typeof response.event_id !== "string" ||
-      typeof response.eviction_serial !== "number"
-    ) {
-      err.write("sanctuary federation revoke: fortress returned no eviction event summary\n");
-      return 3;
-    }
-    out.write(
-      `${JSON.stringify(
-        {
-          revoked: true,
-          node_id: response.node_id,
-          event_id: response.event_id,
-          eviction_serial: response.eviction_serial,
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    return 0;
+      const response = (await request(
+        action,
+        { method: "POST", body: JSON.stringify(body) },
+        adminRequestContext(flags, sessionToken),
+      )) as {
+        revoked?: unknown;
+        node_id?: unknown;
+        event_id?: unknown;
+        eviction_serial?: unknown;
+      };
+      if (
+        response.revoked !== true ||
+        response.node_id !== flags.nodeId ||
+        typeof response.event_id !== "string" ||
+        typeof response.eviction_serial !== "number"
+      ) {
+        err.write("sanctuary federation revoke: fortress returned no eviction event summary\n");
+        return 3;
+      }
+      out.write(
+        `${JSON.stringify(
+          {
+            revoked: true,
+            node_id: response.node_id,
+            event_id: response.event_id,
+            eviction_serial: response.eviction_serial,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return 0;
+
+    });
   } catch (cause) {
     return mapAdminRequestError("revoke", cause, flags.fortressUrl, err);
-  } finally {
-    signer.masterKey.fill(0);
   }
 }
 
@@ -1970,144 +1979,151 @@ export async function runFederationPolicyPush(args: {
 
   let record: FederationTrustRootRecordForZeroize = null;
   try {
-    let policy: { policyVersion: number; policyHash: string };
-    try {
-      policy = await loadPolicyHashForPush(flags);
-    } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause);
-      err.write(`sanctuary federation policy-push: ${detail}\n`);
-      return cause instanceof PolicyPushInputError ? 1 : 3;
-    }
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(signer, async () => {
+      try {
+        let policy: { policyVersion: number; policyHash: string };
+        try {
+          policy = await loadPolicyHashForPush(flags);
+        } catch (cause) {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          err.write(`sanctuary federation policy-push: ${detail}\n`);
+          return cause instanceof PolicyPushInputError ? 1 : 3;
+        }
 
-    const store = new FederationTrustRootStore(signer.storage, signer.masterKey);
-    try {
-      record = await store.load();
-    } catch (cause) {
-      const detail =
-        cause instanceof FederationTrustRootStoreError ? cause.message : "decrypt failed";
-      err.write(
-        `sanctuary federation policy-push: could not load this fortress's federation ` +
-          `trust root (${detail}). Refusing.\n`,
-      );
-      return 3;
-    }
-    if (record === null) {
-      err.write(
-        "sanctuary federation policy-push: this fortress has no federation trust " +
-          "root (_federation/trust-root-v1). Provision an issuer first. Refusing.\n",
-      );
-      return 3;
-    }
+        const store = new FederationTrustRootStore(signer.storage, signer.masterKey);
+        try {
+          record = await store.load();
+        } catch (cause) {
+          const detail =
+            cause instanceof FederationTrustRootStoreError ? cause.message : "decrypt failed";
+          err.write(
+            `sanctuary federation policy-push: could not load this fortress's federation ` +
+            `trust root (${detail}). Refusing.\n`,
+          );
+          return 3;
+        }
+        if (record === null) {
+          err.write(
+            "sanctuary federation policy-push: this fortress has no federation trust " +
+            "root (_federation/trust-root-v1). Provision an issuer first. Refusing.\n",
+          );
+          return 3;
+        }
 
-    const sessionToken = await resolveAdminSessionToken(
-      "policy-push",
-      flags,
-      signer,
-      err,
-      openSession,
-    );
-    if (typeof sessionToken === "number") return sessionToken;
+        const sessionToken = await resolveAdminSessionToken(
+          "policy-push",
+          flags,
+          signer,
+          err,
+          openSession,
+        );
+        if (typeof sessionToken === "number") return sessionToken;
 
-    const originNodeId = federationOperatorAuthorityOrigin(
-      record.pinned_master_pubkey.fortress_id,
-    );
-    const baseSyncPayload = addOperatorAuthorizationFields({
-      wire_version: FEDERATION_SYNC_WIRE_VERSION,
-      node_id: record.node_id,
-      events: [] as FederationEvent[],
-      cursor: { node_id: originNodeId },
+        const originNodeId = federationOperatorAuthorityOrigin(
+          record.pinned_master_pubkey.fortress_id,
+        );
+        const baseSyncPayload = addOperatorAuthorizationFields({
+          wire_version: FEDERATION_SYNC_WIRE_VERSION,
+          node_id: record.node_id,
+          events: [] as FederationEvent[],
+          cursor: { node_id: originNodeId },
+        });
+        const fetchResponse = (await request(
+          action,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              ...baseSyncPayload,
+              operator_signature: signer.signPayload(action, baseSyncPayload),
+            }),
+          },
+          adminRequestContext(flags, sessionToken),
+        )) as { events?: unknown };
+
+        const prior = sortedAuthorityEvents(fetchResponse.events, originNodeId);
+        if (prior === null) {
+          err.write(
+            "sanctuary federation policy-push: fortress returned a malformed sync event cursor\n",
+          );
+          return 3;
+        }
+        const previous = prior.length > 0 ? prior[prior.length - 1] : null;
+        const signedAt = new Date().toISOString();
+        const payload = signFederationPolicyBundlePayload({
+          fortressId: record.pinned_master_pubkey.fortress_id,
+          policyVersion: policy.policyVersion,
+          policyHash: policy.policyHash,
+          signedAt,
+          operatorPrincipalId: record.issuing_principal_cert.principal_id,
+          operatorPrincipalPrivateKey: record.issuing_principal_private_key,
+        });
+        const eventWithoutHash = {
+          event_id: `${originNodeId}:${(previous?.sequence ?? 0) + 1}`,
+          origin_node_id: originNodeId,
+          sequence: (previous?.sequence ?? 0) + 1,
+          occurred_at: signedAt,
+          kind: FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+          payload: payload as unknown as Record<string, unknown>,
+          previous_hash: previous?.event_hash ?? null,
+        };
+        const event: FederationEvent = {
+          ...eventWithoutHash,
+          event_hash: federationEventHash(eventWithoutHash),
+        };
+        const pushPayloadBase: Record<string, unknown> = {
+          wire_version: FEDERATION_SYNC_WIRE_VERSION,
+          node_id: record.node_id,
+          events: [event],
+        };
+        if (flags.idempotencyKey !== undefined) {
+          pushPayloadBase.idempotency_key = flags.idempotencyKey;
+        }
+        const pushPayload = addOperatorAuthorizationFields(pushPayloadBase);
+        const pushResponse = (await request(
+          action,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              ...pushPayload,
+              operator_signature: signer.signPayload(action, pushPayload),
+            }),
+          },
+          adminRequestContext(flags, sessionToken),
+        )) as { accepted?: unknown; rejected?: unknown };
+        const accepted = Array.isArray(pushResponse.accepted)
+          ? pushResponse.accepted
+          : [];
+        if (!accepted.includes(event.event_id)) {
+          err.write(
+            "sanctuary federation policy-push: fortress did not accept the signed policy bundle event\n",
+          );
+          return 3;
+        }
+
+        out.write(
+          `${JSON.stringify(
+            {
+              policy_pushed: true,
+              policy_version: policy.policyVersion,
+              policy_hash: policy.policyHash,
+              hash_algorithm: FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
+              event_id: event.event_id,
+            },
+            null,
+            2,
+          )}\n`,
+        );
+        return 0;
+
+      } finally {
+        zeroFederationTrustRootRecordSecrets(record);
+
+      }
+
     });
-    const fetchResponse = (await request(
-      action,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          ...baseSyncPayload,
-          operator_signature: signer.signPayload(action, baseSyncPayload),
-        }),
-      },
-      adminRequestContext(flags, sessionToken),
-    )) as { events?: unknown };
-
-    const prior = sortedAuthorityEvents(fetchResponse.events, originNodeId);
-    if (prior === null) {
-      err.write(
-        "sanctuary federation policy-push: fortress returned a malformed sync event cursor\n",
-      );
-      return 3;
-    }
-    const previous = prior.length > 0 ? prior[prior.length - 1] : null;
-    const signedAt = new Date().toISOString();
-    const payload = signFederationPolicyBundlePayload({
-      fortressId: record.pinned_master_pubkey.fortress_id,
-      policyVersion: policy.policyVersion,
-      policyHash: policy.policyHash,
-      signedAt,
-      operatorPrincipalId: record.issuing_principal_cert.principal_id,
-      operatorPrincipalPrivateKey: record.issuing_principal_private_key,
-    });
-    const eventWithoutHash = {
-      event_id: `${originNodeId}:${(previous?.sequence ?? 0) + 1}`,
-      origin_node_id: originNodeId,
-      sequence: (previous?.sequence ?? 0) + 1,
-      occurred_at: signedAt,
-      kind: FEDERATION_POLICY_BUNDLE_EVENT_KIND,
-      payload: payload as unknown as Record<string, unknown>,
-      previous_hash: previous?.event_hash ?? null,
-    };
-    const event: FederationEvent = {
-      ...eventWithoutHash,
-      event_hash: federationEventHash(eventWithoutHash),
-    };
-    const pushPayloadBase: Record<string, unknown> = {
-      wire_version: FEDERATION_SYNC_WIRE_VERSION,
-      node_id: record.node_id,
-      events: [event],
-    };
-    if (flags.idempotencyKey !== undefined) {
-      pushPayloadBase.idempotency_key = flags.idempotencyKey;
-    }
-    const pushPayload = addOperatorAuthorizationFields(pushPayloadBase);
-    const pushResponse = (await request(
-      action,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          ...pushPayload,
-          operator_signature: signer.signPayload(action, pushPayload),
-        }),
-      },
-      adminRequestContext(flags, sessionToken),
-    )) as { accepted?: unknown; rejected?: unknown };
-    const accepted = Array.isArray(pushResponse.accepted)
-      ? pushResponse.accepted
-      : [];
-    if (!accepted.includes(event.event_id)) {
-      err.write(
-        "sanctuary federation policy-push: fortress did not accept the signed policy bundle event\n",
-      );
-      return 3;
-    }
-
-    out.write(
-      `${JSON.stringify(
-        {
-          policy_pushed: true,
-          policy_version: policy.policyVersion,
-          policy_hash: policy.policyHash,
-          hash_algorithm: FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
-          event_id: event.event_id,
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    return 0;
   } catch (cause) {
     return mapAdminRequestError("policy-push", cause, flags.fortressUrl, err);
-  } finally {
-    zeroFederationTrustRootRecordSecrets(record);
-    signer.masterKey.fill(0);
   }
 }
 
@@ -2154,7 +2170,7 @@ export async function runFederationRevokePush(args: {
   if (versionRaw === undefined) {
     err.write(
       "sanctuary federation revoke-push: --version <n> is required (the monotonic " +
-        "list version; must be greater than the currently stored version)\n",
+      "list version; must be greater than the currently stored version)\n",
     );
     return 1;
   }
@@ -2184,78 +2200,80 @@ export async function runFederationRevokePush(args: {
   }
 
   try {
-    const issuer = generateIdentityId(signer.operatorPublicKey);
-    // CANONICALIZE the operator's raw argv-order id set (sort + dedupe) BEFORE
-    // signing. `verifyPushedRevocationList` recomputes the signed message over the
-    // CANONICAL id order, so signing over the raw order would spuriously
-    // `bad_signature` any unsorted/duplicated set (exit 3, reading like a key
-    // problem). Reject a malformed set up front rather than sign one that can
-    // never verify.
-    const canonicalIds = canonicalizeRevocationListIds(licenseIds);
-    if (canonicalIds === null) {
-      err.write(
-        "sanctuary federation revoke-push: refusing to sign a malformed " +
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(signer, async () => {
+      const issuer = generateIdentityId(signer.operatorPublicKey);
+      // CANONICALIZE the operator's raw argv-order id set (sort + dedupe) BEFORE
+      // signing. `verifyPushedRevocationList` recomputes the signed message over the
+      // CANONICAL id order, so signing over the raw order would spuriously
+      // `bad_signature` any unsorted/duplicated set (exit 3, reading like a key
+      // problem). Reject a malformed set up front rather than sign one that can
+      // never verify.
+      const canonicalIds = canonicalizeRevocationListIds(licenseIds);
+      if (canonicalIds === null) {
+        err.write(
+          "sanctuary federation revoke-push: refusing to sign a malformed " +
           "--license-id set (each id must be a non-empty string)\n",
-      );
-      return 1;
-    }
-    const payload: RevocationListPayload = {
-      version,
-      revokedLicenseIds: canonicalIds,
-      issuer,
-      issuedAt: new Date().toISOString(),
-    };
-    // Sign with the operator key via the shared operator-signed message path (the
-    // SAME construction `buildRevocationListMessage` verifies).
-    const signature = signer.signPayload(REVOCATION_LIST_SIGN_ACTION, payload);
-    const signed = { payload, signature };
+        );
+        return 1;
+      }
+      const payload: RevocationListPayload = {
+        version,
+        revokedLicenseIds: canonicalIds,
+        issuer,
+        issuedAt: new Date().toISOString(),
+      };
+      // Sign with the operator key via the shared operator-signed message path (the
+      // SAME construction `buildRevocationListMessage` verifies).
+      const signature = signer.signPayload(REVOCATION_LIST_SIGN_ACTION, payload);
+      const signed = { payload, signature };
 
-    // The SINGLE serialized push path (shared with the HTTP route): a
-    // cross-process O_EXCL lock re-reads the EXTERNALLY-ANCHORED + witness-bound
-    // effective floor INSIDE the lock and re-verifies monotonicity against it, then
-    // persists list -> anchor -> custody-MAC'd witness latch in crash-safe order. A
-    // corrupt/deleted list file can never roll the floor back to 0, and two
-    // concurrent pushes cannot both pass against a stale floor.
-    const result = await persistPushedRevocationListSerialized({
-      storage: signer.storage,
-      master: signer.masterKey,
-      signed,
-      issuerPublicKey: signer.operatorPublicKey,
-    });
-    if (!result.ok) {
-      // Surface the floor observed inside the lock for the operator's not_newer.
-      const floor = await effectiveRevocationVersionFloor(
-        signer.storage,
-        signer.masterKey,
-      );
-      err.write(
-        `sanctuary federation revoke-push: refusing to persist (${result.reason}` +
+      // The SINGLE serialized push path (shared with the HTTP route): a
+      // cross-process O_EXCL lock re-reads the EXTERNALLY-ANCHORED + witness-bound
+      // effective floor INSIDE the lock and re-verifies monotonicity against it, then
+      // persists list -> anchor -> custody-MAC'd witness latch in crash-safe order. A
+      // corrupt/deleted list file can never roll the floor back to 0, and two
+      // concurrent pushes cannot both pass against a stale floor.
+      const result = await persistPushedRevocationListSerialized({
+        storage: signer.storage,
+        master: signer.masterKey,
+        signed,
+        issuerPublicKey: signer.operatorPublicKey,
+      });
+      if (!result.ok) {
+        // Surface the floor observed inside the lock for the operator's not_newer.
+        const floor = await effectiveRevocationVersionFloor(
+          signer.storage,
+          signer.masterKey,
+        );
+        err.write(
+          `sanctuary federation revoke-push: refusing to persist (${result.reason}` +
           (result.reason === "not_newer"
             ? `; stored version is ${floor}, pushed ${version})\n`
             : ")\n"),
+        );
+        return 3;
+      }
+      out.write(
+        `${JSON.stringify(
+          {
+            revocation_list_pushed: true,
+            version: result.version,
+            revoked_count: result.revokedCount,
+            issuer,
+          },
+          null,
+          2,
+        )}\n`,
       );
-      return 3;
-    }
-    out.write(
-      `${JSON.stringify(
-        {
-          revocation_list_pushed: true,
-          version: result.version,
-          revoked_count: result.revokedCount,
-          issuer,
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    return 0;
+      return 0;
+
+    });
   } catch (cause) {
     err.write(
       `sanctuary federation revoke-push: persist failed: ${String(cause)}\n`,
     );
     return 3;
-  } finally {
-    signer.masterKey.fill(0);
   }
 }
 
@@ -2298,7 +2316,8 @@ export async function runFederationDowngradeLog(args: {
     return 1;
   }
 
-  try {
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
     const log = await readDowngradeLog(signer.storage, signer.masterKey);
     out.write(
       `${JSON.stringify(
@@ -2313,9 +2332,9 @@ export async function runFederationDowngradeLog(args: {
       )}\n`,
     );
     return 0;
-  } finally {
-    signer.masterKey.fill(0);
-  }
+
+  });
+
 }
 
 interface ProvisionFlags {
@@ -2435,16 +2454,16 @@ export async function runFederationProvision(args: {
   if (flags.cryptoSuiteInvalid) {
     err.write(
       "sanctuary federation provision: --crypto-suite must be ed25519+ml-dsa-v1 " +
-        "(hybrid, the default; same as --pqc-hybrid) or ed25519-v1 (classical " +
-        "opt-out; same as --classical)\n",
+      "(hybrid, the default; same as --pqc-hybrid) or ed25519-v1 (classical " +
+      "opt-out; same as --classical)\n",
     );
     return 1;
   }
   if (flags.cryptoSuiteConflict) {
     err.write(
       "sanctuary federation provision: --classical (or --crypto-suite ed25519-v1) " +
-        "and --pqc-hybrid (or --crypto-suite ed25519+ml-dsa-v1) are mutually " +
-        "exclusive. Hybrid is the default; pass --classical only to opt out.\n",
+      "and --pqc-hybrid (or --crypto-suite ed25519+ml-dsa-v1) are mutually " +
+      "exclusive. Hybrid is the default; pass --classical only to opt out.\n",
     );
     return 1;
   }
@@ -2480,147 +2499,151 @@ export async function runFederationProvision(args: {
   // the resolved operator pubkey (PUBLIC, safe to log). An audit-write failure
   // must NEVER mask the verb's fail-closed behavior, so audit appends are
   // best-effort (mirrors dashboard-standalone's federation audit callback).
-  const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
-  const auditLog = new AuditLog(signer.storage, signer.masterKey);
-  const audit = async (event: FederationTrustRootAuditEvent): Promise<void> => {
-    try {
-      await auditLog.append(
-        "l2",
-        event.operation,
-        "federation",
-        { ...event.details, operator_pubkey: operatorPubkeyB64 },
-        event.result,
-      );
-    } catch {
-      // Federation stays fail-closed; never let an audit-write failure block or
-      // mask the mint's refusal / success behavior.
-    }
-  };
 
-  try {
-    // REFUSE-IF-EXISTS (the most important safety property). Raw existence probe
-    // on BOTH record kinds, WITHOUT decrypting -- so a present-but-corrupt record
-    // is refused too (corrupt == do-not-overwrite, NOT == absent). The mint
-    // primitive's load-first behavior is NOT relied on here: we must distinguish
-    // "refused because one exists" from "minted a fresh one", and we must refuse
-    // over a broken record the primitive would treat as absent.
-    const issuerExists = await signer.storage.exists(
-      FEDERATION_TRUST_ROOT_NAMESPACE,
-      FEDERATION_TRUST_ROOT_KEY,
-    );
-    if (issuerExists) {
-      await audit({
-        operation: "federation_trust_root_mint",
-        result: "failure",
-        details: { reason: "refused_issuer_record_exists" },
-      });
-      err.write(
-        "sanctuary federation provision: this fortress already has a federation " +
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
+    const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
+    const auditLog = new AuditLog(signer.storage, signer.masterKey);
+    const audit = async (event: FederationTrustRootAuditEvent): Promise<void> => {
+      try {
+        await auditLog.append(
+          "l2",
+          event.operation,
+          "federation",
+          { ...event.details, operator_pubkey: operatorPubkeyB64 },
+          event.result,
+        );
+      } catch {
+        // Federation stays fail-closed; never let an audit-write failure block or
+        // mask the mint's refusal / success behavior.
+      }
+    };
+
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    try {
+      // REFUSE-IF-EXISTS (the most important safety property). Raw existence probe
+      // on BOTH record kinds, WITHOUT decrypting -- so a present-but-corrupt record
+      // is refused too (corrupt == do-not-overwrite, NOT == absent). The mint
+      // primitive's load-first behavior is NOT relied on here: we must distinguish
+      // "refused because one exists" from "minted a fresh one", and we must refuse
+      // over a broken record the primitive would treat as absent.
+      const issuerExists = await signer.storage.exists(
+        FEDERATION_TRUST_ROOT_NAMESPACE,
+        FEDERATION_TRUST_ROOT_KEY,
+      );
+      if (issuerExists) {
+        await audit({
+          operation: "federation_trust_root_mint",
+          result: "failure",
+          details: { reason: "refused_issuer_record_exists" },
+        });
+        err.write(
+          "sanctuary federation provision: this fortress already has a federation " +
           "trust root (_federation/trust-root-v1). Minting a new one would create " +
           "a NEW fortress master and orphan every node that already joined this " +
           "mesh. Refusing. To inspect the existing root, boot the dashboard " +
           "(federation status shows fortress_id + node_id). To re-key the signing " +
           "master in place (keeping the fortress_id stable), use " +
           "`sanctuary federation rotate-root --renew` instead.\n",
+        );
+        return 3;
+      }
+      const joinerExists = await signer.storage.exists(
+        FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+        FEDERATION_JOINER_TRUST_ROOT_KEY,
       );
-      return 3;
-    }
-    const joinerExists = await signer.storage.exists(
-      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
-      FEDERATION_JOINER_TRUST_ROOT_KEY,
-    );
-    if (joinerExists) {
-      await audit({
-        operation: "federation_trust_root_mint",
-        result: "failure",
-        details: { reason: "refused_joiner_record_exists" },
-      });
-      err.write(
-        "sanctuary federation provision: this fortress is a federation JOINER " +
+      if (joinerExists) {
+        await audit({
+          operation: "federation_trust_root_mint",
+          result: "failure",
+          details: { reason: "refused_joiner_record_exists" },
+        });
+        err.write(
+          "sanctuary federation provision: this fortress is a federation JOINER " +
           "(_federation/joiner-trust-root-v1 exists); it cannot also be an issuer. " +
           "Minting an issuer root here would create an issuer-on-joiner split-brain. " +
           "Refusing.\n",
-      );
-      return 3;
-    }
+        );
+        return 3;
+      }
 
-    // Mint + persist. The primitive loads-first (defense in depth against a
-    // record that raced in between the probe and here): if it returns
-    // source:"persisted" we REFUSE (never report a fresh mint), and if it
-    // returns null (a record appeared and failed to load) we REFUSE (never
-    // re-mint over it).
-    let provisioned;
-    try {
-      provisioned = await provisionOrLoadFederationTrustRoot({
-        storage: signer.storage,
-        masterKey: signer.masterKey,
-        mint: true,
-        nodeId: flags.nodeId,
-        nodeMode: "local",
-        principalId: "principal-root",
-        issuanceSuite: flags.pqcHybrid
-          ? FEDERATION_ISSUANCE_SUITE_HYBRID
-          : FEDERATION_ISSUANCE_SUITE_CLASSICAL,
-        audit,
-      });
-    } catch (cause) {
-      err.write(
-        `sanctuary federation provision: failed to mint the federation trust root: ${String(cause)}\n`,
-      );
-      return 3;
-    }
-
-    if (provisioned === null) {
-      err.write(
-        "sanctuary federation provision: refused -- a federation trust root " +
-          "appeared on disk during minting and could not be loaded. Refusing to " +
-          "overwrite it.\n",
-      );
-      return 3;
-    }
-    if (provisioned.source !== "minted") {
-      err.write(
-        "sanctuary federation provision: this fortress already has a federation " +
-          "trust root; refusing to mint a second one (it would orphan the mesh).\n",
-      );
-      return 3;
-    }
-
-    // Print ONLY safe public material. The pinned_master is the
-    // FortressMasterPublicKey (public_key, fortress_id, created_at -- all PUBLIC),
-    // the out-of-band trust anchor a joiner pins via `--pinned-master`. NEVER
-    // print the master secret / private keys (they stay owned by the primitive).
-    //
-    // PQC Slice 3: a hybrid-provisioned fortress ALSO prints its hybrid pinned
-    // master (PUBLIC: Ed25519 + ML-DSA-65 public keys), the out-of-band anchor a
-    // hybrid-capable joiner pins. The classical pinned_master stays so a
-    // current-version peer can still verify the Ed25519 chain. NEVER the ML-DSA
-    // secret / hybrid private keys.
-    const isHybrid = provisioned.context.isHybrid === true;
-    out.write(
-      `${JSON.stringify(
-        {
-          provisioned: true,
-          fortress_id: provisioned.record.pinned_master_pubkey.fortress_id,
-          node_id: provisioned.record.node_id,
-          issuance_suite: isHybrid
+      // Mint + persist. The primitive loads-first (defense in depth against a
+      // record that raced in between the probe and here): if it returns
+      // source:"persisted" we REFUSE (never report a fresh mint), and if it
+      // returns null (a record appeared and failed to load) we REFUSE (never
+      // re-mint over it).
+      let provisioned;
+      try {
+        provisioned = await provisionOrLoadFederationTrustRoot({
+          storage: signer.storage,
+          masterKey: signer.masterKey,
+          mint: true,
+          nodeId: flags.nodeId,
+          nodeMode: "local",
+          principalId: "principal-root",
+          issuanceSuite: flags.pqcHybrid
             ? FEDERATION_ISSUANCE_SUITE_HYBRID
             : FEDERATION_ISSUANCE_SUITE_CLASSICAL,
-          pinned_master: { ...provisioned.record.pinned_master_pubkey },
-          ...(isHybrid && provisioned.context.hybridPinnedMaster
-            ? { hybrid_pinned_master: provisioned.context.hybridPinnedMaster }
-            : {}),
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    if (isHybrid) {
-      // One honest, non-naggy note on the DEFAULT (now hybrid) path: scope of the
-      // hybrid choice (no overclaim) AND the version-requirement trade stated
-      // plainly. Printed ONCE, at provision time only (NOT on every command).
-      err.write(
-        "sanctuary federation provision: provisioned with the DEFAULT hybrid " +
+          audit,
+        });
+      } catch (cause) {
+        err.write(
+          `sanctuary federation provision: failed to mint the federation trust root: ${String(cause)}\n`,
+        );
+        return 3;
+      }
+
+      if (provisioned === null) {
+        err.write(
+          "sanctuary federation provision: refused -- a federation trust root " +
+          "appeared on disk during minting and could not be loaded. Refusing to " +
+          "overwrite it.\n",
+        );
+        return 3;
+      }
+      if (provisioned.source !== "minted") {
+        err.write(
+          "sanctuary federation provision: this fortress already has a federation " +
+          "trust root; refusing to mint a second one (it would orphan the mesh).\n",
+        );
+        return 3;
+      }
+
+      // Print ONLY safe public material. The pinned_master is the
+      // FortressMasterPublicKey (public_key, fortress_id, created_at -- all PUBLIC),
+      // the out-of-band trust anchor a joiner pins via `--pinned-master`. NEVER
+      // print the master secret / private keys (they stay owned by the primitive).
+      //
+      // PQC Slice 3: a hybrid-provisioned fortress ALSO prints its hybrid pinned
+      // master (PUBLIC: Ed25519 + ML-DSA-65 public keys), the out-of-band anchor a
+      // hybrid-capable joiner pins. The classical pinned_master stays so a
+      // current-version peer can still verify the Ed25519 chain. NEVER the ML-DSA
+      // secret / hybrid private keys.
+      const isHybrid = provisioned.context.isHybrid === true;
+      out.write(
+        `${JSON.stringify(
+          {
+            provisioned: true,
+            fortress_id: provisioned.record.pinned_master_pubkey.fortress_id,
+            node_id: provisioned.record.node_id,
+            issuance_suite: isHybrid
+              ? FEDERATION_ISSUANCE_SUITE_HYBRID
+              : FEDERATION_ISSUANCE_SUITE_CLASSICAL,
+            pinned_master: { ...provisioned.record.pinned_master_pubkey },
+            ...(isHybrid && provisioned.context.hybridPinnedMaster
+              ? { hybrid_pinned_master: provisioned.context.hybridPinnedMaster }
+              : {}),
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      if (isHybrid) {
+        // One honest, non-naggy note on the DEFAULT (now hybrid) path: scope of the
+        // hybrid choice (no overclaim) AND the version-requirement trade stated
+        // plainly. Printed ONCE, at provision time only (NOT on every command).
+        err.write(
+          "sanctuary federation provision: provisioned with the DEFAULT hybrid " +
           "Ed25519+ML-DSA-65 federation signing master. This makes ONLY the " +
           "federation trust-root cert chain post-quantum-capable; it does NOT " +
           "make audit, transparency, reputation, custody at-rest, or transport " +
@@ -2632,37 +2655,37 @@ export async function runFederationProvision(args: {
           "compromise-revoked in place -- rotate-root refuses on hybrid roots " +
           "(hybrid rotation is a planned follow-up). If you need in-place " +
           "rotation or compromise-recovery today, provision with --classical.\n",
-      );
-    } else {
-      // Inverse note on the --classical opt-out: maximal back-compat, but NO
-      // post-quantum protection on the signing master. Printed ONCE, at provision
-      // time only. Honest + non-naggy.
-      err.write(
-        "sanctuary federation provision: provisioned with the OPT-OUT classical " +
+        );
+      } else {
+        // Inverse note on the --classical opt-out: maximal back-compat, but NO
+        // post-quantum protection on the signing master. Printed ONCE, at provision
+        // time only. Honest + non-naggy.
+        err.write(
+          "sanctuary federation provision: provisioned with the OPT-OUT classical " +
           "Ed25519-only federation signing master (--classical). This root has " +
           "NO post-quantum protection, but is verifiable by any peer including " +
           "older (classical-only) Sanctuary versions. For post-quantum resistance " +
           "of the federation trust root, omit --classical to take the default " +
           "hybrid root (which then requires all peers to be hybrid-capable).\n",
-      );
+        );
+      }
+      return 0;
+
+    } finally {
+      // Keep the audit durable before this short-lived CLI exits, on EVERY path
+      // (success mint, refuse-with-failure-audit, throw). The audit encryption key
+      // was derived in the AuditLog ctor, so flush does not depend on masterKey and
+      // is safe to run here. A non-durable audit append must NEVER turn the verb's
+      // mint/refuse outcome into a different exit code, so flush failures are
+      // swallowed (the trust-root persistence is the source of truth, not the log).
+      try {
+        await auditLog.flush();
+      } catch {
+        // Federation stays fail-closed; audit durability is best-effort here.
+      }
     }
-    return 0;
-  } finally {
-    // Keep the audit durable before this short-lived CLI exits, on EVERY path
-    // (success mint, refuse-with-failure-audit, throw). The audit encryption key
-    // was derived in the AuditLog ctor, so flush does not depend on masterKey and
-    // is safe to run here. A non-durable audit append must NEVER turn the verb's
-    // mint/refuse outcome into a different exit code, so flush failures are
-    // swallowed (the trust-root persistence is the source of truth, not the log).
-    try {
-      await auditLog.flush();
-    } catch {
-      // Federation stays fail-closed; audit durability is best-effort here.
-    }
-    // Constraint 6: the custody master never persists past this call (every path:
-    // success, refuse, throw).
-    signer.masterKey.fill(0);
-  }
+
+  });
 }
 
 interface RotateRootFlags {
@@ -2756,15 +2779,15 @@ export async function runFederationRotateRoot(args: {
   if (flags.compromise && flags.renew) {
     err.write(
       "sanctuary federation rotate-root: --renew and --compromised are mutually exclusive; " +
-        "pick one (--renew = planned re-key, old key stays trusted; --compromised = revoke the " +
-        "old root + rotate the master_secret, old key permanently distrusted)\n",
+      "pick one (--renew = planned re-key, old key stays trusted; --compromised = revoke the " +
+      "old root + rotate the master_secret, old key permanently distrusted)\n",
     );
     return 1;
   }
   if (!flags.renew && !flags.compromise && !flags.resume) {
     err.write(
       "sanctuary federation rotate-root: specify --renew (planned re-key), --compromised " +
-        "(revoke a compromised root), or --resume (complete a crashed rotation)\n",
+      "(revoke a compromised root), or --resume (complete a crashed rotation)\n",
     );
     return 1;
   }
@@ -2794,142 +2817,149 @@ export async function runFederationRotateRoot(args: {
     return 1;
   }
 
-  const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
-  const auditLog = new AuditLog(signer.storage, signer.masterKey);
-  const audit = async (event: FederationRotateRootAuditEvent): Promise<void> => {
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
+    const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
+    const auditLog = new AuditLog(signer.storage, signer.masterKey);
+    const audit = async (event: FederationRotateRootAuditEvent): Promise<void> => {
+      try {
+        await auditLog.append(
+          "l2",
+          event.operation,
+          "federation",
+          { ...event.details, operator_pubkey: operatorPubkeyB64 },
+          event.result,
+        );
+      } catch {
+        // Federation stays fail-closed; an audit-write failure never masks the
+        // verb's rotation/refusal outcome.
+      }
+    };
+
     try {
-      await auditLog.append(
-        "l2",
-        event.operation,
-        "federation",
-        { ...event.details, operator_pubkey: operatorPubkeyB64 },
-        event.result,
-      );
-    } catch {
-      // Federation stays fail-closed; an audit-write failure never masks the
-      // verb's rotation/refusal outcome.
-    }
-  };
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      try {
+        const resuming = flags.resume && (await federationRotateRootInProgress(signer.storage));
+        // --resume with no journal but a fresh-rotate intent also set -> fall through
+        // to a fresh rotation. --resume alone with no journal -> nothing to resume.
+        if (flags.resume && !resuming && !flags.renew && !flags.compromise) {
+          err.write(
+            "sanctuary federation rotate-root: no federation rotate-root is in progress on this " +
+            "fortress (no journal); nothing to resume\n",
+          );
+          return 3;
+        }
 
-  try {
-    const resuming = flags.resume && (await federationRotateRootInProgress(signer.storage));
-    // --resume with no journal but a fresh-rotate intent also set -> fall through
-    // to a fresh rotation. --resume alone with no journal -> nothing to resume.
-    if (flags.resume && !resuming && !flags.renew && !flags.compromise) {
-      err.write(
-        "sanctuary federation rotate-root: no federation rotate-root is in progress on this " +
-          "fortress (no journal); nothing to resume\n",
-      );
-      return 3;
-    }
+        // Whether the in-progress journal (if any) is a compromise rotate decides
+        // which resume to run, regardless of which flag the operator passed.
+        const journalIsCompromise =
+          resuming &&
+          (await federationRotateRootJournalIsCompromise(
+            signer.storage,
+            signer.masterKey,
+          ));
+        const compromisePath = resuming ? journalIsCompromise : flags.compromise;
 
-    // Whether the in-progress journal (if any) is a compromise rotate decides
-    // which resume to run, regardless of which flag the operator passed.
-    const journalIsCompromise =
-      resuming &&
-      (await federationRotateRootJournalIsCompromise(
-        signer.storage,
-        signer.masterKey,
-      ));
-    const compromisePath = resuming ? journalIsCompromise : flags.compromise;
+        if (compromisePath) {
+          const result = resuming
+            ? await resumeFederationRootCompromised({
+              storage: signer.storage,
+              masterKey: signer.masterKey,
+              audit,
+              log: (line) => err.write(`${line}\n`),
+            })
+            : await rotateFederationRootCompromised({
+              storage: signer.storage,
+              masterKey: signer.masterKey,
+              audit,
+              log: (line) => err.write(`${line}\n`),
+            });
 
-    if (compromisePath) {
-      const result = resuming
-        ? await resumeFederationRootCompromised({
+          // Print ONLY safe public material. There is DELIBERATELY no rotation cert
+          // for a compromise rotate (downgrade resistance); adoption is out-of-band
+          // re-pin of the new pinned_master (Slice 3c-2). NEVER a private key /
+          // master_secret.
+          out.write(
+            `${JSON.stringify(
+              {
+                rotated: true,
+                compromised: true,
+                resumed: resuming,
+                fortress_id: result.fortress_id,
+                revoked_master_pubkey: result.revoked_master_pubkey,
+                revocation_serial: result.revocation_serial,
+                pinned_master: { ...result.new_pinned_master },
+                root_revocation: { ...result.root_revocation },
+                adoption: "out-of-band re-pin of pinned_master (no rotation cert is issued for a compromise)",
+                next_steps: ROTATE_ROOT_NEXT_STEPS,
+              },
+              null,
+              2,
+            )}\n`,
+          );
+          writeRotateRootNextSteps(err);
+          return 0;
+        }
+
+        const result = resuming
+          ? await resumeFederationRootRotation({
             storage: signer.storage,
             masterKey: signer.masterKey,
             audit,
             log: (line) => err.write(`${line}\n`),
           })
-        : await rotateFederationRootCompromised({
+          : await rotateFederationRootRenew({
             storage: signer.storage,
             masterKey: signer.masterKey,
             audit,
             log: (line) => err.write(`${line}\n`),
           });
 
-      // Print ONLY safe public material. There is DELIBERATELY no rotation cert
-      // for a compromise rotate (downgrade resistance); adoption is out-of-band
-      // re-pin of the new pinned_master (Slice 3c-2). NEVER a private key /
-      // master_secret.
-      out.write(
-        `${JSON.stringify(
-          {
-            rotated: true,
-            compromised: true,
-            resumed: resuming,
-            fortress_id: result.fortress_id,
-            revoked_master_pubkey: result.revoked_master_pubkey,
-            revocation_serial: result.revocation_serial,
-            pinned_master: { ...result.new_pinned_master },
-            root_revocation: { ...result.root_revocation },
-            adoption: "out-of-band re-pin of pinned_master (no rotation cert is issued for a compromise)",
-            next_steps: ROTATE_ROOT_NEXT_STEPS,
-          },
-          null,
-          2,
-        )}\n`,
+        // Print ONLY safe public material: the NEW pinned master (the out-of-band
+        // trust anchor to redistribute) + the rotation cert (public). NEVER a private
+        // key or the master_secret.
+        out.write(
+          `${JSON.stringify(
+            {
+              rotated: true,
+              resumed: result.resumed,
+              fortress_id: result.fortress_id,
+              rotation_serial: result.rotation_serial,
+              previous_master_pubkey: result.previous_master_pubkey,
+              pinned_master: { ...result.new_pinned_master },
+              rotation_cert: { ...result.rotation_cert },
+              next_steps: ROTATE_ROOT_NEXT_STEPS,
+            },
+            null,
+            2,
+          )}\n`,
+        );
+        writeRotateRootNextSteps(err);
+        return 0;
+
+      } finally {
+        try {
+          await auditLog.flush();
+        } catch {
+          // Audit durability is best-effort; never change the verb's exit code.
+        }
+      }
+
+    } catch (cause) {
+      if (
+        cause instanceof FederationRotateRootError ||
+        cause instanceof FederationRotateRootResumeError
+      ) {
+        err.write(`sanctuary federation rotate-root: ${cause.message}\n`);
+        return 3;
+      }
+      err.write(
+        `sanctuary federation rotate-root: failed to rotate the federation root: ${String(cause)}\n`,
       );
-      writeRotateRootNextSteps(err);
-      return 0;
-    }
-
-    const result = resuming
-      ? await resumeFederationRootRotation({
-          storage: signer.storage,
-          masterKey: signer.masterKey,
-          audit,
-          log: (line) => err.write(`${line}\n`),
-        })
-      : await rotateFederationRootRenew({
-          storage: signer.storage,
-          masterKey: signer.masterKey,
-          audit,
-          log: (line) => err.write(`${line}\n`),
-        });
-
-    // Print ONLY safe public material: the NEW pinned master (the out-of-band
-    // trust anchor to redistribute) + the rotation cert (public). NEVER a private
-    // key or the master_secret.
-    out.write(
-      `${JSON.stringify(
-        {
-          rotated: true,
-          resumed: result.resumed,
-          fortress_id: result.fortress_id,
-          rotation_serial: result.rotation_serial,
-          previous_master_pubkey: result.previous_master_pubkey,
-          pinned_master: { ...result.new_pinned_master },
-          rotation_cert: { ...result.rotation_cert },
-          next_steps: ROTATE_ROOT_NEXT_STEPS,
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    writeRotateRootNextSteps(err);
-    return 0;
-  } catch (cause) {
-    if (
-      cause instanceof FederationRotateRootError ||
-      cause instanceof FederationRotateRootResumeError
-    ) {
-      err.write(`sanctuary federation rotate-root: ${cause.message}\n`);
       return 3;
     }
-    err.write(
-      `sanctuary federation rotate-root: failed to rotate the federation root: ${String(cause)}\n`,
-    );
-    return 3;
-  } finally {
-    try {
-      await auditLog.flush();
-    } catch {
-      // Audit durability is best-effort; never change the verb's exit code.
-    }
-    // Constraint 6: the custody master never persists past this call.
-    signer.masterKey.fill(0);
-  }
+
+  });
 }
 
 interface RevealMasterSecretFlags {
@@ -3038,10 +3068,10 @@ export async function runFederationRevealMasterSecret(args: {
   if (!flags.confirmed) {
     err.write(
       "sanctuary federation reveal-master-secret: this PRINTS the fortress master " +
-        "secret (the 32-byte value that lets a machine join this federation) to " +
-        "stdout. Anyone who captures it can join your mesh. Re-run with --yes " +
-        "(alias -y) to confirm you intend to disclose it; redirect the output to a " +
-        "secure channel and never paste it where it can be logged.\n",
+      "secret (the 32-byte value that lets a machine join this federation) to " +
+      "stdout. Anyone who captures it can join your mesh. Re-run with --yes " +
+      "(alias -y) to confirm you intend to disclose it; redirect the output to a " +
+      "secure channel and never paste it where it can be logged.\n",
     );
     return 1;
   }
@@ -3071,126 +3101,131 @@ export async function runFederationRevealMasterSecret(args: {
     return 1;
   }
 
-  const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
-  const auditLog = makeAuditLog(signer.storage, signer.masterKey);
-  // DURABLE disclosure audit. This is custody-core: a master-secret disclosure
-  // (and the failure reasons that gate it) MUST land durably, so we use the same
-  // `appendCritical()` read-after-write barrier the disclosure broker / export
-  // paths use. We AWAIT it and let a persist failure REJECT loudly -- a reveal
-  // that cannot be audited must NOT proceed (constraint 5: never silently degrade
-  // to a less-secure behavior). The operator signer is already resolved here, so
-  // a signing identity exists for the critical append.
-  const audit = async (result: "success" | "failure", reason?: string): Promise<void> => {
-    await auditLog.appendCritical({
-      layer: "l2",
-      operation: "federation_master_secret_reveal",
-      identity_id: "federation",
-      result,
-      details: {
-        operator_pubkey: operatorPubkeyB64,
-        ...(reason !== undefined ? { reason } : {}),
-      },
-    });
-  };
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(signer, async () => {
+    const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
+    const auditLog = makeAuditLog(signer.storage, signer.masterKey);
+    // DURABLE disclosure audit. This is custody-core: a master-secret disclosure
+    // (and the failure reasons that gate it) MUST land durably, so we use the same
+    // `appendCritical()` read-after-write barrier the disclosure broker / export
+    // paths use. We AWAIT it and let a persist failure REJECT loudly -- a reveal
+    // that cannot be audited must NOT proceed (constraint 5: never silently degrade
+    // to a less-secure behavior). The operator signer is already resolved here, so
+    // a signing identity exists for the critical append.
+    const audit = async (result: "success" | "failure", reason?: string): Promise<void> => {
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "federation_master_secret_reveal",
+        identity_id: "federation",
+        result,
+        details: {
+          operator_pubkey: operatorPubkeyB64,
+          ...(reason !== undefined ? { reason } : {}),
+        },
+      });
+    };
 
-  let record: Awaited<ReturnType<FederationTrustRootStore["load"]>> = null;
-  let secretBytes: Uint8Array | null = null;
-  try {
-    // Read the canonical source: the encrypted issuer trust-root record. We do
-    // NOT mint and do NOT re-derive -- this is exactly the value the join path
-    // consumes via deriveNodeTransportKey({ fortress_master_secret }).
-    const store = new FederationTrustRootStore(signer.storage, signer.masterKey);
+    let record: Awaited<ReturnType<FederationTrustRootStore["load"]>> = null;
+    let secretBytes: Uint8Array | null = null;
+
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
     try {
-      record = await store.load();
-    } catch (cause) {
-      // A present-but-corrupt / undecryptable record fails closed WITHOUT
-      // revealing anything (constraint 5: never degrade to a weaker behavior).
-      await audit("failure", "trust_root_load_failed");
-      const detail =
-        cause instanceof FederationTrustRootStoreError ? cause.message : "decrypt failed";
-      err.write(
-        `sanctuary federation reveal-master-secret: could not load this fortress's ` +
+      // Read the canonical source: the encrypted issuer trust-root record. We do
+      // NOT mint and do NOT re-derive -- this is exactly the value the join path
+      // consumes via deriveNodeTransportKey({ fortress_master_secret }).
+      const store = new FederationTrustRootStore(signer.storage, signer.masterKey);
+      try {
+        record = await store.load();
+      } catch (cause) {
+        // A present-but-corrupt / undecryptable record fails closed WITHOUT
+        // revealing anything (constraint 5: never degrade to a weaker behavior).
+        await audit("failure", "trust_root_load_failed");
+        const detail =
+          cause instanceof FederationTrustRootStoreError ? cause.message : "decrypt failed";
+        err.write(
+          `sanctuary federation reveal-master-secret: could not load this fortress's ` +
           `federation trust root (${detail}). Refusing.\n`,
-      );
-      return 3;
-    }
+        );
+        return 3;
+      }
 
-    if (record === null) {
-      await audit("failure", "not_provisioned");
-      err.write(
-        "sanctuary federation reveal-master-secret: this fortress has no federation " +
+      if (record === null) {
+        await audit("failure", "not_provisioned");
+        err.write(
+          "sanctuary federation reveal-master-secret: this fortress has no federation " +
           "trust root (_federation/trust-root-v1). Provision an issuer first " +
           "(`sanctuary federation provision --node-id <id>`), or you are on a node " +
           "that never provisioned/joined. Refusing.\n",
-      );
-      return 3;
-    }
+        );
+        return 3;
+      }
 
-    // The 32-byte symmetric master secret -- the SAME value a joiner feeds to
-    // `join --master-secret`. Only an ISSUER (ran `provision`) holds this
-    // `_federation/trust-root-v1` record; a pure joiner persists to
-    // `_federation/joiner-trust-root-v1` (no `master_secret`), so `load()`
-    // returned null above and we never reach here on a joiner.
-    secretBytes = Uint8Array.from(record.master_secret);
-    let secretB64 = toBase64url(secretBytes);
-    try {
-      // AUDIT-BEFORE-DISCLOSE: commit the durable success audit FIRST. If it
-      // cannot be persisted, `appendCritical()` rejects, we fall through to the
-      // catch below, abort fail-closed (exit 3), and NOTHING is written to
-      // stdout. The master secret never reaches stdout un-audited.
-      await audit("success");
-      // Only now -- with the disclosure durably audited -- print to stdout (the
-      // intended output; pipe to the joiner's --master-secret).
-      out.write(`${secretB64}\n`);
-      return 0;
-    } catch (cause) {
-      // The durable success audit could not be persisted. Refuse the disclosure
-      // (constraint 5: never silently degrade). Nothing was written to stdout.
-      const detail = cause instanceof Error ? cause.message : String(cause);
-      err.write(
-        `sanctuary federation reveal-master-secret: could not durably record the ` +
+      // The 32-byte symmetric master secret -- the SAME value a joiner feeds to
+      // `join --master-secret`. Only an ISSUER (ran `provision`) holds this
+      // `_federation/trust-root-v1` record; a pure joiner persists to
+      // `_federation/joiner-trust-root-v1` (no `master_secret`), so `load()`
+      // returned null above and we never reach here on a joiner.
+      secretBytes = Uint8Array.from(record.master_secret);
+      let secretB64 = toBase64url(secretBytes);
+      try {
+        // AUDIT-BEFORE-DISCLOSE: commit the durable success audit FIRST. If it
+        // cannot be persisted, `appendCritical()` rejects, we fall through to the
+        // catch below, abort fail-closed (exit 3), and NOTHING is written to
+        // stdout. The master secret never reaches stdout un-audited.
+        await audit("success");
+        // Only now -- with the disclosure durably audited -- print to stdout (the
+        // intended output; pipe to the joiner's --master-secret).
+        out.write(`${secretB64}\n`);
+        return 0;
+      } catch (cause) {
+        // The durable success audit could not be persisted. Refuse the disclosure
+        // (constraint 5: never silently degrade). Nothing was written to stdout.
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        err.write(
+          `sanctuary federation reveal-master-secret: could not durably record the ` +
           `Tier-1 disclosure audit event (${detail}); refusing to reveal the master ` +
           `secret. Nothing was written.\n`,
-      );
-      return 3;
+        );
+        return 3;
+      } finally {
+        // Constraint 6 discipline: drop our reference. A JS string is immutable and
+        // cannot be wiped in place, but the secret BYTES are zeroed in the outer
+        // finally; the value is already on stdout by design (on the success path).
+        secretB64 = "";
+      }
+
     } finally {
-      // Constraint 6 discipline: drop our reference. A JS string is immutable and
-      // cannot be wiped in place, but the secret BYTES are zeroed in the outer
-      // finally; the value is already on stdout by design (on the success path).
-      secretB64 = "";
+      // Zeroize the secret bytes we copied out of the record (constraint 6).
+      secretBytes?.fill(0);
+      // The store's load() already zeroed its own decrypted plaintext; zero the
+      // record's retained secret fields too so nothing lingers past this call.
+      record?.master_secret.fill(0);
+      record?.master_private_key?.fill(0);
+      record?.issuing_principal_private_key.fill(0);
+      record?.local_node_private_key.fill(0);
+      // On a HYBRID-suite issuer, `record.hybrid` carries LIVE Ed25519 + ML-DSA-65
+      // private keys (master, issuing-principal, local-node) decrypted transiently
+      // by load(). The classical four fields above do NOT cover them, so zero every
+      // hybrid private-key Uint8Array too (constraint 6). Optional chaining makes
+      // this a safe no-op on a classical record where `hybrid` is absent.
+      record?.hybrid?.master_private_keys?.ed25519?.private_key?.fill(0);
+      record?.hybrid?.master_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+      record?.hybrid?.issuing_principal_private_keys?.ed25519?.private_key?.fill(0);
+      record?.hybrid?.issuing_principal_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+      record?.hybrid?.local_node_private_keys?.ed25519?.private_key?.fill(0);
+      record?.hybrid?.local_node_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+      // Durability already rode on `appendCritical()` above (read-after-write
+      // verified before that promise resolved); this flush is a belt-and-suspenders
+      // drain of anything else queued and never changes the verb's exit code.
+      try {
+        await auditLog.flush();
+      } catch {
+        // Drain is best-effort here; the critical disclosure audit was already
+        // durably committed before any secret reached stdout.
+      }
     }
-  } finally {
-    // Zeroize the secret bytes we copied out of the record (constraint 6).
-    secretBytes?.fill(0);
-    // The store's load() already zeroed its own decrypted plaintext; zero the
-    // record's retained secret fields too so nothing lingers past this call.
-    record?.master_secret.fill(0);
-    record?.master_private_key?.fill(0);
-    record?.issuing_principal_private_key.fill(0);
-    record?.local_node_private_key.fill(0);
-    // On a HYBRID-suite issuer, `record.hybrid` carries LIVE Ed25519 + ML-DSA-65
-    // private keys (master, issuing-principal, local-node) decrypted transiently
-    // by load(). The classical four fields above do NOT cover them, so zero every
-    // hybrid private-key Uint8Array too (constraint 6). Optional chaining makes
-    // this a safe no-op on a classical record where `hybrid` is absent.
-    record?.hybrid?.master_private_keys?.ed25519?.private_key?.fill(0);
-    record?.hybrid?.master_private_keys?.ml_dsa_65?.secret_key?.fill(0);
-    record?.hybrid?.issuing_principal_private_keys?.ed25519?.private_key?.fill(0);
-    record?.hybrid?.issuing_principal_private_keys?.ml_dsa_65?.secret_key?.fill(0);
-    record?.hybrid?.local_node_private_keys?.ed25519?.private_key?.fill(0);
-    record?.hybrid?.local_node_private_keys?.ml_dsa_65?.secret_key?.fill(0);
-    // Durability already rode on `appendCritical()` above (read-after-write
-    // verified before that promise resolved); this flush is a belt-and-suspenders
-    // drain of anything else queued and never changes the verb's exit code.
-    try {
-      await auditLog.flush();
-    } catch {
-      // Drain is best-effort here; the critical disclosure audit was already
-      // durably committed before any secret reached stdout.
-    }
-    // Constraint 6: the custody master never persists past this call.
-    signer.masterKey.fill(0);
-  }
+
+  });
 }
 
 const FEDERATION_HELP = `sanctuary federation -- cross-machine federation (Wave 1)

@@ -1,3 +1,4 @@
+// fail-before-exempt: the source-rewrite harness now tolerates indentation and asserts its rewrite applied; hardening of an existing guard, so it passes against pre-fix source.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -211,7 +212,8 @@ describe("state import and checkpoint restore writer-key resolver parity", () =>
     const files = Object.fromEntries(
       sourceFiles("src").map((file) => [file, read(file)])
     );
-    files["src/cli/checkpoint.ts"] = files["src/cli/checkpoint.ts"]!.replace(
+    const original = files["src/cli/checkpoint.ts"]!;
+    files["src/cli/checkpoint.ts"] = original.replace(
       /const publicKeyResolver = createStateImportWriterKeyResolver\(\(kid\) =>\n\s+boot\.identityManager\.get\(kid\)\n\s+\);/,
       "const publicKeyResolver = (_kid: string) => [boot.primary.publicKey];"
     );
@@ -243,8 +245,9 @@ describe("state import and checkpoint restore writer-key resolver parity", () =>
     const files = Object.fromEntries(
       sourceFiles("src").map((file) => [file, read(file)])
     );
-    files["src/cli/checkpoint.ts"] = files["src/cli/checkpoint.ts"]!.replace(
-      /      assessParked: async \(\) => assessHarnessParked\(await buildRestoreParkedSource\(\)\),\n      publicKeyResolver,\n    }\);/,
+    const original = files["src/cli/checkpoint.ts"]!;
+    files["src/cli/checkpoint.ts"] = original.replace(
+      /[ \t]+assessParked: async \(\) => assessHarnessParked\(await buildRestoreParkedSource\(\)\),\n[ \t]+publicKeyResolver,\n[ \t]+}\);/,
       `      assessParked: async () => assessHarnessParked(await buildRestoreParkedSource()),
       publicKeyResolver: (kid: string) => {
         const held = boot.identityManager.get(kid);
@@ -254,6 +257,7 @@ describe("state import and checkpoint restore writer-key resolver parity", () =>
     });`
     );
 
+    expect(files["src/cli/checkpoint.ts"]).not.toBe(original);
     expect(() => assertProductionResolverParity(files)).toThrow();
   });
 });

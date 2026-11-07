@@ -26,6 +26,7 @@ import { IdentityManager } from "../cognitive/tools.js";
 import type { ExitV2SdwMemoryManifest } from "../contracts/v1.2/exit-bundle-manifest.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { sign } from "../core/identity.js";
+import { MasterEstablishmentReleaseError } from "../core/master-custody.js";
 import { unlockLocalFortress } from "./local-fortress-unlock.js";
 import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
@@ -207,12 +208,16 @@ export async function runMemoryArchiveExportCommand(
   const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
   if (!interaction) return 1;
   let boot: Bootstrapped | null = null;
+  let opening = false;
+  let outcome: OperationOutcome = { ok: true };
   let stagedPath: string | undefined;
   let committed = false;
   let disclosed = false;
   let transferKey: Uint8Array | undefined;
   try {
+    opening = true;
     boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
+    opening = false;
     if (!boot) return 1;
     if (await exists(parsed.outputPath)) {
       write(err, "memory_archive_export failed: output path already exists\n");
@@ -326,7 +331,9 @@ export async function runMemoryArchiveExportCommand(
         : `memory_archive_export: wrote ${parsed.outputPath}\n`,
     );
     return 0;
-  } catch {
+  } catch (error) {
+    outcome = { ok: false, error };
+    if (opening) throw error;
     // Reachable states only: (a) neither flag set, the failure happened
     // before recovery-material disclosure; (b) disclosed only, the failure
     // happened between disclosure and the rename that commits the bundle;
@@ -348,8 +355,7 @@ export async function runMemoryArchiveExportCommand(
     if (stagedPath !== undefined) {
       await rm(stagedPath, { recursive: true, force: true }).catch(() => undefined);
     }
-    await dispose(boot);
-    interaction.close();
+    await finishInteraction(boot, interaction, outcome);
   }
 }
 
@@ -372,6 +378,8 @@ export async function runMemoryArchiveImportCommand(
   const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
   if (!interaction) return 1;
   let boot: Bootstrapped | null = null;
+  let opening = false;
+  let outcome: OperationOutcome = { ok: true };
   let hiddenBytes: Uint8Array | undefined;
   let transferKey: Uint8Array | undefined;
   // Set true only once importExitV2SdwMemoryArchive itself has returned; the
@@ -403,7 +411,9 @@ export async function runMemoryArchiveImportCommand(
     // Verification consumes and clears its caller-owned key buffer.
     transferKey = undefined;
 
+    opening = true;
     boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
+    opening = false;
     if (!boot) return 1;
 
     const approvalArgs = {
@@ -512,6 +522,8 @@ export async function runMemoryArchiveImportCommand(
     );
     return 0;
   } catch (error) {
+    outcome = { ok: false, error };
+    if (opening) throw error;
     // Pre-commit failures are genuinely authentication/validation failures
     // (bad recovery material, a malformed bundle, a denied approval). A
     // post-commit failure is a different situation entirely: the destination
@@ -533,8 +545,7 @@ export async function runMemoryArchiveImportCommand(
   } finally {
     transferKey?.fill(0);
     hiddenBytes?.fill(0);
-    await dispose(boot);
-    interaction.close();
+    await finishInteraction(boot, interaction, outcome);
   }
 }
 
@@ -565,8 +576,12 @@ export async function runMemoryProvenancePruneSignersCommand(
   const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
   if (interaction === null) return 1;
   let boot: Bootstrapped | null = null;
+  let opening = false;
+  let outcome: OperationOutcome = { ok: true };
   try {
+    opening = true;
     boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
+    opening = false;
     if (boot === null) return 1;
     const gate = new ApprovalGate(
       await loadPrincipalPolicy(parsed.fortressPath),
@@ -586,12 +601,13 @@ export async function runMemoryProvenancePruneSignersCommand(
       ? JSON.stringify({ pruned: true, ...result }) + "\n"
       : `${operation}: deleted ${String(result.deleted.length)} unreachable signer mapping(s)\n`);
     return 0;
-  } catch {
+  } catch (error) {
+    outcome = { ok: false, error };
+    if (opening) throw error;
     write(err, `${operation} failed\n`);
     return 1;
   } finally {
-    await dispose(boot);
-    interaction.close();
+    await finishInteraction(boot, interaction, outcome);
   }
 }
 
@@ -613,8 +629,12 @@ async function runMemoryProvenanceBadSignerCommand(
   const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
   if (interaction === null) return 1;
   let boot: Bootstrapped | null = null;
+  let opening = false;
+  let outcome: OperationOutcome = { ok: true };
   try {
+    opening = true;
     boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
+    opening = false;
     if (boot === null) return 1;
     const gateArgs = {
       agent_id: null,
@@ -652,12 +672,13 @@ async function runMemoryProvenanceBadSignerCommand(
         `memory_provenance_clear_bad_signer: cleared after ${scan.affected} re-verification(s)\n`);
     }
     return 0;
-  } catch {
+  } catch (error) {
+    outcome = { ok: false, error };
+    if (opening) throw error;
     write(err, `${operation} failed\n`);
     return 1;
   } finally {
-    await dispose(boot);
-    interaction.close();
+    await finishInteraction(boot, interaction, outcome);
   }
 }
 
@@ -669,9 +690,10 @@ async function bootstrap(
 ): Promise<Bootstrapped | null> {
   let masterKey: Uint8Array | undefined;
   let identityKey: Uint8Array | undefined;
-  // Held across the whole verb; released in dispose or on the failure path
-  // below so a construction throw after unlock cannot strand the lease (S1).
   let barrier: MasterWriteBarrierLease | undefined;
+  let auditLog: AuditLog | undefined;
+  let transferred = false;
+  let outcome: OperationOutcome = { ok: true };
   try {
     await access(parsed.fortressPath);
     const journalStorage = new FilesystemStorage(join(parsed.fortressPath, "state"));
@@ -706,7 +728,6 @@ async function bootstrap(
     const loaded = await identityManager.load();
     const primary = identityManager.getDefault();
     if (loaded.loaded === 0 || !primary) {
-      masterKey.fill(0);
       write(err, "Error: fortress identity is unavailable.\n");
       return null;
     }
@@ -718,6 +739,7 @@ async function bootstrap(
     // for the fortress-open recovery wiring, not just structurally
     // discovered by the mechanical pin.
     const memoryArchiveAuditLog = new AuditLog(storage, masterKey);
+    auditLog = memoryArchiveAuditLog;
     await recoverInterruptedExitImportsOrThrow(storage, memoryArchiveAuditLog);
     const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
     const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
@@ -774,7 +796,7 @@ async function bootstrap(
       forgetSigner: (did) => { persistedByDid.delete(did); },
       auditLog: memoryArchiveAuditLog,
     });
-    return {
+    const boot: Bootstrapped = {
       storage,
       journalStorage,
       admissionWriteGuard,
@@ -797,25 +819,73 @@ async function bootstrap(
         sign: (bytes) => sign(bytes, primary.encrypted_private_key, signingKey),
       },
     };
-  } catch {
-    identityKey?.fill(0);
-    masterKey?.fill(0);
-    // A throw AFTER a successful writeIntent unlock owns the lease here (the
-    // return object was never built); release it so it cannot block rotation.
-    await barrier?.release().catch(() => undefined);
+    // Bootstrap owns the session until a complete result is transferred, and every untransferred exit awaits release.
+    transferred = true;
+    return boot;
+  } catch (error) {
+    outcome = { ok: false, error };
+    // Release failures must reach command failure handling instead of becoming ordinary unlock refusals.
+    if (error instanceof MasterEstablishmentReleaseError) throw error;
     write(err, "Error: could not open or unlock the fortress.\n");
     return null;
+  } finally {
+    // Bootstrap owns the session until a complete result is transferred, and every untransferred exit awaits release.
+    if (!transferred) {
+      const errors: unknown[] = [];
+      // Flush is the final master-derived storage write; the barrier release below must follow it.
+      try { await auditLog?.flush(); } catch (error) { errors.push(error); }
+      identityKey?.fill(0);
+      masterKey?.fill(0);
+      try { await barrier?.release(); } catch (error) { errors.push(error); }
+      throwCleanupErrors(errors, outcome);
+    }
   }
 }
 
-async function dispose(boot: Bootstrapped | null): Promise<void> {
-  if (!boot) return;
-  // Flush is this carriage's final master-derived write; release the rotation
-  // barrier AFTER it so we release after the last write (S1 / AGENTS rule 12).
-  await boot.auditLog.flush().catch(() => undefined);
-  boot.identityKey.fill(0);
-  boot.masterKey.fill(0);
-  await boot.barrier?.release().catch(() => undefined);
+type OperationOutcome = { ok: true } | { ok: false; error: unknown };
+
+function throwCleanupErrors(errors: unknown[], outcome: OperationOutcome = { ok: true }): void {
+  if (errors.length === 0) return;
+  if (!outcome.ok) errors.unshift(outcome.error);
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, "Memory archive cleanup encountered errors");
+}
+
+const disposalPromises = new WeakMap<Bootstrapped, Promise<void>>();
+
+function dispose(boot: Bootstrapped | null): Promise<void> {
+  if (!boot) return Promise.resolve();
+  const pending = disposalPromises.get(boot);
+  if (pending) return pending;
+  // Cache before running any teardown so reentrant disposal observes the same outcome.
+  const promise = Promise.resolve().then(async () => {
+    const errors: unknown[] = [];
+    // Flush is this carriage's final master-derived storage write; the barrier release below must follow it.
+    try { await boot.auditLog.flush(); } catch (error) { errors.push(error); }
+    boot.identityKey.fill(0);
+    boot.masterKey.fill(0);
+    try { await boot.barrier?.release(); } catch (error) { errors.push(error); }
+    throwCleanupErrors(errors);
+  });
+  disposalPromises.set(boot, promise);
+  return promise;
+}
+
+async function finishInteraction(
+  boot: Bootstrapped | null,
+  interaction: PrivateMemoryArchiveInteraction,
+  outcome: OperationOutcome,
+): Promise<void> {
+  const errors: unknown[] = [];
+  try {
+    try { await dispose(boot); } catch (error) {
+      // Preserve each phase error intact so nested cleanup messages and causes survive every boundary.
+      errors.push(error);
+    }
+  } finally {
+    try { interaction.close(); } catch (error) { errors.push(error); }
+  }
+  throwCleanupErrors(errors, outcome);
 }
 
 async function readBundle(inputPath: string): Promise<{

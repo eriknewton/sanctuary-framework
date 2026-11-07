@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "./construction-work-fixture.js";
 // fail-before-exempt: storagePath was added to existing unmounted-route binding harnesses; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * Wire-unmounted-routes (2026-06-29) — auth-gate regression suite.
@@ -44,7 +45,6 @@ import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.j
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
-  buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
 import { ConsoleService } from "../../src/console/console-service.js";
@@ -129,7 +129,7 @@ async function startRig(): Promise<TestRig> {
   });
 
   dashboard.setV11Bindings(
-    buildV11Bindings({
+    await buildV11Bindings({
       identityId: IDENTITY_ID,
       fortressId,
       auditLog,
@@ -326,7 +326,7 @@ describe("wire-unmounted-routes — bindings absent: match-then-auth-then-503 (n
     });
     // No storage/masterKey -> no anomaly binding; no consoleService.
     dashboard.setV11Bindings(
-      buildV11Bindings({
+      await buildV11Bindings({
         identityId: IDENTITY_ID,
         fortressId: fortressIdFromStoragePath(FORTRESS_STORAGE_PATH),
         auditLog,

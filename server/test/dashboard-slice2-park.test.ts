@@ -18,8 +18,8 @@
  * or the fallback file, so a no-credential restart finds no credential and
  * parks (the supervised LaunchAgent scenario). No mocks of custody.
  */
-
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import * as escrowModule from "../src/wrap/boot-recovery-escrow.js";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
 import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
 import {
@@ -56,11 +56,11 @@ async function seedWrappedFortress(storagePath: string): Promise<void> {
     firstRun: { installMode: "headless", mintRecoveryKey: false },
     storagePathHint: storagePath,
   });
-  const idEncKey = derivePurposeKey(custody.masterKey, "identity-encryption");
-  const mgr = new IdentityManager(storage, custody.masterKey);
-  await mgr.load();
-  const { storedIdentity } = createIdentity("seeded-0", idEncKey, "passphrase");
-  await mgr.save(storedIdentity);
+  try {
+    await seedIdentityWrites(storage, custody.masterKey);
+  } finally {
+    custody.masterKey.fill(0); await custody.masterWriteBarrier?.release();
+  }
 }
 
 async function startOnFreePort(
@@ -656,4 +656,327 @@ describe("Slice 2: single-owner / EADDRINUSE clean-exit (channel level)", () => 
       await owner.stop().catch(() => {});
     }
   });
+});
+
+function unlockDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform))("Deferred standalone session lifetime", () => {
+  let root: string;
+  let dashboard: DashboardApprovalChannel | undefined;
+  let port: number;
+  let savedEnv: NodeJS.ProcessEnv;
+  let sessions: custodyModule.EstablishMasterResult[];
+  const token = "deferred-session-token";
+  const exclusive = () => withExclusiveMasterRotationBarrier(
+    new FilesystemStorage(join(root, "state")), custodyModule.CUSTODY_WRITE_LOCK_NAMESPACE,
+    custodyModule.MASTER_ROTATION_BARRIER_NAME, async () => "entered", { timeoutMs: 0 },
+  );
+  const unlock = () => fetch(`http://127.0.0.1:${port}/api/unlock`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ passphrase: PASSPHRASE }),
+  });
+  const start = async (options: Parameters<typeof startStandaloneDashboard>[0] = {}) => {
+    const result = await startOnFreePort({ host: "127.0.0.1", allowPark: true, ...options });
+    dashboard = result.dashboard;
+    port = result.port;
+  };
+  const assertReleased = async () => {
+    expect(sessions.length).toBeGreaterThan(0);
+    for (const session of sessions) expect(session.masterWriteBarrier!.signal.aborted).toBe(true);
+    await expect(exclusive()).resolves.toBe("entered");
+  };
+  beforeEach(async () => {
+    savedEnv = { ...process.env };
+    root = await mkdtemp(join(tmpdir(), "deferred-session-"));
+    process.env.HOME = root;
+    process.env.SANCTUARY_STORAGE_PATH = root;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = token;
+    delete process.env.SANCTUARY_PASSPHRASE;
+    delete process.env.SANCTUARY_RECOVERY_KEY;
+    await seedWrappedFortress(root);
+    sessions = [];
+    const establish = vi.mocked(custodyModule.establishMaster).getMockImplementation()!;
+    vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+      const session = await establish(options);
+      sessions.push(session);
+      return session;
+    });
+  });
+  afterEach(async () => {
+    try {
+      await dashboard?.stop().catch(() => undefined);
+    } finally {
+      dashboard = undefined;
+      vi.restoreAllMocks();
+      for (const session of sessions) {
+        await session.masterWriteBarrier?.release();
+        session.masterKey.fill(0);
+      }
+      process.env = savedEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stop releases a session unlocked through the authenticated route", async () => {
+    await start();
+    expect((await unlock()).status).toBe(200);
+    expect(sessions[0]!.masterWriteBarrier!.signal.aborted).toBe(false);
+    await expect(exclusive()).rejects.toMatchObject({ kind: "contention" });
+    await dashboard!.stop();
+    await assertReleased();
+  });
+
+  it.each(["acquisition", "attachment"] as const)("stop joins deferred %s before releasing and prevents serving", async (phase) => {
+    const entered = unlockDeferred();
+    const finish = unlockDeferred();
+    const attach = vi.spyOn(DashboardApprovalChannel.prototype, "setDependencies");
+    await start(phase === "attachment" ? { __testFaultAfterLoads: async () => {
+      entered.resolve();
+      await finish.promise;
+    } } : {});
+    if (phase === "acquisition") {
+      const establish = vi.mocked(custodyModule.establishMaster).getMockImplementation()!;
+      vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+        entered.resolve();
+        await finish.promise;
+        return establish(options);
+      });
+    }
+    const request = unlock().catch(() => undefined);
+    let stopped: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      stopped = dashboard!.stop();
+    } finally {
+      finish.resolve();
+      await request;
+      await stopped;
+    }
+    await assertReleased();
+    expect(dashboard!.isParked()).toBe(true);
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("pre-attachment failure releases before admitting a retry", async () => {
+    let fail = true;
+    await start({ __testFaultAfterLoads: () => { if (fail) throw new Error("wiring sentinel"); } });
+    expect((await unlock()).status).toBe(401);
+    await assertReleased();
+    expect(dashboard!.isParked()).toBe(true);
+    fail = false;
+    expect((await unlock()).status).toBe(200);
+    await dashboard!.stop();
+    await assertReleased();
+  });
+
+  it("cleanup failure reports a fixed diagnostic and fences further unlocks", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await start({ __testFaultAfterLoads: () => {
+      const lease = sessions[0]!.masterWriteBarrier!;
+      const release = lease.release.bind(lease);
+      vi.spyOn(lease, "release").mockImplementation(async () => {
+        await release();
+        throw new Error("private cleanup path sentinel");
+      });
+      throw new Error("operation sentinel");
+    } });
+    expect((await unlock()).status).toBe(401);
+    expect(stderr).toHaveBeenCalledWith("Sanctuary Dashboard: cleanup failed.");
+    expect((await unlock()).status).toBe(401);
+    expect(sessions).toHaveLength(1);
+    const stopped = dashboard!.stop();
+    const outcome = await stopped.catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(AggregateError);
+    expect(dashboard!.stop()).toBe(stopped);
+    expect(stderr.mock.calls.filter(([message]) => message === "Sanctuary Dashboard: cleanup failed."))
+      .toHaveLength(1);
+  });
+
+  it("concurrent unlock admission acquires only one session", async () => {
+    const entered = unlockDeferred();
+    const finish = unlockDeferred();
+    await start({ __testFaultAfterLoads: async () => {
+      entered.resolve();
+      await finish.promise;
+    } });
+    const first = unlock();
+    try {
+      await entered.promise;
+      expect((await unlock()).status).toBe(401);
+      expect(sessions).toHaveLength(1);
+    } finally {
+      finish.resolve();
+      await first;
+    }
+    await dashboard!.stop();
+    await assertReleased();
+  });
+
+  it("stopped parked owners refuse late unlock admission", async () => {
+    await start();
+    const handler = (dashboard as unknown as { unlockHandler: (credential: { passphrase: string }) => Promise<boolean> }).unlockHandler;
+    await dashboard!.stop();
+    expect(await handler({ passphrase: PASSPHRASE })).toBe(false);
+    expect(sessions).toHaveLength(0);
+    await expect(exclusive()).resolves.toBe("entered");
+  });
+
+  it("establishment cleanup failure reports refusal and retains its rejected outcome", async () => {
+    await start();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = new AggregateError([new Error("credential sentinel"), new Error("release sentinel")]);
+    const establish = vi.spyOn(custodyModule, "establishMaster").mockRejectedValue(error).mockClear();
+    expect((await unlock()).status).toBe(401);
+    expect(stderr).toHaveBeenCalledWith("Sanctuary Dashboard: cleanup failed.");
+    expect((await unlock()).status).toBe(401);
+    expect(establish).toHaveBeenCalledTimes(1);
+    await expect(dashboard!.stop()).rejects.toBe(error);
+  });
+
+  it.each([false, true])("post-attachment failure exits nonzero and reports cleanup only for a failed release=%s", async (failRelease) => {
+    await start();
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const error = new Error("post-attachment sentinel");
+    const releaseError = new Error("release sentinel");
+    const stderr = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      if (String(args[0]).startsWith("Identities loaded:")) {
+        const lease = sessions[0]!.masterWriteBarrier!;
+        const release = lease.release.bind(lease);
+        vi.spyOn(lease, "release").mockImplementation(async () => {
+          expect((dashboard as unknown as { httpServer: unknown }).httpServer).toBeNull();
+          await release();
+          if (failRelease) throw releaseError;
+        });
+        throw error;
+      }
+    });
+    await unlock().catch(() => undefined);
+    const result = await dashboard!.stop().catch((failure: unknown) => failure);
+    if (failRelease) {
+      expect(result).toBeInstanceOf(AggregateError);
+      const errors = (result as AggregateError).errors;
+      expect(errors[0]).toBe(error);
+      expect(errors[1]).toBe(releaseError);
+    }
+    else expect(result).toBe(error);
+    await assertReleased();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(exit).toHaveBeenCalledExactlyOnceWith(1); // General command failure status.
+    expect(stderr.mock.calls.filter(([message]) => message === "Sanctuary Dashboard: cleanup failed."))
+      .toHaveLength(failRelease ? 1 : 0); // Only a failed release is reported as cleanup, and only once.
+  });
+
+  it.each([false, true])("fatal deferred recovery display failure preserves exit two and reports cleanup only for a rejected release=%s", async (failRelease) => {
+    await start();
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const releaseError = new Error("fatal recovery release sentinel");
+    const releasing = unlockDeferred();
+    const release = unlockDeferred();
+    const exited = unlockDeferred();
+    const establish = vi.mocked(custodyModule.establishMaster).getMockImplementation()!;
+    vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+      const session = await establish(options);
+      session.mintedRecoveryKey = "test-only-recovery-key";
+      const lease = session.masterWriteBarrier!;
+      const originalRelease = lease.release.bind(lease);
+      vi.spyOn(lease, "release").mockImplementation(async () => {
+        releasing.resolve();
+        await release.promise;
+        await originalRelease();
+        if (failRelease) throw releaseError;
+      });
+      return session;
+    });
+    vi.spyOn(escrowModule, "escrowBootRecoveryKey").mockRejectedValue(new escrowModule.BootRecoveryKeyCaptureDeclinedError());
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => { exited.resolve(); return undefined as never; });
+    const handler = (dashboard as unknown as { unlockHandler: (credential: { passphrase: string }) => Promise<boolean> }).unlockHandler;
+    const pending = handler({ passphrase: PASSPHRASE });
+    try {
+      await releasing.promise;
+      expect(exit).not.toHaveBeenCalled();
+      release.resolve();
+      expect(await pending).toBe(false);
+      await dashboard!.stop().catch(() => undefined);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(exit).toHaveBeenCalledWith(2); // Existing fatal recovery-disclosure status.
+      await exited.promise;
+      await assertReleased();
+      expect(stderr.mock.calls.filter(([message]) => message === "Sanctuary Dashboard: cleanup failed."))
+        .toHaveLength(failRelease ? 1 : 0); // A successful release prints no cleanup line.
+      expect(await handler({ passphrase: PASSPHRASE })).toBe(false);
+      expect(sessions).toHaveLength(1);
+    } finally {
+      release.resolve();
+      await pending;
+      await dashboard!.stop().catch(() => undefined);
+    }
+  });
+
+});
+
+import * as custodyModule from "../src/core/master-custody.js";
+import { kernelBackedCrossProcessLockPlatformSupported, withExclusiveMasterRotationBarrier } from "../src/storage/cross-process-lock.js";
+
+async function seedIdentityWrites(storage: FilesystemStorage, masterKey: Uint8Array): Promise<void> {
+  const idEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const writes: Promise<unknown>[] = [];
+  const write = storage.write.bind(storage);
+  const spy = vi.spyOn(storage, "write").mockImplementation((...args) => {
+    const pending = write(...args);
+    writes.push(pending);
+    return pending;
+  });
+  try {
+    const mgr = new IdentityManager(storage, masterKey);
+    await mgr.load();
+    const { storedIdentity } = createIdentity("seeded-0", idEncKey, "passphrase");
+    await mgr.save(storedIdentity);
+  } finally {
+    await Promise.all(writes);
+    spy.mockRestore();
+    idEncKey.fill(0);
+  }
+}
+
+import { DistressListener } from "../src/distress/listener.js";
+
+let rescueSessions: custodyModule.EstablishMasterResult[] = [];
+let rescueChannels: DashboardApprovalChannel[] = [];
+let rescueListeners: DistressListener[] = [];
+
+beforeEach(() => {
+  rescueSessions = [];
+  rescueChannels = [];
+  rescueListeners = [];
+  const establish = custodyModule.establishMaster;
+  vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+    const session = await establish(options);
+    rescueSessions.push(session);
+    return session;
+  });
+  const markStandalone = DashboardApprovalChannel.prototype.setStandaloneMode;
+  vi.spyOn(DashboardApprovalChannel.prototype, "setStandaloneMode").mockImplementation(function (this: DashboardApprovalChannel, ...args) {
+    rescueChannels.push(this);
+    return markStandalone.apply(this, args);
+  });
+  const listen = DistressListener.prototype.start;
+  vi.spyOn(DistressListener.prototype, "start").mockImplementation(function (this: DistressListener) {
+    rescueListeners.push(this);
+    return listen.call(this);
+  });
+});
+
+afterEach(async () => {
+  // Rescue runs after assertions so it cannot satisfy an ownership witness for the owner.
+  vi.restoreAllMocks();
+  for (const channel of rescueChannels) await channel.stop().catch(() => undefined);
+  for (const listener of rescueListeners) await listener.stop().catch(() => undefined);
+  for (const session of rescueSessions) {
+    await session.masterWriteBarrier?.release();
+    session.masterKey.fill(0);
+  }
 });

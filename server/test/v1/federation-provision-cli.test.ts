@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture teardown releases the write barrier before scrubbing the key; behaviour under test is unchanged on the base.
 /**
  * Federation issuer-provision CLI verb tests -- `sanctuary federation provision`
  * (alias `init-issuer`). This verb MINTS the cross-machine root of trust, so the
@@ -182,7 +183,7 @@ describe("federation provision -- mint the issuer trust root (P1, post-state par
         );
         token = session.token;
       } finally {
-        signer.masterKey.fill(0);
+        try { await signer.masterWriteBarrier?.release(); } finally { signer.masterKey.fill(0); }
       }
 
       const statusRes = await fetch(`${rig.baseUrl}/v1/federation/status`, {
@@ -798,7 +799,7 @@ describe("federation provision -- defensive race (record appears between probe a
     const lyingSigner = (async () => ({
       operatorPublicKey,
       storage: lyingStorage,
-      masterKey: Uint8Array.from(masterKey),
+      masterKey: Uint8Array.from(masterKey), masterWriteBarrier: { filesystemBacked: false, assertSessionHeld: () => {}, assertHeld: () => {}, release: async () => {}, signal: new AbortController().signal },
       signPayload: () => "",
       signAttestation: () => ({
         type: "operator_ed25519" as const,

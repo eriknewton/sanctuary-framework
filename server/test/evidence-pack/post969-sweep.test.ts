@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * Sanctuary MCP Server - Evidence Pack: post-#969 sweep regressions (F-1/F-2/F-3)
  *
@@ -358,7 +359,7 @@ describe("F-2: a parse-valid but shape-invalid audit checkpoint is counted and f
     const f = await freshFortress();
     await f.storage.write(
       AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
-      "audit-checkpoint-00000000000000000001",
+      "audit-checkpoint-00000000000000000001", // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
       enc.encode(
         '{"checkpoint_kind":"audit-checkpoint","checkpoint_sequence":"not-a-number"}'
       )
@@ -404,7 +405,7 @@ describe("F-2: a parse-valid but shape-invalid audit checkpoint is counted and f
     };
     await f.storage.write(
       AUDIT_EXPORT_CHECKPOINT_NAMESPACE,
-      "audit-checkpoint-00000000000000000001",
+      "audit-checkpoint-00000000000000000001", // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
       enc.encode(JSON.stringify(driftedShape))
     );
     const chunks: string[] = [];

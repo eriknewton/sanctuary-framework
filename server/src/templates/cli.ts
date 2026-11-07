@@ -17,7 +17,7 @@ import { encodePolicyBlob } from "../policy-engine/canonical-policy.js";
 import { findTenant } from "../cli/agents/discovery.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, closeCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
@@ -201,6 +201,8 @@ async function cmdInit(
   const blob = encodePolicyBlob(compiled);
 
   // Best-effort audit write
+  let session: CliMasterKeySession | undefined;
+  let auditLog: AuditLog | undefined;
   try {
     const storagePath = storagePathOverride ?? (await loadConfig()).storage_path;
     const storage = new FilesystemStorage(`${storagePath}/state`);
@@ -215,13 +217,14 @@ async function cmdInit(
       passphrase = resolved.value;
     }
     // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-    const masterKey = await resolveCliMasterKey(storage, {
+    session = await resolveCliMasterKey(storage, {
       passphrase,
       bootstrap: true,
       storagePathHint: storagePath,
     });
+    const masterKey = session.masterKey;
     const fortressId = fortressIdFromStoragePath(storagePath);
-    const auditLog = new AuditLog(storage, masterKey);
+    auditLog = new AuditLog(storage, masterKey);
     await auditLog.append("l2", "template.init", `fortress:${fortressId}`, {
       template_name: templateName,
       agent_id: agentId,
@@ -229,7 +232,14 @@ async function cmdInit(
       channel: bundle.metadata.channel,
       tier: bundle.metadata.tier,
     });
-  } catch { /* audit best-effort; do not block template init output */ }
+  } catch (error) {
+    if (error instanceof MasterEstablishmentReleaseError) throw error;
+    // Ordinary audit failures preserve the command outcome.
+  }
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  if (session) await closeCliMasterKeySession(session, async () => {
+    try { await auditLog?.flush(); } catch { /* audit best-effort */ }
+  });
 
   out.write("\nTemplate initialized successfully.\n");
   out.write("=".repeat(60) + "\n\n");

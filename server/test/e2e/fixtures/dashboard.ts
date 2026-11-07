@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../../dashboard/construction-work-fixture.js";
 /**
  * Playwright fixture: a real v1.1 dashboard SPA booted against an
  * ephemeral in-memory fortress, served over a node http server, ready
@@ -31,7 +32,6 @@ import { generateRandomKey } from "../../../src/core/random.js";
 import { SubstrateSelector } from "../../../src/intelligence/selector.js";
 import { dispatchV11Request } from "../../../src/dashboard/v1_1/dispatch.js";
 import {
-  buildV11Bindings,
   type V11Bindings,
 } from "../../../src/dashboard/v1_1/wiring.js";
 
@@ -88,7 +88,7 @@ async function startHarness(opts: DashboardHarnessOptions = {}): Promise<Dashboa
     fetchImpl: opts.fetchImpl,
   });
   await selector.load();
-  const bindings = buildV11Bindings({
+  const bindings = await buildV11Bindings({
     identityId: IDENTITY,
     fortressId: FORTRESS,
     auditLog,

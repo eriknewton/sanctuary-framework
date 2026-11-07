@@ -29,7 +29,7 @@ export { AUDIT_SIGNING_LATCH_V2_KEY, AUDIT_SIGNING_HEAD_KEY };
 export function checkpointKey(sequence: number): string {
   // Must match the key layout in writeCheckpointRecord
   // (`${kind}-${20-digit zero-padded sequence}`).
-  return `audit-checkpoint-${String(sequence).padStart(20, "0")}`;
+  return `audit-checkpoint-${String(sequence).padStart(20, "0")}`; // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
 }
 
 export async function seedStoredIdentity(

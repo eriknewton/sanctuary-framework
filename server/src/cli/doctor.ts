@@ -14,7 +14,7 @@ import { getSanctuaryVersion } from "../version.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { isCustodyFsError, readFileCustody } from "../storage/custody-fs.js";
 import { IdentityManager } from "../cognitive/tools.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, type CliMasterKeySession, withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
 import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
@@ -188,23 +188,27 @@ export async function runDoctorChecks(opts: {
   const checks: DoctorCheck[] = [];
   checks.push(checkRequiredNodeVersion(opts.nodeVersion));
   checks.push(await checkStateDir(opts.storagePath));
-  const masterKey = await resolveMasterKeyIfAvailable(opts.storagePath, opts.env);
-  checks.push(await checkIdentity(opts.storagePath, masterKey));
-  checks.push(await checkPolicy(opts.storagePath));
-  checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
-  checks.push(await checkCustodyFactors(opts.storagePath));
-  checks.push(await checkInterruptedExitImport(opts.storagePath));
-  checks.push(await checkExitAdmissionLock(opts.storagePath));
-  checks.push(checkRuntime());
-  checks.push(await checkHermesConfigParser(opts));
-  checks.push(await checkCastleWall(opts));
-  checks.push(await checkLinuxManifestAdmission(opts));
-  const harnessIds = await collectWrappedHarnessAgentIds();
-  checks.push(checkWrappedHarnessAgentIds(harnessIds));
-  checks.push(await checkSdwOwnerTransferLock(opts.storagePath));
-  checks.push(await checkSdwOwnerPin(opts.storagePath, masterKey, harnessIds));
-  if (masterKey) masterKey.fill(0);
-  return checks;
+  const session = await resolveMasterKeyIfAvailable(opts.storagePath, opts.env);
+  const masterKey = session?.masterKey ?? null;
+  const check = async () => {
+    checks.push(await checkIdentity(opts.storagePath, masterKey));
+    checks.push(await checkPolicy(opts.storagePath));
+    checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
+    checks.push(await checkCustodyFactors(opts.storagePath));
+    checks.push(await checkInterruptedExitImport(opts.storagePath));
+    checks.push(await checkExitAdmissionLock(opts.storagePath));
+    checks.push(checkRuntime());
+    checks.push(await checkHermesConfigParser(opts));
+    checks.push(await checkCastleWall(opts));
+    checks.push(await checkLinuxManifestAdmission(opts));
+    const harnessIds = await collectWrappedHarnessAgentIds();
+    checks.push(checkWrappedHarnessAgentIds(harnessIds));
+    checks.push(await checkSdwOwnerTransferLock(opts.storagePath));
+    checks.push(await checkSdwOwnerPin(opts.storagePath, masterKey, harnessIds));
+    return checks;
+  };
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return session ? withCliMasterKeySession(session, check) : check();
 }
 
 /**
@@ -1049,19 +1053,21 @@ async function checkLinuxManifestAdmission(opts: {
 async function resolveMasterKeyIfAvailable(
   storagePath: string,
   env: NodeJS.ProcessEnv,
-): Promise<Uint8Array | null> {
+): Promise<CliMasterKeySession | null> {
   if (!env.SANCTUARY_RECOVERY_KEY && !env.SANCTUARY_PASSPHRASE) return null;
   const storage = new FilesystemStorage(join(storagePath, "state"));
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   // Doctor is a read-only diagnostic: an unresolvable master degrades the
-  // identity check (null) instead of aborting the run. Recovery key keeps
-  // precedence over passphrase, matching the legacy resolution order.
+  // identity check (null); a master-session release failure (at establishment
+  // or after the checks) aborts the run.
+  // Recovery key keeps precedence over passphrase, matching the legacy order.
   //
   // STATED BOUND (HIGH-2, coordinator gate, 2026-08-22): this file does NOT
   // call `recoverInterruptedExitImportsOrThrow` (server/src/exit/bundle.ts),
   // even where a master key is available. Every check in this file,
-  // including this one, is deliberately read-only and never-aborting by
-  // design (the whole point of `doctor` is to diagnose a fortress that may
+  // including this one, is deliberately read-only and continues on ordinary
+  // diagnostic failures; a master-session release failure is the one class
+  // that aborts the run (doctor diagnoses a fortress that may
   // already be broken); recovery is a WRITE that can also THROW, both of
   // which contradict that contract. A fortress with a half-applied
   // exit-import is still diagnosable read-only by every check here; it
@@ -1073,7 +1079,9 @@ async function resolveMasterKeyIfAvailable(
         : { passphrase: env.SANCTUARY_PASSPHRASE! }),
       storagePathHint: storagePath,
     });
-  } catch {
+  } catch (error) {
+    // Optional credentials cannot hide a failed establishment release.
+    if (error instanceof MasterEstablishmentReleaseError) throw error;
     return null;
   }
 }

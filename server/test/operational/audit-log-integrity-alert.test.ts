@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { describe, expect, it } from "vitest";
 import {
   AuditIntegrityError,
@@ -23,7 +24,7 @@ describe("AuditLog integrity alerting", () => {
     }
 
     const second = (await storage.list("_audit", "entry-")).find((meta) =>
-      meta.key.startsWith("entry-00000000000000000002-")
+      meta.key.startsWith("entry-00000000000000000002-") // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     );
     if (!second) throw new Error("missing second audit entry");
     await storage.delete("_audit", second.key);

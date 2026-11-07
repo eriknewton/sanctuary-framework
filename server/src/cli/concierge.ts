@@ -5,7 +5,7 @@ import { readTenantRuntime } from "./agents/runtime.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { loadConfig } from "../config.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { transferCliMasterKeySession, closeCliMasterKeySession, withCliFinalization, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { StateStore } from "../cognitive/state-store.js";
 import { AuditLog } from "../operational/audit-log.js";
@@ -126,7 +126,7 @@ async function status(
   const json = hasFlag(ctx.argv, "--json");
   const result = ctx.dashboardUrl || env.SANCTUARY_DASHBOARD_URL
     ? await statusViaHub(ctx)
-    : await (await (localServiceFactory ?? createLocalService)(env)).status();
+    : await statusLocal(env, localServiceFactory);
   if (json) {
     out.write(JSON.stringify(result, null, 2) + "\n");
   } else {
@@ -163,69 +163,107 @@ async function askLocal(
   env: NodeJS.ProcessEnv,
   localServiceFactory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
 ): Promise<ConciergeAskResponse> {
-  const service = await (localServiceFactory ?? createLocalService)(env);
-  return service.ask(payload, payload.stream ? (token) => out.write(token) : undefined);
+  const local = await localContext(env, localServiceFactory);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return withCliFinalization(
+    () => local.service.ask(payload, payload.stream ? (token) => out.write(token) : undefined),
+    local.close,
+  );
 }
 
-async function createLocalService(env: NodeJS.ProcessEnv): Promise<ConciergeService> {
+interface LocalConciergeContext {
+  service: ConciergeService;
+  close: () => Promise<void>;
+}
+
+async function localContext(
+  env: NodeJS.ProcessEnv,
+  factory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
+): Promise<LocalConciergeContext> {
+  return factory
+    ? { service: await factory(env), close: async () => { } }
+    : createLocalService(env);
+}
+
+async function statusLocal(
+  env: NodeJS.ProcessEnv,
+  factory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
+): Promise<ConciergeStatus> {
+  const local = await localContext(env, factory);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return withCliFinalization(() => local.service.status(), local.close);
+}
+
+async function createLocalService(env: NodeJS.ProcessEnv): Promise<LocalConciergeContext> {
   const config = await loadConfig();
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
   const storage = new FilesystemStorage(join(config.storage_path, "state"));
-  const masterKey = await resolveMasterKey(storage, env);
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loaded = await identityManager.load();
-  if (loaded.loaded === 0) {
-    throw new ConciergeReadError("no readable identities found for this fortress");
-  }
-  const identity = identityManager.getDefault();
-  if (!identity) throw new ConciergeReadError("no primary identity found");
-  const stateStore = new StateStore(storage, masterKey);
-  const auditLog = new AuditLog(storage, masterKey, { integrityMode: "strict" });
-  const compiledContextRuntime = createCompiledContextRuntime({
-    storage,
-    masterKey,
-    auditLog,
-    fortressId: config.storage_path,
-    identityId: identity.identity_id,
-  });
-  const selector = new SubstrateSelector({
-    storage,
-    masterKey,
-    auditLog,
-    identityId: identity.identity_id,
-    compiledContextScanner: compiledContextRuntime.scanner,
-  });
-  await selector.load();
-  const taskService = new TaskService({
-    stateStore,
-    auditLog,
-    fortressId: config.storage_path,
-    identityId: identity.identity_id,
-    signingIdentity: identity,
-    identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
-  });
-  const reader = new SanctuaryContextReader({
-    auditLog,
-    identityManager,
-    stateStore,
-    taskService,
-    config,
-    storagePath: config.storage_path,
-    fortressId: config.storage_path,
-    identityId: identity.identity_id,
-    inboxSources: emptyInboxSources(),
-    policyBudgetSources: emptyPolicyBudgetSources(),
-  });
-  return new ConciergeService({
-    reader,
-    selector,
-  });
+  const session = await resolveMasterKey(storage, env);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loaded = await identityManager.load();
+    if (loaded.loaded === 0) {
+      throw new ConciergeReadError("no readable identities found for this fortress");
+    }
+    const identity = identityManager.getDefault();
+    if (!identity) throw new ConciergeReadError("no primary identity found");
+    const stateStore = new StateStore(storage, masterKey);
+    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "strict" });
+    sessionAuditLog = auditLog;
+    const compiledContextRuntime = createCompiledContextRuntime({
+      storage,
+      masterKey,
+      auditLog,
+      fortressId: config.storage_path,
+      identityId: identity.identity_id,
+    });
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: identity.identity_id,
+      compiledContextScanner: compiledContextRuntime.scanner,
+    });
+    await selector.load();
+    const taskService = new TaskService({
+      stateStore,
+      auditLog,
+      fortressId: config.storage_path,
+      identityId: identity.identity_id,
+      signingIdentity: identity,
+      identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
+    });
+    const reader = new SanctuaryContextReader({
+      auditLog,
+      identityManager,
+      stateStore,
+      taskService,
+      config,
+      storagePath: config.storage_path,
+      fortressId: config.storage_path,
+      identityId: identity.identity_id,
+      inboxSources: emptyInboxSources(),
+      policyBudgetSources: emptyPolicyBudgetSources(),
+    });
+    return {
+      service: new ConciergeService({
+        reader,
+        selector,
+      }),
+      // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+      close: () => closeCliMasterKeySession(session, () => auditLog.flush()),
+    };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function resolveMasterKey(
   storage: FilesystemStorage,
   env: NodeJS.ProcessEnv,
-): Promise<Uint8Array> {
+): Promise<CliMasterKeySession> {
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (env.SANCTUARY_PASSPHRASE) {
     return resolveCliMasterKey(storage, { passphrase: env.SANCTUARY_PASSPHRASE });

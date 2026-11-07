@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /** Audit log operational witnesses, set B. */
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,7 @@ import { installInMemoryKeychainStore } from "../setup/keychain-memory-store.js"
 
 const SEED_OPERATIONS = ["first", "second", "third"];
 const SEED_SEQUENCE = SEED_OPERATIONS.length;
-const ENTRY_SEQUENCE_WIDTH = 20; // Matches the persisted entry key's decimal sequence width.
+const ENTRY_SEQUENCE_WIDTH = 20; // Matches the persisted entry key's decimal sequence width. // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
 const OPTIONS = { checkpointInterval: 0 }; // 0 = periodic checkpoints off.
 
 async function append(log: AuditLog, operation: string): Promise<void> {
