@@ -4,6 +4,7 @@ import { parseStrictJson } from "../hermes-memory-bridge/strict-json.js";
 import { isStrictEd25519PointEncoding } from "../core/identity.js";
 import { canonicalJson } from "../audit/chain.js";
 import { AUDIT_CHAIN_GENESIS, AUDIT_CHAIN_SCHEMA_VERSION } from "../audit/checkpoint-shape.js";
+import { TRANSPARENCY_BUNDLE_FORMAT } from "../transparency/checkpoint.js";
 import { isVerifierCheckpointRecord, type VerifierCheckpointRecord } from "../transparency/verify.js";
 import type { ExportRecord } from "../cli/audit-chain-verify.js";
 
@@ -31,8 +32,8 @@ export const MAX_FILE_BYTES = 67108864;
 export const MAX_PACK_BYTES = 268435456;
 export const MAX_FILES = 256;
 export const MAX_NAME_BYTES = 128;
-// Must match TRANSPARENCY_BUNDLE_FORMAT in transparency/checkpoint.ts and transparency/verify.ts.
-export const TRANSPARENCY_BUNDLE_FORMAT = "SANCTUARY_TRANSPARENCY_BUNDLE_V1";
+// Imported, not copied, so a bundle format change in the transparency producer cannot silently fail every pack.
+export { TRANSPARENCY_BUNDLE_FORMAT };
 export const MAX_JSON_DEPTH = 32;
 export const MAX_RECORDS = 100000;
 export const MAX_JSONL_LINE_BYTES = 1048576;

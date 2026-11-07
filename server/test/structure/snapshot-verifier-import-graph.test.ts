@@ -10,7 +10,7 @@ const ALLOWED = [
   "core/encoding.ts", "core/encryption.ts", "core/hashing.ts", "core/identity.ts", "core/random.ts", "core/rotation-chain.ts",
   "errors/config-error.ts", "errors/index.ts", "errors/profile-error.ts", "errors/untrusted-diagnostic.ts",
   "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
-  "hermes-memory-bridge/constants.ts", "hermes-memory-bridge/strict-json.ts", "lockdown/status.ts", "transparency/verify.ts",
+  "hermes-memory-bridge/constants.ts", "hermes-memory-bridge/strict-json.ts", "lockdown/status.ts", "transparency/checkpoint.ts", "transparency/verify.ts",
 ];
 // Existing audit CLI imports filesystem helpers; the pure entry never calls its I/O functions.
 const EXTERNAL = new Set(["@noble/curves/ed25519", "@noble/hashes/sha256", "@noble/hashes/hmac", "@noble/hashes/sha512", "@noble/hashes/hkdf", "@noble/ciphers/aes.js", "node:crypto", "crypto", "node:fs", "node:fs/promises", "node:path"]);
