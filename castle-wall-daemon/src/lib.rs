@@ -19,6 +19,9 @@
 
 pub(crate) mod admitted_identity;
 #[cfg(target_os = "linux")]
+/// Isolated role contract; no business runtime is enabled.
+pub mod business_profile;
+
 pub mod agent_launch;
 pub mod agent_start;
 pub mod approval;

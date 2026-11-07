@@ -508,6 +508,8 @@ export class IdentityManager {
    * recheck, not a second expensive re-parse.
    */
   private assertValidStoredIdentity(identity: StoredIdentity): void {
+    // Dedicated role identities cannot enter the operator namespace, even through an explicit import.
+    if (identity.label.startsWith("k1-role:")) throw new Error("K1_ROLE_IDENTITY_REFUSED");
     let decoded: Uint8Array;
     try {
       decoded = fromBase64url(identity.public_key);

@@ -65,7 +65,23 @@ export const MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX =
  * federation records) are not listed: an identity signature cannot satisfy
  * them. Adding a domain here is how a future artifact joins the refusal.
  */
+// Contract pin: signing/contract.ts and its generated Rust registry contain these exact K1 domains.
+export const K1_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
+  "sanctuary.linux-business.record.v0\n",
+  "sanctuary.linux-business.policy.v0\n",
+  "sanctuary.linux-business.retrospective.v0\n",
+  "sanctuary.model-record.v0\n",
+  "sanctuary.model-policy.v0\n",
+  "sanctuary.model-session.v0\n",
+  "sanctuary.model-extent.v0\n",
+  "sanctuary.evidence-pack.manifest.k1.v1\n",
+  "sanctuary.producer-custody.descriptor.v1\n",
+  "sanctuary.producer-custody.rotation.v1\n",
+  "sanctuary.k1.unlock-self-test.v1\n"
+];
+
 export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
+  ...K1_SIGNING_DOMAIN_PREFIXES,
   SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
   STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX,
   AUDIT_EVENT_SIGNING_DOMAIN_PREFIX,

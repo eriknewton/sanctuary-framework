@@ -351,3 +351,30 @@ describe("internal identity signing helpers", () => {
     expect(verified.valid).toBe(true);
   });
 });
+
+
+describe("K1 operator protocol separation", () => {
+  it("identity_sign cannot mint a role record and a role signature fails the pinned operator protocol", async () => {
+    const {ROLE_REGISTRY,canonicalBytes,ROLE_SIGNATURE_SCHEME,safeInteger,recordMessage} = await import("../src/signing/contract.js");
+    const {prepareRoleIdentity} = await import("../src/signing/provision.js");
+    const {EncryptedIdentityProvider} = await import("../src/signing/identity-provider.js");
+    const {verifyRecord} = await import("../src/signing/strict-verifier.js");
+    const {z} = await import("zod");
+    const rig=makeRig(); const identity=await callTool(rig.tools,"identity_create",{label:"operator fixture"});
+    const key=generateRandomKey();const role=ROLE_REGISTRY[3].role;
+    const prepared=prepareRoleIdentity(role,1,"a".repeat(32),key,[],[]);
+    const provider=new EncryptedIdentityProvider(prepared.storedIdentity,key,prepared.pin);
+    try {
+      const bytes=canonicalBytes({signature_scheme:ROLE_SIGNATURE_SCHEME,role,epoch:1,kid:prepared.pin.kid,identity_id:prepared.pin.identity_id,machine_id:prepared.pin.machine_id,payload:{count:1}});
+      const raw=await callTool(rig.tools,"identity_sign",{identity_id:identity.identity_id,payload:toBase64url(bytes)});
+      expect(typeof raw.signature).toBe("string");
+      expect(verifyRecord(bytes,raw.signature as string,prepared.pin,z.object({count:safeInteger}).strict())).toBe(false);
+      const denied=await callTool(rig.tools,"identity_sign",{identity_id:identity.identity_id,payload:toBase64url(recordMessage(role,bytes))});
+      expect(denied.signature).toBeUndefined();
+      const own=provider.sign(recordMessage(role,bytes));
+      expect(identityVerify(recordMessage(role,bytes),own,fromBase64url(raw.public_key as string))).toBe(false);
+      await expect(callTool(rig.tools,"identity_sign",{identity_id:prepared.pin.identity_id,payload:toBase64url(bytes)})).rejects.toThrow();
+      await expect(rig.identityManager.save(prepared.storedIdentity)).rejects.toThrow("K1_ROLE_IDENTITY_REFUSED");
+    } finally {provider.close();key.fill(0);rig.masterKey.fill(0);}
+  });
+});
