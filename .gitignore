@@ -103,3 +103,6 @@ server/reports/mutation/
 # cargo-mutants output (mutated enforcement source, test logs, a lock file naming user and host)
 castle-wall-daemon/mutants.out/
 castle-wall-daemon/mutants.out.old/
+
+# Ignore lease guard fixtures that survive an interrupted test run.
+server/.lease-guard-*

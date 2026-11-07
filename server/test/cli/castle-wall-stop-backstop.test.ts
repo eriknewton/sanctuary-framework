@@ -31,6 +31,7 @@ describe("CLI stop completion fence", () => {
     const prior = new Map(["SIGINT", "SIGTERM"].map(signal => [signal, new Set(process.rawListeners(signal))]));
     let run: Promise<number> | undefined;
     const sessionCleanup: Array<() => Promise<void>> = [];
+    const errors: unknown[] = [];
     try {
       await initializeTestCustody(root, { passphrase });
       expect(await runProvisionPin(["--fortress", root], { out: new Capture(), err: new Capture(), env: { HOME: home, SANCTUARY_PASSPHRASE: passphrase }, globalPinnedPublicKeyPath: join(root, "pin") })).toBe(0);
@@ -90,17 +91,25 @@ describe("CLI stop completion fence", () => {
         expect(order, "returning exit and late release start no later cleanup action").toEqual(before);
         expect(clean).not.toHaveBeenCalled();
       }
+    } catch (error) {
+      errors.push(error);
     } finally {
       gate.resolve(); vi.useRealTimers();
       try {
         for (const signal of ["SIGINT", "SIGTERM"]) for (const listener of process.rawListeners(signal)) if (!prior.get(signal)!.has(listener)) { Reflect.apply(listener, process, []); process.removeListener(signal, listener); }
         await run;
+      } catch (error) {
+        if (!errors.includes(error)) errors.push(error);
       } finally {
         const results = await Promise.allSettled(sessionCleanup.map(cleanup => cleanup()));
         const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
-        if (failures.length > 0) throw new AggregateError(failures, "Stop fixture session cleanup failed");
-        await rm(root, { recursive: true, force: true });
+        if (failures.length > 0) errors.push(new AggregateError(failures, "Stop fixture session cleanup failed"));
+        try { await rm(root, { recursive: true, force: true }); }
+        catch (error) { errors.push(error); }
       }
     }
+    // Preserve the run or assertion failure before any teardown failures.
+    if (errors.length > 1) throw new AggregateError(errors, "Stop fixture run and cleanup failed");
+    if (errors.length > 0) throw errors[0];
   });
 });
