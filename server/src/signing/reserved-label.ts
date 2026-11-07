@@ -7,6 +7,8 @@ export const ROLE_IDENTITY_REFUSED = "K1_ROLE_IDENTITY_REFUSED";
  * it before any key generation, storage write or audit append, so a refusal leaves no record asserting success.
  */
 export function assertAdmissibleIdentityLabel(label: unknown): void {
+  // A non-string label refuses too: an admission path that casts unvalidated input must fail closed, never skip the check.
+  if (typeof label !== "string") throw new Error(ROLE_IDENTITY_REFUSED);
   // The prefix is reserved for dedicated role identities, so no operator admission path can mint a look-alike label.
-  if (typeof label === "string" && label.startsWith(ROLE_IDENTITY_LABEL_PREFIX)) throw new Error(ROLE_IDENTITY_REFUSED);
+  if (label.startsWith(ROLE_IDENTITY_LABEL_PREFIX)) throw new Error(ROLE_IDENTITY_REFUSED);
 }

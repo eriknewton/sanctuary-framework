@@ -3,6 +3,7 @@ import {readFileSync,readdirSync} from "node:fs";
 import {resolve,join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {execFileSync} from "node:child_process";
+import {assertAdmissibleIdentityLabel} from "../../src/signing/reserved-label.js";
 import {ROLE_REGISTRY,COMMON_FIELDS,LINUX_FIELDS,PRODUCER_DESCRIPTOR_DOMAIN,PRODUCER_ROTATION_DOMAIN,UNLOCK_CHALLENGE_DOMAIN} from "../../src/signing/contract.js";
 import {K1_SIGNING_DOMAIN_PREFIXES} from "../../src/core/signing-domains.js";
 const root=resolve(fileURLToPath(import.meta.url),"../../../..");
@@ -63,6 +64,16 @@ it("evaluates the pinned canonical kid vector shared with Rust and keeps vectors
   expect(source.match(/const PINNED_KID: &str = "([^"]+)";/)?.[1]).toBe(PINNED_KID_VECTOR.kid);
   expect(source).not.toContain("../../../server/");
 });
+it("keeps every K1 signing domain prefix-free so a domain match cannot select the wrong lifecycle body", () => {
+  const domains = [...K1_SIGNING_DOMAIN_PREFIXES];
+  for (const a of domains) for (const b of domains) if (a !== b) expect(b.startsWith(a)).toBe(false);
+});
+
+it("refuses a non-string label at admission instead of skipping the reserved-prefix check", () => {
+  for (const bad of [undefined, null, 7, {toString: () => "k1-role:x"}, new String("k1-role:x")]) expect(() => assertAdmissibleIdentityLabel(bad)).toThrow("K1_ROLE_IDENTITY_REFUSED");
+  expect(() => assertAdmissibleIdentityLabel("operator")).not.toThrow();
+});
+
 it("keeps the reserved role label literal in its one shared helper", () => {
   const sourceRoot = join(root, "server/src");
   const users = readdirSync(sourceRoot, {recursive: true}).filter((name): name is string => typeof name === "string" && name.endsWith(".ts"))
