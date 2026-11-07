@@ -1,3 +1,4 @@
+import { FederationWork } from "../dashboard/federation-work.js";
 import { createPosturePanelStore, POSTURE_PRELUDE_BUDGET_MS } from "./panel-producer.js";
 /**
  * Sanctuary MCP Server - Principal Dashboard
@@ -1374,18 +1375,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * mean completion happens at the next tick after `completesAt`, never before.
    */
   private _federationBreakGlassPoll: ReturnType<typeof setInterval> | null = null;
-  /**
-   * F1 E1: in-flight guard for {@link tickFederationGuardianBreakGlass}. A tick
-   * awaits an async audit write + (on completion) a durable persist; without
-   * this guard, a slow tick overlapping the next interval firing (or many
-   * timers compressed into one macrotask flush, as happens under fake timers
-   * in tests) could run two ticks CONCURRENTLY against the same audit log /
-   * live fields, corrupting the audit hash chain. Skipping an overlapping tick
-   * is always safe: the poll only ever needs to observe `completesAt` has
-   * elapsed at SOME later tick, and the next interval (or the tick already in
-   * flight) covers that.
-   */
-  private _federationBreakGlassTickInFlight = false;
   private readonly _federationRoster = new Set<string>();
   private _federationState: FederationDashboardState = {
     eventLog: [],
@@ -1407,18 +1396,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private _fleetReResolveTimer: ReturnType<typeof setInterval> | null = null;
   private _fleetPriorCap: PriorCapState | null = null;
-  /**
-   * Fleet control plane PR-3 fix: in-flight latch that SERIALIZES the re-resolve
-   * tick. Two ticks can overlap (the hourly interval and the push-triggered
-   * reconcile), and the grandfather auto-capture reads `record.status === "absent"`
-   * BEFORE it writes - two concurrent ticks would both pass that guard and race on
-   * the write, letting the last writer lock in a transient count or lower the
-   * baseline. This holds the running tick's promise so a second call awaits it
-   * (or no-ops) instead of racing. Cleared in a `finally` so a thrown tick never
-   * wedges the latch. (The write itself is also grow-only at the persistence layer;
-   * this latch removes the read-then-write TOCTOU window as well.)
-   */
-  private _fleetReResolveInFlight: Promise<void> | null = null;
+  private _federationWork = new FederationWork();
+  private _federationTerminal = false;
+  private _federationDisposal: Promise<void> | undefined;
+  private _federationBindingGeneration = 0;
+  private _federationSigningKeyOwnership: "borrowed" | "owned" = "borrowed";
   /** Default license re-resolve cadence: hourly (expiry/revocation are coarse). */
   private static readonly FLEET_RE_RESOLVE_INTERVAL_MS = 60 * 60 * 1000;
   /**
@@ -1429,7 +1411,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private readonly _federationAcceptedHighWater = new Map<string, number>();
   private _federationOutboundHighWater = 0;
-  private _operatorAuthorizationSpentStore = new OperatorAuthorizationSpentStore();
+  private _operatorAuthorizationSpentStore: OperatorAuthorizationSpentStore | null = new OperatorAuthorizationSpentStore();
   private _operatorAuthorizationSpentStoreUnavailable = false;
   /**
    * Federation 3/3b P0: DURABLE peer-sync security state. The store persists +
@@ -1440,7 +1422,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * in memory with the same semantics).
    */
   private _federationSyncStateStore: FederationSyncStateStore | null = null;
-  private _federationReissueChallengeStore = new FederationReissueChallengeStore();
+  private _federationReissueChallengeStore: FederationReissueChallengeStore | null = new FederationReissueChallengeStore();
   private _federationReissueChallengeStoreUnavailable = false;
   /**
    * FAIL-CLOSED latch (DUR-4 / CC-2). Set true when the durable sync-state
@@ -3087,7 +3069,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     authorizationNonce,
     operatorPublicKey,
   }: OperatorAuthorizationConsumeParams): Promise<"consumed" | "replayed"> {
-    if (this._operatorAuthorizationSpentStoreUnavailable) {
+    if (this._operatorAuthorizationSpentStoreUnavailable || this._operatorAuthorizationSpentStore === null) {
       throw new Error("operator_authorization_spent_store_unavailable");
     }
     return await this._operatorAuthorizationSpentStore.consume({
@@ -3198,12 +3180,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * and every authorize path fails closed. Detaching also clears the enabled
    * flag (a federation with no materials cannot be enabled).
    */
-  setFederationContext(ctx: FederationContext | null): void {
+  setFederationContext(
+    ctx: FederationContext | null,
+    signingKeyOwnership: "borrowed" | "owned" = "borrowed",
+  ): Promise<void> {
+    if (ctx !== null) assertNonIssuerContextHasNoIssuerAuthority(ctx);
+    const generation = ++this._federationBindingGeneration;
+    if (ctx === null) {
+      if (this._federationDisposal || !this._federationWork.idle) return this.disposeFederation();
+      this.sealFederationGeneration();
+      this.detachFederation();
+      return Promise.resolve();
+    }
+    const bind = () => {
+      if (this._federationTerminal || generation !== this._federationBindingGeneration) return;
+      if (!this._federationWork.accepting) this._federationWork = new FederationWork();
+      this._federationSigningKeyOwnership = signingKeyOwnership;
+      // Replacing materials preserves the live stores, revocations and operator decision after settlement.
+      this.bindFederationContext(ctx);
+      if (this._federationGuardianBreakGlass !== null) this.armFederationGuardianBreakGlassPoll();
+    };
+    if (this._federationDisposal) return this._federationDisposal.then(bind);
+    if (!this._federationWork.idle) return this.quiesceFederation().then(bind);
+    if (this._federationContext !== null) this.sealFederationGeneration();
+    bind();
+    return Promise.resolve();
+  }
+
+  private bindFederationContext(ctx: FederationContext | null): void {
     this.stopFederationCertificateAutoRenewal();
     this.stopFleetLicenseReResolve();
+    this.stopFederationGuardianBreakGlassPoll();
     if (ctx !== null) {
       assertNonIssuerContextHasNoIssuerAuthority(ctx);
     }
+    const replacing = this._federationContext !== null;
     this._federationContext = ctx;
     if (ctx === null) {
       this._federationEnabled = false;
@@ -3217,7 +3228,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       };
       return;
     }
-    this.reprojectFederationRevocations(ctx);
+    if (!replacing) this.reprojectFederationRevocations(ctx);
     if (ctx.revokedRootPubkeys instanceof Set) {
       for (const pubkey of ctx.revokedRootPubkeys) {
         this._federationRevokedRoots.add(pubkey);
@@ -3230,8 +3241,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       );
     }
     ctx.isNodeRevoked = (nodeId) => this.isFederationNodeRevoked(nodeId);
+    const owner = this._federationWork;
     this._federationRenewal = startFederationNodeCertificateAutoRenewal({
-      renewNow: () => this.renewLocalFederationNodeCertificate(),
+      renewNow: () => this.renewLocalFederationNodeCertificate(owner),
       config: ctx.nodeCertificateRenewal,
     });
     this.startFleetLicenseReResolve();
@@ -3246,10 +3258,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private startFleetLicenseReResolve(): void {
     this.stopFleetLicenseReResolve();
+    if (!this._federationWork.accepting) return;
+    const owner = this._federationWork;
     // Fire once now, then on the interval. Never let a tick throw escape.
-    void this.runFleetLicenseReResolveTick();
+    void this.runFleetLicenseReResolveTick(owner);
     this._fleetReResolveTimer = setInterval(() => {
-      void this.runFleetLicenseReResolveTick();
+      void this.runFleetLicenseReResolveTick(owner);
     }, DashboardApprovalChannel.FLEET_RE_RESOLVE_INTERVAL_MS);
     this._fleetReResolveTimer.unref?.();
   }
@@ -3268,19 +3282,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * with no unlocked custody (locked/standalone) is a no-op. Never touches a
    * node's wall.
    */
-  private runFleetLicenseReResolveTick(): Promise<void> {
-    // Serialize: if a tick is already running, return the SAME promise so a second
-    // caller (the hourly interval firing while a push-triggered tick is mid-flight,
-    // or vice versa) awaits it rather than racing the absent-record capture guard.
-    // Cleared in `finally` so a thrown tick never wedges the latch.
-    if (this._fleetReResolveInFlight !== null) {
-      return this._fleetReResolveInFlight;
-    }
-    const run = this.runFleetLicenseReResolveTickOnce().finally(() => {
-      this._fleetReResolveInFlight = null;
-    });
-    this._fleetReResolveInFlight = run;
-    return run;
+  private runFleetLicenseReResolveTick(owner = this._federationWork): Promise<void> {
+    if (!this.storage || !this.shrOpts?.masterKey) return Promise.resolve();
+    return owner.run("fleet", () => this.runFleetLicenseReResolveTickOnce());
   }
 
   /**
@@ -3900,8 +3904,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     intervalMs = FEDERATION_BREAK_GLASS_POLL_INTERVAL_MS,
   ): void {
     this.stopFederationGuardianBreakGlassPoll();
+    if (!this._federationWork.accepting) return;
+    const owner = this._federationWork;
     const tick = (): void => {
-      void this.tickFederationGuardianBreakGlass();
+      void this.tickFederationGuardianBreakGlass(owner);
     };
     const timer = setInterval(tick, intervalMs);
     timer.unref?.();
@@ -3928,14 +3934,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * can complete once the operator clears the latch (e.g. via a re-pin, which
    * recovers the F3 latch on the increase path).
    */
-  private async tickFederationGuardianBreakGlass(): Promise<void> {
-    if (this._federationBreakGlassTickInFlight) return;
-    this._federationBreakGlassTickInFlight = true;
-    try {
-      await this.tickFederationGuardianBreakGlassInner();
-    } finally {
-      this._federationBreakGlassTickInFlight = false;
-    }
+  private tickFederationGuardianBreakGlass(owner = this._federationWork): Promise<void> {
+    return owner.run("guardian", () => this.tickFederationGuardianBreakGlassInner());
   }
 
   private async tickFederationGuardianBreakGlassInner(): Promise<void> {
@@ -3997,9 +3997,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   async setFederationSyncStateStore(
     store: FederationSyncStateStore | null,
   ): Promise<void> {
+    if (store !== null && this._federationTerminal) return;
     this._federationSyncStateStore = store;
     if (store === null) {
-      this._federationSyncStateUnavailable = false;
+      // Unbinding durable state refuses late callers until a new session hydrates it.
+      this._federationSyncStateUnavailable = true;
       return;
     }
     await this.hydrateFederationSyncState();
@@ -4015,8 +4017,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   async setFederationReissueChallengeStore(
     store: FederationReissueChallengeStore | null,
   ): Promise<void> {
-    this._federationReissueChallengeStore = store ?? new FederationReissueChallengeStore();
-    this._federationReissueChallengeStoreUnavailable = false;
+    if (store !== null && this._federationTerminal) return;
+    this._federationReissueChallengeStore = store;
+    // Unbinding the durable challenge store must not admit proofs into an empty spent set.
+    this._federationReissueChallengeStoreUnavailable = store === null;
     if (store === null) return;
     try {
       await store.init();
@@ -4035,9 +4039,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   async setOperatorAuthorizationSpentStore(
     store: OperatorAuthorizationSpentStore | null,
   ): Promise<void> {
-    this._operatorAuthorizationSpentStore =
-      store ?? new OperatorAuthorizationSpentStore();
-    this._operatorAuthorizationSpentStoreUnavailable = false;
+    if (store !== null && this._federationTerminal) return;
+    this._operatorAuthorizationSpentStore = store;
+    // Unbinding durable authorization history refuses consumption until a new store is loaded.
+    this._operatorAuthorizationSpentStoreUnavailable = store === null;
     if (store === null) return;
     try {
       await store.init();
@@ -4192,6 +4197,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationSyncStateUnavailable = true;
       return;
     }
+    // A completed load cannot reopen a store that the session has already unbound.
+    if (store !== this._federationSyncStateStore) return;
     this._federationSyncStateUnavailable = false;
     this._federationEnabled = snapshot.federationEnabled ?? false;
     this._federationEnabledGeneration = Math.max(
@@ -4778,9 +4785,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private async persistFederationSyncState(): Promise<void> {
     const store = this._federationSyncStateStore;
-    if (store === null) return;
+    if (store === null) {
+      // A detached durable store cannot acknowledge a write that was never persisted.
+      this.assertFederationSyncStateAvailable();
+      return;
+    }
     await store.persist(this.snapshotFederationSyncState());
-    this._federationSyncStateUnavailable = false;
+    if (store === this._federationSyncStateStore) this._federationSyncStateUnavailable = false;
   }
 
   /** RR-1 (Federation 3/3b P0): is this fortress-master (root) pubkey revoked? */
@@ -5223,10 +5234,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       isRootRevoked: (masterPubkeyB64u) =>
         this.isFederationRootRevoked(masterPubkeyB64u),
       renewLocalNodeCertificate: () => {
-        this.renewLocalFederationNodeCertificate();
+        void this.renewLocalFederationNodeCertificate();
       },
       issueReissueChallenge: async (params) => {
-        if (this._federationReissueChallengeStoreUnavailable) {
+        if (this._federationReissueChallengeStoreUnavailable || this._federationReissueChallengeStore === null) {
           throw new Error("federation_reissue_challenge_store_unavailable");
         }
         // LD3 FED-REISSUE-DOS-01 corroboration: fold in the per-request origin
@@ -5239,7 +5250,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         });
       },
       consumeReissueChallenge: async (params) => {
-        if (this._federationReissueChallengeStoreUnavailable) return false;
+        if (this._federationReissueChallengeStoreUnavailable || this._federationReissueChallengeStore === null) return false;
         return this._federationReissueChallengeStore.consume(params);
       },
       federationPosture: () => this.buildFederationPostureSummary(),
@@ -5280,23 +5291,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this._federationRenewal = null;
   }
 
-  private renewLocalFederationNodeCertificate(): void {
+  private renewLocalFederationNodeCertificate(owner = this._federationWork): Promise<void> {
+    return owner.run("renewal", () => this.renewLocalFederationNodeCertificateOnce());
+  }
+
+  private renewLocalFederationNodeCertificateOnce(): void | Promise<void> {
     const ctx = this._federationContext;
     if (ctx === null) return;
     if (!federationContextHasIssuerAuthority(ctx)) return;
-    const result = renewNodeIdentityCertificateIfDue({
-      certificate: ctx.localNodeCert ?? null,
-      localNodeId: ctx.nodeId,
-      pinnedMaster: ctx.pinnedMasterPubkey,
-      operatorPrincipalCert: ctx.issuingPrincipalCert,
-      operatorPrincipalPrivateKey: ctx.getIssuingPrincipalPrivateKey(),
-      masterPrivateKey: ctx.getMasterPrivateKey?.(),
-      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
-      config: ctx.nodeCertificateRenewal,
-    });
+    let principalKey: Uint8Array | undefined;
+    let masterKey: Uint8Array | undefined;
+    let result: ReturnType<typeof renewNodeIdentityCertificateIfDue>;
+    try {
+      // Borrowed getters require independent bytes because Buffer.slice would retain caller storage.
+      const principal = ctx.getIssuingPrincipalPrivateKey();
+      principalKey = this._federationSigningKeyOwnership === "owned" ? principal : Uint8Array.from(principal);
+      const master = ctx.getMasterPrivateKey?.();
+      masterKey = this._federationSigningKeyOwnership === "owned" ? master : master && Uint8Array.from(master);
+      result = renewNodeIdentityCertificateIfDue({
+        certificate: ctx.localNodeCert ?? null,
+        localNodeId: ctx.nodeId,
+        pinnedMaster: ctx.pinnedMasterPubkey,
+        operatorPrincipalCert: ctx.issuingPrincipalCert,
+        operatorPrincipalPrivateKey: principalKey,
+        masterPrivateKey: masterKey,
+        isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+        config: ctx.nodeCertificateRenewal,
+      });
+    } finally {
+      // Owned signing copies are wiped after synchronous signing completes.
+      principalKey?.fill(0);
+      masterKey?.fill(0);
+    }
     if (result.renewed) {
       ctx.localNodeCert = result.certificate;
-      void this.auditLog?.append(
+      return this.auditLog?.append(
         "l2",
         "v1_federation_node_cert_auto_renewed",
         result.certificate.node_id,
@@ -5305,7 +5334,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           next_expires_at: result.nextExpiresAt,
         },
         "success",
-      ).catch(() => {
+      ).then(() => undefined, () => {
         // Best-effort observability only; renewal already completed.
       });
     }
@@ -5925,12 +5954,72 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
-  /**
-   * Stop the HTTP server and clean up.
-   */
+  // A retry opens admission only after the prior session finishes disposal.
+  async beginFederationSession(): Promise<void> {
+    await this._federationDisposal;
+    if (!this._federationTerminal && !this._federationWork.accepting) {
+      this._federationWork = new FederationWork();
+    }
+  }
+
+  // Stop seals admission synchronously before joining pending wiring.
+  sealFederationWork(): void {
+    this._federationTerminal = true;
+    this.sealFederationGeneration();
+  }
+
+  private sealFederationGeneration(): void {
+    this._federationWork.seal();
+    this.stopFederationCertificateAutoRenewal();
+    this.stopFleetLicenseReResolve();
+    this.stopFederationGuardianBreakGlassPoll();
+  }
+
+  private detachFederation(): void {
+    this.bindFederationContext(null);
+    void this.setFederationSyncStateStore(null);
+    void this.setFederationReissueChallengeStore(null);
+    void this.setOperatorAuthorizationSpentStore(null);
+    this._federationGuardianBreakGlass = null;
+    this._fleetPriorCap = null;
+    this._federationSigningKeyOwnership = "borrowed";
+  }
+
+  // Quiescing keeps durable stores bound for requests admitted before HTTP close.
+  private quiesceFederation(): Promise<void> {
+    this.sealFederationGeneration();
+    return this._federationWork.drain();
+  }
+
+  // Disposal unbinds stores before record scrubbing, final persistence and custody release.
+  disposeFederation(): Promise<void> {
+    if (this._federationDisposal) return this._federationDisposal;
+    const owner = this._federationWork;
+    const disposal = this.quiesceFederation().then(() => {
+      if (owner !== this._federationWork) return;
+      this.detachFederation();
+    });
+    this._federationDisposal = disposal;
+    const clear = () => {
+      if (this._federationDisposal === disposal) this._federationDisposal = undefined;
+    };
+    void disposal.then(clear, clear);
+    return disposal;
+  }
+
+  /** Stop the HTTP server and settle the channel's recurring work. */
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
-    this.stopPromise = this.stopHttpServer();
+    this.sealFederationWork();
+    const closed = this.stopHttpServer();
+    const quiesced = this.quiesceFederation();
+    this.stopPromise = (async () => {
+      try { await closed; } finally {
+        await quiesced;
+        // Admitted HTTP work retains durable stores through the close grace window.
+        await this.disposeFederation();
+      }
+    })();
     try {
       await this.stopPromise;
     } finally {
@@ -7440,7 +7529,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         unlocked = await this.unlockHandler(credential);
       } catch {
         // A handler-internal failure (wrong-key throw, wiring error) must not
-        // leak detail and must leave the process parked. Generic failure.
+        // leak detail; the handler owns any shutdown it requires. Generic failure.
         unlocked = false;
       }
 

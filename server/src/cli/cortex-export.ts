@@ -41,7 +41,7 @@ import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
 import { ApprovalGate } from "../principal-policy/gate.js";
 import { loadPrincipalPolicy } from "../principal-policy/loader.js";
@@ -374,116 +374,123 @@ async function cmdRun(
     await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
     const storage = new FilesystemStorage(join(config.storage_path, "state"));
 
-    const masterKey = await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       storagePathHint: config.storage_path,
     });
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
 
-    const auditLog = new AuditLog(storage, masterKey);
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
 
-    // Present-but-invalid cortex-export.json throws here (fail closed). A missing
-    // file means the safe default: local file sink, no network, no approval.
-    const exportConfig = await readExportConfig(config.storage_path);
-    const producerKeyLoad = await loadFortressProducerKey(config.storage_path);
-    if (producerKeyLoad.status === "unreadable") {
-      write(
-        err,
-        `Error: Castle Wall audit producer key is unavailable (${producerKeyLoad.reason}); refusing to export unverifiable agent attribution.\n`,
-      );
-      return 1;
-    }
-    const mapOptions: EnforcementEventMapOptions = {
-      pinnedProducerKeyB64url:
-        producerKeyLoad.status === "present" ? producerKeyLoad.keyB64url : null,
-      subjectFortressId: fortressIdForAttribution(config.storage_path),
-    };
-
-    // A best-effort local audit append (a failed audit never blocks the operator
-    // verb; the export lifecycle is recorded on a best-effort basis, same posture
-    // as the observe CLI). A DROPPED append is made LOUD on stderr (never
-    // silently swallowed): see `buildExportAudit` (silent-audit-drop class #946).
-    const audit = buildExportAudit(auditLog, err);
-
-    // Tier-1 approval gate, built ONLY when the outbound http lane is configured.
-    // For the file sink `approve` is never invoked (enable() short-circuits), so
-    // we still pass a gate-backed approver but it never fires on the local path.
-    let approve: ExportApprover = async () => ({
-      allowed: false,
-      reason: "no approval channel wired",
-    });
-    if (exportConfig.sink === "http") {
-      const policy = await loadPrincipalPolicy(config.storage_path);
-      const baseline = new BaselineTracker(storage, masterKey);
-      const channel = new CortexExportPromptApprovalChannel();
-      const gate = new ApprovalGate(policy, baseline, channel, auditLog);
-      approve = (operation, context) => gate.evaluate(operation, context);
-    }
-
-    // File-sink writer: append to a configured path, else stdout NDJSON.
-    const fileWriter: LineWriter =
-      exportConfig.file_path !== undefined
-        ? appendFileLineWriter(exportConfig.file_path)
-        : stdoutLineWriter();
-
-    // The durable cursor is master-key-AUTHENTICATED (MAC'd + chain-identity
-    // bound): a hand-written / tampered / stale cursor is discarded loudly and the
-    // run re-scans from the start rather than silently going blind. See cursor.ts.
-    const cursor = new FileExportCursorStore(fortressPath, masterKey);
-
-    const result = await runExportPipeline({
-      config: exportConfig,
-      approve,
-      audit,
-      source: auditLog,
-      cursor,
-      fileWriter,
-      mapOptions,
-      // Real fetch for the http sink; the sink is only ever armed behind the gate.
-      fetchImpl: fetch,
-    });
-
-    if (result.status === "refused") {
-      if (json) {
-        write(out, `${JSON.stringify({ ok: false, refused: result.reason }, null, 2)}\n`);
-      } else {
+      // Present-but-invalid cortex-export.json throws here (fail closed). A missing
+      // file means the safe default: local file sink, no network, no approval.
+      const exportConfig = await readExportConfig(config.storage_path);
+      const producerKeyLoad = await loadFortressProducerKey(config.storage_path);
+      if (producerKeyLoad.status === "unreadable") {
         write(
           err,
-          `Refused: the outbound push was not armed (${result.reason}). Nothing was exported over the network.\n`,
+          `Error: Castle Wall audit producer key is unavailable (${producerKeyLoad.reason}); refusing to export unverifiable agent attribution.\n`,
+        );
+        return 1;
+      }
+      const mapOptions: EnforcementEventMapOptions = {
+        pinnedProducerKeyB64url:
+          producerKeyLoad.status === "present" ? producerKeyLoad.keyB64url : null,
+        subjectFortressId: fortressIdForAttribution(config.storage_path),
+      };
+
+      // A best-effort local audit append (a failed audit never blocks the operator
+      // verb; the export lifecycle is recorded on a best-effort basis, same posture
+      // as the observe CLI). A DROPPED append is made LOUD on stderr (never
+      // silently swallowed): see `buildExportAudit` (silent-audit-drop class #946).
+      const audit = buildExportAudit(auditLog, err);
+
+      // Tier-1 approval gate, built ONLY when the outbound http lane is configured.
+      // For the file sink `approve` is never invoked (enable() short-circuits), so
+      // we still pass a gate-backed approver but it never fires on the local path.
+      let approve: ExportApprover = async () => ({
+        allowed: false,
+        reason: "no approval channel wired",
+      });
+      if (exportConfig.sink === "http") {
+        const policy = await loadPrincipalPolicy(config.storage_path);
+        const baseline = new BaselineTracker(storage, masterKey);
+        const channel = new CortexExportPromptApprovalChannel();
+        const gate = new ApprovalGate(policy, baseline, channel, auditLog);
+        approve = (operation, context) => gate.evaluate(operation, context);
+      }
+
+      // File-sink writer: append to a configured path, else stdout NDJSON.
+      const fileWriter: LineWriter =
+        exportConfig.file_path !== undefined
+          ? appendFileLineWriter(exportConfig.file_path)
+          : stdoutLineWriter();
+
+      // The durable cursor is master-key-AUTHENTICATED (MAC'd + chain-identity
+      // bound): a hand-written / tampered / stale cursor is discarded loudly and the
+      // run re-scans from the start rather than silently going blind. See cursor.ts.
+      const cursor = new FileExportCursorStore(fortressPath, masterKey);
+
+      const result = await runExportPipeline({
+        config: exportConfig,
+        approve,
+        audit,
+        source: auditLog,
+        cursor,
+        fileWriter,
+        mapOptions,
+        // Real fetch for the http sink; the sink is only ever armed behind the gate.
+        fetchImpl: fetch,
+      });
+
+      if (result.status === "refused") {
+        if (json) {
+          write(out, `${JSON.stringify({ ok: false, refused: result.reason }, null, 2)}\n`);
+        } else {
+          write(
+            err,
+            `Refused: the outbound push was not armed (${result.reason}). Nothing was exported over the network.\n`,
+          );
+        }
+        return 1;
+      }
+
+      if (json) {
+        write(
+          out,
+          `${JSON.stringify(
+            {
+              ok: true,
+              sink: exportConfig.sink,
+              touches_network: result.touchesNetwork,
+              delivered: result.stream.delivered,
+              batches: result.stream.batches,
+              from_cursor: result.stream.fromCursor,
+              to_cursor: result.stream.toCursor,
+            },
+            null,
+            2,
+          )}\n`,
+        );
+      } else {
+        write(
+          out,
+          `Exported ${result.stream.delivered} enforcement event(s) via the ${exportConfig.sink} sink` +
+          `${result.touchesNetwork ? " (outbound push to the pinned collector)" : " (local, no network)"}.\n`,
+        );
+        write(
+          out,
+          `Cursor advanced ${result.stream.fromCursor} -> ${result.stream.toCursor}; re-run to export new events.\n`,
         );
       }
-      return 1;
-    }
+      return 0;
 
-    if (json) {
-      write(
-        out,
-        `${JSON.stringify(
-          {
-            ok: true,
-            sink: exportConfig.sink,
-            touches_network: result.touchesNetwork,
-            delivered: result.stream.delivered,
-            batches: result.stream.batches,
-            from_cursor: result.stream.fromCursor,
-            to_cursor: result.stream.toCursor,
-          },
-          null,
-          2,
-        )}\n`,
-      );
-    } else {
-      write(
-        out,
-        `Exported ${result.stream.delivered} enforcement event(s) via the ${exportConfig.sink} sink` +
-          `${result.touchesNetwork ? " (outbound push to the pinned collector)" : " (local, no network)"}.\n`,
-      );
-      write(
-        out,
-        `Cursor advanced ${result.stream.fromCursor} -> ${result.stream.toCursor}; re-run to export new events.\n`,
-      );
-    }
-    return 0;
+    }, () => sessionAuditLog?.flush() ?? Promise.resolve());
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;

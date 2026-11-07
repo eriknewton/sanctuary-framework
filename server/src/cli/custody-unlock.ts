@@ -34,7 +34,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { type CliMasterKeySession, transferCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { sign } from "../core/identity.js";
 import type { EncryptedPayload } from "../core/encryption.js";
@@ -49,7 +49,8 @@ import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
  * key. Returns everything an ISSUER caller needs to also build a signer
  * without re-doing the unlock (see {@link openIssuer}). Fail-closed: throws
  * when custody cannot be unlocked or no default operator identity exists. The
- * caller owns zeroing `masterKey`.
+ * caller retains custody through final persistence, then scrubs `masterKey`
+ * and awaits `masterWriteBarrier` release.
  */
 export async function openVerifier(opts: {
   passphrase?: string;
@@ -63,6 +64,7 @@ export async function openVerifier(opts: {
   issuerId: string;
   issuerPublicKey: Uint8Array;
   masterKey: Uint8Array;
+  masterWriteBarrier: CliMasterKeySession["masterWriteBarrier"];
   storage: StorageBackend;
   /** Encrypted issuer private key (for the signer); never key material in the clear. */
   encryptedPrivateKey: EncryptedPayload;
@@ -72,8 +74,8 @@ export async function openVerifier(opts: {
   if (!opts.passphrase && !opts.recoveryKey) {
     throw new Error(
       "an unlocked operator identity is required: set SANCTUARY_PASSPHRASE, " +
-        "--passphrase, or SANCTUARY_RECOVERY_KEY (this verb never prompts the " +
-        "macOS keychain in a headless session)",
+      "--passphrase, or SANCTUARY_RECOVERY_KEY (this verb never prompts the " +
+      "macOS keychain in a headless session)",
     );
   }
   if (opts.fortressPath) {
@@ -84,46 +86,49 @@ export async function openVerifier(opts: {
   const stateStoragePath = join(config.storage_path, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     ...(opts.passphrase !== undefined ? { passphrase: opts.passphrase } : {}),
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     storagePathHint: config.storage_path,
   });
+  const masterKey = session.masterKey;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  const operationLabel = opts.operationLabel ?? "this operation";
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  if (loadResult.loaded === 0) {
-    masterKey.fill(0);
-    throw new Error(
-      loadResult.total > 0
-        ? "operator identity files found but none could be decrypted (wrong passphrase?)"
-        : `no operator identity in this fortress: ${operationLabel} requires a ` +
+    const operationLabel = opts.operationLabel ?? "this operation";
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) {
+      throw new Error(
+        loadResult.total > 0
+          ? "operator identity files found but none could be decrypted (wrong passphrase?)"
+          : `no operator identity in this fortress: ${operationLabel} requires a ` +
           "default operator identity (run `sanctuary identity create`, or " +
           "re-run `sanctuary init` without --no-identity)",
-    );
-  }
-  const identity = identityManager.getDefault();
-  if (!identity?.encrypted_private_key || !identity.public_key) {
-    masterKey.fill(0);
-    throw new Error("no default operator identity is set in this fortress");
-  }
+      );
+    }
+    const identity = identityManager.getDefault();
+    if (!identity?.encrypted_private_key || !identity.public_key) {
+      throw new Error("no default operator identity is set in this fortress");
+    }
 
-  const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const issuerPublicKey = decodePublicKey(identity.public_key);
-  if (issuerPublicKey === null) {
-    masterKey.fill(0);
-    throw new Error("default operator identity public key is malformed");
-  }
+    const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+    const issuerPublicKey = decodePublicKey(identity.public_key);
+    if (issuerPublicKey === null) {
+      throw new Error("default operator identity public key is malformed");
+    }
 
-  return {
-    issuerId: identity.identity_id,
-    issuerPublicKey,
-    masterKey,
-    storage,
-    encryptedPrivateKey: identity.encrypted_private_key,
-    identityEncryptionKey,
-  };
+    return {
+      masterWriteBarrier: session.masterWriteBarrier,
+      issuerId: identity.identity_id,
+      issuerPublicKey,
+      masterKey,
+      storage,
+      encryptedPrivateKey: identity.encrypted_private_key,
+      identityEncryptionKey,
+    };
+
+  });
 }
 
 /**
@@ -131,7 +136,8 @@ export async function openVerifier(opts: {
  * operator identity. Thin wrapper over {@link openVerifier} so every CLI verb
  * that signs with the default operator identity (`license issue`/`revoke`,
  * `fleet attest export`) shares ONE unlock + key-pin path (no copy-paste).
- * Fail-closed as `openVerifier`; the caller owns zeroing `masterKey`.
+ * Fail-closed as `openVerifier`; the caller retains custody through final
+ * persistence, then scrubs `masterKey` and awaits `masterWriteBarrier` release.
  */
 export async function openIssuer(opts: {
   passphrase?: string;
@@ -144,6 +150,7 @@ export async function openIssuer(opts: {
   issuerId: string;
   issuerPublicKey: Uint8Array;
   masterKey: Uint8Array;
+  masterWriteBarrier: CliMasterKeySession["masterWriteBarrier"];
   storage: StorageBackend;
 }> {
   const v = await openVerifier(opts);
@@ -157,6 +164,7 @@ export async function openIssuer(opts: {
     issuerId: v.issuerId,
     issuerPublicKey: v.issuerPublicKey,
     masterKey: v.masterKey,
+    masterWriteBarrier: v.masterWriteBarrier,
     storage: v.storage,
   };
 }

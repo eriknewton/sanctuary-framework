@@ -42,13 +42,7 @@
 import { homedir, platform } from "node:os";
 
 import type { StorageBackend } from "../storage/interface.js";
-import {
-  unlockExistingMasterReadOnly,
-  resolveCliMasterKey,
-  acquireFortressMasterWriteBarrier,
-  CustodyUnlockError,
-  CustodyCredentialMissingError,
-} from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, type CliMasterKeySession, unlockExistingMasterReadOnly, resolveCliMasterKey, acquireFortressMasterWriteBarrier, CustodyUnlockError, CustodyCredentialMissingError } from "../core/master-custody.js";
 import {
   CrossProcessLockError,
   type MasterWriteBarrierLease,
@@ -117,13 +111,7 @@ export type LocalFortressUnlockResult =
       readonly masterKey: Uint8Array;
       /** Which precedence source supplied the credential (non-secret). */
       readonly source: LocalFortressCredentialSource;
-      /**
-       * Present only for a `writeIntent` unlock: the shared master-rotation
-       * barrier the caller MUST hold until its final fortress write and then
-       * release. Absent for a read/export unlock. A write verb that drops this
-       * without holding it reopens the concurrent-rotation corruption window
-       * (S1 / AGENTS rule 12).
-       */
+      /** Existing envelope reads without write intent acquire no session; discarding a retained barrier reopens rotation before key use finishes. */
       readonly barrier?: MasterWriteBarrierLease;
     }
   | {
@@ -213,10 +201,9 @@ export interface LocalFortressUnlockOptions {
 type KeychainCustodyOptions = Parameters<typeof readKeychainCustodyKeyStatus>[1];
 
 /**
- * Resolve a credential by precedence and unlock the fortress master key, adding
- * the EXACT-fortress keyring as the final fallback. Returns ONLY the master key
- * on success (never the credential), or a secret-free remediation on failure.
- * Never generates custody and never mutates the stored passphrase.
+ * Return the unlocked master key with any retained barrier so the caller can finish work before scrubbing and releasing custody.
+ * Never return the credential, generate custody, or change the stored passphrase.
+ * Credential refusals return secret-free remediation.
  */
 export async function unlockLocalFortress(
   opts: LocalFortressUnlockOptions,
@@ -230,7 +217,7 @@ export async function unlockLocalFortress(
     );
   }
   if (!opts.writeIntent) {
-    // Read/export unlock: pre-existing lock-free behavior, no barrier.
+    // A legacy migration transfers its session so the caller can finish using its key.
     return resolveLocalFortressMaster(opts);
   }
   // Write unlock: hold the shared master-rotation barrier from BEFORE the
@@ -259,11 +246,17 @@ export async function unlockLocalFortress(
   try {
     result = await resolveLocalFortressMaster(opts);
   } catch (error) {
-    await barrier.release().catch(() => undefined);
+    try { await barrier.release(); } catch (releaseError) {
+      // Release origin must remain distinguishable while preserving both failures.
+      throw new MasterEstablishmentReleaseError([error, releaseError], "Fortress unlock and session release failed", { cause: releaseError });
+    }
     throw error;
   }
   if (!result.ok) {
-    await barrier.release().catch(() => undefined);
+    try { await barrier.release(); } catch (releaseError) {
+      // A cleanup failure must escape ordinary refusal handling without altering its cause.
+      throw new MasterEstablishmentReleaseError([releaseError], "Session release after unlock refusal failed", { cause: releaseError });
+    }
     return result;
   }
   return { ...result, barrier };
@@ -306,201 +299,214 @@ async function resolveLocalFortressMaster(
       recoveryKey = env.SANCTUARY_RECOVERY_KEY;
       source = "env-recovery-key";
     } else {
-    // Source 5: the EXACT-fortress stored passphrase. `readStoredPassphrase`
-    // NEVER generates — it reads the keyring/fallback for THIS storage path and
-    // fails closed (throws) when the keyring is locked or the fallback file is
-    // corrupt, so a locked keyring can never be mistaken for "no credential".
-    let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
-    let storedFailure: LocalFortressUnlockFailure | undefined;
-    let storedMessage: string | undefined;
-    try {
-      stored = await readStored({
-        storagePath: opts.storagePath,
-        home,
-        // Read-only: a memory verb must never rewrite the at-rest passphrase
-        // file, so a legacy-format upgrade is deferred to a custody verb.
-        readOnly: true,
-        ...(opts.platformOverride !== undefined
-          ? { platformOverride: opts.platformOverride }
-          : {}),
-        ...(opts.exec !== undefined ? { exec: opts.exec } : {}),
-      });
-    } catch (error) {
-      if (error instanceof PassphraseKeyringUnreachableError) {
-        storedFailure = "locked";
-        storedMessage = error.message;
-      } else if (error instanceof PassphraseUnreadableError) {
-        storedFailure = "unreadable";
-        storedMessage = error.message;
-      } else if (error instanceof PassphrasePathIdentityError) {
-        storedFailure = "other";
-        storedMessage = error.message;
-      } else {
-        storedFailure = "other";
-        storedMessage =
-          "the stored fortress passphrase could not be read; no credential or secret detail was emitted";
+      // Source 5: the EXACT-fortress stored passphrase. `readStoredPassphrase`
+      // NEVER generates — it reads the keyring/fallback for THIS storage path and
+      // fails closed (throws) when the keyring is locked or the fallback file is
+      // corrupt, so a locked keyring can never be mistaken for "no credential".
+      let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
+      let storedFailure: LocalFortressUnlockFailure | undefined;
+      let storedMessage: string | undefined;
+      try {
+        stored = await readStored({
+          storagePath: opts.storagePath,
+          home,
+          // Read-only: a memory verb must never rewrite the at-rest passphrase
+          // file, so a legacy-format upgrade is deferred to a custody verb.
+          readOnly: true,
+          ...(opts.platformOverride !== undefined
+            ? { platformOverride: opts.platformOverride }
+            : {}),
+          ...(opts.exec !== undefined ? { exec: opts.exec } : {}),
+        });
+      } catch (error) {
+        if (error instanceof PassphraseKeyringUnreachableError) {
+          storedFailure = "locked";
+          storedMessage = error.message;
+        } else if (error instanceof PassphraseUnreadableError) {
+          storedFailure = "unreadable";
+          storedMessage = error.message;
+        } else if (error instanceof PassphrasePathIdentityError) {
+          storedFailure = "other";
+          storedMessage = error.message;
+        } else {
+          storedFailure = "other";
+          storedMessage =
+            "the stored fortress passphrase could not be read; no credential or secret detail was emitted";
+        }
+      }
+      if (stored && stored.value.length > 0) {
+        passphrase = stored.value;
+        source = "stored-passphrase";
+      }
+
+      const readCustody = opts.readCustody ?? readKeychainCustodyKeyStatus;
+      let custody: KeychainReadResult;
+      try {
+        custody = await readCustody(opts.storagePath, {
+          home,
+          ...(opts.platformOverride !== undefined
+            ? { platformOverride: opts.platformOverride }
+            : {}),
+          ...(opts.exec !== undefined ? { exec: opts.exec } : {}),
+        });
+      } catch {
+        custody = {
+          status: "unreachable",
+          detail: "the stored custody-key identity could not be determined",
+        };
+      }
+      if (custody.status === "found" && custody.key) {
+        if (source === undefined) {
+          custodyKey = custody.key;
+          source = "stored-custody-key";
+        } else {
+          custodyFallbackKey = custody.key;
+        }
+      } else if (source === undefined) {
+        if (storedFailure !== undefined) {
+          return {
+            ok: false,
+            failure: storedFailure,
+            message: storedMessage ?? "the stored fortress credential could not be read",
+          };
+        }
+        if (custody.status === "unreachable") {
+          custodyUnavailableDetail = custody.detail;
+          return {
+            ok: false,
+            failure: "locked",
+            message:
+              custody.detail ??
+              "the OS keyring custody factor is locked or unreachable in this session",
+          };
+        }
+      } else if (custody.status === "unreachable") {
+        custodyUnavailableDetail = custody.detail;
       }
     }
-    if (stored && stored.value.length > 0) {
-      passphrase = stored.value;
-      source = "stored-passphrase";
-    }
 
-    const readCustody = opts.readCustody ?? readKeychainCustodyKeyStatus;
-    let custody: KeychainReadResult;
-    try {
-      custody = await readCustody(opts.storagePath, {
-        home,
-        ...(opts.platformOverride !== undefined
-          ? { platformOverride: opts.platformOverride }
-          : {}),
-        ...(opts.exec !== undefined ? { exec: opts.exec } : {}),
-      });
-    } catch {
-      custody = {
-        status: "unreachable",
-        detail: "the stored custody-key identity could not be determined",
+    if (source === undefined) {
+      return {
+        ok: false,
+        failure: "absent",
+        message: absentCredentialRemediation(opts.storagePath),
       };
     }
-    if (custody.status === "found" && custody.key) {
-      if (source === undefined) {
-        custodyKey = custody.key;
-        source = "stored-custody-key";
-      } else {
-        custodyFallbackKey = custody.key;
-      }
-    } else if (source === undefined) {
-      if (storedFailure !== undefined) {
-        return {
-          ok: false,
-          failure: storedFailure,
-          message: storedMessage ?? "the stored fortress credential could not be read",
-        };
-      }
-      if (custody.status === "unreachable") {
-        custodyUnavailableDetail = custody.detail;
-        return {
-          ok: false,
-          failure: "locked",
-          message:
-            custody.detail ??
-            "the OS keyring custody factor is locked or unreachable in this session",
-        };
-      }
-    } else if (custody.status === "unreachable") {
-      custodyUnavailableDetail = custody.detail;
-    }
-    }
 
-  if (source === undefined) {
-    return {
-      ok: false,
-      failure: "absent",
-      message: absentCredentialRemediation(opts.storagePath),
-    };
-  }
-
-  let masterKey: Uint8Array;
-  try {
-    masterKey = await unlockExistingMasterReadOnly(opts.storage, {
-      // Existing envelope only: a read/export verb cannot mint or migrate
-      // custody and therefore remains usable without a custody-write lock.
-      ...(passphrase !== undefined ? { passphrase } : {}),
-      ...(recoveryKey !== undefined ? { recoveryKey } : {}),
-      ...(custodyKey !== undefined ? { keychainKey: custodyKey } : {}),
-      storagePathHint: opts.storagePath,
-    });
-  } catch (error) {
-    // CustodyCredentialMissingError EXTENDS CustodyUnlockError, so check the
-    // subclass first: "no custody envelope to unlock" (absent) is a different
-    // remediation than "credential does not match" (mismatch).
-    if (error instanceof CustodyCredentialMissingError) {
-      if (source === "stored-custody-key") {
+    let masterKey: Uint8Array;
+    try {
+      masterKey = await unlockExistingMasterReadOnly(opts.storage, {
+        // Existing envelope only: a read/export verb cannot mint or migrate
+        // custody and therefore remains usable without a custody-write lock.
+        ...(passphrase !== undefined ? { passphrase } : {}),
+        ...(recoveryKey !== undefined ? { recoveryKey } : {}),
+        ...(custodyKey !== undefined ? { keychainKey: custodyKey } : {}),
+        storagePathHint: opts.storagePath,
+      });
+    } catch (error) {
+      // CustodyCredentialMissingError EXTENDS CustodyUnlockError, so check the
+      // subclass first: "no custody envelope to unlock" (absent) is a different
+      // remediation than "credential does not match" (mismatch).
+      if (error instanceof CustodyCredentialMissingError) {
+        if (source === "stored-custody-key") {
+          return { ok: false, failure: "absent", message: error.message };
+        }
+        const host = opts.platformOverride ?? platform();
+        if (host === "darwin" || host === "linux") {
+          // A supplied/stored credential is not evidence that this directory is
+          // a legacy fortress. Require the marker for the exact credential kind;
+          // otherwise a virgin directory plus a stray keyring item could mint a
+          // new envelope during a read/export operation.
+          const legacyMarker = await opts.storage.read(
+            "_meta",
+            passphrase !== undefined ? "key-params" : "recovery-key-hash",
+          );
+          if (legacyMarker === null) {
+            return {
+              ok: false,
+              failure: "absent",
+              message: absentCredentialRemediation(opts.storagePath),
+            };
+          }
+          if (opts.readOnly === true) {
+            // INVARIANT: this is the ONLY write this module can perform, and a
+            // read-only caller (a diagnostic) may not perform it. Refusing here,
+            // rather than before the marker check above, keeps a virgin
+            // directory reporting "absent" and reserves this message for the one
+            // fortress shape that would actually have been migrated.
+            return {
+              ok: false,
+              failure: "migration_required",
+              message:
+                "this fortress still uses the pre-envelope custody format, and a read-only command will not migrate it; the credential is valid, so run `sanctuary protect` on this fortress once to perform the one-time custody migration, then retry",
+            };
+          }
+          // Compatibility only: a pre-envelope fortress needs one journaled
+          // migration under the custody write lock. Existing envelopes never
+          // enter this path, so read/export remains lock-free on Windows.
+          let session: CliMasterKeySession;
+          try {
+            session = await resolveCliMasterKey(opts.storage, {
+              ...(passphrase !== undefined ? { passphrase } : {}),
+              ...(recoveryKey !== undefined ? { recoveryKey } : {}),
+              storagePathHint: opts.storagePath,
+            });
+          } catch (migrationError) {
+            // A failed lease release must escape ordinary migration refusal handling.
+            if (migrationError instanceof MasterEstablishmentReleaseError) throw migrationError;
+            if (migrationError instanceof CustodyUnlockError) {
+              return { ok: false, failure: "mismatch", message: migrationError.message };
+            }
+            return {
+              ok: false,
+              failure: "other",
+              message: "legacy fortress custody could not be migrated; no credential or secret detail was emitted",
+            };
+          }
+          // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+          if (opts.writeIntent) {
+            try { await session.masterWriteBarrier?.release(); }
+            catch (releaseError) {
+              session.masterKey.fill(0);
+              // Release origin must survive migration refusal handling after the key is scrubbed.
+              throw new MasterEstablishmentReleaseError([releaseError], "Session release after migration failed", { cause: releaseError });
+            }
+            return { ok: true, masterKey: session.masterKey, source };
+          }
+          return { ok: true, masterKey: session.masterKey, source, barrier: session.masterWriteBarrier };
+        }
         return { ok: false, failure: "absent", message: error.message };
       }
-      const host = opts.platformOverride ?? platform();
-      if (host === "darwin" || host === "linux") {
-        // A supplied/stored credential is not evidence that this directory is
-        // a legacy fortress. Require the marker for the exact credential kind;
-        // otherwise a virgin directory plus a stray keyring item could mint a
-        // new envelope during a read/export operation.
-        const legacyMarker = await opts.storage.read(
-          "_meta",
-          passphrase !== undefined ? "key-params" : "recovery-key-hash",
-        );
-        if (legacyMarker === null) {
-          return {
-            ok: false,
-            failure: "absent",
-            message: absentCredentialRemediation(opts.storagePath),
-          };
-        }
-        if (opts.readOnly === true) {
-          // INVARIANT: this is the ONLY write this module can perform, and a
-          // read-only caller (a diagnostic) may not perform it. Refusing here,
-          // rather than before the marker check above, keeps a virgin
-          // directory reporting "absent" and reserves this message for the one
-          // fortress shape that would actually have been migrated.
-          return {
-            ok: false,
-            failure: "migration_required",
-            message:
-              "this fortress still uses the pre-envelope custody format, and a read-only command will not migrate it; the credential is valid, so run `sanctuary protect` on this fortress once to perform the one-time custody migration, then retry",
-          };
-        }
-        // Compatibility only: a pre-envelope fortress needs one journaled
-        // migration under the custody write lock. Existing envelopes never
-        // enter this path, so read/export remains lock-free on Windows.
-        try {
-          masterKey = await resolveCliMasterKey(opts.storage, {
-            ...(passphrase !== undefined ? { passphrase } : {}),
-            ...(recoveryKey !== undefined ? { recoveryKey } : {}),
-            storagePathHint: opts.storagePath,
-          });
-          return { ok: true, masterKey, source };
-        } catch (migrationError) {
-          if (migrationError instanceof CustodyUnlockError) {
-            return { ok: false, failure: "mismatch", message: migrationError.message };
+      if (error instanceof CustodyUnlockError) {
+        if (source === "stored-passphrase" && custodyFallbackKey) {
+          try {
+            masterKey = await unlockExistingMasterReadOnly(opts.storage, {
+              keychainKey: custodyFallbackKey,
+              storagePathHint: opts.storagePath,
+            });
+            source = "stored-custody-key";
+            return { ok: true, masterKey, source };
+          } catch {
+            // Both local credentials failed to authenticate this exact fortress.
           }
+        }
+        if (source === "stored-passphrase" && custodyUnavailableDetail !== undefined) {
           return {
             ok: false,
-            failure: "other",
-            message: "legacy fortress custody could not be migrated; no credential or secret detail was emitted",
+            failure: "locked",
+            message: custodyUnavailableDetail,
           };
         }
+        return { ok: false, failure: "mismatch", message: error.message };
       }
-      return { ok: false, failure: "absent", message: error.message };
+      // Rotation-in-progress, orphaned state, etc. carry their own secret-free
+      // messages; surface them under "other" rather than a generic string.
+      return {
+        ok: false,
+        failure: "other",
+        message: "fortress custody could not be unlocked; no credential or secret detail was emitted",
+      };
     }
-    if (error instanceof CustodyUnlockError) {
-      if (source === "stored-passphrase" && custodyFallbackKey) {
-        try {
-          masterKey = await unlockExistingMasterReadOnly(opts.storage, {
-            keychainKey: custodyFallbackKey,
-            storagePathHint: opts.storagePath,
-          });
-          source = "stored-custody-key";
-          return { ok: true, masterKey, source };
-        } catch {
-          // Both local credentials failed to authenticate this exact fortress.
-        }
-      }
-      if (source === "stored-passphrase" && custodyUnavailableDetail !== undefined) {
-        return {
-          ok: false,
-          failure: "locked",
-          message: custodyUnavailableDetail,
-        };
-      }
-      return { ok: false, failure: "mismatch", message: error.message };
-    }
-    // Rotation-in-progress, orphaned state, etc. carry their own secret-free
-    // messages; surface them under "other" rather than a generic string.
-    return {
-      ok: false,
-      failure: "other",
-      message: "fortress custody could not be unlocked; no credential or secret detail was emitted",
-    };
-  }
 
     return { ok: true, masterKey, source };
   } finally {

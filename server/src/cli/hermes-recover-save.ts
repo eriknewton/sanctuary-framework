@@ -1,5 +1,7 @@
+import { channel } from "node:diagnostics_channel";
 import { lstat, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { CUSTODY_RELEASE_FAILURE_MESSAGE } from "./custody-release-message.js";
 import { consumeFlagValue } from "./argv.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import {
@@ -27,6 +29,60 @@ import { ReadOnlyStorageGuard } from "../storage/read-only-guard.js";
 
 const HELP = "Usage: sanctuary hermes recover-save --fortress <dir> [--apply] [--passphrase <value>] [--json]\nReport an unfinished save; --apply keeps a verified save or rolls back an unpublished save.\n";
 const UNCLASSIFIED = "The save could not be classified and nothing was changed.";
+
+// Sixteen examined entries bound both nested causes and wide aggregates, including repeated references.
+// Must match REFUSAL_ERROR_NODE_LIMIT in test/cli/hermes-recover-save.test.ts.
+const REFUSAL_ERROR_NODE_LIMIT = 16;
+const refusalChannel = channel("sanctuary.hermes-recover-save.refusal");
+
+function publishCustodyRefusal(cause: unknown): void {
+  if (!refusalChannel.hasSubscribers) return;
+  const seen = new Set<Error>();
+  const published = new Set<string>();
+  let remaining = REFUSAL_ERROR_NODE_LIMIT;
+  function visit(error: unknown): void {
+    if (remaining === 0) return;
+    remaining--;
+    if (!(error instanceof Error) || seen.has(error)) return;
+    seen.add(error);
+    if (error instanceof CrossProcessLockError) {
+      const lockKind = error.kind;
+      // Runtime allowlisting prevents a mutated error from exporting path-bearing fields.
+      switch (lockKind) {
+        case "capability": case "scaffold-integrity": case "contention": case "holder-lost":
+        case "operation_aborted": case "poisoned": case "io": {
+          const reason = error.diagnosticReason === "probe-unknown" || error.diagnosticReason === "reaper-deadline"
+            ? error.diagnosticReason : lockKind;
+          const key = `${lockKind}:${reason}`;
+          if (!published.has(key)) {
+            published.add(key);
+            refusalChannel.publish({ lockKind, reason });
+          }
+        }
+      }
+    }
+    if (error instanceof AggregateError && Array.isArray(error.errors)) {
+      for (const nested of error.errors) {
+        if (remaining === 0) break;
+        visit(nested);
+      }
+    }
+    if (error.cause !== undefined) visit(error.cause);
+  }
+  visit(cause);
+}
+
+function containsCustodyError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  const matches = (value: unknown): boolean => {
+    // Aggregate members can share references or cycles, so each member is examined only once.
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (value instanceof AggregateError) return value.errors.some(matches);
+    return value instanceof CrossProcessLockError;
+  };
+  return matches(error);
+}
 
 /**
  * Inspect or recover one unfinished Hermes save in the explicitly selected, stopped fortress.
@@ -66,9 +122,17 @@ export async function runHermesRecoverSave(options: {
   }
   const apply = passphrase.argv.includes("--apply");
   const json = passphrase.argv.includes("--json");
+  let admitted = false;
+  let callbackReturned = false;
   let actionStarted = false;
   let actionFinished = false;
   let importsRecovered = false;
+  const recordCallbackReturn = async (operation: () => Promise<number>): Promise<number> => {
+    const result = await operation();
+    // Only a resolved callback separates custody finalization from operation failures, including refusal returns.
+    callbackReturned = true;
+    return result;
+  };
   try {
     // Storage and encrypted record identity must use the same canonical path as bridge startup.
     const storagePath = await canonicalHermesFortressPath({ home: env.HOME, fortressDir: resolve(fortress.value!), uid: process.getuid!() });
@@ -78,7 +142,9 @@ export async function runHermesRecoverSave(options: {
     if (!meta.isDirectory() || meta.isSymbolicLink()) throw new Error(UNCLASSIFIED);
     // The existing exclusive side excludes all lifetime bridge leases and blocks new admission through recovery.
     return await withExclusiveMasterRotationBarrier(storage, CUSTODY_WRITE_LOCK_NAMESPACE,
-      MASTER_ROTATION_BARRIER_NAME, async () => {
+      MASTER_ROTATION_BARRIER_NAME, () => recordCallbackReturn(async () => {
+        // Admission is the barrier running this callback; anything thrown after it is not a custody refusal.
+        admitted = true;
         const readonlyStorage = new ReadOnlyStorageGuard(storage);
         const credential = passphrase.value ?? env.SANCTUARY_PASSPHRASE;
         if (!credential && !env.SANCTUARY_RECOVERY_KEY) {
@@ -154,11 +220,20 @@ export async function runHermesRecoverSave(options: {
           out.write(json ? JSON.stringify({ state, outcome, records_removed: removed }) + "\n" : `${state}; ${outcome}; records removed: ${removed}.\n`);
           return 0;
         } finally { masterKey.fill(0); }
-      }, { timeoutMs: 0 }); // Zero wait: an active writer is an immediate refusal, never an invitation to run beside it.
+      }), { timeoutMs: 0 }); // Zero wait: an active writer is an immediate refusal, never an invitation to run beside it.
   } catch (cause) {
+    // Admission diagnostics have no audit authority and must not label post-admission failures, in report or apply mode, as refusals.
+    if (!admitted) {
+      // A diagnostic fault must never replace the operator's refusal message below.
+      try { publishCustodyRefusal(cause); } catch { /* diagnostics are best effort */ }
+    }
     const message = actionFinished ? "Recovery completed but the audit append or lock release failed; the action was not reversed."
       : actionStarted ? "Recovery did not finish; retry --apply if the intent is still readable."
-      : cause instanceof CrossProcessLockError ? "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it."
+      // After an admitted callback returns, typed custody failures belong to finalization, including the barrier's held checks.
+      // Must match CUSTODY_RELEASE_FAILURE_MESSAGE in cli/custody-release-message.ts.
+      : admitted && callbackReturned && containsCustodyError(cause) ? CUSTODY_RELEASE_FAILURE_MESSAGE
+      // An operation-side lock failure cannot truthfully deny custody that was already obtained.
+      : !admitted && cause instanceof CrossProcessLockError ? "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it."
       : importsRecovered ? "The exit import was recovered, but save recovery did not proceed."
       : UNCLASSIFIED;
     err.write(message + "\n");

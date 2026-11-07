@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture teardown releases the write barrier before scrubbing the key; behaviour under test is unchanged on the base.
 /**
  * Federation admin CLI verbs — /v1 session-gap regression (drill-surfaced).
  *
@@ -206,6 +207,7 @@ async function openSessionToken(): Promise<string> {
     );
     return session.token;
   } finally {
-    signer.masterKey.fill(0);
+    try { await signer.masterWriteBarrier?.release(); }
+    finally { signer.masterKey.fill(0); }
   }
 }

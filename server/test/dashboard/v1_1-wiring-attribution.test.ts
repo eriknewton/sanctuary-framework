@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "./construction-work-fixture.js";
 // fail-before-exempt: attribution test now uses a temp fortress storage path for signed Castle Wall context; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 import { describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
@@ -6,7 +7,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { buildV11Bindings } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
@@ -237,7 +237,7 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
       await auditLog.flush();
 
       const { selector, captured } = makeCapturingSelector();
-      const bindings = buildV11Bindings({
+      const bindings = await buildV11Bindings({
         identityId,
         fortressId: "fortress-dashboard-attribution",
         storagePath,
@@ -295,7 +295,7 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
       await auditLog.flush();
 
       const { selector, captured } = makeCapturingSelector();
-      const bindings = buildV11Bindings({
+      const bindings = await buildV11Bindings({
         identityId,
         fortressId,
         storagePath,
@@ -340,7 +340,7 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
       await auditLog.appendCritical(signed);
       await auditLog.flush();
 
-      const bindings = buildV11Bindings({
+      const bindings = await buildV11Bindings({
         identityId,
         fortressId,
         storagePath,
@@ -398,7 +398,7 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
       await auditLog.flush();
 
       const { selector, captured } = makeCapturingSelector();
-      const bindings = buildV11Bindings({
+      const bindings = await buildV11Bindings({
         identityId,
         fortressId,
         storagePath,
@@ -437,7 +437,7 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
       await auditLog.appendCritical(signed);
       await auditLog.flush();
 
-      const bindings = buildV11Bindings({
+      const bindings = await buildV11Bindings({
         identityId,
         fortressId,
         storagePath,
@@ -481,7 +481,7 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
       await auditLog.flush();
 
       const { selector, captured } = makeCapturingSelector();
-      const bindings = buildV11Bindings({
+      const bindings = await buildV11Bindings({
         identityId,
         fortressId,
         storagePath,

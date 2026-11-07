@@ -35,7 +35,7 @@ import { ApprovalGate } from "../principal-policy/gate.js";
 import { loadPrincipalPolicy } from "../principal-policy/loader.js";
 import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse } from "../principal-policy/types.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, type CliMasterKeySession, transferCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
 import {
@@ -221,6 +221,7 @@ export async function runFileGrantCommand(
 }
 
 interface Bootstrapped {
+  session: CliMasterKeySession;
   config: SanctuaryConfig;
   storage: FilesystemStorage;
   masterKey: Uint8Array;
@@ -279,40 +280,47 @@ async function bootstrap(
   const stateStoragePath = join(config.storage_path, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     ...(passphrase !== undefined ? { passphrase } : {}),
     ...(recoveryKey !== undefined ? { recoveryKey } : {}),
     storagePathHint: config.storage_path,
   });
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  if (loadResult.loaded === 0) {
-    write(
-      err,
-      loadResult.total > 0
-        ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
-        : "No identities found in this fortress. Run `sanctuary identity create` first.\n"
-    );
-    return 1;
-  }
-  const primary = identityManager.getDefault();
-  if (!primary) {
-    write(err, "No primary identity set.\n");
-    return 1;
-  }
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) {
+      write(
+        err,
+        loadResult.total > 0
+          ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
+          : "No identities found in this fortress. Run `sanctuary identity create` first.\n"
+      );
+      return 1;
+    }
+    const primary = identityManager.getDefault();
+    if (!primary) {
+      write(err, "No primary identity set.\n");
+      return 1;
+    }
 
-  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-  const stateStore = new StateStore(storage, masterKey);
-  const auditLog = new AuditLog(storage, masterKey);
-  const grantStore = new FileGrantStore(stateStore, {
-    identityId: primary.identity_id,
-    encryptedPrivateKey: primary.encrypted_private_key,
-    identityEncryptionKey: identityEncKey,
-  });
-  const fsOps = new PosixFileGrantFsOps(config.storage_path);
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const stateStore = new StateStore(storage, masterKey);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    const grantStore = new FileGrantStore(stateStore, {
+      identityId: primary.identity_id,
+      encryptedPrivateKey: primary.encrypted_private_key,
+      identityEncryptionKey: identityEncKey,
+    });
+    const fsOps = new PosixFileGrantFsOps(config.storage_path);
 
-  return { config, storage, masterKey, auditLog, grantStore, fsOps, primary };
+    return { session, config, storage, masterKey, auditLog, grantStore, fsOps, primary };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 /**
@@ -407,78 +415,82 @@ async function cmdMint(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  // Reconcile the tree on this mutating touch: scrub any expired grant's tree
-  // entry and flip its persisted status, so access never outlives its TTL.
-  // FAIL-CLOSED HERE, AND ONLY HERE: mint is the one file-grant touch that
-  // EXPANDS access. If the tree could not be fully converged, adding a new
-  // entry to it is the wrong direction, so a reconcile failure refuses the
-  // mint. The catch is what makes that a clean exit code instead of an
-  // unhandled rejection; the failure mode it replaces looks, from outside, like
-  // the command crashing with no verdict at all.
-  try {
-    await reconcileFileGrantTree({
-      store: boot.grantStore,
-      fsOps: boot.fsOps,
-      now: new Date(),
-      auditLog: boot.auditLog,
-      reconciledBy: boot.primary.identity_id,
-    });
-  } catch (reconcileErr) {
-    write(
-      err,
-      `Error: the grant tree could not be fully reconciled, so no new grant ` +
-        `was minted. ${(reconcileErr as Error).message}\n`
-    );
-    return 1;
-  }
-
-  const policy = await loadPrincipalPolicy(boot.config.storage_path);
-  const baseline = new BaselineTracker(boot.storage, boot.masterKey);
-  const channel = new CliPromptApprovalChannel();
-  const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
-
-  const gateResult = await gate.evaluate("file_grant", {
-    agent_id: agentId,
-    path,
-    mode: "read",
-    ttl_seconds: ttlSeconds,
-  });
-  if (!gateResult.allowed) {
-    write(err, "Denied: file-grant mint was not approved.\n");
-    return 1;
-  }
-
-  try {
-    const { grant, enforcement } = await mintFileGrant(
-      {
-        subjectAgentId: agentId,
-        scope: { kind: isDir ? "dir" : "file", path },
-        mode: "read",
-        ttlSeconds,
-        createdBy: boot.primary.identity_id,
-      },
-      {
-        fsOps: boot.fsOps,
+    // Reconcile the tree on this mutating touch: scrub any expired grant's tree
+    // entry and flip its persisted status, so access never outlives its TTL.
+    // FAIL-CLOSED HERE, AND ONLY HERE: mint is the one file-grant touch that
+    // EXPANDS access. If the tree could not be fully converged, adding a new
+    // entry to it is the wrong direction, so a reconcile failure refuses the
+    // mint. The catch is what makes that a clean exit code instead of an
+    // unhandled rejection; the failure mode it replaces looks, from outside, like
+    // the command crashing with no verdict at all.
+    try {
+      await reconcileFileGrantTree({
         store: boot.grantStore,
+        fsOps: boot.fsOps,
         now: new Date(),
         auditLog: boot.auditLog,
-      }
-    );
-    write(out, `Grant minted: ${grant.grant_id}\n`);
-    write(out, `  subject_agent_id: ${grant.subject_agent_id}\n`);
-    write(out, `  scope: ${grant.scope.kind} ${grant.scope.path}\n`);
-    write(out, `  expires_at: ${grant.expires_at ?? "standing (no expiry)"}\n`);
-    write(out, `  ${enforcementLine(enforcement)}\n`);
-    return 0;
-  } catch (mintErr) {
-    write(
-      err,
-      `Error: mint did not complete; a best-effort rollback was attempted, so no ` +
+        reconciledBy: boot.primary.identity_id,
+      });
+    } catch (reconcileErr) {
+      write(
+        err,
+        `Error: the grant tree could not be fully reconciled, so no new grant ` +
+        `was minted. ${(reconcileErr as Error).message}\n`
+      );
+      return 1;
+    }
+
+    const policy = await loadPrincipalPolicy(boot.config.storage_path);
+    const baseline = new BaselineTracker(boot.storage, boot.masterKey);
+    const channel = new CliPromptApprovalChannel();
+    const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
+
+    const gateResult = await gate.evaluate("file_grant", {
+      agent_id: agentId,
+      path,
+      mode: "read",
+      ttl_seconds: ttlSeconds,
+    });
+    if (!gateResult.allowed) {
+      write(err, "Denied: file-grant mint was not approved.\n");
+      return 1;
+    }
+
+    try {
+      const { grant, enforcement } = await mintFileGrant(
+        {
+          subjectAgentId: agentId,
+          scope: { kind: isDir ? "dir" : "file", path },
+          mode: "read",
+          ttlSeconds,
+          createdBy: boot.primary.identity_id,
+        },
+        {
+          fsOps: boot.fsOps,
+          store: boot.grantStore,
+          now: new Date(),
+          auditLog: boot.auditLog,
+        }
+      );
+      write(out, `Grant minted: ${grant.grant_id}\n`);
+      write(out, `  subject_agent_id: ${grant.subject_agent_id}\n`);
+      write(out, `  scope: ${grant.scope.kind} ${grant.scope.path}\n`);
+      write(out, `  expires_at: ${grant.expires_at ?? "standing (no expiry)"}\n`);
+      write(out, `  ${enforcementLine(enforcement)}\n`);
+      return 0;
+    } catch (mintErr) {
+      write(
+        err,
+        `Error: mint did not complete; a best-effort rollback was attempted, so no ` +
         `grant should remain active. ${(mintErr as Error).message}\n`
-    );
-    return 1;
-  }
+      );
+      return 1;
+    }
+
+  }, () => boot.auditLog.flush());
 }
 
 /** Honest, never-overclaiming enforcement line for the mint output. */
@@ -513,75 +525,79 @@ async function cmdList(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  // Reconcile on this list touch too (R2-4). `list` already audits (Fix 6), so
-  // it is no longer purely read-only; reconciling here (safe-direction cleanup:
-  // reconcile only ever REDUCES access) means ANY list/mint/revoke touch scrubs
-  // an expired grant's tree entry, so a mint-once-then-only-list box never keeps
-  // an expired symlink alive. HONEST BOUND: a fully-idle box (one that never
-  // mints, revokes, OR lists) still relies on an out-of-band sweep -- the
-  // exported `reconcileFileGrantTree` is the reusable entry point a future
-  // `file-grant sweep` / cron calls to cover that case.
-  //
-  // A reconcile failure here is REPORTED, not fatal: the reconcile is a
-  // safe-direction cleanup ridden along on a read command, and every grant it
-  // could converge is already converged by the time it reports. Refusing the
-  // whole listing over it would leave the operator with neither the cleanup nor
-  // the list. The notice is what keeps that from being a silent partial run.
-  try {
-    await reconcileFileGrantTree({
-      store: boot.grantStore,
-      fsOps: boot.fsOps,
-      now: new Date(),
-      auditLog: boot.auditLog,
-      reconciledBy: boot.primary.identity_id,
-    });
-  } catch (reconcileErr) {
-    write(
-      err,
-      `Notice: the tree reconcile that runs before a list did not fully ` +
+    // Reconcile on this list touch too (R2-4). `list` already audits (Fix 6), so
+    // it is no longer purely read-only; reconciling here (safe-direction cleanup:
+    // reconcile only ever REDUCES access) means ANY list/mint/revoke touch scrubs
+    // an expired grant's tree entry, so a mint-once-then-only-list box never keeps
+    // an expired symlink alive. HONEST BOUND: a fully-idle box (one that never
+    // mints, revokes, OR lists) still relies on an out-of-band sweep -- the
+    // exported `reconcileFileGrantTree` is the reusable entry point a future
+    // `file-grant sweep` / cron calls to cover that case.
+    //
+    // A reconcile failure here is REPORTED, not fatal: the reconcile is a
+    // safe-direction cleanup ridden along on a read command, and every grant it
+    // could converge is already converged by the time it reports. Refusing the
+    // whole listing over it would leave the operator with neither the cleanup nor
+    // the list. The notice is what keeps that from being a silent partial run.
+    try {
+      await reconcileFileGrantTree({
+        store: boot.grantStore,
+        fsOps: boot.fsOps,
+        now: new Date(),
+        auditLog: boot.auditLog,
+        reconciledBy: boot.primary.identity_id,
+      });
+    } catch (reconcileErr) {
+      write(
+        err,
+        `Notice: the tree reconcile that runs before a list did not fully ` +
         `converge. ${(reconcileErr as Error).message}\n`
+      );
+    }
+
+    const filter = agentFilter ? { subjectAgentId: agentFilter } : undefined;
+    let grants;
+    try {
+      // The DISPLAY read stays strict (`listFileGrants` -> `store.list()`): a
+      // grant table that quietly omitted an unreadable grant would tell the
+      // operator that access does not exist when the truth is that it could not
+      // be read.
+      grants = await listFileGrants(boot.grantStore, new Date(), filter);
+    } catch (listErr) {
+      write(err, `Error: the grant list could not be read. ${(listErr as Error).message}\n`);
+      return 1;
+    }
+    // Tier-3 auto-allow AND audited (build spec section 3.2): record the access.
+    await recordFileGrantListAudit(
+      boot.auditLog,
+      boot.primary.identity_id,
+      filter,
+      grants.length
     );
-  }
 
-  const filter = agentFilter ? { subjectAgentId: agentFilter } : undefined;
-  let grants;
-  try {
-    // The DISPLAY read stays strict (`listFileGrants` -> `store.list()`): a
-    // grant table that quietly omitted an unreadable grant would tell the
-    // operator that access does not exist when the truth is that it could not
-    // be read.
-    grants = await listFileGrants(boot.grantStore, new Date(), filter);
-  } catch (listErr) {
-    write(err, `Error: the grant list could not be read. ${(listErr as Error).message}\n`);
-    return 1;
-  }
-  // Tier-3 auto-allow AND audited (build spec section 3.2): record the access.
-  await recordFileGrantListAudit(
-    boot.auditLog,
-    boot.primary.identity_id,
-    filter,
-    grants.length
-  );
+    if (json) {
+      write(out, JSON.stringify(grants, null, 2) + "\n");
+      return 0;
+    }
 
-  if (json) {
-    write(out, JSON.stringify(grants, null, 2) + "\n");
-    return 0;
-  }
+    if (grants.length === 0) {
+      write(out, "No file grants.\n");
+      return 0;
+    }
 
-  if (grants.length === 0) {
-    write(out, "No file grants.\n");
-    return 0;
-  }
-
-  for (const grant of grants) {
-    write(
-      out,
-      `${grant.grant_id}  ${grant.scope.kind}:${grant.scope.path}  mode=${grant.mode}  ` +
+    for (const grant of grants) {
+      write(
+        out,
+        `${grant.grant_id}  ${grant.scope.kind}:${grant.scope.path}  mode=${grant.mode}  ` +
         `expires_at=${grant.expires_at ?? "standing (no expiry)"}  status=${grant.projected_status}\n`
-    );
-  }
-  return 0;
+      );
+    }
+    return 0;
+
+  }, () => boot.auditLog.flush());
 }
 
 async function cmdRevoke(
@@ -598,64 +614,68 @@ async function cmdRevoke(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  // R3-3 (round 4) put the revoke-time reconcile inside a clean try/catch so a
-  // genuine scrub error (ENOTDIR/EACCES) on an UNRELATED grant's tree entry
-  // could never surface as an unhandled rejection. That is still required, but
-  // sharing ONE catch with `revokeFileGrant` was too coarse, so the reconcile
-  // now gets its own. A revoke is
-  // access-REDUCING and is the operator's explicit instruction; it must never
-  // be blocked by an unrelated grant that reconcile could not converge. The
-  // shape this replaces is the one that reads worst from outside: the operator
-  // is told the revoke "did not complete cleanly" when in fact the revoke never
-  // ran at all, and the reason had nothing to do with the grant they named.
-  try {
-    // Reconcile on this mutating touch too, so a listed-but-expired grant's
-    // tree entry is scrubbed even if the operator only ever revokes.
-    await reconcileFileGrantTree({
-      store: boot.grantStore,
-      fsOps: boot.fsOps,
-      now: new Date(),
-      auditLog: boot.auditLog,
-      reconciledBy: boot.primary.identity_id,
-    });
-  } catch (reconcileErr) {
-    write(
-      err,
-      `Notice: the tree reconcile that runs before a revoke did not fully ` +
+    // R3-3 (round 4) put the revoke-time reconcile inside a clean try/catch so a
+    // genuine scrub error (ENOTDIR/EACCES) on an UNRELATED grant's tree entry
+    // could never surface as an unhandled rejection. That is still required, but
+    // sharing ONE catch with `revokeFileGrant` was too coarse, so the reconcile
+    // now gets its own. A revoke is
+    // access-REDUCING and is the operator's explicit instruction; it must never
+    // be blocked by an unrelated grant that reconcile could not converge. The
+    // shape this replaces is the one that reads worst from outside: the operator
+    // is told the revoke "did not complete cleanly" when in fact the revoke never
+    // ran at all, and the reason had nothing to do with the grant they named.
+    try {
+      // Reconcile on this mutating touch too, so a listed-but-expired grant's
+      // tree entry is scrubbed even if the operator only ever revokes.
+      await reconcileFileGrantTree({
+        store: boot.grantStore,
+        fsOps: boot.fsOps,
+        now: new Date(),
+        auditLog: boot.auditLog,
+        reconciledBy: boot.primary.identity_id,
+      });
+    } catch (reconcileErr) {
+      write(
+        err,
+        `Notice: the tree reconcile that runs before a revoke did not fully ` +
         `converge; the revoke below is unaffected. ` +
         `${(reconcileErr as Error).message}\n`
-    );
-  }
+      );
+    }
 
-  // R3-3 (round 4 completion): the revoke itself stays inside a clean
-  // try/catch so a genuine filesystem error never surfaces as an unhandled
-  // rejection. Mirrors cmdMint's pattern.
-  try {
-    const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
-      fsOps: boot.fsOps,
-      store: boot.grantStore,
-      now: new Date(),
-      auditLog: boot.auditLog,
-    });
+    // R3-3 (round 4 completion): the revoke itself stays inside a clean
+    // try/catch so a genuine filesystem error never surfaces as an unhandled
+    // rejection. Mirrors cmdMint's pattern.
+    try {
+      const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
+        fsOps: boot.fsOps,
+        store: boot.grantStore,
+        now: new Date(),
+        auditLog: boot.auditLog,
+      });
 
-    if (!result.found) {
-      write(err, `No such grant: ${grantId}\n`);
+      if (!result.found) {
+        write(err, `No such grant: ${grantId}\n`);
+        return 1;
+      }
+
+      write(
+        out,
+        result.alreadyRevoked
+          ? `Grant ${grantId} was already revoked.\n`
+          : `Grant ${grantId} revoked.\n`
+      );
+      return 0;
+    } catch (revokeErr) {
+      write(
+        err,
+        `Error: revoke did not complete cleanly. ${(revokeErr as Error).message}\n`
+      );
       return 1;
     }
 
-    write(
-      out,
-      result.alreadyRevoked
-        ? `Grant ${grantId} was already revoked.\n`
-        : `Grant ${grantId} revoked.\n`
-    );
-    return 0;
-  } catch (revokeErr) {
-    write(
-      err,
-      `Error: revoke did not complete cleanly. ${(revokeErr as Error).message}\n`
-    );
-    return 1;
-  }
+  }, () => boot.auditLog.flush());
 }

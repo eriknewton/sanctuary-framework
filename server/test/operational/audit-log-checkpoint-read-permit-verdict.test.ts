@@ -1,4 +1,4 @@
-// fail-before-exempt: this file witnesses a capability the base already has (a pending checkpoint body read keeps its permit through a verdict-triggered stop and returns it on settlement), so it passes against the base by construction; the mutant catalog in the PR description is what fails it.
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /** Checkpoint reads retain their permits through a verdict until settlement. */
 // Witnesses OrderedAuditBodyReads.capture and OrderedAuditBodyReads.stop in operational/audit-log.ts: a read permit is released in the read's own settlement, never at stop(). Must match AUDIT_CHECKPOINT_READ_CONCURRENCY and withAuditWriteLock's checkpointReadAbort pairing in operational/audit-log.ts.
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -16,9 +16,9 @@ const P = 3;
 const CHECKPOINTS = 3 * P; // Mirrors the three-window fixture in audit-log-checkpoint-read-schedule.test.ts.
 type Signal = { aborted: boolean; checkpointReadAbort?: AbortSignal };
 // Mirrors checkpointKey in audit-log-checkpoint-read-schedule.test.ts; storage sequences use 20 digits.
-const checkpointKey = (n: number) => `audit-checkpoint-${String(n).padStart(20, "0")}`;
+const checkpointKey = (n: number) => `audit-checkpoint-${String(n).padStart(20, "0")}`; // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
 // Mirrors entryKey in audit-log-checkpoint-read-schedule.test.ts; storage sequences use 20 digits.
-const entryKey = (n: number) => `entry-${String(n).padStart(20, "0")}-fixture`;
+const entryKey = (n: number) => `entry-${String(n).padStart(20, "0")}-fixture`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
 // Mirrors gate in audit-log-checkpoint-read-schedule.test.ts.
 function gate() { let release!: () => void; const wait = new Promise<void>((resolve) => { release = resolve; }); return { wait, release }; }
 // Mirrors turns in audit-log-checkpoint-read-schedule.test.ts; P squared drains admission and decision continuations.

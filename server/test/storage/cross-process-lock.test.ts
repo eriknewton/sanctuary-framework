@@ -9,7 +9,7 @@
  * Deterministic temp-dir filesystem only; no sockets, no keychain.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, linkSync, mkdirSync, renameSync } from "node:fs";
 import {
   chmod,
@@ -23,6 +23,8 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as childProcess from "node:child_process";
+import * as net from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
@@ -36,6 +38,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   acquireMasterWriteBarrier,
+  withExclusiveMasterRotationBarrier,
   withCrossProcessLock,
   withPathLock,
   withRequiredCrossProcessLock,
@@ -43,6 +46,10 @@ import {
   resetKernelLockPoisonForTests,
   __testSweepUnusedBarrierScaffolds,
 } from "../../src/storage/cross-process-lock.js";
+
+// Mutable module wrappers let each probe fault restore the real native implementation in finally.
+vi.mock("node:net", async importOriginal => ({ ...await importOriginal<typeof import("node:net")>() }));
+vi.mock("node:child_process", async importOriginal => ({ ...await importOriginal<typeof import("node:child_process")>() }));
 
 const NS = "_lock_test";
 const LOCK = ".unit.lock";
@@ -248,6 +255,145 @@ describe("withCrossProcessLock", () => {
         : new Promise<void>((resolve) => child.once("close", () => resolve()))));
     await rm(base, { recursive: true, force: true });
   });
+
+  it("keeps diagnostic metadata non-enumerable while preserving error kind, message and cause", () => {
+    const cause = new Error("underlying failure");
+    const error = new CrossProcessLockError("existing message", "io", { cause, diagnosticReason: "probe-unknown" });
+    expect(error.diagnosticReason).toBe("probe-unknown");
+    expect(Object.getOwnPropertyDescriptor(error, "diagnosticReason")?.enumerable).toBe(false);
+    expect(JSON.stringify(error)).toBe(JSON.stringify(new CrossProcessLockError("existing message", "io", { cause })));
+    expect(error.message).toBe("existing message");
+    expect(error.kind).toBe("io");
+    expect(error.cause).toBe(cause);
+    expect(new CrossProcessLockError("existing message").diagnosticReason).toBeUndefined();
+  });
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux").each(["probe", "retry budget"] as const)(
+    "retains the unknown probe diagnostic at the %s refusal", async boundary => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "diag-"));
+      const target = join(base, "diagnostic");
+      let clock = 0;
+      let entered = false;
+      let reaped = false;
+      try {
+        await withPathLock(target, LOCK, async () => {
+          vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+          let observed!: () => void;
+          const probeObserved = new Promise<void>(resolve => { observed = resolve; });
+          const outcome = withPathLock(target, LOCK, async () => { entered = true; }, {
+            kernelBacked: true, runtimeRoot,
+            timeoutMs: boundary === "probe" ? 0 : SHORT_KERNEL_TEST_TIMEOUT_MS,
+            retryMs: SHORT_KERNEL_TEST_TIMEOUT_MS,
+            __testMonotonicNow: () => clock,
+            __testForceKernelProbeUnknown: () => { observed(); return true; },
+            __testAfterStaleReaperStarted: () => { reaped = true; },
+          }).catch((error: unknown) => error);
+          try {
+            await Promise.race([probeObserved, outcome]);
+            if (boundary === "retry budget") {
+              clock = SHORT_KERNEL_TEST_TIMEOUT_MS;
+              await vi.advanceTimersByTimeAsync(SHORT_KERNEL_TEST_TIMEOUT_MS);
+            }
+            expect(await outcome).toMatchObject({ kind: "io", diagnosticReason: "probe-unknown" });
+            expect(entered).toBe(false);
+            expect(reaped).toBe(false);
+          } finally {
+            clock = SHORT_KERNEL_TEST_TIMEOUT_MS;
+            await vi.runAllTimersAsync();
+            await outcome;
+            vi.useRealTimers();
+          }
+        }, { kernelBacked: true, runtimeRoot });
+      } finally {
+        vi.useRealTimers();
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux").each(["exclusive owner", "reader"] as const)(
+    "marks an indeterminate %s barrier probe with a typed diagnostic", async owner => {
+      const forceUnknown = () => vi.spyOn(net, "createConnection").mockImplementation(() => {
+        const socket = new net.Socket();
+        queueMicrotask(() => socket.emit("error", Object.assign(new Error("probe unavailable"), { code: "ETIMEDOUT" })));
+        return socket;
+      });
+      if (owner === "exclusive owner") {
+        await withExclusiveMasterRotationBarrier(storage, NS, LOCK, async () => {
+          const spy = forceUnknown();
+          let lease: Awaited<ReturnType<typeof acquireMasterWriteBarrier>> | undefined;
+          try {
+            const error = await acquireMasterWriteBarrier(storage, NS, LOCK, { timeoutMs: 0 }).then(
+              value => { lease = value; return undefined; }, (cause: unknown) => cause,
+            );
+            expect(error).toMatchObject({ kind: "io", diagnosticReason: "probe-unknown" });
+          } finally { spy.mockRestore(); await lease?.release(); }
+        });
+      } else {
+        const lease = await acquireMasterWriteBarrier(storage, NS, LOCK);
+        let restore: () => void = () => undefined;
+        try {
+          const spy = forceUnknown();
+          restore = () => spy.mockRestore();
+          await expect(withExclusiveMasterRotationBarrier(storage, NS, LOCK, async () => undefined, { timeoutMs: 0 }))
+            .rejects.toMatchObject({ kind: "io", diagnosticReason: "probe-unknown" });
+        } finally { restore(); await lease.release(); }
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "marks the real stale reaper deadline with a typed diagnostic", async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "diag-"));
+      const target = join(base, "deadline");
+      const residue = join(runtimeRoot, "residue.sock");
+      let socketPath = "";
+      let reaper: ChildProcess | undefined;
+      let closed: Promise<void> = Promise.resolve();
+      let outcome: Promise<unknown> | undefined;
+      const originalSpawn = childProcess.spawn;
+      let restore: () => void = () => undefined;
+      try {
+        const spy = vi.spyOn(childProcess, "spawn").mockImplementation((...args: Parameters<typeof spawn>) => {
+          const child = originalSpawn(...args);
+          if (Array.isArray(args[1]) && args[1].includes("stale-socket-reaper-lock")) {
+            reaper = child;
+            closed = new Promise<void>(resolve => { child.once("close", () => resolve()); });
+          }
+          return child;
+        });
+        restore = () => spy.mockRestore();
+        await withPathLock(target, LOCK, async () => { linkSync(socketPath, residue); }, {
+          kernelBacked: true, runtimeRoot,
+          __testAfterKernelSocketAcquired: path => { socketPath = path; },
+        });
+        // A hard link retains the socket inode after its listener closes, so acquisition reaches the real reaper.
+        linkSync(residue, socketPath);
+        let started!: () => void;
+        const reaperStarted = new Promise<void>(resolve => { started = resolve; });
+        outcome = withPathLock(target, LOCK, async () => { throw new Error("deadline admitted an operation"); }, {
+          kernelBacked: true, runtimeRoot,
+          __testAfterStaleReaperStarted: pid => {
+            process.kill(pid, "SIGSTOP");
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+            started();
+          },
+        }).catch((error: unknown) => error);
+        await Promise.race([reaperStarted, outcome]);
+        // Must match STALE_REAPER_TIMEOUT_MS in src/storage/cross-process-lock.ts: one two-second helper deadline.
+        const staleReaperDeadlineMs = 2_000;
+        await vi.advanceTimersByTimeAsync(staleReaperDeadlineMs);
+        expect(await outcome).toMatchObject({ kind: "io", diagnosticReason: "reaper-deadline" });
+      } finally {
+        vi.useRealTimers();
+        restore();
+        if (reaper?.pid !== undefined && reaper.exitCode === null && reaper.signalCode === null) {
+          try { process.kill(-reaper.pid, "SIGKILL"); } catch { reaper.kill("SIGKILL"); }
+        }
+        try { await outcome; await closed; } finally { await rm(runtimeRoot, { recursive: true, force: true }); }
+      }
+    },
+  );
 
   it("serializes overlapping critical sections on a filesystem backend", async () => {
     const trace: string[] = [];

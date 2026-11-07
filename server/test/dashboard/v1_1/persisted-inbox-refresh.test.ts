@@ -1,8 +1,9 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { buildV11Bindings, fortressIdFromStoragePath } from "../../../src/dashboard/v1_1/wiring.js";
+import { fortressIdFromStoragePath } from "../../../src/dashboard/v1_1/wiring.js";
 import { upsertPersistedLocalAgent } from "../../../src/hub/agent-registry-persistence.js";
 import { InMemoryLocalAgentRegistry } from "../../../src/hub/index.js";
 import type { LocalAgentRecord } from "../../../src/contracts/v1.1/local-agent-records.js";
@@ -43,7 +44,7 @@ describe("persisted agents on production inbox reads", () => {
     // Audit storage is in memory; 32 bytes is the required 256-bit test key.
     const auditLog = new AuditLog(new MemoryStorage(), Buffer.alloc(32));
     const publisher = { publishInbox: vi.fn(), publishAgentStatus: vi.fn() };
-    const { hubService } = buildV11Bindings({ identityId: IDENTITY,
+    const { hubService } = await buildV11Bindings({ identityId: IDENTITY,
       fortressId: fortressIdFromStoragePath(storagePath), storagePath, auditLog, streamPublisher: publisher });
     const listAgents = vi.spyOn(hubService, "listAgents");
     const put = vi.spyOn(InMemoryLocalAgentRegistry.prototype, "put");

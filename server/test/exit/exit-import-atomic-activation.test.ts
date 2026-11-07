@@ -338,6 +338,7 @@ class FaultInjectingStorage implements StorageBackend {
 describe("F1: durable rollback journal - in-process fault injection at each stage boundary", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
   async function newBundleDir(): Promise<string> {
@@ -741,6 +742,7 @@ async function rmWithRetry(dir: string): Promise<void> {
 describe("F1: a real child-process SIGKILL mid-import leaves the target unable to be told apart from pre-import, after recovery", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rmWithRetry(dir)));
   });
   async function newTempDir(prefix: string): Promise<string> {
@@ -767,7 +769,7 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
 
       await mkdir(join(sourceDir, "state"), { recursive: true, mode: 0o700 });
       const sourceStorage = new FilesystemStorage(join(sourceDir, "state"));
-      const sourceMasterKey = await resolveCliMasterKey(sourceStorage, {
+      const sourceMasterKey = await resolveFixtureMasterKey(sourceStorage, {
         passphrase: sourcePassphrase,
         bootstrap: true,
         storagePathHint: sourceDir,
@@ -806,7 +808,7 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       await mkdir(join(referenceDir, "state"), { recursive: true, mode: 0o700 });
       const referenceStorage = new FilesystemStorage(join(referenceDir, "state"));
       const referencePassphrase = "atomic-kill-reference-disposable-passphrase";
-      const referenceMasterKey = await resolveCliMasterKey(referenceStorage, {
+      const referenceMasterKey = await resolveFixtureMasterKey(referenceStorage, {
         passphrase: referencePassphrase,
         bootstrap: true,
         storagePathHint: referenceDir,
@@ -837,7 +839,7 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       // mid-flight.
       await mkdir(join(targetDir, "state"), { recursive: true, mode: 0o700 });
       const targetStorage = new FilesystemStorage(join(targetDir, "state"));
-      const targetMasterKey = await resolveCliMasterKey(targetStorage, {
+      const targetMasterKey = await resolveFixtureMasterKey(targetStorage, {
         passphrase: targetPassphrase,
         bootstrap: true,
         storagePathHint: targetDir,
@@ -1384,6 +1386,7 @@ describe("N4 (coordinator gate, 2026-08-22): write chokepoints refuse while an e
 describe("F2 (coordinator gate, 2026-08-22): exit-import refuses while a master rotation is in progress, in both directions", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
   async function newBundleDir(): Promise<string> {
@@ -1652,6 +1655,7 @@ describe("F3 (coordinator gate, 2026-08-22): post-image-confirmed restore, deter
 describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lock", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
@@ -1764,6 +1768,7 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
 describe("F4 (coordinator gate, 2026-08-22): a `_meta` write fault after entry bytes land must roll back cleanly, not diverge", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
   async function newBundleDir(): Promise<string> {
@@ -1860,6 +1865,7 @@ describe("F4 (coordinator gate, 2026-08-22): a `_meta` write fault after entry b
 describe("HIGH-1 (coordinator gate, 2026-08-22): two graphs, one on-disk fortress - a concurrent open cannot revert a live import", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
   async function newBundleDir(): Promise<string> {
@@ -1989,6 +1995,7 @@ describe("HIGH-1 (coordinator gate, 2026-08-22): two graphs, one on-disk fortres
 describe("Codex gate HIGH (2026-08-23): audit flush and journal deletion order around the activation commit", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
   async function newBundleDir(): Promise<string> {
@@ -2131,6 +2138,7 @@ describe("Codex gate HIGH (2026-08-23): audit flush and journal deletion order a
 describe("Codex gate HIGH (2026-08-23): an ordinary writer racing journal publication is detected at recovery, not silently reverted or silently overwritten", () => {
   const tempDirs: string[] = [];
   afterEach(async () => {
+    await closeFixtureSessions();
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
   async function newBundleDir(): Promise<string> {
@@ -2285,3 +2293,16 @@ describe("Codex gate HIGH (2026-08-23): an ordinary writer racing journal public
     expect(toBase64url(stillPreserved!)).toBe(toBase64url(racingBytes));
   });
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

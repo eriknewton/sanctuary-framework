@@ -145,7 +145,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     // Bootstrap a real passphrase-mode fortress so the CLI's resolveCliMasterKey
     // unlocks an existing custody envelope (parity with memory-file.test.ts).
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
@@ -161,6 +161,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
   });
 
   afterEach(async () => {
+    await closeFixtureSessions();
     try {
       await releaseCustodyLeases();
     } finally {
@@ -179,7 +180,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     masterKey: Uint8Array;
   }> {
     const storage = new FilesystemStorage(join(fortress, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       passphrase: PASSPHRASE,
       storagePathHint: fortress,
     });
@@ -417,7 +418,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       fortress = join(await tempDir(`memfile-owner-pin-${verbName}`), ".sanctuary");
       await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
       const storage = new FilesystemStorage(join(fortress, "state"));
-      const masterKey = await resolveCliMasterKey(storage, {
+      const masterKey = await resolveFixtureMasterKey(storage, {
         passphrase: PASSPHRASE,
         bootstrap: true,
         storagePathHint: fortress,
@@ -433,6 +434,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
     });
 
     afterEach(async () => {
+    await closeFixtureSessions();
       try {
         await releaseCustodyLeases();
       } finally {
@@ -448,7 +450,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       masterKey: Uint8Array;
     }> {
       const storage = new FilesystemStorage(join(fortress, "state"));
-      const masterKey = await resolveCliMasterKey(storage, {
+      const masterKey = await resolveFixtureMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
       });
@@ -656,4 +658,17 @@ async function pinIsAbsentIn(
   masterKey: Uint8Array,
 ): Promise<boolean> {
   return (await readSdwOwnerPin(storage, masterKey)).status === "absent";
+}
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
 }

@@ -5,6 +5,7 @@
  * Wires together: config → storage → crypto core → L1-L4 tools → MCP server
  */
 
+import { ConstructionWork } from "./dashboard/construction-work.js";
 import { mkdir } from "node:fs/promises";
 import { tightenStoragePermissions } from "./storage/permissions.js";
 import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
@@ -481,8 +482,11 @@ export async function createSanctuaryServer(options?: {
     // how the dashboard side left the factor unwiped.
     if (bootKeychainKey) bootKeychainKey.fill(0);
   }
-  const responseScreen = new ResponseScreen(); // Host lifetime begins tainted, independent of proxy configuration.
+  const constructionWork = new ConstructionWork();
+  let startupScreen: ResponseScreen | undefined;
   try {
+  const responseScreen = new ResponseScreen(); // Host lifetime begins tainted, independent of proxy configuration.
+  startupScreen = responseScreen;
   const masterKey = custody.masterKey;
   const keyProtection: "passphrase" | "hardware-key" | "recovery-key" =
     custody.keyProtection;
@@ -1219,14 +1223,8 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdFromStoragePath(config.storage_path),
     auditLog,
   });
-  // Register Z-HNY-02: fire-and-forget at construction, mirroring the
-  // conciergeMemory.pruneExpired() pattern in dashboard/v1_1/wiring.ts, so
-  // the fortress-unlock cycle drops expired findings before any honeypot or
-  // sentinel activity accumulates on top of them.
-  void sentinelFindingStore.pruneExpired().catch(() => {
-    // Best-effort: a transient storage hiccup should not block boot. The
-    // next unlock re-runs the prune.
-  });
+  // The boot prune is session-owned so it settles before final persistence and release, and a rejection changes no outcome; must match the shared-store prune skip in dashboard/v1_1/wiring.ts.
+  constructionWork.track(sentinelFindingStore.pruneExpired());
 
   // 15. Load Principal Policy and create approval gate
   let policy: PrincipalPolicy;
@@ -1362,6 +1360,7 @@ export async function createSanctuaryServer(options?: {
     const embeddedHubIdentityId = intelligenceIdentityId;
     dashboard.setV11Bindings(
       buildV11Bindings({
+        constructionWork,
         streamPublisher: {
           publishInbox: (frame) => dashboard!.broadcastSSE("inbox", frame),
           publishAgentStatus: (snapshot) => dashboard!.broadcastSSE("agent_status", snapshot),
@@ -2428,36 +2427,43 @@ export async function createSanctuaryServer(options?: {
     // the second call finds cleanupPromise already set and returns it (no reentry).
     cleanupPromise = Promise.resolve().then(async () => {
       const errors: unknown[] = [];
-      responseScreen.stop(); // Fence admission synchronously before any asynchronous teardown.
-      // Stop MCP admission first so no new tool calls are accepted.
-      // server.close() is async (SDK Protocol.close); awaiting it ensures the
-      // transport is fully torn down before we flush persistence below.
-      try { await server.close(); } catch (e) { errors.push(e); }
-      // Stop future ticks independently so a failure in one does not block others.
-      try { unifiedInboxScheduler.stop(); } catch (e) { errors.push(e); }
-      // Stop future calibration audit production before the final flush.
-      try { autoTriggerSuggester.stop(); } catch (e) { errors.push(e); }
-      try { await sentinelDispatcher.dispose(); } catch (e) { errors.push(e); }
-      try { await anomalyDispatcher.dispose(); } catch (e) { errors.push(e); }
-      // Dispose the auto-trigger dispatcher's pending timers/listeners after
-      // its event sources (sentinel, anomaly) have been stopped above.
-      try { autoTriggerDispatcher.dispose(); } catch (e) { errors.push(e); }
-      // Stop the selected approval channel. Dispose may emit audit entries.
-      if (selectedApprovalChannel.type === "dashboard") {
-        try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
-      } else if (selectedApprovalChannel.type === "webhook") {
-        try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+      try {
+        try { responseScreen.stop(); } catch (e) { errors.push(e); } // Fence admission synchronously before any asynchronous teardown.
+        // Stop MCP admission first so no new tool calls are accepted.
+        // server.close() is async (SDK Protocol.close); awaiting it ensures the
+        // transport is fully torn down before we flush persistence below.
+        try { await server.close(); } catch (e) { errors.push(e); }
+        // Stop future ticks independently so a failure in one does not block others.
+        try { unifiedInboxScheduler.stop(); } catch (e) { errors.push(e); }
+        // Stop future calibration audit production before the final flush.
+        try { autoTriggerSuggester.stop(); } catch (e) { errors.push(e); }
+        try { await sentinelDispatcher.dispose(); } catch (e) { errors.push(e); }
+        try { await anomalyDispatcher.dispose(); } catch (e) { errors.push(e); }
+        // Dispose the auto-trigger dispatcher's pending timers/listeners after
+        // its event sources (sentinel, anomaly) have been stopped above.
+        try { autoTriggerDispatcher.dispose(); } catch (e) { errors.push(e); }
+        // Stop the selected approval channel. Dispose may emit audit entries.
+        if (selectedApprovalChannel.type === "dashboard") {
+          try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+        } else if (selectedApprovalChannel.type === "webhook") {
+          try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+        }
+        // Shut down proxy client connections.
+        if (clientManager) {
+          try { await clientManager.shutdown(); } catch (e) { errors.push(e); }
+        }
+        try { await responseScreen.close(); } catch (e) { errors.push(e); }
+        try { governor.clearResponseCache(); } catch (e) { errors.push(e); }
+        // Finalization drains best-effort construction work before final persistence and release.
+        try { await constructionWork.drain(); } catch (e) { errors.push(e); }
+        // Flush persistence last; audit flush must follow inbox and baseline.
+        try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
+        try { await baseline.save(); } catch (e) { errors.push(e); }
+        try { await auditLog.flush(); } catch (e) { errors.push(e); }
+      } finally {
+        // The server retains its session through serving and final persistence, then awaits release on every cleanup or failed-start exit.
+        try { await custody.masterWriteBarrier?.release(); } catch (e) { errors.push(e); }
       }
-      // Shut down proxy client connections.
-      if (clientManager) {
-        try { await clientManager.shutdown(); } catch (e) { errors.push(e); }
-      }
-      try { await responseScreen.close(); } catch (e) { errors.push(e); }
-      governor.clearResponseCache();
-      // Flush persistence last; audit flush must follow inbox and baseline.
-      try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
-      try { await baseline.save(); } catch (e) { errors.push(e); }
-      try { await auditLog.flush(); } catch (e) { errors.push(e); }
       if (errors.length === 1) throw errors[0];
       if (errors.length > 1) {
         throw new AggregateError(errors, "Sanctuary MCP Server cleanup encountered errors");
@@ -2508,11 +2514,14 @@ export async function createSanctuaryServer(options?: {
     cleanup,
   };
   } catch (error) {
+    // Failed startup drains best-effort construction work before the key is zeroed and the session is released.
+    await constructionWork.drain();
     // Scanner cleanup cannot skip the custody scrub if cleanup itself fails.
-    try { await responseScreen.close(); } catch { /* Preserve the startup failure below. */ }
+    try { await startupScreen?.close(); } catch { /* Preserve the startup failure below. */ }
     // Startup never transferred the master session to a live server. Release
     // its shared rotation barrier only after every attempted startup write has
     // settled, then scrub the unowned master before surfacing the root cause.
+    // The server retains its session through serving and final persistence, then awaits release on every cleanup or failed-start exit.
     try {
       await custody.masterWriteBarrier?.release();
     } catch (releaseError) {

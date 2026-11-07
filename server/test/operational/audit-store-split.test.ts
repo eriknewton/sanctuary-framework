@@ -22,7 +22,7 @@
  * process) being unreadable to the real operator uid, and the real
  * `sanctuary castle-wall daemon` startup path invoking this migration.
  */
-// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
@@ -570,7 +570,7 @@ describe("F2 Option A: fortress audit store split", () => {
       }
       const auditDir = join(statePath, "_audit");
       for (const fn of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
-        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0");
+        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0"); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
         if (seq >= 1 && seq <= 2) await unlink(join(auditDir, fn)); // the sealed prefix
       }
 
@@ -610,7 +610,7 @@ describe("F2 Option A: fortress audit store split", () => {
       }
       const auditDir = join(statePath, "_audit");
       for (const fn of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
-        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0");
+        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0"); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
         if (seq >= 1 && seq <= 2) await unlink(join(auditDir, fn));
       }
       // ALSO corrupt the established marker in place (bad MAC / bad JSON) rather
@@ -645,7 +645,7 @@ describe("F2 Option A: fortress audit store split", () => {
       await rm(join(statePath, "_meta"), { recursive: true, force: true });
       const auditDir = join(statePath, "_audit");
       for (const fn of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
-        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0");
+        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0"); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
         if (seq >= 1 && seq <= 2) await unlink(join(auditDir, fn));
       }
 

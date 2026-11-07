@@ -1,8 +1,12 @@
 // fail-before-exempt: test lifecycle for the recovery custody check; behavior unchanged
+import { channel } from "node:diagnostics_channel";
+import * as custodyModule from "../../src/core/master-custody.js";
+import * as lockModule from "../../src/storage/cross-process-lock.js";
+import { Server } from "node:net";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readdir, readFile, realpath, stat, symlink, writeFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, readFile, realpath, stat, symlink, writeFile, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
@@ -13,7 +17,7 @@ import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { fromBase64url } from "../../src/core/encoding.js";
 import { CUSTODY_WRITE_LOCK_FILE, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME, establishMaster, unlockExistingMasterReadOnly, withCustodyWriteLock } from "../../src/core/master-custody.js";
-import { ensureKernelSocketRuntimeDirectory, withExclusiveMasterRotationBarrier } from "../../src/storage/cross-process-lock.js";
+import { CrossProcessLockError, ensureKernelSocketRuntimeDirectory, withExclusiveMasterRotationBarrier } from "../../src/storage/cross-process-lock.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { persistUserProvidedPassphrase } from "../../src/wrap/passphrase.js";
 import { memoryProvenancePublicKeyFingerprint } from "../../src/sdw/memory-provenance-bad-signers.js";
@@ -290,12 +294,93 @@ async function command(f: Fixture, apply = false, overrideArgv?: string[]) {
   return { code, out: observed.stdout(), err: observed.stderr() };
 }
 
-async function direct(f: Fixture, apply = true) {
+async function direct(f: Fixture, apply = true, json = false) {
   let out = "";
   let err = "";
-  const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress, ...(apply ? ["--apply"] : [])],
+  const code = await runHermesRecoverSave({ argv: ["recover-save", "--fortress", f.fortress, ...(apply ? ["--apply"] : []), ...(json ? ["--json"] : [])],
     env: { HOME: f.home, SANCTUARY_PASSPHRASE: PASS }, stdout: { write: value => { out += String(value); return true; } }, stderr: { write: value => { err += String(value); return true; } } });
   return { code, out, err };
+}
+
+// Capture the actual listener so even retained socket-loss leases are rescued on assertion failure.
+async function withRecoveryLease<T>(run: () => Promise<T>, options: {
+  releaseFailure?: CrossProcessLockError;
+  afterCallback?: (socketPath: string) => Promise<void>;
+} = {}) {
+  const listeners = new Set<Server>();
+  const capturedLeases = new Set<Server>();
+  const emit = Server.prototype.emit;
+  const close = Server.prototype.close;
+  const barrier = lockModule.withExclusiveMasterRotationBarrier;
+  let socketPath: string | undefined;
+  let observedFailure: unknown;
+  const emitSpy = vi.spyOn(Server.prototype, "emit").mockImplementation(function(this: Server, event, ...args) {
+    if (event === "listening") listeners.add(this);
+    return emit.call(this, event, ...args);
+  });
+  const closeSpy = vi.spyOn(Server.prototype, "close").mockImplementation(function(this: Server, callback) {
+    if (!capturedLeases.has(this) || options.releaseFailure === undefined) return close.call(this, callback);
+    return close.call(this, error => { callback?.(error ?? options.releaseFailure); });
+  });
+  const barrierSpy = vi.spyOn(lockModule, "withExclusiveMasterRotationBarrier").mockImplementation(async (storage, namespace, name, operation, barrierOptions) => {
+    try {
+      return await barrier(storage, namespace, name, async () => {
+        const result = await operation();
+        if (options.afterCallback) await options.afterCallback(socketPath!);
+        return result;
+      }, { ...barrierOptions, __testAfterExclusiveSocketAcquired: path => {
+        socketPath = path;
+        const lease = [...listeners].find(listener => listener.address() === path);
+        if (lease === undefined) throw new Error("Exclusive recovery listener was not captured");
+        capturedLeases.add(lease);
+      } });
+    } catch (cause) { observedFailure = cause; throw cause; }
+  });
+  try {
+    const result = await run();
+    expect(capturedLeases.size).toBe(1); // Each command owns one exclusive custody listener.
+    return { result, observedFailure };
+  } finally {
+    barrierSpy.mockRestore();
+    closeSpy.mockRestore();
+    emitSpy.mockRestore();
+    // Every captured listener is closed before fortress teardown can drain or remove its namespace.
+    await runCleanups([...capturedLeases].map(lease => () => new Promise<void>((resolve, reject) => {
+      close.call(lease, error => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+        else resolve();
+      });
+    })));
+  }
+}
+
+// Must match REFUSAL_ERROR_NODE_LIMIT in src/cli/hermes-recover-save.ts; pin the traversal boundary.
+const REFUSAL_ERROR_NODE_LIMIT = 16;
+const secretPath = "/private/sentinel-fortress/custody.sock";
+
+async function refusalDiagnostic(error: Error, expected: unknown[],
+  stderr = "The save could not be classified and nothing was changed.\n") {
+  const stack: Cleanup[] = [];
+  const events: unknown[] = [];
+  const subscriber = (event: unknown) => { events.push(event); };
+  const diagnostic = channel("sanctuary.hermes-recover-save.refusal");
+  let restore: () => void = () => undefined;
+  try {
+    const f = await fixture(false, stack);
+    const spy = vi.spyOn(lockModule, "withExclusiveMasterRotationBarrier").mockRejectedValue(error);
+    restore = () => spy.mockRestore();
+    diagnostic.subscribe(subscriber);
+    const result = await direct(f);
+    expect(events).toEqual(expected);
+    expect(result.err).toBe(stderr);
+    expect(JSON.stringify(events)).not.toContain(secretPath);
+    expect(result.code).toBe(1);
+    expect(result.out).toBe("");
+  } finally {
+    diagnostic.unsubscribe(subscriber);
+    restore();
+    await runCleanups(stack);
+  }
 }
 
 async function hashes(root: string): Promise<Record<string, string>> {
@@ -548,6 +633,256 @@ describe("Hermes save operator recovery", () => {
     expect((await direct(f)).code).toBe(0);
     expect(await audit(f)).toHaveLength(1);
     expect(await command(f, true)).toMatchObject({ code: 0, out: "nothing to recover\n" });
+  });
+
+  it.each([
+    { kind: "contention", diagnosticReason: undefined, reason: "contention" },
+    { kind: "io", diagnosticReason: "probe-unknown", reason: "probe-unknown" },
+    { kind: "io", diagnosticReason: "reaper-deadline", reason: "reaper-deadline" },
+    { kind: "capability", diagnosticReason: undefined, reason: "capability" },
+  ] as const)("publishes the typed $reason custody refusal without changing command output", async ({ kind, diagnosticReason, reason }) => {
+    await refusalDiagnostic(new CrossProcessLockError(secretPath, kind, { diagnosticReason }), [
+      { lockKind: kind, reason },
+    ], "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it.\n");
+  });
+
+  it("retains distinct aggregate and cause reasons while stopping cycles and duplicates", async () => {
+    const probe = new CrossProcessLockError(secretPath, "io", { diagnosticReason: "probe-unknown" });
+    const deadline = new CrossProcessLockError(secretPath, "io", { diagnosticReason: "reaper-deadline" });
+    const aggregate = new AggregateError([
+      probe, new Error(secretPath, { cause: deadline }),
+      new CrossProcessLockError(secretPath, "io", { diagnosticReason: "probe-unknown" }),
+    ], secretPath, { cause: new CrossProcessLockError(secretPath, "capability") });
+    probe.cause = aggregate;
+    await refusalDiagnostic(aggregate, [
+      { lockKind: "io", reason: "probe-unknown" },
+      { lockKind: "io", reason: "reaper-deadline" },
+      { lockKind: "capability", reason: "capability" },
+    ]);
+  });
+
+  it.each(["cause", "aggregate"] as const)("bounds diagnostic traversal to sixteen entries through %s", async shape => {
+    const within = new CrossProcessLockError(secretPath, "contention");
+    const beyond = new CrossProcessLockError(secretPath, "capability");
+    let error: Error;
+    if (shape === "cause") {
+      within.cause = beyond;
+      error = within;
+      // The typed refusal is the sixteenth node; the seventeenth must remain unvisited.
+      for (let depth = 1; depth < REFUSAL_ERROR_NODE_LIMIT; depth++) error = new Error(secretPath, { cause: error });
+    } else {
+      // The aggregate itself consumes one entry, leaving fourteen fillers before the last admitted reason.
+      error = new AggregateError([
+        ...Array.from({ length: REFUSAL_ERROR_NODE_LIMIT - 2 }, () => new Error(secretPath)), within, beyond,
+      ], secretPath);
+    }
+    await refusalDiagnostic(error, [{ lockKind: "contention", reason: "contention" }]);
+  });
+
+  it.each(["kind", "diagnosticReason"] as const)("omits unallowlisted runtime %s data from diagnostics", async field => {
+    const error = new CrossProcessLockError(secretPath);
+    Object.defineProperty(error, field, { value: secretPath });
+    await refusalDiagnostic(error, field === "kind" ? [] : [{ lockKind: "io", reason: "io" }],
+      "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it.\n");
+  });
+
+  it("keeps the refusal message when diagnostic traversal throws", async () => {
+    const error = new CrossProcessLockError(secretPath);
+    Object.defineProperty(error, "cause", { get() { throw new Error(secretPath); } });
+    await refusalDiagnostic(error, [{ lockKind: "io", reason: "io" }],
+      "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it.\n");
+  });
+
+  // "report" is a report-mode run whose barrier admitted it and failed afterward: admission, not the action, gates the diagnostic.
+  it.each(["started", "finished", "report"] as const)("does not publish a custody refusal after admission (%s)", async stage => {
+    const stack: Cleanup[] = [];
+    const events: unknown[] = [];
+    const subscriber = (event: unknown) => { events.push(event); };
+    const diagnostic = channel("sanctuary.hermes-recover-save.refusal");
+    let restore: () => void = () => undefined;
+    try {
+      const f = await fixture(false, stack);
+      await save(f, "target", SAVE_TEXT, "S3");
+      const error = new CrossProcessLockError(secretPath, "io", { diagnosticReason: "reaper-deadline" });
+      if (stage === "started") {
+        const spy = vi.spyOn(FilesystemStorage.prototype, "delete").mockRejectedValue(error);
+        restore = () => spy.mockRestore();
+      } else {
+        const original = lockModule.withExclusiveMasterRotationBarrier;
+        const spy = vi.spyOn(lockModule, "withExclusiveMasterRotationBarrier").mockImplementation(async (...args) => {
+          await original(...args);
+          throw error;
+        });
+        restore = () => spy.mockRestore();
+      }
+      diagnostic.subscribe(subscriber);
+      const result = await direct(f, stage !== "report");
+      expect(events).toEqual([]);
+      expect(result.code).toBe(1);
+      expect(result.err).toBe(stage === "started"
+        ? "Recovery did not finish; retry --apply if the intent is still readable.\n"
+        : stage === "finished"
+          ? "Recovery completed but the audit append or lock release failed; the action was not reversed.\n"
+          : "Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n");
+      expect(JSON.stringify(events)).not.toContain(secretPath);
+    } finally {
+      diagnostic.unsubscribe(subscriber);
+      restore();
+      // save() registers its children globally; reap them before removing this fixture.
+      try { await runCleanups(cleanups); } finally { await runCleanups(stack); }
+    }
+  });
+
+  const reports = (["absent", "S2", "S3"] as const).flatMap(state => [false, true].map(json => ({
+    state, json, format: json ? "JSON" : "text",
+    output: state === "absent" ? (json ? '{"state":"nothing to recover"}\n' : "nothing to recover\n")
+      : json ? JSON.stringify({ state: state === "S3" ? "completed" : "not_completed",
+        action: state === "S3" ? "keep published save and delete intent" : "roll back save records and delete intent" }) + "\n"
+        : state === "S3" ? "completed; --apply would keep published save and delete intent.\n"
+          : "not_completed; --apply would roll back save records and delete intent.\n",
+  })));
+
+  it.each(reports)("reports custody release failure after writing the $state $format report", async ({ state, json, output }) => {
+    const f = await fixture();
+    if (state !== "absent") await save(f, "target", SAVE_TEXT, state);
+    // No module reset intervenes between this class-bearing error and the real command's catch.
+    const failure = new CrossProcessLockError("custody lock listener close failed", "io");
+    const capturedLeases = new Set<Server>();
+    const close = Server.prototype.close;
+    const barrier = lockModule.withExclusiveMasterRotationBarrier;
+    let socketPath: string | undefined;
+    let observedFailure: unknown;
+    const barrierSpy = vi.spyOn(lockModule, "withExclusiveMasterRotationBarrier").mockImplementation(async (storage, namespace, name, operation, options) => {
+      try {
+        return await barrier(storage, namespace, name, operation, { ...options,
+          __testAfterExclusiveSocketAcquired: path => { socketPath = path; },
+        });
+      } catch (cause) { observedFailure = cause; throw cause; }
+    });
+    // Capture the real exclusive lease's listener and reject its close callback after the kernel closes it.
+    const closeSpy = vi.spyOn(Server.prototype, "close").mockImplementation(function(this: Server, callback) {
+      if (socketPath === undefined || this.address() !== socketPath) return close.call(this, callback);
+      capturedLeases.add(this);
+      return close.call(this, error => { callback?.(error ?? failure); });
+    });
+    try {
+      const result = await direct(f, false, json);
+      expect(capturedLeases.size).toBe(1); // The command owns one exclusive custody listener.
+      expect(observedFailure).toBe(failure);
+      expect(result.out).toBe(output);
+      expect(result.err).toBe("Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n");
+      expect(result.code).toBe(1); // A failed release is command failure.
+      expect(result.err).not.toContain("Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it.");
+    } finally {
+      closeSpy.mockRestore();
+      barrierSpy.mockRestore();
+      // Rescue every captured real listener even when an assertion or the injected close fails.
+      for (const lease of capturedLeases) {
+        await new Promise<void>((resolve, reject) => close.call(lease, error => {
+          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+          else resolve();
+        }));
+      }
+    }
+  });
+
+  it.each([false, true])("reports release failure after apply has nothing to recover (JSON=%s)", async json => {
+    const f = await fixture();
+    const failure = new CrossProcessLockError("custody lock listener close failed", "io");
+    const { result, observedFailure } = await withRecoveryLease(() => direct(f, true, json), { releaseFailure: failure });
+    expect(observedFailure).toBe(failure);
+    expect(result).toEqual({ code: 1, // Release failure is command failure even when no save needed recovery.
+      out: json ? '{"state":"nothing to recover"}\n' : "nothing to recover\n",
+      err: "Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n" });
+  });
+
+  it.each([false, true])("appends release failure after the callback refuses missing credentials (apply=%s)", async apply => {
+    const f = await fixture();
+    const failure = new CrossProcessLockError("custody lock listener close failed", "io");
+    let err = "";
+    const { result, observedFailure } = await withRecoveryLease(() => runHermesRecoverSave({
+      argv: ["recover-save", "--fortress", f.fortress, ...(apply ? ["--apply"] : [])], env: { HOME: f.home },
+      stdout: { write: () => { throw new Error("Refusal must not write stdout"); } },
+      stderr: { write: value => { err += String(value); return true; } },
+    }), { releaseFailure: failure });
+    expect(observedFailure).toBe(failure);
+    expect(result).toBe(1); // Both refusal and failed release require failure status.
+    expect(err).toBe("Recovery requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
+      "Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n");
+  });
+
+  it("reports release failure for the one-member aggregate after real socket loss following classification", async () => {
+    const f = await fixture();
+    await save(f, "target", SAVE_TEXT, "S3");
+    const { result, observedFailure } = await withRecoveryLease(() => direct(f, false), {
+      afterCallback: async socketPath => { await unlink(socketPath); },
+    });
+    expect(observedFailure).toBeInstanceOf(AggregateError);
+    const aggregate = observedFailure as AggregateError;
+    expect(aggregate.errors).toHaveLength(1); // Held check and release share one cached failure object.
+    expect(aggregate.errors[0]).toBe(aggregate.cause);
+    expect(aggregate.cause).toBeInstanceOf(CrossProcessLockError);
+    expect(aggregate.cause).toMatchObject({ kind: "holder-lost" });
+    expect(result).toEqual({ code: 1, // Socket loss makes finalization fail.
+      out: "completed; --apply would keep published save and delete intent.\n",
+      err: "Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n" });
+  });
+
+  it.each([false, true])("reports an operation-side lock error truthfully after admission (release fails=%s)", async releaseFails => {
+    const f = await fixture();
+    const operationFailure = new CrossProcessLockError("operation lock failed", "io");
+    const releaseFailure = new CrossProcessLockError("custody lock listener close failed", "io");
+    const unlockSpy = vi.spyOn(custodyModule, "unlockExistingMasterReadOnly").mockRejectedValue(operationFailure);
+    try {
+      const { result, observedFailure } = await withRecoveryLease(() => direct(f, false),
+        releaseFails ? { releaseFailure } : {});
+      expect(unlockSpy).toHaveBeenCalledOnce();
+      if (releaseFails) {
+        expect(observedFailure).toBeInstanceOf(AggregateError);
+        const aggregate = observedFailure as AggregateError;
+        expect(aggregate.errors).toHaveLength(2); // Operation and release are distinct failures.
+        expect(aggregate.errors[0]).toBe(operationFailure);
+        expect(aggregate.errors[1]).toBe(releaseFailure);
+        expect(aggregate.cause).toBe(operationFailure);
+      } else expect(observedFailure).toBe(operationFailure);
+      expect(result).toEqual({ code: 1, out: "", // No classification or action completed.
+        err: "The save could not be classified and nothing was changed.\n" });
+    } finally { unlockSpy.mockRestore(); }
+  });
+
+  it("finds release custody errors through nested aggregate cycles after a callback return", async () => {
+    const f = await fixture();
+    const failure = new CrossProcessLockError("custody lock listener close failed", "io");
+    const cycle = new AggregateError([], "cyclic finalization fixture");
+    const nested = new AggregateError([cycle], "nested finalization fixture");
+    cycle.errors.push(nested);
+    const { result, observedFailure } = await withRecoveryLease(() => direct(f, false), {
+      releaseFailure: failure, afterCallback: async () => { throw nested; },
+    });
+    expect(observedFailure).toBeInstanceOf(AggregateError);
+    const aggregate = observedFailure as AggregateError;
+    expect(aggregate.errors).toHaveLength(2); // The cyclic assertion fixture and the real release failure remain distinct.
+    expect(aggregate.errors[0]).toBe(nested);
+    expect(aggregate.errors[1]).toBe(failure);
+    expect(result).toEqual({ code: 1, out: "nothing to recover\n", // Finalization failure retains the completed output.
+      err: "Fortress custody could not be released cleanly; any work the command already reported as complete was committed.\n" });
+  });
+
+  it.each(reports)("returns success after reporting $state as $format with a clean release", async ({ state, json, output }) => {
+    const f = await fixture();
+    if (state !== "absent") await save(f, "target", SAVE_TEXT, state);
+    expect(await direct(f, false, json)).toEqual({ code: 0, out: output, err: "" }); // Zero is successful report and release.
+  });
+
+  it("refuses report while a live custody holder owns the fortress", async () => {
+    const f = await fixture();
+    const lease = await lockModule.acquireMasterWriteBarrier(f.storage, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME);
+    try {
+      lease.assertHeld();
+      expect(await direct(f, false)).toEqual({ code: 1, out: "", // One is admission refusal.
+        err: "Recovery requires exclusive custody of the fortress; a live bridge or unavailable custody barrier prevents it.\n" });
+      lease.assertHeld();
+    } finally { await lease.release(); }
   });
 
   it("live bridge refuses report and apply with identical fortress hashes", async () => {

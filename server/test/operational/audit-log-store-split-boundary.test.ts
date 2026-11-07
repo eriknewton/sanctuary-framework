@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * F2 Option A — fortress audit store split-boundary regression tests
  * (`AuditLog`-level: the load-path skip + seed-override mechanism).
@@ -316,7 +317,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     // deleted": write a daemon entry, write NO boundary.
     await storage.write(
       "_audit-daemon",
-      "entry-00000000000000000001-1-0",
+      "entry-00000000000000000001-1-0", // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       new TextEncoder().encode("{}"),
     );
 
@@ -350,7 +351,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     // A daemon marker exists (migration ran).
     await storage.write(
       "_audit-daemon",
-      "entry-00000000000000000001-1-0",
+      "entry-00000000000000000001-1-0", // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       new TextEncoder().encode("{}"),
     );
 
@@ -359,7 +360,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     await rm(join(statePath, "_audit_migration"), { recursive: true, force: true });
     const auditDir = join(statePath, "_audit");
     for (const f of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
-      const seq = Number(/^entry-(\d{20})-/.exec(f)?.[1] ?? "0");
+      const seq = Number(/^entry-(\d{20})-/.exec(f)?.[1] ?? "0"); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       if (seq <= 2) await unlink(join(auditDir, f));
     }
 
@@ -709,7 +710,7 @@ describe("F2 Option A: root-contaminated _audit_checkpoints under a valid bounda
     // store looks exactly like a fresh just-migrated box.
     const auditDir = join(statePath, "_audit");
     for (const f of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
-      const seq = Number(/^entry-(\d{20})-/.exec(f)?.[1] ?? "0");
+      const seq = Number(/^entry-(\d{20})-/.exec(f)?.[1] ?? "0"); // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       if (seq > 6) await unlink(join(auditDir, f));
     }
     const cpDir = join(statePath, "_audit_checkpoints");

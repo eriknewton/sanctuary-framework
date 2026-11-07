@@ -229,6 +229,7 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     tmp = await mkdtemp(join(tmpdir(), "sanctuary-fleet-attest-test-"));
   });
   afterEach(async () => {
+    await closeFixtureSessions();
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_RECOVERY_KEY;
     try {
@@ -274,7 +275,7 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
 
     // No secret-key material anywhere in the printed output.
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey, storagePathHint: fortressPath,
     });
     try {
@@ -389,11 +390,10 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     // Activate it (mirrors the operator pasting the license into the console).
     const { activateFleet } = await import("../../src/entitlement/activation.js");
     const { FilesystemStorage } = await import("../../src/storage/filesystem.js");
-    const { resolveCliMasterKey } = await import("../../src/core/master-custody.js");
     const { IdentityManager } = await import("../../src/cognitive/tools.js");
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -489,11 +489,10 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     // Activate it (mirrors the operator pasting the license into the console).
     const { activateFleet } = await import("../../src/entitlement/activation.js");
     const { FilesystemStorage } = await import("../../src/storage/filesystem.js");
-    const { resolveCliMasterKey } = await import("../../src/core/master-custody.js");
     const { IdentityManager } = await import("../../src/cognitive/tools.js");
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
+    const masterKey = await resolveFixtureMasterKey(storage, {
       recoveryKey,
       storagePathHint: fortressPath,
     });
@@ -823,6 +822,7 @@ describe("fleet attest export - the daemon posture read carries the operator cre
   });
 
   afterEach(async () => {
+    await closeFixtureSessions();
     if (channel) {
       await channel.stop();
       channel = null;
@@ -918,3 +918,16 @@ describe("fleet attest export - the daemon posture read carries the operator cre
     expect(doc.attestation.posture.banner_state).toBe("roster_unavailable");
   });
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

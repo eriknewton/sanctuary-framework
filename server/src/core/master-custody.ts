@@ -2183,7 +2183,7 @@ export async function establishMaster(
     try {
       await barrier.release();
     } catch (releaseError) {
-      throw new AggregateError(
+      throw new MasterEstablishmentReleaseError(
         [error, releaseError],
         "master establishment failed and its shared rotation barrier did not release cleanly",
         { cause: releaseError },
@@ -2618,6 +2618,81 @@ async function establishMasterLocked(
   }
 }
 
+/** Identifies custody release failures (establishment cleanup and CLI unlock release) that must escape optional audit catches. */
+export class MasterEstablishmentReleaseError extends AggregateError {}
+
+/** Custody retained by a CLI consumer until its final persistence completes. */
+export type CliMasterKeySession = Pick<EstablishMasterResult, "masterKey" | "masterWriteBarrier">;
+
+const cliSessionClosures = new WeakMap<CliMasterKeySession, Promise<void>>();
+
+/** Flush pending consumer writes and release once, preserving a rejected close. */
+export function closeCliMasterKeySession(
+  session: CliMasterKeySession,
+  flush?: () => Promise<unknown>,
+): Promise<void> {
+  const existing = cliSessionClosures.get(session);
+  if (existing) return existing;
+  const closing = Promise.resolve().then(async () => {
+    const errors: unknown[] = [];
+    try { await flush?.(); } catch (error) { errors.push(error); }
+    try { session.masterKey.fill(0); } catch (error) { errors.push(error); }
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    try { await session.masterWriteBarrier?.release(); } catch (error) { errors.push(error); }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "CLI session finalization failed");
+  });
+  cliSessionClosures.set(session, closing);
+  return closing;
+}
+
+/** Bound a consumer operation to its session, retaining both operation and cleanup errors. */
+export async function withCliMasterKeySession<T>(
+  session: CliMasterKeySession,
+  operation: () => Promise<T>,
+  flush?: () => Promise<unknown>,
+): Promise<T> {
+  return withCliFinalization(operation, () => closeCliMasterKeySession(session, flush));
+}
+
+/** The aggregate message must match the cleanupFailed comparison in cli/secrets.ts. */
+export const CLI_FINALIZATION_ERROR_MESSAGE = "CLI operation and session finalization failed";
+
+/** Keep the operation outcome when a consumer's final persistence or release also fails. */
+export async function withCliFinalization<T>(
+  operation: () => Promise<T>,
+  finalize: () => Promise<unknown>,
+): Promise<T> {
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+  try { outcome = { ok: true, value: await operation() }; }
+  catch (error) { outcome = { ok: false, error }; }
+  try { await finalize(); }
+  catch (error) {
+    if (!outcome.ok) {
+      throw new AggregateError([outcome.error, error], CLI_FINALIZATION_ERROR_MESSAGE, { cause: error });
+    }
+    throw error;
+  }
+  if (!outcome.ok) throw outcome.error;
+  return outcome.value;
+}
+
+/** Transfer custody only with a constructed object; refusals and failed construction close locally. */
+export async function transferCliMasterKeySession<T extends object | number | null>(
+  session: CliMasterKeySession,
+  construct: () => Promise<T>,
+  flush?: () => Promise<unknown>,
+): Promise<T> {
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+  try { outcome = { ok: true, value: await construct() }; }
+  catch (error) { outcome = { ok: false, error }; }
+  if (outcome.ok && outcome.value !== null && typeof outcome.value === "object") return outcome.value;
+  return withCliMasterKeySession(session, async () => {
+    if (!outcome.ok) throw outcome.error;
+    return outcome.value;
+  }, flush);
+}
+
 /**
  * Thin adapter for CLI verbs that need the fortress master key. Replaces
  * the copy-pasted "read key-params → deriveMasterKey → maybe persist params"
@@ -2637,7 +2712,7 @@ export async function resolveCliMasterKey(
     bootstrap?: boolean;
     storagePathHint?: string;
   }
-): Promise<Uint8Array> {
+): Promise<CliMasterKeySession> {
   const result = await establishMaster({
     storage,
     // A CLI verb opening an EXISTING fortress must not brick on an environmental
@@ -2650,17 +2725,18 @@ export async function resolveCliMasterKey(
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     ...(opts.bootstrap
       ? {
-          firstRun: {
-            installMode: "headless" as CustodyInstallMode,
-            mintRecoveryKey: false,
-          },
-        }
+        firstRun: {
+          installMode: "headless" as CustodyInstallMode,
+          mintRecoveryKey: false,
+        },
+      }
       : {}),
     ...(opts.storagePathHint !== undefined
       ? { storagePathHint: opts.storagePathHint }
       : {}),
   });
-  return result.masterKey;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return result;
 }
 
 /**

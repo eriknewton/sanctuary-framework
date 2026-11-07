@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 /**
  * Sanctuary v1.1.7 — Z empty-state regression-canary
  *
@@ -42,7 +43,6 @@ import { DashboardApprovalChannel } from "../../../src/principal-policy/dashboar
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import {
-  buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../../src/dashboard/v1_1/wiring.js";
 import { upsertPersistedLocalAgent } from "../../../src/hub/agent-registry-persistence.js";
@@ -146,7 +146,7 @@ describe("v1.1 Agents empty-state canary (Finding Z regression)", () => {
         auditLog,
       });
       dashboard.setV11Bindings(
-        buildV11Bindings({
+        await buildV11Bindings({
           identityId: seedRecord.identity_id,
           fortressId: fortressIdFromStoragePath(storagePath),
           auditLog,

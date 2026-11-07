@@ -197,10 +197,18 @@ export type CrossProcessLockErrorKind =
 
 export class CrossProcessLockError extends Error {
   readonly kind: CrossProcessLockErrorKind;
-  constructor(message: string, kind: CrossProcessLockErrorKind = "io", options?: ErrorOptions) {
+  /** Local refusal classification; omitted from ordinary error serialization. */
+  declare readonly diagnosticReason?: "probe-unknown" | "reaper-deadline";
+  constructor(message: string, kind: CrossProcessLockErrorKind = "io", options?: ErrorOptions & {
+    diagnosticReason?: CrossProcessLockError["diagnosticReason"];
+  }) {
     super(message, options);
     this.name = "CrossProcessLockError";
     this.kind = kind;
+    // Keep path-free diagnostic metadata out of existing enumerable error surfaces.
+    if (options?.diagnosticReason !== undefined) {
+      Object.defineProperty(this, "diagnosticReason", { value: options.diagnosticReason });
+    }
   }
 }
 
@@ -349,6 +357,12 @@ export interface CrossProcessLockOptions {
   __testReleaseTimeoutMs?: number;
   /** TEST ONLY: observe the serialized stale-socket reaper process. */
   __testAfterStaleReaperStarted?: (pid: number) => void;
+  /**
+   * TEST ONLY: scheduling control after a serialized stale-socket cleanup
+   * succeeded and before the acquisition loop binds again. It observes; it
+   * cannot report or manufacture a cleanup.
+   */
+  __testAfterStaleSocketReaped?: (path: string) => void | Promise<void>;
   /**
    * TEST ONLY: observe the process-owned socket path after identity capture.
    * Must match the async hook shape in MasterWriteBarrierOptions in this file,
@@ -1165,6 +1179,7 @@ async function exclusiveMasterBarrierIsAbsent(
     throw new CrossProcessLockError(
       `master-rotation barrier liveness is indeterminate (${coordinates.exclusiveSocketPath})`,
       "io",
+      { diagnosticReason: "probe-unknown" },
     );
   }
   const outcome = await reapStaleSocketWithSerializedAuthority(
@@ -1757,6 +1772,7 @@ async function waitForMasterBarrierReaders(
         throw new CrossProcessLockError(
           `master write barrier reader liveness is indeterminate (${path})`,
           "io",
+          { diagnosticReason: "probe-unknown" },
         );
       }
       // Stale: reap it, but bound the number of serialized reaper spawns per
@@ -2206,6 +2222,11 @@ async function ensureInertLockScaffold(
   );
 }
 
+// state_UNAVAILABLE never changes; eligible calls start state_AVAILABLE.
+// Only successful cleanup moves state_AVAILABLE -> state_PENDING;
+// the loop head moves state_PENDING -> state_SPENT before listener preparation.
+type PostReapBindState = "state_UNAVAILABLE" | "state_AVAILABLE" | "state_PENDING" | "state_SPENT";
+
 async function acquireKernelLock(
   lockIdentity: string,
   timeoutMs: number,
@@ -2223,6 +2244,7 @@ async function acquireKernelLock(
           ? `kernel custody lock owner liveness is indeterminate (${lockIdentity}); refusing to unlink`
           : `kernel custody lock ${lockIdentity} remained held for ${timeoutMs}ms (acquisition budget exhausted)`,
         unknownOwner ? "io" : "contention",
+        unknownOwner ? { diagnosticReason: "probe-unknown" } : undefined,
       );
     }
   };
@@ -2260,14 +2282,19 @@ async function acquireKernelLock(
   }
   // The existing local timeout starts after capability setup; the caller's shared deadline covers setup too.
   deadline = Math.min(monotonicNow() + timeoutMs, options.monotonicDeadlineMs ?? Infinity);
+  const zeroWaitEligible = timeoutMs === 0 && options.monotonicDeadlineMs === undefined;
+  let postReapState: PostReapBindState = zeroWaitEligible ? "state_AVAILABLE" : "state_UNAVAILABLE";
   let contentions = 0;
   let firstAttempt = true;
   for (;;) {
-    // A zero local wait retains its one nonblocking probe, but an expired caller deadline never starts a probe.
-    if (!firstAttempt || timeoutMs > 0 || options.monotonicDeadlineMs !== undefined) assertBudget();
-    const nonblockingFirstAttempt = firstAttempt && timeoutMs === 0 && options.monotonicDeadlineMs === undefined;
+    // Only an eligible call (zero local wait, no caller deadline) skips the budget, on its first attempt and on the one bind a successful cleanup grants; every other attempt checks the budget before any probe.
+    const postReapAttempt = postReapState === "state_PENDING";
+    const nonblockingAttempt = zeroWaitEligible && (firstAttempt || postReapAttempt);
+    if (!nonblockingAttempt) assertBudget();
+    // Spending at the loop head, before listener preparation, keeps the granted bind single-use even when this attempt throws.
+    if (postReapAttempt) postReapState = "state_SPENT";
     firstAttempt = false;
-    // Every retry observes the caller deadline before attempting another bind.
+    // Every attempt, nonblocking ones included, observes the abort signal before it binds.
     assertLockWaitNotAborted(abortSignal, socketPath);
     const acquired = prepareKernelListener(socketPath,
       { dev: String(runtimeIdentity.dev), ino: String(runtimeIdentity.ino) }, reaperScaffoldPath, host);
@@ -2277,8 +2304,8 @@ async function acquireKernelLock(
       // The hook is test-only scheduling control; no hook means no await and no yield.
       const hook = options.__testAfterKernelSocketAcquired;
       if (hook !== undefined) await hook(socketPath);
-      // A zero local timeout permits its single free bind; explicit caller deadlines always fence admission.
-      if (!nonblockingFirstAttempt) assertBudget();
+      // A nonblocking attempt skips only its own local budget check (it has no caller deadline); listener admission below always runs.
+      if (!nonblockingAttempt) assertBudget();
       assertKernelListenerAdmission(acquired);
       if (options.__testAfterKernelHolderAcquired) {
         const testHelper = acquired.testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
@@ -2312,6 +2339,15 @@ async function acquireKernelLock(
         : await probeSocketOwner(socketPath);
       unknownOwner = probe === "unknown";
       if (probe === "stale") {
+        // A spent allowance refuses here so one call can perform only one exclusive cleanup.
+        if (postReapState === "state_SPENT") {
+          contentions += 1;
+          options.onContended?.(contentions);
+          throw new CrossProcessLockError(
+            `kernel custody lock ${socketPath} remained held for ${timeoutMs}ms`,
+            "contention",
+          );
+        }
         const reaperOutcome = await reapStaleSocketWithSerializedAuthority(
           socketPath,
           { dev: String(observed.dev), ino: String(observed.ino) },
@@ -2319,7 +2355,14 @@ async function acquireKernelLock(
           host,
           options.__testAfterStaleReaperStarted,
         );
-        if (reaperOutcome === "reaped") continue;
+        if (reaperOutcome === "reaped") {
+          // One serialized cleanup grants a zero-wait call one more bind with the same admission checks.
+          // Forward-only state prevents renewal; an explicit caller deadline is never extended.
+          if (postReapState === "state_AVAILABLE") postReapState = "state_PENDING";
+          const reapedHook = options.__testAfterStaleSocketReaped;
+          if (reapedHook !== undefined) await reapedHook(socketPath);
+          continue;
+        }
         // Another contender may own the reaper lock or may already have replaced
         // the stale inode with its live socket. Retry the main acquire within the
         // caller's bound; never turn normal serialized progress into an I/O fault.
@@ -2344,6 +2387,7 @@ async function acquireKernelLock(
           throw new CrossProcessLockError(
             `kernel custody lock owner liveness is indeterminate (${socketPath}); refusing to unlink`,
             "io",
+            { diagnosticReason: "probe-unknown" },
           );
         }
         await sleepLockRetry(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS, abortSignal, socketPath);
@@ -2606,7 +2650,7 @@ probe();`;
     });
     const timer = setTimeout(() => {
       killReaperGroup();
-      reject(new CrossProcessLockError("stale-socket reaper exceeded its bounded deadline", "io"));
+      reject(new CrossProcessLockError("stale-socket reaper exceeded its bounded deadline", "io", { diagnosticReason: "reaper-deadline" }));
     }, STALE_REAPER_TIMEOUT_MS);
     child.once("error", (error) => {
       clearTimeout(timer);
@@ -3317,6 +3361,7 @@ function releaseKernelLock(
   const fail = (cause: unknown): void => {
     if (settled) return;
     settled = true;
+    // Must match the release diagnostics recognised by isMasterSessionCleanupFailure in cli.ts.
     acquired.failure = cause instanceof CrossProcessLockError ? cause
       : new CrossProcessLockError("custody lock listener close failed", "io", { cause });
     if (timer && acquired.state === "closed") clearTimeout(timer);
@@ -3324,11 +3369,13 @@ function releaseKernelLock(
   };
   try {
     if (acquired.state !== "bound_identity_validated") {
+      // Must match the release diagnostics recognised by isMasterSessionCleanupFailure in cli.ts.
       throw new CrossProcessLockError("custody lock bind identity is unknown", "holder-lost");
     }
     // Close unlinks synchronously, so only fresh synchronous ancestry and ownership may authorize it.
     assertKernelListenerAdmission(acquired);
   } catch (cause) {
+    // Must match the release diagnostics recognised by isMasterSessionCleanupFailure in cli.ts.
     const error = cause instanceof CrossProcessLockError ? cause
       : new CrossProcessLockError("custody lock ownership validation failed", "io", { cause });
     fail(retainKernelListener(acquired, error));
@@ -3345,6 +3392,7 @@ function releaseKernelLock(
     // Once close was called no further unlink is owed; timeout refunds once without retry or retention.
     acquired.state = "closed";
     refundKernelListener(acquired);
+    // Must match the release diagnostics recognised by isMasterSessionCleanupFailure in cli.ts.
     fail(new CrossProcessLockError(`process-owned custody lock listener did not close within ${timeoutMs}ms`, "holder-lost"));
   }, timeoutMs);
   timer.unref?.();

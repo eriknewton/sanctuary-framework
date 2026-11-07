@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "./construction-work-fixture.js";
 // fail-before-exempt: storagePath was threaded into existing v1.1 routing harness wiring; stop-button enforcement is covered by agent-stop, egress, and castle-wall-agent-controller tests.
 /**
  * v1.1.1 hotfix — DashboardApprovalChannel v1.1 routing wiring
@@ -21,7 +22,6 @@ import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.j
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
-  buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
 import { getFreePort } from "../helpers/free-port.js";
@@ -113,7 +113,7 @@ async function startRig(options: { host?: string; allowPlaintextRemote?: boolean
   });
 
   dashboard.setV11Bindings(
-    buildV11Bindings({
+    await buildV11Bindings({
       identityId: IDENTITY_ID,
       fortressId: fortressIdFromStoragePath(FORTRESS_STORAGE_PATH),
       auditLog,

@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 import { SdwWorkingStateStore } from "../../src/sdw/working-state-store.js";
 import { Buffer } from "node:buffer";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -2556,7 +2557,7 @@ describe("Hermes memory process shell", () => {
     const relay = new NeverDrainingDuplex();
     let stderrText = "";
     const parkedStorage = new ParkingAuditStorage(join(fixture.fortressDir, "state"),
-      (namespace, key) => namespace === "_audit_checkpoints" && /-\d{20}$/.test(key));
+      (namespace, key) => namespace === "_audit_checkpoints" && /-\d{20}$/.test(key)); // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
     const shell = await runHermesBridgeProcess({
       env: fixture.env,
       relaySocketFactory: () => relay,

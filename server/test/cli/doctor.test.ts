@@ -6,7 +6,10 @@
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as custodyLocks from "../../src/storage/cross-process-lock.js";
+import * as harnessPaths from "../../src/wrap/config-reader.js";
+import { CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME } from "../../src/core/master-custody.js";
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +27,7 @@ import { migrateFortressAuditStoreSplit } from "../../src/operational/audit-stor
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
-import { IdentityManager } from "../../src/cognitive/tools.js";
+import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 import { createIdentity, sign as identitySign } from "../../src/core/identity.js";
 import {
   AUDIT_CHAIN_GENESIS,
@@ -78,8 +81,10 @@ describe("sanctuary doctor", () => {
     if (opts.identity) {
       const identityKey = derivePurposeKey(derived.key, "identity-encryption");
       const { storedIdentity } = createIdentity("doctor-id", identityKey, "passphrase");
-      const manager = new IdentityManager(storage, derived.key);
-      await manager.save(storedIdentity);
+      try {
+        await persistStoredIdentity(storage, derived.key, storedIdentity);
+        await storage.write("_meta", "primary_identity_id", stringToBytes(JSON.stringify(storedIdentity.identity_id)));
+      } finally { identityKey.fill(0); }
     }
 
     if (opts.policy === "valid") {
@@ -248,6 +253,79 @@ approval_channel:
     }
     forgedIdentityKey.fill(0);
   }
+
+  it.each(["complete", "later check rejects"])("doctor releases its session when %s", async (outcome) => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    vi.stubEnv("HOME", fortress);
+    const leases: custodyLocks.MasterWriteBarrierLease[] = [];
+    const acquire = custodyLocks.acquireMasterWriteBarrier;
+    const acquisition = vi.spyOn(custodyLocks, "acquireMasterWriteBarrier").mockImplementation(async (...args) => {
+      const lease = await acquire(...args);
+      leases.push(lease);
+      return lease;
+    });
+    const sentinel = new Error("later check rejected");
+    const paths = vi.spyOn(harnessPaths, "getPlatformPaths");
+    if (outcome === "later check rejects") paths.mockImplementation(() => { throw sentinel; });
+    try {
+      const operation = runDoctorChecks({
+        storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
+      });
+      if (outcome === "later check rejects") await expect(operation).rejects.toBe(sentinel);
+      else await operation;
+      expect(leases).toHaveLength(1);
+      expect(leases[0]!.signal.aborted).toBe(true);
+      if (custodyLocks.kernelBackedCrossProcessLockPlatformSupported(process.platform)) {
+        const storage = new FilesystemStorage(join(fortress, "state"));
+        await expect(custodyLocks.withExclusiveMasterRotationBarrier(
+          storage, CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME,
+          async () => "entered", { timeoutMs: 0 },
+        )).resolves.toBe("entered");
+      }
+    } finally {
+      paths.mockRestore();
+      acquisition.mockRestore();
+      vi.unstubAllEnvs();
+      for (const lease of leases) await lease.release();
+    }
+  });
+
+  it("doctor reports a release failure outside credential unavailability", async () => {
+    const fortress = await makeFortress({ identity: true });
+    vi.stubEnv("HOME", fortress);
+    const leases: custodyLocks.MasterWriteBarrierLease[] = [];
+    const acquire = custodyLocks.acquireMasterWriteBarrier;
+    const sentinel = new Error("session release rejected");
+    const acquisition = vi.spyOn(custodyLocks, "acquireMasterWriteBarrier").mockImplementation(async (...args) => {
+      const lease = await acquire(...args);
+      leases.push(lease);
+      return { ...lease, release: async () => { await lease.release(); throw sentinel; } };
+    });
+    try {
+      await expect(runDoctorChecks({
+        storagePath: fortress, env: { SANCTUARY_PASSPHRASE: passphrase }, platform: "linux",
+      })).rejects.toBe(sentinel);
+      expect(leases[0]!.signal.aborted).toBe(true);
+    } finally {
+      acquisition.mockRestore();
+      vi.unstubAllEnvs();
+      for (const lease of leases) await lease.release();
+    }
+  });
+
+  it("doctor continues without a session when credentials are unavailable", async () => {
+    const fortress = await makeFortress();
+    vi.stubEnv("HOME", fortress);
+    const acquisition = vi.spyOn(custodyLocks, "acquireMasterWriteBarrier");
+    try {
+      const checks = await runDoctorChecks({ storagePath: fortress, env: {}, platform: "linux" });
+      expect(checks.length).toBeGreaterThan(0);
+      expect(acquisition).not.toHaveBeenCalled();
+    } finally {
+      acquisition.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
 
   it("reports expected checks for a healthy fixture and does not print secrets", async () => {
     const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });

@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../dashboard/construction-work-fixture.js";
 /**
  * Federation PR-A2 — /v1/agents over real HTTP through DashboardApprovalChannel.
  *
@@ -37,7 +38,6 @@ import {
   OPERATOR_AUTHORIZATION_SPENT_STORE_NAMESPACE,
   OperatorAuthorizationSpentStore,
 } from "../../src/v1/operator-authorization-spent-store.js";
-import { buildV11Bindings } from "../../src/dashboard/v1_1/wiring.js";
 import { writePersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
 import type { HubTier1ApprovalEnqueuedResult } from "../../src/hub/types.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
@@ -143,7 +143,7 @@ async function startRig(opts?: {
   );
   if (storagePath) {
     writePersistedLocalAgents(storagePath, [agentRecord()]);
-    const bindings = buildV11Bindings({
+    const bindings = await buildV11Bindings({
       identityId: "op-1",
       fortressId: "fortress-http-test",
       auditLog,

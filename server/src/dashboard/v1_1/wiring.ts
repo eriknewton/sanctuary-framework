@@ -30,6 +30,7 @@
  *     after Tier 1 approval.
  */
 
+import type { ConstructionWork } from "../construction-work.js";
 import { projectHubExportResult, type HubExportDeliveryReceiver } from "../../hub/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -112,6 +113,8 @@ import {
 } from "../../recognition/did-web.js";
 
 export interface BuildV11BindingsInputs {
+  // Ownership is required even without storage; must match ConstructionWork's settlement-only contract.
+  constructionWork: ConstructionWork;
   /** Optional dashboard stream sink for hub mutations. */
   streamPublisher?: import("../../hub/index.js").HubStreamPublisher;
   /** Operator identity id this hub is scoped to. */
@@ -455,9 +458,7 @@ export function buildV11Bindings(
   const readPersisted = () => readPersistedLocalAgents(storagePath);
   const writePersisted = (records: ReturnType<typeof readPersistedLocalAgents>) =>
     writePersistedLocalAgents(storagePath, records);
-  void pruneExpiredDidWebKeysOnUnlock(inputs).catch(() => {
-    // Best-effort unlock pruning must not block dashboard construction.
-  });
+  inputs.constructionWork.track(pruneExpiredDidWebKeysOnUnlock(inputs));
   const resolveAuditAttribution = buildAuditAttributionResolver(inputs);
 
   // WP-V1.2-4: construct the operator-chat service when the caller has
@@ -498,11 +499,7 @@ export function buildV11Bindings(
         ? { retentionDays: inputs.conciergeMemoryRetentionDays }
         : {}),
     });
-    void conciergeMemory.pruneExpired().catch(() => {
-      // Pruning is best-effort on fortress-unlock; a transient storage
-      // hiccup should not block hub construction. The next unlock
-      // re-runs the prune.
-    });
+    inputs.constructionWork.track(conciergeMemory.pruneExpired());
     const agentContextCache = new AgentContextCache({
       identityId: inputs.identityId,
       agentRegistry: registry,
@@ -522,7 +519,7 @@ export function buildV11Bindings(
         warn(`agent_context_cache_refresh_failed:${message}`);
       },
     });
-    void agentContextCache.refresh();
+    inputs.constructionWork.track(agentContextCache.refresh());
     operatorChatService = new OperatorChatService({
       store: chatStore,
       auditLog: inputs.auditLog,
@@ -591,14 +588,7 @@ export function buildV11Bindings(
   // Mounted by the dispatch layer behind the shared auth chokepoint.
   let anomaly: V11AnomalyBinding | undefined;
   if (inputs.storage && inputs.masterKey) {
-    // MUST-FIX 5 (fix-round-2 RECHECK): reuse the caller's SentinelFindingStore
-    // when supplied — see `sentinelFindingStore`'s doc on
-    // BuildV11BindingsInputs for why a second independent instance silently
-    // hides findings between this binding and the caller's own sentinel-
-    // dispatch boot path. `pruneExpired` is skipped for a REUSED instance:
-    // the owner that constructed it already schedules pruning (index.ts's
-    // boot path); running it again here would just be redundant work
-    // against the same store.
+    // A reused shared store skips its own prune because the session already owns that store's prune; must match the session-owned sentinel prune in index.ts.
     const reusingSharedStore = inputs.sentinelFindingStore !== undefined;
     const findingStore =
       inputs.sentinelFindingStore ??
@@ -609,13 +599,7 @@ export function buildV11Bindings(
         auditLog: inputs.auditLog,
       });
     if (!reusingSharedStore) {
-      // Register Z-HNY-02: fire-and-forget at construction, same pattern as
-      // conciergeMemory.pruneExpired() above — the fortress-unlock cycle
-      // drops expired findings before any dashboard read of this store.
-      void findingStore.pruneExpired().catch(() => {
-        // Best-effort; a transient storage hiccup should not block hub
-        // construction. The next unlock re-runs the prune.
-      });
+      inputs.constructionWork.track(findingStore.pruneExpired());
     }
     const dispatcher = new AnomalyPipelineDispatcher({
       findingStore,

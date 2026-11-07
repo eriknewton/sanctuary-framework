@@ -1,3 +1,4 @@
+import { ConstructionWork } from "../../src/dashboard/construction-work.js";
 import { randomBytes } from "node:crypto";
 import { chmodSync, constants as fsConstants, mkdtempSync, rmSync } from "node:fs";
 import { chmod, link, mkdir, open, rm, unlink, writeFile } from "node:fs/promises";
@@ -426,6 +427,7 @@ export function seededItemsForDemo(): SeededDemoItem[] {
 }
 
 async function releaseResources(resources: {
+  constructionWork: ConstructionWork;
   dashboard: DashboardApprovalChannel | null;
   heldCalls: Promise<GateResult>[];
   dispatcher: SentinelDispatcher | null;
@@ -443,6 +445,12 @@ async function releaseResources(resources: {
   await Promise.allSettled(resources.heldCalls);
   try {
     await resources.dispatcher?.dispose();
+  } catch (error) {
+    errors.push(error);
+  }
+  // Teardown drains best-effort construction work before final audit persistence and release.
+  try {
+    await resources.constructionWork.drain();
   } catch (error) {
     errors.push(error);
   }
@@ -490,6 +498,7 @@ export async function seedDemoFortress(
   const envSnapshot = snapshotEnv();
   const port = options.port ?? DEMO_SEED_DEFAULT_PORT;
   let storagePath = "";
+  const constructionWork = new ConstructionWork();
   let custody: Awaited<ReturnType<typeof establishMaster>> | null = null;
   let auditLog: AuditLog | null = null;
   let stopped = false;
@@ -644,6 +653,7 @@ export async function seedDemoFortress(
       dashboard.setSentinelDispatcher(dispatcher);
       dashboard.setV11Bindings(
         buildV11Bindings({
+          constructionWork,
           identityId: agentRecords[0]?.identity_id ?? operatorIdentityId,
           fortressId,
           auditLog,
@@ -704,7 +714,7 @@ export async function seedDemoFortress(
         stopped = true;
         let releaseError: unknown;
         try {
-          await releaseResources({ dashboard, heldCalls, dispatcher, auditLog, custody });
+          await releaseResources({ constructionWork, dashboard, heldCalls, dispatcher, auditLog, custody });
         } catch (error) {
           releaseError = error;
         } finally {
@@ -720,7 +730,7 @@ export async function seedDemoFortress(
   } catch (error) {
     let releaseError: unknown;
     try {
-      await releaseResources({ dashboard, heldCalls, dispatcher, auditLog, custody });
+      await releaseResources({ constructionWork, dashboard, heldCalls, dispatcher, auditLog, custody });
     } catch (err) {
       releaseError = err;
     } finally {

@@ -137,10 +137,11 @@ async function issuerPublicKey(
   recoveryKey: string,
 ): Promise<Uint8Array> {
   const storage = new FilesystemStorage(join(fortressPath, "state"));
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     recoveryKey,
     storagePathHint: fortressPath,
   });
+  const masterKey = session.masterKey;
   try {
     const mgr = new IdentityManager(storage, masterKey);
     await mgr.load();
@@ -149,7 +150,8 @@ async function issuerPublicKey(
     const b64 = id.public_key.replace(/-/g, "+").replace(/_/g, "/");
     return new Uint8Array(Buffer.from(b64, "base64"));
   } finally {
-    masterKey.fill(0);
+    try { await session.masterWriteBarrier?.release(); }
+    finally { masterKey.fill(0); }
   }
 }
 

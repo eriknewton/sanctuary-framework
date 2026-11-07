@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { resolveStoragePath } from "../paths.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import {
@@ -163,9 +163,8 @@ export async function runSdwOwnerCommand(args: SdwOwnerCommandArgs): Promise<num
   }
 
   const storage = new FilesystemStorage(join(storagePath, "state"));
-  let masterKey: Uint8Array | undefined;
   try {
-    masterKey = await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       ...(env.SANCTUARY_PASSPHRASE !== undefined
         ? { passphrase: env.SANCTUARY_PASSPHRASE }
         : {}),
@@ -174,62 +173,67 @@ export async function runSdwOwnerCommand(args: SdwOwnerCommandArgs): Promise<num
         : {}),
       storagePathHint: storagePath,
     });
-    const fortressId = fortressIdFromStoragePath(storagePath);
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
+      const fortressId = fortressIdFromStoragePath(storagePath);
 
-    if (parsed.command === "status") {
-      const pin = await readSdwOwnerPin(storage, masterKey);
-      if (pin.status === "absent") {
-        out.write("SDW owner: unassigned\n");
-        return 3;
+      if (parsed.command === "status") {
+        const pin = await readSdwOwnerPin(storage, masterKey);
+        if (pin.status === "absent") {
+          out.write("SDW owner: unassigned\n");
+          return 3;
+        }
+        if (pin.status === "invalid") {
+          err.write("SDW owner pin is present but failed authentication.\n");
+          return 1;
+        }
+        out.write(`SDW owner: ${pin.data.agent_id}\n`);
+        out.write(`Pinned at: ${pin.data.pinned_at}\n`);
+        return 0;
       }
-      if (pin.status === "invalid") {
-        err.write("SDW owner pin is present but failed authentication.\n");
+
+      const target = parsed.command === "claim" ? parsed.agentId! : parsed.toAgentId!;
+      const [typedId, typedVerb] = await promptLines(stdin, err, [
+        `Type the new wrapped-agent id (${target}) to continue: `,
+        `Type ${parsed.command === "claim" ? "CLAIM" : "TRANSFER"} (uppercase) to continue: `,
+      ]);
+      if (
+        typedId.trim() !== target ||
+        typedVerb.trim() !== (parsed.command === "claim" ? "CLAIM" : "TRANSFER")
+      ) {
+        err.write("Aborted: confirmation did not match.\n");
         return 1;
       }
-      out.write(`SDW owner: ${pin.data.agent_id}\n`);
-      out.write(`Pinned at: ${pin.data.pinned_at}\n`);
-      return 0;
-    }
 
-    const target = parsed.command === "claim" ? parsed.agentId! : parsed.toAgentId!;
-    const [typedId, typedVerb] = await promptLines(stdin, err, [
-      `Type the new wrapped-agent id (${target}) to continue: `,
-      `Type ${parsed.command === "claim" ? "CLAIM" : "TRANSFER"} (uppercase) to continue: `,
-    ]);
-    if (
-      typedId.trim() !== target ||
-      typedVerb.trim() !== (parsed.command === "claim" ? "CLAIM" : "TRANSFER")
-    ) {
-      err.write("Aborted: confirmation did not match.\n");
-      return 1;
-    }
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+      const operation = parsed.command === "claim" ? "sdw_owner_claim" : "sdw_owner_transfer";
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: `${operation}_requested`,
+        identity_id: "principal",
+        result: "success",
+        details: {
+          target_agent_id: target,
+          ...(parsed.command === "transfer"
+            ? { expected_agent_id: parsed.fromAgentId! }
+            : {}),
+        },
+      });
 
-    const auditLog = new AuditLog(storage, masterKey);
-    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
-    const operation = parsed.command === "claim" ? "sdw_owner_claim" : "sdw_owner_transfer";
-    await auditLog.appendCritical({
-      layer: "l1",
-      operation: `${operation}_requested`,
-      identity_id: "principal",
-      result: "success",
-      details: {
-        target_agent_id: target,
-        ...(parsed.command === "transfer"
-          ? { expected_agent_id: parsed.fromAgentId! }
-          : {}),
-      },
-    });
-
-    const result =
-      parsed.command === "claim"
-        ? await claimSdwOwnerForOperator({
+      const result =
+        parsed.command === "claim"
+          ? await claimSdwOwnerForOperator({
             storage,
             masterKey,
             fortressId,
             ownerRef: OWNER_REF,
             agentId: parsed.agentId!,
           })
-        : await transferSdwOwnerForOperator({
+          : await transferSdwOwnerForOperator({
             storage,
             masterKey,
             fortressId,
@@ -237,29 +241,29 @@ export async function runSdwOwnerCommand(args: SdwOwnerCommandArgs): Promise<num
             expectedAgentId: parsed.fromAgentId!,
             newAgentId: parsed.toAgentId!,
           });
-    const succeeded =
-      (parsed.command === "claim" && result.status === "claimed") ||
-      (parsed.command === "transfer" && result.status === "transferred");
-    await auditLog.appendCritical({
-      layer: "l1",
-      operation: succeeded ? operation : `${operation}_refused`,
-      identity_id: "principal",
-      result: succeeded ? "success" : "failure",
-      details: { target_agent_id: target, outcome: result.status },
-    });
-    if (!succeeded) {
-      err.write(`SDW owner ${parsed.command} refused: ${result.status}.\n`);
-      if (result.status === "claim_lost") {
-        err.write("Another owner won the atomic claim; run sdw-owner status before retrying.\n");
+      const succeeded =
+        (parsed.command === "claim" && result.status === "claimed") ||
+        (parsed.command === "transfer" && result.status === "transferred");
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: succeeded ? operation : `${operation}_refused`,
+        identity_id: "principal",
+        result: succeeded ? "success" : "failure",
+        details: { target_agent_id: target, outcome: result.status },
+      });
+      if (!succeeded) {
+        err.write(`SDW owner ${parsed.command} refused: ${result.status}.\n`);
+        if (result.status === "claim_lost") {
+          err.write("Another owner won the atomic claim; run sdw-owner status before retrying.\n");
+        }
+        return 1;
       }
-      return 1;
-    }
-    out.write(`SDW owner ${parsed.command === "claim" ? "claimed by" : "transferred to"} ${target}.\n`);
-    return 0;
+      out.write(`SDW owner ${parsed.command === "claim" ? "claimed by" : "transferred to"} ${target}.\n`);
+      return 0;
+
+    }, () => sessionAuditLog?.flush() ?? Promise.resolve());
   } catch (error) {
     err.write(`sdw-owner failed: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
-  } finally {
-    masterKey?.fill(0);
   }
 }

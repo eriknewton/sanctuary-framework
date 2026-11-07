@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../dashboard/construction-work-fixture.js";
 /**
  * v1.1.5 (Finding Z) — wrap persists a hub `LocalAgentRecord` so the
  * v1.1 dashboard's Agents view reflects what wrap registered.
@@ -57,7 +58,6 @@ import {
   writePersistedLocalAgents,
 } from "../../src/hub/agent-registry-persistence.js";
 import {
-  buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -249,9 +249,9 @@ describe("buildV11Bindings rehydrates from local-agents.json", () => {
     await rm(tmpFortress, { recursive: true, force: true });
   });
 
-  it("seeds an empty registry when storagePath has no persisted file (first boot)", () => {
+  it("seeds an empty registry when storagePath has no persisted file (first boot)", async () => {
     const auditLog = new AuditLog(new MemoryStorage(), randomBytes(32));
-    const { hubService } = buildV11Bindings({
+    const { hubService } = await buildV11Bindings({
       identityId: "id-1",
       fortressId: fortressIdFromStoragePath(tmpFortress),
       auditLog,
@@ -260,7 +260,7 @@ describe("buildV11Bindings rehydrates from local-agents.json", () => {
     expect(hubService.listAgents()).toEqual([]);
   });
 
-  it("rehydrates the registry from the persisted file", () => {
+  it("rehydrates the registry from the persisted file", async () => {
     // hub-service filters listAgents by identity_id, so seeded records
     // must declare the same identity the bindings are constructed with.
     // This mirrors the production shape: wrap and the standalone
@@ -279,7 +279,7 @@ describe("buildV11Bindings rehydrates from local-agents.json", () => {
     });
     writePersistedLocalAgents(tmpFortress, [a, b]);
     const auditLog = new AuditLog(new MemoryStorage(), randomBytes(32));
-    const { hubService } = buildV11Bindings({
+    const { hubService } = await buildV11Bindings({
       identityId: operatorIdentity,
       fortressId: fortressIdFromStoragePath(tmpFortress),
       auditLog,
@@ -292,12 +292,12 @@ describe("buildV11Bindings rehydrates from local-agents.json", () => {
     ]);
   });
 
-  it("degrades to empty registry when the file is corrupted (best-effort)", () => {
+  it("degrades to empty registry when the file is corrupted (best-effort)", async () => {
     const path = localAgentsFilePath(tmpFortress);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     writeFileSync(path, "{ not valid json", { mode: 0o600 });
     const auditLog = new AuditLog(new MemoryStorage(), randomBytes(32));
-    const { hubService } = buildV11Bindings({
+    const { hubService } = await buildV11Bindings({
       identityId: "id-1",
       fortressId: fortressIdFromStoragePath(tmpFortress),
       auditLog,
