@@ -73,3 +73,20 @@ it("refuses ciphertext authenticated without binding AAD", () => {
     expect(() => decryptBinding(payload, master, context)).toThrow("K1_REFUSED");
   } finally { key.fill(0); master.fill(0); }
 });
+import {parseStrict} from "../../src/smb/parse-strict.js";
+it("refuses an authenticated binding whose canonical fields are out of canonical key order", () => {
+  const master = randomBytes(32), key = derivePurposeKey(master, "producer-custody-binding-v1");
+  try {
+    // Every canonical field, compact encoding, reverse canonical key order: only the key order differs from the canonical bytes.
+    const reordered = Object.fromEntries(Object.entries(binding).sort(([a], [b]) => (a < b ? 1 : -1)));
+    const mutant = Buffer.from(JSON.stringify(reordered));
+    expect(mutant.toString()).not.toBe(Buffer.from(canonicalBytes(binding)).toString());
+    expect(mutant.length).toBe(canonicalBytes(binding).length);
+    expect(Buffer.from(canonicalBytes(parseStrict(mutant, 65536))).equals(Buffer.from(canonicalBytes(binding)))).toBe(true);
+    const aad = Buffer.concat([Buffer.from(PRODUCER_CUSTODY_BINDING_AAD), canonicalBytes(context)]);
+    const payload = encrypt(mutant, key, aad);
+    expect(Buffer.from(decrypt(payload, key, aad)).equals(mutant)).toBe(true);
+    expect(() => decryptBinding(payload, master, context)).toThrow("K1_REFUSED");
+    expect(decryptBinding(encrypt(canonicalBytes(binding), key, aad), master, context)).toEqual(binding);
+  } finally { key.fill(0); master.fill(0); }
+});

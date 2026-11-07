@@ -66,6 +66,7 @@ import {
 // influenced and goes through the untrusted-diagnostic chokepoint (STATE-
 // STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
+import { assertAdmissibleIdentityLabel } from "../signing/reserved-label.js";
 
 // Must match AUDIT_EVENT_SIGNING_DOMAIN_PREFIX / INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX
 // in core/signing-domains.ts (the identity_sign refusal list).
@@ -1316,7 +1317,7 @@ export function createCognitiveTools(
       handler: async (args) => {
         const label = args.label as string;
         // Reserved labels refuse new admission before a creation audit can assert success.
-        if (label.startsWith("k1-role:")) throw new Error("K1_ROLE_IDENTITY_REFUSED");
+        assertAdmissibleIdentityLabel(label);
         const { publicIdentity, storedIdentity } = createIdentity(
           label,
           identityEncKey,
@@ -1368,7 +1369,7 @@ export function createCognitiveTools(
       handler: async (args) => {
         const storedIdentity = normalizeImportedIdentity(args.identity);
         // Reserved labels refuse new admission while previously stored labels retain their loading semantics.
-        if (storedIdentity.label.startsWith("k1-role:")) throw new Error("K1_ROLE_IDENTITY_REFUSED");
+        assertAdmissibleIdentityLabel(storedIdentity.label);
         if (identityMgr.hasIdentityConflict(storedIdentity)) {
           await refuseIdentityOverwrite(
             auditLog,

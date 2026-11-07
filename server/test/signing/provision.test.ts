@@ -66,3 +66,18 @@ it.each(["throw", "reuse"])("clears owned preparation material on %s", kind => {
     expect(key.some(byte => byte !== 0)).toBe(true);
   } finally { create.mockRestore(); kid?.mockRestore(); key.fill(0); }
 });
+it("zeroes the owned preparation key after a successful preparation", () => {
+  const key = randomBytes(32);
+  const original = identityModule.createIdentity;
+  let owned: Uint8Array | undefined;
+  // Pass-through spy: the real createIdentity runs, so only the copy handed to it is observed.
+  const create = vi.spyOn(identityModule, "createIdentity").mockImplementation((label, input, protection) => { owned = input; return original(label, input, protection); });
+  try {
+    const {storedIdentity} = prepareRoleIdentity(ROLE_REGISTRY[0].role, 1, "a".repeat(32), key, [], []);
+    expect(storedIdentity.encrypted_private_key.ct).not.toBe("");
+    expect(owned).toBeDefined();
+    expect(owned).not.toBe(key);
+    expect(owned?.every(byte => byte === 0)).toBe(true);
+    expect(key.some(byte => byte !== 0)).toBe(true);
+  } finally { create.mockRestore(); key.fill(0); }
+});

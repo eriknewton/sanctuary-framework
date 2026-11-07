@@ -2,6 +2,7 @@ import { createIdentity } from "../core/identity.js";
 import type { CustodyEnvelope } from "../core/master-custody.js";
 import { decodeCanonical, refuse, roleKid, SIGNER_EPOCHS_MAX, type SigningRole } from "./contract.js";
 import type { RolePin } from "./strict-verifier.js";
+import { ROLE_IDENTITY_LABEL_PREFIX } from "./reserved-label.js";
 
 export function validatePassphrase(passphrase: string): void {
   const points = Array.from(passphrase);
@@ -28,14 +29,17 @@ export function prepareRoleIdentity(role: SigningRole, epoch: number, machineId:
   let storedIdentity: ReturnType<typeof createIdentity>["storedIdentity"] | undefined;
   let returned = false;
   try {
-    ({storedIdentity} = createIdentity("k1-role:" + role, ownedKey, "passphrase"));
+    ({storedIdentity} = createIdentity(ROLE_IDENTITY_LABEL_PREFIX + role, ownedKey, "passphrase"));
     if (!enrollmentKeyAvailable(storedIdentity.public_key, roster, operatorKeys)) return refuse();
     const pin: RolePin = Object.freeze({role, epoch, machine_id: machineId, identity_id: storedIdentity.identity_id,
       public_key: storedIdentity.public_key, kid: roleKid(role, epoch, storedIdentity.public_key)});
     returned = true;
     return {storedIdentity, pin};
   } finally {
-    // Preparation never retains its owned key copy, and failed candidates release their encrypted seed references.
+    // createIdentity wipes the raw seed in its own finally, so after any failed preparation only the candidate's ciphertext
+    // remains, sealed under the caller's still-live identity key (the at-rest form of every stored identity); the ct and iv
+    // strings are released below but cannot be wiped, because JS strings are immutable.
+    // Preparation never retains its owned key copy, on success or failure, so it is zeroed on every exit.
     ownedKey.fill(0);
     if (!returned && storedIdentity) {
       storedIdentity.encrypted_private_key.ct = "";

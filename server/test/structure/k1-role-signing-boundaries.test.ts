@@ -54,10 +54,20 @@ it("pins every evaluated primitive including a derived frame bound", () => {
   expect(actual).toEqual(expected);
   expect(readFileSync(join(root, "server/src/signing/contract.ts"), "utf8")).toContain("SIGNER_HEADER_MAX_BYTES + SIGNER_PREIMAGE_MAX_BYTES + 4");
 });
-it("uses the shared canonical encoder and crate-local public vectors", () => {
+// Must match PINNED_KID in castle-wall-daemon/src/business_profile/mod.rs, where Rust role_kid evaluates the same inputs.
+const PINNED_KID_VECTOR = {role: ROLE_REGISTRY[0].role, epoch: 2, public_key: Buffer.alloc(32, 7).toString("base64url"),
+  kid: "k1:sha256:e09fa5a1f32e54219ade30b8ee6b5cb8367089d6a6aedfad3bf8c875b08fb411"};
+it("evaluates the pinned canonical kid vector shared with Rust and keeps vectors crate-local", () => {
+  expect(runtimeContract.roleKid(PINNED_KID_VECTOR.role, PINNED_KID_VECTOR.epoch, PINNED_KID_VECTOR.public_key)).toBe(PINNED_KID_VECTOR.kid);
   const source = readFileSync(join(root, "castle-wall-daemon/src/business_profile/mod.rs"), "utf8");
-  expect(source.split("#[cfg(test)]")[0]).toContain("hash.update(crate::smb::jcs::encode(&body).ok()?.as_bytes());");
+  expect(source.match(/const PINNED_KID: &str = "([^"]+)";/)?.[1]).toBe(PINNED_KID_VECTOR.kid);
   expect(source).not.toContain("../../../server/");
+});
+it("keeps the reserved role label literal in its one shared helper", () => {
+  const sourceRoot = join(root, "server/src");
+  const users = readdirSync(sourceRoot, {recursive: true}).filter((name): name is string => typeof name === "string" && name.endsWith(".ts"))
+    .filter(name => readFileSync(join(sourceRoot, name), "utf8").includes('"k1-role:"'));
+  expect(users).toEqual(["signing/reserved-label.ts"]);
 });
 
 it("documents the message bound and scalar and signature derivations", () => {

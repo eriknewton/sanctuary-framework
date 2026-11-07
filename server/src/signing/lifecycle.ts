@@ -193,9 +193,14 @@ export const ALLOWED_TRANSITIONS = [
     "guard": "ALWAYS"
   }
 ] as const satisfies readonly {from: CustodyState; event: string; guard: string; to: CustodyState; cleanup_destination?: CustodyState}[];
-export function transition(from: string, event: string, guard = "ALWAYS"): CustodyState {
-  const row = ALLOWED_TRANSITIONS.find(entry => entry.from === from && entry.event === event && entry.guard === guard);
+/** A granted transition: the next state and, for a LOCKING entry, the named state cleanup must settle into. */
+export interface TransitionResult { readonly to: CustodyState; readonly cleanup_destination: CustodyState | null; }
+export function transition(from: string, event: string, guard = "ALWAYS"): TransitionResult {
+  const row: {to: CustodyState; cleanup_destination?: CustodyState} | undefined =
+    ALLOWED_TRANSITIONS.find(entry => entry.from === from && entry.event === event && entry.guard === guard);
   // A named guard must establish the continuing path before the relation grants a destination state.
   if (!row) return refuse();
-  return row.to;
+  // The cleanup destination is returned with the next state so a settled lock (LOCKED) and an uncertain one
+  // (RECOVERY_REQUIRED) stay distinguishable; the supervisor must carry it into the WIPED exit's DESTINATION_* guard.
+  return Object.freeze({to: row.to, cleanup_destination: row.cleanup_destination ?? null});
 }

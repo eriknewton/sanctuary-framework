@@ -196,11 +196,50 @@ it.each(ROLE_REGISTRY)("binds every registered kind for $role", entry => {
   } finally { f.close(); }
 });
 import {sign as identitySign} from "../../src/core/identity.js";
-it.each(["operator", "other role"])("refuses a provider using an %s key", kind => {
+it.each(["other role", "relabelled other role"])("refuses a provider signing with an %s key", kind => {
   const f = fixture(); const other = fixture(ROLE_REGISTRY[3].role);
   try {
     const provider = {sign: (message: Uint8Array) => identitySign(message, other.storedIdentity.encrypted_private_key, other.key)};
-    if (kind === "operator") other.storedIdentity.label = "ordinary operator";
+    // The relabelled case keeps the model-recorder role key and changes only a label the provider never reads.
+    if (kind === "relabelled other role") other.storedIdentity.label = "ordinary operator";
     expect(() => createRecordSigner(f.grant, provider, schema, "append").signRecord({role: f.pin.role, epoch: 1, preimage_bytes: f.preimage})).toThrow("K1_REFUSED");
   } finally { f.close(); other.close(); }
+});
+
+import {strictVerify} from "../../src/signing/strict-verifier.js";
+it.each(ROLE_REGISTRY)("real provider signature from signRecord covers only the $role domain plus preimage", ({role}) => {
+  const f = fixture(role); const sign = vi.spyOn(f.provider, "sign");
+  try {
+    const result = createRecordSigner(f.grant, f.provider, schema, f.body.record_kind).signRecord({role, epoch: 1, preimage_bytes: f.preimage});
+    expect(sign).toHaveBeenCalledTimes(1);
+    const signature = Buffer.from(result.signature, "base64url"), publicKey = Buffer.from(f.pin.public_key, "base64url");
+    // The signer, not its caller, prepends the role domain, so the signature binds exactly that domain and the preimage.
+    expect(strictVerify(recordMessage(role, f.preimage), signature, publicKey)).toBe(true);
+    expect(strictVerify(f.preimage, signature, publicKey)).toBe(false);
+    for (const other of ROLE_REGISTRY.filter(row => row.role !== role))
+      expect(strictVerify(Buffer.concat([Buffer.from(other.domain), f.preimage]), signature, publicKey)).toBe(false);
+  } finally { sign.mockRestore(); f.close(); }
+});
+it.each([contract.PRODUCER_ROTATION_DOMAIN, contract.PRODUCER_DESCRIPTOR_DOMAIN, contract.UNLOCK_CHALLENGE_DOMAIN])("binds lifecycle domain %j to the provider role and machine", domain => {
+  const f = fixture(ROLE_REGISTRY[3].role);
+  try {
+    const own = {role: f.pin.role, machine_id: f.pin.machine_id, v: 1};
+    const message = (body: Uint8Array) => Buffer.concat([Buffer.from(domain), body]);
+    expect(f.provider.sign(message(canonicalBytes(own)))).toHaveLength(64);
+    for (const body of [canonicalBytes({...own, role: ROLE_REGISTRY[0].role}), canonicalBytes({...own, machine_id: "f".repeat(32)}),
+      canonicalBytes({v: 1, machine_id: f.pin.machine_id}), Buffer.from(JSON.stringify({v: 1, role: own.role, machine_id: own.machine_id})),
+      Buffer.from('{"machine_id":"' + own.machine_id + '","role":"' + own.role + '","role":"' + own.role + '","v":1}'),
+      canonicalBytes([own]), new Uint8Array(32)])
+      expect(() => f.provider.sign(message(body))).toThrow("K1_REFUSED");
+  } finally { f.close(); }
+});
+it("verifyRecord refuses a validly signed duplicate-key preimage, matching Rust verify_role", () => {
+  const f = fixture();
+  try {
+    const text = Buffer.from(f.preimage).toString();
+    const duplicate = Buffer.from(text.replace('"record_kind":"append"', '"record_kind":"append","record_kind":"control"'));
+    expect(duplicate.equals(Buffer.from(f.preimage))).toBe(false);
+    const signature = Buffer.from(f.provider.sign(recordMessage(f.pin.role, duplicate))).toString("base64url");
+    for (const kind of ["append", "control"]) expect(verifyRecord(duplicate, signature, f.pin, schema, kind)).toBe(false);
+  } finally { f.close(); }
 });
