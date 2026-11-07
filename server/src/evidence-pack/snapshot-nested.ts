@@ -2,7 +2,7 @@
 import { verifyAuditChainRecords, type ExportRecord, type EntryExportRecord, type CheckpointExportRecord, type RotationAnchorExportRecord } from "../cli/audit-chain-verify.js";
 import { verifyTransparencyCheckpoints, checkpointPayloadHash } from "../transparency/verify.js";
 import * as C from "./snapshot-contract.js";
-export interface NestedOutcome { report: C.NestedReport; partial: C.PartialReason[] }
+export interface NestedOutcome { report: C.NestedReport; partial: C.PartialReason[]; recordKinds?: readonly string[] }
 export function auditExtent(records: readonly C.AuditRecord[]): C.AuditExtent {
   const e = records.filter((r): r is EntryExportRecord => r.type === C.RECORD.entry).sort((a, b) => a.seq - b.seq);
   const c = records.filter((r): r is CheckpointExportRecord => r.type === C.RECORD.checkpoint).sort((a, b) => a.checkpoint_sequence - b.checkpoint_sequence);
@@ -53,6 +53,7 @@ export function verifySnapshotAudit(bytes: Uint8Array, extent: C.AuditExtent, ke
   auditTraversal(spans, assignments.size, entries.length);
   const common = records.filter((r): r is ExportRecord => r.type !== C.RECORD.checkpoint && r.type !== C.RECORD.extension);
   const findings: string[] = []; const scope = new Set<string>(); let signatures = 0; let checked = 0;
+  // DEBT(PACK-AUDIT-REHASH): Each partition rehashes captured payloads up to MAX_KEYS * MAX_FILE_BYTES; signature work also scales with checkpoints and rotation hops outside the traversal budget.
   for (const [key, checkpoints] of assignments) {
     // Each checkpoint is verified exactly once under its role pin and unused pins create no calls.
     const report = verifyAuditChainRecords([...common, ...checkpoints], { publicKey: key, trustEmbedded: false }); const kinds = report.findings.map(f => f.kind);
@@ -62,7 +63,7 @@ export function verifySnapshotAudit(bytes: Uint8Array, extent: C.AuditExtent, ke
     findings.push(...kinds); signatures += report.signatures_verified; checked += report.checkpoints_verified;
   }
   C.requireSnapshot(checked === cps.length, C.HARD.nested_invalid);
-  return { report: { verdict: findings.length ? C.STATUS.FAIL : C.STATUS.PASS, entries_verified: entries.length, checkpoints_verified: checked, signatures_verified: signatures, signature_basis: C.SIGNATURE_BASIS, not_checked: [...scope], findings: [...new Set(findings)].sort() }, partial: [...partial].sort() };
+  return { recordKinds: [...new Set(records.map(r => r.type))], report: { verdict: findings.length ? C.STATUS.FAIL : C.STATUS.PASS, entries_verified: entries.length, checkpoints_verified: checked, signatures_verified: signatures, signature_basis: C.SIGNATURE_BASIS, not_checked: [...scope], findings: [...new Set(findings)].sort() }, partial: [...partial].sort() };
 }
 export function verifySnapshotTransparency(bytes: Uint8Array, extent: C.TransparencyExtent, keys: readonly C.TrustKey[]): NestedOutcome {
   C.cap(keys.length, C.MAX_KEYS);
@@ -79,8 +80,16 @@ export function verifySnapshotTransparency(bytes: Uint8Array, extent: C.Transpar
 export function absentOutcome(component: Exclude<C.Component<unknown>, { state: "included" }>, role: "audit" | "transparency"): NestedOutcome {
   return { report: { state: C.COMPONENT.absent, reason: component.reason }, partial: [C.PARTIAL[`${role}_absent`], C.PARTIAL[`${role}_${component.state}`]] };
 }
-export function joinSnapshotVerdict(partial: readonly C.PartialReason[]): { status: C.SnapshotStatus; exit_code: number; accepted: boolean; snapshot_integrity: typeof C.INTEGRITY.verified | typeof C.INTEGRITY.bytes_match; partial_reasons: C.PartialReason[] } {
-  const reasons = [...new Set(partial)].sort(); const clean = reasons.length === 0;
+export function joinSnapshotVerdict(partial: readonly C.PartialReason[], manifest: C.SnapshotManifest, audit: NestedOutcome, transparency: NestedOutcome): { status: C.SnapshotStatus; exit_code: number; accepted: boolean; snapshot_integrity: typeof C.INTEGRITY.verified | typeof C.INTEGRITY.bytes_match; partial_reasons: C.PartialReason[] } {
+  const reasons = [...new Set(partial)].sort();
+  // PASS requires complete component inclusion, public audit kinds, passing nested verdicts and no incomplete evidence.
+  const clean = manifest.components.audit.state === C.COMPONENT.included
+    && manifest.components.transparency.state === C.COMPONENT.included
+    && audit.report.verdict === C.STATUS.PASS && transparency.report.verdict === C.STATUS.PASS
+    && audit.recordKinds !== undefined && audit.recordKinds.every(kind => C.PUBLIC_AUDIT_KINDS.includes(kind as never))
+    && manifest.extensions.length === 0 && reasons.length === 0;
+  // Missing partial reasons for incomplete evidence are an internal verification failure.
+  C.requireSnapshot(clean === (reasons.length === 0), C.HARD.nested_invalid);
   // PARTIAL is never exit 0 because matching bytes alone cannot establish complete public verification.
   return { status: clean ? C.STATUS.PASS : C.STATUS.PARTIAL, exit_code: clean ? C.EXIT_PASS : C.EXIT_PARTIAL, accepted: clean, snapshot_integrity: clean ? C.INTEGRITY.verified : C.INTEGRITY.bytes_match, partial_reasons: reasons };
 }

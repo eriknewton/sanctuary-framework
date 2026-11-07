@@ -30,6 +30,9 @@ export const MAX_TRUST_BYTES = 1048576;
 export const MAX_FILE_BYTES = 67108864;
 export const MAX_PACK_BYTES = 268435456;
 export const MAX_FILES = 256;
+export const MAX_NAME_BYTES = 128;
+// Must match TRANSPARENCY_BUNDLE_FORMAT in transparency/checkpoint.ts and transparency/verify.ts.
+export const TRANSPARENCY_BUNDLE_FORMAT = "SANCTUARY_TRANSPARENCY_BUNDLE_V1";
 export const MAX_JSON_DEPTH = 32;
 export const MAX_RECORDS = 100000;
 export const MAX_JSONL_LINE_BYTES = 1048576;
@@ -186,7 +189,8 @@ export function parseManifest(value: unknown): SnapshotManifest {
   array(r.extensions, MAX_FILES); const ids = new Set<string>(); const extensionNames = new Set<string>();
   for (const extension of r.extensions) {
     const e = object(extension, ["id", "filenames", "signing_roles"]); text(e.id, EXTENSION_ID); requireSnapshot(!ids.has(e.id)); ids.add(e.id);
-    array(e.filenames, MAX_FILES); array(e.signing_roles, MAX_KEYS); requireSnapshot(e.filenames.length > 0 && new Set(e.signing_roles).size === e.signing_roles.length);
+    // Every extension declares at least one signing role for independent pin binding.
+    array(e.filenames, MAX_FILES); array(e.signing_roles, MAX_KEYS); requireSnapshot(e.signing_roles.length > 0 && e.filenames.length > 0 && new Set(e.signing_roles).size === e.signing_roles.length);
     for (const name of e.filenames) { safeName(name); requireSnapshot(!extensionNames.has(name) && r.files.some(f => (f as SnapshotFile).filename === name && (f as SnapshotFile).role === ROLE.extension)); extensionNames.add(name); }
     for (const role of e.signing_roles) { text(role); requireSnapshot(role === PIN_ROLE.extension + e.id); }
   }
@@ -229,7 +233,14 @@ export const AUDIT_FIELDS = {
   rotation_anchor: { required: ["type", "base_sequence", "base_prev_hash"], optional: ["mac"], nullable: [] },
 } as const;
 export type AuditRecord = ExportRecord | { type: "extension"; extension_id: string; [key: string]: unknown };
-export function parseAuditRecords(bytes: Uint8Array): AuditRecord[] {
+function nestedSchema<T>(parse: () => T): T {
+  // Nested schema failures retain their file boundary while resource and trust errors keep their codes.
+  try { return parse(); }
+  catch (error) { if (error instanceof SnapshotError && error.code === HARD.manifest_invalid) throw new SnapshotError(HARD.nested_invalid); throw error; }
+}
+/** Only the reserved extension envelope permits unknown audit content; bare unknown kinds fail. */
+export function parseAuditRecords(bytes: Uint8Array): AuditRecord[] { return nestedSchema(() => parseAuditRecordsBody(bytes)); }
+function parseAuditRecordsBody(bytes: Uint8Array): AuditRecord[] {
   cap(bytes.length, MAX_FILE_BYTES); const records: AuditRecord[] = []; let start = 0;
   // Byte-level line limits apply before UTF-8 decoding or record allocation.
   for (let i = 0; i <= bytes.length; i++) {
@@ -261,8 +272,12 @@ export function parseAuditRecords(bytes: Uint8Array): AuditRecord[] {
 const TRANSPARENCY_FIELDS = ["checkpoint_kind", "schema_version", "counter", "previous_checkpoint_hash", "issued_at", "fortress_id", "audit", "policy", "daemon", "enforcement", "signer_kid", "signature", "signature_algorithm", "payload_encoding", "public_key"];
 // The existing nested validator owns its frozen format; this table only closes extra fields.
 export function parseTransparency(bytes: Uint8Array): { format: string; exported_at: string; public_key: string; checkpoints: VerifierCheckpointRecord[] } {
+  return nestedSchema(() => parseTransparencyBody(bytes));
+}
+function parseTransparencyBody(bytes: Uint8Array): ReturnType<typeof parseTransparency> {
   const b = object(parseSnapshotJSON(bytes, MAX_FILE_BYTES), ["format", "exported_at", "public_key", "checkpoints"]);
-  text(b.format); timestamp(b.exported_at); publicKey(b.public_key); array(b.checkpoints, MAX_RECORDS); requireSnapshot(b.checkpoints.length > 0);
+  // The nested bundle must name the supported transparency wire format.
+  requireSnapshot(b.format === TRANSPARENCY_BUNDLE_FORMAT, HARD.nested_invalid); timestamp(b.exported_at); publicKey(b.public_key); array(b.checkpoints, MAX_RECORDS); requireSnapshot(b.checkpoints.length > 0);
   for (const candidate of b.checkpoints) {
     const c = object(candidate, TRANSPARENCY_FIELDS); requireSnapshot(isVerifierCheckpointRecord(c)); timestamp(c.issued_at); publicKey(c.public_key); base64(c.signature, SIGNATURE_BYTES);
     object(c.audit, ["merkle_root", "lowest_sequence", "highest_sequence", "head_hash", "entry_count"]); object(c.policy, ["rules_sha256", "rules_count", "manifest_sha256"]); object(c.daemon, ["version", "binary_sha256"]);
@@ -277,7 +292,11 @@ export function validateCapturedStat(value: CapturedStat): void {
   text(r.type); text(r.dev); text(r.ino); text(r.mtime); text(r.ctime); integer(r.size); integer(r.nlink, true);
 }
 export interface CapturedFile { name: Uint8Array; bytes: Uint8Array; before: CapturedStat; after: CapturedStat; metadata: readonly string[] }
-/** Observations are adapter evidence, not authenticated claims from the delivered pack. */
+/** Observations are adapter evidence; full runtime adapter typing belongs to slice 3. */
 export interface CapturedSnapshot { files: readonly CapturedFile[]; rootBefore: CapturedStat; rootAfter: CapturedStat; finalNames: readonly Uint8Array[]; rootMetadata: readonly string[] }
 export interface NestedReport { state?: "absent"; reason?: string; verdict?: SnapshotStatus; findings?: string[]; entries_verified?: number; checkpoints_verified?: number; signatures_verified?: number; signature_basis?: string; not_checked?: readonly string[] }
+/**
+ * Exit 0 iff PASS iff accepted; partial_reasons is nonempty iff PARTIAL.
+ * FAIL has at least one finding and empty partial_reasons; nested reports on FAIL are diagnostic only.
+ */
 export interface VerificationResult { format: typeof RESULT_FORMAT; status: SnapshotStatus; exit_code: number; accepted: boolean; snapshot_integrity: typeof INTEGRITY[keyof typeof INTEGRITY]; export_id: string | null; manifest_digest: string | null; verifier_source_revision: string; findings: { code: HardCode; state: ProtocolState; filename: string | null }[]; partial_reasons: PartialReason[]; nested: { audit: NestedReport | null; transparency: NestedReport | null }; not_checked: readonly string[] }
