@@ -32,6 +32,7 @@
  * letting it through. See that function for the reproduction.
  */
 
+import { CLI_FINALIZATION_ERROR_MESSAGE, MasterEstablishmentReleaseError, withCliFinalization } from "../core/master-custody.js";
 import { statSync } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, isAbsolute } from "node:path";
@@ -227,7 +228,7 @@ async function cmdAdd(
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
-  try {
+  return await withCliFinalization(async () => {
     const value = await resolveValue(argvValue, ctx.stdin, ctx.err, `Enter value for "${name}"`);
     if (!value) {
       ctx.err.write("Aborted: empty value\n");
@@ -236,9 +237,7 @@ async function cmdAdd(
     await broker.addSecret(name, value);
     ctx.out.write(`Stored secret: ${name}\n`);
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── list ────────────────────────────────────────────────────────────
@@ -251,7 +250,7 @@ async function cmdList(ctx: {
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
-  try {
+  return await withCliFinalization(async () => {
     const names = await broker.listSecretNames();
     const grants = broker.getGrants();
     const grantsBySecret = new Map<string, string[]>();
@@ -269,9 +268,7 @@ async function cmdList(ctx: {
       ctx.out.write(`  ${name}\n    granted to: ${scopes}\n`);
     }
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── rotate ──────────────────────────────────────────────────────────
@@ -286,7 +283,7 @@ async function cmdRotate(
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
-  try {
+  return await withCliFinalization(async () => {
     const value = await resolveValue(argvValue, ctx.stdin, ctx.err, `Enter new value for "${name}"`);
     if (!value) {
       ctx.err.write("Aborted: empty value\n");
@@ -295,9 +292,7 @@ async function cmdRotate(
     await broker.rotateSecret(name, value);
     ctx.out.write(`Rotated secret: ${name}\n`);
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── delete ──────────────────────────────────────────────────────────
@@ -311,13 +306,11 @@ async function cmdDelete(
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
-  try {
+  return await withCliFinalization(async () => {
     await broker.deleteSecret(name);
     ctx.out.write(`Deleted secret: ${name}\n`);
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── grant ───────────────────────────────────────────────────────────
@@ -371,13 +364,11 @@ async function cmdGrant(
     storagePath: storage,
     backend: ctx.args.brokerBackend,
   });
-  try {
+  return await withCliFinalization(async () => {
     broker.grant({ skill, secret, scope, ttlSeconds: ttl });
     ctx.out.write(`Granted: ${skill} -> ${secret} (scope=${scope}${ttl ? `, ttl=${ttl}s` : ""})\n`);
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── revoke ──────────────────────────────────────────────────────────
@@ -416,7 +407,7 @@ async function cmdRevoke(
     storagePath: storage,
     backend: ctx.args.brokerBackend,
   });
-  try {
+  return await withCliFinalization(async () => {
     broker.revoke(skill, secret);
     ctx.out.write(
       removed
@@ -424,9 +415,7 @@ async function cmdRevoke(
         : `Revoked (not in policy file): ${skill} -> ${secret}\n`
     );
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 
@@ -493,7 +482,7 @@ async function removeSurrogateRowForRevoke(
     storagePath: storage,
     backend: ctx.args.surrogateBackend,
   });
-  try {
+  await withCliFinalization(async () => {
     await auditLog.appendCritical({
       layer: "l3",
       operation: BROKER_OPS.SURROGATE_REMOVED,
@@ -501,9 +490,7 @@ async function removeSurrogateRowForRevoke(
       result: "success",
       details: { secret, agent_uid: uid.agentUid, removed_value: false },
     });
-  } finally {
-    await close();
-  }
+  }, close);
   ctx.out.write(`Removed surrogate binding: ${secret} (the stored value was kept).\n`);
   return 0;
 }
@@ -723,12 +710,7 @@ async function cmdSurrogateAdd(
     passphrase: ctx.args.passphrase,
     storagePath,
   });
-  let brokerNames: string[];
-  try {
-    brokerNames = await broker.listSecretNames();
-  } finally {
-    await closeBroker();
-  }
+  const brokerNames = await withCliFinalization(() => broker.listSecretNames(), closeBroker);
   if (brokerNames.includes(secret)) {
     // A value under BOTH labels is the one state that makes the label split
     // meaningless: the broker would serve its copy while the gate spends the
@@ -746,7 +728,7 @@ async function cmdSurrogateAdd(
     storagePath,
     backend: ctx.args.surrogateBackend,
   });
-  try {
+  return await withCliFinalization(async () => {
     const value = await resolveValue(
       argvValue,
       ctx.stdin,
@@ -782,9 +764,7 @@ async function cmdSurrogateAdd(
         `never the value.\n`,
     );
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 async function cmdSurrogateList(
@@ -1215,31 +1195,42 @@ async function recordSurrogateRemovalRefused(
   storagePath: string,
   input: { secret: string; agent: string; probe: SurrogateBindingProbe; verb: string },
 ): Promise<void> {
+  let auditFailure: { error: unknown } | undefined;
+  let opened = false;
   try {
     const { auditLog, close } = await openSurrogateStore({
       passphrase: ctx.args.passphrase,
       storagePath,
       backend: ctx.args.surrogateBackend,
     });
-    try {
-      await auditLog.appendCritical({
-        layer: "l3",
-        operation: BROKER_OPS.SURROGATE_REMOVED,
-        identity_id: "sanctuary-broker",
-        result: "failure",
-        details: {
-          secret: input.secret,
-          agent: input.agent,
-          agent_uid: input.probe.agentUid ?? null,
-          verb: input.verb,
-          outcome: "refused",
-          reason: input.probe.refusal ?? "connect_failed",
-        },
-      });
-    } finally {
-      await close();
-    }
+    opened = true;
+    await withCliFinalization(async () => {
+      try {
+        await auditLog.appendCritical({
+          layer: "l3",
+          operation: BROKER_OPS.SURROGATE_REMOVED,
+          identity_id: "sanctuary-broker",
+          result: "failure",
+          details: {
+            secret: input.secret,
+            agent: input.agent,
+            agent_uid: input.probe.agentUid ?? null,
+            verb: input.verb,
+            outcome: "refused",
+            reason: input.probe.refusal ?? "connect_failed",
+          },
+        });
+      } catch (error) {
+        auditFailure = { error };
+        throw error;
+      }
+    }, close);
   } catch (e) {
+    // Ordinary open and append failures are best effort, but establishment and combined cleanup failures escape.
+    // This comparison must match CLI_FINALIZATION_ERROR_MESSAGE in core/master-custody.ts.
+    const cleanupFailed = e instanceof MasterEstablishmentReleaseError
+      || (e instanceof AggregateError && e.message === CLI_FINALIZATION_ERROR_MESSAGE);
+    if (opened ? !auditFailure || e !== auditFailure.error : cleanupFailed) throw e;
     ctx.err.write(
       `  The refusal itself could not be recorded on the audit chain ` +
         `(${e instanceof Error ? e.message : String(e)}).\n`,
@@ -1353,7 +1344,7 @@ async function cmdSurrogateRemove(
     storagePath,
     backend: ctx.args.surrogateBackend,
   });
-  try {
+  return await withCliFinalization(async () => {
     await store.removeValue(secret);
     await auditLog.appendCritical({
       layer: "l3",
@@ -1367,9 +1358,7 @@ async function cmdSurrogateRemove(
         `The placeholder for it stops being minted at the next arming.\n`,
     );
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── surrogate unlock: the no-core rule, then the helper, then the keychain ──
@@ -1561,7 +1550,7 @@ async function cmdSurrogateUnlock(
     storagePath: ctx.args.storagePath,
     backend: ctx.args.surrogateBackend,
   });
-  try {
+  return await withCliFinalization(async () => {
     let value: string;
     try {
       value = await store.readValue(secret);
@@ -1625,9 +1614,7 @@ async function cmdSurrogateUnlock(
       outcome: refused ? "refused" : "unknown",
       reason: describeUnlockOutcome(result),
     });
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 /** Writes the `failure` row for a one-value unlock and the operator lines.
@@ -1855,7 +1842,7 @@ async function cmdAudit(
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
   });
-  try {
+  return await withCliFinalization(async () => {
     // OPERATOR CLI: full-fidelity broker audit (secret name, scope, reason).
     // The operator owns the policy; this is NOT the agent-facing redacted
     // `broker/audit_query` (which uses broker.queryAudit).
@@ -1873,9 +1860,7 @@ async function cmdAudit(
       );
     }
     return 0;
-  } finally {
-    await close();
-  }
+  }, close);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ import {
 } from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import type { StoredIdentity } from "../core/identity.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, type CliMasterKeySession, transferCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
 import {
   AGENT_HARNESS_DAEMON_PLIST_PATH,
@@ -262,6 +262,7 @@ export async function runCheckpointCommand(
 }
 
 interface Bootstrapped {
+  session: CliMasterKeySession;
   config: SanctuaryConfig;
   storage: FilesystemStorage;
   masterKey: Uint8Array;
@@ -321,46 +322,54 @@ async function bootstrap(
   const stateStoragePath = join(config.storage_path, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     ...(passphrase !== undefined ? { passphrase } : {}),
     ...(recoveryKey !== undefined ? { recoveryKey } : {}),
     storagePathHint: config.storage_path,
   });
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
 
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  if (loadResult.loaded === 0) {
-    write(
-      err,
-      loadResult.total > 0
-        ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
-        : "No identities found in this fortress. Run `sanctuary identity create` first.\n",
-    );
-    return 1;
-  }
-  const primary = identityManager.getDefault();
-  if (!primary) {
-    write(err, "No primary identity set.\n");
-    return 1;
-  }
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) {
+      write(
+        err,
+        loadResult.total > 0
+          ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
+          : "No identities found in this fortress. Run `sanctuary identity create` first.\n",
+      );
+      return 1;
+    }
+    const primary = identityManager.getDefault();
+    if (!primary) {
+      write(err, "No primary identity set.\n");
+      return 1;
+    }
 
-  const stateStore = new StateStore(storage, masterKey);
-  const auditLog = new AuditLog(storage, masterKey);
-  const checkpointStore = new MemoryCheckpointStore({
-    fortressPath: config.storage_path,
-    fsOps: nodeMemoryCheckpointFsOps,
-  });
+    const stateStore = new StateStore(storage, masterKey);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    const checkpointStore = new MemoryCheckpointStore({
+      fortressPath: config.storage_path,
+      fsOps: nodeMemoryCheckpointFsOps,
+    });
 
-  return {
-    config,
-    storage,
-    masterKey,
-    stateStore,
-    auditLog,
-    checkpointStore,
-    identityManager,
-    primary,
-  };
+    return {
+      session,
+      config,
+      storage,
+      masterKey,
+      stateStore,
+      auditLog,
+      checkpointStore,
+      identityManager,
+      primary,
+    };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 function errorMessage(err: unknown): string {
@@ -509,26 +518,30 @@ async function cmdCreate(
 ): Promise<number> {
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  try {
-    const record = await createCheckpoint({
-      stateStore: boot.stateStore,
-      store: boot.checkpointStore,
-      masterKey: boot.masterKey,
-      auditLog: boot.auditLog,
-      identityId: boot.primary.identity_id,
-      source: "on_demand",
-      retentionValue: env[CHECKPOINT_RETENTION_ENV],
-    });
-    write(out, `Checkpoint created: ${record.id}\n`);
-    write(out, `  namespaces: ${record.namespaces.join(", ") || "(none)"}\n`);
-    write(out, `  total_keys: ${record.total_keys}\n`);
-    write(out, `  retention_expires_at: ${record.retention_expires_at ?? "none"}\n`);
-    return 0;
-  } catch (createErr) {
-    write(err, `Error: checkpoint create failed. ${errorMessage(createErr)}\n`);
-    return 1;
-  }
+    try {
+      const record = await createCheckpoint({
+        stateStore: boot.stateStore,
+        store: boot.checkpointStore,
+        masterKey: boot.masterKey,
+        auditLog: boot.auditLog,
+        identityId: boot.primary.identity_id,
+        source: "on_demand",
+        retentionValue: env[CHECKPOINT_RETENTION_ENV],
+      });
+      write(out, `Checkpoint created: ${record.id}\n`);
+      write(out, `  namespaces: ${record.namespaces.join(", ") || "(none)"}\n`);
+      write(out, `  total_keys: ${record.total_keys}\n`);
+      write(out, `  retention_expires_at: ${record.retention_expires_at ?? "none"}\n`);
+      return 0;
+    } catch (createErr) {
+      write(err, `Error: checkpoint create failed. ${errorMessage(createErr)}\n`);
+      return 1;
+    }
+
+  }, () => boot.auditLog.flush());
 }
 
 async function cmdRestore(
@@ -545,84 +558,88 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
-  const publicKeyResolver = createStateImportWriterKeyResolver((kid) =>
-    boot.identityManager.get(kid)
-  );
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
+    const publicKeyResolver = createStateImportWriterKeyResolver((kid) =>
+      boot.identityManager.get(kid)
+    );
 
-  // Check before approval auditing writes reserved state; restore repeats this
-  // read-only preflight at its own boundary before any reconstruction writes.
-  try {
-    await preflightCheckpointRestore({
-      stateStore: boot.stateStore,
-      checkpointStore: boot.checkpointStore,
-      masterKey: boot.masterKey,
-      checkpointId: id,
-      publicKeyResolver,
+    // Check before approval auditing writes reserved state; restore repeats this
+    // read-only preflight at its own boundary before any reconstruction writes.
+    try {
+      await preflightCheckpointRestore({
+        stateStore: boot.stateStore,
+        checkpointStore: boot.checkpointStore,
+        masterKey: boot.masterKey,
+        checkpointId: id,
+        publicKeyResolver,
+      });
+    } catch (restoreErr) {
+      // Only version-floor refusals promise unchanged audit bytes; other failures
+      // must reach restoreCheckpoint's critical audit after approval.
+      if (restoreErr instanceof CheckpointRestoreVersionFloorError) {
+        write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
+        return 1;
+      }
+    }
+
+    const policy = await loadPrincipalPolicy(boot.config.storage_path);
+    const baseline = new BaselineTracker(boot.storage, boot.masterKey);
+    const channel = new CheckpointRestorePromptApprovalChannel();
+    const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
+
+    const gateResult = await gate.evaluate("memory_checkpoint_restore", {
+      checkpoint_id: id,
     });
-  } catch (restoreErr) {
-    // Only version-floor refusals promise unchanged audit bytes; other failures
-    // must reach restoreCheckpoint's critical audit after approval.
-    if (restoreErr instanceof CheckpointRestoreVersionFloorError) {
+    if (!gateResult.allowed) {
+      try {
+        await boot.auditLog.appendCritical({
+          layer: "l1",
+          operation: "memory_checkpoint_restore",
+          identity_id: boot.primary.identity_id,
+          result: "failure",
+          details: {
+            checkpoint_id: id,
+            forensic_id: null,
+            poison_map_summary: { added: 0, changed: 0, removed: 0 },
+            error_reason: "approval_denied",
+          },
+        });
+      } catch (auditErr) {
+        write(
+          err,
+          `Error: checkpoint restore was denied, and critical audit failed. ${errorMessage(auditErr)}\n`,
+        );
+        return 1;
+      }
+      write(err, "Denied: checkpoint restore was not approved.\n");
+      return 1;
+    }
+
+    try {
+      const result = await restoreCheckpoint({
+        stateStore: boot.stateStore,
+        checkpointStore: boot.checkpointStore,
+        masterKey: boot.masterKey,
+        auditLog: boot.auditLog,
+        identityId: boot.primary.identity_id,
+        checkpointId: id,
+        assessParked: async () => assessHarnessParked(await buildRestoreParkedSource()),
+        publicKeyResolver,
+      });
+      write(out, `Checkpoint restored: ${result.checkpoint_id}\n`);
+      write(out, `  forensic_id: ${result.forensic_id}\n`);
+      write(out, "  poison_map:\n");
+      write(out, renderPoisonMap(result.poison_map));
+      write(out, `  imported_keys: ${result.import_result.imported_keys}\n`);
+      write(out, "  agent_state: parked\n");
+      return 0;
+    } catch (restoreErr) {
       write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
       return 1;
     }
-  }
 
-  const policy = await loadPrincipalPolicy(boot.config.storage_path);
-  const baseline = new BaselineTracker(boot.storage, boot.masterKey);
-  const channel = new CheckpointRestorePromptApprovalChannel();
-  const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
-
-  const gateResult = await gate.evaluate("memory_checkpoint_restore", {
-    checkpoint_id: id,
-  });
-  if (!gateResult.allowed) {
-    try {
-      await boot.auditLog.appendCritical({
-        layer: "l1",
-        operation: "memory_checkpoint_restore",
-        identity_id: boot.primary.identity_id,
-        result: "failure",
-        details: {
-          checkpoint_id: id,
-          forensic_id: null,
-          poison_map_summary: { added: 0, changed: 0, removed: 0 },
-          error_reason: "approval_denied",
-        },
-      });
-    } catch (auditErr) {
-      write(
-        err,
-        `Error: checkpoint restore was denied, and critical audit failed. ${errorMessage(auditErr)}\n`,
-      );
-      return 1;
-    }
-    write(err, "Denied: checkpoint restore was not approved.\n");
-    return 1;
-  }
-
-  try {
-    const result = await restoreCheckpoint({
-      stateStore: boot.stateStore,
-      checkpointStore: boot.checkpointStore,
-      masterKey: boot.masterKey,
-      auditLog: boot.auditLog,
-      identityId: boot.primary.identity_id,
-      checkpointId: id,
-      assessParked: async () => assessHarnessParked(await buildRestoreParkedSource()),
-      publicKeyResolver,
-    });
-    write(out, `Checkpoint restored: ${result.checkpoint_id}\n`);
-    write(out, `  forensic_id: ${result.forensic_id}\n`);
-    write(out, "  poison_map:\n");
-    write(out, renderPoisonMap(result.poison_map));
-    write(out, `  imported_keys: ${result.import_result.imported_keys}\n`);
-    write(out, "  agent_state: parked\n");
-    return 0;
-  } catch (restoreErr) {
-    write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
-    return 1;
-  }
+  }, () => boot.auditLog.flush());
 }
 
 async function cmdList(
@@ -634,30 +651,34 @@ async function cmdList(
   const json = hasFlag(argv, "--json");
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  try {
-    const records = await boot.checkpointStore.list();
-    if (json) {
-      write(out, `${JSON.stringify(records, null, 2)}\n`);
-      return 0;
-    }
-    if (records.length === 0) {
-      write(out, "No memory checkpoints.\n");
-      return 0;
-    }
-    for (const record of records) {
-      write(
-        out,
-        `${record.id}  created_at=${record.created_at}  source=${record.source}  ` +
+    try {
+      const records = await boot.checkpointStore.list();
+      if (json) {
+        write(out, `${JSON.stringify(records, null, 2)}\n`);
+        return 0;
+      }
+      if (records.length === 0) {
+        write(out, "No memory checkpoints.\n");
+        return 0;
+      }
+      for (const record of records) {
+        write(
+          out,
+          `${record.id}  created_at=${record.created_at}  source=${record.source}  ` +
           `namespaces=${record.namespaces.length}  total_keys=${record.total_keys}  ` +
           `retention_expires_at=${record.retention_expires_at ?? "none"}\n`,
-      );
+        );
+      }
+      return 0;
+    } catch (listErr) {
+      write(err, `Error: checkpoint list failed. ${errorMessage(listErr)}\n`);
+      return 1;
     }
-    return 0;
-  } catch (listErr) {
-    write(err, `Error: checkpoint list failed. ${errorMessage(listErr)}\n`);
-    return 1;
-  }
+
+  }, () => boot.auditLog.flush());
 }
 
 async function cmdShow(
@@ -675,22 +696,26 @@ async function cmdShow(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  try {
-    const record = await boot.checkpointStore.get(id);
-    if (!record) {
-      write(err, `No such checkpoint: ${id}\n`);
+    try {
+      const record = await boot.checkpointStore.get(id);
+      if (!record) {
+        write(err, `No such checkpoint: ${id}\n`);
+        return 1;
+      }
+      write(
+        out,
+        json ? `${JSON.stringify(record, null, 2)}\n` : renderRecord(record),
+      );
+      return 0;
+    } catch (showErr) {
+      write(err, `Error: checkpoint show failed. ${errorMessage(showErr)}\n`);
       return 1;
     }
-    write(
-      out,
-      json ? `${JSON.stringify(record, null, 2)}\n` : renderRecord(record),
-    );
-    return 0;
-  } catch (showErr) {
-    write(err, `Error: checkpoint show failed. ${errorMessage(showErr)}\n`);
-    return 1;
-  }
+
+  }, () => boot.auditLog.flush());
 }
 
 async function cmdPrune(
@@ -701,21 +726,25 @@ async function cmdPrune(
 ): Promise<number> {
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(boot.session, async () => {
 
-  try {
-    const prunedIds = await pruneExpiredCheckpoints({
-      store: boot.checkpointStore,
-      auditLog: boot.auditLog,
-      identityId: boot.primary.identity_id,
-      now: new Date(),
-    });
-    write(out, `Pruned ${prunedIds.length} memory checkpoint(s).\n`);
-    for (const id of prunedIds) {
-      write(out, `  ${id}\n`);
+    try {
+      const prunedIds = await pruneExpiredCheckpoints({
+        store: boot.checkpointStore,
+        auditLog: boot.auditLog,
+        identityId: boot.primary.identity_id,
+        now: new Date(),
+      });
+      write(out, `Pruned ${prunedIds.length} memory checkpoint(s).\n`);
+      for (const id of prunedIds) {
+        write(out, `  ${id}\n`);
+      }
+      return 0;
+    } catch (pruneErr) {
+      write(err, `Error: checkpoint prune failed. ${errorMessage(pruneErr)}\n`);
+      return 1;
     }
-    return 0;
-  } catch (pruneErr) {
-    write(err, `Error: checkpoint prune failed. ${errorMessage(pruneErr)}\n`);
-    return 1;
-  }
+
+  }, () => boot.auditLog.flush());
 }

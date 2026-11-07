@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * IC-05-DG planted-divergence proofs, part 1 (design §f-1/2/3/5) plus the
  * false-positive guards (§f-8).
@@ -189,7 +190,7 @@ describe("IC-05-DG §f-3: reason-spoof probe (D3 / R3-d regression)", () => {
       "checkpoint signer failed: identity material unreadable or signing error";
     await storage.write(
       CHECKPOINT_NAMESPACE,
-      "audit-checkpoint-" + String(1).padStart(20, "0"),
+      "audit-checkpoint-" + String(1).padStart(20, "0"), // Twenty decimal places preserve persisted sequence ordering; must match writeCheckpointRecord / parseCheckpointKeySequence in server/src/operational/audit-log.ts.
       stringToBytes(JSON.stringify(preBoot))
     );
 

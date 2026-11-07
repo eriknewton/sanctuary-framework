@@ -3,18 +3,18 @@
  *
  * Tests the standalone dashboard mode that runs without the MCP server.
  */
-
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { startStandaloneDashboard, handleStandaloneShutdownSignal, __resetStandaloneShutdownStateForTest } from "../src/dashboard-standalone.js";
+import * as escrowModule from "../src/wrap/boot-recovery-escrow.js";
 import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
 import {
-  bindWithRetry,
-  randomTestPort,
-} from "./util/port-collision-retry.js";
+  withExclusiveMasterRotationBarrier,
+  kernelBackedCrossProcessLockPlatformSupported,
+} from "../src/storage/cross-process-lock.js";
 
 type StandaloneDashboardStartOptions = Omit<
   Parameters<typeof startStandaloneDashboard>[0],
@@ -26,15 +26,15 @@ let isolatedDiscoveryOptions:
   | undefined;
 
 /**
- * Boot startStandaloneDashboard with a freshly chosen port, retrying on
- * EADDRINUSE up to 3 times with a small jitter. See
- * server/test/util/port-collision-retry.ts for rationale.
+ * Ephemeral ports keep independent dashboard fixtures from contending.
+ * The helper retains the channel until its bound address is available,
+ * so address read-back failure can still close the listener.
  */
 async function startDashboardOnFreePort(
   options: Omit<Parameters<typeof startStandaloneDashboard>[0], "port"> = {},
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
-  return bindWithRetry(async () => {
-    const port = randomTestPort();
+  return (async () => {
+    const port = EPHEMERAL_PORT;
     const dashboard = await startStandaloneDashboard({
       // Durable-fix: a first-run mint now requires confirmed off-host capture.
       // In CI there is no tty, so default to noConfirm + an off-host escrow
@@ -47,8 +47,8 @@ async function startDashboardOnFreePort(
       discoveryOptions: options.discoveryOptions ?? isolatedDiscoveryOptions,
       port,
     });
-    return { dashboard, port };
-  });
+    return standaloneBoundAddress(dashboard);
+  })();
 }
 
 describe("Standalone Dashboard", () => {
@@ -137,7 +137,7 @@ describe("Standalone Dashboard", () => {
       startStandaloneDashboard({
         passphrase: "test-passphrase-remote-refuse",
         host: "0.0.0.0",
-        port: randomTestPort(), // port-discipline: ignore DashboardApprovalChannel refuses non-loopback plaintext before listen.
+        port: EPHEMERAL_PORT,
         distressPort: 0,
         noConfirm: true,
         discoveryOptions: isolatedDiscoveryOptions,
@@ -287,7 +287,7 @@ describe("Standalone Dashboard", () => {
     let dashboard2: DashboardApprovalChannel | null = null;
     try {
       dashboard2 = await startStandaloneDashboard({
-        port: randomTestPort(), // port-discipline: ignore Missing credentials throw before dashboard construction or listen.
+        port: EPHEMERAL_PORT,
         host: "127.0.0.1",
         distressPort: 0,
         discoveryOptions: isolatedDiscoveryOptions,
@@ -823,21 +823,13 @@ async function startHostedOptionalPanelDashboard(): Promise<{
   authToken: string;
   baseUrl: string;
 }> {
-  // A random port can collide under parallel suites; each retry builds a fresh channel on a fresh port.
-  return bindWithRetry(() => startHostedOptionalPanelDashboardOnce(randomTestPort()));
-}
-
-async function startHostedOptionalPanelDashboardOnce(port: number): Promise<{
-  dashboard: DashboardApprovalChannel;
-  authToken: string;
-  baseUrl: string;
-}> {
   const authToken = "hosted-optional-panel-token";
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
   const fortressId = "hosted_optional_panel_fortress";
   const identityId = "hosted_optional_panel_operator";
+  const port = EPHEMERAL_PORT;
   const dashboard = new DashboardApprovalChannel({
     port,
     host: "127.0.0.1",
@@ -922,17 +914,11 @@ async function startHostedOptionalPanelDashboardOnce(port: number): Promise<{
     }),
   });
 
-  try {
-    await dashboard.start();
-  } catch (error) {
-    // bindWithRetry requires a failed attempt to leave no listener behind before the next port is tried.
-    await dashboard.stop().catch(() => undefined);
-    throw error;
-  }
+  await dashboard.start();
   return {
     dashboard,
     authToken,
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: `http://127.0.0.1:${((dashboard as unknown as { httpServer: import("node:net").Server }).httpServer.address() as import("node:net").AddressInfo).port}`,
   };
 }
 
@@ -990,3 +976,576 @@ async function stopStandaloneResources(dashboard: DashboardApprovalChannel | nul
   }
   if (failures.length) throw new AggregateError(failures, "Standalone teardown failed");
 }
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform))("Standalone session lifetime", () => {
+  let root: string;
+  let dashboard: DashboardApprovalChannel | undefined;
+  let sessions: custodyModule.EstablishMasterResult[];
+  let savedEnv: NodeJS.ProcessEnv;
+  let channels: DashboardApprovalChannel[];
+  let listeners: DistressListener[];
+  const passphrase = "standalone-session-test-passphrase";
+  const startup = (options: Parameters<typeof startStandaloneDashboard>[0] = {}) => startStandaloneDashboard({
+    passphrase, host: "127.0.0.1", port: EPHEMERAL_PORT, distressPort: EPHEMERAL_PORT,
+    ...options,
+  });
+  const exclusive = () => withExclusiveMasterRotationBarrier(
+    new FilesystemStorage(join(root, "state")), custodyModule.CUSTODY_WRITE_LOCK_NAMESPACE,
+    custodyModule.MASTER_ROTATION_BARRIER_NAME, async () => "entered", { timeoutMs: 0 },
+  );
+  const assertReleased = async () => {
+    expect(sessions.length).toBe(1);
+    expect(sessions[0]!.masterWriteBarrier!.signal.aborted).toBe(true);
+    await expect(exclusive()).resolves.toBe("entered");
+  };
+
+  const holdRelease = () => {
+    const entered = deferred();
+    const finish = deferred();
+    const establish = vi.mocked(custodyModule.establishMaster).getMockImplementation()!;
+    vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+      const session = await establish(options);
+      const lease = session.masterWriteBarrier!;
+      const release = lease.release.bind(lease);
+      vi.spyOn(lease, "release").mockImplementation(async () => {
+        entered.resolve();
+        await finish.promise;
+        await release();
+      });
+      return session;
+    });
+    return { entered, finish };
+  };
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "standalone-session-"));
+    savedEnv = { ...process.env };
+    process.env.HOME = root;
+    process.env.SANCTUARY_STORAGE_PATH = root;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "standalone-session-token";
+    delete process.env.SANCTUARY_PASSPHRASE;
+    delete process.env.SANCTUARY_RECOVERY_KEY;
+    const seed = await custodyModule.establishMaster({
+      storage: new FilesystemStorage(join(root, "state")), passphrase,
+      firstRun: { installMode: "headless", mintRecoveryKey: false }, storagePathHint: root,
+    });
+    await seed.masterWriteBarrier?.release();
+    seed.masterKey.fill(0);
+    sessions = [];
+    channels = [];
+    listeners = [];
+    const markStandalone = vi.mocked(DashboardApprovalChannel.prototype.setStandaloneMode).getMockImplementation()!;
+    vi.spyOn(DashboardApprovalChannel.prototype, "setStandaloneMode").mockImplementation(function (this: DashboardApprovalChannel, ...args) {
+      channels.push(this);
+      return markStandalone.apply(this, args);
+    });
+    const listen = vi.mocked(DistressListener.prototype.start).getMockImplementation()!;
+    vi.spyOn(DistressListener.prototype, "start").mockImplementation(function (this: DistressListener) {
+      listeners.push(this);
+      return listen.call(this);
+    });
+    const establish = vi.mocked(custodyModule.establishMaster).getMockImplementation()!;
+    vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+      const session = await establish(options);
+      sessions.push(session);
+      return session;
+    });
+  });
+
+  afterEach(async () => {
+    try {
+      await dashboard?.stop().catch(() => undefined);
+    } finally {
+      dashboard = undefined;
+      vi.restoreAllMocks();
+      for (const channel of channels) await channel.stop().catch(() => undefined);
+      for (const listener of listeners) {
+        try { await listener.stop(); } catch { /* Lease rescue must run after a listener failure. */ }
+      }
+      for (const session of sessions) {
+        await session.masterWriteBarrier?.release();
+        session.masterKey.fill(0);
+      }
+      process.env = savedEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("hosted stop unregisters after finalization with cleanup failure=%s", async (fails) => {
+    __resetStandaloneShutdownStateForTest();
+    const beforeExit = new Set(process.listeners("exit"));
+    const cleanups = new Set<() => Promise<void>>();
+    const unregister = vi.fn();
+    const { entered, finish } = holdRelease();
+    try {
+      dashboard = await startup({ processLifecycle: {
+        registerCleanup: (cleanup) => {
+          cleanups.add(cleanup);
+          return () => { cleanups.delete(cleanup); unregister(); };
+        },
+      } });
+      expect(cleanups.size).toBe(1);
+      expect(process.listeners("SIGINT")).not.toContain(handleStandaloneShutdownSignal);
+      expect(process.listeners("SIGTERM")).not.toContain(handleStandaloneShutdownSignal);
+      expect(process.listeners("exit").filter((listener) => !beforeExit.has(listener))).toHaveLength(1);
+      if (fails) {
+        const flush = AuditLog.prototype.flush;
+        vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async function (this: AuditLog) {
+          await flush.call(this);
+          throw new Error("hosted flush sentinel");
+        });
+      }
+      const stopped = [...cleanups][0]!();
+      await entered.promise;
+      expect(unregister).not.toHaveBeenCalled();
+      expect(cleanups.size).toBe(1);
+      finish.resolve();
+      await stopped; // The existing signal cleanup reports and swallows stop's rejection.
+      await assertReleased();
+      expect(unregister).toHaveBeenCalledOnce();
+      expect(cleanups.size).toBe(0);
+      expect(process.listeners("exit").filter((listener) => !beforeExit.has(listener))).toEqual([]);
+    } finally {
+      finish.resolve();
+      await dashboard?.stop().catch(() => undefined);
+      __resetStandaloneShutdownStateForTest();
+    }
+  });
+
+  it("stop releases the standalone session after final persistence", async () => {
+    dashboard = await startup();
+    const lease = sessions[0]!.masterWriteBarrier!;
+    const release = vi.spyOn(lease, "release");
+    expect(lease.signal.aborted).toBe(false);
+    await expect(exclusive()).rejects.toMatchObject({ kind: "contention" });
+    const saving = deferred();
+    const save = deferred();
+    const originalSave = BaselineTracker.prototype.save;
+    vi.spyOn(BaselineTracker.prototype, "save").mockImplementation(async function (this: BaselineTracker) {
+      saving.resolve();
+      await save.promise;
+      await originalSave.call(this);
+    });
+    const first = dashboard.stop();
+    const concurrent = dashboard.stop();
+    try {
+      await saving.promise;
+      expect(release).not.toHaveBeenCalled();
+      expect(lease.signal.aborted).toBe(false);
+    } finally {
+      save.resolve();
+      await first;
+    }
+    await assertReleased();
+    expect(concurrent).toBe(first);
+    expect(dashboard.stop()).toBe(first);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["policy", "constructor", "bind"] as const)("startup releases its session after %s failure", async (phase) => {
+    const error = new Error("startup sentinel");
+    if (phase === "policy") vi.spyOn(policyModule, "loadPrincipalPolicy").mockRejectedValue(error);
+    if (phase === "constructor") vi.spyOn(channelModule, "DashboardApprovalChannel").mockImplementation(function () { throw error; });
+    if (phase === "bind") vi.spyOn(DashboardApprovalChannel.prototype, "start").mockRejectedValue(error);
+    const { entered, finish } = holdRelease();
+    let settled = false;
+    const pending = startup().catch((failure: unknown) => failure).finally(() => { settled = true; });
+    try {
+      await entered.promise;
+      expect(settled).toBe(false);
+      expect(sessions[0]!.masterWriteBarrier!.signal.aborted).toBe(false);
+    } finally {
+      finish.resolve();
+      await pending;
+    }
+    await assertReleased();
+    expect(await pending).toBe(error);
+  });
+
+  it("malformed policy releases custody before exit", async () => {
+    const error = new policyModule.MalformedPrincipalPolicyError(root, "policy sentinel");
+    vi.spyOn(policyModule, "loadPrincipalPolicy").mockRejectedValue(error);
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => { throw error; });
+    const { entered, finish } = holdRelease();
+    const pending = startup().catch(() => undefined);
+    try {
+      await entered.promise;
+      expect(exit).not.toHaveBeenCalled();
+    } finally {
+      finish.resolve();
+      await pending;
+    }
+    await assertReleased();
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("address-in-use stand-down releases the session and preserves runtime bookkeeping", async () => {
+    const listener = createServer();
+    // A literal 0 lets the OS assign the port, so the port-discipline gate needs no retry wrapper here.
+    await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = listener.address() as import("node:net").AddressInfo;
+      const runtime = await import("../src/cli/agents/runtime.js");
+      const clear = vi.spyOn(runtime, "clearTenantRuntime");
+      dashboard = await startup({ allowPark: true, port: address.port });
+      expect(dashboard.addrInUse()).toBe(true);
+      await assertReleased();
+      expect(clear).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("a stop during an address-in-use stand-down bind preserves the port owner's runtime record", async () => {
+    const listener = createServer();
+    // A literal 0 lets the OS assign the port, so the port-discipline gate needs no retry wrapper here.
+    await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+    const entered = deferred();
+    const finish = deferred();
+    const start = DashboardApprovalChannel.prototype.start;
+    vi.spyOn(DashboardApprovalChannel.prototype, "start").mockImplementation(async function (this: DashboardApprovalChannel, options) {
+      entered.resolve();
+      await finish.promise;
+      await start.call(this, options);
+    });
+    let pending: Promise<{ succeeded: boolean }> | undefined;
+    let stopped: Promise<void> | undefined;
+    try {
+      const address = listener.address() as import("node:net").AddressInfo;
+      const runtime = await import("../src/cli/agents/runtime.js");
+      const clear = vi.spyOn(runtime, "clearTenantRuntime");
+      pending = startup({ allowPark: true, port: address.port })
+        .then(() => ({ succeeded: true }), () => ({ succeeded: false }));
+      await entered.promise;
+      stopped = channels[0]!.stop();
+      finish.resolve();
+      await stopped;
+      expect((await pending).succeeded).toBe(false);
+      expect(channels[0]!.addrInUse()).toBe(true);
+      expect(clear).not.toHaveBeenCalled();
+      await assertReleased();
+    } finally {
+      finish.resolve();
+      await pending;
+      await stopped?.catch(() => undefined);
+      await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("stop retains custody until a pending flush completes", async () => {
+    dashboard = await startup();
+    const entered = deferred();
+    const finish = deferred();
+    vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async () => {
+      entered.resolve();
+      await finish.promise;
+    });
+    const stopped = dashboard.stop();
+    try {
+      await Promise.race([entered.promise, stopped]);
+      await expect(exclusive()).rejects.toMatchObject({ kind: "contention" });
+    } finally {
+      finish.resolve();
+      await stopped;
+    }
+    await assertReleased();
+  });
+
+  it.each(["flush", "release", "both", "undefined", "channel"] as const)("stop preserves %s failure and attempts release once", async (phase) => {
+    const operation = phase === "undefined" ? undefined : new Error("operation sentinel");
+    const releaseError = new Error("release sentinel");
+    if (phase === "channel") {
+      const original = DashboardApprovalChannel.prototype.stop;
+      vi.spyOn(DashboardApprovalChannel.prototype, "stop").mockImplementation(async function (this: DashboardApprovalChannel) {
+        await original.call(this);
+        throw operation;
+      });
+    }
+    dashboard = await startup();
+    const lease = sessions[0]!.masterWriteBarrier!;
+    const realRelease = lease.release.bind(lease);
+    const release = vi.spyOn(lease, "release").mockImplementation(async () => {
+      await realRelease();
+      if (phase === "release" || phase === "both") throw releaseError;
+    });
+    if (phase === "flush" || phase === "both" || phase === "undefined") {
+      vi.spyOn(AuditLog.prototype, "flush").mockRejectedValue(operation);
+    }
+    const first = dashboard.stop();
+    const concurrent = dashboard.stop();
+    const outcome = await first.then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+    await concurrent.catch(() => undefined);
+    await assertReleased();
+    expect(concurrent).toBe(first);
+    expect(dashboard.stop()).toBe(first);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      if (phase === "both") expect((outcome.error as AggregateError).errors).toEqual([operation, releaseError]);
+      else expect(outcome.error).toBe(phase === "release" ? releaseError : operation);
+    }
+  });
+
+  it("partial wiring flushes audit without saving an incomplete baseline", async () => {
+    const save = vi.spyOn(BaselineTracker.prototype, "save");
+    const flush = vi.spyOn(AuditLog.prototype, "flush");
+    await startup({ __testFaultAfterLoads: () => { throw undefined; } }).catch(() => undefined);
+    expect(save).not.toHaveBeenCalled();
+    expect(flush).toHaveBeenCalled();
+  });
+
+  it("optional distress startup failure retains custody until stop", async () => {
+    vi.spyOn(DistressListener.prototype, "start").mockRejectedValue(new Error("distress sentinel"));
+    dashboard = await startup();
+    expect(sessions[0]!.masterWriteBarrier!.signal.aborted).toBe(false);
+    await expect(exclusive()).rejects.toMatchObject({ kind: "contention" });
+    await dashboard.stop();
+    await assertReleased();
+  });
+
+  it("startup rejects when stop joins initial wiring", async () => {
+    const entered = deferred();
+    const finish = deferred();
+    const attach = vi.spyOn(DashboardApprovalChannel.prototype, "setDependencies");
+    const bind = vi.spyOn(DashboardApprovalChannel.prototype, "start");
+    const pending = startup({ __testFaultAfterLoads: async () => {
+      entered.resolve();
+      await finish.promise;
+    } }).then(() => ({ succeeded: true }), (error: unknown) => ({ succeeded: false, error }));
+    let stopped: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      stopped = channels[0]!.stop();
+      finish.resolve();
+      await stopped;
+      expect((await pending).succeeded).toBe(false);
+      expect(attach).not.toHaveBeenCalled();
+      expect(bind).not.toHaveBeenCalled();
+      await assertReleased();
+    } finally {
+      finish.resolve();
+      await pending;
+      await stopped;
+    }
+  });
+
+  it.each([false, true])("stop joins a pending bind before finalization with parked=%s", async (parked) => {
+    const entered = deferred();
+    const finish = deferred();
+    const start = DashboardApprovalChannel.prototype.start;
+    vi.spyOn(DashboardApprovalChannel.prototype, "start").mockImplementation(async function (this: DashboardApprovalChannel, options) {
+      entered.resolve();
+      await finish.promise;
+      await start.call(this, options);
+    });
+    const pending = startup(parked ? { passphrase: undefined, allowPark: true } : {})
+      .then(() => ({ succeeded: true }), () => ({ succeeded: false }));
+    let stopped: Promise<void> | undefined;
+    let settled = false;
+    try {
+      await entered.promise;
+      stopped = channels[0]!.stop();
+      void stopped.then(() => { settled = true; });
+      // With bind gated, this event-loop checkpoint observes all runnable stop work.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      if (!parked) expect(sessions[0]!.masterWriteBarrier!.signal.aborted).toBe(false);
+      finish.resolve();
+      await stopped;
+      expect((await pending).succeeded).toBe(false);
+      expect((channels[0] as unknown as { httpServer: unknown }).httpServer).toBeNull();
+      if (!parked) await assertReleased();
+    } finally {
+      finish.resolve();
+      await pending;
+      await stopped;
+      // Also reap a late listener if the ownership implementation under test failed.
+      if (channels[0]) await DashboardApprovalChannel.prototype.stop.call(channels[0]);
+    }
+  });
+
+  it("a signal joins an ordinary stop already awaiting release", async () => {
+    __resetStandaloneShutdownStateForTest();
+    const { entered, finish } = holdRelease();
+    dashboard = await startup();
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const stopped = dashboard.stop();
+    let signal: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      signal = handleStandaloneShutdownSignal("SIGTERM");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(exit).not.toHaveBeenCalled();
+      finish.resolve();
+      await signal;
+      await assertReleased();
+      expect(exit).toHaveBeenCalledWith(128 + 15); // Shell signal status plus SIGTERM.
+    } finally {
+      finish.resolve();
+      await stopped;
+      await signal;
+      __resetStandaloneShutdownStateForTest();
+    }
+  });
+
+  it("stand-down preserves a single cleanup failure without relabeling it as wiring", async () => {
+    const error = new Error("release sentinel");
+    vi.spyOn(DashboardApprovalChannel.prototype, "start").mockResolvedValue();
+    vi.spyOn(DashboardApprovalChannel.prototype, "addrInUse").mockReturnValue(true);
+    const pending = startup({ allowPark: true, __testFaultAfterLoads: () => {
+      const lease = sessions[0]!.masterWriteBarrier!;
+      const release = lease.release.bind(lease);
+      vi.spyOn(lease, "release").mockImplementation(async () => { await release(); throw error; });
+    } }).catch((failure: unknown) => failure);
+    expect(await pending).toBe(error);
+    await assertReleased();
+  });
+
+  it("bind and release failures describe cleanup and retain each cause once", async () => {
+    const operation = new Error("bind sentinel");
+    const cleanup = new Error("release sentinel");
+    vi.spyOn(DashboardApprovalChannel.prototype, "start").mockRejectedValue(operation);
+    const outcome = await startup({ __testFaultAfterLoads: () => {
+      const lease = sessions[0]!.masterWriteBarrier!;
+      const release = lease.release.bind(lease);
+      vi.spyOn(lease, "release").mockImplementation(async () => { await release(); throw cleanup; });
+    } }).catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(AggregateError);
+    expect((outcome as AggregateError).errors).toEqual([operation, cleanup]);
+    expect((outcome as Error).message).toBe("Sanctuary Dashboard: cleanup failed.");
+    await assertReleased();
+  });
+
+  it("the first Ctrl+C at recovery confirmation awaits release and exits", async () => {
+    __resetStandaloneShutdownStateForTest();
+    const { entered: releasing, finish: release } = holdRelease();
+    const prompted = deferred();
+    const answer = deferred();
+    const establish = vi.mocked(custodyModule.establishMaster).getMockImplementation()!;
+    vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+      const session = await establish(options);
+      session.mintedRecoveryKey = "test-only-recovery-key";
+      return session;
+    });
+    vi.spyOn(escrowModule, "escrowBootRecoveryKey").mockImplementation(async () => {
+      prompted.resolve();
+      await answer.promise;
+      return { disclosedOnTty: true, confirmed: true };
+    });
+    const attach = vi.spyOn(DashboardApprovalChannel.prototype, "setDependencies");
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const pending = startup().catch((error: unknown) => error);
+    let signal: Promise<void> | undefined;
+    try {
+      await prompted.promise;
+      signal = handleStandaloneShutdownSignal("SIGINT");
+      // Escrow is the only outstanding operation; stop can now reach the gated release.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(sessions[0]!.masterWriteBarrier!.release).toHaveBeenCalledOnce();
+      await releasing.promise;
+      expect(exit).not.toHaveBeenCalled();
+      release.resolve();
+      await signal;
+      expect(exit).toHaveBeenCalledWith(128 + 2); // Shell signal status plus SIGINT.
+      await assertReleased();
+      answer.resolve();
+      // Startup never settles under a signal, so the CLI's start-failure handler cannot print or exit 1.
+      const outcome = await Promise.race([pending.then(() => "settled"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("unsettled"), 50))]); // 50 ms spans many event-loop turns; the unfixed rejection settles within a few microtasks.
+      expect(outcome).toBe("unsettled");
+      expect(attach).not.toHaveBeenCalled();
+    } finally {
+      answer.resolve();
+      release.resolve();
+      await signal;
+      __resetStandaloneShutdownStateForTest();
+    }
+  });
+
+  it("signal cleanup reports rejection and shares the stop outcome", async () => {
+    __resetStandaloneShutdownStateForTest();
+    dashboard = await startup();
+    const error = new Error("flush sentinel");
+    vi.spyOn(AuditLog.prototype, "flush").mockRejectedValue(error);
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    try {
+      await handleStandaloneShutdownSignal("SIGTERM");
+      expect(stderr).toHaveBeenCalledWith("Sanctuary Dashboard: cleanup failed.");
+      expect(exit).toHaveBeenCalledWith(128 + 15); // Shell signal status plus SIGTERM.
+      await expect(dashboard.stop()).rejects.toBe(error);
+    } finally {
+      __resetStandaloneShutdownStateForTest();
+    }
+  });
+
+});
+
+const EPHEMERAL_PORT = 0;
+import * as custodyModule from "../src/core/master-custody.js";
+import * as policyModule from "../src/principal-policy/loader.js";
+import * as channelModule from "../src/principal-policy/dashboard.js";
+import { FilesystemStorage } from "../src/storage/filesystem.js";
+import { BaselineTracker } from "../src/principal-policy/baseline.js";
+import { createServer } from "node:net";
+
+async function standaloneBoundAddress(dashboard: DashboardApprovalChannel) {
+  try {
+    const address = (dashboard as unknown as { httpServer: import("node:net").Server }).httpServer.address();
+    if (!address || typeof address === "string") throw new Error("expected TCP address");
+    return { dashboard, port: address.port };
+  } catch (error) {
+    await dashboard.stop();
+    throw error;
+  }
+}
+
+let rescueHome: string;
+let previousHome: string | undefined;
+let rescueSessions: custodyModule.EstablishMasterResult[] = [];
+let rescueChannels: DashboardApprovalChannel[] = [];
+let rescueListeners: DistressListener[] = [];
+
+beforeEach(async () => {
+  previousHome = process.env.HOME;
+  rescueHome = await mkdtemp(join(tmpdir(), "standalone-home-"));
+  process.env.HOME = rescueHome;
+  rescueSessions = [];
+  rescueChannels = [];
+  rescueListeners = [];
+  const establish = custodyModule.establishMaster;
+  vi.spyOn(custodyModule, "establishMaster").mockImplementation(async (options) => {
+    const session = await establish(options);
+    rescueSessions.push(session);
+    return session;
+  });
+  const markStandalone = DashboardApprovalChannel.prototype.setStandaloneMode;
+  vi.spyOn(DashboardApprovalChannel.prototype, "setStandaloneMode").mockImplementation(function (this: DashboardApprovalChannel, ...args) {
+    rescueChannels.push(this);
+    return markStandalone.apply(this, args);
+  });
+  const listen = DistressListener.prototype.start;
+  vi.spyOn(DistressListener.prototype, "start").mockImplementation(function (this: DistressListener) {
+    rescueListeners.push(this);
+    return listen.call(this);
+  });
+});
+
+afterEach(async () => {
+  // Rescue runs after assertions so it cannot satisfy an ownership witness for the owner.
+  vi.restoreAllMocks();
+  for (const channel of rescueChannels) await channel.stop().catch(() => undefined);
+  for (const listener of rescueListeners) await listener.stop().catch(() => undefined);
+  for (const session of rescueSessions) {
+    await session.masterWriteBarrier?.release();
+    session.masterKey.fill(0);
+  }
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  await rm(rescueHome, { recursive: true, force: true });
+});

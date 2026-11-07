@@ -13,7 +13,7 @@ import {
   type AuditEntry,
   type AuditIntegrityFinding,
 } from "../operational/audit-log.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { type CliMasterKeySession, withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { resolveStoragePath } from "../paths.js";
 import {
   consumeFlagValue,
@@ -89,64 +89,70 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
   }
 
   let opts: SearchOptions | undefined;
-  let masterKey: Uint8Array | undefined;
   try {
     opts = parseSearchOptions(rest);
     const searchOpts = opts;
     const env = args.env ?? process.env;
     const storagePath = searchOpts.fortress ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
-    masterKey = await resolveMasterKey(storage, searchOpts, env);
-    const auditLog = new AuditLog(storage, masterKey);
-    const result = await auditLog.query({
-      ...(searchOpts.since ? { since: searchOpts.since } : {}),
-      limit: Number.MAX_SAFE_INTEGER,
-    });
+    const session = await resolveMasterKey(storage, searchOpts, env);
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      const result = await auditLog.query({
+        ...(searchOpts.since ? { since: searchOpts.since } : {}),
+        limit: Number.MAX_SAFE_INTEGER,
+      });
 
-    const untilMs = searchOpts.until ? Date.parse(searchOpts.until) : undefined;
-    let entries = result.entries;
-    if (searchOpts.types.length > 0) {
-      const wanted = new Set(searchOpts.types);
-      entries = entries.filter((entry) => wanted.has(entry.operation));
-    }
-    if (untilMs !== undefined) {
-      entries = entries.filter((entry) => Date.parse(entry.timestamp) <= untilMs);
-    }
-    if (searchOpts.actor) {
-      entries = entries.filter((entry) => entry.identity_id === searchOpts.actor);
-    }
-    if (searchOpts.requestId) {
-      entries = entries.filter(
-        (entry) => entry.details?.request_id === searchOpts.requestId,
-      );
-    }
-    const total = entries.length;
-    entries = entries.slice(-searchOpts.limit);
+      const untilMs = searchOpts.until ? Date.parse(searchOpts.until) : undefined;
+      let entries = result.entries;
+      if (searchOpts.types.length > 0) {
+        const wanted = new Set(searchOpts.types);
+        entries = entries.filter((entry) => wanted.has(entry.operation));
+      }
+      if (untilMs !== undefined) {
+        entries = entries.filter((entry) => Date.parse(entry.timestamp) <= untilMs);
+      }
+      if (searchOpts.actor) {
+        entries = entries.filter((entry) => entry.identity_id === searchOpts.actor);
+      }
+      if (searchOpts.requestId) {
+        entries = entries.filter(
+          (entry) => entry.details?.request_id === searchOpts.requestId,
+        );
+      }
+      const total = entries.length;
+      entries = entries.slice(-searchOpts.limit);
 
-    // audit-chokepoint-exempt: fail-closed WARNING surface, findings are printed
-    // to the operator and forwarded in the JSON; never a chain-verified claim.
-    const findings = result.integrity_findings;
-    if (findings.length > 0) {
-      printIntegrityWarning(err, findings);
-    }
+      // audit-chokepoint-exempt: fail-closed WARNING surface, findings are printed
+      // to the operator and forwarded in the JSON; never a chain-verified claim.
+      const findings = result.integrity_findings;
+      if (findings.length > 0) {
+        printIntegrityWarning(err, findings);
+      }
 
-    if (searchOpts.json) {
-      write(
-        out,
-        JSON.stringify(
-          {
-            entries,
-            total,
-            ...(findings.length > 0 ? { integrity_findings: findings } : {}),
-          },
-          null,
-          2
-        ) + "\n"
-      );
-    } else {
-      printTable(out, entries, searchOpts.requestId !== undefined);
-    }
-    return findings.length > 0 ? 1 : 0;
+      if (searchOpts.json) {
+        write(
+          out,
+          JSON.stringify(
+            {
+              entries,
+              total,
+              ...(findings.length > 0 ? { integrity_findings: findings } : {}),
+            },
+            null,
+            2
+          ) + "\n"
+        );
+      } else {
+        printTable(out, entries, searchOpts.requestId !== undefined);
+      }
+      return findings.length > 0 ? 1 : 0;
+
+    }, () => sessionAuditLog?.flush() ?? Promise.resolve());
   } catch (error) {
     if (error instanceof AuditIntegrityError) {
       printIntegrityWarning(err, error.findings);
@@ -154,15 +160,13 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
         write(
           out,
           JSON.stringify({ entries: [], total: 0, integrity_findings: error.findings }, null, 2) +
-            "\n"
+          "\n"
         );
       }
       return 1;
     }
     write(err, `sanctuary audit search: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
-  } finally {
-    masterKey?.fill(0);
   }
 }
 
@@ -266,7 +270,7 @@ async function resolveMasterKey(
   storage: FilesystemStorage,
   opts: SearchOptions,
   env: NodeJS.ProcessEnv,
-): Promise<Uint8Array> {
+): Promise<CliMasterKeySession> {
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (env.SANCTUARY_RECOVERY_KEY) {
     return resolveCliMasterKey(storage, {

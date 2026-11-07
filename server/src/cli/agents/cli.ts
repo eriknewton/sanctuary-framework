@@ -47,7 +47,7 @@ import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import { readLockdownStatus } from "../../lockdown/status.js";
 import { AuditLog } from "../../operational/audit-log.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
-import { resolveCliMasterKey } from "../../core/master-custody.js";
+import { withCliMasterKeySession, resolveCliMasterKey } from "../../core/master-custody.js";
 import { readStoredPassphrase } from "../../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../../dashboard/v1_1/wiring.js";
 import { consumeFlagValue, unknownFlagWithPrefix, argvTokenForDisplay } from "../argv.js";
@@ -665,23 +665,30 @@ async function auditAgentsConfigChange(
     throw new Error("principal policy update refused");
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase,
     bootstrap: true,
     storagePathHint: tenant.storage_path,
   });
-  const auditLog = new AuditLog(storage, masterKey);
-  await auditLog.appendCritical({
-    layer: "l2",
-    operation: "agents.config",
-    identity_id: `fortress:${fortressId}`,
-    result: "success",
-    details: {
-      tenant: tenant.name,
-      approval_redirect: next,
-      previous,
-    },
-  });
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation: "agents.config",
+      identity_id: `fortress:${fortressId}`,
+      result: "success",
+      details: {
+        tenant: tenant.name,
+        approval_redirect: next,
+        previous,
+      },
+    });
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 function renderApprovalRedirectBlock(state: ApprovalRedirectState): string {

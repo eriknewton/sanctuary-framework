@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * Eager (bounded-cost) audit read path - perf + never-stale-green honesty.
  *
@@ -87,7 +88,7 @@ async function buildChain(
       timestamp,
       encrypted_payload_bytes: encryptedPayloadBytes,
     };
-    const key = `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`;
+    const key = `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`; // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
     await storage.write("_audit", key, stringToBytes(JSON.stringify(envelope)));
     prevHash = entryHash;
   }
@@ -395,7 +396,7 @@ describe("AuditLog eager read - out-of-band sentinel + backstop (injectable inte
       };
       await storage.write(
         "_audit",
-        `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`,
+        `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`, // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
         stringToBytes(JSON.stringify(envelope)),
       );
       prevHash = entryHash;
@@ -536,7 +537,7 @@ describe("AuditLog eager scope isolation - agent/evidence reads stay per-request
       };
       await storage.write(
         "_audit",
-        `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`,
+        `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`, // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
         stringToBytes(JSON.stringify(envelope)),
       );
       prevHash = entryHash;

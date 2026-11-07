@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, transferCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { DefaultPolicyGate } from "../key-17/policy-gate.js";
 import {
@@ -122,6 +122,7 @@ export async function runErc8004Command(
 }
 
 interface FortressSnapshot {
+  session: CliMasterKeySession;
   identityId: string;
   storagePath: string;
   storage: FilesystemStorage;
@@ -180,7 +181,7 @@ async function loadFortressIdentity(
       write(
         err,
         "Error: sanctuary erc8004 requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
-          "       Keychain auto-discovery also failed.\n",
+        "       Keychain auto-discovery also failed.\n",
       );
       return 1;
     }
@@ -194,9 +195,9 @@ async function loadFortressIdentity(
     return 1;
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-  let masterKey: Uint8Array;
+  let session: CliMasterKeySession;
   try {
-    masterKey = await resolveCliMasterKey(storage, {
+    session = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       storagePathHint: config.storage_path,
@@ -206,31 +207,37 @@ async function loadFortressIdentity(
     return 1;
   }
 
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loadResult = await identityManager.load();
-  if (loadResult.loaded === 0) {
-    write(
-      err,
-      loadResult.total > 0
-        ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
-        : "Error: no identities on this fortress yet. Run sanctuary wrap first.\n",
-    );
-    return 1;
-  }
-  const primary = identityManager.getDefault();
-  if (!primary) {
-    write(
-      err,
-      "Error: no primary identity on this fortress yet. Run sanctuary wrap first.\n",
-    );
-    return 1;
-  }
-  return {
-    identityId: primary.identity_id,
-    storagePath: config.storage_path,
-    storage,
-    masterKey,
-  };
+  const masterKey = session.masterKey;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) {
+      write(
+        err,
+        loadResult.total > 0
+          ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
+          : "Error: no identities on this fortress yet. Run sanctuary wrap first.\n",
+      );
+      return 1;
+    }
+    const primary = identityManager.getDefault();
+    if (!primary) {
+      write(
+        err,
+        "Error: no primary identity on this fortress yet. Run sanctuary wrap first.\n",
+      );
+      return 1;
+    }
+    return {
+      session,
+      identityId: primary.identity_id,
+      storagePath: config.storage_path,
+      storage,
+      masterKey,
+    };
+
+  });
 }
 
 async function cmdRegister(
@@ -283,56 +290,62 @@ async function cmdRegister(
 
   const snapshot = await loadFortressIdentity(argv, env, err);
   if (typeof snapshot === "number") return snapshot;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(snapshot.session, async () => {
 
-  const lockdownStatus = await readLockdownStatus(snapshot.storagePath);
+    const lockdownStatus = await readLockdownStatus(snapshot.storagePath);
 
-  const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
+    const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
+    sessionAuditLog = auditLog;
 
-  // Create policy gate with no approval callback (Tier 2 falls through
-  // to the pending-approval path in handleErc8004Request).
-  const policyGate = new DefaultPolicyGate({
-    global_default: "operator_approval_required",
-    erc8004: {
-      default_decision: "operator_approval_required",
-      counterparty_rules: [],
-    },
-  });
+    // Create policy gate with no approval callback (Tier 2 falls through
+    // to the pending-approval path in handleErc8004Request).
+    const policyGate = new DefaultPolicyGate({
+      global_default: "operator_approval_required",
+      erc8004: {
+        default_decision: "operator_approval_required",
+        counterparty_rules: [],
+      },
+    });
 
-  const pendingStore = new Erc8004PendingStore();
+    const pendingStore = new Erc8004PendingStore();
 
-  const registration: Erc8004Registration = {
-    identity: agentId,
-    registry,
-    chain_id: chainId,
-    nonce,
-    timestamp: new Date().toISOString(),
-    ...(metadataUri !== undefined ? { metadata_uri: metadataUri } : {}),
-  };
+    const registration: Erc8004Registration = {
+      identity: agentId,
+      registry,
+      chain_id: chainId,
+      nonce,
+      timestamp: new Date().toISOString(),
+      ...(metadataUri !== undefined ? { metadata_uri: metadataUri } : {}),
+    };
 
-  const result = await handleErc8004Request(
-    {
-      masterKey: snapshot.masterKey,
-      operatorId: snapshot.identityId,
-      policyGate,
-      auditLog,
-      identityId: snapshot.identityId,
-      pendingStore,
-      fortressId: snapshot.identityId,
-    },
-    registration,
-    { autoApprove },
-  );
+    const result = await handleErc8004Request(
+      {
+        masterKey: snapshot.masterKey,
+        operatorId: snapshot.identityId,
+        policyGate,
+        auditLog,
+        identityId: snapshot.identityId,
+        pendingStore,
+        fortressId: snapshot.identityId,
+      },
+      registration,
+      { autoApprove },
+    );
 
-  await auditLog.flush();
+    await auditLog.flush();
 
-  if (json) {
-    write(out, JSON.stringify(result, null, 2) + "\n");
+    if (json) {
+      write(out, JSON.stringify(result, null, 2) + "\n");
+      return 0;
+    }
+
+    write(out, lockdownBanner(lockdownStatus));
+    printHumanResult(out, result, registry);
     return 0;
-  }
 
-  write(out, lockdownBanner(lockdownStatus));
-  printHumanResult(out, result, registry);
-  return 0;
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 function printHumanResult(

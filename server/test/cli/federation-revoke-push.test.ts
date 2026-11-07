@@ -105,7 +105,7 @@ async function seedFortressWithIdentity(fortressPath: string): Promise<string> {
 /** Recover the fortress master key to independently read the stored list. */
 async function fortressMasterKey(fortressPath: string, recoveryKey: string): Promise<Uint8Array> {
   const storage = new FilesystemStorage(join(fortressPath, "state"));
-  return resolveCliMasterKey(storage, { recoveryKey, storagePathHint: fortressPath });
+  return resolveFixtureMasterKey(storage, { recoveryKey, storagePathHint: fortressPath });
 }
 
 describe("sanctuary federation revoke-push / downgrade-log — arg validation (no fortress)", () => {
@@ -148,6 +148,7 @@ describe("sanctuary federation revoke-push / downgrade-log — end-to-end (keych
     tmp = await mkdtemp(join(tmpdir(), "sanctuary-revoke-push-test-"));
   });
   afterEach(async () => {
+    await closeFixtureSessions();
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_RECOVERY_KEY;
     try {
@@ -304,3 +305,16 @@ describe("sanctuary federation revoke-push / downgrade-log — end-to-end (keych
     expect(out.text).toContain('"entry_count": 0');
   });
 });
+
+const fixtureSessions: Awaited<ReturnType<typeof resolveCliMasterKey>>[] = [];
+async function resolveFixtureMasterKey(...args: Parameters<typeof resolveCliMasterKey>): Promise<Uint8Array> {
+  const session = await resolveCliMasterKey(...args);
+  fixtureSessions.push(session);
+  return session.masterKey;
+}
+async function closeFixtureSessions(): Promise<void> {
+  for (const session of fixtureSessions.splice(0)) {
+    try { await session.masterWriteBarrier?.release(); }
+    finally { session.masterKey.fill(0); }
+  }
+}

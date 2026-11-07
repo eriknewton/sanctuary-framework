@@ -61,7 +61,7 @@ async function fixture() {
   tempDirs.push(path);
   vi.stubEnv("SANCTUARY_STORAGE_PATH", path);
   const masterKey = generateRandomKey();
-  vi.mocked(resolveCliMasterKey).mockResolvedValue(masterKey);
+  vi.mocked(resolveCliMasterKey).mockImplementation(async () => ({ masterKey: Uint8Array.from(masterKey), masterWriteBarrier: { filesystemBacked: false, assertSessionHeld: () => {}, assertHeld: () => {}, release: async () => {}, signal: new AbortController().signal } }));
   const storage = new FilesystemStorage(join(path, "state"));
   const stateStore = new StateStore(storage, masterKey);
   const encKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -318,8 +318,9 @@ describe("cold checkpoint CLI", () => {
 
   it("refuses a cold restore when the local rotation chain is not verified", async () => {
     const f = await fixture();
-    await f.call(["create"]);
-    const [checkpoint] = await f.checkpoints.list();
+    // Seed the state checkpoint independently of audit signer history.
+    const exported = await f.stateStore.export();
+    const checkpointId = await createCheckpointFromBundle(f, exported.bundle, exported.exported_at);
     const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
     const { updatedIdentity } = rotateKeys(
       f.identity,
@@ -339,9 +340,12 @@ describe("cold checkpoint CLI", () => {
     });
     await f.stateStore.delete("alpha", "note");
     await f.write("gamma", "post-checkpoint");
+    // An awaited critical append seeds the audit anchor without introducing a signer-history dependency.
+    const audit = new AuditLog(f.storage, f.masterKey);
+    await audit.appendCritical({ layer: "l1", operation: "fixture_ready", identity_id: f.identity.identity_id, result: "success" });
     const before = withoutAuditAndPolicy(await durableBytes(f.path));
 
-    const result = await coldRestore(f, checkpoint!.id);
+    const result = await coldRestore(f, checkpointId);
 
     expect(result.code, JSON.stringify(result)).toBe(1);
     expect(result.stderr).toContain(

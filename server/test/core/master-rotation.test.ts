@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only change that states the derivation of a key-width literal; no assertion changes, so it passes against pre-fix source by construction.
 /**
  * Master-rotation tests (F7, custody/crypto lane).
  *
@@ -1175,7 +1176,7 @@ describe("master rotation: fail-closed coverage", () => {
     const fortress = await buildFortress();
     await fortress.storage.write(
       "_audit-daemon",
-      "entry-00000000000000000001-1-0",
+      "entry-00000000000000000001-1-0", // Twenty decimal places preserve persisted sequence ordering; must match persistChainedEntry / parseEntryKeySequence in server/src/operational/audit-log.ts.
       stringToBytes("{}")
     );
     let caught: unknown;

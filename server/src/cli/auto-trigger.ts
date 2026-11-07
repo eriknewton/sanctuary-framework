@@ -32,7 +32,7 @@
 
 import { loadConfig } from "../config.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, transferCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 
@@ -131,84 +131,88 @@ async function cmdRecommendations(
     ctx.err.write("recommendations subcommand required\n");
     return 2;
   }
-  const { suggester, auditLog, identityId } = await openCalibration(ctx.args);
-  switch (sub) {
-    case "list": {
-      const recs = await suggester.listRecommendations({
-        includeSuppressed: true,
-      });
-      if (recs.length === 0) {
-        ctx.out.write("(no active auto-trigger recommendations)\n");
+  const { session, suggester, auditLog, identityId } = await openCalibration(ctx.args);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    switch (sub) {
+      case "list": {
+        const recs = await suggester.listRecommendations({
+          includeSuppressed: true,
+        });
+        if (recs.length === 0) {
+          ctx.out.write("(no active auto-trigger recommendations)\n");
+          return 0;
+        }
+        for (const rec of recs) {
+          const suppressed = rec.suppressed_until
+            ? ` suppressed-until=${rec.suppressed_until}`
+            : "";
+          ctx.out.write(
+            `${rec.rule_id} [type: ${rec.rule_type}] ${rec.current_rung}->${rec.recommended_rung} confidence=${rec.confidence}${suppressed}\n`,
+          );
+        }
         return 0;
       }
-      for (const rec of recs) {
-        const suppressed = rec.suppressed_until
-          ? ` suppressed-until=${rec.suppressed_until}`
-          : "";
+      case "show": {
+        const ruleId = argv[1];
+        if (!ruleId) {
+          ctx.err.write("recommendations show requires a rule_id\n");
+          return 2;
+        }
+        const rec = await suggester.getRecommendation(ruleId, {
+          includeSuppressed: true,
+          includeNoChange: true,
+        });
+        if (!rec) {
+          ctx.err.write(`rule not found: ${ruleId}\n`);
+          return 1;
+        }
+        ctx.out.write(JSON.stringify(rec, null, 2) + "\n");
+        return 0;
+      }
+      case "accept": {
+        const ruleId = argv[1];
+        if (!ruleId) {
+          ctx.err.write("recommendations accept requires a rule_id\n");
+          return 2;
+        }
+        const result = await suggester.acceptRecommendation(ruleId);
+        await auditLog.append("l2", "auto-trigger.recommendations.accept", identityId, {
+          rule_id: ruleId,
+          rule_type: result.recommendation.rule_type,
+          current_rung: result.recommendation.current_rung,
+          recommended_rung: result.recommendation.recommended_rung,
+          confidence: result.recommendation.confidence,
+        });
         ctx.out.write(
-          `${rec.rule_id} [type: ${rec.rule_type}] ${rec.current_rung}->${rec.recommended_rung} confidence=${rec.confidence}${suppressed}\n`,
+          `Accepted ${ruleId}: rung ${result.recommendation.current_rung} -> ${result.recommendation.recommended_rung}\n`,
         );
+        return 0;
       }
-      return 0;
-    }
-    case "show": {
-      const ruleId = argv[1];
-      if (!ruleId) {
-        ctx.err.write("recommendations show requires a rule_id\n");
+      case "reject": {
+        const ruleId = argv[1];
+        if (!ruleId) {
+          ctx.err.write("recommendations reject requires a rule_id\n");
+          return 2;
+        }
+        const cooldown = parseNumberFlag(argv, "--cooldown-hours");
+        const result = await suggester.rejectRecommendation(ruleId, cooldown);
+        await auditLog.append("l2", "auto-trigger.recommendations.reject", identityId, {
+          rule_id: ruleId,
+          suppressed_until: result.suppressed_until,
+          cooldown_hours: cooldown ?? 24,
+        });
+        ctx.out.write(
+          `Rejected ${ruleId}: suppressed until ${result.suppressed_until}\n`,
+        );
+        return 0;
+      }
+      default:
+        ctx.err.write(`Unknown recommendations subcommand: ${argvTokenForDisplay(sub)}\n`);
         return 2;
-      }
-      const rec = await suggester.getRecommendation(ruleId, {
-        includeSuppressed: true,
-        includeNoChange: true,
-      });
-      if (!rec) {
-        ctx.err.write(`rule not found: ${ruleId}\n`);
-        return 1;
-      }
-      ctx.out.write(JSON.stringify(rec, null, 2) + "\n");
-      return 0;
     }
-    case "accept": {
-      const ruleId = argv[1];
-      if (!ruleId) {
-        ctx.err.write("recommendations accept requires a rule_id\n");
-        return 2;
-      }
-      const result = await suggester.acceptRecommendation(ruleId);
-      await auditLog.append("l2", "auto-trigger.recommendations.accept", identityId, {
-        rule_id: ruleId,
-        rule_type: result.recommendation.rule_type,
-        current_rung: result.recommendation.current_rung,
-        recommended_rung: result.recommendation.recommended_rung,
-        confidence: result.recommendation.confidence,
-      });
-      ctx.out.write(
-        `Accepted ${ruleId}: rung ${result.recommendation.current_rung} -> ${result.recommendation.recommended_rung}\n`,
-      );
-      return 0;
-    }
-    case "reject": {
-      const ruleId = argv[1];
-      if (!ruleId) {
-        ctx.err.write("recommendations reject requires a rule_id\n");
-        return 2;
-      }
-      const cooldown = parseNumberFlag(argv, "--cooldown-hours");
-      const result = await suggester.rejectRecommendation(ruleId, cooldown);
-      await auditLog.append("l2", "auto-trigger.recommendations.reject", identityId, {
-        rule_id: ruleId,
-        suppressed_until: result.suppressed_until,
-        cooldown_hours: cooldown ?? 24,
-      });
-      ctx.out.write(
-        `Rejected ${ruleId}: suppressed until ${result.suppressed_until}\n`,
-      );
-      return 0;
-    }
-    default:
-      ctx.err.write(`Unknown recommendations subcommand: ${argvTokenForDisplay(sub)}\n`);
-      return 2;
-  }
+
+  }, () => auditLog.flush());
 }
 
 async function cmdRules(
@@ -245,24 +249,28 @@ async function cmdRulesList(ctx: {
   out: NodeJS.WritableStream;
   args: AutoTriggerArgs;
 }): Promise<number> {
-  const { store } = await openStore(ctx.args);
-  const ids = await store.listRuleIds();
-  if (ids.length === 0) {
-    ctx.out.write("(no rules configured; defaults are Rung 1 / no overrides)\n");
+  const { session, store } = await openStore(ctx.args);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const ids = await store.listRuleIds();
+    if (ids.length === 0) {
+      ctx.out.write("(no rules configured; defaults are Rung 1 / no overrides)\n");
+      return 0;
+    }
+    for (const id of ids) {
+      const config = await store.get(id);
+      if (!config) continue;
+      const overrides =
+        Object.keys(config.threshold_overrides).length === 0
+          ? "defaults"
+          : JSON.stringify(config.threshold_overrides);
+      ctx.out.write(
+        `${id} [type: ${config.rule_type}] rung=${config.current_rung} cancel-window=${config.cancel_window_seconds}s overrides=${overrides}\n`,
+      );
+    }
     return 0;
-  }
-  for (const id of ids) {
-    const config = await store.get(id);
-    if (!config) continue;
-    const overrides =
-      Object.keys(config.threshold_overrides).length === 0
-        ? "defaults"
-        : JSON.stringify(config.threshold_overrides);
-    ctx.out.write(
-      `${id} [type: ${config.rule_type}] rung=${config.current_rung} cancel-window=${config.cancel_window_seconds}s overrides=${overrides}\n`,
-    );
-  }
-  return 0;
+
+  });
 }
 
 async function cmdRulesShow(
@@ -278,14 +286,18 @@ async function cmdRulesShow(
     ctx.err.write("show requires a rule_id\n");
     return 2;
   }
-  const { store } = await openStore(ctx.args);
-  const config = await store.get(ruleId);
-  if (!config) {
-    ctx.err.write(`rule not found: ${ruleId}\n`);
-    return 1;
-  }
-  ctx.out.write(JSON.stringify(config, null, 2) + "\n");
-  return 0;
+  const { session, store } = await openStore(ctx.args);
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const config = await store.get(ruleId);
+    if (!config) {
+      ctx.err.write(`rule not found: ${ruleId}\n`);
+      return 1;
+    }
+    ctx.out.write(JSON.stringify(config, null, 2) + "\n");
+    return 0;
+
+  });
 }
 
 async function cmdRulesPromote(
@@ -308,27 +320,33 @@ async function cmdRulesPromote(
     );
     return 2;
   }
-  const { store, storage, masterKey, fortressId } = await openStore(ctx.args);
-  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
-  try {
-    const before = await store.get(ruleId);
-    const after = await store.promote(ruleId, ruleType);
-    const auditLog = new AuditLog(storage, masterKey);
-    await auditLog.append("l2", "auto-trigger.rules.promote", identityId, {
-      rule_id: ruleId,
-      rule_type: ruleType,
-      before_rung: before?.current_rung ?? null,
-      after_rung: after.current_rung,
-    });
-    ctx.out.write(`Promoted ${ruleId} -> rung ${after.current_rung}\n`);
-    return 0;
-  } catch (err) {
-    if (err instanceof AutoTriggerError) {
-      ctx.err.write(`${err.code}: ${err.message}\n`);
-      return 1;
+  const { session, store, storage, masterKey, fortressId } = await openStore(ctx.args);
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
+    try {
+      const before = await store.get(ruleId);
+      const after = await store.promote(ruleId, ruleType);
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      await auditLog.append("l2", "auto-trigger.rules.promote", identityId, {
+        rule_id: ruleId,
+        rule_type: ruleType,
+        before_rung: before?.current_rung ?? null,
+        after_rung: after.current_rung,
+      });
+      ctx.out.write(`Promoted ${ruleId} -> rung ${after.current_rung}\n`);
+      return 0;
+    } catch (err) {
+      if (err instanceof AutoTriggerError) {
+        ctx.err.write(`${err.code}: ${err.message}\n`);
+        return 1;
+      }
+      throw err;
     }
-    throw err;
-  }
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdRulesDemote(
@@ -351,27 +369,33 @@ async function cmdRulesDemote(
     );
     return 2;
   }
-  const { store, storage, masterKey, fortressId } = await openStore(ctx.args);
-  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
-  try {
-    const before = await store.get(ruleId);
-    const after = await store.demote(ruleId, ruleType);
-    const auditLog = new AuditLog(storage, masterKey);
-    await auditLog.append("l2", "auto-trigger.rules.demote", identityId, {
-      rule_id: ruleId,
-      rule_type: ruleType,
-      before_rung: before?.current_rung ?? null,
-      after_rung: after.current_rung,
-    });
-    ctx.out.write(`Demoted ${ruleId} -> rung ${after.current_rung}\n`);
-    return 0;
-  } catch (err) {
-    if (err instanceof AutoTriggerError) {
-      ctx.err.write(`${err.code}: ${err.message}\n`);
-      return 1;
+  const { session, store, storage, masterKey, fortressId } = await openStore(ctx.args);
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
+    try {
+      const before = await store.get(ruleId);
+      const after = await store.demote(ruleId, ruleType);
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      await auditLog.append("l2", "auto-trigger.rules.demote", identityId, {
+        rule_id: ruleId,
+        rule_type: ruleType,
+        before_rung: before?.current_rung ?? null,
+        after_rung: after.current_rung,
+      });
+      ctx.out.write(`Demoted ${ruleId} -> rung ${after.current_rung}\n`);
+      return 0;
+    } catch (err) {
+      if (err instanceof AutoTriggerError) {
+        ctx.err.write(`${err.code}: ${err.message}\n`);
+        return 1;
+      }
+      throw err;
     }
-    throw err;
-  }
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdRulesSetThreshold(
@@ -432,30 +456,36 @@ async function cmdRulesSetThreshold(
     );
     return 2;
   }
-  const { store, storage, masterKey, fortressId } = await openStore(ctx.args);
-  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
-  const patch: Parameters<typeof store.updateConfig>[2] = {};
-  if (Object.keys(overrides).length > 0) patch.threshold_overrides = overrides;
-  if (cancelWindow !== undefined) patch.cancel_window_seconds = cancelWindow;
-  const before = await store.get(ruleId);
-  const after = await store.updateConfig(ruleId, ruleType, patch);
-  const auditLog = new AuditLog(storage, masterKey);
-  await auditLog.append("l2", "auto-trigger.rules.set-threshold", identityId, {
-    rule_id: ruleId,
-    rule_type: ruleType,
-    before: {
-      threshold_overrides: before?.threshold_overrides ?? {},
-      cancel_window_seconds: before?.cancel_window_seconds ?? null,
-    },
-    after: {
-      threshold_overrides: after.threshold_overrides,
-      cancel_window_seconds: after.cancel_window_seconds,
-    },
-  });
-  ctx.out.write(
-    `Updated ${ruleId}: overrides=${JSON.stringify(after.threshold_overrides)} cancel-window=${after.cancel_window_seconds}s\n`,
-  );
-  return 0;
+  const { session, store, storage, masterKey, fortressId } = await openStore(ctx.args);
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
+    const patch: Parameters<typeof store.updateConfig>[2] = {};
+    if (Object.keys(overrides).length > 0) patch.threshold_overrides = overrides;
+    if (cancelWindow !== undefined) patch.cancel_window_seconds = cancelWindow;
+    const before = await store.get(ruleId);
+    const after = await store.updateConfig(ruleId, ruleType, patch);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await auditLog.append("l2", "auto-trigger.rules.set-threshold", identityId, {
+      rule_id: ruleId,
+      rule_type: ruleType,
+      before: {
+        threshold_overrides: before?.threshold_overrides ?? {},
+        cancel_window_seconds: before?.cancel_window_seconds ?? null,
+      },
+      after: {
+        threshold_overrides: after.threshold_overrides,
+        cancel_window_seconds: after.cancel_window_seconds,
+      },
+    });
+    ctx.out.write(
+      `Updated ${ruleId}: overrides=${JSON.stringify(after.threshold_overrides)} cancel-window=${after.cancel_window_seconds}s\n`,
+    );
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdCancel(
@@ -526,6 +556,7 @@ async function resolveStoragePath(args: AutoTriggerArgs): Promise<string> {
 async function openStore(
   args: AutoTriggerArgs,
 ): Promise<{
+  session: CliMasterKeySession;
   store: ThresholdConfigStore;
   storage: FilesystemStorage;
   masterKey: Uint8Array;
@@ -544,41 +575,52 @@ async function openStore(
     passphrase = resolved.value;
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase,
     bootstrap: true,
     storagePathHint: storagePath,
   });
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  const store = new ThresholdConfigStore({
-    storage,
-    masterKey,
-    fortressId,
+  const masterKey = session.masterKey;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const store = new ThresholdConfigStore({
+      storage,
+      masterKey,
+      fortressId,
+    });
+    return { session, store, storage, masterKey, fortressId };
+
   });
-  return { store, storage, masterKey, fortressId };
 }
 
 async function openCalibration(
   args: AutoTriggerArgs,
-): Promise<{ suggester: CalibrationSuggester; auditLog: AuditLog; identityId: string }> {
-  const { store, storage, masterKey, fortressId } = await openStore(args);
-  const auditLog = new AuditLog(storage, masterKey);
-  const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
-  const action = new NotifyOperatorAction(auditLog, identityId, fortressId);
-  const dispatcher = new ActionDispatcher({
-    store,
-    action,
-    auditLog,
-    fortressId,
-    identityId,
-  });
-  const suggester = new CalibrationSuggester({
-    store,
-    dispatcher,
-    auditLog,
-    fortressId,
-    identityId,
-    tickIntervalMs: 0,
-  });
-  return { suggester, auditLog, identityId };
+): Promise<{ session: CliMasterKeySession; suggester: CalibrationSuggester; auditLog: AuditLog; identityId: string }> {
+  const { session, store, storage, masterKey, fortressId } = await openStore(args);
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await transferCliMasterKeySession(session, async () => {
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    const identityId = process.env["SANCTUARY_IDENTITY_ID"] ?? `fortress:${fortressId}`;
+    const action = new NotifyOperatorAction(auditLog, identityId, fortressId);
+    const dispatcher = new ActionDispatcher({
+      store,
+      action,
+      auditLog,
+      fortressId,
+      identityId,
+    });
+    const suggester = new CalibrationSuggester({
+      store,
+      dispatcher,
+      auditLog,
+      fortressId,
+      identityId,
+      tickIntervalMs: 0,
+    });
+    return { session, suggester, auditLog, identityId };
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }

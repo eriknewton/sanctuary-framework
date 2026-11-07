@@ -10,6 +10,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 
+import { closeCliMasterKeySession, transferCliMasterKeySession, withCliFinalization } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { unlockLocalFortress } from "./local-fortress-unlock.js";
 import {
@@ -296,6 +297,7 @@ export async function runMemoryIngestCommand(
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
+  let operationFailure: { error: unknown } | undefined;
   try {
     // STEP1-F2 fix round 1: `refuseOwnerRefOrIdentityBeforeBootstrap` above
     // already refused and returned before `bootstrap()` ran if `env` carried
@@ -468,6 +470,7 @@ export async function runMemoryIngestCommand(
     }
     return 0;
   } catch (error) {
+    operationFailure = { error };
     await appendFailure(boot.auditLog, "memory_ingest", {
       harness: parsed.harness,
       owner_ref: parsed.ownerRef,
@@ -477,22 +480,8 @@ export async function runMemoryIngestCommand(
     write(err, `memory_ingest failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    // F4: zero the owned master even if the audit flush THROWS. The flush is the
-    // last consumer that needs the key, but a flush/write error must not skip the
-    // fill — so it runs in an inner `finally`, never a bare sequential statement.
-    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
-    // a flush/zeroing throw can never strand the lease and block rotate-master.
-    // The flush above is this verb's final master-derived write, so releasing
-    // here is releasing after the last write (AGENTS rule 12).
-    try {
-      try {
-        await boot.auditLog.flush();
-      } finally {
-        boot.masterKey.fill(0);
-      }
-    } finally {
-      await boot.barrier?.release().catch(() => undefined);
-    }
+    // Final audit writes settle before scrubbing and release, and cleanup retains any operation failure.
+    await finalizeMemoryFileCommand(boot, operationFailure);
   }
 }
 
@@ -613,6 +602,7 @@ export async function runMemoryEmitCommand(
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
+  let operationFailure: { error: unknown } | undefined;
   try {
     // STEP1-F2: same owner-pin custody question memory_ingest answers before
     // its approval dialog (STEP1-F1) — memory_emit materializes vault content
@@ -686,6 +676,7 @@ export async function runMemoryEmitCommand(
     }
     return 0;
   } catch (error) {
+    operationFailure = { error };
     await appendFailure(boot.auditLog, "memory_emit", {
       harness: parsed.harness,
       owner_ref: parsed.ownerRef,
@@ -695,22 +686,8 @@ export async function runMemoryEmitCommand(
     write(err, `memory_emit failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    // F4: zero the owned master even if the audit flush THROWS. The flush is the
-    // last consumer that needs the key, but a flush/write error must not skip the
-    // fill — so it runs in an inner `finally`, never a bare sequential statement.
-    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
-    // a flush/zeroing throw can never strand the lease and block rotate-master.
-    // The flush above is this verb's final master-derived write, so releasing
-    // here is releasing after the last write (AGENTS rule 12).
-    try {
-      try {
-        await boot.auditLog.flush();
-      } finally {
-        boot.masterKey.fill(0);
-      }
-    } finally {
-      await boot.barrier?.release().catch(() => undefined);
-    }
+    // Final audit writes settle before scrubbing and release, and cleanup retains any operation failure.
+    await finalizeMemoryFileCommand(boot, operationFailure);
   }
 }
 
@@ -737,6 +714,7 @@ export async function runMemoryTranscodeCommand(
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
+  let operationFailure: { error: unknown } | undefined;
   try {
     // STEP1-F2: same owner-pin custody question memory_ingest answers before
     // its approval dialog (STEP1-F1) — memory_transcode reads the SDW vault
@@ -807,6 +785,7 @@ export async function runMemoryTranscodeCommand(
         },
       });
     } catch (auditError) {
+      operationFailure = { error: auditError };
       write(
         err,
         `memory_transcode completed, but its outcome audit record failed (${errorName(auditError)}). Preserve archive_id ${result.archive_id} and inspect the output before retrying.\n`,
@@ -820,6 +799,7 @@ export async function runMemoryTranscodeCommand(
     );
     return 0;
   } catch (error) {
+    operationFailure = { error };
     await appendFailure(boot.auditLog, "memory_transcode", {
       from_harness: parsed.fromHarness,
       to_harness: parsed.toHarness,
@@ -831,22 +811,8 @@ export async function runMemoryTranscodeCommand(
     write(err, `memory_transcode failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    // F4: zero the owned master even if the audit flush THROWS. The flush is the
-    // last consumer that needs the key, but a flush/write error must not skip the
-    // fill — so it runs in an inner `finally`, never a bare sequential statement.
-    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
-    // a flush/zeroing throw can never strand the lease and block rotate-master.
-    // The flush above is this verb's final master-derived write, so releasing
-    // here is releasing after the last write (AGENTS rule 12).
-    try {
-      try {
-        await boot.auditLog.flush();
-      } finally {
-        boot.masterKey.fill(0);
-      }
-    } finally {
-      await boot.barrier?.release().catch(() => undefined);
-    }
+    // Final audit writes settle before scrubbing and release, and cleanup retains any operation failure.
+    await finalizeMemoryFileCommand(boot, operationFailure);
   }
 }
 
@@ -873,6 +839,7 @@ export async function runMemoryTranscodeRestoreCommand(
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
+  let operationFailure: { error: unknown } | undefined;
   try {
     // STEP1-F2: same owner-pin custody question memory_ingest answers before
     // its approval dialog (STEP1-F1) — memory_transcode_restore materializes
@@ -934,6 +901,7 @@ export async function runMemoryTranscodeRestoreCommand(
         },
       });
     } catch (auditError) {
+      operationFailure = { error: auditError };
       write(
         err,
         `memory_transcode_restore completed, but its outcome audit record failed (${errorName(auditError)}). Inspect ${parsed.dir} before retrying.\n`,
@@ -946,6 +914,7 @@ export async function runMemoryTranscodeRestoreCommand(
     );
     return 0;
   } catch (error) {
+    operationFailure = { error };
     await appendFailure(boot.auditLog, "memory_transcode_restore", {
       archive_id: parsed.archiveId,
       owner_ref: parsed.ownerRef,
@@ -955,22 +924,8 @@ export async function runMemoryTranscodeRestoreCommand(
     write(err, `memory_transcode_restore failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    // F4: zero the owned master even if the audit flush THROWS. The flush is the
-    // last consumer that needs the key, but a flush/write error must not skip the
-    // fill — so it runs in an inner `finally`, never a bare sequential statement.
-    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
-    // a flush/zeroing throw can never strand the lease and block rotate-master.
-    // The flush above is this verb's final master-derived write, so releasing
-    // here is releasing after the last write (AGENTS rule 12).
-    try {
-      try {
-        await boot.auditLog.flush();
-      } finally {
-        boot.masterKey.fill(0);
-      }
-    } finally {
-      await boot.barrier?.release().catch(() => undefined);
-    }
+    // Final audit writes settle before scrubbing and release, and cleanup retains any operation failure.
+    await finalizeMemoryFileCommand(boot, operationFailure);
   }
 }
 
@@ -1177,23 +1132,15 @@ async function bootstrap(
     return null;
   }
   const masterKey = unlocked.masterKey;
-  observeMasterKey?.(masterKey);
-  // Any failure between here and the successful return must zero the owned
-  // master before propagating, or a construction throw would leak the live key.
-  try {
+  // Only a complete command context transfers custody; every other exit awaits release.
+  return transferCliMasterKeySession({ masterKey, masterWriteBarrier: unlocked.barrier }, async () => {
+    observeMasterKey?.(masterKey);
     const auditLog = new AuditLog(storage, masterKey);
     const baseline = new BaselineTracker(storage, masterKey);
     await baseline.load();
     const identityManager = new IdentityManager(storage, masterKey);
     const loaded = await identityManager.load();
     if (loaded.loaded === 0 || identityManager.getDefault() === undefined) {
-      masterKey.fill(0);
-      // Release the writeIntent barrier on this early return too: it was acquired
-      // before the unlock and is transferred to the caller ONLY on the successful
-      // return below, so any bail-out here must release it itself or a stranded
-      // shared lease blocks a later rotate-master for the process lifetime (S1).
-      // An outer finally cannot own this — the success path must NOT release.
-      await unlocked.barrier?.release().catch(() => undefined);
       write(err, "Error: fortress primary identity is unavailable.\n");
       return null;
     }
@@ -1227,12 +1174,23 @@ async function bootstrap(
       masterKey,
       ...(unlocked.barrier !== undefined ? { barrier: unlocked.barrier } : {}),
     };
-  } catch (e) {
-    masterKey.fill(0);
-    // The construction failed AFTER the write barrier was acquired; release it
-    // so a stranded lease does not block a later rotate-master (S1).
-    await unlocked.barrier?.release().catch(() => undefined);
-    throw e;
+  });
+}
+
+async function finalizeMemoryFileCommand(
+  boot: BootstrappedMemoryFileCommand,
+  operationFailure: { error: unknown } | undefined,
+): Promise<void> {
+  try {
+    await closeCliMasterKeySession(
+      { masterKey: boot.masterKey, masterWriteBarrier: boot.barrier },
+      () => boot.auditLog.flush(),
+    );
+  } catch (error) {
+    // A reported operation failure remains attached when finalization also fails.
+    await withCliFinalization(async () => {
+      if (operationFailure) throw operationFailure.error;
+    }, async () => { throw error; });
   }
 }
 

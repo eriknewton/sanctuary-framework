@@ -23,7 +23,7 @@
 
 import { loadConfig } from "../config.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { MasterEstablishmentReleaseError, withCliMasterKeySession, closeCliMasterKeySession, type CliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
@@ -151,16 +151,26 @@ async function cmdSubscribe(
     (entry) => entry.sentinelId === sentinelId,
   );
   if (!known) {
+    let session: CliMasterKeySession | undefined;
+    let auditLog: AuditLog | undefined;
     try {
-      const masterKey = await deriveSentinelMasterKey(ctx.args);
+      session = await deriveSentinelMasterKey(ctx.args);
+      const masterKey = session.masterKey;
       const storage = new FilesystemStorage(`${storagePath}/state`);
       const fortressId = fortressIdFromStoragePath(storagePath);
-      const auditLog = new AuditLog(storage, masterKey);
+      auditLog = new AuditLog(storage, masterKey);
       await auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
         sentinel_id: sentinelId,
         subscription_path: `${storagePath}/sentinel-subscriptions.json`,
       }, "failure");
-    } catch { /* audit best-effort */ }
+    } catch (error) {
+      if (error instanceof MasterEstablishmentReleaseError) throw error;
+      // Ordinary audit failures preserve the command outcome.
+    }
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    if (session) await closeCliMasterKeySession(session, async () => {
+      try { await auditLog?.flush(); } catch { /* audit best-effort */ }
+    });
     ctx.err.write(`Unknown sentinel: ${sentinelId}\n`);
     return 2;
   }
@@ -170,19 +180,26 @@ async function cmdSubscribe(
     return 0;
   }
   subscribed.add(sentinelId);
-  await saveSentinelSubscriptions(storagePath, subscribed);
-  const masterKey = await deriveSentinelMasterKey(ctx.args);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  const auditLog = new AuditLog(storage, masterKey);
-  await auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
-    sentinel_id: sentinelId,
-    subscription_path: `${storagePath}/sentinel-subscriptions.json`,
-  });
-  ctx.out.write(
-    `Subscribed: ${sentinelId}\nRestart Sanctuary or wait for the next dispatcher tick to begin evaluation.\n`,
-  );
-  return 0;
+  const session = await deriveSentinelMasterKey(ctx.args);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    await saveSentinelSubscriptions(storagePath, subscribed);
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await auditLog.append("l2", "sentinel.subscribe", `fortress:${fortressId}`, {
+      sentinel_id: sentinelId,
+      subscription_path: `${storagePath}/sentinel-subscriptions.json`,
+    });
+    ctx.out.write(
+      `Subscribed: ${sentinelId}\nRestart Sanctuary or wait for the next dispatcher tick to begin evaluation.\n`,
+    );
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdUnsubscribe(
@@ -205,17 +222,24 @@ async function cmdUnsubscribe(
     return 0;
   }
   subscribed.delete(sentinelId);
-  await saveSentinelSubscriptions(storagePath, subscribed);
-  const masterKey = await deriveSentinelMasterKey(ctx.args);
-  const storage = new FilesystemStorage(`${storagePath}/state`);
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  const auditLog = new AuditLog(storage, masterKey);
-  await auditLog.append("l2", "sentinel.unsubscribe", `fortress:${fortressId}`, {
-    sentinel_id: sentinelId,
-    subscription_path: `${storagePath}/sentinel-subscriptions.json`,
-  });
-  ctx.out.write(`Unsubscribed: ${sentinelId}\n`);
-  return 0;
+  const session = await deriveSentinelMasterKey(ctx.args);
+  const masterKey = session.masterKey;
+  let sessionAuditLog: AuditLog | undefined;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    await saveSentinelSubscriptions(storagePath, subscribed);
+    const storage = new FilesystemStorage(`${storagePath}/state`);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const auditLog = new AuditLog(storage, masterKey);
+    sessionAuditLog = auditLog;
+    await auditLog.append("l2", "sentinel.unsubscribe", `fortress:${fortressId}`, {
+      sentinel_id: sentinelId,
+      subscription_path: `${storagePath}/sentinel-subscriptions.json`,
+    });
+    ctx.out.write(`Unsubscribed: ${sentinelId}\n`);
+    return 0;
+
+  }, () => sessionAuditLog?.flush() ?? Promise.resolve());
 }
 
 async function cmdFindings(
@@ -242,36 +266,41 @@ async function cmdFindings(
   }
   // Unified custody (master-custody.ts): never derive a fortress master
   // verb-locally — a local derivation can diverge from the envelope.
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase,
     bootstrap: true,
     storagePathHint: storagePath,
   });
-  const fortressId = fortressIdFromStoragePath(storagePath);
-  const store = new SentinelFindingStore({
-    storage,
-    masterKey,
-    fortressId,
-  });
-  const findings = await store.listFindings({
-    limit: filters.limit ?? 100,
-    ...(filters.since !== undefined ? { since: filters.since } : {}),
-    ...(filters.severity !== undefined ? { severity: filters.severity } : {}),
-    ...(filters.sentinelId !== undefined
-      ? { sentinelId: filters.sentinelId }
-      : {}),
-    ...(filters.agentId !== undefined ? { agentId: filters.agentId } : {}),
-  });
-  if (findings.length === 0) {
-    ctx.out.write("(no findings)\n");
+  const masterKey = session.masterKey;
+  // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+  return await withCliMasterKeySession(session, async () => {
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const store = new SentinelFindingStore({
+      storage,
+      masterKey,
+      fortressId,
+    });
+    const findings = await store.listFindings({
+      limit: filters.limit ?? 100,
+      ...(filters.since !== undefined ? { since: filters.since } : {}),
+      ...(filters.severity !== undefined ? { severity: filters.severity } : {}),
+      ...(filters.sentinelId !== undefined
+        ? { sentinelId: filters.sentinelId }
+        : {}),
+      ...(filters.agentId !== undefined ? { agentId: filters.agentId } : {}),
+    });
+    if (findings.length === 0) {
+      ctx.out.write("(no findings)\n");
+      return 0;
+    }
+    for (const finding of findings) {
+      ctx.out.write(
+        `[${finding.observed_at}] ${finding.severity.toUpperCase()} ${finding.sentinel_id}${finding.agent_id ? ` (agent ${finding.agent_id})` : ""}: ${finding.summary}\n`,
+      );
+    }
     return 0;
-  }
-  for (const finding of findings) {
-    ctx.out.write(
-      `[${finding.observed_at}] ${finding.severity.toUpperCase()} ${finding.sentinel_id}${finding.agent_id ? ` (agent ${finding.agent_id})` : ""}: ${finding.summary}\n`,
-    );
-  }
-  return 0;
+
+  });
 }
 
 interface FindingFilters {
@@ -311,7 +340,7 @@ async function resolveStoragePath(args: SentinelArgs): Promise<string> {
   return config.storage_path;
 }
 
-async function deriveSentinelMasterKey(args: SentinelArgs): Promise<Uint8Array> {
+async function deriveSentinelMasterKey(args: SentinelArgs): Promise<CliMasterKeySession> {
   const storagePath = await resolveStoragePath(args);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   let passphrase = args.passphrase ?? process.env["SANCTUARY_PASSPHRASE"];
@@ -325,10 +354,10 @@ async function deriveSentinelMasterKey(args: SentinelArgs): Promise<Uint8Array> 
     passphrase = resolved.value;
   }
   // Unified custody (master-custody.ts): see runFindings above.
-  const masterKey = await resolveCliMasterKey(storage, {
+  const session = await resolveCliMasterKey(storage, {
     passphrase,
     bootstrap: true,
     storagePathHint: storagePath,
   });
-  return masterKey;
+  return session;
 }

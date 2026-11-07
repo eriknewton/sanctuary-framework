@@ -1,3 +1,4 @@
+import { buildV11Bindings } from "../construction-work-fixture.js";
 // fail-before-exempt: Export fault assertions preserve existing scrubbing on both base and fix; lift disclosure is witnessed in the controller, route and shipped-client tests.
 /** The approving dashboard alone receives an export key; reusable views remain metadata only. IC-07. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,6 @@ import { AuditLog } from "../../../src/operational/audit-log.js";
 import { StateStore } from "../../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../../src/cognitive/tools.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
-import { buildV11Bindings } from "../../../src/dashboard/v1_1/wiring.js";
 import { dispatchV11Request } from "../../../src/dashboard/v1_1/dispatch.js";
 import { importExitBundle } from "../../../src/exit/bundle.js";
 import * as bundleModule from "../../../src/exit/bundle.js";
@@ -80,7 +80,7 @@ async function fortress(nonempty = true) {
   const identity = JSON.parse((await tools.find(t => t.name === "identity_create")!.handler({ label: "fixture" })).content[0]!.text);
   if (nonempty) await tools.find(t => t.name === "state_write")!.handler({ namespace: "memory", key: "handoff", value: "portable memory", identity_id: identity.identity_id });
   const inputs = { identityId: identity.identity_id, fortressId: "fixture-fortress", storagePath, storage, masterKey, auditLog, identityManager, policy: DEFAULT_POLICY };
-  const bindings = buildV11Bindings(inputs);
+  const bindings = await buildV11Bindings(inputs);
   const dispatch = (path: string, res = new Reply(), method = "POST", token: string | undefined = TOKEN, configured: string | undefined = TOKEN) => {
     const done = dispatchV11Request({ bindings, authToken: configured, loopbackAutoAuth: true }, request(path, method, token), res as unknown as ServerResponse, new URL(path, "http://localhost"), method);
     pending.push(done);
@@ -190,7 +190,7 @@ describe("response-only export delivery", () => {
     secretFree(await allFiles(delivery.bundle_dir));
     secretFree(await publisherFrames(item));
     expect(new HubInboxStore().size()).toBe(0);
-    expect(buildV11Bindings(f).hubService.listInbox()).toEqual([]);
+    expect((await buildV11Bindings(f)).hubService.listInbox()).toEqual([]);
   });
 
   it("safe-item-remains-safe-through-both-sse-publishers", async () => {

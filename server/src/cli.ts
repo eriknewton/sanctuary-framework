@@ -14,6 +14,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
+import { CUSTODY_RELEASE_FAILURE_MESSAGE } from "./cli/custody-release-message.js";
 import { installStdioShutdown } from "./cli/stdio-shutdown.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate, checkForSignedUpdate } from "./update-check.js";
@@ -38,6 +39,17 @@ const { version: PKG_VERSION } = require("../package.json");
  * SIGKILL. Generous enough that a healthy flush always finishes first.
  */
 const BROKER_SHUTDOWN_WATCHDOG_MS = 5000;
+
+/**
+ * Set once dispatch commits to starting a server (the broker server, the MCP
+ * server, or the standalone dashboard). A rejection after that point is a start
+ * failure, so the top-level handler keeps the start-failure message even when
+ * the cause is a custody release failure. CLI commands, including protect and
+ * wrap when they start a dashboard as part of their work, get the
+ * committed-work line, which only claims work they already reported.
+ */
+let serverBootStarted = false;
+let dashboardToStopOnFailure: { stop(): Promise<void> } | undefined;
 
 async function main(): Promise<void> {
   // This facade dispatches before environment promotion, custody resolution, or ordinary boot.
@@ -128,6 +140,7 @@ async function main(): Promise<void> {
 
   // Check for subcommands first
   if (args[0] === "dashboard") {
+    serverBootStarted = true;
     await runStandaloneDashboard(args.slice(1));
     return;
   }
@@ -175,6 +188,7 @@ async function main(): Promise<void> {
     const {
       isWrapCliRefusal,
       parseWrapArgs,
+      registerProcessShutdownCleanup,
       runWrap,
       wrapCliRefusalExitCode,
     } = await import("./wrap/cli.js");
@@ -186,13 +200,14 @@ async function main(): Promise<void> {
     // The closure lives HERE because wrap/cli must not import
     // dashboard-standalone itself (that edge would introduce a new import
     // cycle; see test/structure/import-cycle-baseline.test.ts).
+    let ownedDashboard: { stop(): Promise<void> } | undefined;
     try {
       await runWrap(opts, {
         startOwnedDashboard: async ({ storagePath, port, passphrase }) => {
           const { startStandaloneDashboard } = await import(
             "./dashboard-standalone.js"
           );
-          await startStandaloneDashboard({
+          ownedDashboard = await startStandaloneDashboard({
             storagePath,
             port,
             ...(passphrase !== undefined ? { passphrase } : {}),
@@ -203,6 +218,8 @@ async function main(): Promise<void> {
             // configured token always wins. Loopback auto-auth after unlock
             // keeps the browser UX.
             mintAuthTokenIfAbsent: true,
+            // The host contract must match StandaloneDashboardOptions.processLifecycle in dashboard-standalone.ts.
+            processLifecycle: { registerCleanup: registerProcessShutdownCleanup },
           });
           // The standalone boot binds exactly the requested loopback port (no
           // silent walk) and writes the tenant's runtime.json itself — the
@@ -211,12 +228,18 @@ async function main(): Promise<void> {
         },
       });
     } catch (err) {
-      if (!isWrapCliRefusal(err)) throw err;
+      const refusalExitCode = isWrapCliRefusal(err) ? wrapCliRefusalExitCode(err) : undefined;
+      if (!isWrapCliRefusal(err)) {
+        dashboardToStopOnFailure = ownedDashboard;
+        throw err;
+      }
       // Known protect/wrap refusals are operator outcomes, not MCP boot
       // failures; printing only the curated sentence keeps remedies visible
       // without exposing an irrelevant module stack.
       process.stderr.write(`\n  ${err.message}\n`);
-      return drainAndExit(wrapCliRefusalExitCode(err));
+      // The refusal must remain visible even if stopping the retained dashboard never settles.
+      await ownedDashboard?.stop().catch(() => undefined);
+      return drainAndExit(refusalExitCode!);
     }
     return;
   }
@@ -706,6 +729,7 @@ Commands:
   }
 
   if (args[0] === "broker-server") {
+    serverBootStarted = true;
     const { openBroker } = await import("./disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./broker-mcp/broker-server.js");
     const { loadConfig } = await import("./config.js");
@@ -820,6 +844,7 @@ Commands:
     }
   }
 
+  serverBootStarted = true;
   await refuseMissingMcpChildFortressOrExit();
 
   const { server, config, cleanup } = await createSanctuaryServer({ passphrase });
@@ -1916,6 +1941,38 @@ function formatCliError(err: unknown): string {
   return String(err);
 }
 
+async function isMasterSessionCleanupFailure(error: unknown): Promise<boolean> {
+  const { MasterEstablishmentReleaseError } = await import("./core/master-custody.js");
+  const { CrossProcessLockError } = await import("./storage/cross-process-lock.js");
+  const seen = new Set<unknown>();
+  const matches = (value: unknown): boolean => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (value instanceof MasterEstablishmentReleaseError) return true;
+    // A finalization aggregate also carries flush-only failures after a clean release, so only an actual release member counts.
+    if (value instanceof AggregateError) return value.errors.some(matches);
+    // The shared lock type also reports acquisition refusals, so these diagnostics must match releaseKernelLock in storage/cross-process-lock.ts
+    // (pinned by test/structure/custody-release-diagnostic-parity.test.ts).
+    return value instanceof CrossProcessLockError && (
+      value.message === "custody lock listener close failed" ||
+      value.message === "custody lock ownership validation failed" ||
+      value.message === "custody lock bind identity is unknown" ||
+      /^process-owned custody lock listener did not close within \d+ms$/.test(value.message)
+    );
+  };
+  return matches(error);
+}
+
+async function classifiesAsCommandCleanupFailure(err: unknown): Promise<boolean> {
+  if (serverBootStarted) return false;
+  try {
+    return await isMasterSessionCleanupFailure(err);
+  } catch {
+    // Classification is best effort: a fault here must never replace the original diagnostic or skip the nonzero exit.
+    return false;
+  }
+}
+
 /**
  * The module-scope dispatch of this entry point, exposed as a promise.
  *
@@ -1927,8 +1984,16 @@ function formatCliError(err: unknown): string {
  * REAL top-level dispatch (flag extraction, subcommand routing, dependency
  * wiring) has nothing else to await. Nothing in production reads it.
  */
-export const cliEntryInvocation: Promise<void> = main().catch((err) => {
-  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-  console.error("Sanctuary MCP Server failed to start:", err);
+export const cliEntryInvocation: Promise<void> = main().catch(async (err) => {
+  if (await classifiesAsCommandCleanupFailure(err)) {
+    // Must match CUSTODY_RELEASE_FAILURE_MESSAGE in cli/custody-release-message.ts.
+    // SAFETY: this fixed operator line contains no credential, path, or internal identifier.
+    console.error(CUSTODY_RELEASE_FAILURE_MESSAGE, err);
+  } else {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error("Sanctuary MCP Server failed to start:", err);
+  }
+  // The error must remain visible even if stopping the retained dashboard never settles.
+  await dashboardToStopOnFailure?.stop().catch(() => undefined);
   process.exit(1);
 });

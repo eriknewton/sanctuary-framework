@@ -60,7 +60,7 @@ import { IdentityManager } from "../cognitive/tools.js";
 import { OpaqueNamespaceRegistry } from "../agent-native/safety-base.js";
 import { loadConfig } from "../config.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { AuditLog } from "../operational/audit-log.js";
 import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
@@ -506,476 +506,482 @@ export async function runStateDiscloseUnattributedCommand(
     return 1;
   }
 
-  let masterKey: Uint8Array | undefined;
   let identityEncKey: Uint8Array | undefined;
   try {
     const config = await loadConfig();
     await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
     const storage = new FilesystemStorage(join(config.storage_path, "state"));
-    masterKey = await resolveCliMasterKey(storage, {
+    const session = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       storagePathHint: config.storage_path,
     });
+    const masterKey = session.masterKey;
+    let sessionAuditLog: AuditLog | undefined;
+    // The caller retains this session through its final operation and pending writes, then awaits release on every exit.
+    return await withCliMasterKeySession(session, async () => {
 
-    const identityManager = new IdentityManager(storage, masterKey);
-    const loadResult = await identityManager.load();
-    const primary = identityManager.getDefault();
-    if (loadResult.loaded === 0 || !primary) {
-      write(err, "Error: no usable identity in this fortress.\n");
-      return 1;
-    }
-    identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+      const identityManager = new IdentityManager(storage, masterKey);
+      const loadResult = await identityManager.load();
+      const primary = identityManager.getDefault();
+      if (loadResult.loaded === 0 || !primary) {
+        write(err, "Error: no usable identity in this fortress.\n");
+        return 1;
+      }
+      identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
 
-    const stateStore = new StateStore(storage, masterKey);
-    const auditLog = new AuditLog(storage, masterKey);
-    const gate = new ApprovalGate(
-      await loadPrincipalPolicy(config.storage_path),
-      new BaselineTracker(storage, masterKey),
-      args.approvalChannel ?? new CliPromptApprovalChannel(),
-      auditLog,
-    );
+      const stateStore = new StateStore(storage, masterKey);
+      const auditLog = new AuditLog(storage, masterKey);
+      sessionAuditLog = auditLog;
+      const gate = new ApprovalGate(
+        await loadPrincipalPolicy(config.storage_path),
+        new BaselineTracker(storage, masterKey),
+        args.approvalChannel ?? new CliPromptApprovalChannel(),
+        auditLog,
+      );
 
-    // The gate resolves Tier 1 from the operation NAME against the same
-    // non-relaxable set the MCP router uses, so a hand-authored policy that
-    // lists this operation under tier3_always_allow still lands here.
-    const decision = await gate.evaluate(UNATTRIBUTED_DISCLOSURE_OPERATION, {
-      // This operator-only CLI has no acting agent principal. Keeping the field
-      // explicit prevents a missing value from being mistaken for an inferred one.
-      agent_id: null,
-      namespace,
-      key,
-    });
-    if (!decision.allowed) {
-      write(err, "Denied: unattributed disclosure was not approved.\n");
-      return 1;
-    }
+      // The gate resolves Tier 1 from the operation NAME against the same
+      // non-relaxable set the MCP router uses, so a hand-authored policy that
+      // lists this operation under tier3_always_allow still lands here.
+      const decision = await gate.evaluate(UNATTRIBUTED_DISCLOSURE_OPERATION, {
+        // This operator-only CLI has no acting agent principal. Keeping the field
+        // explicit prevents a missing value from being mistaken for an inferred one.
+        agent_id: null,
+        namespace,
+        key,
+      });
+      if (!decision.allowed) {
+        write(err, "Denied: unattributed disclosure was not approved.\n");
+        return 1;
+      }
 
-    const outcome = await discloseUnattributedState({
-      auditLog,
-      stateStore,
-      // A fail-closed registry AND NO SESSION BINDING, on purpose. An opaque
-      // `mem_*` handle is issued to a live agent session inside a running MCP
-      // server; this process is the operator's own out-of-band presence and
-      // holds no such session, so it owns no handle and every `mem_*` namespace
-      // refuses here. Fail-closed, and the same code path the MCP tool takes
-      // rather than a CLI-shaped approximation of it.
-      namespaceRegistry: new OpaqueNamespaceRegistry({
-        loadHandleForIdentity: async () => {
-          throw new Error("operator CLI cannot claim agent memory handles");
-        },
-        claimHandleForIdentity: async () => {
-          throw new Error("operator CLI cannot claim agent memory handles");
-        },
-        findOwnerForHandle: async () => {
-          throw new Error("operator CLI cannot resolve agent memory handles");
-        },
-      }),
-      namespace,
-      key,
-      identityId: primary.identity_id,
-      ...(decision.approval_audit_id
-        ? { approvalAuditId: decision.approval_audit_id }
-        : {}),
-    });
+      const outcome = await discloseUnattributedState({
+        auditLog,
+        stateStore,
+        // A fail-closed registry AND NO SESSION BINDING, on purpose. An opaque
+        // `mem_*` handle is issued to a live agent session inside a running MCP
+        // server; this process is the operator's own out-of-band presence and
+        // holds no such session, so it owns no handle and every `mem_*` namespace
+        // refuses here. Fail-closed, and the same code path the MCP tool takes
+        // rather than a CLI-shaped approximation of it.
+        namespaceRegistry: new OpaqueNamespaceRegistry({
+          loadHandleForIdentity: async () => {
+            throw new Error("operator CLI cannot claim agent memory handles");
+          },
+          claimHandleForIdentity: async () => {
+            throw new Error("operator CLI cannot claim agent memory handles");
+          },
+          findOwnerForHandle: async () => {
+            throw new Error("operator CLI cannot resolve agent memory handles");
+          },
+        }),
+        namespace,
+        key,
+        identityId: primary.identity_id,
+        ...(decision.approval_audit_id
+          ? { approvalAuditId: decision.approval_audit_id }
+          : {}),
+      });
 
-    if (outcome.status === "refused_namespace_reserved") {
-      write(
-        err,
-        `Refused: namespace "${renderUntrustedMetadata(namespace)}" is reserved for internal ` +
+      if (outcome.status === "refused_namespace_reserved") {
+        write(
+          err,
+          `Refused: namespace "${renderUntrustedMetadata(namespace)}" is reserved for internal ` +
           `use (prefix: ${renderUntrustedMetadata(outcome.reservedPrefix)}). This surface\n` +
           "does not disclose from reserved namespaces.\n",
-      );
-      return 1;
-    }
-    if (outcome.status === "refused_namespace_unavailable") {
-      write(
-        err,
-        `Refused: namespace "${renderUntrustedMetadata(namespace)}" is not available here.\n`,
-      );
-      return 1;
-    }
-    if (outcome.status === "not_found") {
-      write(
-        err,
-        `Not found: ${renderUntrustedMetadata(namespace)}/${renderUntrustedMetadata(key)}\n`,
-      );
-      return 1;
-    }
-    if (outcome.status === "refused_writer_is_establishable") {
-      write(
-        err,
-        "Refused: the writer of this entry CAN be established, so the ordinary\n" +
+        );
+        return 1;
+      }
+      if (outcome.status === "refused_namespace_unavailable") {
+        write(
+          err,
+          `Refused: namespace "${renderUntrustedMetadata(namespace)}" is not available here.\n`,
+        );
+        return 1;
+      }
+      if (outcome.status === "not_found") {
+        write(
+          err,
+          `Not found: ${renderUntrustedMetadata(namespace)}/${renderUntrustedMetadata(key)}\n`,
+        );
+        return 1;
+      }
+      if (outcome.status === "refused_writer_is_establishable") {
+        write(
+          err,
+          "Refused: the writer of this entry CAN be established, so the ordinary\n" +
           "verified read returns it and this surface does not apply. Read it normally.\n",
-      );
-      return 1;
-    }
-    if (outcome.status === "refused_verification") {
-      write(
-        err,
-        `Refused: state verification failed (${renderUntrustedMetadata(outcome.classification)}).\n`,
-      );
-      return 1;
-    }
-
-    const disclosure = outcome.disclosure;
-
-    /**
-     * Record what happened to the DELIVERY of this disclosure.
-     *
-     * The shared operation's terminal row says an entry was read. It cannot
-     * say whether the operator received it, because the transport is what
-     * delivers: a file that cannot be written, a receipt that never reaches
-     * the terminal, and a rollback that could not remove the plaintext are all
-     * outcomes that happen after the read succeeded. Without a row here the
-     * durable history reads success while the command told the operator it
-     * failed, and, worse, while plaintext may still be sitting on their disk.
-     * Critical because it is the only durable answer to "did this content
-     * actually leave the fortress".
-     */
-    const auditDelivery = async (
-      deliveryOutcome: string,
-      result: "success" | "failure",
-      extra?: Record<string, unknown>,
-    ): Promise<void> => {
-      try {
-        await auditLog.appendCritical({
-          layer: "l1",
-          operation: UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION,
-          identity_id: primary.identity_id,
-          result,
-          details: {
-            namespace,
-            key,
-            delivery_outcome: deliveryOutcome,
-            ...extra,
-          },
-        });
-      } catch {
-        // The delivery row itself could not be persisted. Say so here rather
-        // than letting it fall to the outer handler, which would report a
-        // storage fault as a fortress unlock failure: a false explanation of a
-        // real fault, on the one surface whose job is telling the truth.
-        write(
-          err,
-          "Warning: the disclosure delivery audit record could not be written.\n",
-        );
-      }
-    };
-
-    if (json) {
-      // Verbatim, and only here: the TTY refusal above already established
-      // that a program, not a terminal, is reading this stream. The
-      // serialization can itself fail on a stored value it cannot represent,
-      // and that failure must be named as what it is rather than falling
-      // through to the generic unlock diagnosis below.
-      let payload: string;
-      try {
-        const serialized = serialize(disclosure);
-        if (serialized === undefined) {
-          // JSON cannot represent the disclosure at all; treat it as the same
-          // fail-loud outcome a serialization throw produces.
-          throw new Error("disclosure has no JSON serialization");
-        }
-        payload = serialized;
-      } catch {
-        await auditDelivery("json_serialization_failed", "failure");
-        write(
-          err,
-          "Error: could not serialize the disclosure as JSON; a stored field defeats serialization. Use the human path, which writes the content to a file.\n",
         );
         return 1;
       }
-      // THE SAME COMPLETION-OBSERVING WRITE THE RECEIPT USES, and for a
-      // sharper reason: `--json` writes to a redirected file or a pipe, which
-      // is precisely where a broken pipe happens. A bare `write()` followed by
-      // an unconditional success row records "delivered" for bytes the
-      // consumer never received, which is the one thing an audit log must not
-      // do. The terminal row is derived from the write's OUTCOME, never
-      // assumed from having called it.
-      try {
-        await writeAwaitingCompletion(out, payload + "\n");
-      } catch {
-        // INCOMPLETE, NOT EMPTY, and the distinction is the whole report. A
-        // pipe accepts bytes and then breaks, so a rejected write proves the
-        // stream stopped part way; it never proves the consumer got nothing.
-        // Saying "nothing was received" would point the operator away from a
-        // truncated fragment that is really sitting in their file or their
-        // consumer's buffer, which is the thing they have to go and check.
-        await auditDelivery("json_delivery_incomplete", "failure");
+      if (outcome.status === "refused_verification") {
         write(
           err,
-          "Error: the disclosure was not fully delivered to stdout; the stream failed part way, " +
-            "so any output that did arrive is an incomplete fragment and must not be parsed or " +
-            "trusted as a complete document. Discard it and re-run with a writable destination.\n",
-        );
-        return 3;
-      }
-      await auditDelivery("delivered_json", "success");
-    } else {
-      // ORDER OF OPERATIONS, and why: the receipt is composed IN FULL before
-      // the content file is written and before any byte reaches the terminal,
-      // and it is then emitted as one write. Receipt rendering must be TOTAL
-      // over arbitrary stored JSON (every untrusted field goes through the
-      // total metadata renderer), and composing first makes the failure
-      // geometry safe in both directions: a render fault can never leave a
-      // partial receipt with the file already on disk and no line saying
-      // where, and a file-write fault fails the command loudly before the
-      // terminal has claimed anything happened. Printing the content as a
-      // fallback in either case would be the silent downgrade to the exact
-      // behavior this design removed (AGENTS.md MUST-NEVER #5).
-      let contentFilePath: string;
-      let fileBody: { body: string; storedValueWasString: boolean };
-      try {
-        // THE STORAGE ROOT IS CANONICALIZED FIRST, and everything downstream
-        // uses the canonical path. An operator whose fortress path is itself a
-        // symlink (a fortress on another volume reached through a link in the
-        // home directory) is an ordinary, legitimate setup, and the no-follow
-        // verifier below includes its BASE in the chain it refuses symlinks
-        // on. Verifying against the un-resolved root would therefore lock that
-        // operator out of their own data, which is a worse outcome than the
-        // attack being defended against. Resolving once and using the result
-        // everywhere also means the custody check and the write are provably
-        // about the same directory rather than two spellings of it.
-        const canonicalStoragePath = await realpath(config.storage_path);
-        const disclosuresDir = join(canonicalStoragePath, "disclosures");
-        await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
-        // NO-FOLLOW CUSTODY BEFORE ANY MODE CHANGE OR WRITE: `chmod` and a
-        // path-based file write both FOLLOW a symlink, so a pre-positioned
-        // `disclosures -> elsewhere` link would redirect the mode change and
-        // the plaintext disclosure onto an external target. The shared
-        // custody verifier (`storage/custody-fs`, the same machinery the
-        // fortress custody paths use) lstats the leaf and refuses a symlink
-        // or non-directory; the refusal is loud with no fallback.
-        //
-        // HONEST BOUND, recorded because the verifier documents it
-        // (`custody-fs.ts`, `openDirectoryCustodyWithinBase`): the check and
-        // the use are two path-based syscalls, and Node exposes no
-        // `openat`-bound write to fuse them. This refuses a PRE-POSITIONED
-        // link and any statically hostile shape; it does not prevent a
-        // concurrent same-uid swap of `disclosures` between this check and
-        // the write below. That residual is inside the operator's own storage
-        // path, where a same-uid attacker already holds the fortress.
-        await verifyDirectoryCustodyWithinBase(
-          disclosuresDir,
-          canonicalStoragePath,
-        );
-        // `mkdir`'s mode applies only when it CREATES the directory; a
-        // pre-existing disclosures directory keeps whatever mode it had, so
-        // operator-only access is ENFORCED on every run rather than assumed
-        // from creation.
-        await chmod(disclosuresDir, 0o700);
-        // The filename is derived by THIS CODE alone. `namespace` and `key`
-        // are attacker-influenced and never reach the path: a stored or
-        // caller-chosen string in a filename is filesystem injection
-        // (separators, `..`, device names), so the name is a timestamp plus
-        // randomness, both chosen here.
-        const now = args.fileNameSeam?.now ?? new Date();
-        // 3 random bytes hex-encoded = the 6 hex characters in the name.
-        const randomHex =
-          args.fileNameSeam?.randomHex ?? randomBytes(3).toString("hex");
-        // ISO-8601 basic form: strip `-`/`:` and fractional seconds from the
-        // extended form, e.g. 20260819T031500Z.
-        const timestamp = now
-          .toISOString()
-          .replace(/[-:]/g, "")
-          .replace(/\.\d+/, "");
-        contentFilePath = join(
-          disclosuresDir,
-          `disclosure-${timestamp}-${randomHex}.txt`,
-        );
-        fileBody = disclosureFileBody(disclosure.unattributed_content);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        await auditDelivery("prepare_failed", "failure");
-        write(
-          err,
-          "Error: could not prepare the disclosure content file: " +
-            `${renderUntrusted(message)}\n` +
-            "The disclosure was not completed and no content was printed.\n",
+          `Refused: state verification failed (${renderUntrustedMetadata(outcome.classification)}).\n`,
         );
         return 1;
       }
 
-      // THE RECEIPT, composed whole. The banner leads and repeats at the end,
-      // so an operator who scrolls still sees it. Every value on it is either
-      // a label this code chose, an attacker-influenced value rendered through
-      // the bounded, total, ASCII-only metadata encoder, or the content-file
-      // path. The path is operator-config-derived plus the code-chosen
-      // filename, so it is escaped (the whole receipt stays printable ASCII
-      // even under a non-ASCII storage path) but deliberately never
-      // truncated: a shortened path names no file. TOTALITY INVARIANT: no
-      // expression below may throw on any stored value; a render failure may
-      // never suppress the file-path line or misreport the disclosure.
-      const receipt =
-        `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n` +
-        `namespace: ${renderUntrustedMetadata(disclosure.namespace, serialize)}\n` +
-        `key:       ${renderUntrustedMetadata(disclosure.key, serialize)}\n` +
-        // `version` IS attacker-controlled, despite its `number` type. The
-        // stored entry is parsed from legacy JSON and cast to `StateEntry`
-        // without runtime field validation, so `ver` can be any JSON value a
-        // writer put there. The metadata renderer encodes it, carries a
-        // faithful JSON display of a non-primitive, and is total, so nothing
-        // here trusts the type.
-        `version:   ${renderUntrustedMetadata(disclosure.version, serialize)}\n` +
-        // `writer` is the one field this code chooses rather than reads: a
-        // single-inhabitant literal set by the disclosure path itself.
-        `writer:    ${disclosure.writer}\n` +
-        `claimed_written_at: ${
-          disclosure.claimed_written_at === undefined
-            ? "(none recorded)"
-            : renderUntrustedMetadata(disclosure.claimed_written_at, serialize)
-        }\n` +
-        // The identity to restore, printed so the remedy this command
-        // advertises on every path names something the operator can act on.
-        // Labelled UNVERIFIED at the point of display, not only in the field
-        // name: this string comes out of an entry whose signature did not
-        // verify, so whoever wrote the entry chose it. It is a lead to check,
-        // never attribution.
-        "claimed writer id (UNVERIFIED, from the entry itself): " +
-        `${
-          disclosure.claimed_writer_id === undefined
-            ? "(none recorded)"
-            : renderUntrustedMetadata(disclosure.claimed_writer_id, serialize)
-        }\n` +
-        `\ncontent written to: ${renderUntrusted(contentFilePath)}\n` +
-        (fileBody.storedValueWasString
-          ? ""
-          : "note: the stored value was not a string; the file carries its exact JSON serialization.\n") +
-        `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`;
+      const disclosure = outcome.disclosure;
 
-      // CLAIMING THE PATH AND FILLING IT ARE TWO STEPS, on purpose. A single
-      // `writeFile(path, {flag:"wx"})` conflates two failures that call for
-      // opposite responses: a refusal to CLAIM the pathname (something is
-      // already there, and that something is an earlier disclosure this run
-      // must never delete) and a failure while FILLING the file this run just
-      // created (which can leave partial plaintext at the advertised path and
-      // must be cleaned up). Opening first makes `created` the discriminator.
-      //
-      // `wx` still carries the no-overwrite guarantee: the open refuses an
-      // existing file rather than truncating it.
-      let handle: FileHandle | undefined;
-      let created = false;
-      try {
-        handle = await open(contentFilePath, "wx", 0o600);
-        created = true;
-        // FIDELITY INVARIANT AT THE WRITE SITE: the file carries the stored
-        // value byte-for-byte (or its exact JSON serialization when the stored
-        // value was not a string); no display encoding is ever applied to it.
-        await (args.contentWriteSeam
-          ? args.contentWriteSeam(fileBody.body)
-          : handle.writeFile(fileBody.body));
-        // Closed explicitly rather than left to the runtime, because a close
-        // is where a deferred write error surfaces; awaiting it here puts that
-        // failure inside this handler instead of after the receipt is printed.
-        await handle.close();
-        handle = undefined;
-      } catch (error) {
-        // The OS/error message is code- or kernel-originated, not attacker
-        // metadata, but it still goes through the unbounded ASCII escape so
-        // no path this command prints can carry a raw non-ASCII byte.
-        const message = error instanceof Error ? error.message : String(error);
-        await handle?.close().catch(() => undefined);
-        if (!created) {
-          // This run never owned that pathname. Whatever occupies it belongs
-          // to an earlier disclosure, so it is reported and left alone;
-          // removing it here would destroy content the operator has not read.
-          await auditDelivery("file_write_failed", "failure", {
-            content_file: contentFilePath,
+      /**
+       * Record what happened to the DELIVERY of this disclosure.
+       *
+       * The shared operation's terminal row says an entry was read. It cannot
+       * say whether the operator received it, because the transport is what
+       * delivers: a file that cannot be written, a receipt that never reaches
+       * the terminal, and a rollback that could not remove the plaintext are all
+       * outcomes that happen after the read succeeded. Without a row here the
+       * durable history reads success while the command told the operator it
+       * failed, and, worse, while plaintext may still be sitting on their disk.
+       * Critical because it is the only durable answer to "did this content
+       * actually leave the fortress".
+       */
+      const auditDelivery = async (
+        deliveryOutcome: string,
+        result: "success" | "failure",
+        extra?: Record<string, unknown>,
+      ): Promise<void> => {
+        try {
+          await auditLog.appendCritical({
+            layer: "l1",
+            operation: UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION,
+            identity_id: primary.identity_id,
+            result,
+            details: {
+              namespace,
+              key,
+              delivery_outcome: deliveryOutcome,
+              ...extra,
+            },
           });
+        } catch {
+          // The delivery row itself could not be persisted. Say so here rather
+          // than letting it fall to the outer handler, which would report a
+          // storage fault as a fortress unlock failure: a false explanation of a
+          // real fault, on the one surface whose job is telling the truth.
           write(
             err,
-            "Error: could not write the disclosure content file: " +
-              `${renderUntrusted(message)}\n` +
-              "The disclosure was not completed and no content was printed.\n",
+            "Warning: the disclosure delivery audit record could not be written.\n",
+          );
+        }
+      };
+
+      if (json) {
+        // Verbatim, and only here: the TTY refusal above already established
+        // that a program, not a terminal, is reading this stream. The
+        // serialization can itself fail on a stored value it cannot represent,
+        // and that failure must be named as what it is rather than falling
+        // through to the generic unlock diagnosis below.
+        let payload: string;
+        try {
+          const serialized = serialize(disclosure);
+          if (serialized === undefined) {
+            // JSON cannot represent the disclosure at all; treat it as the same
+            // fail-loud outcome a serialization throw produces.
+            throw new Error("disclosure has no JSON serialization");
+          }
+          payload = serialized;
+        } catch {
+          await auditDelivery("json_serialization_failed", "failure");
+          write(
+            err,
+            "Error: could not serialize the disclosure as JSON; a stored field defeats serialization. Use the human path, which writes the content to a file.\n",
           );
           return 1;
         }
-        // This run created the file, so it may now hold a PARTIAL copy of the
-        // plaintext under the advertised name. Same rollback contract the
-        // receipt path uses: remove it, and report removal and residue
-        // differently, because only one of those two is something the
-        // operator has to go and act on.
-        let removed = true;
+        // THE SAME COMPLETION-OBSERVING WRITE THE RECEIPT USES, and for a
+        // sharper reason: `--json` writes to a redirected file or a pipe, which
+        // is precisely where a broken pipe happens. A bare `write()` followed by
+        // an unconditional success row records "delivered" for bytes the
+        // consumer never received, which is the one thing an audit log must not
+        // do. The terminal row is derived from the write's OUTCOME, never
+        // assumed from having called it.
         try {
-          await unlink(contentFilePath);
+          await writeAwaitingCompletion(out, payload + "\n");
         } catch {
-          removed = false;
+          // INCOMPLETE, NOT EMPTY, and the distinction is the whole report. A
+          // pipe accepts bytes and then breaks, so a rejected write proves the
+          // stream stopped part way; it never proves the consumer got nothing.
+          // Saying "nothing was received" would point the operator away from a
+          // truncated fragment that is really sitting in their file or their
+          // consumer's buffer, which is the thing they have to go and check.
+          await auditDelivery("json_delivery_incomplete", "failure");
+          write(
+            err,
+            "Error: the disclosure was not fully delivered to stdout; the stream failed part way, " +
+            "so any output that did arrive is an incomplete fragment and must not be parsed or " +
+            "trusted as a complete document. Discard it and re-run with a writable destination.\n",
+          );
+          return 3;
         }
-        await auditDelivery(
-          removed
-            ? "file_write_failed_partial_removed"
-            : "file_write_failed_file_may_remain",
-          "failure",
-          { content_file: contentFilePath },
-        );
-        write(
-          err,
-          "Error: could not write the disclosure content file: " +
+        await auditDelivery("delivered_json", "success");
+      } else {
+        // ORDER OF OPERATIONS, and why: the receipt is composed IN FULL before
+        // the content file is written and before any byte reaches the terminal,
+        // and it is then emitted as one write. Receipt rendering must be TOTAL
+        // over arbitrary stored JSON (every untrusted field goes through the
+        // total metadata renderer), and composing first makes the failure
+        // geometry safe in both directions: a render fault can never leave a
+        // partial receipt with the file already on disk and no line saying
+        // where, and a file-write fault fails the command loudly before the
+        // terminal has claimed anything happened. Printing the content as a
+        // fallback in either case would be the silent downgrade to the exact
+        // behavior this design removed (AGENTS.md MUST-NEVER #5).
+        let contentFilePath: string;
+        let fileBody: { body: string; storedValueWasString: boolean };
+        try {
+          // THE STORAGE ROOT IS CANONICALIZED FIRST, and everything downstream
+          // uses the canonical path. An operator whose fortress path is itself a
+          // symlink (a fortress on another volume reached through a link in the
+          // home directory) is an ordinary, legitimate setup, and the no-follow
+          // verifier below includes its BASE in the chain it refuses symlinks
+          // on. Verifying against the un-resolved root would therefore lock that
+          // operator out of their own data, which is a worse outcome than the
+          // attack being defended against. Resolving once and using the result
+          // everywhere also means the custody check and the write are provably
+          // about the same directory rather than two spellings of it.
+          const canonicalStoragePath = await realpath(config.storage_path);
+          const disclosuresDir = join(canonicalStoragePath, "disclosures");
+          await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
+          // NO-FOLLOW CUSTODY BEFORE ANY MODE CHANGE OR WRITE: `chmod` and a
+          // path-based file write both FOLLOW a symlink, so a pre-positioned
+          // `disclosures -> elsewhere` link would redirect the mode change and
+          // the plaintext disclosure onto an external target. The shared
+          // custody verifier (`storage/custody-fs`, the same machinery the
+          // fortress custody paths use) lstats the leaf and refuses a symlink
+          // or non-directory; the refusal is loud with no fallback.
+          //
+          // HONEST BOUND, recorded because the verifier documents it
+          // (`custody-fs.ts`, `openDirectoryCustodyWithinBase`): the check and
+          // the use are two path-based syscalls, and Node exposes no
+          // `openat`-bound write to fuse them. This refuses a PRE-POSITIONED
+          // link and any statically hostile shape; it does not prevent a
+          // concurrent same-uid swap of `disclosures` between this check and
+          // the write below. That residual is inside the operator's own storage
+          // path, where a same-uid attacker already holds the fortress.
+          await verifyDirectoryCustodyWithinBase(
+            disclosuresDir,
+            canonicalStoragePath,
+          );
+          // `mkdir`'s mode applies only when it CREATES the directory; a
+          // pre-existing disclosures directory keeps whatever mode it had, so
+          // operator-only access is ENFORCED on every run rather than assumed
+          // from creation.
+          await chmod(disclosuresDir, 0o700);
+          // The filename is derived by THIS CODE alone. `namespace` and `key`
+          // are attacker-influenced and never reach the path: a stored or
+          // caller-chosen string in a filename is filesystem injection
+          // (separators, `..`, device names), so the name is a timestamp plus
+          // randomness, both chosen here.
+          const now = args.fileNameSeam?.now ?? new Date();
+          // 3 random bytes hex-encoded = the 6 hex characters in the name.
+          const randomHex =
+            args.fileNameSeam?.randomHex ?? randomBytes(3).toString("hex");
+          // ISO-8601 basic form: strip `-`/`:` and fractional seconds from the
+          // extended form, e.g. 20260819T031500Z.
+          const timestamp = now
+            .toISOString()
+            .replace(/[-:]/g, "")
+            .replace(/\.\d+/, "");
+          contentFilePath = join(
+            disclosuresDir,
+            `disclosure-${timestamp}-${randomHex}.txt`,
+          );
+          fileBody = disclosureFileBody(disclosure.unattributed_content);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await auditDelivery("prepare_failed", "failure");
+          write(
+            err,
+            "Error: could not prepare the disclosure content file: " +
+            `${renderUntrusted(message)}\n` +
+            "The disclosure was not completed and no content was printed.\n",
+          );
+          return 1;
+        }
+
+        // THE RECEIPT, composed whole. The banner leads and repeats at the end,
+        // so an operator who scrolls still sees it. Every value on it is either
+        // a label this code chose, an attacker-influenced value rendered through
+        // the bounded, total, ASCII-only metadata encoder, or the content-file
+        // path. The path is operator-config-derived plus the code-chosen
+        // filename, so it is escaped (the whole receipt stays printable ASCII
+        // even under a non-ASCII storage path) but deliberately never
+        // truncated: a shortened path names no file. TOTALITY INVARIANT: no
+        // expression below may throw on any stored value; a render failure may
+        // never suppress the file-path line or misreport the disclosure.
+        const receipt =
+          `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n` +
+          `namespace: ${renderUntrustedMetadata(disclosure.namespace, serialize)}\n` +
+          `key:       ${renderUntrustedMetadata(disclosure.key, serialize)}\n` +
+          // `version` IS attacker-controlled, despite its `number` type. The
+          // stored entry is parsed from legacy JSON and cast to `StateEntry`
+          // without runtime field validation, so `ver` can be any JSON value a
+          // writer put there. The metadata renderer encodes it, carries a
+          // faithful JSON display of a non-primitive, and is total, so nothing
+          // here trusts the type.
+          `version:   ${renderUntrustedMetadata(disclosure.version, serialize)}\n` +
+          // `writer` is the one field this code chooses rather than reads: a
+          // single-inhabitant literal set by the disclosure path itself.
+          `writer:    ${disclosure.writer}\n` +
+          `claimed_written_at: ${disclosure.claimed_written_at === undefined
+            ? "(none recorded)"
+            : renderUntrustedMetadata(disclosure.claimed_written_at, serialize)
+          }\n` +
+          // The identity to restore, printed so the remedy this command
+          // advertises on every path names something the operator can act on.
+          // Labelled UNVERIFIED at the point of display, not only in the field
+          // name: this string comes out of an entry whose signature did not
+          // verify, so whoever wrote the entry chose it. It is a lead to check,
+          // never attribution.
+          "claimed writer id (UNVERIFIED, from the entry itself): " +
+          `${disclosure.claimed_writer_id === undefined
+            ? "(none recorded)"
+            : renderUntrustedMetadata(disclosure.claimed_writer_id, serialize)
+          }\n` +
+          `\ncontent written to: ${renderUntrusted(contentFilePath)}\n` +
+          (fileBody.storedValueWasString
+            ? ""
+            : "note: the stored value was not a string; the file carries its exact JSON serialization.\n") +
+          `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`;
+
+        // CLAIMING THE PATH AND FILLING IT ARE TWO STEPS, on purpose. A single
+        // `writeFile(path, {flag:"wx"})` conflates two failures that call for
+        // opposite responses: a refusal to CLAIM the pathname (something is
+        // already there, and that something is an earlier disclosure this run
+        // must never delete) and a failure while FILLING the file this run just
+        // created (which can leave partial plaintext at the advertised path and
+        // must be cleaned up). Opening first makes `created` the discriminator.
+        //
+        // `wx` still carries the no-overwrite guarantee: the open refuses an
+        // existing file rather than truncating it.
+        let handle: FileHandle | undefined;
+        let created = false;
+        try {
+          handle = await open(contentFilePath, "wx", 0o600);
+          created = true;
+          // FIDELITY INVARIANT AT THE WRITE SITE: the file carries the stored
+          // value byte-for-byte (or its exact JSON serialization when the stored
+          // value was not a string); no display encoding is ever applied to it.
+          await (args.contentWriteSeam
+            ? args.contentWriteSeam(fileBody.body)
+            : handle.writeFile(fileBody.body));
+          // Closed explicitly rather than left to the runtime, because a close
+          // is where a deferred write error surfaces; awaiting it here puts that
+          // failure inside this handler instead of after the receipt is printed.
+          await handle.close();
+          handle = undefined;
+        } catch (error) {
+          // The OS/error message is code- or kernel-originated, not attacker
+          // metadata, but it still goes through the unbounded ASCII escape so
+          // no path this command prints can carry a raw non-ASCII byte.
+          const message = error instanceof Error ? error.message : String(error);
+          await handle?.close().catch(() => undefined);
+          if (!created) {
+            // This run never owned that pathname. Whatever occupies it belongs
+            // to an earlier disclosure, so it is reported and left alone;
+            // removing it here would destroy content the operator has not read.
+            await auditDelivery("file_write_failed", "failure", {
+              content_file: contentFilePath,
+            });
+            write(
+              err,
+              "Error: could not write the disclosure content file: " +
+              `${renderUntrusted(message)}\n` +
+              "The disclosure was not completed and no content was printed.\n",
+            );
+            return 1;
+          }
+          // This run created the file, so it may now hold a PARTIAL copy of the
+          // plaintext under the advertised name. Same rollback contract the
+          // receipt path uses: remove it, and report removal and residue
+          // differently, because only one of those two is something the
+          // operator has to go and act on.
+          let removed = true;
+          try {
+            await unlink(contentFilePath);
+          } catch {
+            removed = false;
+          }
+          await auditDelivery(
+            removed
+              ? "file_write_failed_partial_removed"
+              : "file_write_failed_file_may_remain",
+            "failure",
+            { content_file: contentFilePath },
+          );
+          write(
+            err,
+            "Error: could not write the disclosure content file: " +
             `${renderUntrusted(message)}\n` +
             (removed
               ? "The partially written file was removed, no content was printed, and the disclosure was not completed.\n"
               : "The partially written file could NOT be removed. It remains at " +
-                `${renderUntrusted(contentFilePath)} and may contain unattributed plaintext; ` +
-                "remove it manually. The disclosure was not completed and no content was printed.\n"),
-        );
-        return 1;
-      }
-      // One write, after the file exists: the receipt the operator sees always
-      // names a file that is really there.
-      try {
-        await writeAwaitingCompletion(out, receipt);
-      } catch {
-        // ROLLBACK INVARIANT: no disclosure file may outlive a run whose
-        // receipt never named it; the operator either gets both or neither. A
-        // receipt that failed to reach the terminal leaves a plaintext file on
-        // disk the operator does not know exists, so the file is removed and
-        // the failure is reported on stderr with its own exit status, distinct
-        // from the unlock-failure (1) and usage (2) paths, so a wrapper can
-        // tell "re-run" from "wrong credentials".
-        let removed = true;
-        try {
-          await unlink(contentFilePath);
-        } catch {
-          removed = false;
+              `${renderUntrusted(contentFilePath)} and may contain unattributed plaintext; ` +
+              "remove it manually. The disclosure was not completed and no content was printed.\n"),
+          );
+          return 1;
         }
-        // THE TWO OUTCOMES ARE REPORTED DIFFERENTLY, and that is the point. A
-        // swallowed unlink failure under a message saying the file "was
-        // removed" tells the operator the opposite of the truth about a
-        // plaintext file on their disk, and it is the one case where they
-        // must act. When the removal fails the path is named (escaped, like
-        // every other path this command prints) and the message says so.
-        // The rollback outcome is part of the durable record, not only of the
-        // message: "the plaintext may still be there, at this path" is the one
-        // fact an operator reading the log later has to be able to find.
-        await auditDelivery(
-          removed
-            ? "receipt_undelivered_file_removed"
-            : "receipt_undelivered_file_may_remain",
-          "failure",
-          { content_file: contentFilePath },
-        );
-        write(
-          err,
-          removed
-            ? "Error: the receipt could not be delivered; the disclosure file was removed; re-run the command.\n"
-            : "Error: the receipt could not be delivered and the disclosure file could NOT be removed. " +
-                `It remains at ${renderUntrusted(contentFilePath)} and contains unattributed plaintext; ` +
-                "remove it manually, then re-run the command.\n",
-        );
-        return 3;
+        // One write, after the file exists: the receipt the operator sees always
+        // names a file that is really there.
+        try {
+          await writeAwaitingCompletion(out, receipt);
+        } catch {
+          // ROLLBACK INVARIANT: no disclosure file may outlive a run whose
+          // receipt never named it; the operator either gets both or neither. A
+          // receipt that failed to reach the terminal leaves a plaintext file on
+          // disk the operator does not know exists, so the file is removed and
+          // the failure is reported on stderr with its own exit status, distinct
+          // from the unlock-failure (1) and usage (2) paths, so a wrapper can
+          // tell "re-run" from "wrong credentials".
+          let removed = true;
+          try {
+            await unlink(contentFilePath);
+          } catch {
+            removed = false;
+          }
+          // THE TWO OUTCOMES ARE REPORTED DIFFERENTLY, and that is the point. A
+          // swallowed unlink failure under a message saying the file "was
+          // removed" tells the operator the opposite of the truth about a
+          // plaintext file on their disk, and it is the one case where they
+          // must act. When the removal fails the path is named (escaped, like
+          // every other path this command prints) and the message says so.
+          // The rollback outcome is part of the durable record, not only of the
+          // message: "the plaintext may still be there, at this path" is the one
+          // fact an operator reading the log later has to be able to find.
+          await auditDelivery(
+            removed
+              ? "receipt_undelivered_file_removed"
+              : "receipt_undelivered_file_may_remain",
+            "failure",
+            { content_file: contentFilePath },
+          );
+          write(
+            err,
+            removed
+              ? "Error: the receipt could not be delivered; the disclosure file was removed; re-run the command.\n"
+              : "Error: the receipt could not be delivered and the disclosure file could NOT be removed. " +
+              `It remains at ${renderUntrusted(contentFilePath)} and contains unattributed plaintext; ` +
+              "remove it manually, then re-run the command.\n",
+          );
+          return 3;
+        }
+        await auditDelivery("delivered", "success", {
+          content_file: contentFilePath,
+        });
       }
-      await auditDelivery("delivered", "success", {
-        content_file: contentFilePath,
-      });
-    }
-    await auditLog.flush().catch(() => undefined);
-    return 0;
+      await auditLog.flush().catch(() => undefined);
+      return 0;
+
+    }, async () => {
+      // Delivery auditing is best effort; custody release remains outside this catch.
+      try { await sessionAuditLog?.flush(); } catch { /* audit best-effort */ }
+    });
   } catch {
     write(err, "Error: could not open or unlock the fortress.\n");
     return 1;
   } finally {
     identityEncKey?.fill(0);
-    masterKey?.fill(0);
   }
 }

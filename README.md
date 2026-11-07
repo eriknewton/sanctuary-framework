@@ -136,20 +136,20 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 npm install -g @sanctuary-framework/mcp-server
 ```
 
-The current opt-in preview is **v1.9.0-rc.3** on npm's `next` channel. Default
-installs still resolve to v1.8.4, and rc.3 states no capability beyond the
+The current opt-in preview is **v1.9.0-rc.4** on npm's `next` channel. Default
+installs still resolve to v1.8.4, and rc.4 states no capability beyond the
 bounded rows of the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
 ```bash
-npm install -g @sanctuary-framework/mcp-server@1.9.0-rc.3
+npm install -g @sanctuary-framework/mcp-server@1.9.0-rc.4
 # or run the guided installer without a global install
-npx -y @sanctuary-framework/mcp-server@1.9.0-rc.3 protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server@1.9.0-rc.4 protect --claude-code --no-open --no-dashboard
 ```
 
 No signed macOS app is attached for this preview yet. Castle Wall `enable`
 requires an app built from the same commit as the CLI, so macOS wall testing of
-rc.3 waits for `Sanctuary-CastleWall.app.zip` on the
-[v1.9.0-rc.3 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.9.0-rc.3),
+rc.4 waits for `Sanctuary-CastleWall.app.zip` on the
+[v1.9.0-rc.4 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.9.0-rc.4),
 whose SHA-256 will be recorded here once verified. The v1.8.4 app above pairs
 only with the v1.8.4 CLI.
 See the [1.9.0 release notes](docs/releases/v1.9.0.md) for what changed since 1.8.4.
