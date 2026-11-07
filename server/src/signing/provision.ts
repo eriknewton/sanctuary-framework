@@ -19,13 +19,27 @@ export function validateCustodyProfile(envelope: CustodyEnvelope): void {
 export function enrollmentKeyAvailable(publicKey: string, roster: readonly RolePin[], operatorKeys: readonly string[]): boolean {
   return !roster.some(pin => pin.public_key === publicKey) && !operatorKeys.includes(publicKey);
 }
+// Must match binding-store.ts: authenticated bindings establish role authority, and distinct store masters remain a supervisor obligation.
 /** Prepare encrypted material only; this does not establish freshness, attendance or durable enrollment. */
 export function prepareRoleIdentity(role: SigningRole, epoch: number, machineId: string, identityKey: Uint8Array,
   roster: readonly RolePin[], operatorKeys: readonly string[]) {
   if (!/^[a-f0-9]{32}$/.test(machineId) || !Number.isSafeInteger(epoch) || epoch < 1 || roster.filter(pin => pin.role === role).length >= SIGNER_EPOCHS_MAX) return refuse();
-  const {storedIdentity} = createIdentity("k1-role:" + role, identityKey, "passphrase");
-  if (!enrollmentKeyAvailable(storedIdentity.public_key, roster, operatorKeys)) return refuse();
-  const pin: RolePin = Object.freeze({role, epoch, machine_id: machineId, identity_id: storedIdentity.identity_id,
-    public_key: storedIdentity.public_key, kid: roleKid(role, epoch, storedIdentity.public_key)});
-  return {storedIdentity, pin};
+  const ownedKey = new Uint8Array(identityKey);
+  let storedIdentity: ReturnType<typeof createIdentity>["storedIdentity"] | undefined;
+  let returned = false;
+  try {
+    ({storedIdentity} = createIdentity("k1-role:" + role, ownedKey, "passphrase"));
+    if (!enrollmentKeyAvailable(storedIdentity.public_key, roster, operatorKeys)) return refuse();
+    const pin: RolePin = Object.freeze({role, epoch, machine_id: machineId, identity_id: storedIdentity.identity_id,
+      public_key: storedIdentity.public_key, kid: roleKid(role, epoch, storedIdentity.public_key)});
+    returned = true;
+    return {storedIdentity, pin};
+  } finally {
+    // Preparation never retains its owned key copy, and failed candidates release their encrypted seed references.
+    ownedKey.fill(0);
+    if (!returned && storedIdentity) {
+      storedIdentity.encrypted_private_key.ct = "";
+      storedIdentity.encrypted_private_key.iv = "";
+    }
+  }
 }

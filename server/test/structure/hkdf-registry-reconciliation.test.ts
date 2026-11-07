@@ -176,7 +176,7 @@ describe("HKDF label registry reconciliation", () => {
     expect(scanned.size).toBeGreaterThan(40);
     expect(classified.size).toBeGreaterThan(60);
     expect(classification.labels.find(row => row.label === "producer-custody-binding-v1")).toMatchObject({
-      class: "decryptable-store", fixture: false, fixture_via: "producer-custody-binding.test.ts",
+      class: "decryptable-store", fixture: true, fixture_via: "producer-custody-binding.test.ts",
     });
   });
 

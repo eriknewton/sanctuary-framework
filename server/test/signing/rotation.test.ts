@@ -25,3 +25,21 @@ describe("dual role rotation candidate",()=>{
     }finally{a.close();b.close();oldKey.fill(0);newKey.fill(0);}
   });
 });
+
+import {roleKid} from "../../src/signing/contract.js";
+it.each(["skipped epoch", "reused key"])("refuses rotation with %s", kind => {
+  const key = randomBytes(32), nextKey = randomBytes(32);
+  const old = prepareRoleIdentity(ROLE_REGISTRY[0].role, 1, "a".repeat(32), key, [], []);
+  const next = kind === "reused key" ? {...old, pin: {...old.pin, epoch: 2,
+    kid: roleKid(old.pin.role, 2, old.pin.public_key)}} :
+    prepareRoleIdentity(old.pin.role, 5, old.pin.machine_id, nextKey, [old.pin], []);
+  const a = new EncryptedIdentityProvider(old.storedIdentity, key, old.pin);
+  const b = new EncryptedIdentityProvider(next.storedIdentity, kind === "reused key" ? key : nextKey, next.pin);
+  try {
+    const body: RotationBody = {v: 1, signature_scheme: CUSTODY_SIGNATURE_SCHEME, role: old.pin.role,
+      machine_id: old.pin.machine_id, old_epoch: 1, new_epoch: next.pin.epoch, old_kid: old.pin.kid, new_kid: next.pin.kid,
+      old_descriptor_digest: "sha256:" + "a".repeat(64), new_descriptor_digest: "sha256:" + "b".repeat(64),
+      old_terminal_sequence: 1, old_terminal_commitment: "GENESIS", transaction_id: "c".repeat(32), reason: "fixture"};
+    expect(() => prepareRotation(body, old.pin, next.pin, a, b)).toThrow("K1_REFUSED");
+  } finally { a.close(); b.close(); key.fill(0); nextKey.fill(0); }
+});

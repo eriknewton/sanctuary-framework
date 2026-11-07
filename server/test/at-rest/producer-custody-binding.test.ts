@@ -1,4 +1,4 @@
-import {describe,it,expect} from "vitest";
+import {describe,it,expect,vi} from "vitest";
 import {gcm} from "@noble/ciphers/aes.js";
 import {randomBytes} from "node:crypto";
 import {mkdtemp,writeFile,readFile,unlink,rmdir} from "node:fs/promises";
@@ -43,4 +43,33 @@ describe("producer custody binding codec",()=>{
       expect(decryptBinding(encrypted,master,context)).toEqual(binding);
     }finally{master.fill(0);}
   });
+});
+
+it("refuses authenticated but noncanonical binding plaintext", () => {
+  const master = randomBytes(32), key = derivePurposeKey(master, "producer-custody-binding-v1");
+  try {
+    const aad = Buffer.concat([Buffer.from(PRODUCER_CUSTODY_BINDING_AAD), canonicalBytes(context)]);
+    const payload = encrypt(Buffer.from(JSON.stringify(binding)), key, aad);
+    expect(() => decryptBinding(payload, master, context)).toThrow("K1_REFUSED");
+  } finally { key.fill(0); master.fill(0); }
+});
+
+import {BINDING_FIXTURE_CONTEXT, BINDING_FIXTURE_PLAINTEXT, BINDING_FIXTURE_CIPHERTEXT, FIXTURE_MASTER_KEY, FIXTURE_STORES} from "../fixtures/at-rest/fixture-stores.js";
+import * as random from "../../src/core/random.js";
+it("decrypts committed binding bytes and re-encodes the identical envelope", () => {
+  // Must match the embedded committed ciphertext in fixture-stores.ts and its shared harness registration.
+  expect(FIXTURE_STORES.find(row => row.label === "producer-custody-binding-v1")?.committed?.().payload).toEqual(BINDING_FIXTURE_CIPHERTEXT);
+  const plain = decryptBinding(BINDING_FIXTURE_CIPHERTEXT, FIXTURE_MASTER_KEY, BINDING_FIXTURE_CONTEXT);
+  expect(plain).toEqual(BINDING_FIXTURE_PLAINTEXT);
+  const iv = vi.spyOn(random, "generateIV").mockImplementation(() => Buffer.from(BINDING_FIXTURE_CIPHERTEXT.iv, "base64url"));
+  vi.useFakeTimers(); vi.setSystemTime(new Date(BINDING_FIXTURE_CIPHERTEXT.ts));
+  try { expect(encryptBinding(plain, FIXTURE_MASTER_KEY, BINDING_FIXTURE_CONTEXT)).toEqual(BINDING_FIXTURE_CIPHERTEXT); }
+  finally { iv.mockRestore(); vi.useRealTimers(); }
+});
+it("refuses ciphertext authenticated without binding AAD", () => {
+  const master = randomBytes(32), key = derivePurposeKey(master, "producer-custody-binding-v1");
+  try {
+    const payload = encrypt(canonicalBytes(binding), key);
+    expect(() => decryptBinding(payload, master, context)).toThrow("K1_REFUSED");
+  } finally { key.fill(0); master.fill(0); }
 });

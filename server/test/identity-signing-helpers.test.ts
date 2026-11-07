@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ed25519, ED25519_TORSION_SUBGROUP } from "@noble/curves/ed25519";
 import { sha512 } from "@noble/hashes/sha2";
 import { concatBytes } from "@noble/hashes/utils";
@@ -59,7 +59,7 @@ function makeRig() {
     "recovery-key",
     auditLog
   );
-  return { ...l1, masterKey };
+  return { ...l1, masterKey, storage, auditLog };
 }
 
 const auditPayload: AuditEventSigningPayload = {
@@ -365,16 +365,50 @@ describe("K1 operator protocol separation", () => {
     const prepared=prepareRoleIdentity(role,1,"a".repeat(32),key,[],[]);
     const provider=new EncryptedIdentityProvider(prepared.storedIdentity,key,prepared.pin);
     try {
-      const bytes=canonicalBytes({signature_scheme:ROLE_SIGNATURE_SCHEME,role,epoch:1,kid:prepared.pin.kid,identity_id:prepared.pin.identity_id,machine_id:prepared.pin.machine_id,payload:{count:1}});
+      const bytes=canonicalBytes({signature_scheme:ROLE_SIGNATURE_SCHEME,role,record_kind:"record",epoch:1,kid:prepared.pin.kid,identity_id:prepared.pin.identity_id,machine_id:prepared.pin.machine_id,payload:{count:1}});
       const raw=await callTool(rig.tools,"identity_sign",{identity_id:identity.identity_id,payload:toBase64url(bytes)});
       expect(typeof raw.signature).toBe("string");
-      expect(verifyRecord(bytes,raw.signature as string,prepared.pin,z.object({count:safeInteger}).strict())).toBe(false);
+      expect(verifyRecord(bytes,raw.signature as string,prepared.pin,z.object({count:safeInteger}).strict(), "record")).toBe(false);
       const denied=await callTool(rig.tools,"identity_sign",{identity_id:identity.identity_id,payload:toBase64url(recordMessage(role,bytes))});
       expect(denied.signature).toBeUndefined();
       const own=provider.sign(recordMessage(role,bytes));
       expect(identityVerify(recordMessage(role,bytes),own,fromBase64url(raw.public_key as string))).toBe(false);
       await expect(callTool(rig.tools,"identity_sign",{identity_id:prepared.pin.identity_id,payload:toBase64url(bytes)})).rejects.toThrow();
-      await expect(rig.identityManager.save(prepared.storedIdentity)).rejects.toThrow("K1_ROLE_IDENTITY_REFUSED");
+      await expect(callTool(rig.tools,"identity_import",{identity:prepared.storedIdentity})).rejects.toThrow("K1_ROLE_IDENTITY_REFUSED");
     } finally {provider.close();key.fill(0);rig.masterKey.fill(0);}
   });
+});
+
+import {K1_SIGNING_DOMAIN_PREFIXES} from "../src/core/signing-domains.js";
+import {IdentityManager} from "../src/cognitive/tools.js";
+import {createIdentity} from "../src/core/identity.js";
+import {encrypt} from "../src/core/encryption.js";
+it.each(K1_SIGNING_DOMAIN_PREFIXES)("operator signing refuses registered K1 domain %s", async domain => {
+  const rig = makeRig();
+  try {
+    const id = await callTool(rig.tools, "identity_create", {label: "fixture"});
+    const result = await callTool(rig.tools, "identity_sign", {identity_id: id.identity_id, payload: toBase64url(stringToBytes(domain + "{}"))});
+    expect(result.signature).toBeUndefined();
+  } finally { rig.masterKey.fill(0); }
+});
+it("loads a previously stored reserved label as an ordinary identity", async () => {
+  const rig = makeRig(), key = derivePurposeKey(rig.masterKey, "identity-encryption");
+  try {
+    const {storedIdentity} = createIdentity("k1-role:my-persona", key, "passphrase");
+    await rig.storage.write("_identities", storedIdentity.identity_id,
+      stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(storedIdentity)), key))));
+    const manager = new IdentityManager(rig.storage, rig.masterKey);
+    expect(await manager.load()).toEqual({total: 1, loaded: 1, failed: 0});
+    expect(manager.get(storedIdentity.identity_id)?.label).toBe("k1-role:my-persona");
+  } finally { key.fill(0); rig.masterKey.fill(0); }
+});
+it.each(["identity_create", "identity_import"])("refuses reserved labels before any %s audit", async name => {
+  const rig = makeRig(), key = derivePurposeKey(rig.masterKey, "identity-encryption");
+  const audit = vi.spyOn(rig.auditLog, "appendCritical");
+  try {
+    const {storedIdentity} = createIdentity("k1-role:reserved", key, "passphrase");
+    await expect(callTool(rig.tools, name, name === "identity_create" ? {label: storedIdentity.label} : {identity: storedIdentity})).rejects.toThrow("K1_ROLE_IDENTITY_REFUSED");
+    expect(audit).not.toHaveBeenCalled();
+    expect(await rig.storage.list("_identities")).toEqual([]);
+  } finally { audit.mockRestore(); key.fill(0); rig.masterKey.fill(0); }
 });

@@ -1,7 +1,7 @@
 import {describe,it,expect} from "vitest";
 import {ALLOWED_TRANSITIONS,CUSTODY_STATES,transition} from "../../src/signing/lifecycle.js";
 describe("custody lifecycle relation",()=>{
-  it.each(ALLOWED_TRANSITIONS)("$from -> $to: $event",row=>{expect(transition(row.from,row.event)).toBe(row.to);});
+  it.each(ALLOWED_TRANSITIONS)("$from -> $to: $event",row=>{expect(transition(row.from,row.event,row.guard)).toBe(row.to);});
   it("default denies the complete unlisted state/event complement",()=>{
     const states=[...CUSTODY_STATES,"LOCKED at boot","UNKNOWN"];
     const events=[...ALLOWED_TRANSITIONS.map(row=>row.event),"UNLISTED"];
@@ -13,6 +13,11 @@ describe("custody lifecycle relation",()=>{
   });
   it("retired has no signing exit and recovery never unlocks directly",()=>{
     expect(ALLOWED_TRANSITIONS.filter(row=>row.from==="RETIRED").map(row=>row.to)).toEqual(["RETIRED"]);
-    expect(ALLOWED_TRANSITIONS.filter(row=>row.from==="RECOVERING").every(row=>!row.to.includes("directly UNLOCKED")||row.to==="LOCKED, never directly UNLOCKED")).toBe(true);
+    expect(ALLOWED_TRANSITIONS.filter(row=>row.from==="RECOVERING").every(row=>row.to!==("UNLOCKED" as string))).toBe(true);
   });
+});
+
+it("returns only named states with explicit conditional guards", () => {
+  for (const row of ALLOWED_TRANSITIONS) expect(CUSTODY_STATES).toContain(row.to);
+  expect(ALLOWED_TRANSITIONS.filter(row => row.from === "WIPED")).toHaveLength(2);
 });

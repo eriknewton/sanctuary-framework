@@ -4,6 +4,7 @@ import { derivePurposeKey } from "../core/key-derivation.js";
 import { parseStrict } from "../smb/parse-strict.js";
 import { canonicalBytes, decodeCanonical, refuse, safeInteger, ROLE_REGISTRY, PRODUCER_CUSTODY_BINDING_AAD, PRODUCER_CUSTODY_BINDING_PURPOSE, type SigningRole } from "./contract.js";
 
+// Must match provision.ts: role identity comes from the authenticated binding fields, never an identity label.
 export interface BindingContext { fortress_id: string; machine_id: string; role: SigningRole; }
 const bindingSchema = z.object({
   identity_id: z.string().regex(/^[a-f0-9]{32}$/), role: z.enum(ROLE_REGISTRY.map(row => row.role) as [SigningRole, ...SigningRole[]]),

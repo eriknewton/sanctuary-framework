@@ -48,3 +48,21 @@ describe("role preparation predicates",()=>{
     } finally {rng.mockRestore();enc?.mockRestore();seed.fill(0);key.fill(0);}
   });
 });
+
+import * as identityModule from "../../src/core/identity.js";
+import * as contractModule from "../../src/signing/contract.js";
+it.each(["throw", "reuse"])("clears owned preparation material on %s", kind => {
+  const key = randomBytes(32);
+  const prepared = createIdentity("fixture", key, "passphrase");
+  let owned: Uint8Array | undefined;
+  const create = vi.spyOn(identityModule, "createIdentity").mockImplementation((_label, input) => { owned = input; return prepared; });
+  const kid = kind === "throw" ? vi.spyOn(contractModule, "roleKid").mockImplementation(() => { throw new Error("injected"); }) : undefined;
+  try {
+    expect(() => prepareRoleIdentity(ROLE_REGISTRY[0].role, 1, "a".repeat(32), key, [],
+      kind === "reuse" ? [prepared.storedIdentity.public_key] : [])).toThrow();
+    expect(owned).not.toBe(key);
+    expect(owned?.every(byte => byte === 0)).toBe(true);
+    expect(prepared.storedIdentity.encrypted_private_key.ct).toBe("");
+    expect(key.some(byte => byte !== 0)).toBe(true);
+  } finally { create.mockRestore(); kid?.mockRestore(); key.fill(0); }
+});

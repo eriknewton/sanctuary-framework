@@ -24,17 +24,35 @@ describe("Linux business contract fixtures",()=>{
     const key=randomBytes(32);const prepared=prepareRoleIdentity(ROLE_REGISTRY[0].role,1,"a".repeat(32),key,[],[]);
     const provider=new EncryptedIdentityProvider(prepared.storedIdentity,key,prepared.pin);
     const outer={machine_id:prepared.pin.machine_id,boot_id:"d".repeat(32),activation_id:header.activation_id,lease_id:header.lease_id,generation:1,sequence:1,prior_commitment:"GENESIS",captured_at_unix_ms:1,captured_at_boottime_ns:"1"};
-    const body={...outer,signature_scheme:ROLE_SIGNATURE_SCHEME,role:prepared.pin.role,epoch:1,kid:prepared.pin.kid,identity_id:prepared.pin.identity_id,
+    const body={...outer,signature_scheme:ROLE_SIGNATURE_SCHEME,role:prepared.pin.role,record_kind:"append",epoch:1,kid:prepared.pin.kid,identity_id:prepared.pin.identity_id,
       policy_digest:"sha256:"+"a".repeat(64),runtime_digest:"sha256:"+"b".repeat(64),config_digest:"sha256:"+"c".repeat(64),payload:{count:1}};
     const schema=z.object({count:safeInteger}).strict();const bytes=canonicalBytes(body);
     try{
-      const signature=createRecordSigner({...prepared.pin,...outer},provider,schema).signRecord({role:prepared.pin.role,epoch:1,preimage_bytes:bytes}).signature;
+      const signature=createRecordSigner({...prepared.pin,...outer},provider,schema,"append").signRecord({role:prepared.pin.role,epoch:1,preimage_bytes:bytes}).signature;
       const sign=vi.spyOn(provider,"sign");
-      expect(verifyIndexedRecord(bytes,signature,prepared.pin,outer,schema)).toBe(true);
-      provider.close();expect(verifyIndexedRecord(bytes,signature,prepared.pin,outer,schema)).toBe(true);
-      for(const field of Object.keys(outer) as (keyof typeof outer)[])expect(verifyIndexedRecord(bytes,signature,prepared.pin,{...outer,[field]:typeof outer[field]==="number"?2:"different"},schema)).toBe(false);
-      expect(verifyIndexedRecord(bytes,signature,{...prepared.pin,role:ROLE_REGISTRY[2].role},outer,schema)).toBe(false);
+      expect(verifyIndexedRecord(bytes,signature,prepared.pin,outer,schema,"append")).toBe(true);
+      provider.close();expect(verifyIndexedRecord(bytes,signature,prepared.pin,outer,schema,"append")).toBe(true);
+      for(const field of Object.keys(outer) as (keyof typeof outer)[])expect(verifyIndexedRecord(bytes,signature,prepared.pin,{...outer,[field]:typeof outer[field]==="number"?2:"different"},schema,"append")).toBe(false);
+      expect(verifyIndexedRecord(bytes,signature,{...prepared.pin,role:ROLE_REGISTRY[2].role},outer,schema,"append")).toBe(false);
       expect(sign).not.toHaveBeenCalled();
     }finally{provider.close();key.fill(0);}
   });
+});
+import {verifyRecord} from "../../src/signing/strict-verifier.js";
+it("refuses a correctly signed retrospective record as live indexed evidence", () => {
+  const key = randomBytes(32);
+  const prepared = prepareRoleIdentity(ROLE_REGISTRY[2].role, 1, "a".repeat(32), key, [], []);
+  const provider = new EncryptedIdentityProvider(prepared.storedIdentity, key, prepared.pin);
+  const outer = {machine_id: prepared.pin.machine_id, boot_id: "d".repeat(32), activation_id: header.activation_id,
+    lease_id: header.lease_id, generation: 1, sequence: 1, prior_commitment: "GENESIS", captured_at_unix_ms: 1, captured_at_boottime_ns: "1"};
+  const bytes = canonicalBytes({...outer, signature_scheme: ROLE_SIGNATURE_SCHEME, role: prepared.pin.role, record_kind: "retrospective",
+    epoch: 1, kid: prepared.pin.kid, identity_id: prepared.pin.identity_id, policy_digest: "sha256:" + "a".repeat(64),
+    runtime_digest: "sha256:" + "b".repeat(64), config_digest: "sha256:" + "c".repeat(64), payload: {signed_at_append: false}});
+  const schema = z.object({signed_at_append: z.literal(false)}).strict();
+  try {
+    const {signature} = createRecordSigner({...prepared.pin, ...outer}, provider, schema, "retrospective")
+      .signRecord({role: prepared.pin.role, epoch: 1, preimage_bytes: bytes});
+    expect(verifyRecord(bytes, signature, prepared.pin, schema, "retrospective")).toBe(true);
+    expect(verifyIndexedRecord(bytes, signature, prepared.pin, outer, schema, "retrospective")).toBe(false);
+  } finally { provider.close(); key.fill(0); }
 });

@@ -3,51 +3,80 @@ import { z } from "zod";
 import { jcs } from "../smb/jcs.js";
 import { parseStrict } from "../smb/parse-strict.js";
 
+// Must match identity-provider.ts: its allowlist selects one role domain and the three lifecycle domains.
 // Contract pin: core/signing-domains.ts refuses this entire role set and the lifecycle domains below.
 // Contract pin: scripts/generate-record-signer-contract.mjs emits this entire registry into business_profile/signer_contract.rs.
 export const ROLE_REGISTRY = [
   {
     "role": "extension:linux-business-producer-v0",
     "domain": "sanctuary.linux-business.record.v0\n",
-    "envelope_max_bytes": 4096
+    "envelope_max_bytes": 4096,
+    "record_kinds": [
+      "append",
+      "control",
+      "counter",
+      "terminal"
+    ]
   },
   {
     "role": "extension:linux-business-policy-v0",
     "domain": "sanctuary.linux-business.policy.v0\n",
-    "envelope_max_bytes": 4096
+    "envelope_max_bytes": 4096,
+    "record_kinds": [
+      "policy"
+    ]
   },
   {
     "role": "extension:linux-business-retrospective-v0",
     "domain": "sanctuary.linux-business.retrospective.v0\n",
-    "envelope_max_bytes": 4096
+    "envelope_max_bytes": 4096,
+    "record_kinds": [
+      "retrospective"
+    ]
   },
   {
     "role": "extension:model-recorder-v0",
     "domain": "sanctuary.model-record.v0\n",
-    "envelope_max_bytes": 8192
+    "envelope_max_bytes": 8192,
+    "record_kinds": [
+      "record"
+    ]
   },
   {
     "role": "extension:model-policy-v0",
     "domain": "sanctuary.model-policy.v0\n",
-    "envelope_max_bytes": 8192
+    "envelope_max_bytes": 8192,
+    "record_kinds": [
+      "policy"
+    ]
   },
   {
     "role": "extension:model-session-v0",
     "domain": "sanctuary.model-session.v0\n",
-    "envelope_max_bytes": 8192
+    "envelope_max_bytes": 8192,
+    "record_kinds": [
+      "session"
+    ]
   },
   {
     "role": "extension:model-extent-v0",
     "domain": "sanctuary.model-extent.v0\n",
-    "envelope_max_bytes": 65536
+    "envelope_max_bytes": 65536,
+    "record_kinds": [
+      "extent"
+    ]
   },
   {
     "role": "evidence-pack:manifest-v0",
     "domain": "sanctuary.evidence-pack.manifest.k1.v1\n",
-    "envelope_max_bytes": 65536
+    "envelope_max_bytes": 65536,
+    "record_kinds": [
+      "manifest"
+    ]
   }
 ] as const;
-ROLE_REGISTRY.forEach(entry => Object.freeze(entry));
+// Immutable kind arrays prevent callers from expanding the registered signing authority.
+ROLE_REGISTRY.forEach(entry => { Object.freeze(entry.record_kinds); Object.freeze(entry); });
 Object.freeze(ROLE_REGISTRY);
 export type SigningRole = typeof ROLE_REGISTRY[number]["role"];
 export const ROLE_SIGNATURE_SCHEME = "ed25519-k1-role-v1";
@@ -69,7 +98,11 @@ export const H_LEASE_REQUEST_SECONDS = 240;
 export const MAC_K1_REQUEST_TIMEOUT_MS = 180000;
 export const SIGNER_PREIMAGE_MAX_BYTES = 65536;
 export const SIGNER_HEADER_MAX_BYTES = 1024;
-export const SIGNER_FRAME_MAX_BYTES = 66564;
+// Four length bytes plus the maximum header and preimage form the complete frame.
+export const SIGNER_FRAME_MAX_BYTES = SIGNER_HEADER_MAX_BYTES + SIGNER_PREIMAGE_MAX_BYTES + 4;
+// A domain is at most 128 bytes, in addition to the bounded preimage.
+export const SIGNER_DOMAIN_MAX_BYTES = 128;
+export const SIGNER_MESSAGE_MAX_BYTES = SIGNER_PREIMAGE_MAX_BYTES + SIGNER_DOMAIN_MAX_BYTES;
 export const SIGNER_CONNECTIONS_MAX = 4;
 export const SIGNER_ACTIVE_MAX = 1;
 export const SIGNER_QUEUE_MAX = 0;
@@ -102,6 +135,7 @@ export function decodeCanonical(value: string, length?: number): Uint8Array {
   if (bytes.toString("base64url") !== value || (length !== undefined && bytes.length !== length)) return refuse();
   return bytes;
 }
+// Must match role_kid in castle-wall-daemon/src/business_profile/mod.rs, including canonical key ordering.
 export function roleKid(role: SigningRole, epoch: number, publicKey: string): string {
   roleEntry(role);
   if (!Number.isSafeInteger(epoch) || epoch < 1) return refuse();
@@ -113,7 +147,7 @@ const hexId = z.string().regex(/^[a-f0-9]{32}$/);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const u64 = z.string().regex(/^(0|[1-9][0-9]*)$/).refine(value => BigInt(value) <= 18446744073709551615n);
 // Contract pin: generated Rust COMMON_FIELDS and LINUX_FIELDS are checked as whole sets.
-export const COMMON_FIELDS = ["signature_scheme", "role", "epoch", "kid", "identity_id", "machine_id", "payload"] as const;
+export const COMMON_FIELDS = ["signature_scheme", "role", "record_kind", "epoch", "kid", "identity_id", "machine_id", "payload"] as const;
 export const LINUX_FIELDS = ["boot_id", "activation_id", "lease_id", "generation", "sequence", "prior_commitment", "captured_at_unix_ms", "captured_at_boottime_ns", "policy_digest", "runtime_digest", "config_digest"] as const;
 const commonShape = {
   signature_scheme: z.literal(ROLE_SIGNATURE_SCHEME), role: z.enum(ROLE_REGISTRY.map(entry => entry.role) as [SigningRole, ...SigningRole[]]),
@@ -125,12 +159,15 @@ const linuxShape = {
   captured_at_unix_ms: safeInteger, captured_at_boottime_ns: u64,
   policy_digest: digest, runtime_digest: digest, config_digest: digest,
 };
+// Must match the expected kind passed by record-signer.ts, strict-verifier.ts and linux-business/producer-custody.ts.
 /** Trusted adapters supply a closed payload schema; no payload schema arrives in a signing request. */
-export function recordSchema(role: SigningRole, payloadSchema: z.ZodType) {
-  return z.object({ ...commonShape, ...(role.startsWith("extension:linux-business-") ? linuxShape : {}), payload: payloadSchema }).strict();
+export function recordSchema(role: SigningRole, payloadSchema: z.ZodType, recordKind: string) {
+  // The trusted adapter selects a registered signed kind, so overlapping payload schemas cannot substitute records.
+  if (!(roleEntry(role).record_kinds as readonly string[]).includes(recordKind)) return refuse();
+  return z.object({ ...commonShape, record_kind: z.literal(recordKind), ...(role.startsWith("extension:linux-business-") ? linuxShape : {}), payload: payloadSchema }).strict();
 }
 export type RecordBody = z.infer<ReturnType<typeof recordSchema>>;
-export function parseRecord(bytes: Uint8Array, role: SigningRole, payloadSchema: z.ZodType): RecordBody {
+export function parseRecord(bytes: Uint8Array, role: SigningRole, payloadSchema: z.ZodType, recordKind: string): RecordBody {
   try {
     const value = parseStrict(bytes, SIGNER_PREIMAGE_MAX_BYTES);
     const integersOnly = (item: unknown): boolean => {
@@ -140,7 +177,7 @@ export function parseRecord(bytes: Uint8Array, role: SigningRole, payloadSchema:
       return true;
     };
     if (!integersOnly(value)) return refuse();
-    const parsed = recordSchema(role, payloadSchema).parse(value);
+    const parsed = recordSchema(role, payloadSchema, recordKind).parse(value);
     if (parsed.role !== role || !Buffer.from(canonicalBytes(parsed)).equals(Buffer.from(bytes))) return refuse();
     return parsed;
   } catch { return refuse(); }
@@ -151,8 +188,9 @@ export function recordMessage(role: SigningRole, preimage: Uint8Array): Uint8Arr
 export function checkEnvelopeSize(role: SigningRole, body: RecordBody, preimage: Uint8Array): void {
   const entry = roleEntry(role);
   const domainSize = Buffer.byteLength(entry.domain);
+  // Unpadded base64url of a 64-byte Ed25519 signature has ceil(64 * 8 / 6) = 86 characters.
   const completeEnvelope = role.startsWith("extension:linux-business-")
     ? {body, signature: "A".repeat(86)} : {...body, signature: "A".repeat(86)};
-  if (domainSize > 128 || domainSize + preimage.length > 65664 ||
+  if (domainSize > SIGNER_DOMAIN_MAX_BYTES || domainSize + preimage.length > SIGNER_MESSAGE_MAX_BYTES ||
       canonicalBytes(completeEnvelope).length > entry.envelope_max_bytes) refuse();
 }

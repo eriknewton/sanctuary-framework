@@ -1,6 +1,5 @@
 export * from "./contract.js";
 export * from "./record-signer.js";
-export * from "./identity-provider.js";
 export * from "./strict-verifier.js";
 export * from "./binding-store.js";
 export * from "./provision.js";

@@ -11,7 +11,10 @@ describe("isolated K1 boundaries",()=>{
     expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-record-signer-contract.mjs"),"--check"])).not.toThrow();
     const rust=readFileSync(join(root,"castle-wall-daemon/src/business_profile/signer_contract.rs"),"utf8");
     const rows=[...rust.matchAll(/\("([^"]+)", "([^"]+)", (\d+)\)/g)].map(match=>({role:match[1],domain:JSON.parse('"'+match[2]+'"'),envelope_max_bytes:Number(match[3])}));
-    expect(rows).toEqual(ROLE_REGISTRY);
+    expect(ROLE_REGISTRY.every(row => Object.isFrozen(row.record_kinds))).toBe(true);
+    expect(rows).toEqual(ROLE_REGISTRY.map(({role,domain,envelope_max_bytes})=>({role,domain,envelope_max_bytes})));
+    const kinds=[...rust.matchAll(/\("([^\"]+)", &\[([^\]]+)\]\)/g)].map(match=>({role:match[1],record_kinds:JSON.parse("["+match[2]+"]")}));
+    expect(kinds).toEqual(ROLE_REGISTRY.map(({role,record_kinds})=>({role,record_kinds})));
     for(const name of ["COMMON_FIELDS","LINUX_FIELDS"]){const found=rust.match(new RegExp('pub const '+name+': &\\[&str\\] = &('+'\\[[^;]+\\]'+');'));
       expect(found).not.toBeNull();expect(JSON.parse(found![1])).toEqual(name==="COMMON_FIELDS"?COMMON_FIELDS:LINUX_FIELDS);}
   });
@@ -27,4 +30,39 @@ describe("isolated K1 boundaries",()=>{
     for(const path of ["castle-wall-daemon/src/main.rs","castle-wall-daemon/src/daemon.rs"]){expect(readFileSync(join(root,path),"utf8")).not.toContain("business_profile");}
     const tsup=readFileSync(join(root,"server/tsup.config.ts"),"utf8");expect(tsup).not.toContain("signing/");
   });
+});
+
+import * as runtimeContract from "../../src/signing/contract.js";
+import * as signingBarrel from "../../src/signing/index.js";
+it("keeps the raw provider private to its implementation module", () => {
+  expect(signingBarrel).not.toHaveProperty("EncryptedIdentityProvider");
+  const sourceRoot = join(root, "server/src");
+  const importers = readdirSync(sourceRoot, {recursive: true}).filter((name): name is string => typeof name === "string" && name.endsWith(".ts"))
+    .filter(name => /from\s+["'][^"']*identity-provider\.js["']/.test(readFileSync(join(sourceRoot, name), "utf8")));
+  expect(importers.filter(name => !["signing/record-signer.ts", "signing/rotation.ts", "signing/lifecycle.ts"].includes(name))).toEqual([]);
+});
+it("keeps the pure contract portable and agent launch Linux only", () => {
+  const source = readFileSync(join(root, "castle-wall-daemon/src/lib.rs"), "utf8");
+  expect(source).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*pub mod agent_launch;/);
+  expect(source).not.toMatch(/#\[cfg\(target_os = "linux"\)\]\s*[^;]*pub mod business_profile;/);
+});
+it("pins every evaluated primitive including a derived frame bound", () => {
+  const rust = readFileSync(join(root, "castle-wall-daemon/src/business_profile/signer_contract.rs"), "utf8");
+  const actual = Object.fromEntries([...rust.matchAll(/pub const ([A-Z_0-9]+): (?:&str|usize) = (.*);/g)]
+    .map(([, name, value]) => [name, JSON.parse(value)]));
+  const expected = Object.fromEntries(Object.entries(runtimeContract).filter(([, value]) => typeof value === "string" || typeof value === "number"));
+  expect(actual).toEqual(expected);
+  expect(readFileSync(join(root, "server/src/signing/contract.ts"), "utf8")).toContain("SIGNER_HEADER_MAX_BYTES + SIGNER_PREIMAGE_MAX_BYTES + 4");
+});
+it("uses the shared canonical encoder and crate-local public vectors", () => {
+  const source = readFileSync(join(root, "castle-wall-daemon/src/business_profile/mod.rs"), "utf8");
+  expect(source.split("#[cfg(test)]")[0]).toContain("hash.update(crate::smb::jcs::encode(&body).ok()?.as_bytes());");
+  expect(source).not.toContain("../../../server/");
+});
+
+it("documents the message bound and scalar and signature derivations", () => {
+  const contract = readFileSync(join(root, "server/src/signing/contract.ts"), "utf8");
+  expect(contract).toContain("SIGNER_PREIMAGE_MAX_BYTES + SIGNER_DOMAIN_MAX_BYTES");
+  expect(contract).toContain("ceil(64 * 8 / 6) = 86");
+  expect(readFileSync(join(root, "server/src/signing/strict-verifier.ts"), "utf8")).toContain("2^252 + 27742317777372353535851937790883648493");
 });

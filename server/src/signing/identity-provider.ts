@@ -1,7 +1,7 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { decrypt } from "../core/encryption.js";
 import { generateIdentityId, sign, type StoredIdentity } from "../core/identity.js";
-import { decodeCanonical, refuse, roleKid } from "./contract.js";
+import { decodeCanonical, refuse, roleKid, roleEntry, PRODUCER_ROTATION_DOMAIN, PRODUCER_DESCRIPTOR_DOMAIN, UNLOCK_CHALLENGE_DOMAIN } from "./contract.js";
 import { validateEncryptedPayload } from "./binding-store.js";
 import type { RolePin } from "./strict-verifier.js";
 import type { ExactMessageProvider } from "./record-signer.js";
@@ -11,7 +11,10 @@ export class EncryptedIdentityProvider implements ExactMessageProvider {
   #identity: StoredIdentity;
   #key: Uint8Array;
   #closed = false;
+  #domains: readonly string[];
   constructor(identity: StoredIdentity, encryptionKey: Uint8Array, pin: RolePin) {
+    // Must match the role and lifecycle domains in contract.ts and core/signing-domains.ts.
+    this.#domains = [roleEntry(pin.role).domain, PRODUCER_ROTATION_DOMAIN, PRODUCER_DESCRIPTOR_DOMAIN, UNLOCK_CHALLENGE_DOMAIN];
     this.#identity = structuredClone(identity);
     this.#key = new Uint8Array(encryptionKey);
     let seed: Uint8Array | undefined;
@@ -29,7 +32,8 @@ export class EncryptedIdentityProvider implements ExactMessageProvider {
     } finally { seed?.fill(0); }
   }
   sign(message: Uint8Array): Uint8Array {
-    if (this.#closed) return refuse();
+    // Only this role and its internal lifecycle protocols may use the dedicated key.
+    if (this.#closed || !this.#domains.some(domain => Buffer.from(message).subarray(0, Buffer.byteLength(domain)).equals(Buffer.from(domain)))) return refuse();
     try { return sign(message, this.#identity.encrypted_private_key, this.#key); }
     catch { return refuse(); }
   }
