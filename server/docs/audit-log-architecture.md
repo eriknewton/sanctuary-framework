@@ -323,8 +323,14 @@ Discrepancy recorded: the dispatch framing described a whole-log master-key-wrap
 `StrictDurabilityStorageCapabilities` is an explicit opt-in storage surface.
 `writeStrict`, `writeIfAbsentStrict` and `replaceIfEqualsStrict` require file,
 directory and new-parent barriers and propagate unsupported-directory-sync
-errors. `withStrictNamespaceLock` establishes the parent barriers before binding
-the directory descriptors or Darwin workers. A strict write inside a legacy
+errors surfaced by Node. On Darwin, Node FileHandle.sync uses libuv's F_FULLFSYNC,
+then F_BARRIERFSYNC, then fsync fallback chain, discarding earlier errors. Strict
+means whatever that chain achieved and is not proven. A native F_FULLFSYNC check
+or a drilled bound is a prerequisite before S1b relies on strict durability.
+This bound must match StrictDurabilityStorageCapabilities in storage/interface.ts
+and the strict additions in reorg-surface-manifest.md.
+`withStrictNamespaceLock` establishes barriers on verified held directory handles
+before the operation uses descriptor paths or Darwin workers. A strict write inside a legacy
 namespace binding refuses because that binding did not establish these barriers.
 The read-only guard refuses every strict mutation, including lock acquisition.
 Legacy `writeDurable` and legacy custody writes retain their existing tolerance.

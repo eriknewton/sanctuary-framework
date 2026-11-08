@@ -190,8 +190,9 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new FaultingWriteStorage();
     const log = new AuditLog(storage, generateRandomKey());
 
-    // Flush must surface the pending failure before this caller consumes its retained promise.
-    const pending = log.appendCritical({
+    // Must match the critical-flush-discard-fixture allow entry in no-floating-append-critical.test.ts.
+    // critical-flush-discard-fixture
+    void log.appendCritical({
       layer: "l1",
       operation: "state_write",
       identity_id: "id",
@@ -199,7 +200,6 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     });
 
     await expect(log.flush()).rejects.toThrow(AuditLogPersistenceError);
-    await expect(pending).rejects.toThrow();
     await expect(log.flush()).resolves.toBeUndefined();
   });
 

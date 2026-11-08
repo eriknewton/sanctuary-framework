@@ -419,37 +419,35 @@ async function fsyncDirectoryLegacy(dir: string): Promise<void> {
   }
 }
 
-/** Sync a directory without classifying any sync failure as benign. */
-export async function syncDirectoryStrict(dir: string): Promise<void> {
-  const handle = await open(dir, fsConstants.O_RDONLY);
-  let syncFailure: unknown;
-  let syncFailed = false;
+/** Sync the captured directory only while its pathname still names that inode. */
+export async function syncDirectoryStrict(dir: string, expected?: Stats): Promise<void> {
+  // Descriptor roots name held authority, so the final dot avoids following a symlink at the opened component.
+  const path = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(dir) ? `${dir}/.` : dir;
+  const before = expected ?? await lstat(path);
+  const handle = await openExistingDirectoryNoFollow(path);
+  const failures: unknown[] = [];
   try {
-    // A visible directory entry is not evidence that the filesystem persisted it.
+    // A barrier on a substituted directory cannot establish durability for the published entry.
+    if (!before.isDirectory() || before.isSymbolicLink() || !sameFile(before, await handle.stat())) {
+      throw new Error("strict directory identity changed");
+    }
     await handle.sync();
-  } catch (error) {
-    syncFailure = error;
-    syncFailed = true;
-  }
-  try {
-    await handle.close();
-  } catch (error) {
-    // Cleanup failure must preserve the original sync failure rather than replacing its evidence.
-    if (syncFailed) throw new AggregateError([syncFailure, error], "strict directory sync and close failed", { cause: error });
-    throw error;
-  }
-  if (syncFailed) throw syncFailure;
+    if (!sameFile(before, await lstat(path))) throw new Error("strict directory identity changed");
+  } catch (error) { failures.push(error); }
+  try { await handle.close(); } catch (error) { failures.push(error); }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "strict directory sync and close failed");
 }
 
-/** Create and sync the entire parent chain, including barriers left uncertain by a prior attempt. */
+/** Sync the final directory and each newly created entry with its publishing parent. */
 export async function ensureDirectoryStrict(dir: string, mode: number): Promise<void> {
-  await mkdir(dir, { recursive: true, mode });
+  const firstCreated = await mkdir(dir, { recursive: true, mode });
+  const stop = firstCreated === undefined ? dir : dirname(firstCreated);
   let cursor = dir;
   for (;;) {
-    // Repeating parent barriers prevents a failed earlier mkdir from becoming an unsynced existing parent.
+    // Existing ancestors outside this creation are not part of this write's durability authority.
     await syncDirectoryStrict(cursor);
-    // Descriptor roots and worker cwd already carry parent authority established before binding.
-    if (/^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(cursor) || cursor === ".") break;
+    if (cursor === stop || cursor === "." || /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(cursor)) break;
     const parent = dirname(cursor);
     if (parent === cursor) break;
     cursor = parent;
@@ -785,6 +783,15 @@ export async function writeFileCustody(
   data: string | Uint8Array,
   options: WriteFileCustodyOptions,
 ): Promise<void> {
+  return writeFileCustodyWithDurability(path, data, { ...options, strictDurability: options.strictDurability === true });
+}
+
+// Must match the required strictDurability argument at storage call sites in filesystem.ts and directory-capability-worker.ts.
+export async function writeFileCustodyWithDurability(
+  path: string,
+  data: string | Uint8Array,
+  options: WriteFileCustodyOptions & { strictDurability: boolean },
+): Promise<void> {
   const dir = dirname(path);
   let ownerGuard: NoFollowDirectoryGuard | undefined;
   if (options.owner !== undefined && !options.stableDirectoryCapability) {
@@ -795,6 +802,7 @@ export async function writeFileCustody(
     // already exist as real directories inside ownerBase.
     ownerGuard = await openNoFollowPathWithinBase(dir, options.ownerBase);
   }
+  const failures: unknown[] = [];
   try {
     await withOwnerEffectiveIdentity(options.owner, async (droppedToOwner) => {
       if (options.createParent !== false && options.owner === undefined) {
@@ -805,15 +813,31 @@ export async function writeFileCustody(
           await mkdir(dir, { recursive: true, mode: options.parentMode ?? 0o700 });
         }
       }
+      if (options.strictDurability && ownerGuard) {
+        // Owner writes cannot skip uncertain parent barriers merely because creation is forbidden.
+        await ownerGuard.revalidate();
+        for (const entry of ownerGuard.handles) await entry.handle.sync();
+        await ownerGuard.revalidate();
+      }
       await verifyParentCustody(path, options.parent);
       const tempPath = join(
         dir,
         `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
       );
       let handle;
+      let directoryHandle;
+      let directoryIdentity: Stats | undefined;
       let cleanupTemp = true;
+      const writeFailures: unknown[] = [];
       try {
         await ownerGuard?.revalidate();
+        if (options.strictDurability) {
+          const directoryPath = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(dir) ? `${dir}/.` : dir;
+          directoryIdentity = await lstat(directoryPath);
+          directoryHandle = await openExistingDirectoryNoFollow(directoryPath);
+          // Publication and its barrier must refer to the same captured parent inode.
+          if (!directoryIdentity.isDirectory() || !sameFile(directoryIdentity, await directoryHandle.stat())) throw new Error("strict publication directory changed");
+        }
         handle = await open(
           tempPath,
           fsConstants.O_WRONLY |
@@ -834,22 +858,46 @@ export async function writeFileCustody(
         await options.prepareTemp?.(tempPath);
         await handle.writeFile(data);
         await handle.sync();
-        await handle.close();
+        const completedHandle = handle;
         handle = undefined;
+        await completedHandle.close();
         await ownerGuard?.revalidate();
         await rename(tempPath, path);
         cleanupTemp = false;
-        await (options.strictDurability ? syncDirectoryStrict(dir) : fsyncDirectoryLegacy(dir));
-      } finally {
-        await handle?.close().catch(() => undefined);
+        if (directoryHandle) {
+          // A successful return requires the held publishing directory's barrier and unchanged identity.
+          await directoryHandle.sync();
+          const directoryPath = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(dir) ? `${dir}/.` : dir;
+          if (!sameFile(directoryIdentity!, await lstat(directoryPath))) throw new Error("strict publication directory changed");
+        } else await fsyncDirectoryLegacy(dir);
+      } catch (error) { writeFailures.push(error); }
+      finally {
+        // Deferred close and cleanup errors retain the primary failure as evidence of uncertain durability.
+        try { await handle?.close(); } catch (error) { if (options.strictDurability) writeFailures.push(error); }
         if (cleanupTemp) {
-          await unlink(tempPath).catch(() => undefined);
+          try {
+            await unlink(tempPath);
+            if (options.strictDurability && directoryHandle) await directoryHandle.sync();
+          } catch (error) {
+            if (options.strictDurability && (error as NodeJS.ErrnoException).code !== "ENOENT") writeFailures.push(error);
+          }
         }
+        try { await directoryHandle?.close(); } catch (error) { writeFailures.push(error); }
       }
+      if (writeFailures.length === 1) throw writeFailures[0];
+      if (writeFailures.length > 1) throw new AggregateError(writeFailures, "strict file write and cleanup failed");
     });
-  } finally {
+  } catch (error) { failures.push(error); }
+  finally {
     if (ownerGuard !== undefined) {
-      await ownerGuard.close();
+      if (options.strictDurability) {
+        // Every held owner descriptor contributes close errors without replacing a write failure.
+        for (const entry of ownerGuard.handles) {
+          try { await entry.handle.close(); } catch (error) { failures.push(error); }
+        }
+      } else await ownerGuard.close();
     }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "strict owner write and close failed");
 }

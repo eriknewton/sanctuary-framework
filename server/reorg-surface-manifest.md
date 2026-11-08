@@ -136,12 +136,12 @@ to the frozen surfaces above or to existing callers:
 
 | Additive surface | Classification and bound |
 |---|---|
-| `StrictDurabilityStorageCapabilities` | Explicit opt-in interface; must match its methods in `storage/filesystem.ts` and `storage/read-only-guard.ts`. |
+| `StrictDurabilityStorageCapabilities` | Explicit opt-in interface; must match its methods in `storage/filesystem.ts` and `storage/read-only-guard.ts`. On Darwin, Node FileHandle.sync uses libuv's F_FULLFSYNC, then F_BARRIERFSYNC, then fsync fallback chain, discarding earlier errors; strict means whatever that chain achieved and is not proven. This bound must match `storage/interface.ts` and `docs/audit-log-architecture.md`; a native check or drilled bound is an S1b prerequisite. |
 | `writeStrict` | File, directory and parent barriers; no generic write fallback. |
 | `writeIfAbsentStrict` | Exclusive publication with strict barriers, preserving existing destination bytes. |
 | `replaceIfEqualsStrict` | Serialized comparison and strict replacement, preserving mismatched bytes. |
 | `withStrictNamespaceLock` | Strict parent setup and held directory binding through the existing kernel lock; no retained settlement receipt. |
-| `WriteFileCustodyOptions.strictDurability` | Opt-in strict barriers; omitted means the existing legacy behavior. |
+| `WriteFileCustodyOptions.strictDurability` | Public legacy wrapper retains its optional flag; storage internals call `writeFileCustodyWithDurability` with a required durability choice. |
 | `ensureDirectoryStrict`, `syncDirectoryStrict` | Internal custody helpers with propagating sync errors; no benign-error classification. |
 | Darwin `writeStrict`, `writeIfAbsentStrict`, `replaceIfEqualsStrict`, `writeFileStrict`, `mkdirStrict` requests | Internal worker dispatch; must match the strict dispatch in `storage/filesystem.ts`. |
 

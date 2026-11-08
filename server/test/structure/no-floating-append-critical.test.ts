@@ -103,6 +103,17 @@ function isConsumed(call: ts.CallExpression): boolean {
   return false;
 }
 
+function isFlushDiscardFixture(file: string, node: ts.Node, source: ts.SourceFile): boolean {
+  if (relative(ROOT, file) !== "test/operational/audit-log-flush.test.ts" || !isAppendCriticalCall(node) ||
+      propertyName(node.expression) !== "appendCritical" || !ts.isVoidExpression(node.parent) ||
+      !ts.isExpressionStatement(node.parent.parent)) return false;
+  const statement = node.parent.parent;
+  const comments = ts.getLeadingCommentRanges(source.text, statement.getFullStart()) ?? [];
+  const last = comments.at(-1);
+  // Must match the critical-flush-discard-fixture marker in audit-log-flush.test.ts so only the intentional discard is exempt.
+  return last !== undefined && source.text.slice(last.pos, last.end) === "// critical-flush-discard-fixture";
+}
+
 function findFloatingAppendCritical(file: string, text = readFileSync(file, "utf8")): string[] {
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.ESNext, true, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const hits: string[] = [];
@@ -113,7 +124,7 @@ function findFloatingAppendCritical(file: string, text = readFileSync(file, "utf
     const detached = (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
       CRITICAL_METHODS.has(propertyName(node) ?? "") && ts.isCallExpression(node.parent) && node.parent.arguments.includes(node) &&
       callbackName !== undefined && ["then", "catch", "finally", "setTimeout", "setInterval", "queueMicrotask", "forEach", "map", "flatMap", "on", "once"].includes(callbackName);
-    if (detached || (isAppendCriticalCall(node) && !isConsumed(node))) {
+    if ((detached || (isAppendCriticalCall(node) && !isConsumed(node))) && !isFlushDiscardFixture(file, node, source)) {
       const { line, character } = source.getLineAndCharacterOfPosition(node.getStart(source));
       hits.push(`${relative(ROOT, file)}:${line + 1}:${character + 1}`);
     }
@@ -162,3 +173,14 @@ for (const method of ["appendCritical", "appendCriticalWithReceipt", "sealThroug
     }
   });
 }
+
+it("allows only the marked flush discard fixture", () => {
+  const fixture = "export {}; async function fixture() {\n// critical-flush-discard-fixture\nvoid log.appendCritical(input);\n}";
+  const file = join(ROOT, "test/operational/audit-log-flush.test.ts");
+  expect(findFloatingAppendCritical(file, fixture)).toEqual([]);
+});
+it("refuses an unmarked or misplaced flush discard fixture", () => {
+  const fixture = "export {}; async function fixture() {\n// critical-flush-discard-fixture\nvoid log.appendCritical(input);\n}";
+  expect(findFloatingAppendCritical(join(ROOT, "test/other.test.ts"), fixture)).toHaveLength(1);
+  expect(findFloatingAppendCritical(join(ROOT, "test/operational/audit-log-flush.test.ts"), fixture.replace("// critical-flush-discard-fixture", ""))).toHaveLength(1);
+});

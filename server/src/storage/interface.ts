@@ -175,7 +175,12 @@ export interface NamespaceLockStorageCapabilities {
   ): Promise<T>;
 }
 
-/** Explicit file, directory and newly created parent barriers with no fallback. */
+/**
+ * Explicit file, directory and newly created parent barriers at the Node API boundary.
+ * On Darwin, FileHandle.sync uses libuv's F_FULLFSYNC, then F_BARRIERFSYNC, then fsync fallback chain,
+ * discarding earlier errors; strict means whatever that chain achieved and is not proven.
+ * This bound must match audit-log-architecture.md and reorg-surface-manifest.md before recorder use.
+ */
 export interface StrictDurabilityStorageCapabilities {
   // Must match the strict methods in filesystem.ts and the refusal list in read-only-guard.ts.
   /** Bind strict operations to held directories after syncing every new parent. */
@@ -185,9 +190,9 @@ export interface StrictDurabilityStorageCapabilities {
     operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
     options?: import("./cross-process-lock.js").CrossProcessLockOptions,
   ): Promise<T>;
-  /** Replace exact bytes only after every strict barrier has completed. */
+  /** Resolve only after file, directory and close barriers; rejection can follow visible publication. */
   writeStrict(namespace: string, key: string, data: Uint8Array): Promise<void>;
-  /** Publish exclusively with strict barriers; false proves no destination write. */
+  /** Publish exclusively with strict barriers; false leaves the existing destination unchanged. */
   writeIfAbsentStrict(namespace: string, key: string, data: Uint8Array): Promise<boolean>;
   /** Serialize comparison and strict replacement across processes. */
   replaceIfEqualsStrict(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean>;

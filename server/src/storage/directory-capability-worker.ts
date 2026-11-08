@@ -13,6 +13,7 @@ import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { Writable } from "node:stream";
 import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 
+import { storageNamespacePathComponent } from "./namespace-component.js";
 import { FilesystemStorage } from "./filesystem.js";
 import {
   cleanupFreshInitRecoveryResidue,
@@ -22,7 +23,7 @@ import {
 import { tightenStoragePermissions } from "./permissions.js";
 import { writeRecoveryKeyFile } from "../wrap/recovery-key-disclosure.js";
 import { runProvisionPinAlreadyLocked } from "../cli/castle-wall.js";
-import { readFileCustody, writeFileCustody, syncDirectoryStrict } from "./custody-fs.js";
+import { readFileCustody, writeFileCustodyWithDurability, syncDirectoryStrict } from "./custody-fs.js";
 
 interface Request {
   id: number;
@@ -82,7 +83,7 @@ async function syncCwd(): Promise<void> {
   }
 }
 
-async function mkdirRelative(relativePath: string, mode: number, strictDurability = false): Promise<void> {
+async function mkdirRelative(relativePath: string, mode: number, strictDurability: boolean): Promise<void> {
   if (
     isAbsolute(relativePath) ||
     normalize(relativePath) !== relativePath ||
@@ -116,6 +117,18 @@ async function mkdirRelative(relativePath: string, mode: number, strictDurabilit
   }
 }
 
+function strictWriteTarget(storage: FilesystemStorage, owner: { uid: number; gid: number } | undefined, request: Request): { storage: FilesystemStorage; namespace: string; args: unknown[] } {
+  const parsed = requestNamespaceArg(request);
+  if (request.boundNamespace) return { storage, ...parsed };
+  // Must match the original-buffer authorization before strict worker dispatch in filesystem.ts.
+  // The private IPC executor preserves parent-authorized bytes without reauthorizing a decoded buffer.
+  return {
+    storage: new FilesystemStorage(storageNamespacePathComponent(parsed.namespace), { owner, allowDirectoryCapabilityRootNamespace: true }),
+    namespace: DARWIN_BOUND_NAMESPACE_TOKEN,
+    args: parsed.args,
+  };
+}
+
 async function perform(
   storage: FilesystemStorage,
   owner: { uid: number; gid: number } | undefined,
@@ -133,17 +146,17 @@ async function perform(
     }
     // Must match StrictDurabilityStorageCapabilities in interface.ts and filesystem.ts dispatch.
     case "writeStrict": {
-      const { namespace, args } = requestNamespaceArg(request);
-      await storage.writeStrict(namespace, String(args[0]), bytes(args[1]));
+      const { storage: target, namespace, args } = strictWriteTarget(storage, owner, request);
+      await target.writeStrict(namespace, String(args[0]), bytes(args[1]));
       return null;
     }
     case "writeIfAbsentStrict": {
-      const { namespace, args } = requestNamespaceArg(request);
-      return storage.writeIfAbsentStrict(namespace, String(args[0]), bytes(args[1]));
+      const { storage: target, namespace, args } = strictWriteTarget(storage, owner, request);
+      return target.writeIfAbsentStrict(namespace, String(args[0]), bytes(args[1]));
     }
     case "replaceIfEqualsStrict": {
-      const { namespace, args } = requestNamespaceArg(request);
-      return storage.replaceIfEqualsStrict(namespace, String(args[0]), bytes(args[1]), bytes(args[2]));
+      const { storage: target, namespace, args } = strictWriteTarget(storage, owner, request);
+      return target.replaceIfEqualsStrict(namespace, String(args[0]), bytes(args[1]), bytes(args[2]));
     }
     case "writeDurable": {
       const { namespace, args } = requestNamespaceArg(request);
@@ -197,7 +210,7 @@ async function perform(
       await mkdirRelative(String(a[0]), Number(a[1]), true);
       return null;
     case "mkdir":
-      await mkdirRelative(String(a[0]), Number(a[1]));
+      await mkdirRelative(String(a[0]), Number(a[1]), false);
       return null;
     case "isFreshExceptLockScaffold":
       return isFreshFortressOrExactLockScaffold(".", String(a[0]));
@@ -285,7 +298,7 @@ async function perform(
     }
     case "writeFileStrict":
     case "writeFile":
-      await writeFileCustody(singleFileName(a[0]), bytes(a[1]), {
+      await writeFileCustodyWithDurability(singleFileName(a[0]), bytes(a[1]), {
         mode: a[2] === undefined ? 0o600 : Number(a[2]),
         // Must match writeStableFortressFile in filesystem.ts.
         strictDurability: request.op === "writeFileStrict",
