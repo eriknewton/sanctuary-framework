@@ -60,10 +60,11 @@ import {
 import type {
   FilesystemStorageCapabilities,
   NamespaceLockStorageCapabilities,
+  StrictDurabilityStorageCapabilities,
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
-import { readFileCustody, writeFileCustody } from "./custody-fs.js";
+import { readFileCustody, writeFileCustody, ensureDirectoryStrict, syncDirectoryStrict } from "./custody-fs.js";
 import {
   assertStorageMasterWriteBarrierHeld,
   CrossProcessLockError,
@@ -137,14 +138,17 @@ async function readStableFortressFile(
   }
 }
 
+// Must match writeFileStrict in directory-capability-worker.ts so both held-parent paths preserve strict mode.
 async function writeStableFortressFile(
   root: string,
   name: string,
   data: Uint8Array,
   mode: number,
+  strictDurability = false,
 ): Promise<void> {
   await writeFileCustody(stableFortressFilePath(root, name), data, {
     mode,
+    strictDurability,
     createParent: false,
   });
 }
@@ -406,13 +410,14 @@ interface BoundStorageContext {
   lockedNamespace: string;
   namespaceBasePath?: string;
   darwinNamespaceClient?: DarwinDirectoryCapabilityClient;
+  strictDurability: boolean;
 }
 
 // Must match DARWIN_BOUND_NAMESPACE_TOKEN in directory-capability-worker.ts:
 // this is an internal capability token, not a caller-supplied namespace.
 const DARWIN_BOUND_NAMESPACE_TOKEN = "\0sanctuary-bound-namespace\0";
 
-export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities {
+export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities, StrictDurabilityStorageCapabilities {
   private basePath: string;
   /**
    * Custody mutations run through an inode-bound directory capability captured
@@ -421,6 +426,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * Async-local binding keeps concurrent read-only users of this instance on
    * the ordinary path while the protected callback uses the held inode.
    */
+  private readonly strictDurability = new AsyncLocalStorage<boolean>();
   private readonly boundBasePath = new AsyncLocalStorage<BoundStorageContext>();
   /**
    * Create-with-fchown owner (fortress-ownership spec 2026-07-30): when set,
@@ -532,6 +538,17 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     return this.activeNamespacePath(namespace);
   }
 
+  /** Must match the strict namespace contract in interface.ts and worker dispatch. */
+  async withStrictNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    operation: Parameters<typeof withPathLock<T>>[2],
+    options: Parameters<typeof withPathLock<T>>[3] = {},
+  ): Promise<T> {
+    // Strict directory authority requires the kernel-backed path rather than a pathname-only fallback.
+    return this.strictDurability.run(true, () => this.withNamespaceLock(namespace, lockFileName, operation, { ...options, kernelBacked: true }));
+  }
+
   async withNamespaceLock<T>(
     namespace: string,
     lockFileName: string,
@@ -559,6 +576,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // is delegated to a child whose cwd is that exact inode. A rename or
     // replacement of the lexical fortress root cannot redirect a mutation.
     const namespaceComponent = storageNamespacePathComponent(namespace);
+    if (this.strictDurability.getStore()) {
+      await ensureDirectoryStrict(this.basePath, 0o700);
+      await ensureDirectoryStrict(encodedNamespacePath(this.basePath, namespace), 0o700);
+    }
     await mkdir(this.basePath, { recursive: true, mode: 0o700 });
     await mkdir(encodedNamespacePath(this.basePath, namespace), {
       recursive: true,
@@ -687,6 +708,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       const boundBasePath = host === "linux" ? descriptorRoot : this.basePath;
       operationResult = await this.boundBasePath.run({
         basePath: boundBasePath,
+        strictDurability: this.strictDurability.getStore() === true,
         lockedNamespace: namespace,
         ...(host === "linux" ? { namespaceBasePath: descriptorNamespace } : {}),
         ...(rootClient ? { darwinClient: rootClient } : {}),
@@ -705,7 +727,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
               ? { stableFortressCapability: {
                   tightenPermissions: () => parentClient!.call("tighten"),
                   mkdir: (relativePath: string, mode: number) =>
-                    parentClient!.call("mkdir", [relativePath, mode]),
+                    parentClient!.call(this.strictDurability.getStore() ? "mkdirStrict" : "mkdir", [relativePath, mode]),
                   isFreshExceptLockScaffold: (name: string) =>
                     parentClient!.call("isFreshExceptLockScaffold", [name]),
                   writeRecoveryKey: (recoveryKey: string, fortressId?: string) =>
@@ -745,7 +767,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
                       : new Uint8Array(Buffer.from(encoded, "base64"));
                   },
                   write: (name: string, data: Uint8Array, mode = 0o600) =>
-                    parentClient!.call("writeFile", [
+                    parentClient!.call(this.strictDurability.getStore() ? "writeFileStrict" : "writeFile", [
                       name,
                       Buffer.from(data).toString("base64"),
                       mode,
@@ -762,7 +784,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
                     return raw === null ? null : new Uint8Array(raw);
                   },
                   write: (name: string, data: Uint8Array, mode = 0o600) =>
-                    writeStableFortressFile(descriptorParent, name, data, mode),
+                    writeStableFortressFile(descriptorParent, name, data, mode, this.strictDurability.getStore()),
                   delete: (name: string) =>
                     deleteStableFortressFile(descriptorParent, name),
                   restoreFreshLockScaffold: (name: string) =>
@@ -869,10 +891,15 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     await this.atomicWriteFile(filePath, checkedData, false);
   }
 
-  async writeIfAbsent(
+  async writeIfAbsent(namespace: string, key: string, data: Uint8Array): Promise<boolean> {
+    return this.writeIfAbsentMode(namespace, key, data, false);
+  }
+
+  private async writeIfAbsentMode(
     namespace: string,
     key: string,
     data: Uint8Array,
+    strictDurability = false,
   ): Promise<boolean> {
     assertStorageMasterWriteBarrierHeld(this);
     this.assertCallerNamespace(namespace);
@@ -880,7 +907,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return this.callDarwinNamespace(capability, "writeIfAbsent", [
+      return this.callDarwinNamespace(capability, strictDurability ? "writeIfAbsentStrict" : "writeIfAbsent", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -898,6 +925,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // overwrites the winner. The random staging name does not end in `.enc`,
     // so an interrupted claim is never enumerated as a storage record.
     await writeFileCustody(stagedPath, checkedData, {
+      // Must match WriteFileCustodyOptions.strictDurability in custody-fs.ts so this write preserves every barrier.
+      strictDurability,
       mode: 0o600,
       parentMode: 0o700,
       ...(this.owner !== undefined
@@ -921,18 +950,29 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         }
         throw err;
       }
-      await this.fsyncDirectory(dirPath);
+      await (strictDurability ? syncDirectoryStrict(dirPath) : this.fsyncDirectoryLegacy(dirPath));
       return true;
     } finally {
-      await unlink(stagedPath).catch(() => undefined);
+      if (strictDurability) {
+        // Staging cleanup is a directory mutation and cannot bypass the strict barrier.
+        await unlink(stagedPath);
+        await syncDirectoryStrict(dirPath);
+      } else {
+        await unlink(stagedPath).catch(() => undefined);
+      }
     }
   }
 
-  async replaceIfEquals(
+  async replaceIfEquals(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean> {
+    return this.replaceIfEqualsMode(namespace, key, expected, data, false);
+  }
+
+  private async replaceIfEqualsMode(
     namespace: string,
     key: string,
     expected: Uint8Array,
     data: Uint8Array,
+    strictDurability = false,
   ): Promise<boolean> {
     assertStorageMasterWriteBarrierHeld(this);
     this.assertCallerNamespace(namespace);
@@ -940,7 +980,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return this.callDarwinNamespace(capability, "replaceIfEquals", [
+      return this.callDarwinNamespace(capability, strictDurability ? "replaceIfEqualsStrict" : "replaceIfEquals", [
         key,
         Buffer.from(expected).toString("base64"),
         Buffer.from(checkedData).toString("base64"),
@@ -949,6 +989,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const filePath = this.entryPath(namespace, key);
     const dirPath = dirname(filePath);
     const lockName = `.${basename(filePath)}.compare-replace.lock`;
+    // Even an absent comparison creates lock parents, so strict setup cannot wait for a matching row.
+    if (strictDurability) await ensureDirectoryStrict(dirPath, 0o700);
 
     // The lock covers the complete read -> compare -> atomic replacement
     // window. A plain read followed by rename is not CAS: two processes can
@@ -956,17 +998,20 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // second process re-read only after the winner has committed. A crashed
     // holder leaves a visible stale lock and future calls fail closed rather
     // than auto-breaking it with a racy unlink.
-    return withPathLock(
+    const replaced = await withPathLock(
       dirPath,
       lockName,
       async () => {
         const current = await this.readAtPath(filePath);
         if (current === null || !constantTimeEqual(current, expected)) return false;
-        await this.atomicWriteFile(filePath, checkedData, true);
+        await this.atomicWriteFile(filePath, checkedData, true, strictDurability);
         return true;
       },
       { metadata: { operation: "storage_compare_and_replace" } },
     );
+    // Strict completion also syncs the directory entry removed by comparison-lock cleanup.
+    if (strictDurability) await syncDirectoryStrict(dirPath);
+    return replaced;
   }
 
   async writeDurable(
@@ -991,15 +1036,54 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     await this.atomicWriteFile(filePath, checkedData, true);
   }
 
+  private assertStrictDirectoryBinding(): void {
+    const bound = this.boundBasePath.getStore();
+    // Legacy bindings may have created unsynced ancestors before capturing their descriptors.
+    if (bound && !bound.strictDurability) throw new Error("strict writes require a strict namespace binding");
+  }
+
+  /** Must match StrictDurabilityStorageCapabilities in interface.ts and worker strict dispatch. */
+  async writeStrict(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    this.assertStrictDirectoryBinding();
+    const capability = this.darwinCapability(namespace);
+    // Strict dispatch preserves the held worker directory instead of reopening the lexical root.
+    if (capability) {
+      await this.callDarwinNamespace(capability, "writeStrict", [key, Buffer.from(checkedData).toString("base64")]);
+      return;
+    }
+    await this.atomicWriteFile(this.entryPath(namespace, key), checkedData, true, true);
+  }
+
+  /** Exclusive strict publication; must match interface.ts and worker dispatch. */
+  async writeIfAbsentStrict(namespace: string, key: string, data: Uint8Array): Promise<boolean> {
+    this.assertStrictDirectoryBinding();
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    return this.writeIfAbsentMode(namespace, key, checkedData, true);
+  }
+
+  /** Strict serialized replacement; must match interface.ts and worker dispatch. */
+  async replaceIfEqualsStrict(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean> {
+    this.assertStrictDirectoryBinding();
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    return this.replaceIfEqualsMode(namespace, key, expected, checkedData, true);
+  }
+
   private async atomicWriteFile(
     filePath: string,
     data: Uint8Array,
-    syncFile: boolean
+    syncFile: boolean,
+    strictDurability = false,
   ): Promise<void> {
     // For owner writes, writeFileCustody verifies the namespace dir exists
     // inside basePath before opening the temp file. It will not recursively
     // create parent dirs as root.
     await writeFileCustody(filePath, data, {
+      // Must match WriteFileCustodyOptions.strictDurability in custody-fs.ts so this write preserves every barrier.
+      strictDurability,
       mode: 0o600,
       parentMode: 0o700,
       // The storage root is the containment base: an owner-write must never
@@ -1013,10 +1097,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           }
         : {}),
     });
-    if (syncFile) await this.fsyncDirectory(dirname(filePath));
+    if (syncFile) await (strictDurability ? syncDirectoryStrict(dirname(filePath)) : this.fsyncDirectoryLegacy(dirname(filePath)));
   }
 
-  private async fsyncDirectory(dirPath: string): Promise<void> {
+  private async fsyncDirectoryLegacy(dirPath: string): Promise<void> {
     let handle;
     try {
       handle = await open(dirPath, "r");
@@ -1086,14 +1170,14 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
     const newPath = this.entryPath(namespace, key);
     if (await this.deleteAtPath(newPath, secureOverwrite)) {
-      await this.fsyncDirectory(dirname(newPath));
+      await this.fsyncDirectoryLegacy(dirname(newPath));
       return true;
     }
     // Legacy fallback: existing fortresses may have data at the old path.
     const legacy = this.legacyEntryPath(namespace, key);
     if (legacy === newPath) return false;
     if (!(await this.deleteAtPath(legacy, secureOverwrite))) return false;
-    await this.fsyncDirectory(dirname(legacy));
+    await this.fsyncDirectoryLegacy(dirname(legacy));
     return true;
   }
 

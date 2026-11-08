@@ -8,7 +8,7 @@
  * in the StateStore layer above.
  *
  * Every method declared on `StorageBackend`, `FilesystemStorageCapabilities`,
- * and `NamespaceLockStorageCapabilities`
+ * `StrictDurabilityStorageCapabilities`, and `NamespaceLockStorageCapabilities`
  * must be classified as mutating-or-delegated in `read-only-guard.ts` (must
  * match `READ_ONLY_STORAGE_MUTATING_METHODS` /
  * `READ_ONLY_STORAGE_DELEGATED_METHODS` there); full-set parity is enforced by
@@ -173,4 +173,22 @@ export interface NamespaceLockStorageCapabilities {
     operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
     options?: import("./cross-process-lock.js").CrossProcessLockOptions,
   ): Promise<T>;
+}
+
+/** Explicit file, directory and newly created parent barriers with no fallback. */
+export interface StrictDurabilityStorageCapabilities {
+  // Must match the strict methods in filesystem.ts and the refusal list in read-only-guard.ts.
+  /** Bind strict operations to held directories after syncing every new parent. */
+  withStrictNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
+    options?: import("./cross-process-lock.js").CrossProcessLockOptions,
+  ): Promise<T>;
+  /** Replace exact bytes only after every strict barrier has completed. */
+  writeStrict(namespace: string, key: string, data: Uint8Array): Promise<void>;
+  /** Publish exclusively with strict barriers; false proves no destination write. */
+  writeIfAbsentStrict(namespace: string, key: string, data: Uint8Array): Promise<boolean>;
+  /** Serialize comparison and strict replacement across processes. */
+  replaceIfEqualsStrict(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean>;
 }

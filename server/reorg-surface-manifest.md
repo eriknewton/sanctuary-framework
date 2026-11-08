@@ -127,3 +127,24 @@ JSON and a `kind` beginning `surrogate_`; its help strings did not change.
 - `CASTLE_WALL_DAEMON_AUDIT_FENCE_EXIT_CODE = 74` (EX_IOERR); must match `CASTLE_WALL_DAEMON_AUDIT_FENCE_EXIT_CODE` in `server/src/cli/castle-wall-full-agent-state.ts`.
 - `[castle-wall] AUDIT-EXIT-FENCE`; must match `AUDIT-EXIT-FENCE` in `server/src/cli/castle-wall-full-agent-state.ts`.
 - `[castle-wall] FULL-AGENT-CRASH-LOOP-STOP`; must match `FULL-AGENT-CRASH-LOOP-STOP` in `server/src/cli/castle-wall-full-agent-state.ts`.
+
+
+## Default-off strict storage additions
+
+These additive internal APIs are classified as behavior additions, with no change
+to the frozen surfaces above or to existing callers:
+
+| Additive surface | Classification and bound |
+|---|---|
+| `StrictDurabilityStorageCapabilities` | Explicit opt-in interface; must match its methods in `storage/filesystem.ts` and `storage/read-only-guard.ts`. |
+| `writeStrict` | File, directory and parent barriers; no generic write fallback. |
+| `writeIfAbsentStrict` | Exclusive publication with strict barriers, preserving existing destination bytes. |
+| `replaceIfEqualsStrict` | Serialized comparison and strict replacement, preserving mismatched bytes. |
+| `withStrictNamespaceLock` | Strict parent setup and held directory binding through the existing kernel lock; no retained settlement receipt. |
+| `WriteFileCustodyOptions.strictDurability` | Opt-in strict barriers; omitted means the existing legacy behavior. |
+| `ensureDirectoryStrict`, `syncDirectoryStrict` | Internal custody helpers with propagating sync errors; no benign-error classification. |
+| Darwin `writeStrict`, `writeIfAbsentStrict`, `replaceIfEqualsStrict`, `writeFileStrict`, `mkdirStrict` requests | Internal worker dispatch; must match the strict dispatch in `storage/filesystem.ts`. |
+
+No receipt, pin or seal API or persisted audit format is added. Existing encrypted
+bytes, namespace encoding, modes, cryptographic labels and legacy API signatures
+remain unchanged. The new methods are not added to package exports or boot paths.

@@ -190,9 +190,8 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new FaultingWriteStorage();
     const log = new AuditLog(storage, generateRandomKey());
 
-    // Intentionally fire-and-forget: critical writes now share append()'s
-    // flush-time failure surfacing, so a voided durable write cannot disappear.
-    void log.appendCritical({
+    // Flush must surface the pending failure before this caller consumes its retained promise.
+    const pending = log.appendCritical({
       layer: "l1",
       operation: "state_write",
       identity_id: "id",
@@ -200,6 +199,7 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     });
 
     await expect(log.flush()).rejects.toThrow(AuditLogPersistenceError);
+    await expect(pending).rejects.toThrow();
     await expect(log.flush()).resolves.toBeUndefined();
   });
 

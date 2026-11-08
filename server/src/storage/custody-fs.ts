@@ -104,6 +104,8 @@ export type ReadFileCustodyOptions =
   | ReadFileCustodyTextOptions;
 
 export interface WriteFileCustodyOptions {
+  /** Must match strictDurability in filesystem.ts and directory-capability-worker.ts. */
+  strictDurability?: boolean;
   mode: number;
   /**
    * Create the parent directory before writing. Defaults to true. Set false for
@@ -405,7 +407,7 @@ export async function readFileCustodyWithStats(
   }
 }
 
-async function fsyncDirectory(dir: string): Promise<void> {
+async function fsyncDirectoryLegacy(dir: string): Promise<void> {
   let handle;
   try {
     handle = await open(dir, fsConstants.O_RDONLY);
@@ -414,6 +416,43 @@ async function fsyncDirectory(dir: string): Promise<void> {
     if (!isBenignDirectoryFsyncError(err)) throw err;
   } finally {
     await handle?.close().catch(() => undefined);
+  }
+}
+
+/** Sync a directory without classifying any sync failure as benign. */
+export async function syncDirectoryStrict(dir: string): Promise<void> {
+  const handle = await open(dir, fsConstants.O_RDONLY);
+  let syncFailure: unknown;
+  let syncFailed = false;
+  try {
+    // A visible directory entry is not evidence that the filesystem persisted it.
+    await handle.sync();
+  } catch (error) {
+    syncFailure = error;
+    syncFailed = true;
+  }
+  try {
+    await handle.close();
+  } catch (error) {
+    // Cleanup failure must preserve the original sync failure rather than replacing its evidence.
+    if (syncFailed) throw new AggregateError([syncFailure, error], "strict directory sync and close failed", { cause: error });
+    throw error;
+  }
+  if (syncFailed) throw syncFailure;
+}
+
+/** Create and sync the entire parent chain, including barriers left uncertain by a prior attempt. */
+export async function ensureDirectoryStrict(dir: string, mode: number): Promise<void> {
+  await mkdir(dir, { recursive: true, mode });
+  let cursor = dir;
+  for (;;) {
+    // Repeating parent barriers prevents a failed earlier mkdir from becoming an unsynced existing parent.
+    await syncDirectoryStrict(cursor);
+    // Descriptor roots and worker cwd already carry parent authority established before binding.
+    if (/^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(cursor) || cursor === ".") break;
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
   }
 }
 
@@ -759,10 +798,12 @@ export async function writeFileCustody(
   try {
     await withOwnerEffectiveIdentity(options.owner, async (droppedToOwner) => {
       if (options.createParent !== false && options.owner === undefined) {
-        await mkdir(dir, {
-          recursive: true,
-          mode: options.parentMode ?? 0o700,
-        });
+        if (options.strictDurability) {
+          // Must match the strict parent contract in filesystem.ts.
+          await ensureDirectoryStrict(dir, options.parentMode ?? 0o700);
+        } else {
+          await mkdir(dir, { recursive: true, mode: options.parentMode ?? 0o700 });
+        }
       }
       await verifyParentCustody(path, options.parent);
       const tempPath = join(
@@ -798,7 +839,7 @@ export async function writeFileCustody(
         await ownerGuard?.revalidate();
         await rename(tempPath, path);
         cleanupTemp = false;
-        await fsyncDirectory(dir);
+        await (options.strictDurability ? syncDirectoryStrict(dir) : fsyncDirectoryLegacy(dir));
       } finally {
         await handle?.close().catch(() => undefined);
         if (cleanupTemp) {

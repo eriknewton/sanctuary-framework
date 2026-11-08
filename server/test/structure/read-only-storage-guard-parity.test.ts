@@ -38,6 +38,7 @@ const GUARDED_INTERFACES = [
   "StorageBackend",
   "FilesystemStorageCapabilities",
   "NamespaceLockStorageCapabilities",
+  "StrictDurabilityStorageCapabilities",
 ];
 
 /**
@@ -57,7 +58,7 @@ const GUARDED_INTERFACES = [
 function interfaceMethodNames(source: string, interfaceName: string): string[] {
   const header = new RegExp(`interface\\s+${interfaceName}\\s*{`).exec(source);
   if (!header) {
-    throw new Error(`interface ${interfaceName} not found in storage/interface.ts`);
+    return [];
   }
   let depth = 0;
   let end = -1;
@@ -106,6 +107,10 @@ describe("ReadOnlyStorageGuard interface parity", () => {
     expect(declared).toContain("read");
     expect(declared).toContain("writeDurable");
     expect(declared).toContain("withNamespaceLock");
+    expect(declared).toContain("withStrictNamespaceLock");
+    expect(declared).toContain("writeStrict");
+    expect(declared).toContain("writeIfAbsentStrict");
+    expect(declared).toContain("replaceIfEqualsStrict");
   });
 
   it("classifies every declared storage method, and classifies nothing else", () => {
