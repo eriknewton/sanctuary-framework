@@ -21,6 +21,10 @@ describe("snapshot extension registry", () => {
     }
   });
   it("unregistered handler retains extension_unverified", () => { const f = extension("future", ["extension:future"]); expect(verifySnapshot(f.capture, f.pins, SOURCE)).toMatchObject({ status: "PARTIAL", exit_code: 10, accepted: false, partial_reasons: [C.PARTIAL.extension_unverified] }); });
+  it.each(Object.values(SNAPSHOT_EXTENSIONS).flat())("an unregistered id named after a registered role cannot claim it %s", role => {
+    const id = role.slice("extension:".length), ownRole = Object.hasOwn(SNAPSHOT_EXTENSIONS, id) && SNAPSHOT_EXTENSIONS[id].includes(role);
+    const f = extension(id, [role]); expect(extensionRolesAllowed(id, [role])).toBe(ownRole); expect(verifySnapshot(f.capture, f.pins, SOURCE).status).toBe(ownRole ? "PARTIAL" : "FAIL");
+  });
   it.each([["extension:linux-business-policy-v0"], ["extension:future-role"], ["extension:future", "extension:vendor-reconciliation-v0"]].map(roles => [roles]))("unregistered handler cannot claim a registered or foreign role %j", roles => {
     const f = extension("future", roles); expect(extensionRolesAllowed("future", roles)).toBe(false); expect(verifySnapshot(f.capture, f.pins, SOURCE).status).toBe("FAIL");
   });

@@ -34,7 +34,6 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
   let instance: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
   let cleanupAttempted = false, stage: string | undefined, committed = false;
   let createdDestination: string | undefined;
-  const createdFiles: string[] = [];
   const phase = async (state: ExportState) => deps.phase(state, stage);
   const oldStorage = process.env.SANCTUARY_STORAGE_PATH;
   try {
@@ -77,9 +76,7 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     await mkdir(output, { mode: PRIVATE_DIRECTORY_MODE }); createdDestination = output;
     // Use verified in-memory bytes and exclusive creates so a late writer cannot be overwritten.
     for (const [name, bytes] of files) {
-      const path = join(output, name), fd = await open(path, "wx", PRIVATE_FILE_MODE);
-      // Record exclusive ownership before writing so even a partial write is eligible for rollback.
-      createdFiles.push(path);
+      const fd = await open(join(output, name), "wx", PRIVATE_FILE_MODE);
       try { await fd.writeFile(bytes); } finally { await fd.close(); }
     }
     const final = verifySnapshot(await captureSnapshotDirectory(output, signer.public_key, digest), pins, deps.buildRevision);
@@ -94,14 +91,9 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     return self.exit_code;
   } catch (error) {
     if (createdDestination && !committed) {
-      // Rollback removes only this export's exclusive creations and never recursively removes a destination with concurrent content.
-      for (const path of createdFiles) { try { await unlink(path); } catch { /* A remaining file prevents rmdir below. */ } }
-      try { await rmdir(createdDestination); }
-      catch {
-        // Exclusive labeling preserves any concurrent marker while making an incomplete delivery recognizable.
-        try { await writeFile(join(createdDestination, FAILED_DESTINATION_MARKER), "", { flag: "wx", mode: PRIVATE_FILE_MODE }); }
-        catch { /* A missing or unwritable destination cannot accept the fixed marker. */ }
-      }
+      // A failed delivery is labeled, never deleted: removal by name could reach a file another writer substituted, and the unlisted marker alone makes the directory fail verification.
+      try { await writeFile(join(createdDestination, FAILED_DESTINATION_MARKER), "", { flag: "wx", mode: PRIVATE_FILE_MODE }); }
+      catch { /* A missing or unwritable destination cannot accept the fixed marker. */ }
     }
     if (instance && !cleanupAttempted) {
       try { await instance.cleanup(); } catch { /* Preserve the original closed failure code. */ }
