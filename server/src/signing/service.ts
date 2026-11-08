@@ -40,7 +40,7 @@ export function workerSigner(identity: StoredIdentity, key: Uint8Array, grant: S
   try {
     // The internally generated self-test binds the same role and machine required by the private K1a provider.
     const body = canonicalBytes({ v: 1, role: grant.role, machine_id: grant.machine_id, epoch: grant.epoch, kid: grant.kid,
-      descriptor_digest: "sha256:" + (awaitlessDigest(canonicalBytes(grant))), boot_id: readBootId(), lease_id: grant.lease_id,
+      grant_digest: "sha256:" + (awaitlessDigest(canonicalBytes(grant))), boot_id: readBootId(), lease_id: grant.lease_id,
       challenge_nonce: randomBytes(SELF_TEST_NONCE_BYTES).toString("hex"), started_boottime_ns: started });
     const message = Buffer.concat([Buffer.from(UNLOCK_CHALLENGE_DOMAIN), body]);
     const signature = provider.sign(message);
@@ -86,6 +86,7 @@ export class SigningServiceClient {
   }
   static connect(): SigningServiceClient {
     // A fixed executable and empty environment prevent caller loader options from entering the native bridge.
+    // Must match signer_service.rs: the bridge validates AF_UNIX stdio and drops capabilities before connecting.
     return new SigningServiceClient(spawn(SIGNER_BINARY, ["--bridge"], { env: {}, stdio: "pipe" }));
   }
   async #request(packet: Uint8Array): Promise<Record<string, unknown>> {

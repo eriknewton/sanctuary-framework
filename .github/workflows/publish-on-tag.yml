@@ -77,6 +77,11 @@ jobs:
         id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Install pinned Rust toolchain for native signing witnesses
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+
       - name: Use Node.js 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -85,6 +90,7 @@ jobs:
           cache-dependency-path: server/package-lock.json
 
       - name: Provision the root-owned workstation signer interpreter
+        # Must match fixtureNode in server/test/fixtures/k1-service.ts.
         # setup-node's tool cache is runner-writable, so its symlink cannot carry key custody.
         # Copy the selected runtime into the fixed trusted path checked by the real signer.
         # Must match the step of the same name in ci.yml and test-baseline-guard.yml; the
@@ -153,7 +159,18 @@ jobs:
 
       - name: Run tests
         working-directory: server
-        run: npm test
+        run: |
+          # Keep native compilation after release trust checks and inside the existing shell-step inventory.
+          # Must match test/fixtures/k1-service.ts: both profiles live under this one target root.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target"
+          (
+            cd ../castle-wall-daemon
+            CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock
+            cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock
+          )
+          export SANCTUARY_K1_TEST_BINARIES="$CARGO_TARGET_DIR"
+          echo "SANCTUARY_K1_TEST_BINARIES=$SANCTUARY_K1_TEST_BINARIES" >> "$GITHUB_ENV"
+          npm test
 
       - name: Build
         working-directory: server

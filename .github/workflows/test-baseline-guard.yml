@@ -56,6 +56,20 @@ jobs:
             exit 1
           fi
 
+      - name: Install pinned Rust toolchain for native signing witnesses
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+
+      - name: Build native signing witness binaries
+        working-directory: castle-wall-daemon
+        run: |
+          # Must match test/fixtures/k1-service.ts: both profiles live under this one target root.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target"
+          CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock
+          cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock
+          echo "SANCTUARY_K1_TEST_BINARIES=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+
       - name: Use Node.js 24
         uses: actions/setup-node@v7
         with:
@@ -96,6 +110,7 @@ jobs:
           packages: python3-yaml
 
       - name: Provision the root-owned workstation signer interpreter
+        # Must match fixtureNode in server/test/fixtures/k1-service.ts.
         # setup-node's tool cache is runner-writable, so its symlink cannot carry key custody.
         # Copy the selected runtime into the fixed trusted path checked by the real signer.
         run: sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node

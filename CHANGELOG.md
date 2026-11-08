@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-- Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.
+- Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony, capability-free peers and restart-persistent worker uncertainty. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.
 - Added an isolated per-role record-signing contract and an encrypted key-provider with test fixtures. Nothing is wired into the daemon, a service or any existing export yet.
 - Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Export, recipient CLI and packaging are not included.
 

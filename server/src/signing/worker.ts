@@ -23,6 +23,10 @@ const CARRIAGE_RETURN = 13;
 const LINE_FEED = 10;
 const INTERRUPT = 3;
 const END_OF_INPUT = 4;
+const BACKSPACE = 8;
+const DELETE = 127;
+const PASSPHRASE_MODE = "p".charCodeAt(0);
+const RECOVERY_MODE = "r".charCodeAt(0);
 const ttyWait = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 const PRIVATE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -43,25 +47,37 @@ function frame(): { bytes: Buffer; header: Record<string, unknown>; body: Buffer
   if (typeof bodyLength !== "number" || !Number.isSafeInteger(bodyLength) || bodyLength < 0 || bodyLength > SIGNER_PREIMAGE_MAX_BYTES) return refuse();
   const body = exact(STDIN_FD, bodyLength); return { bytes: Buffer.concat([size, raw, body]), header, body };
 }
-function readFactor(inode: string, device: string): string {
+function readFactor(inode: string, device: string): {passphrase: string} | {recoveryKey: string} {
   const owned = Buffer.alloc(FACTOR_MAX_BYTES); const one = Buffer.alloc(1); let stream: ReadStream | undefined;
   try {
     // Worker revalidation refuses a pipe even if a compromised parent supplies it as fd3.
     const terminal = fstatSync(TTY_FD, {bigint: true});
     if (!isatty(TTY_FD) || !terminal.isCharacterDevice() || terminal.ino.toString() !== inode || terminal.rdev.toString() !== device) return refuse();
     stream = new ReadStream(TTY_FD); stream.setRawMode(true);
-    writeSync(TTY_FD, "K1 passphrase: "); let length = 0;
+    writeSync(TTY_FD, "K1 factor mode [p=passphrase,r=recovery]: ");
+    let recovery: boolean | undefined; let length = 0;
     for (;;) {
       try { if (readSync(TTY_FD, one, 0, 1, null) !== 1) return refuse(); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EAGAIN") return refuse();
         Atomics.wait(ttyWait, 0, 0, TTY_RETRY_MS); continue;
       }
-      if (one[0] === CARRIAGE_RETURN || one[0] === LINE_FEED) break;
+      if (one[0] === CARRIAGE_RETURN || one[0] === LINE_FEED) {
+        if (recovery !== undefined) break;
+        if (length !== 1 || (owned[0] !== PASSPHRASE_MODE && owned[0] !== RECOVERY_MODE)) return refuse();
+        recovery = owned[0] === RECOVERY_MODE; owned.fill(0); length = 0;
+        writeSync(TTY_FD, recovery ? "K1 recovery key: " : "K1 passphrase: "); continue;
+      }
+      // Raw terminal editing removes the preceding UTF-8 code point without retaining corrected factor bytes.
+      if (one[0] === BACKSPACE || one[0] === DELETE) {
+        if (length > 0) { let start = length - 1; while (start > 0 && (owned[start]! & 0xc0) === 0x80) start--; owned.fill(0, start, length); length = start; }
+        continue;
+      }
       if (one[0] === INTERRUPT || one[0] === END_OF_INPUT || length === FACTOR_MAX_BYTES) return refuse();
       owned[length++] = one[0];
     }
-    return new TextDecoder("utf-8", { fatal: true }).decode(owned.subarray(0, length));
+    const factor = new TextDecoder("utf-8", { fatal: true }).decode(owned.subarray(0, length));
+    return recovery ? {recoveryKey: factor} : {passphrase: factor};
   } finally {
     // Mutable intake buffers are wiped locally while immutable factor and library copies remain bounded by worker reaping.
     owned.fill(0); one.fill(0); stream?.setRawMode(false); writeSync(TTY_FD, "\n"); closeSync(TTY_FD);
@@ -105,8 +121,7 @@ async function main(): Promise<void> {
   let master: Uint8Array | undefined; let key: Uint8Array | undefined; let plain: Uint8Array | undefined;
   let signer: ReturnType<typeof workerSigner> | undefined;
   try {
-    const factor = readFactor(config.tty_inode, config.tty_device);
-    const credential = factor.startsWith("recovery:") ? {recoveryKey: factor.slice("recovery:".length)} : {passphrase: factor};
+    const credential = readFactor(config.tty_inode, config.tty_device);
     // Only the authenticated envelope returned by the read-only custody API establishes the two-wrap profile.
     const unlocked = await unlockExistingMasterReadOnlyWithEnvelope(store, credential); master = unlocked.masterKey;
     validateCustodyProfile(unlocked.envelope);
@@ -136,4 +151,7 @@ async function main(): Promise<void> {
   } finally { signer?.close(); key?.fill(0); master?.fill(0); plain?.fill(0); store.close(); }
 }
 // The release entrypoint accepts no argv, environment credential, injected callback or caller challenge.
-void main().then(() => process.exit(0), () => { writeSync(STDOUT_FD, publicFrame({op: "REFUSED"})); process.exit(1); });
+void main().then(() => process.exit(0), () => {
+  // main has wiped owned buffers before this acknowledgement; native reaping closes immutable library copies.
+  writeSync(STDOUT_FD, publicFrame({op: "WIPED"})); process.exit(0);
+});

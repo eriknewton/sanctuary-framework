@@ -10,6 +10,7 @@ User=root
 Group=root
 ExecStart=/usr/libexec/sanctuary-business-signer
 Restart=no
+# Must match signer_peer.rs: launcher and bridge drop capabilities before connecting.
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes

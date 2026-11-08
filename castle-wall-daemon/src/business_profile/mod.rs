@@ -1,7 +1,7 @@
 //! Role contracts and an inert native service, separate from daemon boot.
-pub mod signer_contract;
 #[cfg(target_os = "linux")]
 pub mod custody;
+pub mod signer_contract;
 #[cfg(target_os = "linux")]
 pub mod signer_peer;
 #[cfg(target_os = "linux")]
@@ -83,6 +83,7 @@ fn kid_from_body(body: &serde_json::Value) -> Option<String> {
 }
 
 /// Cryptographic contract only; typed payload and outer index checks belong to each future consumer.
+#[allow(clippy::too_many_arguments)] // The frozen role verifier consumes all independent public pins.
 pub fn verify_role(
     role: &str,
     epoch: u64,
