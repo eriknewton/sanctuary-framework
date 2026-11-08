@@ -27,13 +27,23 @@ fn environment_drops_unlisted_variables() {
     );
     assert!(cmd.get_args().any(|a| a == "--disable-sigusr1"));
 }
+// CI installs Node outside /usr/bin, so the child is the node on PATH; the closed environment is what this test proves, not the install location.
+fn node_on_path() -> std::path::PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("node must be on PATH for the closed-environment witness")
+}
 #[test]
 fn closed_environment_applies_to_child() {
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("environment.cjs");
     std::fs::write(&script, "process.stdout.write(JSON.stringify(process.env))").unwrap();
     std::env::set_var("K1_UNLISTED_SENTINEL", "should-not-inherit");
-    let output = worker_command(std::path::Path::new("/usr/bin/node"), &script)
+    let output = worker_command(&node_on_path(), &script)
         .stdout(Stdio::piped())
         .output()
         .unwrap();
