@@ -63,6 +63,14 @@ path = "src/bin/protected-agent-v1.rs"
 name = "network-agent-standin"
 path = "src/bin/network-agent-standin.rs"
 
+[[bin]]
+name = "sanctuary-business-signer"
+path = "src/bin/sanctuary-business-signer.rs"
+
+[[bin]]
+name = "sanctuary-business-unlock"
+path = "src/bin/sanctuary-business-unlock.rs"
+
 [features]
 # Pause points must never enter the default release feature graph.
 smb-test-hooks = []

@@ -25,11 +25,13 @@ describe("isolated K1 boundaries",()=>{
   it("contract is unwired and imports no raw loader or operator resolver",()=>{
     const paths=["server/src/signing","server/src/linux-business"];
     const source=paths.flatMap(path=>readdirSync(join(root,path)).filter(name=>name.endsWith(".ts")).map(name=>readFileSync(join(root,path,name),"utf8"))).join("\n");
-    for(const forbidden of ["load_or_generate","from_signing_key","IdentityManager","getDefault(","node:net","node:child_process","console.","process.env"]) {
+    for(const forbidden of ["load_or_generate","from_signing_key","IdentityManager","getDefault(","node:net","console.","process.env"]) {
       const code=source.split("\n").filter(line=>!line.trimStart().startsWith("//")&&!line.trimStart().startsWith("/**")).join("\n");expect(code).not.toContain(forbidden);
     }
+    for (const name of readdirSync(join(root,"server/src/signing")).filter(name => name.endsWith(".ts") && name !== "service.ts"))
+      expect(readFileSync(join(root,"server/src/signing",name),"utf8")).not.toContain("node:child_process");
     for(const path of ["castle-wall-daemon/src/main.rs","castle-wall-daemon/src/daemon.rs"]){expect(readFileSync(join(root,path),"utf8")).not.toContain("business_profile");}
-    const tsup=readFileSync(join(root,"server/tsup.config.ts"),"utf8");expect(tsup).not.toContain("signing/");
+    const tsup=readFileSync(join(root,"server/tsup.config.ts"),"utf8");expect(tsup).toContain('entryPoints: ["src/signing/worker.ts"]');
   });
 });
 
@@ -40,7 +42,7 @@ it("keeps the raw provider private to its implementation module", () => {
   const sourceRoot = join(root, "server/src");
   const importers = readdirSync(sourceRoot, {recursive: true}).filter((name): name is string => typeof name === "string" && name.endsWith(".ts"))
     .filter(name => /from\s+["'][^"']*identity-provider\.js["']/.test(readFileSync(join(sourceRoot, name), "utf8")));
-  expect(importers.filter(name => !["signing/record-signer.ts", "signing/rotation.ts", "signing/lifecycle.ts"].includes(name))).toEqual([]);
+  expect(importers.filter(name => !["signing/record-signer.ts", "signing/rotation.ts", "signing/lifecycle.ts", "signing/service.ts"].includes(name))).toEqual([]);
 });
 it("keeps the pure contract portable and agent launch Linux only", () => {
   const source = readFileSync(join(root, "castle-wall-daemon/src/lib.rs"), "utf8");

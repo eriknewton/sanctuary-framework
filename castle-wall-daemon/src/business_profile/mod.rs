@@ -1,5 +1,13 @@
-//! Contract fixtures only; no daemon boot, key loader, socket or service integration.
+//! Role contracts and an inert native service, separate from daemon boot.
 pub mod signer_contract;
+#[cfg(target_os = "linux")]
+pub mod custody;
+#[cfg(target_os = "linux")]
+pub mod signer_peer;
+#[cfg(target_os = "linux")]
+pub mod signer_service;
+#[cfg(target_os = "linux")]
+pub mod signer_watchdog;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use curve25519_dalek::edwards::CompressedEdwardsY;

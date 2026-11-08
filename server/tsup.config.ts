@@ -1,5 +1,7 @@
 import { defineConfig } from "tsup";
+import { build as buildNativeWorker } from "esbuild";
 import { execFileSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
 
 // Must match SANCTUARY_SOURCE_SHA_ENV in server/test/scripts/tsup-config-source-sha.test.ts.
 const SANCTUARY_SOURCE_SHA_ENV = "SANCTUARY_SOURCE_SHA";
@@ -68,4 +70,23 @@ export default defineConfig({
     __SANCTUARY_SOURCE_SHA__: JSON.stringify(sourceSha),
   },
   noExternal: ["@noble/curves", "@noble/hashes"],
+  async onSuccess() {
+    // The native worker has its own closed bundle because it is not an entrypoint of the frozen CLI runtime.
+    // Must match custody.rs WORKER_BINARY and k1-release-closure.test.ts; the installed basename is signing-worker.cjs.
+    await buildNativeWorker({
+      entryPoints: ["src/signing/worker.ts"], outfile: "dist/k1/signing-worker.cjs",
+      bundle: true, platform: "node", format: "cjs", target: "node22", packages: "bundle",
+      plugins: [{
+        name: "release-custody-observer-removal",
+        setup(build) {
+          // Release artifacts remove callback calls before bundling so no secret observer survives tree shaking.
+          build.onLoad({filter: /[/\\]core[/\\]master-custody\.ts$/}, async args => {
+            const source = await readFile(args.path, "utf8");
+            const contents = source.replace(/^\s*opts\.__testObserveSecretBuffer\?\.\([^;]+;$/gm, "");
+            return {contents, loader: "ts"};
+          });
+        },
+      }],
+    });
+  },
 });

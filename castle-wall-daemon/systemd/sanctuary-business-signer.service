@@ -1,0 +1,38 @@
+# Must match business_profile/custody.rs and signing/service.ts installation paths.
+[Unit]
+Description=Sanctuary inert business role signer
+Requires=sanctuary-business-closed.service
+After=sanctuary-business-closed.service
+
+[Service]
+Type=notify
+User=root
+Group=root
+ExecStart=/usr/libexec/sanctuary-business-signer
+Restart=no
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+PrivateIPC=yes
+RestrictAddressFamilies=AF_UNIX
+LimitCORE=0
+MemorySwapMax=0
+MemoryMax=256M
+TasksMax=16
+TimeoutStopSec=5
+KillMode=control-group
+UMask=0077
+ReadWritePaths=/var/lib/sanctuary-business-signer /run/sanctuary/business-signer
+RuntimeDirectory=sanctuary/business-signer
+RuntimeDirectoryMode=0700
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+# No Install section: boot wiring belongs to the paired consumer slice.

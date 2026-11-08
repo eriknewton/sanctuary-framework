@@ -134,6 +134,7 @@ describe("codebase-conventions gate", () => {
     const onDisk = moduleDirs();
     const inMap = mapModules();
     expect(inMap).toEqual(expect.arrayContaining(["signing", "linux-business"]));
+    expect(readFileSync(join(SERVER_SRC, "signing", "worker.ts"), "utf8")).toContain("unlockExistingMasterReadOnlyWithEnvelope");
 
     const missingFromMap = onDisk.filter((d) => !inMap.includes(d));
     const missingFromTree = inMap.filter((m) => !onDisk.includes(m));
