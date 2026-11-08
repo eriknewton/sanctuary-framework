@@ -16,11 +16,12 @@ function observation(stat: BigIntStats): C.CapturedStat {
   return { type: stat.isFile() ? C.FILE_TYPE.file : stat.isDirectory() ? C.FILE_TYPE.directory : "invalid", size: Number(stat.size), nlink: Number(stat.nlink), dev: String(stat.dev), ino: String(stat.ino), mtime: String(stat.mtimeNs), ctime: String(stat.ctimeNs) };
 }
 async function metadata(path: string): Promise<string[]> {
-  // Metadata is excluded from signed evidence, so inability to enumerate it must refuse capture.
+  // This exporter adapter uses subprocesses; the offline verifier must supply captured names without reusing it.
+  // Must match snapshot-contract.ts: enumerate exact metadata names only, never values, including OS-attached labels.
   const command = process.platform === "darwin" ? "/usr/bin/xattr" : "python3";
   const args = process.platform === "darwin" ? [path] : ["-c", "import os,sys,json; print(json.dumps(os.listxattr(sys.argv[1], follow_symlinks=False)))", path];
   const { stdout } = await execute(command, args, { maxBuffer: METADATA_OUTPUT_LIMIT, timeout: METADATA_TIMEOUT_MS });
-  return process.platform === "darwin" ? stdout.trim().split("\n").filter(Boolean) : JSON.parse(stdout) as string[];
+  return process.platform === "darwin" ? stdout.split("\n").filter(name => name !== "") : JSON.parse(stdout) as string[];
 }
 export async function canonicalOutput(path: string): Promise<string> { return join(await realpath(dirname(resolve(path))), basename(resolve(path))); }
 export function requireOutside(pack: string, path: string): void {
@@ -66,8 +67,10 @@ export async function captureSnapshotDirectory(path: string, packKey: string, ex
       const filePath = join(root, decoded); const lst = observation(await lstat(filePath, { bigint: true }));
       C.requireSnapshot(lst.type === C.FILE_TYPE.file && lst.nlink === 1, C.HARD.file_type_invalid); C.cap(lst.size, maximum);
       const fd = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      const file: C.CapturedFile = { name, bytes: new Uint8Array(), before: observation(await fd.stat({ bigint: true })), after: lst, metadata: [] };
+      const file: C.CapturedFile = { name, bytes: new Uint8Array(), before: lst, after: lst, metadata: [] };
+      // Register the handle before any fallible observation so the outer finally closes every opened file.
       held.push({ fd, file, path: filePath });
+      file.before = observation(await fd.stat({ bigint: true }));
       C.requireSnapshot(C.canonicalSnapshotJSON(lst) === C.canonicalSnapshotJSON(file.before), C.HARD.snapshot_changed);
       const buffer = Buffer.alloc(lst.size + 1); const { bytesRead } = await fd.read(buffer, 0, buffer.length, 0);
       C.requireSnapshot(bytesRead === lst.size, C.HARD.snapshot_changed); file.bytes = buffer.subarray(0, bytesRead); file.metadata = await metadata(filePath); return file;
@@ -118,7 +121,9 @@ export async function runSnapshotTrustCommand(argv: string[], io: CommandIO = co
   try {
     const pack = await canonicalOutput(flags["--pack"]), output = await canonicalOutput(flags["--output"]);
     const pinPath = await canonicalOutput(flags["--public-key-file"]); requireOutside(pack, output); requireOutside(pack, pinPath); C.requireSnapshot(output !== pinPath, C.HARD.unsafe_path);
-    const packKey = new TextDecoder().decode(await readPublicFile(pinPath, C.MAX_TRUST_BYTES)).trim(); C.publicKey(packKey);
+    // The independent key grammar permits one final LF only, so whitespace cannot silently change the supplied pin.
+    const keyText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await readPublicFile(pinPath, C.MAX_TRUST_BYTES));
+    const packKey = keyText.endsWith(C.LF) ? keyText.slice(0, -C.LF.length) : keyText; C.publicKey(packKey);
     const capture = await captureSnapshotDirectory(pack, packKey, flags["--expect-manifest-digest"]);
     const raw = C.parseManifestEnvelope(capture.files.find(f => Buffer.from(f.name).toString() === C.MANIFEST_FILENAME)!.bytes);
     const candidate = authenticateSnapshotBytes(capture, packKey, flags["--expect-manifest-digest"], raw.source_revision as string);

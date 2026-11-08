@@ -12,8 +12,8 @@ export const SNAPSHOT_FORMAT = "SANCTUARY_EVIDENCE_SNAPSHOT_V0";
 export const TRUST_FORMAT = "SANCTUARY_EVIDENCE_TRUST_V0";
 export const RECEIPT_FORMAT = "SANCTUARY_EVIDENCE_EXPORT_RECEIPT_V0";
 export const RESULT_FORMAT = "SANCTUARY_EVIDENCE_VERIFICATION_V0";
-// Must match MANIFEST_DOMAIN in core/signing-domains.ts, including the raw-sign refusal.
-import { MANIFEST_DOMAIN } from "../core/signing-domains.js";
+// Must match EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN in core/signing-domains.ts, including the raw-sign refusal.
+import { EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN as MANIFEST_DOMAIN } from "../core/signing-domains.js";
 export { MANIFEST_DOMAIN };
 import { extensionRolesAllowed } from "./snapshot-extensions.js";
 export const SIGNATURE_SCHEME = "ed25519-v1";
@@ -60,6 +60,7 @@ export const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 export const STATES = { ARGUMENTS: "ARGUMENTS", PIN_INPUTS: "PIN_INPUTS", MANIFEST_BYTES: "MANIFEST_BYTES", MANIFEST_AUTHENTICATED: "MANIFEST_AUTHENTICATED", EXPECTED_SNAPSHOT: "EXPECTED_SNAPSHOT", FILE_SET_AUTHENTICATED: "FILE_SET_AUTHENTICATED", BYTES_VERIFIED: "BYTES_VERIFIED", NESTED_VERIFIED: "NESTED_VERIFIED", FINAL_RECHECK: "FINAL_RECHECK" } as const;
 export const STATUS = { PASS: "PASS", PARTIAL: "PARTIAL", FAIL: "FAIL" } as const;
 export const INTEGRITY = { verified: "verified", bytes_match: "bytes_match", unverified: "unverified" } as const;
+// Must match the closed diagnostic filter in snapshot-export-cli.ts; no free-form error code is exported.
 export const HARD = Object.freeze({ pin_invalid: "pin_invalid", manifest_invalid: "manifest_invalid", manifest_signature_invalid: "manifest_signature_invalid", embedded_key_mismatch: "embedded_key_mismatch", manifest_digest_mismatch: "manifest_digest_mismatch", unsupported_format: "unsupported_format", unsafe_path: "unsafe_path", file_set_mismatch: "file_set_mismatch", file_type_invalid: "file_type_invalid", file_digest_mismatch: "file_digest_mismatch", descriptor_mismatch: "descriptor_mismatch", extent_mismatch: "extent_mismatch", nested_invalid: "nested_invalid", limit_exceeded: "limit_exceeded", io_error: "io_error", snapshot_changed: "snapshot_changed", unexpected_metadata: "unexpected_metadata", unlisted_os_metadata: "unlisted_os_metadata" } as const);
 export const PARTIAL = Object.freeze({ audit_absent: "audit_absent", transparency_absent: "transparency_absent", checkpoint_unsigned: "checkpoint_unsigned", checkpoint_coverage_absent: "checkpoint_coverage_absent", audit_legacy_anchor_unverified: "audit_legacy_anchor_unverified", audit_rotation_anchor_unverified: "audit_rotation_anchor_unverified", audit_pruned_root_unverified: "audit_pruned_root_unverified", audit_custody_mac_unverified: "audit_custody_mac_unverified", transparency_prefix_unverified: "transparency_prefix_unverified", extension_unverified: "extension_unverified", audit_tail_unanchored: "audit_tail_unanchored", audit_span_gap: "audit_span_gap", audit_empty_verified: "audit_empty_verified", audit_read_failed: "audit_read_failed", transparency_empty_verified: "transparency_empty_verified", transparency_read_failed: "transparency_read_failed" } as const);
 export const HUMAN = { PASS: "PASS: expected snapshot bytes verified; supported nested checks passed.", PARTIAL: "PARTIAL: snapshot bytes match the expected digest; some checks are incomplete; do not rely on this pack as complete.", FAIL: "FAIL: snapshot verification failed.", USAGE_ERROR: "USAGE_ERROR: invalid command arguments." } as const;
@@ -74,6 +75,9 @@ export const PUBLIC_AUDIT_KINDS = [RECORD.entry, RECORD.checkpoint] as const;
 export const AUDIT_PARTIAL_FINDINGS: readonly string[] = [PARTIAL.checkpoint_unsigned, PARTIAL.checkpoint_coverage_absent];
 export const SIGNATURE_BASIS = "pinned";
 export const FILE_TYPE = { file: "file", directory: "directory" } as const;
+// Must match the name-only checks in snapshot-verify.ts and capture in snapshot-trust-cli.ts.
+export const OS_ATTACHED_METADATA: readonly string[] = Object.freeze(["com.apple.provenance", "com.apple.quarantine", "security.selinux"]);
+export const OS_ATTACHED_METADATA_NOT_CHECKED = "OS-attached file metadata (provenance, quarantine, security label) is outside the signed set.";
 export const OS_METADATA = /^\.DS_Store$|^\._/;
 export const FIXED_FILES = {
   report: [REPORT_FILENAME, "text/markdown"], pdf: [PDF_FILENAME, "application/pdf"], trust: [TRUST_FILENAME, "application/json"], recipient: [RECIPIENT_FILENAME, "text/markdown"], audit: [AUDIT_FILENAME, "application/jsonl"], transparency: [TRANSPARENCY_FILENAME, "application/json"],

@@ -23,6 +23,7 @@ export async function gatherAuditExport(storage: FilesystemStorage, masterKey: U
     // The legacy writer ignores backpressure, so record overflow without emitting an unhandled stream error.
     const sink = new Writable({ write(chunk, _encoding, done) { if (!oversized) { size += chunk.length; oversized = size > maximumBytes; if (!oversized) chunks.push(Buffer.from(chunk)); } done(); } });
     const summary = await exportAuditChain(storage, sink);
+    // The v0 reason vocabulary maps size overflow to read_error rather than signing an incomplete audit chain.
     C.requireSnapshot(!oversized, C.HARD.limit_exceeded);
     // Skipped records make the read incomplete even when the exporter produced zero bytes.
     if (totalRecordsSkipped(summary) > 0) return { state: C.COMPONENT.read_failed, reason: "invalid_records", summary };

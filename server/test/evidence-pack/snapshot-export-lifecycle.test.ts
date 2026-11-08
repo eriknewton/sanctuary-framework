@@ -1,4 +1,4 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, afterEach } from "vitest";
 import { mkdir, readFile, readdir, writeFile, lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { exportSnapshot, EXPORT_STATES, runSnapshotExportCommand } from "../../src/evidence-pack/snapshot-export-cli.js";
@@ -6,6 +6,8 @@ import { captureSnapshotDirectory, runSnapshotTrustCommand, requireOutside } fro
 import { verifySnapshot } from "../../src/evidence-pack/snapshot-verify.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
 import { exporterFixture, SOURCE } from "./snapshot-fixtures.js";
+afterEach(() => vi.restoreAllMocks());
+vi.mock("../../src/evidence-pack/snapshot-trust-cli.js", async original => ({ ...await original<typeof import("../../src/evidence-pack/snapshot-trust-cli.js")>() }));
 vi.mock("node:fs/promises", async original => ({ ...await original<typeof import("node:fs/promises")>() }));
 it("lifecycle order cleanup receipt and stdout describe independently verified committed bytes", async () => {
   const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(0);
@@ -25,6 +27,7 @@ it.each(EXPORT_STATES)("fault at %s never emits success", async state => {
   const x = await exporterFixture(); x.deps.phase = async current => { if (current === state) throw new Error("fault"); };
   expect(await runSnapshotExportCommand(["--fortress", x.options.fortress, "--output", x.options.output, "--receipt", x.options.receipt, "--public-key-file", x.options.publicKeyFile], x.deps)).toBe(1);
   expect(x.stdout).toEqual([]);
+  expect(x.stderr.join("")).toBe((state === "RECEIPT" ? "Evidence export finalization failed; committed pack retained.\n" : "Evidence export failed; any failed stage is retained.\n") + "EXPORT_FINDING=io_error\n");
   if (["SELF_VERIFY", "CLEANUP", "COMMIT"].includes(state)) expect((await readdir(x.root)).some(n => n.startsWith(".evidence-failed-stage-"))).toBe(true);
   if (state === "RECEIPT") expect(await readdir(x.options.output)).toContain(C.MANIFEST_FILENAME);
   else await expect(lstat(x.options.output)).rejects.toMatchObject({ code: "ENOENT" });
@@ -83,6 +86,7 @@ it("external pin and receipt paths cannot be inside the delivery", () => {
 it("stdout failure leaves committed bytes and returns exit one", async () => {
   const x = await exporterFixture(); x.deps.io.stdout = async () => { throw new Error("pipe"); };
   expect(await exportSnapshot(x.options, x.deps)).toBe(1); expect(await readdir(x.options.output)).toContain(C.MANIFEST_FILENAME);
+  expect(x.stderr.join("")).toBe("Evidence export finalization failed; committed pack retained.\nEXPORT_FINDING=io_error\n");
 });
 
 it("capture bounds actual bytes by the authenticated file row before reading", async () => {
@@ -106,4 +110,115 @@ it("capture bounds inventory before allocating the complete directory list", asy
     await expect(captureSnapshotDirectory(x.options.output, x.f.pack.public_key, C.manifestDigest(C.utf8("unused")))).rejects.toThrow(C.HARD.limit_exceeded);
     expect(visited).toBe(C.MAX_FILES + 1);
   } finally { spy.mockRestore(); }
+});
+
+it.each(["GATHER", "BUILD_PUBLIC_TRUST", "RENDER", "HASH", "SIGN", "HASH_MANIFEST_FILE", "STAGE", "SELF_VERIFY", "CLEANUP", "COMMIT", "RECEIPT"] as const)("closed diagnostic preserves typed failure at %s", async state => {
+  const x = await exporterFixture();
+  x.deps.phase = async current => { if (current === state) throw new C.SnapshotError(C.HARD.pin_invalid); };
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL);
+  expect(x.stderr.join("")).toBe((state === "RECEIPT" ? "Evidence export finalization failed; committed pack retained.\n" : "Evidence export failed; any failed stage is retained.\n") + "EXPORT_FINDING=pin_invalid\n");
+});
+it("closed diagnostic rejects a forged error code", async () => {
+  const x = await exporterFixture(); x.deps.phase = async () => { throw new C.SnapshotError("/private/sentinel" as C.HardCode); };
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL);
+  expect(x.stderr.join("")).toBe("Evidence export failed; any failed stage is retained.\nEXPORT_FINDING=io_error\n");
+});
+it("self check reports its actual metadata finding and leaves no public key", async () => {
+  const x = await exporterFixture(), adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js"), original = adapter.captureSnapshotDirectory;
+  vi.spyOn(adapter, "captureSnapshotDirectory").mockImplementation(async (...args) => { const capture = await original(...args); capture.rootMetadata = ["user.private-sentinel"]; return capture; });
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL);
+  expect(x.stderr.join("")).toBe("Evidence export failed; any failed stage is retained.\nEXPORT_FINDING=unexpected_metadata\n");
+  await expect(lstat(x.options.publicKeyFile)).rejects.toMatchObject({ code: "ENOENT" });
+});
+it.each([false, true])("final confirm rollback preserves concurrent content %s", async concurrent => {
+  const x = await exporterFixture(), adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js"), original = adapter.captureSnapshotDirectory;
+  let confirmed = false;
+  vi.spyOn(adapter, "captureSnapshotDirectory").mockImplementation(async (...args) => {
+    const capture = await original(...args);
+    if (args[0] === x.options.output) {
+      confirmed = true;
+      if (concurrent) await writeFile(join(x.options.output, "owner.txt"), "prior");
+      capture.rootAfter.ino += "changed";
+    }
+    return capture;
+  });
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL); expect(confirmed).toBe(true);
+  expect(x.stdout).toEqual([]); await expect(lstat(x.options.receipt)).rejects.toMatchObject({ code: "ENOENT" });
+  if (concurrent) {
+    expect((await readdir(x.options.output)).sort()).toEqual(["EXPORT_FAILED", "owner.txt"]);
+    expect(await readFile(join(x.options.output, "owner.txt"), "utf8")).toBe("prior");
+    expect(await readFile(join(x.options.output, "EXPORT_FAILED"), "utf8")).toBe("");
+  } else await expect(lstat(x.options.output)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(x.stderr.join("")).toBe("Evidence export failed; any failed stage is retained.\nEXPORT_FINDING=snapshot_changed\n");
+});
+it("partial destination write rolls back its exclusive file", async () => {
+  const x = await exporterFixture(), fs = await import("node:fs/promises"), original = fs.open, originalWrite = fs.writeFile;
+  vi.spyOn(fs, "writeFile").mockImplementation(async (...args: Parameters<typeof fs.writeFile>) => {
+    if (String(args[0]).startsWith(x.options.output + "/")) { await originalWrite(args[0], "", args[2]); throw new Error("partial write"); }
+    return originalWrite(...args);
+  });
+  vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const fd = await original(...args);
+    if (String(args[0]).startsWith(x.options.output + "/") && args[1] === "wx") vi.spyOn(fd, "writeFile").mockImplementation(async () => { throw new Error("partial write"); });
+    return fd;
+  });
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL);
+  await expect(lstat(x.options.output)).rejects.toMatchObject({ code: "ENOENT" });
+});
+it("capture closes the file handle when its first stat fails", async () => {
+  const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
+  const receipt = JSON.parse(await readFile(x.options.receipt, "utf8")), fs = await import("node:fs/promises"), original = fs.open;
+  const closed = vi.fn();
+  vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const fd = await original(...args);
+    if (String(args[0]) === join(x.options.output, C.MANIFEST_FILENAME)) {
+      const close = fd.close.bind(fd);
+      vi.spyOn(fd, "close").mockImplementation(async () => { closed(); await close(); });
+      vi.spyOn(fd, "stat").mockRejectedValue(new Error("stat failed"));
+    }
+    return fd;
+  });
+  await expect(captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest)).rejects.toThrow("stat failed");
+  expect(closed).toHaveBeenCalledOnce();
+});
+it.each(["leading space", "CRLF", "two LF", "BOM", "no LF"])("trust key grammar handles %s", async kind => {
+  const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
+  const key = x.f.pack.public_key;
+  const text = kind === "leading space" ? " " + key : kind === "CRLF" ? key + "\r\n" : kind === "two LF" ? key + "\n\n" : kind === "BOM" ? "\ufeff" + key : key;
+  await writeFile(x.options.publicKeyFile, text); x.stdout.length = 0;
+  const receipt = JSON.parse(await readFile(x.options.receipt, "utf8")), output = join(x.root, "candidate.json");
+  expect(await runSnapshotTrustCommand(["--pack", x.options.output, "--public-key-file", x.options.publicKeyFile, "--expect-manifest-digest", receipt.manifest_digest, "--output", output], x.deps.io)).toBe(kind === "no LF" ? C.EXIT_PASS : C.EXIT_FAIL);
+  if (kind !== "no LF") { expect(x.stdout).toEqual([]); await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" }); }
+});
+
+it.each(["unlink", "rmdir"] as const)("stage %s failure reports finalization and retains committed pack", async operation => {
+  const x = await exporterFixture(), fs = await import("node:fs/promises");
+  vi.spyOn(fs, operation).mockRejectedValue(new Error("stage cleanup"));
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL);
+  expect(await readdir(x.options.output)).toContain(C.MANIFEST_FILENAME);
+  expect(x.stdout).toEqual([]);
+  expect(x.stderr.join("")).toBe("Evidence export finalization failed; committed pack retained.\nEXPORT_FINDING=io_error\n");
+});
+it.each(["com.apple.provenance ", " com.apple.quarantine"])("Darwin capture preserves metadata bytes %j", async name => {
+  const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
+  const receipt = JSON.parse(await readFile(x.options.receipt, "utf8"));
+  const { promisify } = await import("node:util"), platform = process.platform;
+  const execute = vi.fn(async () => ({ stdout: name + C.LF }));
+  vi.doMock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), execFile: Object.assign(vi.fn(), { [promisify.custom]: execute }) }));
+  try {
+    Object.defineProperty(process, "platform", { value: "darwin" }); vi.doUnmock("../../src/evidence-pack/snapshot-trust-cli.js"); vi.resetModules();
+    const adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js");
+    const capture = await adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
+    expect(capture.rootMetadata).toEqual([name]);
+    for (const file of capture.files) expect(file.metadata).toEqual([name]);
+    for (const call of execute.mock.calls as unknown as [string, string[]][]) expect(call).toEqual(["/usr/bin/xattr", [expect.any(String)], expect.any(Object)]);
+    expect(verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE).findings[0].code).toBe(C.HARD.unexpected_metadata);
+  } finally { Object.defineProperty(process, "platform", { value: platform }); vi.doUnmock("node:child_process"); vi.resetModules(); }
+});
+
+it("self check failure leaves no public key output", async () => {
+  const x = await exporterFixture();
+  x.deps.phase = async state => { if (state === "SELF_VERIFY") throw new Error("self check"); };
+  expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_FAIL);
+  await expect(lstat(x.options.publicKeyFile)).rejects.toMatchObject({ code: "ENOENT" });
 });

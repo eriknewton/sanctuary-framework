@@ -78,7 +78,9 @@ export async function exporterFixture() {
   const { join } = await import("node:path");
   const { tmpdir } = await import("node:os");
   const { exportDependencies } = await import("../../src/evidence-pack/snapshot-export-cli.js");
-  const f = fixture(); const root = await mkdtemp(join(tmpdir(), "snapshot-"));
+  // The exporter canonicalizes output paths, so the root is canonical too; on macOS tmpdir() is a symlink into /private.
+  const { realpath } = await import("node:fs/promises");
+  const f = fixture(); const root = await realpath(await mkdtemp(join(tmpdir(), "snapshot-")));
   const options = { fortress: join(root, "fortress"), output: join(root, "pack"), receipt: join(root, "receipt.json"), publicKeyFile: join(root, "key.txt") };
   const states: string[] = [], stdout: string[] = [], stderr: string[] = [];
   const identities = [f.pack, f.audit, f.secondAudit]; let cleanupCount = 0;

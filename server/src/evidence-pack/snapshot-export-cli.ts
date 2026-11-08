@@ -1,6 +1,6 @@
 /** Export lifecycle composition; all server imports resolve within this bundle. */
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, writeFile, lstat, unlink, rmdir } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, lstat, unlink, rmdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { createSanctuaryServer } from "../index.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -24,13 +24,21 @@ export interface ExportDependencies {
   io: CommandIO;
 }
 export const exportDependencies: ExportDependencies = { boot: createSanctuaryServer, gather: gatherSnapshot, runtimeRevision: SNAPSHOT_SOURCE_REVISION, buildRevision: SNAPSHOT_SOURCE_REVISION, phase: async () => {}, io: commandIO };
+const FAILED_DESTINATION_MARKER = "EXPORT_FAILED";
+async function reportExportFailure(io: CommandIO, message: string, error: unknown): Promise<void> {
+  // Only the closed codes from snapshot-contract.ts may cross the diagnostic boundary because errors can contain private paths.
+  const code = error instanceof C.SnapshotError && Object.values(C.HARD).includes(error.code) ? error.code : C.HARD.io_error;
+  await io.stderr(`${message}\nEXPORT_FINDING=${code}\n`);
+}
 export async function exportSnapshot(options: ExportOptions, deps: ExportDependencies = exportDependencies): Promise<number> {
   let instance: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
   let cleanupAttempted = false, stage: string | undefined, committed = false;
+  let createdDestination: string | undefined;
+  const createdFiles: string[] = [];
   const phase = async (state: ExportState) => deps.phase(state, stage);
   const oldStorage = process.env.SANCTUARY_STORAGE_PATH;
   try {
-    // Provenance is fixed by this bundle and a runtime value cannot relabel the artifact.
+    // Provenance is fixed by this bundle; runtime equality is a test seam because production uses the same build constant on both sides.
     C.text(deps.buildRevision, C.REVISION); C.requireSnapshot(deps.runtimeRevision === deps.buildRevision);
     const fortress = resolve(options.fortress), output = await canonicalOutput(options.output), receiptPath = await canonicalOutput(options.receipt), keyPath = await canonicalOutput(options.publicKeyFile);
     requireOutside(output, receiptPath); requireOutside(output, keyPath); C.requireSnapshot(receiptPath !== keyPath, C.HARD.unsafe_path);
@@ -43,12 +51,11 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     C.requireSnapshot(resolve(instance.config.storage_path) === fortress, C.HARD.unsafe_path);
     const signer = instance.identityManager.getDefault(); C.requireSnapshot(signer, C.HARD.pin_invalid);
     const generatedAt = new Date().toISOString(), exportId = randomUUID();
+    // Must match the storage root in src/index.ts because the boot result does not expose its storage object.
     const gathered: SnapshotGather = await deps.gather({ storage: new FilesystemStorage(join(fortress, "state")), masterKey: instance.masterKey, fortress, generatedAt, localSign: process.env.SANCTUARY_CASTLE_LOCAL_SIGN === "1" });
     await phase("BUILD_PUBLIC_TRUST");
     const identities = instance.identityManager.list().map(i => instance!.identityManager.get(i.identity_id)!);
     const trust = buildPublicTrust(signer, identities, gathered);
-    // The pin is written from the signing identity with exclusive creation, never read from delivered evidence.
-    await writeFile(keyPath, signer.public_key + C.LF, { flag: "wx", mode: PRIVATE_FILE_MODE });
     const fingerprint = C.manifestDigest(C.publicKey(signer.public_key));
     await phase("RENDER"); const files = renderSnapshot(exportId, generatedAt, gathered, trust);
     await phase("HASH"); const rows = hashSnapshotFiles(files);
@@ -60,16 +67,23 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     // The recipient verifier must accept the staged bytes before any destination is created.
     await phase("SELF_VERIFY"); const pins = { packKey: signer.public_key, descriptorBytes: trust, expectedManifestDigest: digest };
     const self = verifySnapshot(await captureSnapshotDirectory(stage, signer.public_key, digest), pins, deps.buildRevision);
-    C.requireSnapshot(self.status === C.STATUS.PASS || self.status === C.STATUS.PARTIAL, C.HARD.nested_invalid);
+    C.requireSnapshot(self.status === C.STATUS.PASS || self.status === C.STATUS.PARTIAL, self.findings[0]?.code ?? C.HARD.nested_invalid);
+    // The pin is written from the signing identity with exclusive creation, never read from delivered evidence.
+    await writeFile(keyPath, signer.public_key + C.LF, { flag: "wx", mode: PRIVATE_FILE_MODE });
     // Cleanup must finish successfully before the pack can become a committed delivery.
     await phase("CLEANUP"); cleanupAttempted = true; await instance.cleanup();
     await phase("COMMIT");
     // Exclusive directory creation closes the absent-check race and never replaces an existing destination.
-    await mkdir(output, { mode: PRIVATE_DIRECTORY_MODE });
+    await mkdir(output, { mode: PRIVATE_DIRECTORY_MODE }); createdDestination = output;
     // Use verified in-memory bytes and exclusive creates so a late writer cannot be overwritten.
-    for (const [name, bytes] of files) await writeFile(join(output, name), bytes, { flag: "wx", mode: PRIVATE_FILE_MODE });
+    for (const [name, bytes] of files) {
+      const path = join(output, name), fd = await open(path, "wx", PRIVATE_FILE_MODE);
+      // Record exclusive ownership before writing so even a partial write is eligible for rollback.
+      createdFiles.push(path);
+      try { await fd.writeFile(bytes); } finally { await fd.close(); }
+    }
     const final = verifySnapshot(await captureSnapshotDirectory(output, signer.public_key, digest), pins, deps.buildRevision);
-    C.requireSnapshot(final.status === self.status, C.HARD.snapshot_changed); committed = true;
+    C.requireSnapshot(final.status === self.status, final.findings[0]?.code ?? C.HARD.snapshot_changed); committed = true;
     for (const name of files.keys()) await unlink(join(stage, name));
     await rmdir(stage);
     await phase("RECEIPT");
@@ -78,12 +92,24 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     await writeFile(receiptPath, snapshotJSON(receipt), { flag: "wx", mode: PRIVATE_FILE_MODE });
     await deps.io.stdout(`EXPORT_ID=${exportId}\nMANIFEST_DIGEST=${digest}\nEXPORT_STATUS=${self.status}\nPACK_KEY_FINGERPRINT=${fingerprint}\n`);
     return self.exit_code;
-  } catch {
-    await deps.io.stderr(committed ? "Receipt failed; committed pack retained.\n" : "Evidence export failed; any failed stage is retained.\n");
+  } catch (error) {
+    if (createdDestination && !committed) {
+      // Rollback removes only this export's exclusive creations and never recursively removes a destination with concurrent content.
+      for (const path of createdFiles) { try { await unlink(path); } catch { /* A remaining file prevents rmdir below. */ } }
+      try { await rmdir(createdDestination); }
+      catch {
+        // Exclusive labeling preserves any concurrent marker while making an incomplete delivery recognizable.
+        try { await writeFile(join(createdDestination, FAILED_DESTINATION_MARKER), "", { flag: "wx", mode: PRIVATE_FILE_MODE }); }
+        catch { /* A missing or unwritable destination cannot accept the fixed marker. */ }
+      }
+    }
+    if (instance && !cleanupAttempted) {
+      try { await instance.cleanup(); } catch { /* Preserve the original closed failure code. */ }
+    }
+    await reportExportFailure(deps.io, committed ? "Evidence export finalization failed; committed pack retained." : "Evidence export failed; any failed stage is retained.", error);
     return C.EXIT_FAIL;
   } finally {
-    try { if (instance && !cleanupAttempted) await instance.cleanup(); }
-    finally { if (oldStorage === undefined) delete process.env.SANCTUARY_STORAGE_PATH; else process.env.SANCTUARY_STORAGE_PATH = oldStorage; }
+    if (oldStorage === undefined) delete process.env.SANCTUARY_STORAGE_PATH; else process.env.SANCTUARY_STORAGE_PATH = oldStorage;
   }
 }
 export async function runSnapshotExportCommand(argv: string[], deps: ExportDependencies = exportDependencies): Promise<number> {
@@ -93,5 +119,5 @@ export async function runSnapshotExportCommand(argv: string[], deps: ExportDepen
   try { flags = parseSnapshotFlags(argv, ["--fortress", "--output", "--receipt", "--public-key-file"]); }
   catch { await deps.io.stderr(help); return C.EXIT_USAGE; }
   try { return await exportSnapshot({ fortress: flags["--fortress"], output: flags["--output"], receipt: flags["--receipt"], publicKeyFile: flags["--public-key-file"] }, deps); }
-  catch { await deps.io.stderr("Evidence export cleanup failed.\n"); return C.EXIT_FAIL; }
+  catch (error) { await reportExportFailure(deps.io, "Evidence export cleanup failed.", error); return C.EXIT_FAIL; }
 }

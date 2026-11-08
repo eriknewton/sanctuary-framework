@@ -113,6 +113,13 @@ it("registered CLI argv commits a real temporary fortress with in-memory credent
   const result = verifySnapshot(await captureSnapshotDirectory(output, who.public_key, r.manifest_digest), { packKey: who.public_key, descriptorBytes: descriptor, expectedManifestDigest: r.manifest_digest }, SOURCE);
   expect(result).toMatchObject({ status: "PARTIAL", exit_code: 10, accepted: false });
   expect(stdout.join("")).toBe(`EXPORT_ID=${r.export_id}\nMANIFEST_DIGEST=${r.manifest_digest}\nEXPORT_STATUS=PARTIAL\nPACK_KEY_FINGERPRINT=${r.pack_key_fingerprint}\n`);
+  vi.resetModules(); exits.length = 0; stdout.length = 0;
+  const candidate = join(root, "candidate.json");
+  process.argv = [process.execPath, resolve("src/cli.ts"), "export-evidence-trust", "--pack", output, "--public-key-file", key, "--expect-manifest-digest", r.manifest_digest, "--output", candidate];
+  try { await (await import("../../src/cli.js")).cliEntryInvocation; } finally { process.argv = original; }
+  expect(exits).toEqual([0]);
+  expect(stdout.join("")).toBe(`TRUST_DESCRIPTOR_SHA256=${r.trust_descriptor_sha256}\n`);
+  expect(await readFile(candidate)).toEqual(await readFile(join(output, C.TRUST_FILENAME)));
 }, 60_000);
 
 it("writable Castle pin is unavailable as authenticated authority", async () => {

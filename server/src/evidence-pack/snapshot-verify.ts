@@ -12,12 +12,16 @@ function capturedName(name: Uint8Array): string {
 }
 function nameKey(name: Uint8Array): string { capturedName(name); return Buffer.from(name).toString("hex"); }
 function fileName(file: C.CapturedFile): string { return capturedName(file.name); }
+function checkMetadata(names: readonly string[]): void {
+  // These OS or download labels are involuntary, cannot be removed by unprivileged processes on current macOS and carry no pack content, so admitting only the exact names in snapshot-contract.ts preserves the signed file-byte claim.
+  C.requireSnapshot(names.every(name => C.OS_ATTACHED_METADATA.includes(name)), C.HARD.unexpected_metadata);
+}
 function checkType(file: C.CapturedFile): void {
   C.validateCapturedStat(file.before); C.validateCapturedStat(file.after);
   // Type and metadata observations are mandatory evidence supplied by the future no-follow adapter.
   C.requireSnapshot(file.before.type === C.FILE_TYPE.file && file.after.type === C.FILE_TYPE.file, C.HARD.file_type_invalid);
   C.requireSnapshot(file.before.nlink === 1 && file.after.nlink === 1, C.HARD.file_type_invalid);
-  C.requireSnapshot(file.metadata.length === 0, C.HARD.unexpected_metadata);
+  checkMetadata(file.metadata);
 }
 export interface CandidateDescriptor { candidateDescriptorBytes: Uint8Array; keysAuthenticated: false }
 export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifierSourceRevision: string): C.VerificationResult {
@@ -40,14 +44,15 @@ function inspectSnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifi
   let state: C.ProtocolState = C.STATES.ARGUMENTS; let exportId: string | null = null; let digest: string | null = null;
   let filename: string | null = null;
   const nested: C.VerificationResult["nested"] = { audit: null, transparency: null };
-  const resultBase = { format: C.RESULT_FORMAT, verifier_source_revision: verifierSourceRevision, not_checked: C.NOT_CHECKED } as const;
+  const resultBase = { format: C.RESULT_FORMAT, verifier_source_revision: verifierSourceRevision, not_checked: [...C.NOT_CHECKED] as string[] } as const;
   try {
     C.text(pins.expectedManifestDigest, C.DIGEST); C.text(verifierSourceRevision, C.REVISION);
     state = C.STATES.PIN_INPUTS; const descriptor = validateSnapshotPins(pins);
     state = C.STATES.MANIFEST_BYTES; C.cap(capture.files.length, C.MAX_FILES);
+    if ([capture.rootMetadata, ...capture.files.map(file => file.metadata)].some(names => names.some(name => C.OS_ATTACHED_METADATA.includes(name)))) resultBase.not_checked.push(C.OS_ATTACHED_METADATA_NOT_CHECKED);
     C.validateCapturedStat(capture.rootBefore); C.validateCapturedStat(capture.rootAfter);
     C.requireSnapshot(capture.rootBefore.type === C.FILE_TYPE.directory && capture.rootAfter.type === C.FILE_TYPE.directory, C.HARD.file_type_invalid);
-    C.requireSnapshot(capture.rootMetadata.length === 0, C.HARD.unexpected_metadata);
+    checkMetadata(capture.rootMetadata);
     const manifests = capture.files.filter(f => nameKey(f.name) === nameKey(C.utf8(C.MANIFEST_FILENAME))); C.requireSnapshot(manifests.length === 1, C.HARD.file_set_mismatch);
     const mf = manifests[0]; filename = C.MANIFEST_FILENAME; checkType(mf); const raw = C.parseManifestEnvelope(mf.bytes);
     state = C.STATES.MANIFEST_AUTHENTICATED;

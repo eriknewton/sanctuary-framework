@@ -5,7 +5,7 @@ export const SNAPSHOT_EXTENSIONS: Readonly<Record<string, readonly string[]>> = 
   "model-recorder-v0": Object.freeze(["extension:model-recorder-policy-v0", "extension:model-recorder-session-v0", "extension:model-recorder-extent-v0", "extension:model-recorder-v0"]),
 });
 export function extensionRolesAllowed(id: string, roles: readonly string[]): boolean {
-  // Unknown handlers remain incomplete, while registered handlers cannot claim another role's authority.
-  const allowed = Object.hasOwn(SNAPSHOT_EXTENSIONS, id) ? SNAPSHOT_EXTENSIONS[id] : undefined;
-  return roles.length > 0 && new Set(roles).size === roles.length && (!allowed || roles.every(role => allowed.includes(role)));
+  // A registered handler may claim only its own role set, and an unregistered id only its own "extension:<id>" role, so no id can cite a pin issued for a registered handler.
+  const allowed = Object.hasOwn(SNAPSHOT_EXTENSIONS, id) ? SNAPSHOT_EXTENSIONS[id] : [`extension:${id}`];
+  return roles.length > 0 && new Set(roles).size === roles.length && roles.every(role => allowed.includes(role));
 }
