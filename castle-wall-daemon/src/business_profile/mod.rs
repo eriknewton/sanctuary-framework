@@ -166,10 +166,10 @@ mod tests {
             );
         }
     }
-    // Must match PINNED_KID_VECTOR in server/test/structure/k1-role-signing-boundaries.test.ts, computed by TypeScript
-    // roleKid over 32 bytes of 0x07 at epoch 2 for the producer role.
-    const PINNED_KID: &str =
-        "k1:sha256:e09fa5a1f32e54219ade30b8ee6b5cb8367089d6a6aedfad3bf8c875b08fb411";
+    // Must match PINNED_KID_VECTOR in server/test/structure/k1-role-signing-boundaries.test.ts, which reads these same
+    // file bytes: TypeScript roleKid over 32 bytes of 0x07 at epoch 2 for the producer role. Both languages compare an
+    // executed kid computation with one shared file, so no test parses Rust source text to find the pin.
+    const PINNED_KID: &str = include_str!("pinned_kid.txt");
     #[test]
     fn kid_encoding_uses_canonical_order() {
         let role = ROLE_REGISTRY[0].0;

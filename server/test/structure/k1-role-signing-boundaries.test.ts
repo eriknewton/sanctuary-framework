@@ -55,16 +55,15 @@ it("pins every evaluated primitive including a derived frame bound", () => {
   expect(actual).toEqual(expected);
   expect(readFileSync(join(root, "server/src/signing/contract.ts"), "utf8")).toContain("SIGNER_HEADER_MAX_BYTES + SIGNER_PREIMAGE_MAX_BYTES + 4");
 });
-// Must match PINNED_KID in castle-wall-daemon/src/business_profile/mod.rs, where Rust role_kid evaluates the same inputs.
+// Must match castle-wall-daemon/src/business_profile/pinned_kid.txt, which the Rust PINNED_KID in mod.rs includes and checks against role_kid over the same inputs.
 const PINNED_KID_VECTOR = {role: ROLE_REGISTRY[0].role, epoch: 2, public_key: Buffer.alloc(32, 7).toString("base64url"),
   kid: "k1:sha256:e09fa5a1f32e54219ade30b8ee6b5cb8367089d6a6aedfad3bf8c875b08fb411"};
 it("evaluates the pinned canonical kid vector shared with Rust and keeps vectors crate-local", () => {
   expect(runtimeContract.roleKid(PINNED_KID_VECTOR.role, PINNED_KID_VECTOR.epoch, PINNED_KID_VECTOR.public_key)).toBe(PINNED_KID_VECTOR.kid);
   const source = readFileSync(join(root, "castle-wall-daemon/src/business_profile/mod.rs"), "utf8");
-  // Comments are stripped and exactly one live declaration must match, so a commented-out copy cannot satisfy the pin.
-  const live = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  const declarations = [...live.matchAll(/^\s*const PINNED_KID: &str =\s*"([^"]+)";/gm)].map(match => match[1]);
-  expect(declarations).toEqual([PINNED_KID_VECTOR.kid]);
+  // The Rust test compares its executed role_kid with these exact file bytes through include_str!, so reading the file,
+  // never parsing Rust source text, ties both languages to one value that a comment cannot hide or replace.
+  expect(readFileSync(join(root, "castle-wall-daemon/src/business_profile/pinned_kid.txt"), "utf8")).toBe(PINNED_KID_VECTOR.kid);
   expect(source).not.toContain("../../../server/");
 });
 it("keeps every K1 signing domain prefix-free so a domain match cannot select the wrong lifecycle body", () => {
