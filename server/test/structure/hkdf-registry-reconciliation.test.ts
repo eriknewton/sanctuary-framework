@@ -175,6 +175,9 @@ describe("HKDF label registry reconciliation", () => {
   it("sanity: the scan and the classification both found a meaningful set", () => {
     expect(scanned.size).toBeGreaterThan(40);
     expect(classified.size).toBeGreaterThan(60);
+    expect(classification.labels.find(row => row.label === "producer-custody-binding-v1")).toMatchObject({
+      class: "decryptable-store", fixture: true, fixture_via: "producer-custody-binding.test.ts",
+    });
   });
 
   it("every label found by the code scan is in the committed classification", () => {

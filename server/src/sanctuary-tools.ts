@@ -34,6 +34,7 @@ import { createIdentity } from "./core/identity.js";
 import { generateSHR, type ReputationEvidence } from "./shr/generator.js";
 import { gatherReputationEvidence } from "./shr/tools.js";
 import type { ReputationStore } from "./reputation/reputation-store.js";
+import { assertAdmissibleIdentityLabel } from "./signing/reserved-label.js";
 
 export interface SanctuaryToolsOptions {
   config: SanctuaryConfig;
@@ -152,6 +153,8 @@ export function createSanctuaryTools(
       },
       handler: async (args) => {
         const label = (args.label as string) || "sovereign-agent";
+        // Reserved role labels refuse new admission before key generation, storage or the bootstrap audit.
+        assertAdmissibleIdentityLabel(label);
         const publish = args.publish === undefined ? true : Boolean(args.publish);
         const verascoreUrl =
           (args.verascore_url as string) || config.verascore.url || "https://verascore.ai";

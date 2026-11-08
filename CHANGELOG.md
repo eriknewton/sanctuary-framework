@@ -8,8 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - Added a private offline evidence snapshot verifier candidate, explicit capture diagnostics, fresh build outputs, artifact provenance, recipient instructions and a synthetic second-Mac drill procedure.
 
-- Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
+- Added an isolated per-role record-signing contract and an encrypted key-provider with test fixtures. Nothing is wired into the daemon, a service or any existing export yet.
 
+- Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
 - Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)

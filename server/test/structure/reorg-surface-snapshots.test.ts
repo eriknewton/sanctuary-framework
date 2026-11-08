@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds a negative guard that the role-signing contract registers no MCP tool; no such tool exists before this change either, so the guard passes against pre-change source by construction and pins the absence going forward.
 /**
  * Reorg surface snapshots — MCP tools/list wire shape + operation-policy tiers.
  *
@@ -185,6 +186,8 @@ describe("reorg surface snapshot: MCP tools/list wire shape", () => {
       passphrase: "snapshot-harness-deterministic-v1",
     });
     const names = (await listToolWire(server)).map((t) => t.name);
+    // Contract fixtures must not add a role signer to the existing tool catalog.
+    expect(names.filter(name => /^(k1_|role_sign|record_sign)/.test(name))).toEqual([]);
     const dupes = names.filter((n, i) => names.indexOf(n) !== i);
     expect(dupes, `duplicate tool names: ${dupes.join(", ")}`).toEqual([]);
   });

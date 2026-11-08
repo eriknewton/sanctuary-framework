@@ -23,6 +23,7 @@ import { createIdentity } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { withCliMasterKeySession, resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
+import { assertAdmissibleIdentityLabel } from "../signing/reserved-label.js";
 import {
   consumeFlagValue,
   flagValue,
@@ -294,6 +295,9 @@ async function cmdCreate(
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
   const label = flagValue(argv, "--label")?.trim() || "operator";
+  // Reserved role labels refuse new admission before custody resolution, storage writes or identity generation.
+  try { assertAdmissibleIdentityLabel(label); }
+  catch (error) { write(err, `Error: ${(error as Error).message}\n`); return 1; }
 
   // Resolve fortress path: --fortress flag > env > default.
   // loadConfig() reads process.env.SANCTUARY_STORAGE_PATH directly.
