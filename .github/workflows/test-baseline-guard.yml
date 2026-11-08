@@ -251,7 +251,8 @@ jobs:
           # test files; npm ci (the head's lockfile), npm run build and npm run
           # typecheck (the head's package scripts); scripts/gate2b-check.sh and
           # scripts/gate2b-self-test.sh; scripts/redact-test-output.mjs and
-          # scripts/redact-test-output-self-test.mjs;
+          # scripts/redact-test-output-self-test.mjs; cargo build with
+          # castle-wall-daemon/Cargo.lock, build scripts and proc-macros;
           # scripts/ci/retry-with-timeout.sh; the local actions under
           # .github/actions/; and this workflow file itself (GitHub runs the
           # head's workflow on pull_request). Reading the helper from the base

@@ -94,17 +94,13 @@ fn local_revocation_removes_authority_before_reaping() {
 
 #[test]
 fn cleanup_acknowledgement_does_not_renew_kill_deadline() {
-    use castle_wall_daemon::business_profile::{
-        signer_service::wipe_deadline,
-        signer_watchdog::{State, NS_PER_SECOND},
-    };
+    use castle_wall_daemon::business_profile::signer_service::Settlement;
+    let mut settlement = Settlement::default();
     let now = NS_PER_SECOND;
-    let deadline = now + NS_PER_SECOND;
-    assert_eq!(wipe_deadline(State::Unlocking, now, 0), deadline);
-    assert_eq!(
-        wipe_deadline(State::Locking, deadline + 1, deadline),
-        deadline
-    );
+    settlement.acknowledge(State::Unlocking, now);
+    let deadline = settlement.deadline();
+    settlement.lock(State::Locking, now + NS_PER_SECOND);
+    assert_eq!(settlement.deadline(), deadline);
 }
 
 #[test]
@@ -146,7 +142,8 @@ fn lifecycle_cap_counts_backlog_while_lock_is_accepted() {
     let listener = signer_peer::listen(&path).unwrap();
     let ceremony = signer_peer::connect(&path).unwrap();
     let accepted = signer_peer::accept(listener.as_raw_fd()).unwrap();
-    assert!(!seal_lifecycle_backlog(listener.as_raw_fd(), 1).unwrap());
+    // Probe empty, then connect before the final accept to exercise the admission race.
+    assert!(!castle_wall_daemon::business_profile::signer_service::readable(listener.as_raw_fd()));
     let lock = signer_peer::connect(&path).unwrap();
     assert!(seal_lifecycle_backlog(listener.as_raw_fd(), LIFECYCLE_CONNECTIONS_MAX - 1).unwrap());
     let control = signer_peer::accept(listener.as_raw_fd()).unwrap();
@@ -158,4 +155,120 @@ fn lifecycle_cap_counts_backlog_while_lock_is_accepted() {
     let next = signer_peer::connect(&path).unwrap();
     let admitted = signer_peer::accept(reopened.as_raw_fd()).unwrap();
     drop((ceremony, accepted, next, admitted));
+}
+
+#[test]
+fn seeded_worker_settlement_schedules_preserve_custody() {
+    use castle_wall_daemon::business_profile::signer_service::Settlement;
+    const SEEDS: u64 = 4096;
+    const STEPS: usize = 64;
+    #[derive(Clone, Copy)]
+    enum Event {
+        Ready,
+        Wiped,
+        Lock,
+        Fault,
+        ExitSuccess,
+        Kill,
+        Signed,
+    }
+    const EVENTS: [Event; 9] = [
+        Event::Ready,
+        Event::Wiped,
+        Event::Wiped,
+        Event::Lock,
+        Event::Lock,
+        Event::Fault,
+        Event::ExitSuccess,
+        Event::Kill,
+        Event::Signed,
+    ];
+    const NS_PER_MS: u64 = NS_PER_SECOND / 1000;
+    const TICK_BOUNDARIES: u64 = 3;
+    const XORSHIFT_LEFT_FIRST: u32 = 13;
+    const XORSHIFT_RIGHT: u32 = 7;
+    const XORSHIFT_LEFT_LAST: u32 = 17;
+    for seed in 0..SEEDS {
+        let mut random = seed + 1;
+        let mut lease = Lease::default();
+        assert!(lease.begin(0, 300));
+        let mut settlement = Settlement::default();
+        let mut acks = 0;
+        let mut fault = false;
+        let mut revoked = false;
+        let mut now = 0;
+        for _ in 0..STEPS {
+            random ^= random << XORSHIFT_LEFT_FIRST;
+            random ^= random >> XORSHIFT_RIGHT;
+            random ^= random << XORSHIFT_LEFT_LAST;
+            now += (random % TICK_BOUNDARIES) * WATCHDOG_TICK_MS as u64 * NS_PER_MS;
+            let before = settlement.deadline();
+            match EVENTS[random as usize % EVENTS.len()] {
+                Event::Ready => {
+                    if !lease.ready(now) {
+                        settlement.fault(now);
+                        fault = true;
+                        lease.revoke();
+                        revoked = true;
+                    }
+                }
+                Event::Wiped => {
+                    acks += 1;
+                    fault |= acks != 1 || !matches!(lease.state, State::Unlocking | State::Locking);
+                    settlement.acknowledge(lease.state, now);
+                    lease.revoke();
+                    revoked = true;
+                }
+                Event::Lock => {
+                    settlement.lock(lease.state, now);
+                    lease.revoke();
+                    revoked = true;
+                }
+                Event::Fault => {
+                    settlement.fault(now);
+                    fault = true;
+                    lease.revoke();
+                    revoked = true;
+                }
+                Event::Signed => {
+                    assert!(!revoked || !lease.can_sign(now), "seed {seed}");
+                }
+                event @ (Event::ExitSuccess | Event::Kill) => {
+                    let success = matches!(event, Event::ExitSuccess);
+                    assert_eq!(
+                        settlement.cooperative(success),
+                        acks == 1 && !fault && success,
+                        "seed {seed}"
+                    );
+                    lease.revoke();
+                    revoked = true;
+                    lease.reaped(settlement.cooperative(success));
+                    if lease.state == State::Wiped {
+                        assert!(acks == 1 && !fault && success);
+                    }
+                }
+            }
+            if let Some(previous) = before {
+                assert!(settlement.deadline().unwrap() <= previous, "seed {seed}");
+            }
+            if revoked {
+                assert!(!lease.can_sign(now), "seed {seed}");
+            }
+        }
+    }
+}
+
+#[test]
+fn final_slot_seals_even_without_a_readable_probe() {
+    use castle_wall_daemon::business_profile::{signer_peer, signer_service};
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lifecycle.sock");
+    let listener = signer_peer::listen(&path).unwrap();
+    let first = signer_peer::connect(&path).unwrap();
+    let accepted = signer_peer::accept(listener.as_raw_fd()).unwrap();
+    assert!(!signer_service::readable(listener.as_raw_fd()));
+    assert!(signer_service::seal_lifecycle_backlog(listener.as_raw_fd(), 1).unwrap());
+    assert!(signer_peer::connect(&path).is_err());
+    drop((first, accepted));
 }

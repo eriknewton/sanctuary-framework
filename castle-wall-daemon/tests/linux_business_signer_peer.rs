@@ -102,8 +102,10 @@ fn root_real_uid_refuses() {
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     assert_eq!(status, 0);
-    if let Ok(packet) = receive(a.as_raw_fd(), 32) {
-        assert!(!peer.matches(&packet));
+    assert!(castle_wall_daemon::business_profile::signer_service::readable(a.as_raw_fd()));
+    match receive(a.as_raw_fd(), 32) {
+        Ok(packet) => assert!(!peer.matches(&packet)),
+        Err(error) => assert_eq!(error.to_string(), "K1_REFUSED"),
     }
 }
 #[test]
@@ -119,8 +121,10 @@ fn passed_socket_from_another_process_refuses() {
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     assert_eq!(status, 0);
-    if let Ok(packet) = receive(a.as_raw_fd(), 32) {
-        assert!(!peer.matches(&packet));
+    assert!(castle_wall_daemon::business_profile::signer_service::readable(a.as_raw_fd()));
+    match receive(a.as_raw_fd(), 32) {
+        Ok(packet) => assert!(!peer.matches(&packet)),
+        Err(error) => assert_eq!(error.to_string(), "K1_REFUSED"),
     }
 }
 
@@ -180,4 +184,26 @@ fn retained_bounding_capabilities_refuse_peer_admission() {
     if u64::from_str_radix(bnd.trim(), 16).unwrap() != 0 {
         assert!(empty_capabilities(unsafe { libc::getpid() }, true).is_err());
     }
+}
+
+#[test]
+fn service_capability_status_requires_every_empty_set_and_no_new_privileges() {
+    // Captured status field layout is parsed by the same function as service accept admission.
+    const EMPTY: &str = "Name:\tsigner\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n";
+    assert!(validate_capability_status(EMPTY, true).is_ok());
+    for field in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+        let fixture = EMPTY.replace(
+            &format!("{field}:\t0000000000000000"),
+            &format!("{field}:\t0000000000000001"),
+        );
+        assert!(
+            validate_capability_status(&fixture, true).is_err(),
+            "{field}"
+        );
+    }
+    assert!(validate_capability_status(&EMPTY.replace("NoNewPrivs:\t1\n", ""), true).is_err());
+    assert!(
+        validate_capability_status(&EMPTY.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"), true)
+            .is_err()
+    );
 }

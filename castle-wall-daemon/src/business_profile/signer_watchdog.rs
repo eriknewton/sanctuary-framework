@@ -4,6 +4,7 @@ use std::io;
 use std::process::Child;
 
 pub const NS_PER_SECOND: u64 = 1_000_000_000;
+// Must match attendance.test.ts kill bound: launcher startup plus reap is measured in watchdog ticks.
 pub const WATCHDOG_TICK_MS: i32 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {

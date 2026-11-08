@@ -106,7 +106,8 @@ class ReadOnlyStore implements StorageBackend {
     } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; return refuse(); }
     finally { if (file !== undefined) closeSync(file); if (directory !== undefined) closeSync(directory); }
   }
-  async write(): Promise<void> { return refuse(); }
+  // must match refuse() in contract.ts.
+  async write(): Promise<void> { throw new Error("K1_REFUSED"); }
   async delete(): Promise<boolean> { return refuse(); }
   async list(): Promise<never> { return refuse(); }
   async exists(): Promise<boolean> { return refuse(); }
@@ -141,7 +142,7 @@ async function main(): Promise<void> {
     for (;;) {
       const request = frame();
       if (Object.keys(request.header).sort().join(",") === "op,preimage_length" && request.header.op === "LOCK" && request.body.length === 0) {
-        signer.close(); signer = undefined; writeSync(STDOUT_FD, publicFrame({op: "WIPED"})); return;
+        return;
       }
       const {header, preimage} = decodeSignerFrame(request.bytes);
       if (header.activation_id !== config.grant.activation_id || header.lease_id !== config.grant.lease_id || header.generation !== config.grant.generation) return refuse();
@@ -151,7 +152,8 @@ async function main(): Promise<void> {
   } finally { signer?.close(); key?.fill(0); master?.fill(0); plain?.fill(0); store.close(); }
 }
 // The release entrypoint accepts no argv, environment credential, injected callback or caller challenge.
-void main().then(() => process.exit(0), () => {
+const acknowledgeWipe = () => {
   // main has wiped owned buffers before this acknowledgement; native reaping closes immutable library copies.
   writeSync(STDOUT_FD, publicFrame({op: "WIPED"})); process.exit(0);
-});
+};
+void main().then(acknowledgeWipe, acknowledgeWipe);

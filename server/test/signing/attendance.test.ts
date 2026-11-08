@@ -1,3 +1,4 @@
+// fail-before-exempt: Native process and terminal absence witnesses use separately rebuilt Rust base binaries; the server-only source swap cannot exercise their enforcement sites.
 import { describe,it as test,expect } from "vitest";
 // Linux native witnesses require kernel credentials and built harness artifacts.
 const it = process.platform === "linux" ? test : test.skip;
@@ -66,7 +67,17 @@ it("Linux only: reserved LOCK slot kills an UNLOCKING worker before READY",async
     ceremony=f.ceremonyHeld();
     for(let i=0;i<500&&!f.trace.promptSeen;i++)await new Promise(resolve=>setTimeout(resolve,10));
     expect(f.trace.promptSeen).toBe(true);expect((await f.client.status()).state).toBe("UNLOCKING");
-    const before=Date.now();expect(await f.ceremony(true)).toBe(0);expect(Date.now()-before).toBeLessThan(1500);
+    const workerPid=f.workerPid();expect(workerPid).toBeGreaterThan(0);
+    // Must match signer_watchdog WATCHDOG_TICK_MS: the bound includes launcher startup and one reap tick.
+    const tick=Number(readFileSync("../castle-wall-daemon/src/business_profile/signer_watchdog.rs","utf8").match(/WATCHDOG_TICK_MS: i32 = (\d+)/)![1]);
+    const launcherAndReapTicks=150;
+    const before=performance.now();expect(await f.lockImmediate()).toBe(0);
+    while(performance.now()-before < tick*launcherAndReapTicks){
+      try{process.kill(workerPid,0);}catch{break;}
+      await new Promise(resolve=>setTimeout(resolve,tick));
+    }
+    expect(()=>process.kill(workerPid,0)).toThrow();
+    expect(performance.now()-before).toBeLessThan(tick*launcherAndReapTicks);
     expect(await ceremony).toBe(1);expect((await f.client.status()).state).toBe("WIPE_UNCONFIRMED");
   }finally{await f.close();await ceremony?.catch(()=>undefined);}
 },45_000);
@@ -87,5 +98,43 @@ test.skipIf(process.platform !== "linux" || process.env.SANCTUARY_K1_ROOT_UNIT_D
     const signed=await f.client.signRecord({role:g.role,epoch:g.epoch,preimage_bytes:bytes},g,deadline());
     expect(verifyRecord(bytes,signed.signature,f.grant,INERT_COUNTER_SCHEMA,INERT_RECORD_KIND)).toBe(true);
     expect(await f.ceremony(true)).toBe(0);
+  }finally{await f.close();}
+},45_000);
+
+it("Linux only: LOCK restores terminal after a worker repeatedly switches raw mode",async()=>{
+  const source = `const fs=require('node:fs'); const tty=require('node:tty'); const terminal=new tty.ReadStream(3); terminal.setRawMode(true); fs.writeSync(3,'K1 passphrase:'); setInterval(()=>{terminal.setRawMode(false);terminal.setRawMode(true);},1);`;
+  const f=await serviceFixture("fixture ",false,source);let ceremony:Promise<number|null>|undefined;
+  try{
+    ceremony=f.ceremonyHeld();
+    for(let i=0;i<500&&!f.trace.promptSeen;i++)await new Promise(resolve=>setTimeout(resolve,10));
+    expect(f.trace.promptSeen).toBe(true);
+    expect(await f.ceremony(true)).toBe(0);expect(await ceremony).toBe(1);
+    expect(f.trace.terminalRestored).toBe(true);
+  }finally{await f.close();await ceremony?.catch(()=>undefined);}
+},45_000);
+
+it("Linux only: seeded cleanup and fault frames never launder the durable marker",async()=>{
+  const seeds=8;
+  for(let seed=0;seed<seeds;seed++){
+    const fault = seed % 4;
+    const source=`const fs=require('node:fs'); const frame=op=>{const b=Buffer.from(JSON.stringify({op}));const n=Buffer.alloc(4);n.writeUInt32BE(b.length);return Buffer.concat([n,b]);}; process.stdin.once('data',()=>{setTimeout(()=>{fs.writeSync(1,Buffer.concat([frame('WIPED'),${fault===0?"frame('WIPED')":fault===1?"frame('FAULT')":fault===2?"Buffer.from([0])":"Buffer.alloc(0)"}])); ${fault===3?"fs.writeSync(2,'fault');":""} process.exit(0);},${seed});});`;
+    const f=await serviceFixture("fixture ",false,source);
+    try{
+      expect(await f.ceremony()).toBe(1);
+      expect((await f.client.status()).state).toBe("WIPE_UNCONFIRMED");
+      await f.restart();expect((await f.client.status()).state).toBe("RECOVERY_REQUIRED");
+    }finally{await f.close();}
+  }
+},180_000);
+it("Linux only: reaping replies to an in-flight signer before the bridge deadline",async()=>{
+  const source=`const fs=require('node:fs'); let ready=false; process.stdin.on('data',()=>{if(ready)process.exit(0);ready=true;const body=Buffer.from('{"op":"READY"}');const size=Buffer.alloc(4);size.writeUInt32BE(body.length);fs.writeSync(1,Buffer.concat([size,body]));});`;
+  const f=await serviceFixture("fixture ",false,source);
+  try{
+    expect(await f.ceremony()).toBe(0);const workerPid=f.workerPid();const {g,bytes}=await f.body();const end=deadline();
+    const reapBudgetMs=250;
+    const before=performance.now();
+    await expect(f.client.signRecord({role:g.role,epoch:g.epoch,preimage_bytes:bytes},g,end)).rejects.toThrow("K1_REFUSED");
+    expect(performance.now()-before).toBeLessThan(reapBudgetMs);
+    expect(()=>process.kill(workerPid,0)).toThrow();
   }finally{await f.close();}
 },45_000);

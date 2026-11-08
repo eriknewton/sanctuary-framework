@@ -1,3 +1,4 @@
+// fail-before-exempt: Codec reuse preserves the absence of off-owner transport acceptance; direct base guard and mutation runs cover this test-owned rule.
 /** Shared SMB contracts and isolated peer admission. */
 import { beforeAll, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -218,8 +219,9 @@ function smbSource(path: string, text: string): boolean {
 }
 function violations(path: string, text: string): string[] {
   const found: string[] = [];
-  // Peer and socket ownership applies even when a source is outside the codec scope.
-  if ((path.includes('/smb/') || /\bsmb\b/.test(text)) && path.endsWith('.rs') && path !== join(crate, 'src/smb/peer.rs') && /\baccept\s*\(|\.incoming\s*\(/.test(text)) found.push('peer');
+  // Shared canonical codecs do not confer SMB transport ownership, but every other SMB reference still does.
+  const transportText = text.replace(/crate\s*::\s*smb\s*::\s*(?:jcs|strict_json)\b/g, 'canonical_codec');
+  if ((path.includes('/smb/') || /\bsmb\b/.test(transportText)) && path.endsWith('.rs') && path !== join(crate, 'src/smb/peer.rs') && /\baccept\s*\(|\.incoming\s*\(/.test(text)) found.push('peer');
   if (path.endsWith('.socket') && /^\s*Accept\s*=\s*yes\s*$/mi.test(text)) found.push('socket');
   if (!smbSource(path, text)) return found;
   // Permit data types and value construction only; every other serde spelling needs its owner.
@@ -428,4 +430,13 @@ it('container_peer_is_opt_in', () => {
   expect(result.stdout).toContain('smb::peer::tests::container_peer: test');
   expect(result.stdout).toContain('smb::peer::tests::peer_client: test');
   expect(result.stdout).toContain('smb::tests::release_hook_scan: test');
+});
+
+it('codec reuse excludes only canonical codecs from peer ownership', () => {
+  const outside = join(crate, 'src/business_profile/signer_service.rs');
+  expect(violations(outside, 'crate::smb::jcs::encode(); crate::smb::strict_json::parse(); accept(')).not.toContain('peer');
+  for (const module of ['peer', 'frame', 'wire', 'future_transport']) {
+    expect(violations(outside, `crate::smb::${module}::call(); accept(`)).toContain('peer');
+  }
+  expect(violations(join(crate, 'src/smb/other.rs'), 'accept(')).toContain('peer');
 });

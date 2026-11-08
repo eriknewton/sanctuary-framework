@@ -195,7 +195,7 @@ struct Worker {
     received: Vec<u8>,
     tty: Option<OwnedFd>,
     term: libc::termios,
-    cleanup: bool,
+    settlement: Settlement,
     lock_queued: bool,
 }
 impl Worker {
@@ -300,7 +300,7 @@ fn spawn_worker(
         received: Vec::new(),
         tty: Some(tty),
         term,
-        cleanup: false,
+        settlement: Settlement::default(),
         lock_queued: false,
     })
 }
@@ -363,7 +363,6 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
     let mut attempts = 0;
     let mut lifecycle_window = signer_watchdog::boottime_ns()?;
     let mut lifecycle_tokens = LIFECYCLE_BURST_MAX;
-    let mut locking_deadline = 0;
     // Readiness only reports a locked service and never grants application admission.
     notify_ready()?;
     loop {
@@ -386,7 +385,8 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
             && ((matches!(lease.state, State::Unlocking | State::Unlocked)
                 && (!lease.live(now) || !peer_live || !ceremony_live))
                 || timed_out
-                || (lease.state == State::Locking && now >= locking_deadline))
+                || (lease.state == State::Locking
+                    && worker.as_ref().is_some_and(|w| w.settlement.due(now))))
         {
             if let Some(mut w) = worker.take() {
                 signer_watchdog::kill_and_reap(&mut w.child, &mut lease)?;
@@ -414,19 +414,24 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
                     _ => {
                         lease.revoke();
-                        locking_deadline = now;
+                        w.settlement.fault(now);
                     }
                 }
             }
             let mut chunk = [0u8; RESPONSE_MAX_BYTES + LENGTH_BYTES];
-            if let Ok(n) = w.error.read(&mut chunk) {
-                if n > 0 {
+            match w.error.read(&mut chunk) {
+                Ok(n) if n > 0 => {
                     #[cfg(feature = "test-isolation")]
                     observe(&paths, &chunk[..n]);
                     // Worker diagnostics are never forwarded because exceptions may contain private material.
                     lease.revoke();
-                    locking_deadline = now;
+                    w.settlement.fault(now);
                 }
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                    lease.revoke();
+                    w.settlement.fault(now);
+                }
+                _ => (),
             }
             match w.output.read(&mut chunk) {
                 Ok(n) if n > 0 => {
@@ -434,7 +439,7 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                     observe(&paths, &chunk[..n]);
                     if w.received.len() + n > RESPONSE_MAX_BYTES + LENGTH_BYTES {
                         lease.revoke();
-                        locking_deadline = now;
+                        w.settlement.fault(now);
                     } else {
                         w.received.extend_from_slice(&chunk[..n]);
                         while w.received.len() >= LENGTH_BYTES {
@@ -445,7 +450,7 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                             ) as usize;
                             if length > RESPONSE_MAX_BYTES {
                                 lease.revoke();
-                                locking_deadline = now;
+                                w.settlement.fault(now);
                                 break;
                             } else if w.received.len() >= length + LENGTH_BYTES {
                                 let result = response(&w.received[..length + LENGTH_BYTES]);
@@ -479,13 +484,10 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                                                 lease.state,
                                                 State::Unlocking | State::Locking
                                             )
-                                            && !w.cleanup =>
+                                            && !w.settlement.cleanup =>
                                     {
-                                        locking_deadline =
-                                            wipe_deadline(lease.state, now, locking_deadline);
+                                        w.settlement.acknowledge(lease.state, now);
                                         lease.revoke();
-                                        w.cleanup = true;
-                                        w.release_terminal();
                                     }
                                     Ok(v)
                                         if v.get("op") == Some(&json!("SIGNED"))
@@ -505,12 +507,18 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                                                 }
                                                 budget.settled();
                                             } else {
+                                                if let Some(c) = &clients[i] {
+                                                    let _ = reply(
+                                                        c.fd.as_raw_fd(),
+                                                        json!({"op":"REFUSED"}),
+                                                    );
+                                                }
                                                 lease.revoke();
-                                                locking_deadline = now;
+                                                w.settlement.fault(now);
                                             }
                                         } else {
                                             lease.revoke();
-                                            locking_deadline = now;
+                                            w.settlement.fault(now);
                                         }
                                     }
                                     Ok(v)
@@ -530,7 +538,7 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                                     }
                                     _ => {
                                         lease.revoke();
-                                        locking_deadline = now;
+                                        w.settlement.fault(now);
                                     }
                                 }
                             } else {
@@ -539,14 +547,23 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                         }
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                    lease.revoke();
+                    w.settlement.fault(now);
+                }
                 _ => (),
             }
         }
         if let Some(w) = worker.as_mut() {
-            if let Some(status) = reaped_after_output(&mut w.child, w.output.as_raw_fd())? {
+            if let Some(status) =
+                reaped_after_outputs(&mut w.child, &[w.output.as_raw_fd(), w.error.as_raw_fd()])?
+            {
+                if !w.received.is_empty() {
+                    w.settlement.fault(now);
+                }
                 lease.revoke();
-                lease.reaped(w.cleanup && status.success());
+                lease.reaped(w.settlement.cooperative(status.success()));
+                w.release_terminal();
                 if lease.state == State::Wiped {
                     // Only cooperative wipe followed by successful reaping permits the next attended attempt.
                     std::fs::remove_file(&marker)?;
@@ -559,7 +576,11 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                     }
                 }
                 worker.take();
-                active.take();
+                if let Some((i, _, _, _)) = active.take() {
+                    if let Some(c) = &clients[i] {
+                        let _ = reply(c.fd.as_raw_fd(), json!({"op":"REFUSED"}));
+                    }
+                }
                 budget.settled();
             }
         }
@@ -574,7 +595,8 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
             (lifecycle.as_raw_fd(), &mut ceremonies, &config.launcher),
         ] {
             if listener == lifecycle.as_raw_fd() {
-                if lifecycle_sealed {
+                // An empty probe skips accept entirely so a later connect cannot bypass final-slot sealing.
+                if lifecycle_sealed || !readable(listener) {
                     continue;
                 }
                 lifecycle_sealed =
@@ -593,7 +615,7 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
             {
                 if let Ok(fd) = signer_peer::accept(listener) {
                     if let Ok(peer) = Peer::capture(fd.as_raw_fd(), policy) {
-                        // Production peers must shed capabilities before connection so the unit can authenticate them.
+                        // Must match signer_peer::validate_capability_status: only a completed capability drop admits a peer.
                         if signer_peer::empty_capabilities(peer.pid, paths.owner == ROOT_UID)
                             .is_err()
                         {
@@ -709,9 +731,10 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                 // Local revocation bypasses ceremony quotas so a KDF or remote flood cannot retain signing authority.
                 if let Some(w) = worker.as_mut() {
                     let unlocking = lease.state == State::Unlocking;
+                    let previous = lease.state;
                     lease.revoke();
-                    w.release_terminal();
-                    locking_deadline = if unlocking { now } else { now + NS_PER_SECOND };
+                    // Keep the terminal until reap because an unlocking child can still change its attributes.
+                    w.settlement.lock(previous, now);
                     // Finish a partially written frame before LOCK so framing cannot turn a cooperative wipe into a forced kill.
                     if !unlocking && !w.lock_queued {
                         queue_lock(&mut w.pending, &mut w.offset)?;
@@ -946,12 +969,49 @@ pub fn queue_lock(pending: &mut Vec<u8>, offset: &mut usize) -> io::Result<()> {
     Ok(())
 }
 
-pub fn wipe_deadline(state: State, now: u64, current: u64) -> u64 {
-    // A cleanup acknowledgement can start refusal reaping but can never renew an existing kill deadline.
-    if state == State::Unlocking {
-        now.saturating_add(NS_PER_SECOND)
-    } else {
-        current
+#[derive(Debug, Default)]
+pub struct Settlement {
+    deadline: Option<u64>,
+    cleanup: bool,
+    faulted: bool,
+}
+impl Settlement {
+    pub fn deadline(&self) -> Option<u64> {
+        self.deadline
+    }
+    pub fn due(&self, now: u64) -> bool {
+        self.deadline.is_some_and(|end| now >= end)
+    }
+    fn shorten_deadline(&mut self, proposed: u64) {
+        // Every kill request shares this minimum so later events cannot prolong worker custody.
+        self.deadline = Some(
+            self.deadline
+                .map_or(proposed, |current| current.min(proposed)),
+        );
+    }
+    pub fn fault(&mut self, now: u64) {
+        // A worker fault is sticky because a later cleanup frame cannot undo observed uncertainty.
+        self.faulted = true;
+        self.shorten_deadline(now);
+    }
+    pub fn lock(&mut self, state: State, now: u64) {
+        self.shorten_deadline(if state == State::Unlocking {
+            now
+        } else {
+            now.saturating_add(NS_PER_SECOND)
+        });
+    }
+    pub fn acknowledge(&mut self, state: State, now: u64) {
+        if self.cleanup || !matches!(state, State::Unlocking | State::Locking) {
+            self.fault(now);
+        } else {
+            self.cleanup = true;
+            self.shorten_deadline(now.saturating_add(NS_PER_SECOND));
+        }
+    }
+    pub fn cooperative(&self, success: bool) -> bool {
+        // Marker removal requires exactly one cleanup acknowledgement, no observed fault and successful reaping.
+        self.cleanup && !self.faulted && success
     }
 }
 
@@ -959,25 +1019,34 @@ pub fn reaped_after_output(
     child: &mut Child,
     output: RawFd,
 ) -> io::Result<Option<std::process::ExitStatus>> {
+    reaped_after_outputs(child, &[output])
+}
+
+pub fn reaped_after_outputs(
+    child: &mut Child,
+    outputs: &[RawFd],
+) -> io::Result<Option<std::process::ExitStatus>> {
     let status = child.try_wait()?;
     if status.is_some() {
-        let mut available: libc::c_int = 0;
-        // A child can exit between read and wait, so buffered cleanup frames must settle before the lease observes reaping.
-        if unsafe { libc::ioctl(output, libc::FIONREAD, &mut available) } != 0 {
-            return Err(refused());
-        }
-        if available > 0 {
-            return Ok(None);
+        for output in outputs {
+            let mut available: libc::c_int = 0;
+            // A child can exit between read and wait, so buffered cleanup frames must settle before the lease observes reaping.
+            if unsafe { libc::ioctl(*output, libc::FIONREAD, &mut available) } != 0 {
+                return Err(refused());
+            }
+            if available > 0 {
+                return Ok(None);
+            }
         }
     }
     Ok(status)
 }
 
 pub fn seal_lifecycle_backlog(listener: RawFd, accepted: usize) -> io::Result<bool> {
-    if accepted < LIFECYCLE_CONNECTIONS_MAX.saturating_sub(1) || !readable(listener) {
+    if accepted < LIFECYCLE_CONNECTIONS_MAX.saturating_sub(1) {
         return Ok(false);
     }
-    // Match signer_peer::listen's single queued connection by denying new connects before accepting the final slot.
+    // Match signer_peer::listen's single queued connection by sealing before the final accept even when a prior probe was empty.
     if unsafe { libc::shutdown(listener, libc::SHUT_RD) } != 0 {
         return Err(io::Error::last_os_error());
     }

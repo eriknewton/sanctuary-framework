@@ -482,6 +482,11 @@ pub fn require_unix_socket(fd: RawFd) -> io::Result<()> {
 }
 pub fn empty_capabilities(pid: i32, bounding: bool) -> io::Result<()> {
     let status = bounded_text(&format!("/proc/{pid}/status"))?;
+    validate_capability_status(&status, bounding)
+}
+
+// Must match signer_service accept admission: parsed status is the completed capability drop evidence.
+pub fn validate_capability_status(status: &str, bounding: bool) -> io::Result<()> {
     // NoNewPrivs pins the completed drop across later execs and makes omission observable in unprivileged fixtures.
     if status
         .lines()
