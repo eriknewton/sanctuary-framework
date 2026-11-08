@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import { readFileSync, writeFileSync, mkdtempSync, realpathSync } from "node:fs";
+import { describe, it, expect, beforeAll, vi } from "vitest";
+import { readFileSync, writeFileSync, mkdtempSync, realpathSync, readdirSync, lstatSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync, execFileSync } from "node:child_process";
@@ -41,9 +41,30 @@ it("source archive admits only regular files and directories", () => {
   const root = mkdtempSync(join(tmpdir(), "archive-positive-")), source = join(root, "source"), target = join(root, "staged"), archive = join(root, "source.tar"); mkdirSync(source); mkdirSync(target); writeFileSync(join(source, "file"), "exact bytes"); execFileSync("tar", ["-cf", archive, "-C", source, "."]);
   extractSourceArchive(archive, target); expect(readFileSync(join(target, "file"), "utf8")).toBe("exact bytes");
 });
-it("repeated candidate builds replace stale distribution files", async () => {
-  const c = await prepareFixtureCandidate();
-  writeFileSync(join(c.tree, "packages/evidence-pack-verifier/dist/stale.js"), "stale");
+// Must match the in-place output replacement in scripts/build-evidence-pack.mjs.
+it.each(["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"])("rebuild clears stale files in place in %s", async output => {
+  const c = await prepareFixtureCandidate(), destination = join(c.tree, output);
+  const before = lstatSync(destination, { bigint: true });
+  writeFileSync(join(destination, "stale.js"), "stale");
   await buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], c.tree, SOURCE);
-  expect(existsSync(join(c.tree, "packages/evidence-pack-verifier/dist/stale.js"))).toBe(false);
+  expect(existsSync(join(destination, "stale.js"))).toBe(false);
+  expect(lstatSync(destination, { bigint: true }).ino).toBe(before.ino);
+  expect(lstatSync(destination, { bigint: true }).dev).toBe(before.dev);
 }, 120_000);
+it.each(["deleted", "mismatched"])("buildCandidate entry refuses %s environment revision before staging a file", async kind => {
+  const root = mkdtempSync(join(tmpdir(), "entry-provenance-")), tree = join(root, "tree"), staging = join(root, "staging");
+  mkdirSync(tree); mkdirSync(staging);
+  const source = join(root, "source"); mkdirSync(source); writeFileSync(join(source, "sentinel"), "must not be staged");
+  const a = join(root, "source.tar"), m = join(root, "source.json");
+  execFileSync("tar", ["-cf", a, "-C", source, "."]);
+  writeFileSync(m, JSON.stringify({ ...metadata, source_archive_sha256: digest(readFileSync(a)) }));
+  expect(existsSync(join(tree, ".git"))).toBe(false);
+  vi.stubEnv("TMPDIR", staging);
+  vi.stubEnv("SANCTUARY_SOURCE_SHA", kind === "deleted" ? undefined : (SOURCE[0] === "a" ? "b" : "a").repeat(SOURCE.length));
+  try {
+    // The omitted revision argument exercises the release entry's ambient input before any archive byte is staged.
+    await expect(buildCandidate(["--source-metadata", m, "--source-archive", a], tree)).rejects.toThrow("Source provenance refused");
+    expect(readdirSync(staging)).toEqual([]);
+    expect(readdirSync(tree)).toEqual([]);
+  } finally { vi.unstubAllEnvs(); }
+});

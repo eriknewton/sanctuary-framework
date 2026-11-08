@@ -172,3 +172,18 @@ it("isolation refuses value lookup output even with the permitted executable", a
   const attack = `import cp from "node:child_process"; cp.spawnSync("/usr/bin/xattr", ["-s", "-p", "com.apple.provenance", process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/key"], {env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:["ignore","pipe","ignore"]});`;
   const result = isolated(attack); expect(result.status).toBe(C.EXIT_FAIL); expect(result.stderr).toContain('"denied":1');
 }, 120_000);
+
+// Must match the parent prerequisite block in docs/audit/evidence-pack-v0-drill.md.
+it.each(["mkdir", "owner", "mode", "valid"])("drill shell parent prerequisite handles %s", kind => {
+  const doc = readFileSync("../docs/audit/evidence-pack-v0-drill.md", "utf8");
+  const block = doc.slice(doc.indexOf("test ! -L /tmp/v70"), doc.indexOf("mkdir -m 700 /tmp/v70/mac-a"));
+  const root = mkdtempSync(join(tmpdir(), "doc-parent-")), parent = join(root, "v70");
+  if (kind !== "mkdir") mkdirSync(parent);
+  const script = `mkdir() { command mkdir "$@"; return 1; }
+stat() { case "$2" in %u) printf '%s' '${kind === "owner" ? "wrong-owner" : process.getuid!()}' ;; %Lp) printf '%s' '${kind === "mode" ? "755" : "700"}' ;; esac; }
+${block.replaceAll("/tmp/v70", parent)}
+printf reached`;
+  const result = spawnSync("/bin/sh", ["-c", script], { env: { ...process.env }, encoding: "utf8" });
+  expect(result.status).toBe(kind === "valid" ? C.EXIT_PASS : C.EXIT_FAIL);
+  expect(result.stdout).toBe(kind === "valid" ? "reached" : "");
+});

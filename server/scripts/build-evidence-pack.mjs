@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,11 +62,18 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   chmodSync(bundle, 0o755);
   writeFileSync(join(packageRoot, "dist/provenance.json"), JSON.stringify({ format: BUILD_FORMAT, package_version: pkg.version, source_revision: metadata.source_revision, source_archive_sha256: metadata.source_archive_sha256, verifier_sha256: digest(readFileSync(bundle)), dependency_lock_sha256: digest(readFileSync(join(root, "server/package-lock.json"))) }, null, 2) + "\n");
   if (readdirSync(join(packageRoot, "dist")).sort().join() !== "provenance.json,verify-evidence-pack.js") throw new Error("Unexpected verifier artifact");
-  // A fresh destination prevents earlier local artifacts from entering the candidate file set.
-  const destination = join(root, "packages/evidence-pack-verifier/dist");
-  if (existsSync(destination)) renameSync(destination, join(mkdtempSync(join(tmpdir(), "pack-previous-")), "dist"));
-  cpSync(join(packageRoot, "dist"), join(root, "packages/evidence-pack-verifier/dist"), { recursive: true });
-  cpSync(join(staged, "server/evidence-pack-dist"), join(root, "server/evidence-pack-dist"), { recursive: true });
+  // Must match the output-directory witnesses in snapshot-provenance.test.ts.
+  // Both flat output directories are cleared in place so stale files cannot travel into rebuilt artifacts across volumes.
+  for (const relative of ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"]) {
+    const destination = join(root, relative);
+    if (existsSync(destination)) {
+      const entries = readdirSync(destination, { withFileTypes: true });
+      // Unexpected directories refuse cleanup because build outputs are flat and recursive deletion is not authorized.
+      if (entries.some(entry => entry.isDirectory())) throw new Error("Unexpected output directory");
+      for (const entry of entries) unlinkSync(join(destination, entry.name));
+    }
+    cpSync(join(staged, relative), destination, { recursive: true });
+  }
 }
 // Test archives live outside git and are explicitly marked non-release; no fixture metadata authenticates a release.
 export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")) {

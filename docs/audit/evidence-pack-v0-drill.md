@@ -17,7 +17,12 @@ Mac A, from the reviewed build's server directory:
 
 ```sh
 test ! -L /tmp/v70 || exit 1
-if [ ! -e /tmp/v70 ]; then mkdir -m 700 /tmp/v70; fi
+# Private ownership and mode keep all synthetic state within the operator's disposable root.
+# Must match the parent prerequisite witness in snapshot-packed.test.ts.
+if [ ! -e /tmp/v70 ]; then mkdir -m 700 /tmp/v70 || exit 1; fi
+test -d /tmp/v70 || exit 1
+test "$(stat -f %u /tmp/v70)" = "$(id -u)" || exit 1
+test "$(stat -f %Lp /tmp/v70)" = 700 || exit 1
 mkdir -m 700 /tmp/v70/mac-a
 export NODE_OPTIONS=--max-old-space-size=3072
 FIXTURE=evidence-pack-dist/evidence-pack-drill-fixture.js
