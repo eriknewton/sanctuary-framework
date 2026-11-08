@@ -1,3 +1,4 @@
+// fail-before-exempt: These are mutation sentinels over the verifier that earlier slices already shipped, so they pass on the reverted source by design; each one is killed instead by a single-predicate mutation of the production verifier.
 /** Production-consumer mutation witnesses complement the installed acceptance rows. */
 import { describe, it, expect } from "vitest";
 import { verifySnapshot } from "../../src/evidence-pack/snapshot-verify.js";

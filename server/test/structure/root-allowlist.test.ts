@@ -1,4 +1,4 @@
-// fail-before-exempt: This change allowlists the hermes-memory-relay and local-model-gateway root packages; this guard inspects tracked root entries, not server/src behavior, so reversing server/src must not make it fail.
+// fail-before-exempt: This change allowlists the new packages root directory that holds the evidence pack verifier package; this guard inspects tracked root entries outside server/src, which verify-fail-before does not revert, so reversing server/src must not make it fail.
 /**
  * ROOT-ALLOWLIST guard (DoE review L-3).
  *
