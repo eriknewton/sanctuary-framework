@@ -12,11 +12,17 @@ import * as C from "../src/evidence-pack/snapshot-contract.js";
 declare const __SANCTUARY_SOURCE_SHA__: string;
 // Must match the disposable root and checkpoint-prefix procedure in docs/audit/evidence-pack-v0-drill.md.
 const MODE_DIRECTORY = 0o700, MODE_FILE = 0o600, INITIAL_CHECKPOINTS = 2, ENTRIES_PER_CHECKPOINT = 2;
-interface FixtureState { synthetic: true; master: string; who: StoredIdentity; rows: { namespace: string; key: string; data: string }[] }
-async function rootPath(path: string): Promise<string> {
-  const root = resolve(path), allowed = await realpath("/tmp/v70");
-  const parent = await realpath(dirname(root));
-  // A canonical, explicit disposable root keeps all fixture secrets away from operator state and refuses symlink redirects.
+interface FixtureState { synthetic: true; master: string; who: StoredIdentity; wrong: Pick<StoredIdentity, "identity_id" | "public_key" | "rotation_history">; rows: { namespace: string; key: string; data: string }[] }
+export async function rootPath(path: string, allowedPath = "/tmp/v70"): Promise<string> {
+  const root = resolve(path);
+  const modeMask = 0o777; // Permission bits exclude the inode type.
+  for (const directory of [allowedPath, root]) {
+    const stat = await lstat(directory);
+    // Only existing private directories owned by this uid may receive synthetic secret state.
+    C.requireSnapshot(stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & modeMask) === MODE_DIRECTORY, C.HARD.unsafe_path);
+  }
+  const allowed = await realpath(allowedPath), parent = await realpath(dirname(root));
+  // The explicit root must be a direct child of the checked disposable parent.
   C.requireSnapshot(parent === allowed, C.HARD.unsafe_path);
   return join(parent, basename(root));
 }
@@ -52,11 +58,11 @@ export async function runDrillFixture(argv: string[]): Promise<number> {
     const root = await rootPath(argv[2]); installIsolation(root, fileURLToPath(import.meta.url), true); await installDrillCredentials(); requireDrillCredentials();
     const fortress = join(root, "fortress"), statePath = join(fortress, "synthetic-state.json"); let state: FixtureState;
     if (argv[0] === "create") {
-      await mkdir(root, { mode: MODE_DIRECTORY }); await mkdir(fortress, { mode: MODE_DIRECTORY });
+      await mkdir(fortress, { mode: MODE_DIRECTORY });
       const master = randomBytes(C.KEY_BYTES), key = derivePurposeKey(master, "identity-encryption");
       const who = createIdentity("synthetic evidence drill", key, "passphrase").storedIdentity;
       const wrong = createIdentity("synthetic unrelated pin", key, "passphrase").storedIdentity;
-      state = { synthetic: true, master: master.toString("base64url"), who, rows: [] }; key.fill(0);
+      state = { synthetic: true, master: master.toString("base64url"), who, wrong: { identity_id: wrong.identity_id, public_key: wrong.public_key, rotation_history: wrong.rotation_history }, rows: [] }; key.fill(0);
       await mkdir(join(fortress, "policy/egress/rules"), { recursive: true, mode: MODE_DIRECTORY });
       await writeFile(join(fortress, "synthetic-binary"), "Synthetic fixture only.\n", { flag: "wx", mode: MODE_FILE });
       await writeFile(join(fortress, "castle-pinned-pubkey.bin"), C.publicKey(who.public_key), { flag: "wx", mode: MODE_FILE });
@@ -81,7 +87,14 @@ export async function runDrillFixture(argv: string[]): Promise<number> {
         try {
           const result = await exportSnapshot({ fortress, output, receipt: join(root, argv[4] + "-receipt.json"), publicKeyFile: join(root, argv[4] + "-export-key.txt") }, { boot: boot as unknown as import("../src/evidence-pack/snapshot-export-cli.js").ExportDependencies["boot"], gather: async () => gatherSnapshot({ storage, masterKey, fortress, generatedAt: new Date().toISOString(), localSign: true, globalPinPath: join(fortress, "synthetic-absent-global-pin") }), buildRevision: __SANCTUARY_SOURCE_SHA__, runtimeRevision: __SANCTUARY_SOURCE_SHA__, phase: async () => { requireDrillCredentials(); }, io: { stdout: text => { process.stdout.write(text); }, stderr: text => { process.stderr.write(text); } } });
           C.requireSnapshot(result === C.EXIT_PASS, C.HARD.nested_invalid);
-          await writeFile(join(root, argv[4] + "-trust.json"), await readFile(join(output, C.TRUST_FILENAME)), { flag: "wx", mode: MODE_FILE });
+          const descriptorBytes = await readFile(join(output, C.TRUST_FILENAME));
+          await writeFile(join(root, argv[4] + "-trust.json"), descriptorBytes, { flag: "wx", mode: MODE_FILE });
+          const descriptor = C.parseSnapshotJSON(descriptorBytes, C.MAX_TRUST_BYTES) as { format: string; keys: C.TrustKey[] };
+          const wrong = state.wrong, fingerprint = C.manifestDigest(C.publicKey(wrong.public_key));
+          // The unrelated public role is an explicit synthetic signature control, never an acceptance pin.
+          descriptor.keys = descriptor.keys.map(row => row.role !== C.PIN_ROLE.pack ? row : { ...row, key_id: fingerprint, fingerprint, public_key_base64url: wrong.public_key, rotation_evidence: { kind: C.ROTATION.history, identity_id: wrong.identity_id, current_public_key: wrong.public_key, history: [] } });
+          // Must match the independently transferred control pins in docs/audit/evidence-pack-v0-drill.md.
+          await writeFile(join(root, argv[4] + "-wrong-trust.json"), snapshotJSON(descriptor), { flag: "wx", mode: MODE_FILE });
         } finally { masterKey.fill(0); }
       }
     }

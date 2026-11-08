@@ -5,7 +5,7 @@ Copyright 2026 Erik Newton. Apache-2.0.
 This private candidate verifies a selected snapshot with independently authenticated pins. It is not published. Use Node 22 or later. Authenticate the exact tarball hash and source revision before installing with scripts disabled.
 
 ```sh
-npm install --prefix ./verifier --ignore-scripts --no-audit --no-fund ./approved-candidate.tgz
+npm install --prefix ./verifier --ignore-scripts --no-audit --no-fund --offline ./approved-candidate.tgz
 ./verifier/node_modules/.bin/verify-evidence-pack --version
 ./verifier/node_modules/.bin/verify-evidence-pack --pack ./pack \
   --public-key-file ./pins/pack-key.txt --trust-descriptor-file ./pins/public-trust.json \
@@ -23,3 +23,9 @@ PASS does not establish freshness, continuous history, legal compliance, wall en
 The package has no runtime dependencies or install scripts. Its bundle contains the offline verifier and public verification primitives. Build provenance records the exact bundle hash, source revision and source archive hash; these records require an authenticated distribution channel. Drill programs are not shipped in this package.
 
 <!-- Command and exit contract: server/src/evidence-pack/snapshot-offline-cli.ts and snapshot-contract.ts. -->
+
+Supported hosts are macOS with `/usr/bin/xattr` and Linux with `/usr/bin/python3` and filesystem attribute enumeration support. Use `--json` to retain named capture findings. `enumerator_unavailable` means the platform or enumerator prerequisite is absent; `unexpected_metadata` or `io_error` can also reflect a local capture failure. Retain the result and repeat verification from a fresh extraction on a supported host before making an acceptance decision.
+
+Metadata enumeration uses paths and checks the held inode after each subprocess. A path changed and restored during the subprocess cannot be excluded by those observations. This bounds observation of names only; metadata values are never evidence.
+
+Build provenance includes the SHA-256 of the dependency lockfile used by the build tree. Installed dependency bytes still require a trusted build environment; the lockfile record alone does not establish reproducibility.

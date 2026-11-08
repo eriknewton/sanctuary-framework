@@ -1,5 +1,5 @@
 /** Offline filesystem boundary; authority is supplied only through explicit public pin files. */
-import { constants, type BigIntStats } from "node:fs";
+import { constants, lstatSync, type BigIntStats } from "node:fs";
 import { lstat, open, opendir, realpath, type FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -16,12 +16,21 @@ export const METADATA_OUTPUT_LIMIT = C.MAX_NAME_BYTES * C.MAX_FILES;
 export const METADATA_TIMEOUT_MS = 10_000;
 // Must match the exact subprocess policy consumed by evidence-pack-drill-isolation.ts.
 export const LINUX_METADATA_PROGRAM = "import os,sys,json; print(json.dumps(os.listxattr(sys.argv[1], follow_symlinks=False)))";
-export function metadataNames(path: string, platform: string = process.platform): string[] {
+export function metadataNames(path: string, platform: string = process.platform, held?: Pick<BigIntStats, "dev" | "ino">): string[] {
   // Fixed OS paths, closed argv, no stdin and an empty environment prevent metadata enumeration from selecting code or credentials through ambient state.
   const options = { env: { LC_ALL: "C" }, shell: false as const, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT, stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"] };
   try {
-    C.requireSnapshot(platform === "darwin" || platform === "linux", C.HARD.unexpected_metadata);
-    const bytes = execFileSync(platform === "darwin" ? "/usr/bin/xattr" : "/usr/bin/python3", platform === "darwin" ? [path] : ["-I", "-S", "-c", LINUX_METADATA_PROGRAM, path], options);
+    // Unsupported hosts cannot establish metadata capture and must report an environment finding.
+    C.requireSnapshot(platform === "darwin" || platform === "linux", C.HARD.enumerator_unavailable);
+    const recheck = () => {
+      if (!held) return;
+      let current: BigIntStats;
+      try { current = lstatSync(path, { bigint: true }); } catch { throw new C.SnapshotError(C.HARD.snapshot_changed); }
+      // Each path enumeration must still name the held inode before its names can be consumed.
+      C.requireSnapshot(!current.isSymbolicLink() && current.dev === held.dev && current.ino === held.ino, C.HARD.snapshot_changed);
+    };
+    const bytes = execFileSync(platform === "darwin" ? "/usr/bin/xattr" : "/usr/bin/python3", platform === "darwin" ? ["-s", path] : ["-I", "-S", "-c", LINUX_METADATA_PROGRAM, path], options);
+    recheck();
     const output = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
     const names: unknown = platform === "darwin" ? (output === "" ? [] : output.split(C.LF).slice(0, output.endsWith(C.LF) ? -1 : undefined)) : C.parseSnapshotJSON(C.utf8(output), METADATA_OUTPUT_LIMIT);
     C.requireSnapshot(Array.isArray(names) && names.every(n => typeof n === "string"), C.HARD.unexpected_metadata);
@@ -29,11 +38,19 @@ export function metadataNames(path: string, platform: string = process.platform)
     if (platform === "darwin") for (const name of C.OS_ATTACHED_METADATA) {
       if (!names.includes(name)) continue;
       // Exact fixed-name existence checks disambiguate LF-joined labels while discarding all value bytes inside the OS subprocess.
-      const found = spawnSync("/usr/bin/xattr", ["-p", name, path], { ...options, stdio: "ignore" });
+      const found = spawnSync("/usr/bin/xattr", ["-s", "-p", name, path], { ...options, stdio: "ignore" });
+      recheck();
+      // An absent lookup executable leaves the local capture prerequisite unsatisfied.
+      if ((found.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") throw new C.SnapshotError(C.HARD.enumerator_unavailable);
       C.requireSnapshot(!found.error && found.status === C.EXIT_PASS, C.HARD.unexpected_metadata);
     }
     return names;
-  } catch { throw new C.SnapshotError(C.HARD.unexpected_metadata); }
+  } catch (error) {
+    // Only capture-specific findings retain their meaning at the metadata boundary.
+    if (error instanceof C.SnapshotError && (error.code === C.HARD.snapshot_changed || error.code === C.HARD.enumerator_unavailable)) throw error;
+    // An absent executable is a local capture prerequisite, distinct from observed metadata names.
+    throw new C.SnapshotError((error as NodeJS.ErrnoException).code === "ENOENT" ? C.HARD.enumerator_unavailable : C.HARD.unexpected_metadata);
+  }
 }
 function observation(stat: BigIntStats): C.CapturedStat {
   return { type: stat.isFile() ? C.FILE_TYPE.file : stat.isDirectory() ? C.FILE_TYPE.directory : "invalid", size: Number(stat.size), nlink: Number(stat.nlink), dev: String(stat.dev), ino: String(stat.ino), mtime: String(stat.mtimeNs), ctime: String(stat.ctimeNs) };
@@ -71,7 +88,7 @@ export async function captureOfflineSnapshot(path: string, packKey: string, expe
   try {
     C.requireSnapshot(C.canonicalSnapshotJSON(before) === C.canonicalSnapshotJSON(observation(await rootFd.stat({ bigint: true }))), C.HARD.snapshot_changed);
     const names = await directoryNames(root); C.cap(names.length, C.MAX_FILES);
-    const rootMetadata = metadataNames(root);
+    const rootMetadata = metadataNames(root, process.platform, await rootFd.stat({ bigint: true }));
     async function capture(name: Buffer, maximum: number): Promise<C.CapturedFile> {
       const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(name); C.safeName(decoded);
       const filePath = join(root, decoded); const lst = observation(await lstat(filePath, { bigint: true }));
@@ -83,7 +100,7 @@ export async function captureOfflineSnapshot(path: string, packKey: string, expe
       file.before = observation(await fd.stat({ bigint: true }));
       C.requireSnapshot(C.canonicalSnapshotJSON(lst) === C.canonicalSnapshotJSON(file.before), C.HARD.snapshot_changed);
       const buffer = Buffer.alloc(lst.size + 1); const { bytesRead } = await fd.read(buffer, 0, buffer.length, 0);
-      C.requireSnapshot(bytesRead === lst.size, C.HARD.snapshot_changed); file.bytes = buffer.subarray(0, bytesRead); file.metadata = metadataNames(filePath); return file;
+      C.requireSnapshot(bytesRead === lst.size, C.HARD.snapshot_changed); file.bytes = buffer.subarray(0, bytesRead); file.metadata = metadataNames(filePath, process.platform, await fd.stat({ bigint: true })); return file;
     }
     const manifestName = names.find(n => n.equals(Buffer.from(C.MANIFEST_FILENAME))); C.requireSnapshot(manifestName, C.HARD.file_set_mismatch);
     const mf = await capture(manifestName, C.MAX_MANIFEST_BYTES); const raw = C.parseManifestEnvelope(mf.bytes);
@@ -134,10 +151,15 @@ export function parseOfflineArguments(args: string[]): { flags: Record<string, s
   return { flags, json };
 }
 export function parseOfflineKey(bytes: Uint8Array): string {
-  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  // One optional final LF admits a text file without normalizing any part of the authenticated key grammar.
-  const key = text.endsWith(C.LF) ? text.slice(0, -C.LF.length) : text;
-  C.publicKey(key); return key;
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    // One optional final LF admits a text file without normalizing any part of the authenticated key grammar.
+    const key = text.endsWith(C.LF) ? text.slice(0, -C.LF.length) : text;
+    C.publicKey(key); return key;
+  } catch {
+    // Key grammar failures describe the supplied pin regardless of the decoder that rejects it.
+    throw new C.SnapshotError(C.HARD.pin_invalid);
+  }
 }
 function captureFailure(error: unknown, state: C.ProtocolState): C.VerificationResult {
   return { format: C.RESULT_FORMAT, status: C.STATUS.FAIL, exit_code: C.EXIT_FAIL, accepted: false, snapshot_integrity: C.INTEGRITY.unverified, export_id: null, manifest_digest: null, verifier_source_revision: OFFLINE_REVISION, findings: [{ code: error instanceof C.SnapshotError ? error.code : C.HARD.io_error, state, filename: null }], partial_reasons: [], nested: { audit: null, transparency: null }, not_checked: C.NOT_CHECKED };
@@ -157,7 +179,7 @@ export async function runOfflineCommand(argv: string[], io: OfflineIO = offlineI
       state = C.STATES.MANIFEST_BYTES;
       result = verifySnapshot(await captureOfflineSnapshot(flags["--pack"], pins.packKey, pins.expectedManifestDigest, next => { state = next; }), pins, OFFLINE_REVISION);
     } catch (error) { result = captureFailure(error, state); }
-    await io.stdout(json ? JSON.stringify(result) + C.LF : C.HUMAN[result.status] + C.LF + result.partial_reasons.join(C.LF) + C.LF);
+    await io.stdout(json ? JSON.stringify(result) + C.LF : C.HUMAN[result.status] + C.LF + [...result.findings.map(finding => finding.code), ...result.partial_reasons].join(C.LF) + C.LF);
     return result.exit_code;
   } catch { return C.EXIT_FAIL; }
 }

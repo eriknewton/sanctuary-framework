@@ -6,11 +6,14 @@ import net from "node:net";
 import tls from "node:tls";
 import http from "node:http";
 import https from "node:https";
+import http2 from "node:http2";
+import inspector from "node:inspector";
+import workers from "node:worker_threads";
 import dns from "node:dns";
 import dgram from "node:dgram";
 import { promisify } from "node:util";
 import { syncBuiltinESMExports } from "node:module";
-import { resolve, sep } from "node:path";
+import { resolve, sep, dirname, basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { installInMemoryKeychainStore } from "../test/setup/keychain-memory-store.js";
 import { execKeychain } from "../src/wrap/keychain-exec.js";
@@ -32,15 +35,30 @@ export async function installDrillCredentials(): Promise<void> {
 }
 export function requireDrillCredentials(): void { if (!installed) throw new Error("Drill isolation is required"); }
 export function installIsolation(rootPath: string, bundlePath: string, writable = false): void {
-  const root = resolve(rootPath), bundle = fs.realpathSync(bundlePath);
-  const home = process.env.HOME ? resolve(process.env.HOME) : undefined;
+  const realpath = fs.realpathSync.bind(fs), lstat = fs.lstatSync.bind(fs);
+  const root = realpath(rootPath), bundle = realpath(bundlePath);
+  function resolved(path: string): string {
+    try { return realpath(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(path) === path) throw error;
+      return join(resolved(dirname(path)), basename(path));
+    }
+  }
+  const home = process.env.HOME ? resolved(resolve(process.env.HOME)) : undefined;
   let denied = 0, enumerations = 0;
   const deny = (): never => { denied++; throw new Error("Evidence drill isolation denied I/O"); };
   const inside = (path: string) => path === root || path.startsWith(root + sep);
   const pathOf = (value: unknown) => value instanceof URL ? fileURLToPath(value) : Buffer.isBuffer(value) ? value.toString() : typeof value === "string" ? value : undefined;
   const check = (value: unknown, write = false) => {
     if (typeof value === "number") return deny();
-    const text = pathOf(value); if (!text) return deny(); const path = resolve(text);
+    const text = pathOf(value); if (!text) return deny();
+    // Canonical ancestors and a non-link final component keep admitted paths inside the actual disposable root.
+    const lexical = resolve(text);
+    let link = false;
+    try { link = lstat(lexical).isSymbolicLink(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return deny(); }
+    if (link) return deny();
+    const path = resolved(lexical);
     if (!writable && ((home && (path === home || path.startsWith(home + sep))) || path.split(sep).includes(".sanctuary"))) return deny();
     if (write && !writable) return deny();
     if (!inside(path) && path !== bundle) return deny();
@@ -48,7 +66,7 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
   function wrap(object: object, key: string, fn: (original: (...args: unknown[]) => unknown, args: unknown[]) => unknown) {
     const record = object as Record<string, unknown>; const original = record[key];
     if (typeof original === "function") {
-      const wrapper = (...args: unknown[]) => fn(original.bind(object), args);
+      const wrapper = function (...args: unknown[]) { return fn(original.bind(object), args); };
       if (object === child && key === "execFile") Object.defineProperty(wrapper, promisify.custom, { value: (...args: unknown[]) => new Promise((resolve, reject) => wrapper(...args, (error: Error | null, stdout: string, stderr: string) => error ? reject(error) : resolve({ stdout, stderr }))) });
       record[key] = wrapper;
     }
@@ -63,9 +81,10 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
     if (!Array.isArray(argv) || !options) return deny();
     const file = argv.at(-1); check(file);
     const linux = command === "/usr/bin/python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-I", "-S", "-c", LINUX_METADATA_PROGRAM]);
-    const darwin = command === "/usr/bin/xattr" && (argv.length === 1 || (argv.length === 3 && argv[0] === "-p" && OS_ATTACHED_METADATA.includes(argv[1])));
+    const darwin = command === "/usr/bin/xattr" && argv[0] === "-s" && (argv.length === 2 || (argv.length === 4 && argv[1] === "-p" && OS_ATTACHED_METADATA.includes(argv[2])));
+    const exporterDarwin = command === "/usr/bin/xattr" && (argv.length === 1 || (argv.length === 3 && argv[0] === "-p" && OS_ATTACHED_METADATA.includes(argv[1])));
     // The synthetic exporter uses its older adapter, so the drill fixes that adapter to the same OS executable and closes its stdin before execution.
-    if (writable && key === "execFile" && ((command === "python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-c", LINUX_METADATA_PROGRAM])) || darwin)) {
+    if (writable && key === "execFile" && ((command === "python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-c", LINUX_METADATA_PROGRAM])) || exporterDarwin)) {
       const callback = args.at(-1);
       enumerations++;
       const process = original(command === "python3" ? "/usr/bin/python3" : command, command === "python3" ? ["-I", "-S", ...argv] : argv, { env: { LC_ALL: "C" }, shell: false, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT }, callback) as { stdin?: { end: () => void } };
@@ -73,12 +92,16 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
     }
     const exact = linux || darwin;
     const stdio = options.stdio;
-    const closed = options.shell === false && JSON.stringify(options.env) === JSON.stringify({ LC_ALL: "C" }) && options.timeout === METADATA_TIMEOUT_MS && options.maxBuffer === METADATA_OUTPUT_LIMIT && (stdio === "ignore" || JSON.stringify(stdio) === JSON.stringify(["ignore", "pipe", "ignore"]));
+    // Value lookups discard stdout because only attribute names may reach the verifier.
+    const safeStdio = darwin && argv[1] === "-p" ? stdio === "ignore" : JSON.stringify(stdio) === JSON.stringify(["ignore", "pipe", "ignore"]);
+    const closed = options.shell === false && JSON.stringify(options.env) === JSON.stringify({ LC_ALL: "C" }) && options.timeout === METADATA_TIMEOUT_MS && options.maxBuffer === METADATA_OUTPUT_LIMIT && safeStdio;
     // Must match snapshot-offline-cli.ts: only fixed-path name enumeration is admitted, with bounded execution and no inherited environment.
     if (!exact || !closed || !["execFileSync", "spawnSync"].includes(key)) return deny();
     enumerations++; return original(...args);
   });
-  for (const [object, keys] of [[net, ["connect", "createConnection", "createServer"]], [net.Socket.prototype, ["connect"]], [tls, ["connect", "createServer"]], [http, ["request", "get", "createServer"]], [https, ["request", "get", "createServer"]], [dns, ["lookup", "resolve"]], [dns.promises, ["lookup", "resolve"]], [dgram, ["createSocket"]]] as [object, string[]][]) for (const key of keys) wrap(object, key, () => deny());
+  // Must match the forbidden bundle import set in test/evidence-pack/snapshot-packed.test.ts.
+  // Every network and alternate execution entry is denied so non-PASS paths have the same isolation boundary.
+  for (const [object, keys] of [[net, ["connect", "createConnection", "createServer"]], [net.Socket.prototype, ["connect"]], [tls, ["connect", "createServer"]], [http, ["request", "get", "createServer"]], [https, ["request", "get", "createServer"]], [dns, ["lookup", "resolve"]], [dns.promises, ["lookup", "resolve"]], [dgram, ["createSocket"]], [http2, ["connect", "createServer", "createSecureServer"]], [inspector, ["open", "Session"]], [workers, ["Worker"]]] as [object, string[]][]) for (const key of keys) wrap(object, key, () => deny());
   for (const object of [dns, dns.promises]) for (const key of Object.keys(object)) if (typeof (object as unknown as Record<string, unknown>)[key] === "function") wrap(object, key, () => deny());
   globalThis.fetch = async () => deny();
   syncBuiltinESMExports();

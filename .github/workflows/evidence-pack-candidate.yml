@@ -11,6 +11,7 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=3072
       VITEST_MAX_WORKERS: 2
       TMPDIR: /tmp/c13
+      EVIDENCE_PACK_TEST_CANDIDATE: /tmp/c13/candidate.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -20,13 +21,21 @@ jobs:
           node-version: 22
       # Must match server/scripts/build-evidence-pack.mjs: hash the exact source archive and record the full revision.
       - name: Record candidate source
+        env:
+          CANDIDATE_EVENT: ${{ github.event_name }}
+          CANDIDATE_REF: ${{ github.ref }}
         run: |
           mkdir -p /tmp/c13
           chmod 700 /tmp/c13
+          # Dispatch candidates must come from an approved ref so their revision remains attributable.
+          if [ "$CANDIDATE_EVENT" = workflow_dispatch ]; then
+            case "$CANDIDATE_REF" in refs/heads/main|refs/tags/v*) ;; *) exit 1 ;; esac
+          fi
+          node --input-type=module -e 'import fs from "node:fs"; fs.writeFileSync("/tmp/c13/source-ref.json", JSON.stringify({ref:process.env.CANDIDATE_REF,non_release:process.env.CANDIDATE_EVENT === "pull_request"}));'
           git archive HEAD > /tmp/c13/source.tar
           echo "SANCTUARY_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           node --input-type=module -e 'import fs from "node:fs"; import crypto from "node:crypto"; import cp from "node:child_process"; fs.writeFileSync("/tmp/c13/release-source.json", JSON.stringify({format:"SANCTUARY_RELEASE_SOURCE_V1",source_revision:cp.execFileSync("git",["rev-parse","HEAD"],{encoding:"utf8"}).trim(),source_archive_sha256:crypto.createHash("sha256").update(fs.readFileSync("/tmp/c13/source.tar")).digest("hex")}));'
-      - name: Build and test candidate
+      - name: Build candidate
         working-directory: server
         run: |
           npm ci --no-audit --no-fund
@@ -36,28 +45,43 @@ jobs:
           npm run lint
           npx tsx scripts/check-no-raw-console.ts
           npm run check-import-cycles
-          npx vitest run test/evidence-pack/snapshot-cli.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-provenance.test.ts test/evidence-pack/snapshot-acceptance.test.ts test/evidence-pack/snapshot-mutations.test.ts test/structure/snapshot-verifier-import-graph.test.ts test/structure/publish-workflow-signing-gate.test.ts
-          node ../scripts/check-release-action-pins.mjs
       - name: Pack candidate once
         working-directory: packages/evidence-pack-verifier
         run: |
           npm pack --json --ignore-scripts --offline > /tmp/c13/pack.json
           sha256sum ./*.tgz > /tmp/c13/tarball.sha256
+      # Must match candidateForTests in server/scripts/build-evidence-pack.mjs: both runtimes consume this packed descriptor.
+      - name: Install packed candidate and record descriptor
+        run: |
+          npm install --prefix /tmp/c13/installed --ignore-scripts --no-audit --no-fund --offline ./packages/evidence-pack-verifier/*.tgz
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+          import path from "node:path";
+          const packed = JSON.parse(fs.readFileSync("/tmp/c13/pack.json", "utf8"))[0];
+          const ref = JSON.parse(fs.readFileSync("/tmp/c13/source-ref.json", "utf8"));
+          fs.writeFileSync(process.env.EVIDENCE_PACK_TEST_CANDIDATE, JSON.stringify({ ...ref, root: "/tmp/c13", tree: process.cwd(), command: "/tmp/c13/installed/node_modules/.bin/verify-evidence-pack", packed, archive: "/tmp/c13/source.tar", metadata: "/tmp/c13/release-source.json", tarball: path.resolve("packages/evidence-pack-verifier", packed.filename) }));
+          JS
+      - name: Test packed candidate on Node 22
+        working-directory: server
+        run: |
+          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-cli.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-provenance.test.ts test/evidence-pack/snapshot-acceptance.test.ts test/evidence-pack/snapshot-mutations.test.ts test/structure/snapshot-verifier-import-graph.test.ts test/structure/publish-workflow-signing-gate.test.ts
+          node ../scripts/check-release-action-pins.mjs
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - name: Check identical candidate on Node 24
         run: |
-          npm install --prefix /tmp/c13/node24 --ignore-scripts --no-audit --no-fund --offline ./packages/evidence-pack-verifier/*.tgz
-          /tmp/c13/node24/node_modules/.bin/verify-evidence-pack --version
+          /tmp/c13/installed/node_modules/.bin/verify-evidence-pack --version
           cd server
-          npx vitest run test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
+          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: evidence-pack-candidate
+          name: ${{ github.event_name == 'pull_request' && format('evidence-pack-nonrelease-{0}', github.run_id) || 'evidence-pack-candidate' }}
           path: |
             packages/evidence-pack-verifier/*.tgz
             /tmp/c13/release-source.json
             /tmp/c13/source.tar
             /tmp/c13/pack.json
+            /tmp/c13/candidate.json
+            /tmp/c13/source-ref.json
             /tmp/c13/tarball.sha256

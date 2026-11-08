@@ -32,3 +32,9 @@ PASS does not establish continuous history, legal compliance, wall enforcement, 
 The command invokes both nested verifiers. A separately installed legacy server command can diagnose a single audit key with `sanctuary audit-chain verify --input audit-chain.jsonl --public-key "$(cat pins/audit-key.txt)"`. That diagnostic is not full-pack acceptance and does not handle multiple audit keys.
 
 <!-- Command and exit contract: server/src/evidence-pack/snapshot-offline-cli.ts and snapshot-contract.ts. -->
+
+Supported hosts are macOS with `/usr/bin/xattr` and Linux with `/usr/bin/python3` and filesystem attribute enumeration support. Use `--json` to retain named capture findings. `enumerator_unavailable` means the platform or enumerator prerequisite is absent; `unexpected_metadata` or `io_error` can also reflect a local capture failure. Retain the result and repeat verification from a fresh extraction on a supported host before making an acceptance decision.
+
+Metadata enumeration uses paths and checks the held inode after each subprocess. A path changed and restored during the subprocess cannot be excluded by those observations. This bounds observation of names only; metadata values are never evidence.
+
+Build provenance includes the SHA-256 of the dependency lockfile used by the build tree. Installed dependency bytes still require a trusted build environment; the lockfile record alone does not establish reproducibility.

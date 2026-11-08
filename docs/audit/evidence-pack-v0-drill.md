@@ -4,11 +4,21 @@ This is a future synthetic-data procedure. No second-Mac results have been recor
 
 Use only an explicit disposable root directly below `/tmp/v70`. Never use a live fortress. The fixture creates fresh keys and synthetic audit and transparency checkpoints. Its private fixture state stays on Mac A. Transfer only public pins, receipts and pack directories. Authenticate pins and the expected digest through a channel independent of the transferred pack. A fixture drill describes copy integrity, not live wall records.
 
+Mac A first builds the reviewed source tree using an independently authenticated full revision and source archive. From the repository root, set `APPROVED_REVISION`, `SOURCE_METADATA` and `SOURCE_ARCHIVE` to those approved inputs. The metadata has the exact fields `format`, `source_revision` and `source_archive_sha256`, with format `SANCTUARY_RELEASE_SOURCE_V1`. A missing or mismatched input stops the build.
+
+```sh
+cd server
+npm ci --no-audit --no-fund
+SANCTUARY_SOURCE_SHA="$APPROVED_REVISION" npm run build
+SANCTUARY_SOURCE_SHA="$APPROVED_REVISION" npm run build:evidence-pack -- --source-metadata "$SOURCE_METADATA" --source-archive "$SOURCE_ARCHIVE"
+```
+
 Mac A, from the reviewed build's server directory:
 
 ```sh
-mkdir -p /tmp/v70
-chmod 700 /tmp/v70
+test ! -L /tmp/v70 || exit 1
+if [ ! -e /tmp/v70 ]; then mkdir -m 700 /tmp/v70; fi
+mkdir -m 700 /tmp/v70/mac-a
 export NODE_OPTIONS=--max-old-space-size=3072
 FIXTURE=evidence-pack-dist/evidence-pack-drill-fixture.js
 mkdir -p /tmp/v70/mac-a-records
@@ -28,17 +38,23 @@ run_a current node "$FIXTURE" export --root /tmp/v70/mac-a --name pack
 run_a other node "$FIXTURE" export --root /tmp/v70/mac-a --name pack-other
 ```
 
+The fixture requires both directories to be owned by the operator with mode 0700; an unsuitable directory stops the procedure before fixture state is written.
+
 Wrap each command to retain its command text, stdout, stderr and exit in a new records directory. Stop on a nonzero exit and retain every result. Never translate exit 10 into success. The compiled fixture installs the in-memory credential store in the same module instance as its signing helpers. It appends and flushes records through the production audit log and transparency emitter and labels its records synthetic. All fixture state remains beneath the explicit root.
 
 Extract the current, other and stale digests and export ids from their respective receipts. Copy `pack-trust.json` to the separately authenticated `pins/public-trust.json`. Confirm every role and full key fingerprint, and authenticate the package hash and full source revision. Do not derive the expected digest by hashing the delivery on Mac B.
 
 ```sh
 python3 - <<'PY'
-import json
+import json, shutil
 from pathlib import Path
 root = Path('/tmp/v70/mac-a')
 pins = root / 'pins'
 pins.mkdir(mode=0o700)
+for name in ['pack-key.txt', 'wrong-key.txt']:
+    shutil.copyfile(root / name, pins / name)
+shutil.copyfile(root / 'pack-trust.json', pins / 'public-trust.json')
+shutil.copyfile(root / 'pack-wrong-trust.json', pins / 'wrong-trust.json')
 for name, target in [('pack', 'expected'), ('pack-other', 'other'), ('pack-stale', 'stale')]:
     receipt = json.loads((root / (name + '-receipt.json')).read_text())
     assert receipt['status'] == 'PASS'
@@ -110,7 +126,7 @@ check_pack wrong-key ./pack ./pins/wrong-key.txt ./pins/public-trust.json ./pins
 check_pack wrong-consistent ./pack ./pins/wrong-key.txt ./pins/wrong-trust.json ./pins/expected-digest.txt 1 manifest_signature_invalid || exit 1
 ```
 
-For the last row, prepare a separately authenticated descriptor whose pack-manifest role names the unrelated public key and whose other role pins retain their approved values. This is a signature-gate exercise. Do not use it for acceptance.
+Before the last row, use the fixture-generated `pins/wrong-trust.json` supplied with the other authenticated test pins. It names the unrelated public key for the pack role and retains the other role pins. This is a signature-gate exercise. Do not use it for acceptance.
 
 OS-attached file metadata (provenance, quarantine, security label) is outside the signed set. Darwin's OS enumerator can read values internally; only names enter the verifier and value output is discarded. No label value is evidence. Verify before browsing the fresh extraction in Finder and keep the delivery unchanged during use.
 

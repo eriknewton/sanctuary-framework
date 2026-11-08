@@ -84,3 +84,5 @@ describe("installed selected-snapshot acceptance", () => {
   it("installed unknown signed member is authenticated before schema inspection", () => { const f = fixture(); Object.assign(f.manifest, { unknown: true }); resignManifest(f, false); check(delivery(f), "FAIL", 1, C.HARD.manifest_signature_invalid); });
   it("installed unreadable pack never becomes acceptance", () => { const d = delivery(fixture()); d.args[1] = join(d.root, "missing"); check(d, "FAIL", 1, C.HARD.io_error); });
 });
+
+it("installed whitespace key reports the pin finding", () => { const d = delivery(fixture()); writeFileSync(join(d.root, "key"), " " + readFileSync(join(d.root, "key"), "utf8")); check(d, "FAIL", C.EXIT_FAIL, C.HARD.pin_invalid); });
