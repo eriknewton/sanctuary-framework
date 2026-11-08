@@ -197,6 +197,10 @@ pub struct Packet {
     pub cred: libc::ucred,
     pub pidfd: OwnedFd,
 }
+// cmsg_len is usize on glibc and u32 on musl; widening to usize is lossless on every supported target.
+fn cmsg_len(header: &libc::cmsghdr) -> usize {
+    header.cmsg_len as _
+}
 pub fn receive(fd: RawFd, max: usize) -> io::Result<Packet> {
     if max > SIGNER_FRAME_MAX_BYTES {
         return Err(refused());
@@ -211,7 +215,8 @@ pub fn receive(fd: RawFd, max: usize) -> io::Result<Packet> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr() as _;
-    msg.msg_controllen = mem::size_of_val(&control);
+    // msghdr and cmsghdr length fields are usize on glibc and u32 on musl; the inferred cast keeps both static targets building.
+    msg.msg_controllen = mem::size_of_val(&control) as _;
     let size = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT) };
     if size <= 0 {
         return Err(refused());
@@ -225,7 +230,7 @@ pub fn receive(fd: RawFd, max: usize) -> io::Result<Packet> {
         while !header.is_null() {
             let h = &*header;
             if h.cmsg_level == libc::SOL_SOCKET && h.cmsg_type == libc::SCM_RIGHTS {
-                let count = (h.cmsg_len - libc::CMSG_LEN(0) as usize) / mem::size_of::<i32>();
+                let count = (cmsg_len(h) - libc::CMSG_LEN(0) as usize) / mem::size_of::<i32>();
                 for index in 0..count {
                     rights.push(OwnedFd::from_raw_fd(
                         *(libc::CMSG_DATA(header) as *const i32).add(index),
@@ -233,7 +238,7 @@ pub fn receive(fd: RawFd, max: usize) -> io::Result<Packet> {
                 }
             } else if h.cmsg_level == libc::SOL_SOCKET
                 && h.cmsg_type == SCM_PIDFD
-                && h.cmsg_len == libc::CMSG_LEN(mem::size_of::<i32>() as _) as usize
+                && cmsg_len(h) == libc::CMSG_LEN(mem::size_of::<i32>() as _) as usize
             {
                 let received = *(libc::CMSG_DATA(header) as *const i32);
                 // A sender that exited before receipt can yield a negative pidfd, which must never acquire FD ownership.
@@ -250,7 +255,7 @@ pub fn receive(fd: RawFd, max: usize) -> io::Result<Packet> {
                 }
             } else if h.cmsg_level == libc::SOL_SOCKET
                 && h.cmsg_type == libc::SCM_CREDENTIALS
-                && h.cmsg_len == libc::CMSG_LEN(mem::size_of::<libc::ucred>() as _) as usize
+                && cmsg_len(h) == libc::CMSG_LEN(mem::size_of::<libc::ucred>() as _) as usize
                 && cred.is_none()
             {
                 cred = Some(*(libc::CMSG_DATA(header) as *const libc::ucred));
@@ -290,11 +295,11 @@ pub fn send(fd: RawFd, bytes: &[u8], rights: &[RawFd]) -> io::Result<()> {
     if !rights.is_empty() {
         unsafe {
             msg.msg_control = control.as_mut_ptr() as _;
-            msg.msg_controllen = libc::CMSG_SPACE(mem::size_of_val(rights) as _) as usize;
+            msg.msg_controllen = libc::CMSG_SPACE(mem::size_of_val(rights) as _) as _;
             let header = libc::CMSG_FIRSTHDR(&msg);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(mem::size_of_val(rights) as _) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(mem::size_of_val(rights) as _) as _;
             std::ptr::copy_nonoverlapping(
                 rights.as_ptr(),
                 libc::CMSG_DATA(header) as *mut i32,

@@ -12,13 +12,14 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 LAYOUT = runpy.run_path(str(HERE / 'install-layout.py'))
 DEPENDENCIES = runpy.run_path(str(HERE / 'install-dependencies.py'))
-# Must match the test-only flag families in src/main.rs and src/config.rs.
+# Must match the test-only flag families in src/main.rs, src/config.rs and the two business signer binaries in src/bin.
 SEAMS = {'--isolated-runtime-root': '/nonexistent/package-seam', '--isolated-castle-table-tag': 'p1check',
          '--test-health-interval-ms': '1', '--test-shutdown-at': 'pre-recovery',
          '--test-stop-guard-deadline-secs': '1', '--test-nft-binary': '/bin/false',
          '--test-wedge-health-pass-after': '1', '--test-delay-before-ready-ms': '1',
          '--test-trigger-nfqueue-deadline-fail-stop': None,
-         '--test-trigger-fatal-control-path': None, '--test-hang-teardown': None}
+         '--test-trigger-fatal-control-path': None, '--test-hang-teardown': None,
+         '--test-service': None, '--test-bridge': None, '--test-ceremony': None}
 
 
 def classify_refusal(name, flag, status, stderr):
