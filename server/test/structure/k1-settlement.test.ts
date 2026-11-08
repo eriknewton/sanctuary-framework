@@ -61,7 +61,10 @@ it("both service listeners require the fixture-tested capability parser",()=>{
 });
 
 it("fail-before markers describe only the current native enforcement change",()=>{
-  expect(readFileSync("test/smb/contracts.test.ts","utf8").split("\n").slice(0,30).join("\n")).not.toContain("fail-before-exempt:");
+  // The SMB marker may only state why this change sits outside the server/src revert, never an older change's reason.
+  const smb=readFileSync("test/smb/contracts.test.ts","utf8").split("\n").slice(0,30).filter(line=>line.includes("fail-before-exempt:"));
+  expect(smb).toHaveLength(1);
+  expect(smb[0]).toContain("read castle-wall-daemon Rust sources and this file's own violation scanner, which verify-fail-before does not revert");
   const attendance=readFileSync("test/signing/attendance.test.ts","utf8").split("\n")[0];
   expect(attendance).toContain("This change exercises Rust settlement through rebuilt native binaries");
   expect(attendance).toContain("fixture additions only observe the marker and coordinate worker frames");
