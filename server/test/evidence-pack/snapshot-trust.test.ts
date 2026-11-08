@@ -19,3 +19,11 @@ describe("snapshot-trust", () => {
   it("key cap rejects before key inspection", () => { expect(() => C.parseTrustDescriptor(jsonBytes({ format: C.TRUST_FORMAT, keys: Array(C.MAX_KEYS + 1).fill(null) }))).toThrow(C.HARD.limit_exceeded); });
   it("rotation cap rejects before hop inspection", () => { const f = fixture(); const rows = C.parseTrustDescriptor(f.pins.descriptorBytes).keys; const row = rows.find(k => k.role === C.PIN_ROLE.pack)!; if (row.rotation_evidence.kind !== C.ROTATION.history) throw new Error(); row.rotation_evidence.history = Array(C.MAX_ROTATION_HOPS + 1).fill(null); expect(() => C.parseTrustDescriptor(descriptorBytes(rows))).toThrow(C.HARD.limit_exceeded); });
 });
+
+it("outer descriptor extraction never authenticates nested keys", async () => {
+  const { authenticateSnapshotBytes } = await import("../../src/evidence-pack/snapshot-verify.js");
+  const f = fixture(); f.bundle.checkpoints[0].signature = Buffer.alloc(C.SIGNATURE_BYTES).toString("base64url"); syncTransparency(f);
+  const candidate = authenticateSnapshotBytes(f.capture, f.pack.public_key, f.pins.expectedManifestDigest, SOURCE);
+  expect(candidate).toEqual({ candidateDescriptorBytes: f.pins.descriptorBytes, keysAuthenticated: false });
+  expect(verifySnapshot(f.capture, f.pins, SOURCE).status).toBe("FAIL");
+});

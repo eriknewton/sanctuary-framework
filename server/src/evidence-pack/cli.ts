@@ -17,18 +17,16 @@
 
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Writable } from "node:stream";
+import { gatherAuditExport, gatherTransparencyExport } from "./snapshot-gather.js";
 import { createSanctuaryServer } from "../index.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { AuditIntegrityError, type AuditEntry } from "../operational/audit-log.js";
 import {
   createDaemonAuditLog,
-  daemonMigrationEstablished,
   errnoAccessReason,
   resolveDaemonStorePresence,
 } from "../operational/audit-store-split.js";
-import { fortressRanAuditStoreSplitMigration } from "../cli/audit-chain-export.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { listPackRelevantEntries } from "./pack-files.js";
 import {
@@ -46,12 +44,7 @@ import type { CandidateObservation } from "../castle-wall/observe/types.js";
 import { readPersistedLocalAgentsStrict } from "../hub/agent-registry-persistence.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { SovereigntyProfileStore } from "../sovereignty-profile.js";
-import { readPersistedCheckpoints } from "../transparency/emitter.js";
-import {
-  TRANSPARENCY_BUNDLE_FORMAT,
-  type TransparencyBundle,
-} from "../transparency/checkpoint.js";
-import { exportAuditChain, totalRecordsSkipped } from "../cli/audit-chain-export.js";
+import { totalRecordsSkipped } from "../cli/audit-chain-export.js";
 import type {
   CustodyFacts,
   DaemonStoreDisclosure,
@@ -431,23 +424,15 @@ export async function gatherDiscreteExports(
 ): Promise<EvidencePackDiscreteExports> {
   const transparency: ReadOutcome<string> = await (async () => {
     try {
-      const checkpoints = await readPersistedCheckpoints(storage);
-      if (checkpoints.length === 0) {
-        return emptyVerified();
-      }
-      const keys = new Set(checkpoints.map((c) => c.public_key));
-      if (keys.size !== 1) {
+      const read = await gatherTransparencyExport(storage, generatedAt);
+      if (read.state === "empty_verified") return emptyVerified();
+      if (read.state === "read_failed") {
+        if (read.reason !== "mixed_keys") throw read.cause;
         return readFailed(
           "the checkpoints carry more than one signing key; a single-key bundle could not be assembled. Investigate the key history before publishing."
         );
       }
-      const bundle: TransparencyBundle = {
-        format: TRANSPARENCY_BUNDLE_FORMAT,
-        exported_at: generatedAt,
-        public_key: [...keys][0]!,
-        checkpoints,
-      };
-      return populated(JSON.stringify(bundle, null, 2));
+      return populated(JSON.stringify(read.value, null, 2));
     } catch (e) {
       return readFailed(
         readFailureReason("the transparency bundle could not be gathered", e)
@@ -457,24 +442,9 @@ export async function gatherDiscreteExports(
 
   const audit_chain: ReadOutcome<string> = await (async () => {
     try {
-      // R2-1: refuse an operator-only chain on a split (migrated) fortress. The
-      // raw exporter dumps `_audit` only; the daemon enforcement chain would be
-      // silently omitted. This is the SAME fail-closed guard `runExport`
-      // enforces (marker-aware: it also fires when the daemon directory was
-      // deleted but the migration marker survives). Omitting it as a
-      // `read_failed` is honest: §10 then states the export is not included and
-      // why, instead of calling an incomplete chain "the recorded enforcement
-      // history".
-      // Consult BOTH the export module's own daemon-dir/marker probe AND the
-      // marker+boundary-aware `daemonMigrationEstablished` (which the pack can
-      // run because it holds the master key): the former misses a boundary-only
-      // migrated fortress whose daemon dir was deleted and whose _meta marker is
-      // absent, the latter closes that hole. Either firing means an operator-
-      // only export would omit the daemon chain.
-      if (
-        (await fortressRanAuditStoreSplitMigration(storage)) ||
-        (await daemonMigrationEstablished(storage, masterKey))
-      ) {
+      const read = await gatherAuditExport(storage, masterKey);
+      if (read.state === "read_failed" && read.reason === "read_error") throw read.cause;
+      if (read.state === "read_failed" && read.reason === "split_store") {
         return readFailed(
           "a single-file audit-chain export could NOT be shown to be complete for " +
             "this fortress: it appears to have run the audit-store writer split (a " +
@@ -487,25 +457,9 @@ export async function gatherDiscreteExports(
             "root."
         );
       }
-      const chunks: Buffer[] = [];
-      const sink = new Writable({
-        write(chunk, _enc, cb) {
-          chunks.push(Buffer.from(chunk));
-          cb();
-        },
-      });
-      const summary = await exportAuditChain(storage, sink);
-      const jsonl = Buffer.concat(chunks).toString("utf8");
-      // P1-A (dry-bar round 6): one or more LISTED records were unreadable /
-      // invalid JSON / not a V2 envelope and were SKIPPED, so this export is
-      // INCOMPLETE. Distinguish "listed N, exported < N" (a corrupt / partial
-      // chain) from "listed 0" (a genuinely empty chain): never render a corrupt
-      // all-skipped chain as a definitive §10 `emptyVerified` "empty" (a false
-      // clean bill, the opposite of the tamper-evidence the export exists to
-      // provide), and never sign a silently-partial chain as complete. Disclose
-      // it as a read failure carrying the listed/exported/skipped counts.
-      const skipped = totalRecordsSkipped(summary);
-      if (skipped > 0) {
+      if (read.state === "read_failed" && read.summary) {
+        const summary = read.summary;
+        const skipped = totalRecordsSkipped(summary);
         return readFailed(
           "the audit-chain export could NOT be shown to be complete for this " +
             `fortress: ${skipped} listed record(s) were unreadable, invalid, or ` +
@@ -517,7 +471,7 @@ export async function gatherDiscreteExports(
             "than present a corrupt or incomplete chain as a complete or empty one."
         );
       }
-      return jsonl.length > 0 ? populated(jsonl) : emptyVerified();
+      return read.state === "included" ? populated(read.value) : emptyVerified();
     } catch (e) {
       return readFailed(
         readFailureReason("the audit-chain export could not be gathered", e)

@@ -228,3 +228,20 @@ async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> 
   finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
 }
 resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));
+
+// Both consumers share origin-classified failures without parsing legacy reason strings.
+it("snapshot typed gather shares split and skipped guards with legacy", async () => {
+  const { gatherAuditExport } = await import("../../src/evidence-pack/snapshot-gather.js");
+  const split = await splitFortress();
+  expect(await gatherAuditExport(split.storage, split.masterKey)).toMatchObject({ state: "read_failed", reason: "split_store" });
+  const corrupt = await freshFortress(); await corrupt.storage.write("_audit", "corrupt", new TextEncoder().encode("invalid"));
+  expect(await gatherAuditExport(corrupt.storage, corrupt.masterKey)).toMatchObject({ state: "read_failed", reason: "invalid_records" });
+});
+
+it("bounded snapshot gather records overflow without an unhandled stream error", async () => {
+  const { gatherAuditExport } = await import("../../src/evidence-pack/snapshot-gather.js");
+  const f = await freshFortress(), log = new AuditLog(f.storage, f.masterKey);
+  await log.appendCritical({ layer: "l1", operation: "bounded-fixture", identity_id: "fixture", result: "success" }); await log.flush();
+  expect(await gatherAuditExport(f.storage, f.masterKey, 1)).toMatchObject({ state: "read_failed", reason: "read_error" });
+  expect((await gatherAuditExport(f.storage, f.masterKey)).state).toBe("included");
+});

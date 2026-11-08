@@ -21,6 +21,8 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "erc8004",
   "evidence-pack",
   "exit",
+  "export-evidence",
+  "export-evidence-trust",
   "export-passphrase",
   "federation",
   "file-grant",
