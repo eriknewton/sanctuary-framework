@@ -15,6 +15,8 @@ function fileName(file: C.CapturedFile): string { return capturedName(file.name)
 function checkMetadata(names: readonly string[]): void {
   // These OS or download labels are involuntary, cannot be removed by unprivileged processes on current macOS and carry no pack content, so admitting only the exact names in snapshot-contract.ts preserves the signed file-byte claim.
   C.requireSnapshot(names.every(name => C.OS_ATTACHED_METADATA.includes(name)), C.HARD.unexpected_metadata);
+  // A file cannot carry one attribute name twice, so a repeated name can only come from an ambiguous listing and is refused.
+  C.requireSnapshot(new Set(names).size === names.length, C.HARD.unexpected_metadata);
 }
 function checkType(file: C.CapturedFile): void {
   C.validateCapturedStat(file.before); C.validateCapturedStat(file.after);
@@ -51,7 +53,7 @@ function inspectSnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifi
     state = C.STATES.MANIFEST_BYTES; C.cap(capture.files.length, C.MAX_FILES);
     // The notice describes admitted labels only, so a capture that also carries a refused name reports the refusal alone.
     const metadataSets = [capture.rootMetadata, ...capture.files.map(file => file.metadata)];
-    if (metadataSets.every(names => names.every(name => C.OS_ATTACHED_METADATA.includes(name))) && metadataSets.some(names => names.length > 0)) resultBase.not_checked.push(C.OS_ATTACHED_METADATA_NOT_CHECKED);
+    if (metadataSets.every(names => new Set(names).size === names.length && names.every(name => C.OS_ATTACHED_METADATA.includes(name))) && metadataSets.some(names => names.length > 0)) resultBase.not_checked.push(C.OS_ATTACHED_METADATA_NOT_CHECKED);
     C.validateCapturedStat(capture.rootBefore); C.validateCapturedStat(capture.rootAfter);
     C.requireSnapshot(capture.rootBefore.type === C.FILE_TYPE.directory && capture.rootAfter.type === C.FILE_TYPE.directory, C.HARD.file_type_invalid);
     checkMetadata(capture.rootMetadata);

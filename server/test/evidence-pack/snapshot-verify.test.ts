@@ -60,6 +60,12 @@ it.each(osLabels.flatMap(allowed => ["root", "file"].map(location => ({ allowed,
   expect(JSON.stringify(run(f))).not.toContain("private-sentinel");
   expect(run(f).not_checked).not.toContain(metadataNotice);
 });
+it.each(["root", "file"])("a repeated OS label on %s refuses without the scope notice", location => {
+  const f = fixture(), names = ["com.apple.provenance", "com.apple.quarantine", "com.apple.provenance"];
+  if (location === "root") f.capture.rootMetadata = names; else f.capture.files[0].metadata = names;
+  rejected(f, C.HARD.unexpected_metadata);
+  expect(run(f).not_checked).not.toContain(metadataNotice);
+});
 it.each(["com.apple.ResourceFork", "com.apple.FinderInfo", "Com.apple.provenance", "com.apple.quarantine ", "security.selinux\0"].flatMap(name => ["root", "file"].map(location => ({ name, location }))))("exact metadata name $name on $location refuses", ({ name, location }) => {
   const f = fixture();
   if (location === "root") f.capture.rootMetadata = [name]; else f.capture.files[0].metadata = [name];

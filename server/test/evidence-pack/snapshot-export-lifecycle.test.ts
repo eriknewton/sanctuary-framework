@@ -247,10 +247,12 @@ it("Darwin capture refuses allowed names that do not exist under their exact nam
     expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata);
   } finally { Object.defineProperty(process, "platform", { value: platform }); vi.doUnmock("node:child_process"); vi.resetModules(); }
 });
-it.skipIf(process.platform !== "darwin")("on macOS a real LF-joined attribute name is refused", async () => {
+it.skipIf(process.platform !== "darwin")("on macOS a real LF-joined attribute name over genuine labels is refused", async () => {
   const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
   const receipt = JSON.parse(await readFile(x.options.receipt, "utf8")), { execFile } = await import("node:child_process"), { promisify } = await import("node:util");
-  await promisify(execFile)("/usr/bin/xattr", ["-w", "com.apple.quarantine\nsecurity.selinux", "x", join(x.options.output, C.REPORT_FILENAME)]);
+  // macOS gives every new file a genuine provenance label, so this joined name lists as two existing names and only the repeat refuses it.
+  await promisify(execFile)("/usr/bin/xattr", ["-w", "com.apple.provenance\ncom.apple.quarantine", "x", join(x.options.output, C.REPORT_FILENAME)]);
+  await promisify(execFile)("/usr/bin/xattr", ["-w", "com.apple.quarantine", "q", join(x.options.output, C.REPORT_FILENAME)]);
   const capture = await captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
   const result = verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE);
   expect(result.status).toBe("FAIL"); expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata);
