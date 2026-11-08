@@ -1567,6 +1567,7 @@ async function standaloneBoundAddress(dashboard: DashboardApprovalChannel) {
 let rescueHome: string;
 let previousHome: string | undefined;
 let previousCustodyLockRoot: string | undefined;
+let rescueLockRoot: string;
 let rescueSessions: custodyModule.EstablishMasterResult[] = [];
 let rescueChannels: DashboardApprovalChannel[] = [];
 let rescueListeners: DistressListener[] = [];
@@ -1577,7 +1578,9 @@ beforeEach(async () => {
   rescueHome = await mkdtemp(join(tmpdir(), "standalone-home-"));
   process.env.HOME = rescueHome;
   // A private rendezvous excludes readers from recycled directory identities while keeping every reader owned by this fixture visible to its release probe.
-  process.env.SANCTUARY_CUSTODY_LOCK_ROOT = join(rescueHome, "locks");
+  // It sits under a short parent because the composed reader socket path must fit KERNEL_SOCKET_PATH_MAX_BYTES (storage/cross-process-lock.ts), and the default macOS TMPDIR alone is about 49 bytes.
+  rescueLockRoot = await mkdtemp(join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), "sdl-"));
+  process.env.SANCTUARY_CUSTODY_LOCK_ROOT = rescueLockRoot;
   rescueSessions = [];
   rescueChannels = [];
   rescueListeners = [];
@@ -1602,15 +1605,20 @@ beforeEach(async () => {
 afterEach(async () => {
   // Rescue runs after assertions so it cannot satisfy an ownership witness for the owner.
   vi.restoreAllMocks();
-  for (const channel of rescueChannels) await channel.stop().catch(() => undefined);
-  for (const listener of rescueListeners) await listener.stop().catch(() => undefined);
-  for (const session of rescueSessions) {
-    await session.masterWriteBarrier?.release();
-    session.masterKey.fill(0);
+  try {
+    for (const channel of rescueChannels) await channel.stop().catch(() => undefined);
+    for (const listener of rescueListeners) await listener.stop().catch(() => undefined);
+    for (const session of rescueSessions) {
+      await session.masterWriteBarrier?.release();
+      session.masterKey.fill(0);
+    }
+  } finally {
+    // The environment is restored even when a rescue release throws, so no later test inherits this fixture's private rendezvous.
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousCustodyLockRoot === undefined) delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+    else process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousCustodyLockRoot;
+    await rm(rescueHome, { recursive: true, force: true });
+    await rm(rescueLockRoot, { recursive: true, force: true });
   }
-  if (previousHome === undefined) delete process.env.HOME;
-  else process.env.HOME = previousHome;
-  if (previousCustodyLockRoot === undefined) delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
-  else process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousCustodyLockRoot;
-  await rm(rescueHome, { recursive: true, force: true });
 });
