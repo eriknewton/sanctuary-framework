@@ -17,32 +17,60 @@ use sha2::{Digest, Sha256};
 use signer_contract::*;
 
 pub fn strict_point(bytes: &[u8]) -> bool {
-    let encoded: [u8; 32] = match bytes.try_into() { Ok(value) => value, Err(_) => return false };
+    let encoded: [u8; 32] = match bytes.try_into() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
     match CompressedEdwardsY(encoded).decompress() {
-        Some(point) => point.compress().to_bytes() == encoded && !point.is_small_order() && point.is_torsion_free(),
+        Some(point) => {
+            point.compress().to_bytes() == encoded
+                && !point.is_small_order()
+                && point.is_torsion_free()
+        }
         None => false,
     }
 }
 
 pub fn strict_encoding_profile(signature: &[u8], public_key: &[u8]) -> bool {
-    if signature.len() != 64 || !strict_point(public_key) || !strict_point(&signature[..32]) { return false; }
-    let scalar: [u8; 32] = signature[32..].try_into().expect("checked signature length");
+    if signature.len() != 64 || !strict_point(public_key) || !strict_point(&signature[..32]) {
+        return false;
+    }
+    // Safety: the length check above returned early unless the signature is exactly 64 bytes, so this slice is exactly 32 bytes.
+    let scalar: [u8; 32] = signature[32..]
+        .try_into()
+        .expect("checked signature length");
     bool::from(curve25519_dalek::scalar::Scalar::from_canonical_bytes(scalar).is_some())
 }
 
 pub fn strict_verify(message: &[u8], signature: &[u8], public_key: &[u8]) -> bool {
-    if !strict_encoding_profile(signature, public_key) { return false; }
-    let bytes: &[u8; 32] = match public_key.try_into() { Ok(value) => value, Err(_) => return false };
-    match (VerifyingKey::from_bytes(bytes), Signature::from_slice(signature)) {
+    if !strict_encoding_profile(signature, public_key) {
+        return false;
+    }
+    let bytes: &[u8; 32] = match public_key.try_into() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    match (
+        VerifyingKey::from_bytes(bytes),
+        Signature::from_slice(signature),
+    ) {
         (Ok(key), Ok(sig)) => key.verify_strict(message, &sig).is_ok(),
         _ => false,
     }
 }
 
 pub fn role_kid(role: &str, epoch: u64, public_key: &[u8]) -> Option<String> {
-    if epoch == 0 || epoch > 9007199254740991 || public_key.len() != 32 || !ROLE_REGISTRY.iter().any(|entry| entry.0 == role) { return None; }
+    if epoch == 0
+        || epoch > 9007199254740991
+        || public_key.len() != 32
+        || !ROLE_REGISTRY.iter().any(|entry| entry.0 == role)
+    {
+        return None;
+    }
     // Must match roleKid in server/src/signing/contract.ts, including canonical JSON and unpadded base64url.
-    kid_from_body(&json!({"v": 1, "role": role, "epoch": epoch, "public_key": URL_SAFE_NO_PAD.encode(public_key)}))
+    kid_from_body(
+        &json!({"v": 1, "role": role, "epoch": epoch, "public_key": URL_SAFE_NO_PAD.encode(public_key)}),
+    )
 }
 
 /// Hashes the kid domain and the canonical encoding of an already-built kid body.
@@ -55,19 +83,55 @@ fn kid_from_body(body: &serde_json::Value) -> Option<String> {
 }
 
 /// Cryptographic contract only; typed payload and outer index checks belong to each future consumer.
-pub fn verify_role(role: &str, epoch: u64, kid: &str, scheme: &str, record_kind: &str, preimage: &[u8], signature: &[u8], public_key: &[u8]) -> bool {
+pub fn verify_role(
+    role: &str,
+    epoch: u64,
+    kid: &str,
+    scheme: &str,
+    record_kind: &str,
+    preimage: &[u8],
+    signature: &[u8],
+    public_key: &[u8],
+) -> bool {
     // A legacy scheme refuses even if its signature verifies because it cannot name a K1 role grant.
-    if scheme != ROLE_SIGNATURE_SCHEME || role_kid(role, epoch, public_key).as_deref() != Some(kid) { return false; }
-    let entry = match ROLE_REGISTRY.iter().find(|entry| entry.0 == role) { Some(value) => value, None => return false };
-    if preimage.len() > SIGNER_PREIMAGE_MAX_BYTES || entry.1.len() + preimage.len() > SIGNER_MESSAGE_MAX_BYTES { return false; }
+    if scheme != ROLE_SIGNATURE_SCHEME || role_kid(role, epoch, public_key).as_deref() != Some(kid)
+    {
+        return false;
+    }
+    let entry = match ROLE_REGISTRY.iter().find(|entry| entry.0 == role) {
+        Some(value) => value,
+        None => return false,
+    };
+    if preimage.len() > SIGNER_PREIMAGE_MAX_BYTES
+        || entry.1.len() + preimage.len() > SIGNER_MESSAGE_MAX_BYTES
+    {
+        return false;
+    }
     // Must match the registered signed record_kind selected by TypeScript adapters in signing/contract.ts.
-    if !RECORD_KINDS.iter().any(|row| row.0 == role && row.1.contains(&record_kind)) { return false; }
+    if !RECORD_KINDS
+        .iter()
+        .any(|row| row.0 == role && row.1.contains(&record_kind))
+    {
+        return false;
+    }
     // Must match parseRecord in server/src/signing/contract.ts: one strict parse refusing duplicate keys, then canonical
     // re-encode equality, so TypeScript and Rust can never read different fields out of the same signed bytes.
-    let body = match crate::smb::strict_json::parse(preimage, SIGNER_PREIMAGE_MAX_BYTES) { Ok(value) => value, Err(_) => return false };
-    if crate::smb::jcs::encode(&body).ok().as_deref().map(str::as_bytes) != Some(preimage) { return false; }
+    let body = match crate::smb::strict_json::parse(preimage, SIGNER_PREIMAGE_MAX_BYTES) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if crate::smb::jcs::encode(&body)
+        .ok()
+        .as_deref()
+        .map(str::as_bytes)
+        != Some(preimage)
+    {
+        return false;
+    }
     // Overlapping payload schemas cannot grant the authority of another signed record kind.
-    if body.get("record_kind").and_then(|value| value.as_str()) != Some(record_kind) { return false; }
+    if body.get("record_kind").and_then(|value| value.as_str()) != Some(record_kind) {
+        return false;
+    }
     let mut message = entry.1.as_bytes().to_vec();
     message.extend_from_slice(preimage);
     strict_verify(&message, signature, public_key)
@@ -91,12 +155,25 @@ mod tests {
             let body = crate::smb::jcs::encode(&json!({"record_kind": kind})).unwrap();
             let message = [ROLE_REGISTRY[0].1.as_bytes(), body.as_bytes()].concat();
             let signature = key.sign(&message).to_bytes();
-            assert_eq!(verify_role(role, 1, &kid, ROLE_SIGNATURE_SCHEME, kind, body.as_bytes(), &signature, &public_key), kind == "append");
+            assert_eq!(
+                verify_role(
+                    role,
+                    1,
+                    &kid,
+                    ROLE_SIGNATURE_SCHEME,
+                    kind,
+                    body.as_bytes(),
+                    &signature,
+                    &public_key
+                ),
+                kind == "append"
+            );
         }
     }
     // Must match PINNED_KID_VECTOR in server/test/structure/k1-role-signing-boundaries.test.ts, computed by TypeScript
     // roleKid over 32 bytes of 0x07 at epoch 2 for the producer role.
-    const PINNED_KID: &str = "k1:sha256:e09fa5a1f32e54219ade30b8ee6b5cb8367089d6a6aedfad3bf8c875b08fb411";
+    const PINNED_KID: &str =
+        "k1:sha256:e09fa5a1f32e54219ade30b8ee6b5cb8367089d6a6aedfad3bf8c875b08fb411";
     #[test]
     fn kid_encoding_uses_canonical_order() {
         let role = ROLE_REGISTRY[0].0;
@@ -104,11 +181,28 @@ mod tests {
         // Same fields, two insertion orders: where serde_json keeps insertion order, an order-sensitive encoder would hash two
         // different byte strings; the pinned TypeScript value catches any encoder that is not the canonical one either way.
         let mut forward = serde_json::Map::new();
-        for (name, value) in [("v", json!(1)), ("role", json!(role)), ("epoch", json!(2)), ("public_key", json!(public_key))] { forward.insert(name.into(), value); }
+        for (name, value) in [
+            ("v", json!(1)),
+            ("role", json!(role)),
+            ("epoch", json!(2)),
+            ("public_key", json!(public_key)),
+        ] {
+            forward.insert(name.into(), value);
+        }
         let mut reverse = serde_json::Map::new();
-        for (name, value) in [("public_key", json!(public_key)), ("epoch", json!(2)), ("role", json!(role)), ("v", json!(1))] { reverse.insert(name.into(), value); }
+        for (name, value) in [
+            ("public_key", json!(public_key)),
+            ("epoch", json!(2)),
+            ("role", json!(role)),
+            ("v", json!(1)),
+        ] {
+            reverse.insert(name.into(), value);
+        }
         let forward_kid = kid_from_body(&serde_json::Value::Object(forward)).unwrap();
-        assert_eq!(forward_kid, kid_from_body(&serde_json::Value::Object(reverse)).unwrap());
+        assert_eq!(
+            forward_kid,
+            kid_from_body(&serde_json::Value::Object(reverse)).unwrap()
+        );
         assert_eq!(forward_kid, PINNED_KID);
         assert_eq!(role_kid(role, 2, &[7_u8; 32]).unwrap(), PINNED_KID);
     }
@@ -119,30 +213,81 @@ mod tests {
         let role = ROLE_REGISTRY[0].0;
         let public_key = key.verifying_key().to_bytes();
         let kid = role_kid(role, 1, &public_key).unwrap();
-        let sign = |body: &str| key.sign(&[ROLE_REGISTRY[0].1.as_bytes(), body.as_bytes()].concat()).to_bytes();
+        let sign = |body: &str| {
+            key.sign(&[ROLE_REGISTRY[0].1.as_bytes(), body.as_bytes()].concat())
+                .to_bytes()
+        };
         // A lax last-wins parser would read "control" here, while the TypeScript strict parser refuses the bytes.
         let duplicate = r#"{"record_kind":"append","record_kind":"control"}"#;
-        for kind in ["append", "control"] { assert!(!verify_role(role, 1, &kid, ROLE_SIGNATURE_SCHEME, kind, duplicate.as_bytes(), &sign(duplicate), &public_key)); }
+        for kind in ["append", "control"] {
+            assert!(!verify_role(
+                role,
+                1,
+                &kid,
+                ROLE_SIGNATURE_SCHEME,
+                kind,
+                duplicate.as_bytes(),
+                &sign(duplicate),
+                &public_key
+            ));
+        }
         let spaced = r#"{"record_kind": "append"}"#;
-        assert!(!verify_role(role, 1, &kid, ROLE_SIGNATURE_SCHEME, "append", spaced.as_bytes(), &sign(spaced), &public_key));
+        assert!(!verify_role(
+            role,
+            1,
+            &kid,
+            ROLE_SIGNATURE_SCHEME,
+            "append",
+            spaced.as_bytes(),
+            &sign(spaced),
+            &public_key
+        ));
         let canonical = r#"{"record_kind":"append"}"#;
-        assert!(verify_role(role, 1, &kid, ROLE_SIGNATURE_SCHEME, "append", canonical.as_bytes(), &sign(canonical), &public_key));
+        assert!(verify_role(
+            role,
+            1,
+            &kid,
+            ROLE_SIGNATURE_SCHEME,
+            "append",
+            canonical.as_bytes(),
+            &sign(canonical),
+            &public_key
+        ));
     }
     #[test]
     fn identical_public_strict_vectors() {
         for vector in vectors().as_array().unwrap() {
             let decode = |key: &str| hex::decode(vector[key].as_str().unwrap()).unwrap();
-            assert_eq!(strict_encoding_profile(&decode("signature"), &decode("public_key")), vector["valid"].as_bool().unwrap(), "encoding {}", vector["name"]);
-            assert_eq!(strict_verify(&decode("message"), &decode("signature"), &decode("public_key")), vector["valid"].as_bool().unwrap(), "{}", vector["name"]);
+            assert_eq!(
+                strict_encoding_profile(&decode("signature"), &decode("public_key")),
+                vector["valid"].as_bool().unwrap(),
+                "encoding {}",
+                vector["name"]
+            );
+            assert_eq!(
+                strict_verify(
+                    &decode("message"),
+                    &decode("signature"),
+                    &decode("public_key")
+                ),
+                vector["valid"].as_bool().unwrap(),
+                "{}",
+                vector["name"]
+            );
             if let Some(kind) = vector["point_kind"].as_str() {
-                let bytes = if kind == "A" { decode("public_key") } else { decode("signature")[..32].to_vec() };
+                let bytes = if kind == "A" {
+                    decode("public_key")
+                } else {
+                    decode("signature")[..32].to_vec()
+                };
                 assert!(!strict_point(&bytes), "point gate {}", vector["name"]);
             }
         }
     }
     #[test]
     fn every_role_vector_and_legacy_refusal() {
-        let rows: serde_json::Value = serde_json::from_str(include_str!("role_vectors.json")).unwrap();
+        let rows: serde_json::Value =
+            serde_json::from_str(include_str!("role_vectors.json")).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), ROLE_REGISTRY.len());
         for row in rows.as_array().unwrap() {
             let role = row["role"].as_str().unwrap();
@@ -153,14 +298,74 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let kind = parsed["record_kind"].as_str().unwrap();
             assert_eq!(role_kid(role, 1, &key).unwrap(), kid);
-            assert!(verify_role(role, 1, kid, ROLE_SIGNATURE_SCHEME, kind, &body, &sig, &key));
-            assert!(!verify_role(role, 1, kid, "ed25519-v1", kind, &body, &sig, &key));
-            assert!(!verify_role(role, 1, "cw-audit-producer-v1", ROLE_SIGNATURE_SCHEME, kind, &body, &sig, &key));
+            assert!(verify_role(
+                role,
+                1,
+                kid,
+                ROLE_SIGNATURE_SCHEME,
+                kind,
+                &body,
+                &sig,
+                &key
+            ));
+            assert!(!verify_role(
+                role,
+                1,
+                kid,
+                "ed25519-v1",
+                kind,
+                &body,
+                &sig,
+                &key
+            ));
+            assert!(!verify_role(
+                role,
+                1,
+                "cw-audit-producer-v1",
+                ROLE_SIGNATURE_SCHEME,
+                kind,
+                &body,
+                &sig,
+                &key
+            ));
             for other_kind in RECORD_KINDS.iter().find(|row| row.0 == role).unwrap().1 {
-                if *other_kind != kind { assert!(!verify_role(role, 1, kid, ROLE_SIGNATURE_SCHEME, other_kind, &body, &sig, &key)); }
+                if *other_kind != kind {
+                    assert!(!verify_role(
+                        role,
+                        1,
+                        kid,
+                        ROLE_SIGNATURE_SCHEME,
+                        other_kind,
+                        &body,
+                        &sig,
+                        &key
+                    ));
+                }
             }
-            assert!(!verify_role(role, 1, kid, ROLE_SIGNATURE_SCHEME, "unregistered", &body, &sig, &key));
-            for other in ROLE_REGISTRY { if other.0 != role { assert!(!verify_role(other.0, 1, kid, ROLE_SIGNATURE_SCHEME, kind, &body, &sig, &key)); } }
+            assert!(!verify_role(
+                role,
+                1,
+                kid,
+                ROLE_SIGNATURE_SCHEME,
+                "unregistered",
+                &body,
+                &sig,
+                &key
+            ));
+            for other in ROLE_REGISTRY {
+                if other.0 != role {
+                    assert!(!verify_role(
+                        other.0,
+                        1,
+                        kid,
+                        ROLE_SIGNATURE_SCHEME,
+                        kind,
+                        &body,
+                        &sig,
+                        &key
+                    ));
+                }
+            }
         }
     }
 }

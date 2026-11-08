@@ -106,3 +106,9 @@ export {
   type PackArtifactId,
   type ArtifactScope,
 } from "./artifact-scope.js";
+
+export * as snapshotContract from "./snapshot-contract.js";
+export { verifySnapshot } from "./snapshot-verify.js";
+export { validateSnapshotPins, bindSnapshotTrust, validateRotationEvidence } from "./snapshot-trust.js";
+export type { SnapshotPins } from "./snapshot-trust.js";
+export { verifySnapshotAudit, verifySnapshotTransparency, joinSnapshotVerdict } from "./snapshot-nested.js";
