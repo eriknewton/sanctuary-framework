@@ -51,14 +51,15 @@ describe("bounded name-only metadata capture", () => {
   });
 });
 
-import { mkdtempSync, mkdirSync, writeFileSync, lstatSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, lstatSync, renameSync, symlinkSync, unlinkSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fixture, syncAudit } from "./snapshot-fixtures.js";
 function verdictInput(status: string) {
   const f = fixture();
   if (status === "PARTIAL") { for (const row of f.records) if (row.type === "checkpoint") { row.unsigned = true; row.signature = null; row.signer_kid = null; delete row.public_key; } syncAudit(f); }
-  const root = mkdtempSync(join(tmpdir(), "verdict-")), pack = join(root, "pack"); mkdirSync(pack);
+  // The exporter resolves the pack path, so the fixture root is resolved too; on macOS tmpdir() sits under the /var symlink to /private/var.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "verdict-"))), pack = join(root, "pack"); mkdirSync(pack);
   for (const file of f.capture.files) writeFileSync(join(pack, Buffer.from(file.name).toString()), file.bytes);
   if (status === "FAIL") writeFileSync(join(pack, C.PDF_FILENAME), "changed");
   writeFileSync(join(root, "key"), f.pins.packKey); writeFileSync(join(root, "trust"), f.pins.descriptorBytes);
