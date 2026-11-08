@@ -1,0 +1,4799 @@
+{
+  "version": 1,
+  "contract": "Must match linux-business-records.ts and business_profile/records_schema.rs and records_schema.json via generate-record-signer-contract.mjs.",
+  "bounds": {
+    "safe_integer": 9007199254740991,
+    "u64_max": "18446744073709551615",
+    "max_bytes": 65536,
+    "flow_max": 64,
+    "attempt_max": 64,
+    "replay_max": 64,
+    "counter_period_ns": "1000000000"
+  },
+  "definitions": {
+    "N": {
+      "type": "integer",
+      "min": 0,
+      "max": 9007199254740991
+    },
+    "Pos": {
+      "type": "integer",
+      "min": 1,
+      "max": 9007199254740991
+    },
+    "UID": {
+      "type": "integer",
+      "min": 0,
+      "max": 4294967294
+    },
+    "Port": {
+      "type": "integer",
+      "min": 0,
+      "max": 65535
+    },
+    "U8": {
+      "type": "integer",
+      "min": 0,
+      "max": 255
+    },
+    "U16": {
+      "type": "integer",
+      "min": 0,
+      "max": 65535
+    },
+    "U32": {
+      "type": "integer",
+      "min": 0,
+      "max": 4294967295
+    },
+    "ID": {
+      "type": "string",
+      "encoding": "id"
+    },
+    "Digest": {
+      "type": "string",
+      "encoding": "digest"
+    },
+    "Kid": {
+      "type": "string",
+      "encoding": "kid"
+    },
+    "U64": {
+      "type": "string",
+      "encoding": "u64"
+    },
+    "IPv4": {
+      "type": "string",
+      "encoding": "ipv4"
+    },
+    "IPv6": {
+      "type": "string",
+      "encoding": "ipv6"
+    },
+    "IP": {
+      "type": "union",
+      "branches": [
+        {
+          "type": "ref",
+          "name": "IPv4"
+        },
+        {
+          "type": "ref",
+          "name": "IPv6"
+        }
+      ]
+    },
+    "Commitment": {
+      "type": "union",
+      "branches": [
+        {
+          "type": "literal",
+          "value": "GENESIS"
+        },
+        {
+          "type": "ref",
+          "name": "Digest"
+        }
+      ]
+    },
+    "Window": {
+      "type": "object",
+      "fields": {
+        "first_ns": {
+          "type": "ref",
+          "name": "U64"
+        },
+        "last_ns": {
+          "type": "ref",
+          "name": "U64"
+        }
+      },
+      "where": [
+        {
+          "op": "le",
+          "paths": [
+            "first_ns",
+            "last_ns"
+          ]
+        }
+      ]
+    },
+    "DirectionCounts": {
+      "type": "object",
+      "fields": {
+        "ip_bytes": {
+          "type": "ref",
+          "name": "U64"
+        },
+        "packets": {
+          "type": "ref",
+          "name": "U64"
+        }
+      }
+    },
+    "Counts": {
+      "type": "object",
+      "fields": {
+        "original": {
+          "type": "ref",
+          "name": "DirectionCounts"
+        },
+        "reply": {
+          "type": "ref",
+          "name": "DirectionCounts"
+        }
+      }
+    },
+    "Flow": {
+      "type": "object",
+      "fields": {
+        "machine_id": {
+          "type": "ref",
+          "name": "ID"
+        },
+        "boot_id": {
+          "type": "ref",
+          "name": "ID"
+        },
+        "activation_id": {
+          "type": "ref",
+          "name": "ID"
+        },
+        "ct_zone": {
+          "type": "ref",
+          "name": "U16"
+        },
+        "ct_id": {
+          "type": "ref",
+          "name": "U32"
+        },
+        "open_sequence": {
+          "type": "ref",
+          "name": "Pos"
+        }
+      }
+    },
+    "Listener": {
+      "type": "object",
+      "fields": {
+        "uid": {
+          "type": "ref",
+          "name": "UID"
+        },
+        "cookie": {
+          "type": "ref",
+          "name": "U64"
+        },
+        "netns_inode": {
+          "type": "ref",
+          "name": "U64"
+        },
+        "address": {
+          "type": "ref",
+          "name": "IPv4"
+        },
+        "port": {
+          "type": "ref",
+          "name": "Port"
+        },
+        "endpoint_generation": {
+          "type": "ref",
+          "name": "N"
+        }
+      }
+    },
+    "Tuple": {
+      "type": "union",
+      "branches": [
+        {
+          "type": "object",
+          "fields": {
+            "family": {
+              "type": "literal",
+              "value": "ipv4"
+            },
+            "protocol": {
+              "type": "literal",
+              "value": "tcp"
+            },
+            "src_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "dst_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "src_port": {
+              "type": "ref",
+              "name": "Port"
+            },
+            "dst_port": {
+              "type": "ref",
+              "name": "Port"
+            }
+          },
+          "where": [
+            {
+              "op": "address_family",
+              "paths": [
+                "family",
+                "src_ip",
+                "dst_ip"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "fields": {
+            "family": {
+              "type": "literal",
+              "value": "ipv4"
+            },
+            "protocol": {
+              "type": "literal",
+              "value": "udp"
+            },
+            "src_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "dst_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "src_port": {
+              "type": "ref",
+              "name": "Port"
+            },
+            "dst_port": {
+              "type": "ref",
+              "name": "Port"
+            }
+          },
+          "where": [
+            {
+              "op": "address_family",
+              "paths": [
+                "family",
+                "src_ip",
+                "dst_ip"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "fields": {
+            "family": {
+              "type": "literal",
+              "value": "ipv4"
+            },
+            "protocol": {
+              "type": "literal",
+              "value": "icmp"
+            },
+            "src_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "dst_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "icmp_type": {
+              "type": "ref",
+              "name": "U8"
+            },
+            "icmp_code": {
+              "type": "ref",
+              "name": "U8"
+            }
+          },
+          "where": [
+            {
+              "op": "address_family",
+              "paths": [
+                "family",
+                "src_ip",
+                "dst_ip"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "fields": {
+            "family": {
+              "type": "literal",
+              "value": "ipv6"
+            },
+            "protocol": {
+              "type": "literal",
+              "value": "tcp"
+            },
+            "src_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "dst_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "src_port": {
+              "type": "ref",
+              "name": "Port"
+            },
+            "dst_port": {
+              "type": "ref",
+              "name": "Port"
+            }
+          },
+          "where": [
+            {
+              "op": "address_family",
+              "paths": [
+                "family",
+                "src_ip",
+                "dst_ip"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "fields": {
+            "family": {
+              "type": "literal",
+              "value": "ipv6"
+            },
+            "protocol": {
+              "type": "literal",
+              "value": "udp"
+            },
+            "src_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "dst_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "src_port": {
+              "type": "ref",
+              "name": "Port"
+            },
+            "dst_port": {
+              "type": "ref",
+              "name": "Port"
+            }
+          },
+          "where": [
+            {
+              "op": "address_family",
+              "paths": [
+                "family",
+                "src_ip",
+                "dst_ip"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "fields": {
+            "family": {
+              "type": "literal",
+              "value": "ipv6"
+            },
+            "protocol": {
+              "type": "literal",
+              "value": "icmp"
+            },
+            "src_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "dst_ip": {
+              "type": "ref",
+              "name": "IP"
+            },
+            "icmp_type": {
+              "type": "ref",
+              "name": "U8"
+            },
+            "icmp_code": {
+              "type": "ref",
+              "name": "U8"
+            }
+          },
+          "where": [
+            {
+              "op": "address_family",
+              "paths": [
+                "family",
+                "src_ip",
+                "dst_ip"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "LiveTuple": {
+      "type": "object",
+      "fields": {
+        "family": {
+          "type": "literal",
+          "value": "ipv4"
+        },
+        "protocol": {
+          "type": "literal",
+          "value": "tcp"
+        },
+        "src_ip": {
+          "type": "ref",
+          "name": "IP"
+        },
+        "dst_ip": {
+          "type": "ref",
+          "name": "IP"
+        },
+        "src_port": {
+          "type": "ref",
+          "name": "Port"
+        },
+        "dst_port": {
+          "type": "ref",
+          "name": "Port"
+        }
+      },
+      "where": [
+        {
+          "op": "address_family",
+          "paths": [
+            "family",
+            "src_ip",
+            "dst_ip"
+          ]
+        }
+      ]
+    },
+    "Context": {
+      "type": "object",
+      "fields": {
+        "flow": {
+          "type": "ref",
+          "name": "Flow"
+        },
+        "original": {
+          "type": "ref",
+          "name": "LiveTuple"
+        },
+        "reply": {
+          "type": "ref",
+          "name": "LiveTuple"
+        },
+        "netns_inode": {
+          "type": "ref",
+          "name": "U64"
+        },
+        "socket_cookie": {
+          "type": "ref",
+          "name": "U64"
+        },
+        "actor_uid": {
+          "type": "ref",
+          "name": "UID"
+        }
+      },
+      "where": [
+        {
+          "op": "reverse_tuple",
+          "paths": [
+            "original",
+            "reply"
+          ]
+        }
+      ]
+    },
+    "Endpoint": {
+      "type": "object",
+      "fields": {
+        "source": {
+          "type": "literal",
+          "value": "endpoint"
+        },
+        "endpoint_generation": {
+          "type": "ref",
+          "name": "N"
+        },
+        "request_id": {
+          "type": "ref",
+          "name": "ID"
+        },
+        "status": {
+          "type": "enum",
+          "values": [
+            "complete",
+            "error",
+            "truncated",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "KnownEndpoint": {
+      "type": "object",
+      "fields": {
+        "source": {
+          "type": "literal",
+          "value": "endpoint"
+        },
+        "endpoint_generation": {
+          "type": "ref",
+          "name": "N"
+        },
+        "request_id": {
+          "type": "ref",
+          "name": "ID"
+        },
+        "status": {
+          "type": "enum",
+          "values": [
+            "complete",
+            "error",
+            "truncated"
+          ]
+        }
+      }
+    }
+  },
+  "record": {
+    "type": "union",
+    "branches": [
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "open"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "edge": {
+                "type": "literal",
+                "value": "agent_endpoint"
+              },
+              "listener": {
+                "type": "ref",
+                "name": "Listener"
+              },
+              "origin_link_sequence": {
+                "type": "literal",
+                "value": null
+              },
+              "rule": {
+                "type": "literal",
+                "value": "listener_open"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "open"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "edge": {
+                "type": "literal",
+                "value": "endpoint_vendor"
+              },
+              "listener": {
+                "type": "literal",
+                "value": null
+              },
+              "origin_link_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "egress_link"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "link"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "link": {
+                "type": "object",
+                "fields": {
+                  "kind": {
+                    "type": "literal",
+                    "value": "ingress"
+                  },
+                  "agent_flow": {
+                    "type": "ref",
+                    "name": "Flow"
+                  },
+                  "accepted_cookie": {
+                    "type": "ref",
+                    "name": "U64"
+                  },
+                  "listener": {
+                    "type": "ref",
+                    "name": "Listener"
+                  }
+                }
+              },
+              "rule": {
+                "type": "literal",
+                "value": "ingress_link"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "link"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "link": {
+                "type": "object",
+                "fields": {
+                  "kind": {
+                    "type": "literal",
+                    "value": "egress"
+                  },
+                  "agent_flow": {
+                    "type": "ref",
+                    "name": "Flow"
+                  },
+                  "ingress_sequence": {
+                    "type": "ref",
+                    "name": "Pos"
+                  },
+                  "origin_agent_uid": {
+                    "type": "ref",
+                    "name": "UID"
+                  }
+                }
+              },
+              "rule": {
+                "type": "literal",
+                "value": "egress_link"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "allowance"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "link_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "permit_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "ceiling": {
+                "type": "ref",
+                "name": "Counts"
+              },
+              "expires_ns": {
+                "type": "ref",
+                "name": "U64"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "captured_at_boottime_ns",
+              "payload.expires_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "counter"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "counter_epoch": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "window": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "totals": {
+                "type": "ref",
+                "name": "Counts"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "complete": {
+                "type": "literal",
+                "value": true
+              },
+              "checkpoint": {
+                "type": "literal",
+                "value": "periodic"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "observed"
+              },
+              "gap": {
+                "type": "literal",
+                "value": null
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "counter"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "counter_epoch": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "window": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "totals": {
+                "type": "ref",
+                "name": "Counts"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "complete": {
+                "type": "literal",
+                "value": true
+              },
+              "checkpoint": {
+                "type": "literal",
+                "value": "final"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "observed"
+              },
+              "gap": {
+                "type": "literal",
+                "value": null
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "counter"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "counter_epoch": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "window": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "totals": {
+                "type": "ref",
+                "name": "Counts"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "complete": {
+                "type": "literal",
+                "value": false
+              },
+              "checkpoint": {
+                "type": "literal",
+                "value": "periodic"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "counter_lost"
+              },
+              "gap": {
+                "type": "ref",
+                "name": "Window"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.first_ns",
+              "payload.gap.first_ns"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.gap.last_ns",
+              "payload.window.last_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "counter"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "counter_epoch": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "window": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "totals": {
+                "type": "ref",
+                "name": "Counts"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "complete": {
+                "type": "literal",
+                "value": false
+              },
+              "checkpoint": {
+                "type": "literal",
+                "value": "final"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "counter_lost"
+              },
+              "gap": {
+                "type": "ref",
+                "name": "Window"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.first_ns",
+              "payload.gap.first_ns"
+            ]
+          },
+          {
+            "op": "le",
+            "paths": [
+              "payload.gap.last_ns",
+              "payload.window.last_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "terminal"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "final_counter_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "transport": {
+                "type": "enum",
+                "values": [
+                  "closed",
+                  "reset",
+                  "timeout",
+                  "revoked"
+                ]
+              },
+              "endpoint": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "literal",
+                    "value": null
+                  },
+                  {
+                    "type": "ref",
+                    "name": "KnownEndpoint"
+                  }
+                ]
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "observed",
+                  "deadline",
+                  "operator_stop",
+                  "peer_lost",
+                  "lease_expired"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "terminal"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "context": {
+                "type": "ref",
+                "name": "Context"
+              },
+              "final_counter_sequence": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "literal",
+                    "value": null
+                  },
+                  {
+                    "type": "ref",
+                    "name": "Pos"
+                  }
+                ]
+              },
+              "transport": {
+                "type": "enum",
+                "values": [
+                  "closed",
+                  "reset",
+                  "timeout",
+                  "revoked",
+                  "unknown"
+                ]
+              },
+              "endpoint": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "literal",
+                    "value": null
+                  },
+                  {
+                    "type": "ref",
+                    "name": "Endpoint"
+                  }
+                ]
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "counter_lost",
+                  "storage_fault",
+                  "restart",
+                  "integrity"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.context.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "denial"
+              },
+              "attempt_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "actor_uid": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "ref",
+                    "name": "UID"
+                  },
+                  {
+                    "type": "literal",
+                    "value": null
+                  }
+                ]
+              },
+              "tuple": {
+                "type": "ref",
+                "name": "Tuple"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "nfqueue",
+                  "syscall_probe"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "policy_denied"
+              },
+              "rule": {
+                "type": "enum",
+                "values": [
+                  "scope_deny",
+                  "vendor_deny"
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "diagnostic"
+              },
+              "code": {
+                "type": "literal",
+                "value": "unparseable"
+              },
+              "attempt_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "actor_uid": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "ref",
+                    "name": "UID"
+                  },
+                  {
+                    "type": "literal",
+                    "value": null
+                  }
+                ]
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel",
+                  "syscall_probe"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "policy_denied"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "scope_deny"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "denial"
+              },
+              "attempt_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "actor_uid": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "ref",
+                    "name": "UID"
+                  },
+                  {
+                    "type": "literal",
+                    "value": null
+                  }
+                ]
+              },
+              "tuple": {
+                "type": "ref",
+                "name": "Tuple"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "nfqueue",
+                  "syscall_probe"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "family_denied"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "family_deny"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "diagnostic"
+              },
+              "code": {
+                "type": "literal",
+                "value": "unsupported_family"
+              },
+              "attempt_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "actor_uid": {
+                "type": "union",
+                "branches": [
+                  {
+                    "type": "ref",
+                    "name": "UID"
+                  },
+                  {
+                    "type": "literal",
+                    "value": null
+                  }
+                ]
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel",
+                  "syscall_probe"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "family_denied"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "family_deny"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "denial"
+              },
+              "attempt_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "actor_uid": {
+                "type": "literal",
+                "value": null
+              },
+              "tuple": {
+                "type": "ref",
+                "name": "Tuple"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "nfqueue",
+                  "syscall_probe"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "owner_unknown"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "owner_unknown"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "diagnostic"
+              },
+              "code": {
+                "type": "literal",
+                "value": "owner_unknown"
+              },
+              "attempt_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "actor_uid": {
+                "type": "literal",
+                "value": null
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel",
+                  "syscall_probe"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "owner_unknown"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "owner_unknown"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "permit"
+              },
+              "outcome": {
+                "type": "literal",
+                "value": "issued"
+              },
+              "flow": {
+                "type": "ref",
+                "name": "Flow"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "permit_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "observed"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "permit"
+              },
+              "outcome": {
+                "type": "literal",
+                "value": "revoked"
+              },
+              "flow": {
+                "type": "ref",
+                "name": "Flow"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "permit_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "deadline",
+                  "peer_lost",
+                  "lease_expired",
+                  "operator_stop"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "permit"
+              },
+              "outcome": {
+                "type": "literal",
+                "value": "unknown"
+              },
+              "flow": {
+                "type": "ref",
+                "name": "Flow"
+              },
+              "allowance_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "permit_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "packet_budget"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "storage_fault",
+                  "counter_lost",
+                  "restart",
+                  "integrity"
+                ]
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.machine_id",
+              "machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.boot_id",
+              "boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.flow.activation_id",
+              "activation_id"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "lease_boundary"
+              },
+              "boundary": {
+                "type": "literal",
+                "value": "activation_start"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              },
+              "previous_lease_id": {
+                "type": "literal",
+                "value": null
+              },
+              "previous_generation": {
+                "type": "literal",
+                "value": null
+              },
+              "previous_sequence": {
+                "type": "literal",
+                "value": 0
+              },
+              "previous_commitment": {
+                "type": "literal",
+                "value": "GENESIS"
+              },
+              "gap": {
+                "type": "literal",
+                "value": null
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "lease_boundary"
+              },
+              "boundary": {
+                "type": "literal",
+                "value": "rollover"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              },
+              "previous_lease_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "previous_generation": {
+                "type": "ref",
+                "name": "N"
+              },
+              "previous_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "previous_commitment": {
+                "type": "ref",
+                "name": "Digest"
+              },
+              "gap": {
+                "type": "literal",
+                "value": null
+              },
+              "reason": {
+                "type": "literal",
+                "value": "reserved"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "lease_boundary"
+              },
+              "boundary": {
+                "type": "literal",
+                "value": "restart"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "NOT_STARTED"
+              },
+              "previous_lease_id": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "previous_generation": {
+                "type": "ref",
+                "name": "N"
+              },
+              "previous_sequence": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "previous_commitment": {
+                "type": "ref",
+                "name": "Digest"
+              },
+              "gap": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "restart"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.gap.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "activation_stop"
+              },
+              "last_flow_sequence": {
+                "type": "ref",
+                "name": "N"
+              },
+              "unresolved_flows": {
+                "type": "literal",
+                "value": 0
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "observed",
+                  "operator_stop"
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "activation_stop"
+              },
+              "last_flow_sequence": {
+                "type": "ref",
+                "name": "N"
+              },
+              "unresolved_flows": {
+                "type": "ref",
+                "name": "Pos"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              },
+              "reason": {
+                "type": "enum",
+                "values": [
+                  "peer_lost",
+                  "lease_expired",
+                  "storage_fault",
+                  "counter_lost",
+                  "restart",
+                  "integrity"
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "recovery_error"
+              },
+              "code": {
+                "type": "literal",
+                "value": "counter_lost"
+              },
+              "interval": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel_counter",
+                  "writer",
+                  "endpoint"
+                ]
+              },
+              "known_through": {
+                "type": "ref",
+                "name": "N"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "counter_lost"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.interval.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "recovery_error"
+              },
+              "code": {
+                "type": "literal",
+                "value": "record_uncertain"
+              },
+              "interval": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel_counter",
+                  "writer",
+                  "endpoint"
+                ]
+              },
+              "known_through": {
+                "type": "ref",
+                "name": "N"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "storage_fault"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.interval.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "recovery_error"
+              },
+              "code": {
+                "type": "literal",
+                "value": "effect_uncertain"
+              },
+              "interval": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel_counter",
+                  "writer",
+                  "endpoint"
+                ]
+              },
+              "known_through": {
+                "type": "ref",
+                "name": "N"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "restart"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.interval.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "control"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "type": {
+                "type": "literal",
+                "value": "recovery_error"
+              },
+              "code": {
+                "type": "literal",
+                "value": "integrity"
+              },
+              "interval": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "source": {
+                "type": "enum",
+                "values": [
+                  "kernel_counter",
+                  "writer",
+                  "endpoint"
+                ]
+              },
+              "known_through": {
+                "type": "ref",
+                "name": "N"
+              },
+              "rule": {
+                "type": "literal",
+                "value": "lifecycle"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "EFFECT_UNKNOWN"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "integrity"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.interval.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "denial_overflow"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "counter_epoch": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "window": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "unit": {
+                "type": "literal",
+                "value": "packets"
+              },
+              "count": {
+                "type": "ref",
+                "name": "U64"
+              },
+              "source": {
+                "type": "literal",
+                "value": "kernel_counter"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "overflow"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "target": {
+                "type": "object",
+                "fields": {
+                  "kind": {
+                    "type": "literal",
+                    "value": "pinned_vendor"
+                  },
+                  "family": {
+                    "type": "literal",
+                    "value": "ipv4"
+                  },
+                  "destination": {
+                    "type": "ref",
+                    "name": "IPv4"
+                  },
+                  "port": {
+                    "type": "ref",
+                    "name": "Port"
+                  }
+                }
+              },
+              "rule": {
+                "type": "literal",
+                "value": "vendor_deny"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "object",
+        "fields": {
+          "signature_scheme": {
+            "type": "literal",
+            "value": "ed25519-k1-role-v1"
+          },
+          "role": {
+            "type": "literal",
+            "value": "extension:linux-business-producer-v0"
+          },
+          "record_kind": {
+            "type": "literal",
+            "value": "denial_overflow"
+          },
+          "epoch": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "kid": {
+            "type": "ref",
+            "name": "Kid"
+          },
+          "identity_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "machine_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "boot_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "activation_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "lease_id": {
+            "type": "ref",
+            "name": "ID"
+          },
+          "generation": {
+            "type": "ref",
+            "name": "N"
+          },
+          "sequence": {
+            "type": "ref",
+            "name": "Pos"
+          },
+          "prior_commitment": {
+            "type": "ref",
+            "name": "Commitment"
+          },
+          "captured_at_unix_ms": {
+            "type": "ref",
+            "name": "N"
+          },
+          "captured_at_boottime_ns": {
+            "type": "ref",
+            "name": "U64"
+          },
+          "policy_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "runtime_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "config_digest": {
+            "type": "ref",
+            "name": "Digest"
+          },
+          "payload": {
+            "type": "object",
+            "fields": {
+              "counter_epoch": {
+                "type": "ref",
+                "name": "ID"
+              },
+              "window": {
+                "type": "ref",
+                "name": "Window"
+              },
+              "unit": {
+                "type": "literal",
+                "value": "packets"
+              },
+              "count": {
+                "type": "ref",
+                "name": "U64"
+              },
+              "source": {
+                "type": "literal",
+                "value": "kernel_counter"
+              },
+              "reason": {
+                "type": "literal",
+                "value": "overflow"
+              },
+              "effect": {
+                "type": "literal",
+                "value": "OBSERVED"
+              },
+              "target": {
+                "type": "object",
+                "fields": {
+                  "kind": {
+                    "type": "literal",
+                    "value": "scope_class"
+                  },
+                  "family": {
+                    "type": "enum",
+                    "values": [
+                      "ipv4",
+                      "ipv6"
+                    ]
+                  },
+                  "class": {
+                    "type": "enum",
+                    "values": [
+                      "other_destination",
+                      "unknown_owner",
+                      "unparseable"
+                    ]
+                  }
+                }
+              },
+              "rule": {
+                "type": "literal",
+                "value": "scope_deny"
+              }
+            }
+          }
+        },
+        "where": [
+          {
+            "op": "le",
+            "paths": [
+              "payload.window.last_ns",
+              "captured_at_boottime_ns"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

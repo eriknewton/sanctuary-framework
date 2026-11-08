@@ -179,3 +179,34 @@ it.each(["FAULT","SIGNED"] as const)("Linux only: LOCK then %s before WIPED reta
     await f.restart();expect((await f.client.status()).state).toBe("RECOVERY_REQUIRED");
   }finally{await f.close();}
 },45_000);
+
+import { businessBodies } from "../fixtures/k1-service.js";
+import { BUSINESS_KINDS } from "../../src/signing/linux-business-records.js";
+import { canonicalBytes } from "../../src/signing/contract.js";
+it.each(BUSINESS_KINDS)("Linux only: attended native worker refuses business %s after signing inert count", async kind => {
+  const f=await serviceFixture();
+  try {
+    expect(await f.ceremony()).toBe(0);
+    const {g,bytes}=await f.body();
+    expect((await f.client.signRecord({role:g.role,epoch:g.epoch,preimage_bytes:bytes},g,deadline())).kid).toBe(g.kid);
+    const before=f.privateFrames().toString().match(/"op":"SIGNED"/g)?.length ?? 0;
+    expect(before).toBe(1);
+    const body=structuredClone(businessBodies().find(b=>b.record_kind===kind)!);
+    const inert=JSON.parse(Buffer.from(bytes).toString());
+    for(const key of Object.keys(body).filter(k=>k!=="payload" && k!=="record_kind")) body[key]=inert[key];
+    const p=body.payload as {context?:{flow:Record<string,unknown>}};
+    if(p.context)for(const key of ["machine_id","boot_id","activation_id"])p.context.flow[key]=body[key];
+    await expect(f.client.signRecord({role:g.role,epoch:g.epoch,preimage_bytes:canonicalBytes(body)},g,deadline())).rejects.toThrow("K1_REFUSED");
+    // Observe the native private channel so a client-side verification refusal cannot hide a signature.
+    expect(f.privateFrames().toString().match(/"op":"SIGNED"/g)?.length ?? 0).toBe(before);
+  } finally {await f.close();}
+},45_000);
+
+it("Linux only: cooperative wipe and reap clear the crash marker before restart",async()=>{
+  const f=await serviceFixture();try{
+    expect(await f.ceremony()).toBe(0);expect(f.markerPresent()).toBe(true);
+    const pid=f.workerPid();expect(await f.ceremony(true)).toBe(0);
+    expect(()=>process.kill(pid,0)).toThrow();expect(f.markerPresent()).toBe(false);
+    await f.restart();expect((await f.client.status()).state).toBe("LOCKED");
+  }finally{await f.close();}
+},45_000);
