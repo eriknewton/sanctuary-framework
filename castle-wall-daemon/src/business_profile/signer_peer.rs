@@ -102,16 +102,47 @@ impl Peer {
         unsafe { libc::poll(&mut poll, 1, 0) == 0 }
     }
     pub fn matches(&self, packet: &Packet) -> bool {
+        self.identity_refusal(packet).is_none()
+    }
+    // Must match linux_business_signer_peer.rs: isolated drills assert the specific identity refusal while the sender lives.
+    #[cfg(feature = "test-isolation")]
+    pub fn test_identity_refusal(&self, packet: &Packet) -> Option<&'static str> {
+        self.identity_refusal(packet).map(|reason| match reason {
+            IdentityRefusal::Uid => "UID",
+            IdentityRefusal::Gid => "GID",
+            IdentityRefusal::Pid => "PID",
+            IdentityRefusal::Process => "PROCESS",
+        })
+    }
+    // Must match linux_business_signer_peer live_sender_packet: malformed receipt is never an identity witness.
+    fn identity_refusal(&self, packet: &Packet) -> Option<IdentityRefusal> {
         let cred = &packet.cred;
         // Credentials and the kernel message pidfd must identify the captured live process so transferred sockets cannot carry authority.
-        self.live()
-            && same_pidfd(self.pidfd.as_raw_fd(), packet.pidfd.as_raw_fd())
-            && pidfd_pid(packet.pidfd.as_raw_fd()) == Some(self.pid)
-            && cred.pid == self.pid
-            && cred.uid == self.uid
-            && cred.gid == self.gid
+        if cred.uid != self.uid {
+            Some(IdentityRefusal::Uid)
+        } else if cred.gid != self.gid {
+            Some(IdentityRefusal::Gid)
+        } else if cred.pid != self.pid {
+            Some(IdentityRefusal::Pid)
+        } else if !self.live()
+            || !same_pidfd(self.pidfd.as_raw_fd(), packet.pidfd.as_raw_fd())
+            || pidfd_pid(packet.pidfd.as_raw_fd()) != Some(self.pid)
+        {
+            Some(IdentityRefusal::Process)
+        } else {
+            None
+        }
     }
 }
+// Internal reasons distinguish identity refusals in tests without changing public errors.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityRefusal {
+    Uid,
+    Gid,
+    Pid,
+    Process,
+}
+
 fn bounded_text(path: &str) -> io::Result<String> {
     let mut data = String::new();
     fs::File::open(path)?
@@ -564,4 +595,47 @@ fn pidfd_pid(fd: RawFd) -> Option<i32> {
         .lines()
         .find_map(|line| line.strip_prefix("Pid:"))
         .and_then(|value| value.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn uid_refusal_is_distinct_from_receive_and_process_faults() {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let a = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let b = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        passcred(a.as_raw_fd()).unwrap();
+        let policy = PeerPolicy {
+            uid: unsafe { libc::geteuid() },
+            executable_sha256: hex::encode(Sha256::digest(fs::read("/proc/self/exe").unwrap())),
+            cgroup: fs::read_to_string("/proc/self/cgroup")
+                .unwrap()
+                .trim()
+                .into(),
+        };
+        let peer = Peer::capture(a.as_raw_fd(), &policy).unwrap();
+        send(b.as_raw_fd(), b"control", &[]).unwrap();
+        const PACKET_BOUND: usize = 32;
+        let mut packet = receive(a.as_raw_fd(), PACKET_BOUND).unwrap();
+        assert_eq!(peer.identity_refusal(&packet), None);
+        packet.cred.uid = peer.uid.wrapping_add(1);
+        assert_eq!(peer.identity_refusal(&packet), Some(IdentityRefusal::Uid));
+        assert!(!peer.matches(&packet));
+        packet.cred.uid = peer.uid;
+        assert!(peer.matches(&packet));
+        packet.cred.pid = peer.pid.wrapping_add(1);
+        assert_eq!(peer.identity_refusal(&packet), Some(IdentityRefusal::Pid));
+    }
 }

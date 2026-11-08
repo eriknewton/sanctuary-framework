@@ -39,6 +39,10 @@ fn socketpair_kernel_credentials_authenticate_and_wrong_caller_refuses() {
     let packet = receive(a.as_raw_fd(), 32).unwrap();
     assert!(peer.matches(&packet));
     let mut packet = packet;
+    packet.cred.uid = peer.uid.wrapping_add(1);
+    assert!(!peer.matches(&packet));
+    packet.cred.uid = peer.uid;
+    assert!(peer.matches(&packet));
     packet.cred.pid += 1;
     assert!(!peer.matches(&packet));
     let mut other = policy();
@@ -81,51 +85,83 @@ fn extra_rights_are_visible_for_ceremony_refusal() {
     send(b.as_raw_fd(), b"ceremony", &[f.as_raw_fd(), f.as_raw_fd()]).unwrap();
     assert_eq!(receive(a.as_raw_fd(), 32).unwrap().rights.len(), 2);
 }
+// Must match signer_peer identity_refusal: receipt must succeed before identity is judged.
+const HANDSHAKE_TIMEOUT_MS: i32 = 5000;
+const PACKET_BOUND: usize = 32;
+const OTHER_UID: u32 = 65534;
+fn live_sender_packet(change_uid: bool) -> (Peer, Packet) {
+    let (a, b) = pair();
+    let peer = Peer::capture(a.as_raw_fd(), &policy()).unwrap();
+    send(b.as_raw_fd(), b"control", &[]).unwrap();
+    assert!(peer.matches(&receive(a.as_raw_fd(), PACKET_BOUND).unwrap()));
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let input = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe {
+            if change_uid && (libc::setgid(OTHER_UID) != 0 || libc::setuid(OTHER_UID) != 0) {
+                libc::_exit(2)
+            }
+        }
+        let ok = send(b.as_raw_fd(), b"foreign", &[]).is_ok();
+        let mut poll = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut done = 0u8;
+        let acknowledged = unsafe {
+            libc::poll(&mut poll, 1, HANDSHAKE_TIMEOUT_MS) == 1
+                && libc::read(input.as_raw_fd(), &mut done as *mut u8 as *mut _, 1) == 1
+        };
+        unsafe { libc::_exit(if ok && acknowledged { 0 } else { 3 }) }
+    }
+    let mut poll = libc::pollfd {
+        fd: a.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let readable = unsafe { libc::poll(&mut poll, 1, HANDSHAKE_TIMEOUT_MS) };
+    let packet = receive(a.as_raw_fd(), PACKET_BOUND);
+    let result = packet.as_ref().map(|packet| {
+        let credentials_match = packet.cred.pid == pid
+            && packet.cred.uid == if change_uid { OTHER_UID } else { peer.uid };
+        // Must match signer_peer.rs test_identity_refusal: test-only reasons distinguish live identity denial from receive failures.
+        #[cfg(feature = "test-isolation")]
+        let reason_matches =
+            peer.test_identity_refusal(packet) == Some(if change_uid { "UID" } else { "PID" });
+        #[cfg(not(feature = "test-isolation"))]
+        let reason_matches = true;
+        credentials_match && reason_matches && !peer.matches(packet)
+    });
+    let done = 1u8;
+    assert_eq!(
+        unsafe { libc::write(output.as_raw_fd(), &done as *const u8 as *const _, 1) },
+        1
+    );
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert_eq!(status, 0);
+    assert_eq!(readable, 1);
+    assert!(result.unwrap());
+    (peer, packet.unwrap())
+}
 #[test]
 #[ignore = "needs root host: per-message credentials across real UIDs"]
 fn root_real_uid_refuses() {
     kernel_probe().unwrap();
     assert_eq!(unsafe { libc::geteuid() }, 0);
-    let (a, b) = pair();
-    let peer = Peer::capture(a.as_raw_fd(), &policy()).unwrap();
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0);
-    if pid == 0 {
-        unsafe {
-            if libc::setgid(65534) != 0 || libc::setuid(65534) != 0 {
-                libc::_exit(2)
-            }
-        };
-        let ok = send(b.as_raw_fd(), b"wrong uid", &[]).is_ok();
-        unsafe { libc::_exit(if ok { 0 } else { 3 }) }
-    }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-    assert_eq!(status, 0);
-    assert!(castle_wall_daemon::business_profile::signer_service::readable(a.as_raw_fd()));
-    match receive(a.as_raw_fd(), 32) {
-        Ok(packet) => assert!(!peer.matches(&packet)),
-        Err(error) => assert_eq!(error.to_string(), "K1_REFUSED"),
-    }
+    live_sender_packet(true);
 }
 #[test]
 fn passed_socket_from_another_process_refuses() {
-    let (a, b) = pair();
-    let peer = Peer::capture(a.as_raw_fd(), &policy()).unwrap();
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0);
-    if pid == 0 {
-        let ok = send(b.as_raw_fd(), b"passed socket", &[]).is_ok();
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) }
-    }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-    assert_eq!(status, 0);
-    assert!(castle_wall_daemon::business_profile::signer_service::readable(a.as_raw_fd()));
-    match receive(a.as_raw_fd(), 32) {
-        Ok(packet) => assert!(!peer.matches(&packet)),
-        Err(error) => assert_eq!(error.to_string(), "K1_REFUSED"),
-    }
+    live_sender_packet(false);
 }
 
 #[test]
@@ -199,6 +235,19 @@ fn service_capability_status_requires_every_empty_set_and_no_new_privileges() {
         assert!(
             validate_capability_status(&fixture, true).is_err(),
             "{field}"
+        );
+        let missing = EMPTY.replace(&format!("{field}:\t0000000000000000\n"), "");
+        assert!(
+            validate_capability_status(&missing, true).is_err(),
+            "missing {field}"
+        );
+        assert_eq!(
+            validate_capability_status(&fixture, false).is_ok(),
+            field == "CapBnd"
+        );
+        assert_eq!(
+            validate_capability_status(&missing, false).is_ok(),
+            field == "CapBnd"
         );
     }
     assert!(validate_capability_status(&EMPTY.replace("NoNewPrivs:\t1\n", ""), true).is_err());

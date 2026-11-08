@@ -1,4 +1,3 @@
-// fail-before-exempt: Codec reuse preserves the absence of off-owner transport acceptance; direct base guard and mutation runs cover this test-owned rule.
 /** Shared SMB contracts and isolated peer admission. */
 import { beforeAll, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';

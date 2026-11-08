@@ -484,7 +484,7 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                                                 lease.state,
                                                 State::Unlocking | State::Locking
                                             )
-                                            && !w.settlement.cleanup =>
+                                            && !w.settlement.acknowledged() =>
                                     {
                                         w.settlement.acknowledge(lease.state, now);
                                         lease.revoke();
@@ -533,6 +533,9 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                                                     json!({"op":"REFUSED"}),
                                                 );
                                             }
+                                        } else {
+                                            // Unsolicited output after revocation remains a fault because no admitted request explains it.
+                                            w.settlement.fault(now);
                                         }
                                         budget.settled();
                                     }
@@ -736,7 +739,8 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
                     // Keep the terminal until reap because an unlocking child can still change its attributes.
                     w.settlement.lock(previous, now);
                     // Finish a partially written frame before LOCK so framing cannot turn a cooperative wipe into a forced kill.
-                    if !unlocking && !w.lock_queued {
+                    // An acknowledged worker is exiting, so redundant writes must not turn cleanup into a pipe fault.
+                    if !unlocking && !w.lock_queued && !w.settlement.acknowledged() {
                         queue_lock(&mut w.pending, &mut w.offset)?;
                         w.lock_queued = true;
                     }
@@ -969,51 +973,59 @@ pub fn queue_lock(pending: &mut Vec<u8>, offset: &mut usize) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
-pub struct Settlement {
-    deadline: Option<u64>,
-    cleanup: bool,
-    faulted: bool,
-}
-impl Settlement {
-    pub fn deadline(&self) -> Option<u64> {
-        self.deadline
+// The nested module makes settlement fields inaccessible to the service loop.
+mod settlement {
+    use super::{State, NS_PER_SECOND};
+    #[derive(Debug, Default)]
+    pub struct Settlement {
+        deadline: Option<u64>,
+        cleanup: bool,
+        faulted: bool,
     }
-    pub fn due(&self, now: u64) -> bool {
-        self.deadline.is_some_and(|end| now >= end)
-    }
-    fn shorten_deadline(&mut self, proposed: u64) {
-        // Every kill request shares this minimum so later events cannot prolong worker custody.
-        self.deadline = Some(
+    impl Settlement {
+        pub fn acknowledged(&self) -> bool {
+            self.cleanup
+        }
+        pub fn deadline(&self) -> Option<u64> {
             self.deadline
-                .map_or(proposed, |current| current.min(proposed)),
-        );
-    }
-    pub fn fault(&mut self, now: u64) {
-        // A worker fault is sticky because a later cleanup frame cannot undo observed uncertainty.
-        self.faulted = true;
-        self.shorten_deadline(now);
-    }
-    pub fn lock(&mut self, state: State, now: u64) {
-        self.shorten_deadline(if state == State::Unlocking {
-            now
-        } else {
-            now.saturating_add(NS_PER_SECOND)
-        });
-    }
-    pub fn acknowledge(&mut self, state: State, now: u64) {
-        if self.cleanup || !matches!(state, State::Unlocking | State::Locking) {
-            self.fault(now);
-        } else {
-            self.cleanup = true;
-            self.shorten_deadline(now.saturating_add(NS_PER_SECOND));
+        }
+        pub fn due(&self, now: u64) -> bool {
+            self.deadline.is_some_and(|end| now >= end)
+        }
+        fn shorten_deadline(&mut self, proposed: u64) {
+            // Every kill request shares this minimum so later events cannot prolong worker custody.
+            self.deadline = Some(
+                self.deadline
+                    .map_or(proposed, |current| current.min(proposed)),
+            );
+        }
+        pub fn fault(&mut self, now: u64) {
+            // A worker fault is sticky because a later cleanup frame cannot undo observed uncertainty.
+            self.faulted = true;
+            self.shorten_deadline(now);
+        }
+        pub fn lock(&mut self, state: State, now: u64) {
+            self.shorten_deadline(if state == State::Unlocking {
+                now
+            } else {
+                now.saturating_add(NS_PER_SECOND)
+            });
+        }
+        pub fn acknowledge(&mut self, state: State, now: u64) {
+            if self.cleanup || !matches!(state, State::Unlocking | State::Locking) {
+                self.fault(now);
+            } else {
+                self.cleanup = true;
+                self.shorten_deadline(now.saturating_add(NS_PER_SECOND));
+            }
+        }
+        pub fn cooperative(&self, success: bool) -> bool {
+            // Marker removal requires exactly one cleanup acknowledgement, no observed fault and successful reaping.
+            self.cleanup && !self.faulted && success
         }
     }
-    pub fn cooperative(&self, success: bool) -> bool {
-        // Marker removal requires exactly one cleanup acknowledgement, no observed fault and successful reaping.
-        self.cleanup && !self.faulted && success
-    }
 }
+pub use settlement::Settlement;
 
 pub fn reaped_after_output(
     child: &mut Child,

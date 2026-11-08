@@ -201,9 +201,15 @@ fn seeded_worker_settlement_schedules_preserve_custody() {
             random ^= random << XORSHIFT_LEFT_FIRST;
             random ^= random >> XORSHIFT_RIGHT;
             random ^= random << XORSHIFT_LEFT_LAST;
+            let event = EVENTS[random as usize % EVENTS.len()];
+            random ^= random << XORSHIFT_LEFT_FIRST;
+            random ^= random >> XORSHIFT_RIGHT;
+            random ^= random << XORSHIFT_LEFT_LAST;
             now += (random % TICK_BOUNDARIES) * WATCHDOG_TICK_MS as u64 * NS_PER_MS;
             let before = settlement.deadline();
-            match EVENTS[random as usize % EVENTS.len()] {
+            let mut immediate = fault;
+            let mut reaped = false;
+            match event {
                 Event::Ready => {
                     if !lease.ready(now) {
                         settlement.fault(now);
@@ -220,6 +226,7 @@ fn seeded_worker_settlement_schedules_preserve_custody() {
                     revoked = true;
                 }
                 Event::Lock => {
+                    immediate |= lease.state == State::Unlocking;
                     settlement.lock(lease.state, now);
                     lease.revoke();
                     revoked = true;
@@ -242,17 +249,34 @@ fn seeded_worker_settlement_schedules_preserve_custody() {
                     );
                     lease.revoke();
                     revoked = true;
+                    reaped = true;
                     lease.reaped(settlement.cooperative(success));
                     if lease.state == State::Wiped {
                         assert!(acks == 1 && !fault && success);
                     }
                 }
             }
+            if fault || immediate {
+                assert!(settlement.due(now), "immediate kill seed {seed}");
+            }
+            if lease.state == State::Locking {
+                assert!(
+                    settlement.deadline().is_some(),
+                    "missing deadline seed {seed}"
+                );
+                assert!(
+                    settlement.deadline().unwrap() <= now + NS_PER_SECOND,
+                    "grace seed {seed}"
+                );
+            }
             if let Some(previous) = before {
                 assert!(settlement.deadline().unwrap() <= previous, "seed {seed}");
             }
             if revoked {
                 assert!(!lease.can_sign(now), "seed {seed}");
+            }
+            if reaped {
+                break;
             }
         }
     }

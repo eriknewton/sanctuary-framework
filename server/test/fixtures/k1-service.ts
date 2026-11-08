@@ -1,4 +1,4 @@
-import { copyFileSync, accessSync, constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, readdirSync, unlinkSync, rmdirSync } from "node:fs";
+import { copyFileSync, accessSync, constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, unlinkSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
@@ -99,7 +99,8 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
     }
     return outcome;
   };
-  return {trace,workerPid(){return Number(readFileSync(`/proc/${service.pid}/task/${service.pid}/children`,"utf8").trim());},get client(){return client;},get service(){return service;},grant,
+  // Must match attendance.test.ts: the marker survives every noncooperative settlement.
+  return {trace,markerPresent:()=>existsSync(join(custody,"worker-unclean")),workerPid(){return Number(readFileSync(`/proc/${service.pid}/task/${service.pid}/children`,"utf8").trim());},get client(){return client;},get service(){return service;},grant,
     lockImmediate:()=>ceremony(true,passphrase,false,false,false),
     ceremonyHeld:()=>ceremony(false,passphrase,false,true),
     ceremonyEdited:()=>ceremony(false,passphrase+"x\x7f"),

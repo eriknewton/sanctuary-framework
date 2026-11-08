@@ -1,10 +1,10 @@
-// fail-before-exempt: Native process and terminal absence witnesses use separately rebuilt Rust base binaries; the server-only source swap cannot exercise their enforcement sites.
+// fail-before-exempt: This change exercises Rust settlement through rebuilt native binaries; its fixture additions only observe the marker and coordinate worker frames, so server/src reversal cannot regress these cases.
 import { describe,it as test,expect } from "vitest";
 // Linux native witnesses require kernel credentials and built harness artifacts.
 const it = process.platform === "linux" ? test : test.skip;
 
 import { serviceFixture,deadline } from "../fixtures/k1-service.js";
-import { INERT_COUNTER_SCHEMA,INERT_RECORD_KIND } from "../../src/signing/service.js";
+import { INERT_COUNTER_SCHEMA,INERT_RECORD_KIND,LENGTH_BYTES } from "../../src/signing/service.js";
 import { verifyRecord } from "../../src/signing/strict-verifier.js";
 describe("native attended service (Linux only: kernel credentials required)",()=>{
   it("Linux only: PTY unlock signs through K1a and strict verifies, then lock refuses",async()=>{
@@ -26,6 +26,8 @@ describe("native attended service (Linux only: kernel credentials required)",()=
 });
 
 import {readFileSync,existsSync,readdirSync,readlinkSync} from "node:fs";
+// Must match signer_watchdog WATCHDOG_TICK_MS for native scheduling bounds.
+const watchdogTickMs=Number(readFileSync("../castle-wall-daemon/src/business_profile/signer_watchdog.rs","utf8").match(/WATCHDOG_TICK_MS: i32 = (\d+)/)![1]);
 it("Linux only: crashed secret worker is reaped into WIPE_UNCONFIRMED",async()=>{
   const f=await serviceFixture();try{
     expect(await f.ceremony()).toBe(0);const {g,bytes}=await f.body();
@@ -69,8 +71,11 @@ it("Linux only: reserved LOCK slot kills an UNLOCKING worker before READY",async
     expect(f.trace.promptSeen).toBe(true);expect((await f.client.status()).state).toBe("UNLOCKING");
     const workerPid=f.workerPid();expect(workerPid).toBeGreaterThan(0);
     // Must match signer_watchdog WATCHDOG_TICK_MS: the bound includes launcher startup and one reap tick.
-    const tick=Number(readFileSync("../castle-wall-daemon/src/business_profile/signer_watchdog.rs","utf8").match(/WATCHDOG_TICK_MS: i32 = (\d+)/)![1]);
-    const launcherAndReapTicks=150;
+    const tick=watchdogTickMs;
+    // Allow twenty launcher scheduling ticks and two service ticks, below the cooperative one-second grace.
+    const launcherStartupTicks=20;
+    const serviceReapTicks=2;
+    const launcherAndReapTicks=launcherStartupTicks+serviceReapTicks;
     const before=performance.now();expect(await f.lockImmediate()).toBe(0);
     while(performance.now()-before < tick*launcherAndReapTicks){
       try{process.kill(workerPid,0);}catch{break;}
@@ -114,9 +119,11 @@ it("Linux only: LOCK restores terminal after a worker repeatedly switches raw mo
 },45_000);
 
 it("Linux only: seeded cleanup and fault frames never launder the durable marker",async()=>{
-  const seeds=8;
+  const faultKinds=["duplicate", "unknown", "truncated", "stderr"] as const;
+  const phasesPerFault=2;
+  const seeds=faultKinds.length*phasesPerFault;
   for(let seed=0;seed<seeds;seed++){
-    const fault = seed % 4;
+    const fault = seed % faultKinds.length;
     const source=`const fs=require('node:fs'); const frame=op=>{const b=Buffer.from(JSON.stringify({op}));const n=Buffer.alloc(4);n.writeUInt32BE(b.length);return Buffer.concat([n,b]);}; process.stdin.once('data',()=>{setTimeout(()=>{fs.writeSync(1,Buffer.concat([frame('WIPED'),${fault===0?"frame('WIPED')":fault===1?"frame('FAULT')":fault===2?"Buffer.from([0])":"Buffer.alloc(0)"}])); ${fault===3?"fs.writeSync(2,'fault');":""} process.exit(0);},${seed});});`;
     const f=await serviceFixture("fixture ",false,source);
     try{
@@ -131,10 +138,44 @@ it("Linux only: reaping replies to an in-flight signer before the bridge deadlin
   const f=await serviceFixture("fixture ",false,source);
   try{
     expect(await f.ceremony()).toBe(0);const workerPid=f.workerPid();const {g,bytes}=await f.body();const end=deadline();
-    const reapBudgetMs=250;
+    // Twenty-five watchdog ticks leave the response well inside the bridge request deadline.
+    const reapTicks=25;
+    const reapBudgetMs=watchdogTickMs*reapTicks;
     const before=performance.now();
     await expect(f.client.signRecord({role:g.role,epoch:g.epoch,preimage_bytes:bytes},g,end)).rejects.toThrow("K1_REFUSED");
     expect(performance.now()-before).toBeLessThan(reapBudgetMs);
     expect(()=>process.kill(workerPid,0)).toThrow();
+  }finally{await f.close();}
+},45_000);
+
+// Must match the fixture marker observer and signer_service cooperative settlement.
+it("Linux only: LOCK after WIPED settles LOCKED without writing to the exiting worker",async()=>{
+  const exitTicks=20;
+  // Synchronous intake avoids leaving a libuv reader attached to the deliberately closed descriptor.
+  const source=`const fs=require('node:fs');const read=size=>{const b=Buffer.alloc(size);let offset=0;while(offset<size)offset+=fs.readSync(0,b,offset,size-offset,null);return b;};const header=JSON.parse(read(read(${LENGTH_BYTES}).readUInt32BE()));read(header.preimage_length);fs.closeSync(0);const b=Buffer.from('{"op":"WIPED"}');const n=Buffer.alloc(${LENGTH_BYTES});n.writeUInt32BE(b.length);fs.writeSync(1,Buffer.concat([n,b]));setTimeout(()=>process.exit(0),${exitTicks*watchdogTickMs});`;
+  const f=await serviceFixture("fixture ",false,source);let ceremony:Promise<number|null>|undefined;
+  try{
+    ceremony=f.ceremonyHeld();
+    const pollTicks=100;
+    for(let i=0;i<pollTicks&&(await f.client.status()).state!=="LOCKING";i++)await new Promise(resolve=>setTimeout(resolve,watchdogTickMs));
+    expect((await f.client.status()).state).toBe("LOCKING");
+    expect(f.markerPresent()).toBe(true);
+    expect(await f.lockImmediate()).toBe(0);
+    expect(await ceremony).toBe(1);
+    expect((await f.client.status()).state).toBe("LOCKED");
+    expect(f.markerPresent()).toBe(false);
+    await f.restart();expect((await f.client.status()).state).toBe("LOCKED");
+  }finally{await f.close();await ceremony?.catch(()=>undefined);}
+},45_000);
+
+it.each(["FAULT","SIGNED"] as const)("Linux only: LOCK then %s before WIPED retains uncertainty",async fault=>{
+  const source=`const fs=require('node:fs');const frame=op=>{const b=Buffer.from(JSON.stringify({op}));const n=Buffer.alloc(${LENGTH_BYTES});n.writeUInt32BE(b.length);return Buffer.concat([n,b]);};let state='UNLOCKING';process.stdin.on('data',()=>{if(state==='UNLOCKING'){state='UNLOCKED';fs.writeSync(1,frame('READY'));return;}fs.writeSync(1,Buffer.concat([frame('${fault}'),frame('WIPED')]));process.exit(0);});`;
+  const f=await serviceFixture("fixture ",false,source);
+  try{
+    expect(await f.ceremony()).toBe(0);
+    expect(await f.ceremony(true)).toBe(0);
+    expect((await f.client.status()).state).toBe("WIPE_UNCONFIRMED");
+    expect(f.markerPresent()).toBe(true);
+    await f.restart();expect((await f.client.status()).state).toBe("RECOVERY_REQUIRED");
   }finally{await f.close();}
 },45_000);
