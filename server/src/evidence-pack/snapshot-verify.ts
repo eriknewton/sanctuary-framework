@@ -19,7 +19,24 @@ function checkType(file: C.CapturedFile): void {
   C.requireSnapshot(file.before.nlink === 1 && file.after.nlink === 1, C.HARD.file_type_invalid);
   C.requireSnapshot(file.metadata.length === 0, C.HARD.unexpected_metadata);
 }
+export interface CandidateDescriptor { candidateDescriptorBytes: Uint8Array; keysAuthenticated: false }
 export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifierSourceRevision: string): C.VerificationResult {
+  return inspectSnapshot(capture, pins, verifierSourceRevision, false) as C.VerificationResult;
+}
+export function authenticateSnapshotBytes(capture: C.CapturedSnapshot, packKey: string, expectedManifestDigest: string, sourceRevision: string): CandidateDescriptor {
+  const delivered = capture.files.find(f => fileName(f) === C.TRUST_FILENAME)?.bytes;
+  C.requireSnapshot(delivered, C.HARD.file_set_mismatch);
+  // Candidate keys support schema checks only and never become recipient authority or a nested PASS.
+  const result = inspectSnapshot(capture, { packKey, expectedManifestDigest, descriptorBytes: delivered }, sourceRevision, true);
+  if ("status" in result) throw new C.SnapshotError(result.findings[0]?.code ?? C.HARD.io_error);
+  return result;
+}
+function finalRecheck(capture: C.CapturedSnapshot): void {
+  C.requireSnapshot(sameStat(capture.rootBefore, capture.rootAfter), C.HARD.snapshot_changed);
+  for (const file of capture.files) C.requireSnapshot(sameStat(file.before, file.after), C.HARD.snapshot_changed);
+  C.requireSnapshot(C.canonicalSnapshotJSON(capture.finalNames.map(nameKey).sort()) === C.canonicalSnapshotJSON(capture.files.map(f => nameKey(f.name)).sort()), C.HARD.snapshot_changed);
+}
+function inspectSnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifierSourceRevision: string, outerOnly: boolean): C.VerificationResult | CandidateDescriptor {
   let state: C.ProtocolState = C.STATES.ARGUMENTS; let exportId: string | null = null; let digest: string | null = null;
   let filename: string | null = null;
   const nested: C.VerificationResult["nested"] = { audit: null, transparency: null };
@@ -56,6 +73,10 @@ export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, 
       C.requireSnapshot(row.size_bytes === file.bytes.length && row.sha256 === C.sha256Hex(file.bytes), C.HARD.file_digest_mismatch);
     }
     filename = C.TRUST_FILENAME; state = C.STATES.BYTES_VERIFIED; bindSnapshotTrust(manifest, descriptor, files.get(C.TRUST_FILENAME)!, pins.descriptorBytes);
+    if (outerOnly) {
+      state = C.STATES.FINAL_RECHECK; finalRecheck(capture);
+      return { candidateDescriptorBytes: files.get(C.TRUST_FILENAME)!.slice(), keysAuthenticated: false };
+    }
     state = C.STATES.NESTED_VERIFIED; const audit = manifest.components.audit; const transparency = manifest.components.transparency;
     filename = audit.state === C.COMPONENT.included ? audit.filename : null;
     const a = audit.state === C.COMPONENT.included ? verifySnapshotAudit(files.get(audit.filename)!, audit.extent, descriptor.keys) : absentOutcome(audit, C.ROLE.audit); nested.audit = a.report;

@@ -12,7 +12,10 @@ export const SNAPSHOT_FORMAT = "SANCTUARY_EVIDENCE_SNAPSHOT_V0";
 export const TRUST_FORMAT = "SANCTUARY_EVIDENCE_TRUST_V0";
 export const RECEIPT_FORMAT = "SANCTUARY_EVIDENCE_EXPORT_RECEIPT_V0";
 export const RESULT_FORMAT = "SANCTUARY_EVIDENCE_VERIFICATION_V0";
-export const MANIFEST_DOMAIN = "sanctuary.evidence-snapshot.v0\n";
+// Must match MANIFEST_DOMAIN in core/signing-domains.ts, including the raw-sign refusal.
+import { MANIFEST_DOMAIN } from "../core/signing-domains.js";
+export { MANIFEST_DOMAIN };
+import { extensionRolesAllowed } from "./snapshot-extensions.js";
 export const SIGNATURE_SCHEME = "ed25519-v1";
 export const HASH_ALGORITHM = "sha256";
 export const MANIFEST_FILENAME = "00_pack_manifest.json";
@@ -92,7 +95,8 @@ export function canonicalSnapshotJSON(value: unknown): string { return canonical
 export function manifestSigningBytes(value: Record<string, unknown>): Uint8Array {
   const body = { ...value };
   delete body.manifest_signature;
-  return sha256(utf8(MANIFEST_DOMAIN + canonicalSnapshotJSON(body)));
+  // Signing the prefixed message preserves raw-sign refusal because a digest hides the internal domain.
+  return utf8(MANIFEST_DOMAIN + canonicalSnapshotJSON(body));
 }
 export function object(value: unknown, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
   requireSnapshot(value !== null && typeof value === "object" && !Array.isArray(value));
@@ -193,14 +197,16 @@ export function parseManifest(value: unknown): SnapshotManifest {
     // Every extension declares at least one signing role for independent pin binding.
     array(e.filenames, MAX_FILES); array(e.signing_roles, MAX_KEYS); requireSnapshot(e.signing_roles.length > 0 && e.filenames.length > 0 && new Set(e.signing_roles).size === e.signing_roles.length);
     for (const name of e.filenames) { safeName(name); requireSnapshot(!extensionNames.has(name) && r.files.some(f => (f as SnapshotFile).filename === name && (f as SnapshotFile).role === ROLE.extension)); extensionNames.add(name); }
-    for (const role of e.signing_roles) { text(role); requireSnapshot(role === PIN_ROLE.extension + e.id); }
+    for (const role of e.signing_roles) { text(role); requireSnapshot(role.startsWith(PIN_ROLE.extension) && EXTENSION_ID.test(role.slice(PIN_ROLE.extension.length))); }
+    // Registered roles constrain authority without claiming that a handler has verified the payload.
+    requireSnapshot(extensionRolesAllowed(e.id, e.signing_roles as string[]));
   }
   requireSnapshot(extensionNames.size === (roles.get(ROLE.extension) ?? 0));
   return r as unknown as SnapshotManifest;
 }
 
 export interface RotationHistory { kind: "identity-history"; identity_id: string; current_public_key: string; history: { old_public_key: string; new_public_key: string; rotation_event: string; rotated_at: string }[] }
-export interface TrustKey { role: string; key_id: string; algorithm: typeof ALGORITHM; public_key_base64url: string; fingerprint: string; rotation_evidence: RotationHistory | { kind: "out-of-band-only" } }
+export interface TrustKey { role: string; key_id: string; algorithm: typeof ALGORITHM; public_key_base64url: string; fingerprint: string; rotation_evidence: RotationHistory | { kind: "out-of-band-only" } | { kind: "castle-pin"; path_class: "global" | "fortress-local" } }
 export interface TrustDescriptor { format: typeof TRUST_FORMAT; keys: TrustKey[] }
 export function parseTrustDescriptor(bytes: Uint8Array): TrustDescriptor {
   const r = object(parseSnapshotJSON(bytes, MAX_TRUST_BYTES), ["format", "keys"]);
@@ -211,7 +217,7 @@ export function parseTrustDescriptor(bytes: Uint8Array): TrustDescriptor {
     requireSnapshot(k.algorithm === ALGORITHM, HARD.unsupported_format); const raw = publicKey(k.public_key_base64url);
     requireSnapshot(k.key_id === manifestDigest(raw) && k.fingerprint === k.key_id, HARD.pin_invalid);
     const order = k.role + ":" + k.key_id; requireSnapshot(order > previous, HARD.pin_invalid); previous = order;
-    const e = object(k.rotation_evidence, ["kind"], ["identity_id", "current_public_key", "history"]);
+    const e = object(k.rotation_evidence, ["kind"], ["identity_id", "current_public_key", "history", "path_class"]);
     if (e.kind === ROTATION.history) {
       object(e, ["kind", "identity_id", "current_public_key", "history"]); text(e.identity_id, IDENTITY_ID); publicKey(e.current_public_key); array(e.history, MAX_ROTATION_HOPS);
       for (const hop of e.history) {
@@ -219,6 +225,8 @@ export function parseTrustDescriptor(bytes: Uint8Array): TrustDescriptor {
         const event = object(parseSnapshotJSON(base64(h.rotation_event), MAX_TRUST_BYTES), ["old_public_key", "new_public_key", "identity_id", "reason", "rotated_at", "signature"]);
         publicKey(event.old_public_key); publicKey(event.new_public_key); text(event.identity_id, IDENTITY_ID); text(event.reason); timestamp(event.rotated_at); base64(event.signature, SIGNATURE_BYTES);
       }
+    } else if (e.kind === ROTATION.castle) {
+      object(e, ["kind", "path_class"]); requireSnapshot(k.role === PIN_ROLE.transparency && (e.path_class === "global" || e.path_class === "fortress-local"));
     } else { object(e, ["kind"]); requireSnapshot(e.kind === ROTATION.oob); }
     requireSnapshot(!(k.role === PIN_ROLE.pack || k.role === PIN_ROLE.audit) || e.kind === ROTATION.history, HARD.pin_invalid);
   }

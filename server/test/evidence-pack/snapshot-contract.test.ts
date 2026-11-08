@@ -24,3 +24,38 @@ describe("snapshot-contract", () => {
   it("per-file signed size cap rejects", () => { const f = fixture(); f.manifest.files[0].size_bytes = C.MAX_FILE_BYTES + 1; expect(() => C.parseManifest(f.manifest)).toThrow(C.HARD.limit_exceeded); });
   it("PARTIAL human line contains neither acceptance nor verification claim", () => { expect(C.HUMAN.PARTIAL).not.toContain("PASS"); expect(C.HUMAN.PARTIAL).not.toContain("verified"); });
 });
+
+// The raw signer must not mint a manifest accepted by the internal protocol.
+it("manifest domain is refused by identity_sign", async () => {
+  const { MemoryStorage } = await import("../../src/storage/memory.js");
+  const { StateStore } = await import("../../src/cognitive/state-store.js");
+  const { createCognitiveTools } = await import("../../src/cognitive/tools.js");
+  const { AuditLog } = await import("../../src/operational/audit-log.js");
+  const { encrypt } = await import("../../src/core/encryption.js");
+  const { identity, master, encryptionKey } = await import("./snapshot-fixtures.js");
+  const who = identity(), storage = new MemoryStorage();
+  await storage.write("_identities", who.identity_id, C.utf8(JSON.stringify(encrypt(C.utf8(JSON.stringify(who)), encryptionKey))));
+  const { tools, identityManager } = createCognitiveTools(new StateStore(storage, master), storage, master, "passphrase", new AuditLog(new MemoryStorage(), master));
+  await identityManager.load();
+  const result = await tools.find(t => t.name === "identity_sign")!.handler({ identity_id: who.identity_id, payload: Buffer.from(C.utf8(C.MANIFEST_DOMAIN + "{}" )).toString("base64url") });
+  expect(JSON.parse(result.content[0].text).denied).toBe(true);
+});
+it("old digest manifest signature is rejected", async () => {
+  const { signBytes } = await import("./snapshot-fixtures.js");
+  const { sha256 } = await import("@noble/hashes/sha256");
+  const f = fixture();
+  const { manifest_signature: _signature, ...body } = f.manifest;
+  f.manifest.manifest_signature = signBytes(sha256(C.utf8(C.MANIFEST_DOMAIN + C.canonicalSnapshotJSON(body))), f.pack);
+  resignManifest(f, false);
+  expect(verifySnapshot(f.capture, f.pins, SOURCE).findings[0]?.code).toBe(C.HARD.manifest_signature_invalid);
+});
+it("multi role Linux extension is incomplete rather than invalid", async () => {
+  const { capturedFile, descriptorBytes, trustRow, replaceFile, refreshFiles } = await import("./snapshot-fixtures.js");
+  const f = fixture(); const roles = ["extension:linux-business-producer-v0", "extension:linux-business-policy-v0"];
+  f.capture.files = [...f.capture.files, capturedFile("linux.bin", C.utf8("opaque"))];
+  f.manifest.extensions = [{ id: "linux-business-v0", filenames: ["linux.bin"], signing_roles: roles }];
+  const rows = C.parseTrustDescriptor(f.pins.descriptorBytes).keys;
+  rows.push(...roles.map(role => ({ ...trustRow(f.audit, role), rotation_evidence: { kind: C.ROTATION.oob } })));
+  f.pins.descriptorBytes = descriptorBytes(rows); replaceFile(f, C.TRUST_FILENAME, f.pins.descriptorBytes); refreshFiles(f);
+  expect(verifySnapshot(f.capture, f.pins, SOURCE)).toMatchObject({ status: "PARTIAL", exit_code: 10, accepted: false, partial_reasons: [C.PARTIAL.extension_unverified] });
+});

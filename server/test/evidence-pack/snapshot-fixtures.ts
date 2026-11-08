@@ -1,6 +1,5 @@
 import { createIdentity, sign, type StoredIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { makePackSigner, canonicalJSON } from "../../src/evidence-pack/signer.js";
 import { computeAuditEntryHash, computeAuditRoot, checkpointSigningBytes } from "../../src/audit/chain.js";
 import { checkpointSigningBytes as transparencySigningBytes, checkpointPayloadOf, computeCheckpointHash, TRANSPARENCY_BUNDLE_FORMAT, type EnforcementCheckpointRecord, type TransparencyBundle } from "../../src/transparency/checkpoint.js";
 import { checkpointPayloadHash } from "../../src/transparency/verify.js";
@@ -66,7 +65,7 @@ export function refreshFiles(f: Fixture): void {
   }).sort((a, b) => a.filename < b.filename ? -1 : 1); resignManifest(f);
 }
 export function resignManifest(f: Fixture, signBody = true): void {
-  if (signBody) { const { manifest_signature: _signature, ...body } = f.manifest; f.manifest.manifest_signature = makePackSigner(f.pack, master).signContent(C.MANIFEST_DOMAIN + canonicalJSON(body)); }
+  if (signBody) { f.manifest.manifest_signature = signBytes(C.manifestSigningBytes(f.manifest as unknown as Record<string, unknown>), f.pack); }
   const bytes = jsonBytes(f.manifest);
   f.capture.files = [...f.capture.files.filter(file => Buffer.from(file.name).toString() !== C.MANIFEST_FILENAME), capturedFile(C.MANIFEST_FILENAME, bytes)];
   f.capture.finalNames = f.capture.files.map(file => file.name.slice()); f.pins.expectedManifestDigest = C.manifestDigest(bytes);
@@ -74,3 +73,16 @@ export function resignManifest(f: Fixture, signBody = true): void {
 export function replaceFile(f: Fixture, name: string, bytes: Uint8Array): void { f.capture.files = f.capture.files.map(file => Buffer.from(file.name).toString() === name ? capturedFile(name, bytes) : file); }
 export function syncAudit(f: Fixture): void { replaceFile(f, C.AUDIT_FILENAME, auditBytes(f.records)); f.manifest.components.audit = { state: C.COMPONENT.included, filename: C.AUDIT_FILENAME, extent: auditExtent(f.records) }; refreshFiles(f); }
 export function syncTransparency(f: Fixture): void { replaceFile(f, C.TRANSPARENCY_FILENAME, jsonBytes(f.bundle)); f.manifest.components.transparency = { state: C.COMPONENT.included, filename: C.TRANSPARENCY_FILENAME, extent: transparencyExtent(f.bundle) }; refreshFiles(f); }
+export async function exporterFixture() {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const { exportDependencies } = await import("../../src/evidence-pack/snapshot-export-cli.js");
+  const f = fixture(); const root = await mkdtemp(join(tmpdir(), "snapshot-"));
+  const options = { fortress: join(root, "fortress"), output: join(root, "pack"), receipt: join(root, "receipt.json"), publicKeyFile: join(root, "key.txt") };
+  const states: string[] = [], stdout: string[] = [], stderr: string[] = [];
+  const identities = [f.pack, f.audit, f.secondAudit]; let cleanupCount = 0;
+  const gathered: import("../../src/evidence-pack/snapshot-gather.js").SnapshotGather = { audit: f.manifest.components.audit, transparency: f.manifest.components.transparency, auditBytes: auditBytes(f.records), transparencyBytes: jsonBytes(f.bundle), transparencyPin: { key: f.transparency.public_key, pathClass: "fortress-local" } };
+  const deps: import("../../src/evidence-pack/snapshot-export-cli.js").ExportDependencies = { ...exportDependencies, runtimeRevision: SOURCE, buildRevision: SOURCE, boot: async () => ({ config: { storage_path: options.fortress }, identityManager: { getDefault: () => f.pack, list: () => identities, get: (id: string) => identities.find(i => i.identity_id === id) }, masterKey: master, cleanup: async () => { cleanupCount++; } }) as unknown as Awaited<ReturnType<typeof exportDependencies.boot>>, gather: async () => gathered, phase: async state => { states.push(state); }, io: { stdout: text => { stdout.push(text); }, stderr: text => { stderr.push(text); } } };
+  return { f, root, options, deps, gathered, states, stdout, stderr, cleanupCount: () => cleanupCount };
+}
