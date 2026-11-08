@@ -186,7 +186,7 @@ describe("reorg surface snapshot: MCP tools/list wire shape", () => {
       passphrase: "snapshot-harness-deterministic-v1",
     });
     const names = (await listToolWire(server)).map((t) => t.name);
-    // The inert native service must not add a role signer to the existing tool catalog.
+    // Contract fixtures must not add a role signer to the existing tool catalog.
     expect(names.filter(name => /^(k1_|role_sign|record_sign)/.test(name))).toEqual([]);
     const dupes = names.filter((n, i) => names.indexOf(n) !== i);
     expect(dupes, `duplicate tool names: ${dupes.join(", ")}`).toEqual([]);
