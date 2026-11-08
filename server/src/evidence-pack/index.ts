@@ -112,3 +112,7 @@ export { verifySnapshot } from "./snapshot-verify.js";
 export { validateSnapshotPins, bindSnapshotTrust, validateRotationEvidence } from "./snapshot-trust.js";
 export type { SnapshotPins } from "./snapshot-trust.js";
 export { verifySnapshotAudit, verifySnapshotTransparency, joinSnapshotVerdict } from "./snapshot-nested.js";
+export { exportSnapshot, runSnapshotExportCommand } from "./snapshot-export-cli.js";
+export { runSnapshotTrustCommand } from "./snapshot-trust-cli.js";
+export { gatherSnapshot } from "./snapshot-gather.js";
+export { SNAPSHOT_EXTENSIONS } from "./snapshot-extensions.js";

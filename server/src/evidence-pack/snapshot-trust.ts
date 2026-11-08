@@ -21,7 +21,7 @@ export function validateRotationEvidence(row: C.TrustKey): void {
   const result = verifyRotationChain({ identityId: e.identity_id, currentPublicKey: e.current_public_key, rotationHistory: e.history });
   // Public history authorizes only explicitly pinned, uncompromised keys in a fully verified chain.
   C.requireSnapshot(result.status === C.INTEGRITY.verified, C.HARD.pin_invalid);
-  // DEBT(PACK-RETIRED-KEY-SIGNED-AT): Slice 2 must decide how checkpoint signed_at is bounded by retirement for uncompromised audit keys.
+  // DEBT(PACK-RETIRED-KEY-SIGNED-AT): The exporter bounds checkpoint signed_at by retirement and refuses compromised keys; recipient verification still lacks the retirement-time bound.
   C.requireSnapshot(row.public_key_base64url === e.current_public_key || result.chain.retired.some(k => k.public_key_base64url === row.public_key_base64url && !k.compromised), C.HARD.pin_invalid);
 }
 export function bindSnapshotTrust(manifest: C.SnapshotManifest, descriptor: C.TrustDescriptor, delivered: Uint8Array, independent: Uint8Array): void {

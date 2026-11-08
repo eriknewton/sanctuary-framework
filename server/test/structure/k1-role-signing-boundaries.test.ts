@@ -1,38 +1,23 @@
-// fail-before-exempt: This change makes existing generated-contract and vector pins independent of Rust whitespace; the server source delta does not own those format-only invariants.
 import {describe,it,expect} from "vitest";
-import {readFileSync,readdirSync,mkdtempSync,mkdirSync,copyFileSync,symlinkSync,unlinkSync,rmdirSync} from "node:fs";
+import {readFileSync,readdirSync} from "node:fs";
 import {resolve,join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {execFileSync} from "node:child_process";
-import {tmpdir} from "node:os";
 import {assertAdmissibleIdentityLabel} from "../../src/signing/reserved-label.js";
 import {ROLE_REGISTRY,COMMON_FIELDS,LINUX_FIELDS,PRODUCER_DESCRIPTOR_DOMAIN,PRODUCER_ROTATION_DOMAIN,UNLOCK_CHALLENGE_DOMAIN} from "../../src/signing/contract.js";
 import {K1_SIGNING_DOMAIN_PREFIXES} from "../../src/core/signing-domains.js";
 const root=resolve(fileURLToPath(import.meta.url),"../../../..");
 describe("isolated K1 boundaries",()=>{
   it("generated Rust matches the full TS role, schema and constant sets",()=>{
-    const temporary=mkdtempSync(join(tmpdir(),"k1-generated-"));
-    const scriptDir=join(temporary,"scripts"),crate=join(temporary,"castle-wall-daemon"),sourceDir=join(crate,"src"),generated=join(sourceDir,"business_profile");
-    for(const dir of [scriptDir,crate,sourceDir,generated])mkdirSync(dir);
-    symlinkSync(join(root,"server"),join(temporary,"server"));
-    const script=join(scriptDir,"generate-record-signer-contract.mjs");copyFileSync(join(root,"scripts/generate-record-signer-contract.mjs"),script);
-    // Rust formatting may add trailing commas and whitespace, but every literal and other token must match the generator.
-    const tokens=(text:string)=>{const parts=text.match(/"(?:\\.|[^"\\])*"|[^\s]/g)??[];return parts.filter((part,i)=>!(part===","&&[")","]"].includes(parts[i+1]))).join("");};
-    try{
-      execFileSync(process.execPath,[script]);
-      for(const name of ["signer_contract.rs","public_vectors.json","role_vectors.json"]){
-        const actual=readFileSync(join(root,"castle-wall-daemon/src/business_profile",name),"utf8"),expected=readFileSync(join(generated,name),"utf8");
-        expect(name.endsWith(".rs")?tokens(actual):actual).toBe(name.endsWith(".rs")?tokens(expected):expected);
-      }
-    }finally{for(const name of ["signer_contract.rs","public_vectors.json","role_vectors.json"])try{unlinkSync(join(generated,name));}catch{}unlinkSync(script);unlinkSync(join(temporary,"server"));for(const dir of [generated,sourceDir,crate,scriptDir,temporary])rmdirSync(dir);}
+    expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-record-signer-contract.mjs"),"--check"])).not.toThrow();
     const rust=readFileSync(join(root,"castle-wall-daemon/src/business_profile/signer_contract.rs"),"utf8");
-    const rows=[...rust.matchAll(/\(\s*"([^"]+)",\s*"([^"]+)",\s*(\d+),?\s*\)/g)].map(match=>({role:match[1],domain:JSON.parse('"'+match[2]+'"'),envelope_max_bytes:Number(match[3])}));
+    const rows=[...rust.matchAll(/\("([^"]+)", "([^"]+)", (\d+)\)/g)].map(match=>({role:match[1],domain:JSON.parse('"'+match[2]+'"'),envelope_max_bytes:Number(match[3])}));
     expect(ROLE_REGISTRY.every(row => Object.isFrozen(row.record_kinds))).toBe(true);
     expect(rows).toEqual(ROLE_REGISTRY.map(({role,domain,envelope_max_bytes})=>({role,domain,envelope_max_bytes})));
-    const kinds=[...rust.matchAll(/\(\s*"([^\"]+)",\s*&\[([^\]]+)\],?\s*\)/g)].map(match=>({role:match[1],record_kinds:JSON.parse("["+match[2]+"]")}));
+    const kinds=[...rust.matchAll(/\("([^\"]+)", &\[([^\]]+)\]\)/g)].map(match=>({role:match[1],record_kinds:JSON.parse("["+match[2]+"]")}));
     expect(kinds).toEqual(ROLE_REGISTRY.map(({role,record_kinds})=>({role,record_kinds})));
     for(const name of ["COMMON_FIELDS","LINUX_FIELDS"]){const found=rust.match(new RegExp('pub const '+name+': &\\[&str\\] = &('+'\\[[^;]+\\]'+');'));
-      expect(found).not.toBeNull();expect(JSON.parse(found![1].replace(/,\s*\]/g,"]"))).toEqual(name==="COMMON_FIELDS"?COMMON_FIELDS:LINUX_FIELDS);}
+      expect(found).not.toBeNull();expect(JSON.parse(found![1])).toEqual(name==="COMMON_FIELDS"?COMMON_FIELDS:LINUX_FIELDS);}
   });
   it("refusal registry covers every role and lifecycle domain",()=>{
     expect([...K1_SIGNING_DOMAIN_PREFIXES].sort()).toEqual([...ROLE_REGISTRY.map(row=>row.domain),PRODUCER_DESCRIPTOR_DOMAIN,PRODUCER_ROTATION_DOMAIN,UNLOCK_CHALLENGE_DOMAIN].sort());
@@ -72,13 +57,15 @@ it("pins every evaluated primitive including a derived frame bound", () => {
   expect(actual).toEqual(expected);
   expect(readFileSync(join(root, "server/src/signing/contract.ts"), "utf8")).toContain("SIGNER_HEADER_MAX_BYTES + SIGNER_PREIMAGE_MAX_BYTES + 4");
 });
-// Must match PINNED_KID in castle-wall-daemon/src/business_profile/mod.rs, where Rust role_kid evaluates the same inputs.
+// Must match castle-wall-daemon/src/business_profile/pinned_kid.txt, which the Rust PINNED_KID in mod.rs includes and checks against role_kid over the same inputs.
 const PINNED_KID_VECTOR = {role: ROLE_REGISTRY[0].role, epoch: 2, public_key: Buffer.alloc(32, 7).toString("base64url"),
   kid: "k1:sha256:e09fa5a1f32e54219ade30b8ee6b5cb8367089d6a6aedfad3bf8c875b08fb411"};
 it("evaluates the pinned canonical kid vector shared with Rust and keeps vectors crate-local", () => {
   expect(runtimeContract.roleKid(PINNED_KID_VECTOR.role, PINNED_KID_VECTOR.epoch, PINNED_KID_VECTOR.public_key)).toBe(PINNED_KID_VECTOR.kid);
   const source = readFileSync(join(root, "castle-wall-daemon/src/business_profile/mod.rs"), "utf8");
-  expect(source.match(/const PINNED_KID: &str =\s*"([^"]+)";/)?.[1]).toBe(PINNED_KID_VECTOR.kid);
+  // The Rust test compares its executed role_kid with these exact file bytes through include_str!, so reading the file,
+  // never parsing Rust source text, ties both languages to one value that a comment cannot hide or replace.
+  expect(readFileSync(join(root, "castle-wall-daemon/src/business_profile/pinned_kid.txt"), "utf8")).toBe(PINNED_KID_VECTOR.kid);
   expect(source).not.toContain("../../../server/");
 });
 it("keeps every K1 signing domain prefix-free so a domain match cannot select the wrong lifecycle body", () => {

@@ -7,8 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 - Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony, capability-free peers and restart-persistent worker uncertainty, monotonic kill deadlines, fault-latched cleanup settlement and cooperative cleanup that tolerates a concurrent LOCK. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.
-- Added an isolated per-role record-signing contract and an encrypted key-provider with test fixtures. Nothing is wired into the daemon, a service or any existing export yet.
-- Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Export, recipient CLI and packaging are not included.
+- Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
+- Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 
