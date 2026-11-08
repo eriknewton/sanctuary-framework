@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
@@ -158,6 +158,30 @@ describe("sanctuary identity create CLI surface", () => {
     });
     expect(code).toBe(1);
     expect(err.text).toContain("requires SANCTUARY_PASSPHRASE");
+  });
+});
+
+describe("sanctuary identity create reserved labels", () => {
+  it("refuses a k1-role: label before custody resolution or any fortress write", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "sanctuary-identity-reserved-"));
+    const fortressPath = join(parent, "never-created");
+    try {
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runIdentityCommand({
+        argv: ["create", "--label", "k1-role:x", "--fortress", fortressPath],
+        out,
+        err,
+        env: { SANCTUARY_PASSPHRASE: "a synthetic passphrase for fixtures" },
+      });
+      expect(code).toBe(1);
+      expect(err.text).toContain("K1_ROLE_IDENTITY_REFUSED");
+      expect(out.text).toBe("");
+      await expect(readdir(parent)).resolves.toEqual([]);
+    } finally {
+      delete process.env.SANCTUARY_STORAGE_PATH;
+      await rmdir(parent);
+    }
   });
 });
 

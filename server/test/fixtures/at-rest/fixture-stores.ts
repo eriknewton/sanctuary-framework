@@ -30,6 +30,7 @@
  * (scoping §7 fixture-generation rule; invariants 2 + 6).
  */
 
+import {encryptBinding} from "../../../src/signing/binding-store.js";
 import type { StorageBackend } from "../../../src/storage/interface.js";
 import { ContextGatePolicyStore } from "../../../src/operational/context-gate.js";
 import { PolicyStore as DisclosurePolicyStore } from "../../../src/disclosure/policies.js";
@@ -57,6 +58,7 @@ export interface FixtureStoreSpec {
   readonly label: string;
   /** The storage namespace the store persists under (the on-disk dir name). */
   readonly namespace: string;
+  readonly committed?: () => {key: string; payload: unknown};
   /** Write the toy payload through the store's real persist path. */
   readonly write: (
     storage: StorageBackend,
@@ -65,6 +67,16 @@ export interface FixtureStoreSpec {
 }
 
 export const FIXTURE_STORES: readonly FixtureStoreSpec[] = [
+  {
+    label: "producer-custody-binding-v1",
+    namespace: "_producer_custody",
+    // Must match the embedded-fixture staging and reader in at-rest-decrypt-fixtures.test.ts.
+    committed: () => ({key: "binding", payload: BINDING_FIXTURE_CIPHERTEXT}),
+    write: async (storage, masterKey) => {
+      await storage.write("_producer_custody", "binding", new TextEncoder().encode(JSON.stringify(
+        encryptBinding(BINDING_FIXTURE_PLAINTEXT, masterKey, BINDING_FIXTURE_CONTEXT))));
+    },
+  },
   {
     label: "l2-context-gate",
     namespace: "_context_gate_policies",
@@ -181,3 +193,27 @@ export const FIXTURE_STORES: readonly FixtureStoreSpec[] = [
     },
   },
 ];
+
+// Must match the binding reader and retained-byte witness in producer-custody-binding.test.ts.
+export const BINDING_FIXTURE_CONTEXT = {
+  "fortress_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "machine_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "role": "extension:linux-business-producer-v0"
+} as const;
+export const BINDING_FIXTURE_PLAINTEXT = {
+  "identity_id": "cccccccccccccccccccccccccccccccc",
+  "role": "extension:linux-business-producer-v0",
+  "machine_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "epoch": 1,
+  "kid": "k1:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "roster_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "high_water": 9,
+  "transaction_state": "LOCKED"
+} as const;
+export const BINDING_FIXTURE_CIPHERTEXT = {
+  "v": 1,
+  "alg": "aes-256-gcm",
+  "iv": "GXgkKSIC9LM10vCu",
+  "ct": "2WH2SzCASd30RHBLPOxOx2uaU9FU_ik96ZTQIkZ_j5upEHOwk8R36A8DGVNq5G3ClPfMTQy8o0AtB8MBO7QAZHkCZMyNlnhis3OFOP90B8Rg6plVe9UEDxt56ZHRIh7R9v4fBqtQ254mD5cH-gRk91PEekBJtKozBLYRtlO5XwwZ-VcL6SXTtNXKapzJ0hCNHXlfCE_2YO0eSnEhv-9lRSrYWNrhCmPRh5uPbWHhpmNCun5IFTOSqoMHw7YPP0hecVF4kSA_N-0DUihANrN4JGOoN4GYJJokVSobzTIWL_xZj1-nif9eSrRHWnf0JfIzww19foKm0oS90ME3BviPs1lWONFXHSwqetmN9k-iQMO5keaLz_AFTssvhjDgbs0sjTb7z98Z_NMmcpAgSqP3lrxd0uPzA-iQCzYvmqj4iJXDpjgsh-uvYlktMiMe2kUHJQStHcKwNU7e1dLn8iXET-wbMGdf5LUYgfHcDHVPRBA-WJSx1dlVgjT-JbRnpDSS5SYr",
+  "ts": "2026-11-07T22:30:38.852Z"
+} as const;

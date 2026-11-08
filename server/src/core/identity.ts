@@ -287,33 +287,35 @@ export function createIdentity(
   keyProtection: "passphrase" | "hardware-key" | "recovery-key"
 ): { publicIdentity: PublicIdentity; storedIdentity: StoredIdentity } {
   const { publicKey, privateKey } = generateKeypair();
-  const identityId = generateIdentityId(publicKey);
-  const did = publicKeyToDid(publicKey);
-  const now = new Date().toISOString();
+  try {
+    const identityId = generateIdentityId(publicKey);
+    const did = publicKeyToDid(publicKey);
+    const now = new Date().toISOString();
 
-  // Encrypt the private key for storage
-  const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
+    // Encrypt the private key for storage
+    const encryptedPrivateKey = encrypt(privateKey, encryptionKey);
 
-  // Zero out the raw private key in memory
-  privateKey.fill(0);
 
-  const publicIdentity: PublicIdentity = {
-    identity_id: identityId,
-    label,
-    public_key: toBase64url(publicKey),
-    did,
-    created_at: now,
-    key_type: "ed25519",
-    key_protection: keyProtection,
-  };
+    const publicIdentity: PublicIdentity = {
+      identity_id: identityId,
+      label,
+      public_key: toBase64url(publicKey),
+      did,
+      created_at: now,
+      key_type: "ed25519",
+      key_protection: keyProtection,
+    };
 
-  const storedIdentity: StoredIdentity = {
-    ...publicIdentity,
-    encrypted_private_key: encryptedPrivateKey,
-    rotation_history: [],
-  };
+    const storedIdentity: StoredIdentity = {
+      ...publicIdentity,
+      encrypted_private_key: encryptedPrivateKey,
+      rotation_history: [],
+    };
 
-  return { publicIdentity, storedIdentity };
+    return { publicIdentity, storedIdentity };
+  } finally {
+    privateKey.fill(0);
+  }
 }
 
 /**
@@ -437,59 +439,62 @@ export function rotateKeys(
 ): { updatedIdentity: StoredIdentity; rotationEvent: RotationEvent } {
   const { publicKey: newPublicKey, privateKey: newPrivateKey } =
     generateKeypair();
-  const newIdentityDid = publicKeyToDid(newPublicKey);
-  const now = new Date().toISOString();
+  try {
+    const newIdentityDid = publicKeyToDid(newPublicKey);
+    const now = new Date().toISOString();
 
-  // Create rotation event
-  // CONTRACT PIN (server/src/core/rotation-chain.ts `rotationEventSigningBytes`):
-  // this object literal's field order is the signature preimage and must match
-  // the verifier exactly because `JSON.stringify` is order-sensitive.
-  const eventData = JSON.stringify({
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now,
-  });
+    // Create rotation event
+    // CONTRACT PIN (server/src/core/rotation-chain.ts `rotationEventSigningBytes`):
+    // this object literal's field order is the signature preimage and must match
+    // the verifier exactly because `JSON.stringify` is order-sensitive.
+    const eventData = JSON.stringify({
+      old_public_key: storedIdentity.public_key,
+      new_public_key: toBase64url(newPublicKey),
+      identity_id: storedIdentity.identity_id,
+      reason,
+      rotated_at: now,
+    });
 
-  // Sign the rotation event with the OLD key (proves authorization)
-  const eventBytes = new TextEncoder().encode(eventData);
-  const signature = sign(
-    eventBytes,
-    storedIdentity.encrypted_private_key,
-    encryptionKey
-  );
+    // Sign the rotation event with the OLD key (proves authorization)
+    const eventBytes = new TextEncoder().encode(eventData);
+    const signature = sign(
+      eventBytes,
+      storedIdentity.encrypted_private_key,
+      encryptionKey
+    );
 
-  const rotationEvent: RotationEvent = {
-    old_public_key: storedIdentity.public_key,
-    new_public_key: toBase64url(newPublicKey),
-    identity_id: storedIdentity.identity_id,
-    reason,
-    rotated_at: now,
-    signature: toBase64url(signature),
-  };
+    const rotationEvent: RotationEvent = {
+      old_public_key: storedIdentity.public_key,
+      new_public_key: toBase64url(newPublicKey),
+      identity_id: storedIdentity.identity_id,
+      reason,
+      rotated_at: now,
+      signature: toBase64url(signature),
+    };
 
-  // Encrypt the new private key
-  const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
-  newPrivateKey.fill(0);
+    // Encrypt the new private key
+    const encryptedNewPrivateKey = encrypt(newPrivateKey, encryptionKey);
 
-  const updatedIdentity: StoredIdentity = {
-    ...storedIdentity,
-    public_key: toBase64url(newPublicKey),
-    did: newIdentityDid,
-    encrypted_private_key: encryptedNewPrivateKey,
-    rotation_history: [
-      ...storedIdentity.rotation_history,
-      {
-        old_public_key: storedIdentity.public_key,
-        new_public_key: toBase64url(newPublicKey),
-        rotation_event: toBase64url(
-          new TextEncoder().encode(JSON.stringify(rotationEvent))
-        ),
-        rotated_at: now,
-      },
-    ],
-  };
+    const updatedIdentity: StoredIdentity = {
+      ...storedIdentity,
+      public_key: toBase64url(newPublicKey),
+      did: newIdentityDid,
+      encrypted_private_key: encryptedNewPrivateKey,
+      rotation_history: [
+        ...storedIdentity.rotation_history,
+        {
+          old_public_key: storedIdentity.public_key,
+          new_public_key: toBase64url(newPublicKey),
+          rotation_event: toBase64url(
+            new TextEncoder().encode(JSON.stringify(rotationEvent))
+          ),
+          rotated_at: now,
+        },
+      ],
+    };
 
-  return { updatedIdentity, rotationEvent };
+    return { updatedIdentity, rotationEvent };
+  } finally {
+    newPrivateKey.fill(0);
+  }
 }
