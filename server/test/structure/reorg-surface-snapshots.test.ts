@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds a negative guard that the role-signing contract registers no MCP tool; no such tool exists before this change either, so the guard passes against pre-change source by construction and pins the absence going forward.
 /**
  * Reorg surface snapshots — MCP tools/list wire shape + operation-policy tiers.
  *
