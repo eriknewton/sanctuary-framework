@@ -61,7 +61,10 @@ const PINNED_KID_VECTOR = {role: ROLE_REGISTRY[0].role, epoch: 2, public_key: Bu
 it("evaluates the pinned canonical kid vector shared with Rust and keeps vectors crate-local", () => {
   expect(runtimeContract.roleKid(PINNED_KID_VECTOR.role, PINNED_KID_VECTOR.epoch, PINNED_KID_VECTOR.public_key)).toBe(PINNED_KID_VECTOR.kid);
   const source = readFileSync(join(root, "castle-wall-daemon/src/business_profile/mod.rs"), "utf8");
-  expect(source.match(/const PINNED_KID: &str =\s*"([^"]+)";/)?.[1]).toBe(PINNED_KID_VECTOR.kid);
+  // Comments are stripped and exactly one live declaration must match, so a commented-out copy cannot satisfy the pin.
+  const live = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const declarations = [...live.matchAll(/^\s*const PINNED_KID: &str =\s*"([^"]+)";/gm)].map(match => match[1]);
+  expect(declarations).toEqual([PINNED_KID_VECTOR.kid]);
   expect(source).not.toContain("../../../server/");
 });
 it("keeps every K1 signing domain prefix-free so a domain match cannot select the wrong lifecycle body", () => {
