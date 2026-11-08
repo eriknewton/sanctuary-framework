@@ -133,6 +133,7 @@ describe("codebase-conventions gate", () => {
   it("module map (server/src/README.md) lists exactly the dirs under server/src", () => {
     const onDisk = moduleDirs();
     const inMap = mapModules();
+    expect(inMap).toEqual(expect.arrayContaining(["signing", "linux-business"]));
 
     const missingFromMap = onDisk.filter((d) => !inMap.includes(d));
     const missingFromTree = inMap.filter((m) => !onDisk.includes(m));

@@ -365,6 +365,13 @@ describe("at-rest decrypt fixtures (pre-change ciphertext must still read)", () 
       });
 
       beforeAll(() => {
+        if (spec.committed) {
+          fortress = mkdtempSync(join(tmpdir(), "binding-fixture-"));
+          const stored = spec.committed();
+          mkdirSync(join(fortress, spec.namespace));
+          writeFileSync(join(fortress, spec.namespace, stored.key + ".enc"), JSON.stringify(stored.payload));
+          return;
+        }
         const fixtureDir = join(FIXTURE_ROOT, spec.label);
         if (!existsSync(fixtureDir)) {
           throw new Error(
@@ -408,3 +415,13 @@ describe("at-rest decrypt fixtures (pre-change ciphertext must still read)", () 
     });
   }
 });
+
+import {mkdirSync, writeFileSync} from "node:fs";
+import {decryptBinding} from "../../src/signing/binding-store.js";
+import {BINDING_FIXTURE_CONTEXT, BINDING_FIXTURE_PLAINTEXT} from "../fixtures/at-rest/fixture-stores.js";
+// Must match the binding entry and committed bytes in fixture-stores.ts.
+READERS["producer-custody-binding-v1"] = async (storage, masterKey) => {
+  const raw = await storage.read("_producer_custody", "binding");
+  expect(raw).not.toBeNull();
+  expect(decryptBinding(JSON.parse(new TextDecoder().decode(raw!)), masterKey, BINDING_FIXTURE_CONTEXT)).toEqual(BINDING_FIXTURE_PLAINTEXT);
+};

@@ -130,6 +130,18 @@ describe("sanctuary meta-tools", () => {
       expect((result.passphrase_warning as string)).toContain("unrecoverable");
     });
 
+    it("refuses a reserved role label before key generation, storage or the bootstrap audit", async () => {
+      const { allTools, storage, auditLog } = setup();
+      const append = vi.spyOn(auditLog, "append");
+      const appendCritical = vi.spyOn(auditLog, "appendCritical");
+      await expect(callTool(allTools, "sanctuary_bootstrap", { label: "k1-role:x", publish: false }))
+        .rejects.toThrow("K1_ROLE_IDENTITY_REFUSED");
+      expect(append).not.toHaveBeenCalled();
+      expect(appendCritical).not.toHaveBeenCalled();
+      expect(await storage.list("_identities")).toEqual([]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
     it("rejects non-HTTPS verascore URLs", async () => {
       const { allTools } = setup();
       const result = await callTool(allTools, "sanctuary_bootstrap", {

@@ -179,3 +179,5 @@ These strings serve the same domain-separation purpose as HKDF info but appear i
 ## Crypto-agility migration note
 
 The v1.5+ Crypto Agility Sprint will replace HKDF-SHA256 with a post-quantum-aware KDF (likely HKDF-SHA3-256 or KMAC-256, pending CFRG guidance at that time). When that sprint runs, **every info string in this registry MUST be rotated to a v2 variant** (`sanctuary-fed-v0.2-transport`, `sanctuary-composition-v2-sidecar-signing-key`, etc.) so the v1.x derivations remain reproducible from preserved historical-master pubkeys and the v2 derivations live in a non-overlapping domain. Audit-chain continuity (federation spec §9.5) requires that v1.x verification still works post-migration; isolating the namespaces is how that works.
+
+The `producer-custody-binding-v1` decryptable store purpose belongs to `signing/binding-store.ts`. It uses the existing purpose salt and binds `sanctuary.producer-custody.binding.v1\n` plus canonical `{fortress_id,machine_id,role}` as AAD. Retained ciphertext is covered by `test/at-rest/producer-custody-binding.test.ts`; generic master rotation has no binding-store migration in this slice.

@@ -18,6 +18,10 @@
 //! 6, 7, 8). Parent ADR: Castle_Architecture_ADR_2026-04-30.md.
 
 pub(crate) mod admitted_identity;
+/// Isolated role contract; no business runtime is enabled.
+pub mod business_profile;
+
+// Agent launch uses Linux credentials while the signing contract is portable.
 #[cfg(target_os = "linux")]
 pub mod agent_launch;
 pub mod agent_start;
