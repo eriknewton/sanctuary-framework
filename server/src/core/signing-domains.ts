@@ -22,6 +22,9 @@
  * signing domain of its own.
  */
 
+/** Must match MANIFEST_DOMAIN in evidence-pack/snapshot-contract.ts. */
+export const EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN = "sanctuary.evidence-snapshot.v0\n";
+
 /** Hash domain for one exported SDW record's ciphertext envelope. */
 export const SDW_EXPORT_RECORD_HASH_DOMAIN = "sanctuary.sdw-export-record-hash.v1\n";
 /** Digest domain for the approval-bound export scope. */
@@ -57,7 +60,8 @@ export const MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX =
  * Prefixes the raw `identity_sign` surface refuses: the domains enumerated
  * in this change, each one verified somewhere in the tree against a managed
  * identity key (the SDW export manifest, state-store envelopes, audit events,
- * internal receipts and audit checkpoints). Other identity-signed domains
+ * internal receipts, audit checkpoints and evidence snapshot manifests via
+ * EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN). Other identity-signed domains
  * exist and are tracked separately (operator-signed v1, sign-challenge,
  * bridge, reputation, memory-attest, exit-lineage); they are not yet on this
  * list. Hash-only domains (the SDW record-hash and scope-digest domains) and
@@ -67,6 +71,7 @@ export const MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX =
  */
 export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
   SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
+  EVIDENCE_SNAPSHOT_MANIFEST_DOMAIN,
   STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX,
   AUDIT_EVENT_SIGNING_DOMAIN_PREFIX,
   INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX,

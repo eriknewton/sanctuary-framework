@@ -33,3 +33,41 @@ describe("snapshot-verify", () => {
   it("both absent components are PARTIAL with exact state reasons", () => { const f = fixture(); f.manifest.components = { audit: { state: C.COMPONENT.empty_verified, reason: "no_records" }, transparency: { state: C.COMPONENT.read_failed, reason: "read_error" } }; f.capture.files = f.capture.files.filter(file => ![C.AUDIT_FILENAME, C.TRANSPARENCY_FILENAME].includes(Buffer.from(file.name).toString())); refreshFiles(f); const r = run(f); expect([r.status, r.exit_code, r.accepted, r.snapshot_integrity]).toEqual([C.STATUS.PARTIAL, 10, false, C.INTEGRITY.bytes_match]); expect(r.partial_reasons).toEqual([C.PARTIAL.audit_absent, C.PARTIAL.audit_empty_verified, C.PARTIAL.transparency_absent, C.PARTIAL.transparency_read_failed].sort()); });
   it("unknown extension payload forces PARTIAL", () => { const f = fixture(); f.capture.files = [...f.capture.files, capturedFile("future.bin", C.utf8("opaque"))]; f.manifest.extensions = [{ id: "future", filenames: ["future.bin"], signing_roles: [C.PIN_ROLE.extension + "future"] }]; f.pins.descriptorBytes = descriptorBytes([...C.parseTrustDescriptor(f.pins.descriptorBytes).keys, trustRow(identity(), C.PIN_ROLE.extension + "future")]); replaceFile(f, C.TRUST_FILENAME, f.pins.descriptorBytes); refreshFiles(f); expect(run(f).partial_reasons).toEqual([C.PARTIAL.extension_unverified]); expect(run(f).status).toBe(C.STATUS.PARTIAL); });
 });
+
+const osLabels = ["com.apple.provenance", "com.apple.quarantine", "security.selinux"];
+const metadataNotice = "OS-attached file metadata (provenance, quarantine, security label) is outside the signed set.";
+it.each(["PASS", "PARTIAL"])("OS labels preserve %s and disclose one fixed unsigned scope", status => {
+  const f = fixture();
+  if (status === "PARTIAL") {
+    f.manifest.components.audit = { state: C.COMPONENT.empty_verified, reason: "no_records" };
+    f.capture.files = f.capture.files.filter(file => Buffer.from(file.name).toString() !== C.AUDIT_FILENAME); refreshFiles(f);
+  }
+  const before = run(f); expect(before.status).toBe(status); expect(before.not_checked).not.toContain(metadataNotice);
+  f.capture.rootMetadata = osLabels;
+  for (const file of f.capture.files) file.metadata = osLabels;
+  const after = run(f);
+  expect(after).toEqual({ ...before, not_checked: [...before.not_checked, metadataNotice] });
+});
+it.each(["root", "file"])("OS labels on only %s disclose scope", location => {
+  const f = fixture();
+  if (location === "root") f.capture.rootMetadata = osLabels; else f.capture.files[0].metadata = osLabels;
+  expect(run(f)).toMatchObject({ status: "PASS", findings: [], not_checked: [...C.NOT_CHECKED, metadataNotice] });
+});
+it.each(osLabels.flatMap(allowed => ["root", "file"].map(location => ({ allowed, location }))))("OS label $allowed with unknown metadata on $location refuses", ({ allowed, location }) => {
+  const f = fixture(), names = [allowed, "user.private-sentinel"];
+  if (location === "root") f.capture.rootMetadata = names; else f.capture.files[0].metadata = names;
+  rejected(f, C.HARD.unexpected_metadata);
+  expect(JSON.stringify(run(f))).not.toContain("private-sentinel");
+  expect(run(f).not_checked).not.toContain(metadataNotice);
+});
+it.each(["root", "file"])("a repeated OS label on %s refuses without the scope notice", location => {
+  const f = fixture(), names = ["com.apple.provenance", "com.apple.quarantine", "com.apple.provenance"];
+  if (location === "root") f.capture.rootMetadata = names; else f.capture.files[0].metadata = names;
+  rejected(f, C.HARD.unexpected_metadata);
+  expect(run(f).not_checked).not.toContain(metadataNotice);
+});
+it.each(["com.apple.ResourceFork", "com.apple.FinderInfo", "Com.apple.provenance", "com.apple.quarantine ", "security.selinux\0"].flatMap(name => ["root", "file"].map(location => ({ name, location }))))("exact metadata name $name on $location refuses", ({ name, location }) => {
+  const f = fixture();
+  if (location === "root") f.capture.rootMetadata = [name]; else f.capture.files[0].metadata = [name];
+  rejected(f, C.HARD.unexpected_metadata);
+});

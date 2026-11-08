@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-- Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Export, recipient CLI and packaging are not included.
+- Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
+
+- Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.
 
 ### Next Castle Wall Linux package (not in 0.1.0-1)
 

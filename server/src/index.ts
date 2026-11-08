@@ -380,6 +380,7 @@ export async function createSanctuaryServer(options?: {
   // would otherwise be orphaned inside the fortress dir); it only applies when
   // the boot path owns a filesystem fortress.
   const bootOwnsStorage = options?.storage === undefined;
+  // Must match the snapshot-export-cli.ts gather storage root because boot does not expose this storage object.
   const storage = options?.storage ?? new FilesystemStorage(
     `${config.storage_path}/state`
   );

@@ -337,6 +337,17 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "export-evidence") {
+    const { runSnapshotExportCommand } = await import("./evidence-pack/snapshot-export-cli.js");
+    const argv = fortressFlag.fortressPath === undefined ? args.slice(1) : [...args.slice(1), "--fortress", fortressFlag.fortressPath];
+    return drainAndExit(await runSnapshotExportCommand(argv));
+  }
+
+  if (args[0] === "export-evidence-trust") {
+    const { runSnapshotTrustCommand } = await import("./evidence-pack/snapshot-trust-cli.js");
+    return drainAndExit(await runSnapshotTrustCommand(args.slice(1)));
+  }
+
   if (args[0] === "evidence-pack") {
     const { runEvidencePack } = await import("./evidence-pack/cli.js");
     await runEvidencePack(args.slice(1));
