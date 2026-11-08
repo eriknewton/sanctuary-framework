@@ -59,6 +59,13 @@ describe("packed recipient consumer", () => {
     'import workers from "node:worker_threads"; new workers.Worker("", {eval:true});',
     'await fetch("https://example.invalid");',
     'import fs from "node:fs"; fs.readFileSync(process.env.HOME+"/secret");',
+    'import fs from "node:fs"; await fs.openAsBlob(process.env.HOME+"/secret");',
+    'import fs from "node:fs"; fs.globSync(process.env.HOME+"/*");',
+    'import fs from "node:fs/promises"; for await (const entry of fs.glob(process.env.HOME+"/*")) void entry;',
+    'import fs from "node:fs"; fs.watch(process.env.HOME).close();',
+    'import fs from "node:fs"; fs.watchFile(process.env.HOME+"/secret", () => undefined);',
+    'import fs from "node:fs"; fs.statfsSync(process.env.HOME);',
+    'import fs from "node:fs"; fs.utimesSync(process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/pack", 0, 0);',
     'import fs from "node:fs/promises"; await fs.readFile("/tmp/operator/.sanctuary/state");',
     'import cp from "node:child_process"; cp.execFileSync("/usr/bin/env", ["python3", "-c", "print(1)"]);',
   ])("isolation detects forbidden reach %s", attack => { const r = isolated(attack); expect(r.status).toBe(1); expect(r.stderr).toContain('"denied":1'); });
