@@ -1,0 +1,88 @@
+/** Read-only recipient isolation and same-instance synthetic drill isolation. */
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import child from "node:child_process";
+import net from "node:net";
+import tls from "node:tls";
+import http from "node:http";
+import https from "node:https";
+import dns from "node:dns";
+import dgram from "node:dgram";
+import { promisify } from "node:util";
+import { syncBuiltinESMExports } from "node:module";
+import { resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { installInMemoryKeychainStore } from "../test/setup/keychain-memory-store.js";
+import { execKeychain } from "../src/wrap/keychain-exec.js";
+import { LINUX_METADATA_PROGRAM, METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT } from "../src/evidence-pack/snapshot-offline-cli.js";
+import { OS_ATTACHED_METADATA } from "../src/evidence-pack/snapshot-contract.js";
+const NORMAL_EXIT = 0, DENIED_EXIT = 1;
+let installed = false;
+export async function installDrillCredentials(): Promise<void> {
+  // Explicit synthetic mode avoids ambient package-marker probes; the credential round trip still requires the injected store.
+  process.env.NODE_ENV = "test";
+  installInMemoryKeychainStore();
+  // This probe reaches the exact chokepoint used by the bundled exporter, so a second fake module cannot masquerade as isolation.
+  const service = "synthetic-evidence-drill", account = "synthetic", sentinel = "synthetic-isolation-proof";
+  const added = await execKeychain("security", ["add-generic-password", "-U", "-s", service, "-a", account, "-w", sentinel]);
+  const found = await execKeychain("security", ["find-generic-password", "-s", service, "-a", account, "-w"]);
+  const removed = await execKeychain("security", ["delete-generic-password", "-s", service, "-a", account]);
+  if (added.code !== NORMAL_EXIT || found.code !== NORMAL_EXIT || found.stdout.trimEnd() !== sentinel || removed.code !== NORMAL_EXIT) throw new Error("Synthetic credential round trip required");
+  installed = true;
+}
+export function requireDrillCredentials(): void { if (!installed) throw new Error("Drill isolation is required"); }
+export function installIsolation(rootPath: string, bundlePath: string, writable = false): void {
+  const root = resolve(rootPath), bundle = fs.realpathSync(bundlePath);
+  const home = process.env.HOME ? resolve(process.env.HOME) : undefined;
+  let denied = 0, enumerations = 0;
+  const deny = (): never => { denied++; throw new Error("Evidence drill isolation denied I/O"); };
+  const inside = (path: string) => path === root || path.startsWith(root + sep);
+  const pathOf = (value: unknown) => value instanceof URL ? fileURLToPath(value) : Buffer.isBuffer(value) ? value.toString() : typeof value === "string" ? value : undefined;
+  const check = (value: unknown, write = false) => {
+    if (typeof value === "number") return deny();
+    const text = pathOf(value); if (!text) return deny(); const path = resolve(text);
+    if (!writable && ((home && (path === home || path.startsWith(home + sep))) || path.split(sep).includes(".sanctuary"))) return deny();
+    if (write && !writable) return deny();
+    if (!inside(path) && path !== bundle) return deny();
+  };
+  function wrap(object: object, key: string, fn: (original: (...args: unknown[]) => unknown, args: unknown[]) => unknown) {
+    const record = object as Record<string, unknown>; const original = record[key];
+    if (typeof original === "function") {
+      const wrapper = (...args: unknown[]) => fn(original.bind(object), args);
+      if (object === child && key === "execFile") Object.defineProperty(wrapper, promisify.custom, { value: (...args: unknown[]) => new Promise((resolve, reject) => wrapper(...args, (error: Error | null, stdout: string, stderr: string) => error ? reject(error) : resolve({ stdout, stderr }))) });
+      record[key] = wrapper;
+    }
+  }
+  // Only explicit fixture paths can be accessed, so HOME and operator storage cannot become implicit inputs.
+  const reads = ["readFile", "open", "opendir", "readdir", "stat", "lstat", "realpath", "readlink", "access", "exists", "createReadStream"];
+  const writes = ["writeFile", "appendFile", "mkdir", "mkdtemp", "rm", "rmdir", "unlink", "rename", "copyFile", "cp", "symlink", "link", "chmod", "chown", "truncate", "createWriteStream"];
+  for (const object of [fs, fsp]) for (const key of reads) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => { check(args[0]); if (key === "open" && !writable) { const flags = args[1]; if (typeof flags === "string" ? flags !== "r" : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC)) !== 0) deny(); } return original(...args); });
+  for (const object of [fs, fsp]) for (const key of writes) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => { check(args[0], true); if (["rename", "copyFile", "cp", "symlink", "link"].includes(key)) check(args[1], true); return original(...args); });
+  for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) wrap(child, key, (original, args) => {
+    const [command, argv, options] = args as [string, string[], Record<string, unknown>];
+    if (!Array.isArray(argv) || !options) return deny();
+    const file = argv.at(-1); check(file);
+    const linux = command === "/usr/bin/python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-I", "-S", "-c", LINUX_METADATA_PROGRAM]);
+    const darwin = command === "/usr/bin/xattr" && (argv.length === 1 || (argv.length === 3 && argv[0] === "-p" && OS_ATTACHED_METADATA.includes(argv[1])));
+    // The synthetic exporter uses its older adapter, so the drill fixes that adapter to the same OS executable and closes its stdin before execution.
+    if (writable && key === "execFile" && ((command === "python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-c", LINUX_METADATA_PROGRAM])) || darwin)) {
+      const callback = args.at(-1);
+      enumerations++;
+      const process = original(command === "python3" ? "/usr/bin/python3" : command, command === "python3" ? ["-I", "-S", ...argv] : argv, { env: { LC_ALL: "C" }, shell: false, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT }, callback) as { stdin?: { end: () => void } };
+      process.stdin?.end(); return process;
+    }
+    const exact = linux || darwin;
+    const stdio = options.stdio;
+    const closed = options.shell === false && JSON.stringify(options.env) === JSON.stringify({ LC_ALL: "C" }) && options.timeout === METADATA_TIMEOUT_MS && options.maxBuffer === METADATA_OUTPUT_LIMIT && (stdio === "ignore" || JSON.stringify(stdio) === JSON.stringify(["ignore", "pipe", "ignore"]));
+    // Must match snapshot-offline-cli.ts: only fixed-path name enumeration is admitted, with bounded execution and no inherited environment.
+    if (!exact || !closed || !["execFileSync", "spawnSync"].includes(key)) return deny();
+    enumerations++; return original(...args);
+  });
+  for (const [object, keys] of [[net, ["connect", "createConnection", "createServer"]], [net.Socket.prototype, ["connect"]], [tls, ["connect", "createServer"]], [http, ["request", "get", "createServer"]], [https, ["request", "get", "createServer"]], [dns, ["lookup", "resolve"]], [dns.promises, ["lookup", "resolve"]], [dgram, ["createSocket"]]] as [object, string[]][]) for (const key of keys) wrap(object, key, () => deny());
+  for (const object of [dns, dns.promises]) for (const key of Object.keys(object)) if (typeof (object as unknown as Record<string, unknown>)[key] === "function") wrap(object, key, () => deny());
+  globalThis.fetch = async () => deny();
+  syncBuiltinESMExports();
+  process.on("exit", () => { process.stderr.write(JSON.stringify({ isolation: true, denied, enumerations }) + "\n"); if (denied) process.exitCode = DENIED_EXIT; });
+}
+// The preload is opt-in and the production verifier never imports this harness.
+if (process.env.EVIDENCE_PACK_ISOLATION_ROOT && process.env.EVIDENCE_PACK_ISOLATION_BUNDLE) installIsolation(process.env.EVIDENCE_PACK_ISOLATION_ROOT, process.env.EVIDENCE_PACK_ISOLATION_BUNDLE);

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- Added a private offline evidence snapshot verifier candidate, recipient instructions and a synthetic second-Mac drill procedure.
+
 - Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
 
 - Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.

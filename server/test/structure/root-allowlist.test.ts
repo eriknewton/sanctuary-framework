@@ -91,6 +91,7 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "local-model-gateway",
   "menubar",
   "package.json",
+  "packages",
   "plugin",
   "quickstart",
   "rfcs",

@@ -9,11 +9,11 @@ const ALLOWED = [
   "audit/chain.ts", "audit/checkpoint-shape.ts", "cli/argv.ts", "cli/audit-chain-verify.ts",
   "core/encoding.ts", "core/encryption.ts", "core/hashing.ts", "core/identity.ts", "core/random.ts", "core/signing-domains.ts", "core/rotation-chain.ts",
   "errors/config-error.ts", "errors/index.ts", "errors/profile-error.ts", "errors/untrusted-diagnostic.ts",
-  "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
+  "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
   "hermes-memory-bridge/constants.ts", "hermes-memory-bridge/strict-json.ts", "lockdown/status.ts", "transparency/checkpoint.ts", "transparency/verify.ts",
 ];
 // Existing audit CLI imports filesystem helpers; the pure entry never calls its I/O functions.
-const EXTERNAL = new Set(["@noble/curves/ed25519", "@noble/hashes/sha256", "@noble/hashes/hmac", "@noble/hashes/sha512", "@noble/hashes/hkdf", "@noble/ciphers/aes.js", "node:crypto", "crypto", "node:fs", "node:fs/promises", "node:path"]);
+const EXTERNAL = new Set(["@noble/curves/ed25519", "@noble/hashes/sha256", "@noble/hashes/hmac", "@noble/hashes/sha512", "@noble/hashes/hkdf", "@noble/ciphers/aes.js", "node:child_process", "node:crypto", "crypto", "node:fs", "node:fs/promises", "node:path"]);
 function imports(source: string): string[] {
   const tree = ts.createSourceFile("fixture.ts", source, ts.ScriptTarget.Latest, true); const specs: string[] = [];
   function visit(node: ts.Node) {
@@ -32,7 +32,7 @@ function imports(source: string): string[] {
 }
 function crawl(): { files: string[]; external: string[] } {
   const seen = new Set<string>(); const external = new Set<string>();
-  const queue = ["evidence-pack/snapshot-verify.ts", "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-nested.ts"];
+  const queue = ["evidence-pack/snapshot-verify.ts", "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-nested.ts"];
   while (queue.length) {
     const file = queue.shift()!; if (seen.has(file)) continue; seen.add(file);
     for (const spec of imports(readFileSync(resolve(ROOT, file), "utf8"))) {
