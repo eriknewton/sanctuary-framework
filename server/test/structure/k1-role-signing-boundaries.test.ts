@@ -1,3 +1,4 @@
+// fail-before-exempt: the changed assertions read server/tsup.config.ts and castle-wall-daemon sources, which verify-fail-before does not revert (it reverts server/src only); the full suite at head checks them.
 import {describe,it,expect} from "vitest";
 import {readFileSync,readdirSync} from "node:fs";
 import {resolve,join} from "node:path";

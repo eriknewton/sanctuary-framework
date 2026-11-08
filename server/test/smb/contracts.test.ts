@@ -1,3 +1,4 @@
+// fail-before-exempt: the changed scanner and its new witness read castle-wall-daemon Rust sources and this file's own violation scanner, which verify-fail-before does not revert (it reverts server/src only); the witness exercises the scanner directly with fixture text.
 /** Shared SMB contracts and isolated peer admission. */
 import { beforeAll, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
