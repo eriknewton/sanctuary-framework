@@ -9,7 +9,7 @@ const ALLOWED = [
   "audit/chain.ts", "audit/checkpoint-shape.ts", "cli/argv.ts", "cli/audit-chain-verify.ts",
   "core/encoding.ts", "core/encryption.ts", "core/hashing.ts", "core/identity.ts", "core/random.ts", "core/signing-domains.ts", "core/rotation-chain.ts",
   "errors/config-error.ts", "errors/index.ts", "errors/profile-error.ts", "errors/untrusted-diagnostic.ts",
-  "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
+  "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-metadata.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
   "hermes-memory-bridge/constants.ts", "hermes-memory-bridge/strict-json.ts", "lockdown/status.ts", "transparency/checkpoint.ts", "transparency/verify.ts",
 ];
 // Existing audit CLI imports filesystem helpers; the pure entry never calls its I/O functions.
@@ -37,8 +37,8 @@ function crawl(injected: Record<string, string> = {}): { files: string[]; extern
     const file = queue.shift()!; if (seen.has(file)) continue; seen.add(file);
     for (const spec of imports(readFileSync(resolve(ROOT, file), "utf8") + (injected[file] ?? ""))) {
       if (!spec.startsWith(".")) {
-        // Only the offline capture adapter may start the fixed metadata enumerator.
-        if (spec === "node:child_process") { expect(file).toBe("evidence-pack/snapshot-offline-cli.ts"); continue; }
+        // Must match the subprocess boundary in snapshot-metadata.ts so pure verification cannot start an OS command.
+        if (spec === "node:child_process") { expect(file).toBe("evidence-pack/snapshot-metadata.ts"); continue; }
         external.add(spec); continue;
       }
       const target = resolve(ROOT, dirname(file), spec.replace(/\.js$/, ".ts")); expect(existsSync(target)).toBe(true); queue.push(relative(ROOT, target));

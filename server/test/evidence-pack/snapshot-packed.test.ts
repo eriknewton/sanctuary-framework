@@ -11,7 +11,7 @@ import { verifyAuditChainContent } from "../../src/cli/audit-chain-verify.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
 let c: Awaited<ReturnType<typeof candidateForTests>>;
 const TIMEOUT_MS = 30_000;
-function isolated(attack?: string, status = "PASS", alias = false) {
+function isolated(attack?: string, status = "PASS", alias = false, writable = false) {
   const f = fixture(), root = mkdtempSync(join(tmpdir(), "isolated-")), pack = join(root, "pack"); mkdirSync(pack);
   if (status === "PARTIAL") { for (const row of f.records) if (row.type === "checkpoint") { row.unsigned = true; row.signature = null; row.signer_kid = null; delete row.public_key; } syncAudit(f); }
   for (const file of f.capture.files) writeFileSync(join(pack, Buffer.from(file.name).toString()), file.bytes);
@@ -29,7 +29,9 @@ function isolated(attack?: string, status = "PASS", alias = false) {
   const expectedEnumerations = listingPaths.reduce((count, path) => count + 1 + (process.platform === "darwin" ? execFileSync("/usr/bin/xattr", ["-s", path], { encoding: "utf8" }).split("\n").filter(Boolean).length : 0), 0);
   let allowedRoot = root;
   if (alias) { const link = join(mkdtempSync(join(tmpdir(), "alias-")), "parent"); symlinkSync(dirname(root), link); allowedRoot = join(link, basename(root)); }
-  const result = spawnSync(process.env.EVIDENCE_PACK_TEST_NODE ?? process.execPath, ["--import", preload, target, ...args], { env: { ...process.env, PATH: process.env.PATH, HOME: join(root, "denied-home"), EVIDENCE_PACK_ISOLATION_ROOT: allowedRoot, EVIDENCE_PACK_ISOLATION_BUNDLE: realpathSync(target), NODE_OPTIONS: "--max-old-space-size=3072" }, encoding: "utf8", timeout: TIMEOUT_MS });
+  const activePreload = writable ? join(root, "writable-preload.mjs") : preload;
+  if (writable) writeFileSync(activePreload, `const root = process.env.EVIDENCE_PACK_ISOLATION_ROOT, bundle = process.env.EVIDENCE_PACK_ISOLATION_BUNDLE; delete process.env.EVIDENCE_PACK_ISOLATION_BUNDLE; const { installIsolation } = await import(${JSON.stringify(preload)}); installIsolation(root, bundle, true);`);
+  const result = spawnSync(process.env.EVIDENCE_PACK_TEST_NODE ?? process.execPath, ["--import", activePreload, target, ...args], { env: { ...process.env, PATH: process.env.PATH, HOME: join(root, "denied-home"), EVIDENCE_PACK_ISOLATION_ROOT: allowedRoot, EVIDENCE_PACK_ISOLATION_BUNDLE: realpathSync(target), NODE_OPTIONS: "--max-old-space-size=3072" }, encoding: "utf8", timeout: TIMEOUT_MS });
   return { ...result, expectedEnumerations };
 }
 describe("packed recipient consumer", () => {
@@ -187,3 +189,13 @@ printf reached`;
   expect(result.status).toBe(kind === "valid" ? C.EXIT_PASS : C.EXIT_FAIL);
   expect(result.stdout).toBe(kind === "valid" ? "reached" : "");
 });
+
+it.each([false, true])("isolation refuses legacy exporter argv with writable %s", async writable => {
+  c ??= await candidateForTests();
+  const { METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT, LINUX_METADATA_PROGRAM } = await import("../../src/evidence-pack/snapshot-offline-cli.js");
+  for (const [command, prefix] of [["/usr/bin/xattr", []], ["/usr/bin/xattr", ["-p", "com.apple.provenance"]], ["python3", ["-c", LINUX_METADATA_PROGRAM]]] as const) {
+    const attack = `import cp from "node:child_process"; cp.execFile(${JSON.stringify(command)}, [...${JSON.stringify(prefix)}, process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/key"], {env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:"ignore"}, () => {});`;
+    const result = isolated(attack, "PASS", false, writable);
+    expect(result.stderr).toContain('"denied":1'); expect(result.status).toBe(C.EXIT_FAIL);
+  }
+}, 120_000);

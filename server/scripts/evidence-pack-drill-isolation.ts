@@ -17,7 +17,7 @@ import { resolve, sep, dirname, basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { installInMemoryKeychainStore } from "../test/setup/keychain-memory-store.js";
 import { execKeychain } from "../src/wrap/keychain-exec.js";
-import { LINUX_METADATA_PROGRAM, METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT } from "../src/evidence-pack/snapshot-offline-cli.js";
+import { LINUX_METADATA_PROGRAM, METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT } from "../src/evidence-pack/snapshot-metadata.js";
 import { OS_ATTACHED_METADATA } from "../src/evidence-pack/snapshot-contract.js";
 const NORMAL_EXIT = 0, DENIED_EXIT = 1;
 let installed = false;
@@ -82,20 +82,12 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
     const file = argv.at(-1); check(file);
     const linux = command === "/usr/bin/python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-I", "-S", "-c", LINUX_METADATA_PROGRAM]);
     const darwin = command === "/usr/bin/xattr" && argv[0] === "-s" && (argv.length === 2 || (argv.length === 4 && argv[1] === "-p" && OS_ATTACHED_METADATA.includes(argv[2])));
-    const exporterDarwin = command === "/usr/bin/xattr" && (argv.length === 1 || (argv.length === 3 && argv[0] === "-p" && OS_ATTACHED_METADATA.includes(argv[1])));
-    // The synthetic exporter uses its older adapter, so the drill fixes that adapter to the same OS executable and closes its stdin before execution.
-    if (writable && key === "execFile" && ((command === "python3" && JSON.stringify(argv.slice(0, -1)) === JSON.stringify(["-c", LINUX_METADATA_PROGRAM])) || exporterDarwin)) {
-      const callback = args.at(-1);
-      enumerations++;
-      const process = original(command === "python3" ? "/usr/bin/python3" : command, command === "python3" ? ["-I", "-S", ...argv] : argv, { env: { LC_ALL: "C" }, shell: false, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT }, callback) as { stdin?: { end: () => void } };
-      process.stdin?.end(); return process;
-    }
     const exact = linux || darwin;
     const stdio = options.stdio;
     // Value lookups discard stdout because only attribute names may reach the verifier.
     const safeStdio = darwin && argv[1] === "-p" ? stdio === "ignore" : JSON.stringify(stdio) === JSON.stringify(["ignore", "pipe", "ignore"]);
     const closed = options.shell === false && JSON.stringify(options.env) === JSON.stringify({ LC_ALL: "C" }) && options.timeout === METADATA_TIMEOUT_MS && options.maxBuffer === METADATA_OUTPUT_LIMIT && safeStdio;
-    // Must match snapshot-offline-cli.ts: only fixed-path name enumeration is admitted, with bounded execution and no inherited environment.
+    // Must match snapshot-metadata.ts: every writable and read-only path admits only bounded no-follow enumeration with closed execution.
     if (!exact || !closed || !["execFileSync", "spawnSync"].includes(key)) return deny();
     enumerations++; return original(...args);
   });

@@ -1,7 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
 import { parseOfflineArguments, parseOfflineKey, runOfflineCommand, metadataNames, METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT, LINUX_METADATA_PROGRAM } from "../../src/evidence-pack/snapshot-offline-cli.js";
 import * as child from "node:child_process";
-vi.mock("node:child_process", async importOriginal => ({ ...await importOriginal<typeof import("node:child_process")>() }));
+vi.mock("node:child_process", async importOriginal => {
+  const native = await importOriginal<typeof import("node:child_process")>();
+  const { promisify } = await import("node:util");
+  const execFile = vi.fn(native.execFile);
+  Object.defineProperty(execFile, promisify.custom, { value: (...args: unknown[]) => new Promise((resolve, reject) => {
+    Reflect.apply(execFile, undefined, [...args, (error: Error | null, stdout: string, stderr: string) => error ? reject(error) : resolve({ stdout, stderr })]);
+  }) });
+  return { ...native, execFile };
+});
 import * as fs from "node:fs/promises";
 vi.mock("node:fs/promises", async importOriginal => ({ ...await importOriginal<typeof import("node:fs/promises")>() }));
 import { identity } from "./snapshot-fixtures.js";
@@ -108,4 +116,65 @@ it("human capture diagnostics retain the named environment finding", async () =>
 it.each(["not-json", "{}"])("malformed enumerator output retains the capture finding %s", output => {
   const call = vi.spyOn(child, "execFileSync").mockReturnValue(Buffer.from(output));
   try { expect(() => metadataNames("/explicit/file", "linux")).toThrow(C.HARD.unexpected_metadata); } finally { call.mockRestore(); }
+});
+
+import { captureSnapshotDirectory } from "../../src/evidence-pack/snapshot-trust-cli.js";
+import { readFileSync } from "node:fs";
+// Must match the shared metadata contract: both consumers bind every observation to an open handle.
+it("exporter Darwin adapter uses bounded no-follow listing and discarded exact lookups", async () => {
+  const args = verdictInput("PASS"), platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const legacy = vi.mocked(child.execFile).mockImplementation(((...argv: unknown[]) => {
+    (argv.at(-1) as (error: null, stdout: string, stderr: string) => void)(null, "com.apple.quarantine\n", ""); return {};
+  }) as typeof child.execFile);
+  const listing = vi.spyOn(child, "execFileSync").mockReturnValue(Buffer.from("com.apple.quarantine\n"));
+  const lookup = vi.spyOn(child, "spawnSync").mockReturnValue({ status: C.EXIT_PASS } as ReturnType<typeof child.spawnSync>);
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    const capture = await captureSnapshotDirectory(args[1], readFileSync(args[3], "utf8"), args[7]);
+    const paths = [args[1], ...capture.files.map(file => join(args[1], Buffer.from(file.name).toString()))];
+    expect(listing.mock.calls).toEqual(paths.map(path => ["/usr/bin/xattr", ["-s", path], { env: { LC_ALL: "C" }, shell: false, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT, stdio: ["ignore", "pipe", "ignore"] }]));
+    expect(lookup.mock.calls).toEqual(paths.map(path => ["/usr/bin/xattr", ["-s", "-p", "com.apple.quarantine", path], { env: { LC_ALL: "C" }, shell: false, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT, stdio: "ignore" }]));
+    expect(capture.rootMetadata).toEqual(["com.apple.quarantine"]);
+    for (const file of capture.files) expect(file.metadata).toEqual(["com.apple.quarantine"]);
+  } finally { Object.defineProperty(process, "platform", platform); listing.mockRestore(); lookup.mockRestore(); legacy.mockRestore(); }
+});
+const REPLACEMENT_STAGES = ["root listing", "root lookup", "file listing", "file lookup"];
+it.each(REPLACEMENT_STAGES)("exporter Darwin simulated replacement refuses immediately after %s", stage => replacementWitness(stage, false));
+it.skipIf(process.platform !== "darwin").each(REPLACEMENT_STAGES)("exporter Darwin native replacement refuses immediately after %s", stage => replacementWitness(stage, true));
+async function replacementWitness(stage: string, native: boolean) {
+  const args = verdictInput("PASS"), path = stage.startsWith("root") ? args[1] : join(args[1], C.MANIFEST_FILENAME);
+  if (native) child.execFileSync("/usr/bin/xattr", ["-w", "com.apple.quarantine", "synthetic", path]);
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const originalList = child.execFileSync, originalLookup = child.spawnSync;
+  let replaced = false, callsAfterReplacement = 0;
+  const replace = () => { renameSync(path, path + ".held"); if (stage.startsWith("root")) mkdirSync(path); else writeFileSync(path, "replacement"); replaced = true; };
+  const listing = vi.spyOn(child, "execFileSync").mockImplementation((...argv) => {
+    if (replaced) callsAfterReplacement++;
+    const output = native ? Reflect.apply(originalList, child, argv) : Buffer.from("com.apple.quarantine\n");
+    if (stage.endsWith("listing") && argv[1]?.at(-1) === path) replace();
+    return output;
+  });
+  const lookup = vi.spyOn(child, "spawnSync").mockImplementation((...argv) => {
+    if (replaced) callsAfterReplacement++;
+    const output = native ? Reflect.apply(originalLookup, child, argv) : { status: C.EXIT_PASS } as ReturnType<typeof child.spawnSync>;
+    if (stage.endsWith("lookup") && argv[1]?.at(-1) === path) replace();
+    return output;
+  });
+  const legacy = vi.mocked(child.execFile).mockImplementation(((...argv: unknown[]) => {
+    if (replaced) callsAfterReplacement++;
+    const parameters = argv[1] as string[];
+    if (parameters.at(-1) === path && stage.endsWith(parameters.includes("-p") ? "lookup" : "listing")) replace();
+    (argv.at(-1) as (error: null, stdout: string, stderr: string) => void)(null, "com.apple.quarantine\n", ""); return {};
+  }) as typeof child.execFile);
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    await expect(captureSnapshotDirectory(args[1], readFileSync(args[3], "utf8"), args[7])).rejects.toThrow(C.HARD.snapshot_changed);
+    expect(replaced).toBe(true); expect(callsAfterReplacement).toBe(0);
+  } finally { Object.defineProperty(process, "platform", platform); listing.mockRestore(); lookup.mockRestore(); legacy.mockRestore(); }
+}
+it.skipIf(process.platform !== "darwin")("exporter Darwin native accepts exact attached metadata", async () => {
+  const args = verdictInput("PASS");
+  child.execFileSync("/usr/bin/xattr", ["-w", "com.apple.quarantine", "synthetic", args[1]]);
+  const capture = await captureSnapshotDirectory(args[1], readFileSync(args[3], "utf8"), args[7]);
+  expect(capture.rootMetadata).toContain("com.apple.quarantine");
 });
