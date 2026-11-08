@@ -75,6 +75,8 @@ fn kid_from_body(body: &serde_json::Value) -> Option<String> {
 }
 
 /// Cryptographic contract only; typed payload and outer index checks belong to each future consumer.
+// Each argument is one signed-envelope field the TypeScript strict verifier checks separately; a bundling struct would hide which field a caller omitted.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_role(
     role: &str,
     epoch: u64,
