@@ -21,8 +21,15 @@ async function metadata(path: string): Promise<string[]> {
   const command = process.platform === "darwin" ? "/usr/bin/xattr" : "python3";
   const args = process.platform === "darwin" ? [path] : ["-c", "import os,sys,json; print(json.dumps(os.listxattr(sys.argv[1], follow_symlinks=False)))", path];
   const { stdout } = await execute(command, args, { maxBuffer: METADATA_OUTPUT_LIMIT, timeout: METADATA_TIMEOUT_MS });
+  if (process.platform !== "darwin") return JSON.parse(stdout) as string[];
   // xattr ends each name with LF, so only the final empty element is a terminator; an interior empty line comes from a name containing LF and stays as "" so verification refuses it.
-  return process.platform === "darwin" ? (stdout === "" ? [] : stdout.split("\n").slice(0, stdout.endsWith("\n") ? -1 : undefined)) : JSON.parse(stdout) as string[];
+  const listed = stdout === "" ? [] : stdout.split("\n").slice(0, stdout.endsWith("\n") ? -1 : undefined);
+  // The listing cannot tell one LF-joined name from two attributes, so each admitted name must exist under its exact name or it is replaced by a name verification refuses.
+  return Promise.all(listed.map(async name => {
+    if (!C.OS_ATTACHED_METADATA.includes(name)) return name;
+    try { await execute(command, ["-p", name, path], { maxBuffer: METADATA_OUTPUT_LIMIT, timeout: METADATA_TIMEOUT_MS }); return name; }
+    catch { return ""; }
+  }));
 }
 export async function canonicalOutput(path: string): Promise<string> { return join(await realpath(dirname(resolve(path))), basename(resolve(path))); }
 export function requireOutside(pack: string, path: string): void {

@@ -231,6 +231,30 @@ it.each(["unlink", "rmdir"] as const)("stage %s failure reports finalization and
   expect(x.stdout).toEqual([]);
   expect(x.stderr.join("")).toBe("Evidence export finalization failed; committed pack retained.\nEXPORT_FINDING=io_error\n");
 });
+it("Darwin capture refuses allowed names that do not exist under their exact name", async () => {
+  const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
+  const receipt = JSON.parse(await readFile(x.options.receipt, "utf8"));
+  const { promisify } = await import("node:util"), platform = process.platform;
+  // One attribute whose name joins two allowed names with LF lists exactly like two attributes; the exact-name lookup then fails.
+  const execute = vi.fn(async (_command: string, args: string[]) => { if (args[0] === "-p") throw new Error("No such xattr"); return { stdout: "com.apple.provenance\ncom.apple.quarantine\n" }; });
+  vi.doMock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), execFile: Object.assign(vi.fn(), { [promisify.custom]: execute }) }));
+  try {
+    Object.defineProperty(process, "platform", { value: "darwin" }); vi.doUnmock("../../src/evidence-pack/snapshot-trust-cli.js"); vi.resetModules();
+    const adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js");
+    const capture = await adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
+    expect(capture.rootMetadata).toEqual(["", ""]);
+    const result = verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE);
+    expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata);
+  } finally { Object.defineProperty(process, "platform", { value: platform }); vi.doUnmock("node:child_process"); vi.resetModules(); }
+});
+it.skipIf(process.platform !== "darwin")("on macOS a real LF-joined attribute name is refused", async () => {
+  const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
+  const receipt = JSON.parse(await readFile(x.options.receipt, "utf8")), { execFile } = await import("node:child_process"), { promisify } = await import("node:util");
+  await promisify(execFile)("/usr/bin/xattr", ["-w", "com.apple.quarantine\nsecurity.selinux", "x", join(x.options.output, C.REPORT_FILENAME)]);
+  const capture = await captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
+  const result = verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE);
+  expect(result.status).toBe("FAIL"); expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata);
+});
 it.each(["com.apple.provenance ", " com.apple.quarantine"])("Darwin capture preserves metadata bytes %j", async name => {
   const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
   const receipt = JSON.parse(await readFile(x.options.receipt, "utf8"));
