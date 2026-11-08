@@ -73,9 +73,11 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
   }
   // Only explicit fixture paths can be accessed, so HOME and operator storage cannot become implicit inputs.
   // Every path-taking read, listing or observer entry point is mediated; a missing one lets a bundle read outside the root while the drill still reports zero denials.
-  const reads = ["readFile", "open", "opendir", "readdir", "stat", "lstat", "statfs", "realpath", "readlink", "access", "exists", "createReadStream", "openAsBlob", "glob", "watch", "watchFile"];
+  const reads = ["readFile", "open", "opendir", "readdir", "stat", "lstat", "statfs", "realpath", "readlink", "access", "exists", "createReadStream", "openAsBlob", "watch", "watchFile"];
   const writes = ["writeFile", "appendFile", "mkdir", "mkdtemp", "rm", "rmdir", "unlink", "rename", "copyFile", "cp", "symlink", "link", "chmod", "lchmod", "chown", "lchown", "utimes", "lutimes", "truncate", "createWriteStream"];
   for (const object of [fs, fsp]) for (const key of reads) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => { check(args[0]); if (key === "open" && !writable) { const flags = args[1]; if (typeof flags === "string" ? flags !== "r" : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC)) !== 0) deny(); } return original(...args); });
+  // Glob lists options.cwd or the process directory and accepts pattern arrays, so no single-path check can bound it; the verifier never globs, so every form is refused.
+  for (const object of [fs, fsp]) for (const suffix of ["", "Sync"]) wrap(object, "glob" + suffix, () => deny());
   for (const object of [fs, fsp]) for (const key of writes) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => { check(args[0], true); if (["rename", "copyFile", "cp", "symlink", "link"].includes(key)) check(args[1], true); return original(...args); });
   for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) wrap(child, key, (original, args) => {
     const [command, argv, options] = args as [string, string[], Record<string, unknown>];
