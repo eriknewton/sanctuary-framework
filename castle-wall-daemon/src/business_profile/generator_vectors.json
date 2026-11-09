@@ -1,0 +1,151 @@
+{
+  "version": 1,
+  "contract": "Must match the validation-only generator tests in linux-business-schema.test.ts.",
+  "cases": [
+    {
+      "id": "unknown-operator",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "Context",
+            "where",
+            0,
+            "op"
+          ],
+          "value": "unknown"
+        }
+      ]
+    },
+    {
+      "id": "unknown-path",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "Context",
+            "where",
+            0
+          ],
+          "value": {
+            "op": "eq",
+            "paths": [
+              "missing",
+              "missing"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "union-path",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "Context",
+            "fields",
+            "original"
+          ],
+          "value": {
+            "type": "ref",
+            "name": "Tuple"
+          }
+        },
+        {
+          "path": [
+            "definitions",
+            "Context",
+            "where",
+            0
+          ],
+          "value": {
+            "op": "eq",
+            "paths": [
+              "original.src_ip",
+              "original.src_ip"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "overlapping-union",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "IP",
+            "branches",
+            1
+          ],
+          "value": {
+            "type": "ref",
+            "name": "IPv4"
+          }
+        }
+      ]
+    },
+    {
+      "id": "empty-enum",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "Endpoint",
+            "fields",
+            "status",
+            "values"
+          ],
+          "value": [
+            ""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fractional-literal",
+      "changes": [
+        {
+          "path": [
+            "record",
+            "branches",
+            0,
+            "fields",
+            "epoch"
+          ],
+          "value": {
+            "type": "literal",
+            "value": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "id": "unknown-node",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "N",
+            "type"
+          ],
+          "value": "mystery"
+        }
+      ]
+    },
+    {
+      "id": "unknown-field",
+      "changes": [
+        {
+          "path": [
+            "definitions",
+            "N",
+            "extra"
+          ],
+          "value": true
+        }
+      ]
+    }
+  ]
+}
