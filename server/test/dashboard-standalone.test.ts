@@ -7,7 +7,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { startStandaloneDashboard, handleStandaloneShutdownSignal, __resetStandaloneShutdownStateForTest } from "../src/dashboard-standalone.js";
 import * as escrowModule from "../src/wrap/boot-recovery-escrow.js";
 import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
@@ -1467,6 +1467,63 @@ describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform)
     }
   });
 
+  it.each(["stop", "signal", "stand-down", "bind failure"] as const)(
+    "%s release ignores readers from a previous fixture directory identity",
+    async (path) => {
+      const previousState = join(root, "previous-state");
+      const metadata = join(root, "state", "_meta");
+      const previousMetadata = join(previousState, "_meta");
+      const fixtureRuntime = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const previousReaders: MasterWriteBarrierLease[] = [];
+      const error = new Error("bind sentinel");
+      __resetStandaloneShutdownStateForTest();
+      await mkdir(previousState);
+      // Moving metadata preserves its inode so the old readers deterministically model directory identity reuse.
+      await rename(metadata, previousMetadata);
+      try {
+        try {
+          if (inheritedCustodyLockRoot === undefined) delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+          else process.env.SANCTUARY_CUSTODY_LOCK_ROOT = inheritedCustodyLockRoot;
+          const previousStorage = new FilesystemStorage(previousState);
+          for (const _owner of ["first", "second"] as const) {
+            previousReaders.push(await acquireMasterWriteBarrier(
+              previousStorage, custodyModule.CUSTODY_WRITE_LOCK_NAMESPACE,
+              custodyModule.MASTER_ROTATION_BARRIER_NAME,
+            ));
+          }
+        } finally {
+          if (fixtureRuntime === undefined) delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+          else process.env.SANCTUARY_CUSTODY_LOCK_ROOT = fixtureRuntime;
+          await rename(previousMetadata, metadata);
+        }
+        for (const reader of previousReaders) {
+          expect(() => reader.assertSessionHeld()).toThrowError(expect.objectContaining({ kind: "holder-lost" }));
+        }
+        if (path === "stand-down") {
+          vi.spyOn(DashboardApprovalChannel.prototype, "start").mockResolvedValue();
+          vi.spyOn(DashboardApprovalChannel.prototype, "addrInUse").mockReturnValue(true);
+        }
+        if (path === "bind failure") {
+          vi.spyOn(DashboardApprovalChannel.prototype, "start").mockRejectedValue(error);
+          await expect(startup()).rejects.toBe(error);
+        } else {
+          dashboard = await startup({ allowPark: true });
+          if (path === "stop") await dashboard.stop();
+          if (path === "signal") {
+            const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+            await handleStandaloneShutdownSignal("SIGTERM");
+            expect(exit).toHaveBeenCalledWith(128 + 15); // Shell signal status plus SIGTERM.
+          }
+        }
+        await assertReleased();
+        expect(previousReaders.every((reader) => !reader.signal.aborted)).toBe(true);
+      } finally {
+        for (const reader of previousReaders) await reader.release();
+        __resetStandaloneShutdownStateForTest();
+      }
+    },
+  );
+
   it("signal cleanup reports rejection and shares the stop outcome", async () => {
     __resetStandaloneShutdownStateForTest();
     dashboard = await startup();
@@ -1487,12 +1544,14 @@ describe.skipIf(!kernelBackedCrossProcessLockPlatformSupported(process.platform)
 });
 
 const EPHEMERAL_PORT = 0;
+const inheritedCustodyLockRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
 import * as custodyModule from "../src/core/master-custody.js";
 import * as policyModule from "../src/principal-policy/loader.js";
 import * as channelModule from "../src/principal-policy/dashboard.js";
 import { FilesystemStorage } from "../src/storage/filesystem.js";
 import { BaselineTracker } from "../src/principal-policy/baseline.js";
 import { createServer } from "node:net";
+import { acquireMasterWriteBarrier, type MasterWriteBarrierLease } from "../src/storage/cross-process-lock.js";
 
 async function standaloneBoundAddress(dashboard: DashboardApprovalChannel) {
   try {
@@ -1507,14 +1566,21 @@ async function standaloneBoundAddress(dashboard: DashboardApprovalChannel) {
 
 let rescueHome: string;
 let previousHome: string | undefined;
+let previousCustodyLockRoot: string | undefined;
+let rescueLockRoot: string;
 let rescueSessions: custodyModule.EstablishMasterResult[] = [];
 let rescueChannels: DashboardApprovalChannel[] = [];
 let rescueListeners: DistressListener[] = [];
 
 beforeEach(async () => {
   previousHome = process.env.HOME;
+  previousCustodyLockRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
   rescueHome = await mkdtemp(join(tmpdir(), "standalone-home-"));
   process.env.HOME = rescueHome;
+  // A private rendezvous excludes readers from recycled directory identities while keeping every reader owned by this fixture visible to its release probe.
+  // It sits under a short parent because the composed reader socket path must fit KERNEL_SOCKET_PATH_MAX_BYTES (storage/cross-process-lock.ts), and the default macOS TMPDIR alone is about 49 bytes.
+  rescueLockRoot = await mkdtemp(join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), "sdl-"));
+  process.env.SANCTUARY_CUSTODY_LOCK_ROOT = rescueLockRoot;
   rescueSessions = [];
   rescueChannels = [];
   rescueListeners = [];
@@ -1539,13 +1605,20 @@ beforeEach(async () => {
 afterEach(async () => {
   // Rescue runs after assertions so it cannot satisfy an ownership witness for the owner.
   vi.restoreAllMocks();
-  for (const channel of rescueChannels) await channel.stop().catch(() => undefined);
-  for (const listener of rescueListeners) await listener.stop().catch(() => undefined);
-  for (const session of rescueSessions) {
-    await session.masterWriteBarrier?.release();
-    session.masterKey.fill(0);
+  try {
+    for (const channel of rescueChannels) await channel.stop().catch(() => undefined);
+    for (const listener of rescueListeners) await listener.stop().catch(() => undefined);
+    for (const session of rescueSessions) {
+      await session.masterWriteBarrier?.release();
+      session.masterKey.fill(0);
+    }
+  } finally {
+    // The environment is restored even when a rescue release throws, so no later test inherits this fixture's private rendezvous.
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousCustodyLockRoot === undefined) delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+    else process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousCustodyLockRoot;
+    await rm(rescueHome, { recursive: true, force: true });
+    await rm(rescueLockRoot, { recursive: true, force: true });
   }
-  if (previousHome === undefined) delete process.env.HOME;
-  else process.env.HOME = previousHome;
-  await rm(rescueHome, { recursive: true, force: true });
 });

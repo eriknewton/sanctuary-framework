@@ -1,0 +1,12 @@
+{
+  "name": "@sanctuary-framework/evidence-pack-verifier",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline verification of selected Sanctuary evidence snapshot bytes",
+  "author": "Erik Newton",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": { "node": ">=22.0.0" },
+  "bin": { "verify-evidence-pack": "dist/verify-evidence-pack.js" },
+  "files": ["dist", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
+}

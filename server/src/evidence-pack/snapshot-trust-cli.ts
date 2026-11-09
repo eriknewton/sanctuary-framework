@@ -2,34 +2,15 @@
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, opendir, realpath, writeFile, type FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve, relative, isAbsolute } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { authenticateSnapshotBytes } from "./snapshot-verify.js";
 import { verify } from "../core/identity.js";
 import * as C from "./snapshot-contract.js";
-const execute = promisify(execFile);
+// Must match the shared held-inode contract in snapshot-metadata.ts so capture cannot consume names from a replacement.
+import { metadataNames } from "./snapshot-metadata.js";
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
-const METADATA_OUTPUT_LIMIT = C.MAX_NAME_BYTES * C.MAX_FILES;
-const METADATA_TIMEOUT_MS = 10_000;
 function observation(stat: BigIntStats): C.CapturedStat {
   return { type: stat.isFile() ? C.FILE_TYPE.file : stat.isDirectory() ? C.FILE_TYPE.directory : "invalid", size: Number(stat.size), nlink: Number(stat.nlink), dev: String(stat.dev), ino: String(stat.ino), mtime: String(stat.mtimeNs), ctime: String(stat.ctimeNs) };
-}
-async function metadata(path: string): Promise<string[]> {
-  // This exporter adapter uses subprocesses; the offline verifier must supply captured names without reusing it.
-  // Must match snapshot-contract.ts: enumerate exact metadata names only, never values, including OS-attached labels.
-  const command = process.platform === "darwin" ? "/usr/bin/xattr" : "python3";
-  const args = process.platform === "darwin" ? [path] : ["-c", "import os,sys,json; print(json.dumps(os.listxattr(sys.argv[1], follow_symlinks=False)))", path];
-  const { stdout } = await execute(command, args, { maxBuffer: METADATA_OUTPUT_LIMIT, timeout: METADATA_TIMEOUT_MS });
-  if (process.platform !== "darwin") return JSON.parse(stdout) as string[];
-  // xattr ends each name with LF, so only the final empty element is a terminator; an interior empty line comes from a name containing LF and stays as "" so verification refuses it.
-  const listed = stdout === "" ? [] : stdout.split("\n").slice(0, stdout.endsWith("\n") ? -1 : undefined);
-  // The listing cannot tell one LF-joined name from two attributes, so each admitted name must exist under its exact name or it is replaced by a name verification refuses.
-  return Promise.all(listed.map(async name => {
-    if (!C.OS_ATTACHED_METADATA.includes(name)) return name;
-    try { await execute(command, ["-p", name, path], { maxBuffer: METADATA_OUTPUT_LIMIT, timeout: METADATA_TIMEOUT_MS }); return name; }
-    catch { return ""; }
-  }));
 }
 export async function canonicalOutput(path: string): Promise<string> { return join(await realpath(dirname(resolve(path))), basename(resolve(path))); }
 export function requireOutside(pack: string, path: string): void {
@@ -69,7 +50,8 @@ export async function captureSnapshotDirectory(path: string, packKey: string, ex
   try {
     C.requireSnapshot(C.canonicalSnapshotJSON(before) === C.canonicalSnapshotJSON(observation(await rootFd.stat({ bigint: true }))), C.HARD.snapshot_changed);
     const names = await directoryNames(root); C.cap(names.length, C.MAX_FILES);
-    const rootMetadata = await metadata(root);
+    // The open root identity binds subprocess observations to the directory being captured.
+    const rootMetadata = metadataNames(root, process.platform, await rootFd.stat({ bigint: true }));
     async function capture(name: Buffer, maximum: number): Promise<C.CapturedFile> {
       const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(name); C.safeName(decoded);
       const filePath = join(root, decoded); const lst = observation(await lstat(filePath, { bigint: true }));
@@ -81,7 +63,9 @@ export async function captureSnapshotDirectory(path: string, packKey: string, ex
       file.before = observation(await fd.stat({ bigint: true }));
       C.requireSnapshot(C.canonicalSnapshotJSON(lst) === C.canonicalSnapshotJSON(file.before), C.HARD.snapshot_changed);
       const buffer = Buffer.alloc(lst.size + 1); const { bytesRead } = await fd.read(buffer, 0, buffer.length, 0);
-      C.requireSnapshot(bytesRead === lst.size, C.HARD.snapshot_changed); file.bytes = buffer.subarray(0, bytesRead); file.metadata = await metadata(filePath); return file;
+      C.requireSnapshot(bytesRead === lst.size, C.HARD.snapshot_changed); file.bytes = buffer.subarray(0, bytesRead);
+      // The open file identity binds subprocess observations to the bytes already read.
+      file.metadata = metadataNames(filePath, process.platform, await fd.stat({ bigint: true })); return file;
     }
     const manifestName = names.find(n => n.equals(Buffer.from(C.MANIFEST_FILENAME))); C.requireSnapshot(manifestName, C.HARD.file_set_mismatch);
     const mf = await capture(manifestName, C.MAX_MANIFEST_BYTES); const raw = C.parseManifestEnvelope(mf.bytes);

@@ -48,6 +48,15 @@ for (const manifestConfig of npmManifests) {
   }
 }
 
+// Native witness builds execute build scripts and proc-macros before packing, so their locked registry inputs are release trust inputs.
+// Must match publish-on-tag and test-baseline-guard: both native profiles use cargo build --locked.
+const nativeLock = readFileSync(join(repoRoot.pathname, "castle-wall-daemon/Cargo.lock"), "utf8");
+for (const entry of nativeLock.split("[[package]]").slice(1)) {
+  if (/^source\s*=/m.test(entry) && (!/^source = "registry\+https:\/\/github.com\/rust-lang\/crates.io-index"$/m.test(entry) || !/^checksum = "[a-f0-9]{64}"$/m.test(entry))) {
+    failures.push("castle-wall-daemon/Cargo.lock contains an unpinned native build dependency");
+  }
+}
+
 const cargoToml = readFileSync(join(repoRoot.pathname, "menubar/src-tauri/Cargo.toml"), "utf8");
 const releaseCriticalCargoCrates = new Set([
   "tauri-build",
