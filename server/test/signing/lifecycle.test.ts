@@ -46,3 +46,9 @@ it("refuses every listed state/event pair under the default guard and every guar
   }
   expect(denied).toBeGreaterThan(ALLOWED_TRANSITIONS.length);
 });
+
+it("recovery exit has only the explicit recovery evidence guard and returns LOCKED",()=>{
+  const event="Attended recovery with signed gap, outside receipt, durable anchor acknowledgment and worker gone";
+  expect(()=>transition("RECOVERING",event,"ALWAYS")).toThrow("K1_REFUSED");
+  expect(transition("RECOVERING",event,"RECOVERY_EXIT")).toEqual({to:"LOCKED",cleanup_destination:null});
+});
