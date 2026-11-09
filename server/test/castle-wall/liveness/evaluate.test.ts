@@ -315,7 +315,31 @@ describe("freshness", () => {
     const envelope = evaluate(set(O + "raw.daemon_ref.sequence", 101));
     expect(envelope.wall.reasons).toContain("counter_regression");
     const newInstance = evaluate(set(O + "raw.daemon_ref", { daemon_instance: "daemon-fixture-0", sequence: 900 }));
-    expectWallOk(newInstance);
+    expect(newInstance.wall.reasons).not.toContain("counter_regression");
+    expect(newInstance.wall.state.startsWith("wall_OK_")).toBe(false);
+    expect(newInstance.wall.state).toBe("wall_RECOVERING");
+    expect(newInstance.wall.reasons).toEqual(["recovering"]);
+    expect(newInstance.exit_code).toBe(1);
+  });
+
+  it("an observer referencing an earlier daemon instance is never credited toward OK, even at a lower sequence", () => {
+    // The restarted daemon reuses the PID and restarts its sequence, so only the instance label tells the two apart.
+    const restarted = [set(D + "daemon_instance", "daemon-fixture-2"), set(D + "sequence", 5)];
+    for (const sequence of [0, 4, 5, 900]) {
+      const envelope = evaluate(...restarted, set(O + "raw.daemon_ref", { daemon_instance: "daemon-fixture-1", sequence }));
+      expect(envelope.wall.reasons, `sequence ${sequence}`).toEqual(["recovering"]);
+      expect(envelope.exit_code).toBe(1);
+    }
+  });
+
+  it("recovers to OK once a fresh observer record references the current instance, with the daemon sequence ahead of the reference", () => {
+    const restarted = [set(D + "daemon_instance", "daemon-fixture-2"), set(D + "sequence", 5)];
+    const coherent = evaluate(...restarted, set(O + "raw.daemon_ref", { daemon_instance: "daemon-fixture-2", sequence: 4 }));
+    expectWallOk(coherent);
+    expect(coherent.wall.reasons).toEqual(["none"]);
+    const regressed = evaluate(...restarted, set(O + "raw.daemon_ref", { daemon_instance: "daemon-fixture-2", sequence: 6 }));
+    expect(regressed.wall.reasons).toContain("counter_regression");
+    expect(regressed.exit_code).toBe(1);
   });
 
   it("other-boot records read initializing while the instance is younger than CANARY_WINDOW, never time_untrusted and never OK", () => {

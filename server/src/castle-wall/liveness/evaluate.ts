@@ -427,8 +427,16 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
       if (age === undefined) { wall.add("time_untrusted"); return null; }
       return age;
     };
-    // Counter regression: the observer saw a later sequence of this same daemon instance than the one on disk.
-    if (p.daemon_ref !== null && current.daemon !== null && p.daemon_ref.daemon_instance === current.daemon.daemon_instance &&
+    // Gate 1 has two separate halves. Instance consistency: an observer whose daemon reference names another
+    // instance observed a different process, so none of its wall evidence is credited toward OK for the current
+    // instance; the wall reads recovering until a fresh observer record references the current instance. A matching
+    // PID is not instance evidence, since a restarted daemon can reuse it.
+    const observerInstanceMismatch = p.daemon_ref !== null && current.daemon !== null &&
+      p.daemon_ref.daemon_instance !== current.daemon.daemon_instance;
+    if (observerInstanceMismatch) wall.add("recovering");
+    // Sequence monotonicity, compared only within one instance: the observer saw a later sequence of this same
+    // instance than the one on disk. The daemon publishes independently, so its sequence may run ahead of the reference.
+    if (p.daemon_ref !== null && current.daemon !== null && !observerInstanceMismatch &&
         current.daemon.sequence < p.daemon_ref.sequence) wall.add("counter_regression");
     // Gate 3.
     const availabilityAge = stamp(p.availability.resolved_at_ms);
