@@ -1,0 +1,13 @@
+{
+  "//": "compilerOptions must match CONFIG in scripts/promise-hygiene/policy.mjs",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test"]
+}
