@@ -30,7 +30,7 @@ import { nodeReaderFs, readLivenessRecords, type DeadlineClock, type ReaderFs } 
 import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
 import { CanaryRecordingSlot, saturatingIncrement, type CanaryOriginSubjects } from "../../../src/castle-wall/liveness/recorder.js";
 import { parseDaemonRecord, parseObserverRecord } from "../../../src/castle-wall/liveness/schema.js";
-import { livenessFortressId, runLivenessStatus } from "../../../src/cli/castle-wall-liveness-status.js";
+import { evaluateFortressLiveness, livenessFortressId, runLivenessStatus, wallOnlyStatusExit } from "../../../src/cli/castle-wall-liveness-status.js";
 
 const UID = process.getuid?.() ?? 0;
 const START = Date.parse("2026-11-09T12:00:00.000Z");
@@ -269,6 +269,166 @@ describe("hostile record files", () => {
       expect(envelope.subject.fortress_id).toBe(livenessFortressId(root));
     } finally {
       stalled.abort();
+    }
+  });
+});
+
+describe("a stalled operation or cleanup never outlives the read deadline", () => {
+  type Stall = "stat" | "read" | "close";
+  /**
+   * A daemon.json handle that holds one operation open until the test releases it. Close waits for any
+   * outstanding operation of the same handle, as a Node FileHandle does, so a stalled stat or read also stalls close.
+   */
+  function stallingFs(stall: Stall) {
+    const releases: Array<() => void> = [];
+    let reached = false;
+    const hold = <T>(value: T): Promise<T> => { reached = true; return new Promise<T>(resolve => { releases.push(() => resolve(value)); }); };
+    const record = Buffer.from("{}");
+    const info = { uid: UID, mode: 0o100600, size: record.length, isFile: () => true, isDirectory: () => false };
+    const fs: ReaderFs = {
+      open: async (path, flags) => {
+        if (!path.endsWith("daemon.json")) return nodeReaderFs.open(path, flags);
+        let outstanding: Promise<unknown> = Promise.resolve();
+        let served = false;
+        return {
+          stat: () => { const op = stall === "stat" ? hold(info) : Promise.resolve(info); outstanding = op; return op; },
+          read: (buffer, at) => {
+            if (stall === "read") { const op = hold({ bytesRead: 0 }); outstanding = op; return op; }
+            if (served) return Promise.resolve({ bytesRead: 0 });
+            served = true;
+            record.copy(buffer, at);
+            return Promise.resolve({ bytesRead: record.length });
+          },
+          close: () => stall === "close" ? hold(undefined) : outstanding.then(() => undefined),
+        };
+      },
+    };
+    return { fs, reached: () => reached, release: () => { for (const release of releases.splice(0)) release(); } };
+  }
+  /** Fail fast, rather than hang, when the reader is still waiting on the stalled operation. */
+  const settlesWithoutRelease = <T>(pending: Promise<T>): Promise<T> => Promise.race([
+    pending,
+    new Promise<never>((_resolve, reject) => { setTimeout(() => reject(new Error("still waiting on the stalled operation")), 2 * SECOND).unref(); }),
+  ]);
+  async function untilReached(stalled: { reached(): boolean }): Promise<void> {
+    for (let i = 0; i < 200 && !stalled.reached(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    expect(stalled.reached(), "the schedule reached its stall point").toBe(true);
+  }
+  const schedules: Stall[] = ["stat", "read", "close"];
+  const host = { read: async () => ({ ok: true as const, bootId: "boot-fixture", uptimeMs: 1_000_000 }), uptimeMs: () => 1_000_000 };
+
+  it.each(schedules)("a pending %s returns read_deadline once the deadline fires, before the stall is released", async stall => {
+    const root = fortress();
+    writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+    const stalled = stallingFs(stall);
+    const deadline = manualDeadline();
+    try {
+      const reading = readLivenessRecords({ fortressPath: root, operatorUid: UID, fs: stalled.fs, deadline: deadline.clock });
+      await untilReached(stalled);
+      deadline.fire();
+      const result = await settlesWithoutRelease(reading);
+      expect(result.readDeadlineHit).toBe(true);
+      expect(result.daemon).toEqual({ status: "custody_invalid", cause: "read_deadline" });
+    } finally {
+      stalled.release();
+    }
+  });
+
+  it.each(schedules)("a pending %s makes liveness-status exit 70 and the status and full-status tail exit 1, before the stall is released", async stall => {
+    for (const command of ["liveness-status", "status tail"] as const) {
+      const root = fortress();
+      writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+      const stalled = stallingFs(stall);
+      const deadline = manualDeadline();
+      const ctx = { platform: "darwin", getuid: () => UID, now: () => START, hostClock: host, readerFs: stalled.fs, deadline: deadline.clock };
+      let out = "";
+      const sink = new Writable({ write(chunk, _encoding, done) { out += String(chunk); done(); } });
+      try {
+        // status and full-status both end in this shared tail: the evaluated envelope mapped through the wall-only exit.
+        const running = command === "liveness-status"
+          ? runLivenessStatus(["--json", "--fortress", root], { ...ctx, out: sink, err: sink, env: {} })
+          : evaluateFortressLiveness(root, ctx).then(wallOnlyStatusExit);
+        await untilReached(stalled);
+        deadline.fire();
+        const exit = await settlesWithoutRelease(running);
+        expect(exit, command).toBe(command === "liveness-status" ? 70 : 1);
+        if (command === "liveness-status") expect(JSON.parse(out).wall.evidence.cause).toBe("read_deadline");
+      } finally {
+        stalled.release();
+      }
+    }
+  });
+
+  it("a close that rejects after the deadline is observed and never surfaces", async () => {
+    const root = fortress();
+    writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+    let rejectClose!: (error: Error) => void;
+    let closes = 0;
+    let reachedRead = false;
+    let releaseRead!: () => void;
+    const fs: ReaderFs = {
+      open: async (path, flags) => {
+        if (!path.endsWith("daemon.json")) return nodeReaderFs.open(path, flags);
+        return {
+          stat: async () => ({ uid: UID, mode: 0o100600, size: 2, isFile: () => true, isDirectory: () => false }),
+          read: () => { reachedRead = true; return new Promise(resolve => { releaseRead = () => resolve({ bytesRead: 0 }); }); },
+          close: () => { closes++; return new Promise<void>((_resolve, reject) => { rejectClose = reject; }); },
+        };
+      },
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    const deadline = manualDeadline();
+    try {
+      const reading = readLivenessRecords({ fortressPath: root, operatorUid: UID, fs, deadline: deadline.clock });
+      for (let i = 0; i < 200 && !reachedRead; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      deadline.fire();
+      expect((await settlesWithoutRelease(reading)).readDeadlineHit).toBe(true);
+      releaseRead();
+      for (let i = 0; i < 50 && closes === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      rejectClose(new Error("close failed late"));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(closes).toBe(1);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("a handle whose open completes after the deadline is closed once by the cleanup owner, and its close rejection is observed", async () => {
+    const root = fortress();
+    writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+    let releaseOpen!: () => void;
+    let opening = false;
+    let closes = 0;
+    const lateHandle = {
+      stat: async () => ({ uid: UID, mode: 0o100600, size: 2, isFile: () => true, isDirectory: () => false }),
+      read: async () => ({ bytesRead: 0 }),
+      close: () => { closes++; return Promise.reject(new Error("close failed late")); },
+    };
+    const fs: ReaderFs = {
+      open: (path, flags) => {
+        if (!path.endsWith("daemon.json")) return nodeReaderFs.open(path, flags);
+        opening = true;
+        return new Promise(resolve => { releaseOpen = () => resolve(lateHandle); });
+      },
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    const deadline = manualDeadline();
+    try {
+      const reading = readLivenessRecords({ fortressPath: root, operatorUid: UID, fs, deadline: deadline.clock });
+      for (let i = 0; i < 200 && !opening; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      deadline.fire();
+      expect((await settlesWithoutRelease(reading)).readDeadlineHit).toBe(true);
+      releaseOpen();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(closes).toBe(1);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
     }
   });
 });

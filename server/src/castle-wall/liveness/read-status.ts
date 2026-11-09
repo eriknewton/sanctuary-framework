@@ -82,6 +82,25 @@ class DeadlineHit extends Error {}
 const FILE_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
 const DIRECTORY_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (fsConstants.O_DIRECTORY ?? 0);
 
+/**
+ * The one cleanup owner for every handle a read opened. Each handle is closed
+ * at most once, its close rejection is observed here, and nothing outside the
+ * read's own work ever waits on a close: a close can wait on a stalled
+ * operation of the same handle (the Node FileHandle does), so awaiting it at the
+ * public boundary would let a stall outlive the deadline.
+ */
+class HandleCleanup {
+  private readonly closing = new Map<ReaderFileHandle, Promise<void>>();
+  close(handle: ReaderFileHandle): Promise<void> {
+    let pending = this.closing.get(handle);
+    if (pending === undefined) {
+      pending = Promise.resolve().then(() => handle.close()).catch(() => undefined);
+      this.closing.set(handle, pending);
+    }
+    return pending;
+  }
+}
+
 /** Read the three records under one deadline; a timeout or non-regular file reads custody_invalid. */
 export async function readLivenessRecords(options: {
   fortressPath: string;
@@ -97,30 +116,26 @@ export async function readLivenessRecords(options: {
     fireDeadline = () => { expired = true; reject(new DeadlineHit()); };
   });
   deadlinePromise.catch(() => undefined);
-  // Every reader operation races this one deadline, so a stalled filesystem cannot hold a status command.
   const timer = clock.after(STATUS_READ_DEADLINE, () => fireDeadline());
+  const cleanup = new HandleCleanup();
   const bounded = <T>(operation: Promise<T>): Promise<T> => {
-    // A late completion after the deadline is discarded, and a late handle is closed rather than leaked.
+    // A late completion after the deadline is discarded, and a late handle goes to the one cleanup owner rather than leaking.
     operation.then(value => {
       if (expired && value !== null && typeof value === "object" && "close" in value) {
-        void (value as { close(): Promise<void> }).close().catch(() => undefined);
+        void cleanup.close(value as unknown as ReaderFileHandle);
       }
     }, () => undefined);
     if (expired) return Promise.reject(new DeadlineHit());
     return Promise.race([operation, deadlinePromise]);
   };
   const deadlineRecord: RecordRead = { status: "custody_invalid", cause: "read_deadline" };
+  const work = readAll(fs, bounded, cleanup, options.fortressPath, options.operatorUid);
+  // The abandoned work may settle after the deadline; its result is discarded and its rejection observed here.
+  work.catch(() => undefined);
   try {
-    const directory = await checkDirectories(fs, bounded, options.fortressPath, options.operatorUid);
-    if (directory.status !== "ok") {
-      const absent: RecordRead = { status: "absent" };
-      return { directory, daemon: absent, observer: absent, config: absent, readDeadlineHit: false };
-    }
-    const base = join(options.fortressPath, LIVENESS_DIRECTORY);
-    const daemon = await readRecord(fs, bounded, join(base, DAEMON_RECORD_FILE), options.operatorUid, STATUS_BYTES);
-    const observer = await readRecord(fs, bounded, join(base, OBSERVER_RECORD_FILE), options.operatorUid, STATUS_BYTES);
-    const config = await readRecord(fs, bounded, join(base, CONFIG_RECORD_FILE), options.operatorUid, CONFIG_BYTES);
-    return { directory, daemon, observer, config, readDeadlineHit: false };
+    // The whole read, cleanup included, races the one deadline at this public boundary, so neither a stalled
+    // open, stat or read nor a close waiting on one can hold a status command past STATUS_READ_DEADLINE.
+    return await Promise.race([work, deadlinePromise]);
   } catch (error) {
     if (!(error instanceof DeadlineHit)) throw error;
     return { directory: { status: "ok" }, daemon: deadlineRecord, observer: deadlineRecord, config: deadlineRecord, readDeadlineHit: true };
@@ -129,13 +144,22 @@ export async function readLivenessRecords(options: {
   }
 }
 
-type Bounded = <T>(operation: Promise<T>) => Promise<T>;
-
-async function closeQuietly(handle: ReaderFileHandle): Promise<void> {
-  await handle.close().catch(() => undefined);
+async function readAll(fs: ReaderFs, bounded: Bounded, cleanup: HandleCleanup, fortressPath: string, operatorUid: number): Promise<LivenessReadResult> {
+  const directory = await checkDirectories(fs, bounded, cleanup, fortressPath, operatorUid);
+  if (directory.status !== "ok") {
+    const absent: RecordRead = { status: "absent" };
+    return { directory, daemon: absent, observer: absent, config: absent, readDeadlineHit: false };
+  }
+  const base = join(fortressPath, LIVENESS_DIRECTORY);
+  const daemon = await readRecord(fs, bounded, cleanup, join(base, DAEMON_RECORD_FILE), operatorUid, STATUS_BYTES);
+  const observer = await readRecord(fs, bounded, cleanup, join(base, OBSERVER_RECORD_FILE), operatorUid, STATUS_BYTES);
+  const config = await readRecord(fs, bounded, cleanup, join(base, CONFIG_RECORD_FILE), operatorUid, CONFIG_BYTES);
+  return { directory, daemon, observer, config, readDeadlineHit: false };
 }
 
-async function checkDirectory(fs: ReaderFs, bounded: Bounded, path: string, operatorUid: number): Promise<"ok" | "absent" | CustodyCause> {
+type Bounded = <T>(operation: Promise<T>) => Promise<T>;
+
+async function checkDirectory(fs: ReaderFs, bounded: Bounded, cleanup: HandleCleanup, path: string, operatorUid: number): Promise<"ok" | "absent" | CustodyCause> {
   let handle: ReaderFileHandle;
   try {
     handle = await bounded(fs.open(path, DIRECTORY_FLAGS));
@@ -152,21 +176,21 @@ async function checkDirectory(fs: ReaderFs, bounded: Bounded, path: string, oper
     if ((info.mode & GROUP_OTHER_WRITE) !== 0) return "mode";
     return "ok";
   } finally {
-    await closeQuietly(handle);
+    await cleanup.close(handle);
   }
 }
 
-async function checkDirectories(fs: ReaderFs, bounded: Bounded, fortressPath: string, operatorUid: number): Promise<LivenessInput["directory"]> {
-  const fortress = await checkDirectory(fs, bounded, fortressPath, operatorUid);
+async function checkDirectories(fs: ReaderFs, bounded: Bounded, cleanup: HandleCleanup, fortressPath: string, operatorUid: number): Promise<LivenessInput["directory"]> {
+  const fortress = await checkDirectory(fs, bounded, cleanup, fortressPath, operatorUid);
   if (fortress === "absent") return { status: "absent" };
   if (fortress !== "ok") return { status: "custody_invalid", cause: fortress };
-  const liveness = await checkDirectory(fs, bounded, join(fortressPath, LIVENESS_DIRECTORY), operatorUid);
+  const liveness = await checkDirectory(fs, bounded, cleanup, join(fortressPath, LIVENESS_DIRECTORY), operatorUid);
   if (liveness === "absent") return { status: "absent" };
   if (liveness !== "ok") return { status: "custody_invalid", cause: liveness };
   return { status: "ok" };
 }
 
-async function readRecord(fs: ReaderFs, bounded: Bounded, path: string, operatorUid: number, cap: number): Promise<RecordRead> {
+async function readRecord(fs: ReaderFs, bounded: Bounded, cleanup: HandleCleanup, path: string, operatorUid: number, cap: number): Promise<RecordRead> {
   let handle: ReaderFileHandle;
   try {
     // O_NONBLOCK keeps a FIFO from blocking the open; O_NOFOLLOW refuses a substituted link.
@@ -198,7 +222,7 @@ async function readRecord(fs: ReaderFs, bounded: Bounded, path: string, operator
       return { status: "unparsable" };
     }
   } finally {
-    await closeQuietly(handle);
+    await cleanup.close(handle);
   }
 }
 
