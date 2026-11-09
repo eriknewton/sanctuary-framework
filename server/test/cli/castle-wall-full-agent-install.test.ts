@@ -527,7 +527,9 @@ describe("install-full stable runtime preflight", () => {
     const cli = join(pkg, "dist", "cli.js");
     f.ctx.execPath = join(keg, "node");
     f.ctx.cliPath = cli;
-    f.ctx.stableRuntime = running => resolveStableRuntime({ ...running, nodeCandidates: [optNode], cliCandidates: [cli], tempRoots: [], runningNodeVersion: "22.11.0" });
+    // The fixture files are owned by whoever runs the suite, so custody is checked against that uid, not the fixture's 501.
+    // Failure mode: with the fixture uid the test passes only on a Mac whose operator is uid 501 and refuses on every Linux box.
+    f.ctx.stableRuntime = running => resolveStableRuntime({ ...running, operatorUid: process.getuid!(), nodeCandidates: [optNode], cliCandidates: [cli], tempRoots: [], runningNodeVersion: "22.11.0" });
     // The fake launchd reports the arguments it was bootstrapped with, read back from the written plist.
     const original = f.exec.getMockImplementation()!;
     f.exec.mockImplementation((command, args) => {
