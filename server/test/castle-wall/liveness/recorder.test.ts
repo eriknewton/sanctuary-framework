@@ -134,6 +134,17 @@ describe("publication independent of the audit sink", () => {
     expect(r.stats().published).toBe(2);
   });
 
+  it("after retirement at daemon stop a tick publishes nothing and never throws", async () => {
+    const { r, read } = recorder();
+    wireAll(r);
+    await r.emissionTick();
+    expect(read().sequence).toBe(1);
+    r.retire();
+    await expect(r.emissionTick()).resolves.toBeUndefined();
+    expect(read().sequence).toBe(1);
+    expect(r.stats().published).toBe(1);
+  });
+
   it("a publication failure is counted and never thrown into the tick", async () => {
     const { r } = recorder();
     const failing = new LivenessRecorder({

@@ -19,6 +19,8 @@ function fortress(): string {
 const publisher = (fortressPath: string, instance = "aaaaaaaaaaaaaaaa", fs?: PublisherFs) =>
   new LivenessRecordPublisher({ fortressPath, fileName: "daemon.json", instance, operatorUid: UID, fs });
 const target = (root: string) => join(root, "liveness", "daemon.json");
+/** After a settled publication only the record and the publication claim remain: no temp file and no held lock. */
+const SETTLED_ENTRIES = ["daemon.json", "daemon.json.publisher"];
 
 describe("publication", () => {
   it("creates an owner-only directory and an owner-only record", async () => {
@@ -27,7 +29,8 @@ describe("publication", () => {
     expect(statSync(join(root, "liveness")).mode & 0o777).toBe(0o700);
     expect(statSync(target(root)).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(target(root), "utf8"))).toEqual({ sequence: 1 });
-    expect(readdirSync(join(root, "liveness"))).toEqual(["daemon.json"]);
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(SETTLED_ENTRIES);
+    expect(statSync(join(root, "liveness", "daemon.json.publisher")).mode & 0o777).toBe(0o600);
   });
 
   it("is single flight: one write in flight and only the newest waiting record follows it", async () => {
@@ -35,7 +38,8 @@ describe("publication", () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     let renames = 0;
-    const fs: PublisherFs = { ...nodePublisherFs, rename: async (from, to) => { renames++; if (renames === 1) await gate; return nodePublisherFs.rename(from, to); } };
+    // Only renames over the record count; the publication claim's own rename is not a record write.
+    const fs: PublisherFs = { ...nodePublisherFs, rename: async (from, to) => { if (to !== target(root)) return nodePublisherFs.rename(from, to); renames++; if (renames === 1) await gate; return nodePublisherFs.rename(from, to); } };
     const p = publisher(root, "aaaaaaaaaaaaaaaa", fs);
     const first = p.publish({ sequence: 1 });
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -57,7 +61,7 @@ describe("publication", () => {
     } };
     await expect(publisher(root, "bbbbbbbbbbbbbbbb", fs).publish({ sequence: 2 })).rejects.toThrow("fixture write failure");
     expect(JSON.parse(readFileSync(target(root), "utf8"))).toEqual({ sequence: 1 });
-    expect(readdirSync(join(root, "liveness"))).toEqual(["daemon.json"]);
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(SETTLED_ENTRIES);
   });
 
   it("removes an earlier instance's temp on its first publish and never trusts it", async () => {
@@ -65,7 +69,7 @@ describe("publication", () => {
     mkdirSync(join(root, "liveness"), { mode: 0o700 });
     writeFileSync(join(root, "liveness", "daemon.json.0000000000000000.tmp"), JSON.stringify({ sequence: 99 }), { mode: 0o600 });
     await publisher(root).publish({ sequence: 1 });
-    expect(readdirSync(join(root, "liveness"))).toEqual(["daemon.json"]);
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(SETTLED_ENTRIES);
     expect(JSON.parse(readFileSync(target(root), "utf8"))).toEqual({ sequence: 1 });
   });
 

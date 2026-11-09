@@ -2118,6 +2118,8 @@ export async function startMacOSCastleWallDaemon(
     phase = "state_STOP_TIMERS";
     stopLeaseHeartbeat(); stopResolverLifecycleTimer(); stopAuditHeartbeat();
     stopAgentEgressProbeTimer(); stopEmissionLivenessTimer();
+    // With the tick stopped, retire liveness publication so a queued snapshot of this instance never lands after a successor's.
+    livenessRecorder?.retire();
     if (pendingRequests.size > 0) consumer.noteIngressDrop("approval_shutdown", pendingRequests.size);
     pendingRequests.clear();
     // Cleanup initiation is guaranteed; an unsettled cleanup cannot be called complete.

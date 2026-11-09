@@ -324,6 +324,15 @@ export class LivenessRecorder {
     });
   }
 
+  /**
+   * Retire publication at daemon stop: the waiting snapshot is dropped and no
+   * later one is created or committed, so a stopping instance can never land a
+   * record after its successor's.
+   */
+  retire(): void {
+    this.publisher.retire();
+  }
+
   stats(): { published: number; failures: number } {
     const s = this.publisher.stats();
     return { published: s.published, failures: Math.max(s.failures, this.publishFailures) };
