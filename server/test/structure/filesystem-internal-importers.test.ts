@@ -293,6 +293,12 @@ function edges(fileName: string, source: string): Edge[] {
     if (memberName === "createRequire" && loaderUse(node) !== "load") opaque();
     // `module.require`, `require.main.require` and similar member loaders are not modelled, so they fail closed.
     if (memberName === "require") opaque();
+    if (ts.isBindingElement(node)) {
+      const key = node.propertyName && ts.isComputedPropertyName(node.propertyName) && ts.isStringLiteralLike(node.propertyName.expression)
+        ? node.propertyName.expression.text : staticPropertyName(node.propertyName ?? node.name);
+      // A destructure that reads or binds `require` (`const { require: load } = module`) yields an untracked loader, so it fails closed.
+      if (key === "require" || (ts.isIdentifier(node.name) && node.name.text === "require")) opaque();
+    }
     ts.forEachChild(node, visit);
   };
   visit(tree);
@@ -351,6 +357,8 @@ function specifierPaths(fromFile: string, specifier: string): string[] | "bare" 
     if (specifier.startsWith(".") || isAbsolute(specifier)) {
       return [resolve(dirname(fromFile), specifier.replace(/[?#].*$/, "")), fileURLToPath(new URL(specifier, pathToFileURL(fromFile)))];
     }
+    // A `#` subpath import resolves through package.json "imports", which the guard does not read, so it is treated as reaching anything.
+    if (specifier.startsWith("#")) return "undecodable";
     return "bare";
   } catch {
     return "undecodable";
@@ -625,6 +633,11 @@ describe("filesystem.ts internal entries import graph", () => {
     ["a createRequire base in another directory", resolve(SERVER, "src/cli/importer-fixture.mjs"), `import { createRequire } from "node:module";\nconst load = createRequire(new URL("../storage/base.mjs", import.meta.url));\nconst { ${TEST_HOOK_INJECTION}: hook } = load("./filesystem.ts");`],
     ["a computed createRequire base", ELSEWHERE, 'import { createRequire } from "node:module";\nconst load = createRequire(base);'],
     ["runtime code importing a test module", ELSEWHERE, 'import { fixture } from "../../test/fixture.js";'],
+    ["require destructured off module", resolve(SERVER, "src/storage/importer-fixture.cjs"), 'const { require: load } = module;\nconst storage = load("./filesystem.ts");'],
+    ["require destructured by a computed literal key", ELSEWHERE, 'const { ["require"]: load } = module;'],
+    ["a local binding named require from a destructure", ELSEWHERE, "const { loader: require } = tools;"],
+    ["a subpath import specifier", ELSEWHERE, `import { ${TEST_HOOK_INJECTION} } from "#storage/filesystem";`],
+    ["a dynamic subpath import specifier", ELSEWHERE, 'const storage = await import("#storage");'],
   ];
 
   it.each(flaggedFixtures)("flags %s", (_label, fileName, source) => {
