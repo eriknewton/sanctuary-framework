@@ -1,3 +1,4 @@
+// fail-before-exempt: The new unrelated spawn witness preserves an existing absence guard; fixture marker propagation is tested against its own base and mutation.
 // fail-before-exempt: This change moves the existing credential-store fixture injection allowlist from setup/keychain-fake.ts to setup/keychain-memory-store.ts; the scanner and all credential-binary safety assertions are unchanged and must pass against both production versions.
 /**
  * The chokepoint that keeps tests off the operator's real login keychain.
@@ -1166,4 +1167,13 @@ describe("no test may spawn a child with a scrubbed environment", () => {
     }
     expect(violations).toEqual([]);
   });
+  it("rejects an unrelated test file that scrubs its child environment", () => {
+    const fixture = ts.createSourceFile(
+      "unrelated-new-spawn.test.ts",
+      'import { spawnSync } from "node:child_process"; spawnSync("node", [], { env: {} });',
+      ts.ScriptTarget.Latest, true, ts.ScriptKind.TS,
+    );
+    expect(scrubbedEnvSpawns(fixture)).toHaveLength(1);
+  });
+
 });
