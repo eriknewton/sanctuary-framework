@@ -261,10 +261,16 @@ describe("publication under the observer", () => {
       return undefined;
     }
     async lstat(): Promise<{ uid: number; mode: number; isDirectory(): boolean }> { return { uid: OPERATOR, mode: 0o40700, isDirectory: () => true }; }
+    /** Record temps only; the lock and claim temps the publication fence writes are not record writes. */
+    private isRecordTemp(path: string): boolean {
+      return path.endsWith(".tmp") && !path.endsWith(".lock.tmp") && !path.endsWith(".publisher.tmp");
+    }
     async open(path: string): Promise<PublisherFileHandle> {
       if (this.files.has(path)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
-      this.openTemps++;
-      this.maxOpenTemps = Math.max(this.maxOpenTemps, this.openTemps);
+      if (this.isRecordTemp(path)) {
+        this.openTemps++;
+        this.maxOpenTemps = Math.max(this.maxOpenTemps, this.openTemps);
+      }
       let data = "";
       this.files.set(path, "");
       return {
@@ -275,20 +281,35 @@ describe("publication under the observer", () => {
       };
     }
     async rename(from: string, to: string): Promise<void> {
-      const hold = this.hold;
-      this.hold = null;
-      if (hold !== null) await hold;
+      const record = this.isRecordTemp(from);
+      if (record) {
+        const hold = this.hold;
+        this.hold = null;
+        if (hold !== null) await hold;
+      }
       const text = this.files.get(from)!;
       this.files.delete(from);
-      this.openTemps--;
       this.files.set(to, text);
+      if (!record) return;
+      this.openTemps--;
       this.renamedSequences.push((JSON.parse(text) as { sequence: number }).sequence);
     }
     async unlink(path: string): Promise<void> {
       if (!this.files.delete(path)) throw Object.assign(new Error("absent"), { code: "ENOENT" });
-      this.openTemps--;
+      if (this.isRecordTemp(path)) this.openTemps--;
     }
     async readdir(): Promise<string[]> { return []; }
+    async link(existing: string, newPath: string): Promise<void> {
+      if (this.files.has(newPath)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
+      const text = this.files.get(existing);
+      if (text === undefined) throw Object.assign(new Error("absent"), { code: "ENOENT" });
+      this.files.set(newPath, text);
+    }
+    async readFile(path: string): Promise<string> {
+      const text = this.files.get(path);
+      if (text === undefined) throw Object.assign(new Error("absent"), { code: "ENOENT" });
+      return text;
+    }
   }
 
   it("never lets an older record overwrite a newer one, and keeps one write in flight with one waiting, over 1000 waves", async () => {

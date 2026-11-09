@@ -7,7 +7,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -160,7 +160,10 @@ describe("production composition", () => {
     expect(record.observer_period_ms).toBe(OBSERVER_PERIOD);
     for (const call of argv) expect(["/usr/sbin/sysctl", "/bin/launchctl", "/bin/ps", "/usr/sbin/netstat"]).toContain(call[0]);
     for (const call of argv.filter(c => c[0] === "/bin/launchctl")) expect(call[1]).toBe("print");
+    // The publication fence leaves only the record and its current-publisher claim; no lock or temp survives.
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["observer.json", "observer.json.publisher"]);
     unlinkSync(recordPath);
+    unlinkSync(`${recordPath}.publisher`);
     rmdirSync(join(root, "liveness"));
     rmdirSync(root);
   });

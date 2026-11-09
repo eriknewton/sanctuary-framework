@@ -8,6 +8,8 @@ import {
   CENSUS_PAIR_MIN,
   CENSUS_PERIOD,
   CENSUS_RUN,
+  HOUR,
+  LOCAL_JITTER,
   SECOND,
   agentWindow,
 } from "../../../src/castle-wall/liveness/constants.js";
@@ -146,7 +148,8 @@ describe("never qualifying", () => {
 
   const cases: Array<[string, (s: RawSample[]) => RawSample[], Parameters<typeof evaluateSeries>[1]?]> = [
     ["flat counters", s => editRows(s, row => ({ ...row, rxbytes: 49560 }))],
-    ["wrong pid", s => s, { store: { pid: 75400 }, gateway: { pid: 75400 } }],
+    // The sampler filter: rows owned by another pid never reach a stored sample. The reader's own pid binding is witnessed in "census sample identity".
+    ["rows owned by a pid other than the configured gateway, dropped by the sampler", s => s, { store: { pid: GATEWAY_PID + 1 }, gateway: { pid: GATEWAY_PID + 1 } }],
     ["address outside the set", s => editRows(s, row => ({ ...row, foreign: "198.51.100.10.443", foreignEndpoint: { ...row.foreignEndpoint, host: "198.51.100.10", ipv4: 3325256714 } }))],
     ["port other than 443", s => editRows(s, row => ({ ...row, foreign: "203.0.113.10.8443", foreignEndpoint: { ...row.foreignEndpoint, port: "8443", portNumber: 8443 } }))],
     ["CLOSE_WAIT", s => editRows(s, row => ({ ...row, tcp_state: "CLOSE_WAIT" }))],
@@ -289,5 +292,104 @@ describe("census availability and commissioning", () => {
     const envelope = evaluateLiveness({ ...input, observer: { status: "absent" } });
     expect(envelope.agent.state).toBe("agent_DOWN");
     expect(envelope.agent.reasons).toEqual(["observer_missing"]);
+  });
+});
+
+describe("census sample clocks", () => {
+  /** Edit already-stored samples, as a reader would find them on disk, then evaluate at the last sample's reader clock. */
+  const evaluateStored = (edit: (sample: StoredCensusSample) => StoredCensusSample): LivenessEnvelope =>
+    evaluateLiveness(inputAt(LAST.observedAtMs, LAST.uptimeMs, SERIES.map(sample => edit(store(sample)))));
+  const shiftUtc = (deltaMs: number) => (sample: StoredCensusSample): StoredCensusSample =>
+    ({ ...sample, observed_at: new Date(Date.parse(sample.observed_at) + deltaMs).toISOString() });
+  const shiftUptime = (deltaMs: number) => (sample: StoredCensusSample): StoredCensusSample =>
+    ({ ...sample, observed_uptime_ms: sample.observed_uptime_ms + deltaMs });
+  const DAY = 24 * HOUR;
+
+  it("the unedited stored series is the control and reads agent_OK_PASSIVE", () => {
+    const envelope = evaluateStored(sample => sample);
+    expect(envelope.agent.state).toBe("agent_OK_PASSIVE");
+    expect(envelope.agent.reasons).toEqual(["none"]);
+  });
+
+  it.each([
+    ["UTC times one day in the future", shiftUtc(DAY)],
+    ["UTC times one millisecond past the future jitter", shiftUtc(LOCAL_JITTER + 1)],
+    ["uptimes one hour in the past, so the two ages diverge", shiftUptime(-HOUR)],
+    ["uptimes one millisecond past the divergence jitter", shiftUptime(-(LOCAL_JITTER + 1))],
+    ["uptimes ahead of the reader's uptime, a negative age", shiftUptime(SECOND)],
+  ] as const)("%s read agent DOWN time_untrusted and leave the wall unchanged", (_name, edit) => {
+    const envelope = evaluateStored(edit);
+    expect(envelope.agent.state).toBe("agent_DOWN");
+    expect(envelope.agent.reasons).toContain("time_untrusted");
+    expect(envelope.agent.reasons).not.toContain("none");
+    expectWallOk(envelope);
+  });
+
+  it.each([
+    ["UTC times exactly the future jitter ahead", shiftUtc(LOCAL_JITTER)],
+    ["uptimes exactly the divergence jitter behind", shiftUptime(-LOCAL_JITTER)],
+  ] as const)("%s are accepted at the boundary", (_name, edit) => {
+    const envelope = evaluateStored(edit);
+    expect(envelope.agent.state).toBe("agent_OK_PASSIVE");
+    expect(envelope.agent.reasons).toEqual(["none"]);
+  });
+
+  it("an untrusted sample from another boot is never credited and is not read as untrusted time", () => {
+    const envelope = evaluateLiveness(inputAt(LAST.observedAtMs, LAST.uptimeMs,
+      SERIES.map(sample => shiftUtc(DAY)(store(sample, { bootId: "boot-fixture-previous" })))));
+    expect(envelope.agent.reasons).not.toContain("time_untrusted");
+    expect(envelope.agent.state).not.toBe("agent_OK_PASSIVE");
+  });
+});
+
+describe("census sample identity", () => {
+  /** The reference series as stored on disk: nonempty qualifying rows owned by the current gateway. */
+  const stored = (): StoredCensusSample[] => SERIES.map(sample => store(sample));
+  const evaluateStored = (samples: StoredCensusSample[], at: RawSample = LAST): LivenessEnvelope =>
+    evaluateLiveness(inputAt(at.observedAtMs, at.uptimeMs, samples));
+  /** Edit the gateway identity of already-stored samples, every one or those `which` selects. */
+  const editGateway = (samples: StoredCensusSample[], edit: Partial<StoredCensusSample["gateway"]>, which: (index: number) => boolean = () => true) =>
+    samples.map((sample, index) => which(index) ? { ...sample, gateway: { ...sample.gateway, ...edit } } : sample);
+  const OTHER_UID = 999;
+
+  it("the control: the same stored series with every identity field matching forms a run and reads agent_OK_PASSIVE", () => {
+    const samples = stored();
+    expect(samples.every(sample => sample.rows.length > 0)).toBe(true);
+    const envelope = evaluateStored(samples);
+    expect(envelope.agent.state).toBe("agent_OK_PASSIVE");
+    expect(envelope.agent.reasons).toEqual(["none"]);
+  });
+
+  it.each([
+    ["pid", { pid: GATEWAY_PID + 1 }],
+    ["start identity", { start_identity: "gateway-start-other" }],
+    ["uid", { uid: OTHER_UID }],
+  ] as const)("a stored series whose gateway %s alone differs is agent DOWN process_identity_unknown", (_field, edit) => {
+    const samples = editGateway(stored(), edit);
+    expect(samples.every(sample => sample.rows.length > 0)).toBe(true);
+    const envelope = evaluateStored(samples);
+    expect(envelope.agent.state).toBe("agent_DOWN");
+    expect(envelope.agent.reasons).toContain("process_identity_unknown");
+    expectWallOk(envelope);
+  });
+
+  it("one contradicting sample at the end of an otherwise healthy series is agent DOWN", () => {
+    const samples = editGateway(stored(), { start_identity: "gateway-start-other" }, index => index === SERIES.length - 1);
+    const envelope = evaluateStored(samples);
+    expect(envelope.agent.state).toBe("agent_DOWN");
+    expect(envelope.agent.reasons).toContain("process_identity_unknown");
+  });
+
+  it("a young generation whose samples contradict the current gateway is agent DOWN, never the initializing grace", () => {
+    const young = stored().slice(0, 2);
+    expect(evaluateStored(young, SERIES[1]!).agent.state).toBe("agent_INITIALIZING");
+    const contradicted = evaluateStored(editGateway(young, { uid: OTHER_UID }), SERIES[1]!);
+    expect(contradicted.agent.state).toBe("agent_DOWN");
+    expect(contradicted.agent.reasons).toContain("process_identity_unknown");
+  });
+
+  it("an older generation of the same boot with another process identity is excluded, not contradictory", () => {
+    const envelope = evaluateStored(editGateway(stored(), { generation: "generation-fixture-0", pid: GATEWAY_PID + 1, start_identity: "gateway-start-old" }));
+    expect(envelope.agent.reasons).toEqual(["agent_flow_stale"]);
   });
 });

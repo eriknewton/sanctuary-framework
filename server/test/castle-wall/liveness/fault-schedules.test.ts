@@ -1,6 +1,6 @@
 /** Rule 8 and rule 12 fault schedules: slot waves, saturation, spam caps, paused publication, hostile record files and record budgets. */
 import { execFileSync } from "node:child_process";
-import { closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -30,7 +30,7 @@ import { nodeReaderFs, readLivenessRecords, type DeadlineClock, type ReaderFs } 
 import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
 import { CanaryRecordingSlot, saturatingIncrement, type CanaryOriginSubjects } from "../../../src/castle-wall/liveness/recorder.js";
 import { parseDaemonRecord, parseObserverRecord } from "../../../src/castle-wall/liveness/schema.js";
-import { livenessFortressId, runLivenessStatus } from "../../../src/cli/castle-wall-liveness-status.js";
+import { evaluateFortressLiveness, livenessFortressId, runLivenessStatus, wallOnlyStatusExit } from "../../../src/cli/castle-wall-liveness-status.js";
 
 const UID = process.getuid?.() ?? 0;
 const START = Date.parse("2026-11-09T12:00:00.000Z");
@@ -143,22 +143,138 @@ describe("slot waves", () => {
   });
 });
 
-describe("publication paused before rename, then restart", () => {
-  it("never trusts the old temp and a late old write cannot overwrite a newer sequence", async () => {
-    const root = fortress();
+describe("publication paused, then restart", () => {
+  const OLD = "1111111111111111";
+  const NEW = "2222222222222222";
+  type Step = "open" | "write" | "rename";
+  const recordAt = (root: string) => JSON.parse(readFileSync(join(root, "liveness", "daemon.json"), "utf8")) as unknown;
+  /** Pause the old publisher's second record write at one step, after its first publish has claimed the target. */
+  function pausedAt(root: string, step: Step) {
+    const recordTemp = join(root, "liveness", `daemon.json.${OLD}.tmp`);
+    const target = join(root, "liveness", "daemon.json");
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    let reachedRename!: () => void;
-    const atRename = new Promise<void>(resolve => { reachedRename = resolve; });
-    const pausedFs: PublisherFs = { ...nodePublisherFs, rename: async (from, to) => { reachedRename(); await gate; return nodePublisherFs.rename(from, to); } };
-    const old = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: "1111111111111111", operatorUid: UID, fs: pausedFs });
-    const late = old.publish({ sequence: 1 });
-    await atRename;
-    const restarted = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: "2222222222222222", operatorUid: UID });
-    await restarted.publish({ sequence: 5 });
-    release();
+    let reached!: () => void;
+    const atStep = new Promise<void>(resolve => { reached = resolve; });
+    let armed = false;
+    const pause = async () => { reached(); await gate; };
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      open: async (path, flags, mode) => {
+        if (armed && step === "open" && path === recordTemp) { armed = false; await pause(); }
+        const handle = await nodePublisherFs.open(path, flags, mode);
+        if (path !== recordTemp) return handle;
+        return {
+          stat: () => handle.stat(), sync: () => handle.sync(), close: () => handle.close(),
+          writeFile: async data => { if (armed && step === "write") { armed = false; await pause(); } return handle.writeFile(data); },
+        };
+      },
+      rename: async (from, to) => {
+        if (armed && step === "rename" && to === target) { armed = false; await pause(); }
+        return nodePublisherFs.rename(from, to);
+      },
+    };
+    return { fs, arm: () => { armed = true; }, atStep, release };
+  }
+
+  it.each(["open", "write", "rename"] as const)("a queued old snapshot and a late %s completion never overwrite the newer instance's record", async step => {
+    const root = fortress();
+    const paused = pausedAt(root, step);
+    const old = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: OLD, operatorUid: UID, fs: paused.fs });
+    await old.publish({ sequence: 1 });
+    paused.arm();
+    const late = old.publish({ sequence: 2 });
+    late.catch(() => undefined);
+    await paused.atStep;
+    // A legitimate later tick queues behind the paused write.
+    const queued = old.publish({ sequence: 3 });
+    queued.catch(() => undefined);
+    const restarted = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: NEW, operatorUid: UID });
+    const newer = restarted.publish({ sequence: 5 });
+    if (step !== "rename") {
+      // Before the rename the old instance holds no lock, so the newer instance commits at once.
+      await newer;
+      expect(recordAt(root)).toEqual({ sequence: 5 });
+    }
+    paused.release();
+    await Promise.allSettled([late, queued]);
+    await newer;
+    // The paused rename was already inside the lock with a valid claim, so it may land, but only before the newer record.
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    // The old instance is superseded: its next snapshot is refused and the newer record stays.
+    await expect(old.publish({ sequence: 4 })).rejects.toThrow();
+    expect(old.isRetired()).toBe(true);
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
+    expect(readFileSync(join(root, "liveness", "daemon.json.publisher"), "utf8")).toBe(`${NEW}\n`);
+  });
+
+  it("a retired publisher drops its waiting snapshot and creates nothing more", async () => {
+    const root = fortress();
+    const paused = pausedAt(root, "write");
+    const recordTemp = join(root, "liveness", `daemon.json.${OLD}.tmp`);
+    let tempOpens = 0;
+    const counting: PublisherFs = { ...paused.fs, open: (path, flags, mode) => { if (path === recordTemp) tempOpens++; return paused.fs.open(path, flags, mode); } };
+    const p = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: OLD, operatorUid: UID, fs: counting });
+    await p.publish({ sequence: 1 });
+    paused.arm();
+    const inFlight = p.publish({ sequence: 2 });
+    inFlight.catch(() => undefined);
+    await paused.atStep;
+    const waiting = p.publish({ sequence: 3 });
+    waiting.catch(() => undefined);
+    const opensAtRetire = tempOpens;
+    p.retire();
+    paused.release();
+    await Promise.allSettled([inFlight, waiting]);
+    expect(recordAt(root)).toEqual({ sequence: 1 });
+    expect(tempOpens, "no snapshot is created after retirement").toBe(opensAtRetire);
+    await expect(p.publish({ sequence: 4 })).rejects.toThrow("retired");
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
+  });
+
+  it("an old instance cannot check its claim while the newer instance holds the lock to establish its own", async () => {
+    const root = fortress();
+    const ownerPath = join(root, "liveness", "daemon.json.publisher");
+    const oldPaused = pausedAt(root, "rename");
+    const old = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: OLD, operatorUid: UID, fs: oldPaused.fs });
+    await old.publish({ sequence: 1 });
+    // Hold the newer instance inside its startup critical section, after its sweep and before its claim lands.
+    let releaseClaim!: () => void;
+    const claimGate = new Promise<void>(resolve => { releaseClaim = resolve; });
+    let atClaim!: () => void;
+    const claimReached = new Promise<void>(resolve => { atClaim = resolve; });
+    const newFs: PublisherFs = { ...nodePublisherFs, rename: async (from, to) => { if (to === ownerPath) { atClaim(); await claimGate; } return nodePublisherFs.rename(from, to); } };
+    const restarted = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: NEW, operatorUid: UID, fs: newFs });
+    const newer = restarted.publish({ sequence: 5 });
+    await claimReached;
+    oldPaused.arm();
+    const late = old.publish({ sequence: 2 });
+    late.catch(() => undefined);
+    // Give the old publisher time to reach its rename if anything let it past the held lock.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    releaseClaim();
+    await newer;
+    oldPaused.release();
     await late.catch(() => undefined);
-    expect(JSON.parse(readFileSync(join(root, "liveness", "daemon.json"), "utf8"))).toEqual({ sequence: 5 });
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    expect(old.isRetired()).toBe(true);
+  });
+
+  it("a lock left by a holder whose process has exited is taken over", async () => {
+    const root = fortress();
+    const lock = join(root, "liveness", "daemon.json.lock");
+    const deadPid = 2_000_000_000;
+    writeFileSync(lock, `${JSON.stringify({ pid: deadPid, instance: OLD })}\n`, { mode: 0o600 });
+    const checked: number[] = [];
+    const p = new LivenessRecordPublisher({
+      fortressPath: root, fileName: "daemon.json", instance: NEW, operatorUid: UID,
+      processExists: pid => { checked.push(pid); return pid !== deadPid; },
+    });
+    await p.publish({ sequence: 1 });
+    expect(checked).toContain(deadPid);
+    expect(recordAt(root)).toEqual({ sequence: 1 });
+    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
   });
 });
 
@@ -269,6 +385,166 @@ describe("hostile record files", () => {
       expect(envelope.subject.fortress_id).toBe(livenessFortressId(root));
     } finally {
       stalled.abort();
+    }
+  });
+});
+
+describe("a stalled operation or cleanup never outlives the read deadline", () => {
+  type Stall = "stat" | "read" | "close";
+  /**
+   * A daemon.json handle that holds one operation open until the test releases it. Close waits for any
+   * outstanding operation of the same handle, as a Node FileHandle does, so a stalled stat or read also stalls close.
+   */
+  function stallingFs(stall: Stall) {
+    const releases: Array<() => void> = [];
+    let reached = false;
+    const hold = <T>(value: T): Promise<T> => { reached = true; return new Promise<T>(resolve => { releases.push(() => resolve(value)); }); };
+    const record = Buffer.from("{}");
+    const info = { uid: UID, mode: 0o100600, size: record.length, isFile: () => true, isDirectory: () => false };
+    const fs: ReaderFs = {
+      open: async (path, flags) => {
+        if (!path.endsWith("daemon.json")) return nodeReaderFs.open(path, flags);
+        let outstanding: Promise<unknown> = Promise.resolve();
+        let served = false;
+        return {
+          stat: () => { const op = stall === "stat" ? hold(info) : Promise.resolve(info); outstanding = op; return op; },
+          read: (buffer, at) => {
+            if (stall === "read") { const op = hold({ bytesRead: 0 }); outstanding = op; return op; }
+            if (served) return Promise.resolve({ bytesRead: 0 });
+            served = true;
+            record.copy(buffer, at);
+            return Promise.resolve({ bytesRead: record.length });
+          },
+          close: () => stall === "close" ? hold(undefined) : outstanding.then(() => undefined),
+        };
+      },
+    };
+    return { fs, reached: () => reached, release: () => { for (const release of releases.splice(0)) release(); } };
+  }
+  /** Fail fast, rather than hang, when the reader is still waiting on the stalled operation. */
+  const settlesWithoutRelease = <T>(pending: Promise<T>): Promise<T> => Promise.race([
+    pending,
+    new Promise<never>((_resolve, reject) => { setTimeout(() => reject(new Error("still waiting on the stalled operation")), 2 * SECOND).unref(); }),
+  ]);
+  async function untilReached(stalled: { reached(): boolean }): Promise<void> {
+    for (let i = 0; i < 200 && !stalled.reached(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    expect(stalled.reached(), "the schedule reached its stall point").toBe(true);
+  }
+  const schedules: Stall[] = ["stat", "read", "close"];
+  const host = { read: async () => ({ ok: true as const, bootId: "boot-fixture", uptimeMs: 1_000_000 }), uptimeMs: () => 1_000_000 };
+
+  it.each(schedules)("a pending %s returns read_deadline once the deadline fires, before the stall is released", async stall => {
+    const root = fortress();
+    writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+    const stalled = stallingFs(stall);
+    const deadline = manualDeadline();
+    try {
+      const reading = readLivenessRecords({ fortressPath: root, operatorUid: UID, fs: stalled.fs, deadline: deadline.clock });
+      await untilReached(stalled);
+      deadline.fire();
+      const result = await settlesWithoutRelease(reading);
+      expect(result.readDeadlineHit).toBe(true);
+      expect(result.daemon).toEqual({ status: "custody_invalid", cause: "read_deadline" });
+    } finally {
+      stalled.release();
+    }
+  });
+
+  it.each(schedules)("a pending %s makes liveness-status exit 70 and the status and full-status tail exit 1, before the stall is released", async stall => {
+    for (const command of ["liveness-status", "status tail"] as const) {
+      const root = fortress();
+      writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+      const stalled = stallingFs(stall);
+      const deadline = manualDeadline();
+      const ctx = { platform: "darwin", getuid: () => UID, now: () => START, hostClock: host, readerFs: stalled.fs, deadline: deadline.clock };
+      let out = "";
+      const sink = new Writable({ write(chunk, _encoding, done) { out += String(chunk); done(); } });
+      try {
+        // status and full-status both end in this shared tail: the evaluated envelope mapped through the wall-only exit.
+        const running = command === "liveness-status"
+          ? runLivenessStatus(["--json", "--fortress", root], { ...ctx, out: sink, err: sink, env: {} })
+          : evaluateFortressLiveness(root, ctx).then(wallOnlyStatusExit);
+        await untilReached(stalled);
+        deadline.fire();
+        const exit = await settlesWithoutRelease(running);
+        expect(exit, command).toBe(command === "liveness-status" ? 70 : 1);
+        if (command === "liveness-status") expect(JSON.parse(out).wall.evidence.cause).toBe("read_deadline");
+      } finally {
+        stalled.release();
+      }
+    }
+  });
+
+  it("a close that rejects after the deadline is observed and never surfaces", async () => {
+    const root = fortress();
+    writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+    let rejectClose!: (error: Error) => void;
+    let closes = 0;
+    let reachedRead = false;
+    let releaseRead!: () => void;
+    const fs: ReaderFs = {
+      open: async (path, flags) => {
+        if (!path.endsWith("daemon.json")) return nodeReaderFs.open(path, flags);
+        return {
+          stat: async () => ({ uid: UID, mode: 0o100600, size: 2, isFile: () => true, isDirectory: () => false }),
+          read: () => { reachedRead = true; return new Promise(resolve => { releaseRead = () => resolve({ bytesRead: 0 }); }); },
+          close: () => { closes++; return new Promise<void>((_resolve, reject) => { rejectClose = reject; }); },
+        };
+      },
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    const deadline = manualDeadline();
+    try {
+      const reading = readLivenessRecords({ fortressPath: root, operatorUid: UID, fs, deadline: deadline.clock });
+      for (let i = 0; i < 200 && !reachedRead; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      deadline.fire();
+      expect((await settlesWithoutRelease(reading)).readDeadlineHit).toBe(true);
+      releaseRead();
+      for (let i = 0; i < 50 && closes === 0; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      rejectClose(new Error("close failed late"));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(closes).toBe(1);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("a handle whose open completes after the deadline is closed once by the cleanup owner, and its close rejection is observed", async () => {
+    const root = fortress();
+    writeFileSync(join(root, "liveness", "daemon.json"), "{}", { mode: 0o600 });
+    let releaseOpen!: () => void;
+    let opening = false;
+    let closes = 0;
+    const lateHandle = {
+      stat: async () => ({ uid: UID, mode: 0o100600, size: 2, isFile: () => true, isDirectory: () => false }),
+      read: async () => ({ bytesRead: 0 }),
+      close: () => { closes++; return Promise.reject(new Error("close failed late")); },
+    };
+    const fs: ReaderFs = {
+      open: (path, flags) => {
+        if (!path.endsWith("daemon.json")) return nodeReaderFs.open(path, flags);
+        opening = true;
+        return new Promise(resolve => { releaseOpen = () => resolve(lateHandle); });
+      },
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    const deadline = manualDeadline();
+    try {
+      const reading = readLivenessRecords({ fortressPath: root, operatorUid: UID, fs, deadline: deadline.clock });
+      for (let i = 0; i < 200 && !opening; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      deadline.fire();
+      expect((await settlesWithoutRelease(reading)).readDeadlineHit).toBe(true);
+      releaseOpen();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(closes).toBe(1);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
     }
   });
 });

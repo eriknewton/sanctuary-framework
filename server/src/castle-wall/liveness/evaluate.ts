@@ -4,7 +4,6 @@
  * is ever stored as a verdict. It imports no filesystem, network or process
  * module so the same code ships in the contract bundle.
  */
-import { parseIsoInstantWithOffset } from "../../core/time.js";
 import {
   AGENT_WINDOW_BASE,
   AVAILABILITY_WINDOW,
@@ -49,6 +48,7 @@ import {
   type ObserverEnvelope,
   type ObserverWallPart,
 } from "./schema.js";
+import { recordTiming } from "./timing.js";
 
 // ---------------------------------------------------------------------------
 // Inputs.
@@ -131,19 +131,6 @@ class ReasonSet {
   ordered(): string[] {
     return this.values().sort((a, b) => (reasonPosition(b) ?? 0) - (reasonPosition(a) ?? 0));
   }
-}
-
-type Timing = { ok: true; ageMs: number } | { ok: false };
-
-/** Age of a record from both clocks; a future time or a divergence beyond LOCAL_JITTER is untrusted. */
-function recordTiming(observedAt: string, observedUptimeMs: number, nowMs: number, uptimeMs: number): Timing {
-  // Timestamps entering freshness arithmetic go through the one strict instant predicate; an unparsable time is untrusted.
-  const utcAge = nowMs - (parseIsoInstantWithOffset(observedAt) ?? Number.NaN);
-  const uptimeAge = uptimeMs - observedUptimeMs;
-  if (!Number.isFinite(utcAge) || utcAge < -LOCAL_JITTER || uptimeAge < 0) return { ok: false };
-  // Within one boot the two clocks progress together; a larger gap means one of them moved.
-  if (Math.abs(utcAge - uptimeAge) > LOCAL_JITTER) return { ok: false };
-  return { ok: true, ageMs: Math.max(0, utcAge, uptimeAge) };
 }
 
 /** Age of an embedded UTC time; null when absent, and undefined when it lies beyond LOCAL_JITTER in the future. */
@@ -427,8 +414,16 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
       if (age === undefined) { wall.add("time_untrusted"); return null; }
       return age;
     };
-    // Counter regression: the observer saw a later sequence of this same daemon instance than the one on disk.
-    if (p.daemon_ref !== null && current.daemon !== null && p.daemon_ref.daemon_instance === current.daemon.daemon_instance &&
+    // Gate 1 has two separate halves. Instance consistency: an observer whose daemon reference names another
+    // instance observed a different process, so none of its wall evidence is credited toward OK for the current
+    // instance; the wall reads recovering until a fresh observer record references the current instance. A matching
+    // PID is not instance evidence, since a restarted daemon can reuse it.
+    const observerInstanceMismatch = p.daemon_ref !== null && current.daemon !== null &&
+      p.daemon_ref.daemon_instance !== current.daemon.daemon_instance;
+    if (observerInstanceMismatch) wall.add("recovering");
+    // Sequence monotonicity, compared only within one instance: the observer saw a later sequence of this same
+    // instance than the one on disk. The daemon publishes independently, so its sequence may run ahead of the reference.
+    if (p.daemon_ref !== null && current.daemon !== null && !observerInstanceMismatch &&
         current.daemon.sequence < p.daemon_ref.sequence) wall.add("counter_regression");
     // Gate 3.
     const availabilityAge = stamp(p.availability.resolved_at_ms);
@@ -511,16 +506,21 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
       if (failedLast && p.optional_reply.required) agent.add("optional_reply_failed");
       optionalReplyOk = !failedLast && success !== null && now - success <= agentWindowMs && now - success >= -LOCAL_JITTER;
     }
-    if (p.gateway !== null && p.census.status === "ok") {
+    if (p.gateway !== null && p.census.status === "ok" && agentUid !== undefined) {
       const result = evaluateCensusRun({
         samples: p.census.samples,
-        gateway: { pid: p.gateway.pid, generation: p.gateway.generation },
+        gateway: { pid: p.gateway.pid, start_identity: p.gateway.start_identity, uid: p.gateway.uid, generation: p.gateway.generation },
+        agentUid,
         ipv4Set: config.messaging_ipv4 ?? [],
         bootId,
         nowMs: now,
+        uptimeMs,
         agentWindowMs,
       });
       if (result.invalid) agent.add("observation_invalid");
+      if (result.timeUntrusted) agent.add("time_untrusted");
+      // A contradicting current-generation sample is DOWN-class, so it is never OK and never the initializing grace.
+      if (result.identityContradiction) agent.add("process_identity_unknown");
       if (result.counterRegression) agent.add("counter_regression");
       if (result.run === null) {
         const startMs = result.generationStartMs;
