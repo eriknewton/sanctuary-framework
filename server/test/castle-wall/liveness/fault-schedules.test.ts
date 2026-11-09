@@ -422,6 +422,28 @@ describe("publication paused, then restart", () => {
     expect(opens.length, "no open follows the retirement").toBe(opensAtRetire);
     expect(recordAt(root)).toEqual({ sequence: 1 });
   });
+
+  it("an old-instance record landing after the newer instance's record reads not-OK with exit 1", async () => {
+    const root = fortress();
+    const base = STATES.base;
+    const currentRecord = base.daemon.value;
+    const staleRecord = { ...currentRecord, daemon_instance: "daemon-fixture-0", sequence: currentRecord.sequence + 1 };
+    const write = (record: unknown) => writeFileSync(join(liveness(root), "daemon.json"), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    const evaluateOnDisk = async () => {
+      const read = await readLivenessRecords({ fortressPath: root, operatorUid: UID });
+      return evaluateLiveness({ ...base, daemon: read.daemon });
+    };
+    expect(base.observer.value.raw.daemon_ref).toEqual({ daemon_instance: currentRecord.daemon_instance, sequence: currentRecord.sequence });
+    write(currentRecord);
+    const current = await evaluateOnDisk();
+    expect(current.exit_code, current.wall.reasons.join(",")).toBe(0);
+    // A superseded instance's rename issued inside the window after its final check lands over the newer record.
+    write(staleRecord);
+    const stale = await evaluateOnDisk();
+    expect(stale.wall.state.startsWith("wall_OK_")).toBe(false);
+    expect(stale.exit_code).toBe(1);
+    expect(wallOnlyStatusExit(stale)).toBe(1);
+  });
 });
 
 describe("publication claim reads", () => {
