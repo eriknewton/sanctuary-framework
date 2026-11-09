@@ -322,6 +322,7 @@ describe("record budgets", () => {
         full_service: { loaded: false, latched: false, pid: uid, start_identity: label("s"), last_charge_at_ms: n },
         session: "reboot_no_login",
         canary_integrity: { passed: false, checked_at_ms: n },
+        canary_allow_sighting: { captured_at_ms: n, principal: "agent", daemon_instance: label("d") },
         census: { status: "unavailable", samples: Array(CENSUS_SAMPLES_MAX).fill(sample) },
         gateway: { pid: uid, uid, start_identity: label("s"), generation: label("g"), alive: false },
         optional_reply: { required: false, last_success_at_ms: n, last_failure_at_ms: n },

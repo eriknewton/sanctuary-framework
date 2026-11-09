@@ -1,0 +1,292 @@
+/**
+ * Adversarial schedules for the observer process: a single-flight cycle under
+ * slow collectors, the bounded child runner under timeout, late completion,
+ * ignored signals and repeated admission waves, and record publication when a
+ * write is paused while newer cycles complete.
+ */
+import { EventEmitter } from "node:events";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { COUNTER_MAX, KILL_REAP_GRACE, MAX_COLLECTION_CHILDREN, TERM_GRACE } from "../../../src/castle-wall/liveness/constants.js";
+import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
+import { LivenessObserver, type ObserverCollectors, type ObserverPublisher } from "../../../src/castle-wall/liveness/observer.js";
+import { LivenessRecordPublisher, type PublisherFileHandle, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
+import {
+  BoundedChildRunner,
+  WATCH_CHILD_ENV,
+  WATCH_COMMANDS,
+  watchCommandArgv,
+  type WatchChild,
+  type WatchCommandOperand,
+  type WatchSpawn,
+} from "../../../src/cli/castle-wall-watch-collectors.js";
+
+const OPERATOR = 501;
+afterEach(() => { vi.useRealTimers(); });
+
+/** Timers that never fire on their own, so a cycle ends only when its collectors settle. */
+const inertTimers = {
+  setTimeout: () => 0, clearTimeout: () => undefined, setInterval: () => 0, clearInterval: () => undefined,
+};
+
+/** Collectors that settle fast with absent records, except `readRecords`, which each test may hold. */
+function quietCollectors(readRecords: ObserverCollectors["readRecords"]): ObserverCollectors {
+  const refuse = () => Promise.reject(new Error("fixture collector refused"));
+  return {
+    readRecords, readBootId: () => Promise.resolve("boot-fixture-current"), queryAvailability: () => Promise.resolve("live"),
+    printFullAgent: refuse, readFullAgentState: refuse, readProcesses: refuse, printHarness: refuse, collectCanaryFacts: refuse,
+  };
+}
+const absentRecords = () => ({
+  directory: { status: "ok" as const }, daemon: { status: "absent" as const }, observer: { status: "absent" as const },
+  config: { status: "absent" as const }, readDeadlineHit: false,
+});
+
+function observerWith(collectors: ObserverCollectors, publisher: ObserverPublisher, now: { ms: number } = { ms: 1_794_225_600_000 }): LivenessObserver {
+  const series = new CensusSeries();
+  let observer: LivenessObserver | null = null;
+  const sampler = new CensusSampler({ series, runNetstat: async () => ({ status: "failed" }), context: () => observer!.samplingContext(), clock: { nowMs: () => now.ms, uptimeMs: () => now.ms }, timers: inertTimers });
+  observer = new LivenessObserver({
+    fortressId: "fortress-0123456789abcdef", hostId: "host-fixture", operatorUid: OPERATOR, collectors, sampler, series, publisher,
+    clock: { nowMs: () => now.ms, uptimeMs: () => now.ms }, timers: inertTimers, instance: "observer-schedule-1",
+  });
+  return observer;
+}
+const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+
+// ---------------------------------------------------------------------------
+describe("single-flight cycle", () => {
+  it("skips and counts ticks during an in-flight cycle, never queues them, across 1000 slow cycles", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let calls = 0;
+    let release: () => void = () => undefined;
+    const observer = observerWith(quietCollectors(() => {
+      calls++;
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise(resolve => { release = () => { inFlight--; resolve(absentRecords()); }; });
+    }), { publish: async () => undefined });
+    for (let wave = 0; wave < 1000; wave++) {
+      const cycle = observer.tick();
+      for (let i = 0; i < 3; i++) expect(observer.tick()).toBe(cycle);
+      release();
+      await cycle;
+    }
+    await flush();
+    expect(maxInFlight).toBe(1);
+    expect(calls).toBe(1000);
+    expect(observer.stats().cycles).toBe(1000);
+    expect(observer.stats().skipped).toBe(3000);
+  });
+
+  it("saturates the skipped counter at COUNTER_MAX and never publishes it", async () => {
+    const published: unknown[] = [];
+    let release: () => void = () => undefined;
+    const observer = observerWith(quietCollectors(() => new Promise(resolve => { release = () => resolve(absentRecords()); })), { publish: async record => { published.push(record); } });
+    observer.primeSkippedForTest(COUNTER_MAX - 1);
+    const cycle = observer.tick();
+    for (let i = 0; i < 5; i++) void observer.tick();
+    expect(observer.stats().skipped).toBe(COUNTER_MAX);
+    release();
+    await cycle;
+    await flush();
+    const text = JSON.stringify(published);
+    expect(published).toHaveLength(1);
+    expect(text).not.toContain("skipped");
+    expect(text).not.toContain(String(COUNTER_MAX));
+  });
+});
+
+// ---------------------------------------------------------------------------
+type FakeChild = WatchChild & EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; signals: string[]; exitNow(code?: number): void; ignoreTerm: boolean; ignoreKill: boolean };
+function fakeSpawner(): { spawn: WatchSpawn; children: FakeChild[]; calls: Array<{ file: string; args: readonly string[]; env: Record<string, string> }> } {
+  const children: FakeChild[] = [];
+  const calls: Array<{ file: string; args: readonly string[]; env: Record<string, string> }> = [];
+  const spawn: WatchSpawn = (file, args, options) => {
+    calls.push({ file, args, env: options.env });
+    const child = Object.assign(new EventEmitter(), { pid: 6000 + children.length, stdout: new EventEmitter(), stderr: new EventEmitter(), signals: [] as string[], ignoreTerm: false, ignoreKill: false }) as FakeChild;
+    child.exitNow = (code = 0) => { child.emit("exit", code, null); child.emit("close", code, null); };
+    child.kill = signal => {
+      child.signals.push(signal);
+      if ((signal === "SIGTERM" && !child.ignoreTerm) || (signal === "SIGKILL" && !child.ignoreKill)) queueMicrotask(() => { child.emit("exit", null, signal); child.emit("close", null, signal); });
+      return true;
+    };
+    children.push(child);
+    return child;
+  };
+  return { spawn, children, calls };
+}
+const fakeRunnerTimers = { setTimeout: (fire: () => void, ms: number) => setTimeout(fire, ms), clearTimeout: (h: unknown) => clearTimeout(h as NodeJS.Timeout) };
+const DEADLINE = 1000;
+
+describe("bounded child runner", () => {
+  it("discards a late success after the deadline and frees the slot only on an observed exit", async () => {
+    vi.useFakeTimers();
+    const { spawn, children } = fakeSpawner();
+    const runner = new BoundedChildRunner({ spawn, timers: fakeRunnerTimers });
+    const result = runner.run({ command: "ps" }, DEADLINE);
+    children[0]!.ignoreTerm = true;
+    await vi.advanceTimersByTimeAsync(DEADLINE);
+    expect(await result).toEqual({ status: "failed", reason: "deadline" });
+    expect(children[0]!.signals).toEqual(["SIGTERM"]);
+    expect(runner.slotStates()[0]).toBe("slot_TERMINATING");
+    children[0]!.stdout.emit("data", Buffer.from("late output\n"));
+    expect(runner.liveChildren()).toBe(1);
+    children[0]!.exitNow(0);
+    expect(runner.slotStates()[0]).toBe("slot_IDLE");
+    expect(await result).toEqual({ status: "failed", reason: "deadline" });
+  });
+
+  it("sends SIGKILL at TERM_GRACE to a child ignoring SIGTERM, and returns the slot when the exit is seen", async () => {
+    vi.useFakeTimers();
+    const { spawn, children } = fakeSpawner();
+    const runner = new BoundedChildRunner({ spawn, timers: fakeRunnerTimers });
+    void runner.run({ command: "netstat" }, DEADLINE);
+    children[0]!.ignoreTerm = true;
+    await vi.advanceTimersByTimeAsync(DEADLINE + TERM_GRACE - 1);
+    expect(children[0]!.signals).toEqual(["SIGTERM"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(children[0]!.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(runner.slotStates()[0]).toBe("slot_IDLE");
+  });
+
+  it("poisons a slot whose SIGKILL brings no exit by KILL_REAP_GRACE and never replaces it, across 1000 admission and timeout waves", async () => {
+    vi.useFakeTimers();
+    const { spawn, children, calls } = fakeSpawner();
+    const runner = new BoundedChildRunner({ spawn, timers: fakeRunnerTimers });
+    let maxLive = 0;
+    for (let wave = 0; wave < 1000; wave++) {
+      const before = children.length;
+      const results = Array.from({ length: MAX_COLLECTION_CHILDREN + 2 }, () => runner.run({ command: "sysctl_boot" }, DEADLINE));
+      for (const child of children.slice(before)) { child.ignoreTerm = true; child.ignoreKill = true; }
+      maxLive = Math.max(maxLive, runner.liveChildren());
+      // Each wave admits at most the idle slots; the rest fail now with no_slot and never queue.
+      const settled = await Promise.all(results.map(async (p, i) => {
+        if (i < children.length - before) return null;
+        return p;
+      }));
+      for (const r of settled.filter(r => r !== null)) expect(r).toEqual({ status: "failed", reason: "no_slot" });
+      await vi.advanceTimersByTimeAsync(DEADLINE + TERM_GRACE + KILL_REAP_GRACE);
+      maxLive = Math.max(maxLive, runner.liveChildren());
+      expect(runner.liveChildren()).toBeLessThanOrEqual(MAX_COLLECTION_CHILDREN);
+    }
+    expect(maxLive).toBe(MAX_COLLECTION_CHILDREN);
+    expect(runner.slotStates()).toEqual(Array(MAX_COLLECTION_CHILDREN).fill("slot_POISONED"));
+    expect(children).toHaveLength(MAX_COLLECTION_CHILDREN);
+    expect(await runner.run({ command: "ps" }, DEADLINE)).toEqual({ status: "failed", reason: "no_slot" });
+    expect(calls).toHaveLength(MAX_COLLECTION_CHILDREN);
+    for (const child of children) expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  it("spawns only closed-enum argv with exactly the fixed environment, and refuses operands that would widen it", async () => {
+    const { spawn, calls, children } = fakeSpawner();
+    const runner = new BoundedChildRunner({ spawn, timers: fakeRunnerTimers });
+    const operands: WatchCommandOperand[] = [
+      { command: "launchctl_print_gui", uid: OPERATOR, label: "ai.sanctuaryprotocol.watch" },
+      { command: "launchctl_print_system", label: "ai.sanctuaryprotocol.castle-wall.canary" },
+      { command: "launchctl_bootstrap_gui", uid: OPERATOR, plistPath: "/Users/operator-fixture/Library/LaunchAgents/x.plist" },
+      { command: "launchctl_bootout_gui", uid: OPERATOR, label: "ai.sanctuaryprotocol.watch" },
+      { command: "ps" }, { command: "id_name", uid: 502 }, { command: "id_uid", name: "sanctuary-agent-fixture" },
+      { command: "sysctl_boot" }, { command: "netstat" },
+    ];
+    expect(operands.map(o => o.command).sort()).toEqual([...WATCH_COMMANDS].sort());
+    for (const operand of operands) {
+      const result = runner.run(operand, DEADLINE);
+      children[children.length - 1]!.exitNow(0);
+      expect((await result).status).toBe("ok");
+    }
+    const files = new Set(calls.map(c => c.file));
+    expect([...files].sort()).toEqual(["/bin/launchctl", "/bin/ps", "/usr/bin/id", "/usr/sbin/netstat", "/usr/sbin/sysctl"]);
+    for (const call of calls) {
+      expect(call.env).toEqual({ PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" });
+      expect(call.env).toEqual({ ...WATCH_CHILD_ENV });
+      for (const arg of call.args) expect(arg).not.toMatch(/sudo|osascript|^su$|[;&|`$]/);
+    }
+    const refused: WatchCommandOperand[] = [
+      { command: "launchctl_print_system", label: "x; rm" },
+      { command: "launchctl_print_gui", uid: -1, label: "a" },
+      { command: "launchctl_bootstrap_gui", uid: OPERATOR, plistPath: "relative.plist" },
+      { command: "id_uid", name: "-o" },
+      { command: "unknown" } as unknown as WatchCommandOperand,
+    ];
+    for (const operand of refused) {
+      expect(await runner.run(operand, DEADLINE)).toEqual({ status: "failed", reason: "spawn_error" });
+    }
+    expect(calls).toHaveLength(operands.length);
+    expect(() => watchCommandArgv({ command: "id_name", uid: 2 ** 33 })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("publication under the observer", () => {
+  /** An in-memory publisher filesystem whose first rename of each wave can be paused. */
+  class MemoryFs implements PublisherFs {
+    files = new Map<string, string>();
+    dirs = new Set<string>();
+    openTemps = 0;
+    maxOpenTemps = 0;
+    renamedSequences: number[] = [];
+    hold: Promise<void> | null = null;
+    async mkdir(path: string): Promise<unknown> {
+      if (this.dirs.has(path)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
+      this.dirs.add(path);
+      return undefined;
+    }
+    async lstat(): Promise<{ uid: number; mode: number; isDirectory(): boolean }> { return { uid: OPERATOR, mode: 0o40700, isDirectory: () => true }; }
+    async open(path: string): Promise<PublisherFileHandle> {
+      if (this.files.has(path)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
+      this.openTemps++;
+      this.maxOpenTemps = Math.max(this.maxOpenTemps, this.openTemps);
+      let data = "";
+      this.files.set(path, "");
+      return {
+        stat: async () => ({ uid: OPERATOR, mode: 0o100600, isFile: () => true }),
+        writeFile: async text => { data = text; },
+        sync: async () => undefined,
+        close: async () => { if (this.files.has(path)) this.files.set(path, data); },
+      };
+    }
+    async rename(from: string, to: string): Promise<void> {
+      const hold = this.hold;
+      this.hold = null;
+      if (hold !== null) await hold;
+      const text = this.files.get(from)!;
+      this.files.delete(from);
+      this.openTemps--;
+      this.files.set(to, text);
+      this.renamedSequences.push((JSON.parse(text) as { sequence: number }).sequence);
+    }
+    async unlink(path: string): Promise<void> {
+      if (!this.files.delete(path)) throw Object.assign(new Error("absent"), { code: "ENOENT" });
+      this.openTemps--;
+    }
+    async readdir(): Promise<string[]> { return []; }
+  }
+
+  it("never lets an older record overwrite a newer one, and keeps one write in flight with one waiting, over 1000 waves", async () => {
+    const fs = new MemoryFs();
+    const publisher = new LivenessRecordPublisher({ fortressPath: "/fortress-fixture", fileName: "observer.json", instance: "observer-schedule-1", operatorUid: OPERATOR, fs });
+    const now = { ms: 1_794_225_600_000 };
+    const observer = observerWith(quietCollectors(() => Promise.resolve(absentRecords())), publisher, now);
+    const target = "/fortress-fixture/liveness/observer.json";
+    let lastSequence = 0;
+    for (let wave = 0; wave < 1000; wave++) {
+      let release!: () => void;
+      fs.hold = new Promise<void>(resolve => { release = resolve; });
+      const renamesBefore = fs.renamedSequences.length;
+      // Cycle A starts its write and pauses before rename; B and C complete while it is paused.
+      for (let k = 0; k < 3; k++) { await observer.tick(); now.ms += 10_000; }
+      lastSequence = observer.stats().sequence;
+      expect(fs.renamedSequences.length).toBe(renamesBefore);
+      release();
+      for (let i = 0; i < 50 && fs.renamedSequences.length < renamesBefore + 2; i++) await flush();
+      const wrote = fs.renamedSequences.slice(renamesBefore);
+      // One in flight and only the newest waiting: A then C, never B.
+      expect(wrote).toEqual([lastSequence - 2, lastSequence]);
+      expect((JSON.parse(fs.files.get(target)!) as { sequence: number }).sequence).toBe(lastSequence);
+    }
+    for (let i = 1; i < fs.renamedSequences.length; i++) expect(fs.renamedSequences[i]!).toBeGreaterThan(fs.renamedSequences[i - 1]!);
+    expect(fs.maxOpenTemps).toBe(1);
+    await observer.stop();
+  });
+});

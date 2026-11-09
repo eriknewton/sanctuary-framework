@@ -17,8 +17,10 @@ import {
   LABEL_BYTES,
   LAUNCHD_LEEWAY_MAX,
   LIVENESS_SCHEMA_VERSION,
+  MAX_MCP_SCRIPT_PATHS,
   MAX_MESSAGING_PREFIXES,
   OBSERVER_PERIOD,
+  PATH_BYTES,
   POLL_BACKOFF_CAP_MAX,
   RECOVERY_SAMPLES_PER_COMPONENT,
   SECOND,
@@ -194,6 +196,8 @@ export interface CanaryConfirmationRecord {
 export interface CanaryFailureRecord { seq: number; admitted_at_ms: number; failed_at_ms: number }
 export interface CanaryLateRecord { seq: number; admitted_at_ms: number; settled_at_ms: number }
 export interface CanaryAllowSighting { captured_at_ms: number; principal: "agent" | "gate" }
+/** The observer's retained allow sighting: the daemon's sighting tagged with the daemon instance that reported it. */
+export interface RetainedCanaryAllowSighting extends CanaryAllowSighting { daemon_instance: string }
 export interface DaemonCanaryEvidence {
   adapter: "uid" | "unsupported";
   last_confirmation: CanaryConfirmationRecord | null;
@@ -365,6 +369,8 @@ export interface ObserverWallPart {
   full_service: { loaded: boolean; latched: boolean; pid: number | null; start_identity: string | null; last_charge_at_ms: number | null };
   session: "full" | "safe_mode_only" | "logged_out" | "reboot_no_login";
   canary_integrity: { passed: boolean; checked_at_ms: number } | null;
+  /** Required and nullable: a missing key never parses, so a missing fault carrier can never read as no fault. */
+  canary_allow_sighting: RetainedCanaryAllowSighting | null;
   recovery: ComponentRecovery;
 }
 export interface ObserverAgentPart {
@@ -425,13 +431,23 @@ function wallPart(raw: Record<string, unknown>, recoveryValue: unknown): ParsedR
     const checked_at_ms = r ? c.uint(r.checked_at_ms, "raw.canary_integrity.checked_at_ms") : undefined;
     canary_integrity = passed === undefined || checked_at_ms === undefined ? undefined : { passed, checked_at_ms };
   }
+  let canary_allow_sighting: ObserverWallPart["canary_allow_sighting"] | undefined = null;
+  if (raw.canary_allow_sighting !== null) {
+    const p = "raw.canary_allow_sighting";
+    const r = c.object(raw.canary_allow_sighting, p, ["captured_at_ms", "principal", "daemon_instance"]);
+    const captured_at_ms = r ? c.uint(r.captured_at_ms, `${p}.captured_at_ms`) : undefined;
+    // The same closed principal set as the daemon's sighting: operator and other subjects never parse.
+    const principal = r ? c.enumeration(r.principal, `${p}.principal`, ["agent", "gate"] as const) : undefined;
+    const daemon_instance = r ? c.label(r.daemon_instance, `${p}.daemon_instance`) : undefined;
+    canary_allow_sighting = captured_at_ms === undefined || !principal || daemon_instance === undefined ? undefined : { captured_at_ms, principal, daemon_instance };
+  }
   const rec = recovery(c, recoveryValue, "recovery.wall");
   if (c.failures.length > 0 || daemon_ref === undefined || !status || resolved_at_ms === undefined || loaded === undefined ||
       latched === undefined || pid === undefined || start_identity === undefined || last_charge_at_ms === undefined ||
-      !session || canary_integrity === undefined || !rec) return { ok: false, failures: c.failures.length > 0 ? c.failures : ["raw"] };
+      !session || canary_integrity === undefined || canary_allow_sighting === undefined || !rec) return { ok: false, failures: c.failures.length > 0 ? c.failures : ["raw"] };
   return {
     ok: true,
-    value: { daemon_ref, availability: { status, resolved_at_ms }, full_service: { loaded, latched, pid, start_identity, last_charge_at_ms }, session, canary_integrity, recovery: rec },
+    value: { daemon_ref, availability: { status, resolved_at_ms }, full_service: { loaded, latched, pid, start_identity, last_charge_at_ms }, session, canary_integrity, canary_allow_sighting, recovery: rec },
   };
 }
 
@@ -507,8 +523,9 @@ function agentPart(raw: Record<string, unknown>, recoveryValue: unknown): Parsed
   return { ok: true, value: { census: { status, samples }, gateway, optional_reply, mcp, recovery: rec } };
 }
 
-const OBSERVER_WALL_RAW = ["daemon_ref", "availability", "full_service", "session", "canary_integrity"] as const;
-const OBSERVER_AGENT_RAW = ["census", "gateway", "optional_reply", "mcp"] as const;
+// Must match the record assembly in server/src/castle-wall/liveness/observer.ts; the observer parity test reads both lists.
+export const OBSERVER_WALL_RAW = ["daemon_ref", "availability", "full_service", "session", "canary_integrity", "canary_allow_sighting"] as const;
+export const OBSERVER_AGENT_RAW = ["census", "gateway", "optional_reply", "mcp"] as const;
 
 /** Strictly parse an observer record. Envelope failures refuse both components. */
 export function parseObserverRecord(value: unknown): ParsedObserver {
@@ -533,6 +550,8 @@ export function parseObserverRecord(value: unknown): ParsedObserver {
 // config.json
 // ---------------------------------------------------------------------------
 export interface MessagingPrefix { prefix: string; source: string }
+/** The optional MCP stale-child commissioning block. */
+export interface McpConfig { harness_label: string; script_paths: string[] }
 export interface PtbConfirmation {
   version: string;
   timeout_s: number;
@@ -552,6 +571,8 @@ export interface LivenessConfig {
   gateway_selector: { process_name: string } | undefined;
   ptb: PtbConfirmation | undefined;
   gateway_egress: "direct" | "gate_proxied" | undefined;
+  /** null when the block is absent (no check), undefined when it is invalid. */
+  mcp: McpConfig | null | undefined;
   commissioning: { wall: boolean | undefined; agent: boolean | undefined; alert_drill: boolean | undefined };
 }
 export type ParsedConfig =
@@ -560,8 +581,12 @@ export type ParsedConfig =
 
 const CONFIG_FIELDS = [
   "schema_version", "record", "agent_uid", "gate_uid", "launchd_leeway_s", "poll_backoff_cap_s", "messaging",
-  "gateway_selector", "ptb", "gateway_egress", "commissioning",
+  "gateway_selector", "ptb", "gateway_egress", "commissioning", "mcp",
 ] as const;
+/** The launchd label charset, narrower than the general label rule, so no `/` or space reaches a launchctl argv. */
+const LAUNCHD_LABEL_TEXT = /^[A-Za-z0-9._-]+$/;
+// eslint-disable-next-line no-control-regex
+const CONTROL_TEXT = /[\x00-\x1f\x7f]/;
 
 /**
  * Parse `config.json`. A bad `agent_uid`, `gate_uid`, `launchd_leeway_s`, wall
@@ -632,6 +657,20 @@ export function parseConfigRecord(value: unknown): ParsedConfig {
     }
   }
   const gateway_egress = "gateway_egress" in o ? agent.enumeration(o.gateway_egress, "gateway_egress", ["direct", "gate_proxied"] as const) : undefined;
+  let mcp: McpConfig | null | undefined = null;
+  if ("mcp" in o) {
+    const m = agent.object(o.mcp, "mcp", ["harness_label", "script_paths"]);
+    const harness_label = m && typeof m.harness_label === "string" && m.harness_label.length <= LABEL_BYTES && LAUNCHD_LABEL_TEXT.test(m.harness_label)
+      ? m.harness_label : agent.fail("mcp.harness_label");
+    const list = m ? agent.array(m.script_paths, "mcp.script_paths", MAX_MCP_SCRIPT_PATHS) : undefined;
+    const script_paths: string[] = [];
+    if (list && list.length === 0) agent.fail("mcp.script_paths");
+    list?.forEach((item, index) => {
+      const valid = typeof item === "string" && item.startsWith("/") && !CONTROL_TEXT.test(item) && new TextEncoder().encode(item).length <= PATH_BYTES;
+      if (valid) script_paths.push(item); else agent.fail(`mcp.script_paths[${index}]`);
+    });
+    mcp = harness_label !== undefined && list !== undefined && list.length > 0 && script_paths.length === list.length ? { harness_label, script_paths } : undefined;
+  }
   let commissioning: LivenessConfig["commissioning"] = { wall: undefined, agent: undefined, alert_drill: undefined };
   if ("commissioning" in o) {
     const raw = o.commissioning;
@@ -651,7 +690,7 @@ export function parseConfigRecord(value: unknown): ParsedConfig {
     value: {
       agent_uid, gate_uid, launchd_leeway_ms: leeway === undefined ? undefined : leeway * SECOND,
       poll_backoff_cap_ms: backoff === undefined ? undefined : backoff * SECOND,
-      messaging_ipv4, messaging_ipv6, gateway_selector, ptb, gateway_egress, commissioning,
+      messaging_ipv4, messaging_ipv6, gateway_selector, ptb, gateway_egress, mcp, commissioning,
     },
     wallInvalid: wall.failures,
     agentInvalid: agent.failures,

@@ -145,6 +145,7 @@
             "passed": true,
             "checked_at_ms": 1794225595000
           },
+          "canary_allow_sighting": null,
           "census": {
             "status": "ok",
             "samples": [
@@ -821,6 +822,67 @@
         "exit": 1,
         "wall_reasons_include": [
           "canary_unprovisioned"
+        ]
+      }
+    },
+    {
+      "name": "wall down canary allow retained across daemon restart",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.daemon_instance",
+          "value": "daemon-fixture-2"
+        },
+        {
+          "op": "set",
+          "path": "observer.value.raw.daemon_ref",
+          "value": {
+            "daemon_instance": "daemon-fixture-2",
+            "sequence": 100
+          }
+        },
+        {
+          "op": "set",
+          "path": "observer.value.raw.canary_allow_sighting",
+          "value": {
+            "captured_at_ms": 1794225000000,
+            "principal": "agent",
+            "daemon_instance": "daemon-fixture-1"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "canary_destination_allowed"
+        ]
+      }
+    },
+    {
+      "name": "wall ok canary allow aged out of history window",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.canary_allow_sighting",
+          "value": {
+            "captured_at_ms": 1794223799999,
+            "principal": "gate",
+            "daemon_instance": "daemon-fixture-1"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_OK_IDLE",
+        "wall_alarm": false,
+        "exit": 0,
+        "wall_reasons": [
+          "none"
         ]
       }
     },

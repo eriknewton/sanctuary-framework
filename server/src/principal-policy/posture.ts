@@ -99,6 +99,7 @@ export {
 
 import type { CastleWallEventType } from "../castle-wall/audit/events.js";
 import { parseCastleWallSignedCanonicalBody } from "../castle-wall/audit-attribution.js";
+import { isMonitoringOriginDrop } from "../castle-wall/liveness/monitoring-origin.js";
 import { destinationHostOf, destinationIpOf, destinationPortOf, CONTROL_CHARS } from "../castle-wall/export/map.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -769,9 +770,13 @@ export async function buildCastleWallPosture(
       if (mapped === null || !inWindow || isDuplicate) countThisEntry = false;
       else countOp = mapped;
     }
+    // A canary drop is the wall's own heartbeat, so it leaves the blocked count while staying arm and freshness evidence below; drops only.
+    // Must match isMonitoringOriginDestination in server/src/castle-wall/liveness/monitoring-origin.ts.
+    const canaryDrop = countOp === "egress_blocked" && isMonitoringOriginDrop("egress_blocked",
+      reResult.basis === "producer_signed_verified" ? parseCastleWallSignedCanonicalBody(entry.details ?? {})?.details : entry.details);
     if (countThisEntry) {
       if (countOp === "egress_allowed") verdictCounts.allowed += 1;
-      else if (countOp === "egress_blocked") verdictCounts.blocked += 1;
+      else if (countOp === "egress_blocked" && !canaryDrop) verdictCounts.blocked += 1;
       else if (countOp === "operator_decision") verdictCounts.operator_decisions += 1;
     }
 
@@ -1374,12 +1379,18 @@ export async function buildAuditDigest(
           !isDuplicate;
       }
     }
-    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked") {
+    // A canary drop is the wall's own heartbeat: it stays enforcement evidence above but leaves kernel_blocks and the
+    // blocked-destination rows; drops only, so kernel_allows still counts an allow to the canary tuple.
+    // Must match isMonitoringOriginDestination in server/src/castle-wall/liveness/monitoring-origin.ts.
+    const digestSigned = signedAttribution?.basis === "producer_signed_verified";
+    const digestCanaryDrop = entry.operation === "egress_blocked" &&
+      isMonitoringOriginDrop("egress_blocked", digestSigned ? parseCastleWallSignedCanonicalBody(entry.details ?? {})?.details : entry.details);
+    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked" && !digestCanaryDrop) {
       kernelBlocks += 1;
       // Every counted block enters exactly one row and only counted blocks enter;
       // the sum before the cap equals kernel_blocks under the same evidence gate.
       // A producer-verified destination describes this signed flow, never stored top-level metadata.
-      const signed = signedAttribution?.basis === "producer_signed_verified";
+      const signed = digestSigned;
       const bodyDetails = signed ? parseCastleWallSignedCanonicalBody(entry.details ?? {})?.details : entry.details;
       const destination = blockedDestinationLabel(isRecord(bodyDetails) ? bodyDetails : undefined);
       const capturedAt = signed ? signedAttribution?.signedCapturedAtMs ?? null : ts;

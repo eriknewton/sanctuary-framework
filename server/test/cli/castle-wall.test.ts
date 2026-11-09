@@ -55,6 +55,7 @@ import {
 } from "../../src/castle-wall/runtime/linux-activation-gate.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
+import { parseTrustAnchor } from "../../src/cli/install.js";
 import { runInit } from "../../src/wrap/init.js";
 import {
   CrossProcessLockError,
@@ -683,9 +684,57 @@ describe("castle-wall CLI verbs", () => {
       expect(code).toBe(1);
       expect(out.text()).toContain("Content filter: enabled");
       expect(out.text()).toContain(
-        "Dead-man lease broadcast: disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
+        "Last CLI arm request (advisory): disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
       );
       expect(out.text()).not.toContain("Dead-man lease: disarmed");
+    });
+
+    async function leaseStatusText(armed: boolean, filterState: "enabled" | "disabled"): Promise<string> {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-lease.json"),
+        JSON.stringify({ armed, ttl_seconds: 60, heartbeat_interval_seconds: 5, updated_at: "2026-06-26T08:00:00.000Z", source: "castle-wall-cli" }, null, 2) + "\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({ stdout: JSON.stringify({ ok: true, action: "status", state: filterState }) + "\n", exitCode: 0 });
+      await runStatus([], {
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () => "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+      return out.text();
+    }
+
+    it("labels an armed lease as the last CLI arm request, advisory", async () => {
+      expect(await leaseStatusText(true, "enabled")).toContain(
+        "Last CLI arm request (advisory): armed; content-filter=enabled; ttl=60s; heartbeat=5s; updated=2026-06-26T08:00:00.000Z\n",
+      );
+    });
+
+    it("marks an armed lease not enforcement while the content filter is not enabled", async () => {
+      expect(await leaseStatusText(true, "disabled")).toContain(
+        "Last CLI arm request (advisory, not enforcement): armed; content-filter=disabled; ttl=60s; heartbeat=5s; updated=2026-06-26T08:00:00.000Z\n",
+      );
+    });
+
+    it("leaves the install probe's parse of the status text unchanged by the lease label", async () => {
+      // Replicates the probe's three parsed lines over the same fixture with the new and the previous label text.
+      const probe = (text: string) => ({
+        contentFilter: text.includes("Content filter: enabled") ? "enabled" : text.includes("Content filter: disabled") ? "disabled" : "unknown",
+        enforcement: text.includes("Enforcement availability: live") ? "live" : text.includes("Enforcement availability: unavailable") ? "unavailable" : "undetermined",
+        trustAnchor: parseTrustAnchor(text),
+      });
+      for (const [armed, state] of [[true, "enabled"], [true, "disabled"], [false, "enabled"]] as const) {
+        const text = await leaseStatusText(armed, state);
+        const previous = text
+          .replace("Last CLI arm request (advisory, not enforcement): armed", "Dead-man lease (advisory broadcast, not enforcement): armed")
+          .replace(/Last CLI arm request \(advisory\): (armed|disarmed)/, "Dead-man lease broadcast: $1");
+        expect(previous).not.toBe(text);
+        expect(probe(text)).toEqual(probe(previous));
+      }
     });
 
     it("reports the filter disabled (sysext installed but not filtering)", async () => {
