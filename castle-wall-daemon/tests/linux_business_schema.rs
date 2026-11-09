@@ -214,3 +214,48 @@ fn every_business_branch_verifies_only_for_its_enrolled_subject() {
         assert!(!records::verify(bytes.as_bytes(), &invalid, &pin, &public));
     }
 }
+
+#[test]
+fn shared_join_vectors() {
+    // Must match both TS join executors: every corpus id, result and complete final state participates without filtering.
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../src/business_profile/record_join_vectors.json"
+    ))
+    .unwrap();
+    assert_eq!(corpus["version"], 1); // Initial shared join format version.
+    assert_eq!(corpus["schema_digest"], records_schema::SCHEMA_DIGEST);
+    let cases = corpus["cases"].as_array().unwrap();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        assert!(ids.insert(id), "duplicate {id}");
+        let mut state = case["initial"].clone();
+        let mut accepted_prefix = 0;
+        let mut refusal_code = Value::Null;
+        for record in case["records"].as_array().unwrap() {
+            let before = state.clone();
+            match records::advance(&state, record) {
+                Ok(next) => {
+                    state = next;
+                    accepted_prefix += 1;
+                }
+                Err(code) => {
+                    assert_eq!(state, before, "{id}");
+                    refusal_code = json!(code);
+                    break;
+                }
+            }
+        }
+        assert_eq!(refusal_code, case["expect"]["refusal_code"], "{id}");
+        let result = json!({"id":id,"accepted_prefix":accepted_prefix,"refusal_code":refusal_code,"final_state":state});
+        let mut want = case["expect"].clone();
+        want["id"] = json!(id);
+        assert_eq!(result, want, "{id}");
+        actual.push(result);
+        expected.push(want);
+    }
+    assert_eq!(ids.len(), cases.len());
+    assert_eq!(actual, expected);
+}

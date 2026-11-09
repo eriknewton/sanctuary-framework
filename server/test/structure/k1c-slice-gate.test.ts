@@ -63,10 +63,19 @@ const expectedImports={
     "./binding-store.js",
     "./contract.js",
     "./provision.js",
+    "./record-joins.js",
     "./record-signer.js",
     "./service.js",
     "node:fs",
     "node:tty"
+  ],
+  "signing/record-joins.ts": [
+    "../linux-business/producer-custody.js",
+    "./contract.js",
+    "./linux-business-records.js",
+    "./strict-verifier.js",
+    "node:crypto",
+    "zod"
   ],
   "signing/strict-verifier.ts": [
     "../core/identity.js",
@@ -99,7 +108,18 @@ it("pins full inert dispatch and every direct seam import edge",()=>{
 });
 it("pins native crash settlement bytes and excludes classifier paths from all live roots",()=>{
   expect(createHash("sha256").update(readFileSync("../castle-wall-daemon/src/business_profile/signer_service.rs")).digest("hex")).toBe("3ffd1c4c222db6620f064c1ea313d3eacdbef1956aff8f9abbe983ffa2fe5427");
-  expect(createHash("sha256").update(readFileSync("src/signing/worker.ts")).digest("hex")).toBe("fabb257c2d06162ef567a06da8837762d7a7b71d141da7845fd8eecfbf327eb3");
+  // The original protocol must match its byte pin after removing only the explicitly pinned pure seam.
+  const worker = readFileSync("src/signing/worker.ts", "utf8");
+  const additions = [
+    'import { advance, type JoinState, type JoinRecord, type JoinResult } from "./record-joins.js";\n',
+    '/** Validation-only entrypoint; successful joins convey no signing or installed authority. */\nexport function validateBusinessJoin(state: JoinState, record: JoinRecord): JoinResult {\n  // Must match records.rs::advance and the shared corpus consumers without widening service.ts inert dispatch.\n  return advance(state, record);\n}\n\n',
+  ];
+  let protocol = worker;
+  for (const addition of additions) { expect(protocol.split(addition)).toHaveLength(2); protocol = protocol.replace(addition, ""); }
+  const guard = '// Only the directly executed CommonJS release worker may enter the attended protocol.\nif (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) void main().then(acknowledgeWipe, acknowledgeWipe);';
+  expect(protocol.split(guard)).toHaveLength(2);
+  protocol = protocol.replace(guard, 'void main().then(acknowledgeWipe, acknowledgeWipe);');
+  expect(createHash("sha256").update(protocol).digest("hex")).toBe("fabb257c2d06162ef567a06da8837762d7a7b71d141da7845fd8eecfbf327eb3");
   const files=readdirSync(sourceRoot,{recursive:true}).filter((n):n is string=>typeof n==="string"&&n.endsWith(".ts"));
   const edges=new Map(files.map(name=>[resolve(sourceRoot,name),dependencies(name).filter(s=>s.startsWith('.')).map(s=>resolve(sourceRoot,dirname(name),s.replace(/\.js$/,".ts")))]));
   const forbidden=["signing/custody-transaction.ts","signing/durable-store.ts","linux-business/activation-anchor.ts","signing/lifecycle.ts"].map(n=>resolve(sourceRoot,n));
