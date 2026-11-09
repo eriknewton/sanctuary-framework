@@ -113,11 +113,11 @@
     "libp2p": "2.10.0",
     "lmdb": "3.5.9",
     "uint8arrays": "6.1.1",
-    "viem": "2.57.14"
+    "viem": "2.57.16"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@playwright/test": "1.64.1",
+    "@playwright/test": "1.65.0",
     "@stryker-mutator/core": "10.1.1",
     "@stryker-mutator/vitest-runner": "10.1.1",
     "@types/node": "26.6.6",
@@ -129,7 +129,7 @@
     "tsx": "4.23.15",
     "typescript": "5.9.3",
     "typescript-eslint": "8.72.1",
-    "vite": "8.3.5",
+    "vite": "8.3.6",
     "vitest": "4.1.11"
   },
   "engines": {
