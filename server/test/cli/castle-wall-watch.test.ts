@@ -492,10 +492,21 @@ describe("uninstall-watch", () => {
 // ---------------------------------------------------------------------------
 describe("run-watch", () => {
   const refuse = () => Promise.reject(new Error("fixture collector refused"));
-  const failingCollectors: ObserverCollectors = {
-    readRecords: refuse, readBootId: refuse, queryAvailability: refuse, printFullAgent: refuse, readFullAgentState: refuse,
-    readProcesses: refuse, printHarness: refuse, collectCanaryFacts: refuse,
-  };
+  /**
+   * Every collector fails, except that the first cycle's boot and record reads resolve the instance start (an instance
+   * publishes nothing until it has read its own record and a boot), so the later failing cycles still publish.
+   */
+  function failingCollectors(): ObserverCollectors {
+    let bootReads = 0;
+    let recordReads = 0;
+    const absent = { status: "absent" as const };
+    return {
+      readRecords: () => recordReads++ === 0 ? Promise.resolve({ directory: absent, daemon: absent, observer: absent, config: absent, readDeadlineHit: false }) : refuse(),
+      readBootId: () => bootReads++ === 0 ? Promise.resolve("boot-fixture-current") : refuse(),
+      queryAvailability: refuse, printFullAgent: refuse, readFullAgentState: refuse,
+      readProcesses: refuse, printHarness: refuse, collectCanaryFacts: refuse,
+    };
+  }
   class CountingTimers {
     active = new Set<number>();
     private next = 1;
@@ -511,7 +522,7 @@ describe("run-watch", () => {
     const sampler = new CensusSampler({ series, runNetstat: async () => ({ status: "failed" }), context: () => observer!.samplingContext(), clock: { nowMs: () => 1, uptimeMs: () => 1 }, timers });
     const publishes = { started: 0, finished: 0 };
     observer = new LivenessObserver({
-      fortressId: "fortress-0123456789abcdef", hostId: "host-fixture", operatorUid: UID, collectors: failingCollectors, sampler, series,
+      fortressId: "fortress-0123456789abcdef", hostId: "host-fixture", operatorUid: UID, collectors: failingCollectors(), sampler, series,
       publisher: { publish: () => { publishes.started++; return new Promise<void>(done => setImmediate(() => { publishes.finished++; done(); })); } },
       clock: { nowMs: () => 1_794_225_600_000, uptimeMs: () => 36_000_000 }, timers, instance: "observer-run-watch-1",
     });

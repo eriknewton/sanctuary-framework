@@ -24,6 +24,7 @@ import {
   EvidenceFailureSet,
   LivenessObserver,
   agentCycleClean,
+  resolvedSeedRead,
   wallCycleClean,
   type AvailabilityStatus,
   type ObserverCollectors,
@@ -82,6 +83,8 @@ class World {
   processes: [ProcessRow[], ProcessRow[]] = [psRows(), psRows()];
   published: Record<string, unknown>[] = [];
   publishFailNext = false;
+  /** The shared reader hit its deadline: every record reads custody_invalid read_deadline. */
+  recordsDeadline = false;
 
   constructor() { (this.config.commissioning as Record<string, unknown>).agent = false; }
   advance(ms: number): void { this.now += ms; this.uptime += ms; }
@@ -108,13 +111,19 @@ class World {
 
   collectors(): ObserverCollectors {
     return {
-      readRecords: () => this.gate("readRecords", () => ({
+      readRecords: () => this.gate("readRecords", () => this.recordsDeadline ? {
+        directory: { status: "ok" as const },
+        daemon: { status: "custody_invalid" as const, cause: "read_deadline" as const },
+        observer: { status: "custody_invalid" as const, cause: "read_deadline" as const },
+        config: { status: "custody_invalid" as const, cause: "read_deadline" as const },
+        readDeadlineHit: true,
+      } : {
         directory: { status: "ok" as const },
         daemon: this.daemonPresent ? { status: "present" as const, value: this.daemonRecord() } : { status: "absent" as const },
         observer: this.observerRecord === null ? { status: "absent" as const } : { status: "present" as const, value: structuredClone(this.observerRecord) },
         config: { status: "present" as const, value: structuredClone(this.config) },
         readDeadlineHit: false,
-      })),
+      }),
       readBootId: () => this.gate("readBootId", () => this.boot),
       queryAvailability: () => {
         if (this.availability === "reject") return Promise.reject(new Error("socket"));
@@ -430,12 +439,15 @@ describe("evidence failures", () => {
     ["readFullAgentState", "wall", "observation_invalid"],
     ["readProcesses", "wall", "process_identity_unknown"],
     ["collectCanaryFacts", "wall", "canary_unprovisioned"],
-  ])("a %s failure gives %s %s and still publishes", async (name, component, reason) => {
+  ])("a %s failure gives %s %s and still publishes once the instance start has resolved", async (name, component, reason) => {
     const world = new World();
+    const observer = observerFor(world);
+    await cycle(observer);
     world.fail.add(name);
-    const record = await cycle(observerFor(world));
+    world.advance(OBSERVER_PERIOD);
+    const record = await cycle(observer);
     expect(failuresOf(record)).toContainEqual({ component, reason });
-    expect(world.published).toHaveLength(1);
+    expect(world.published).toHaveLength(2);
   });
 
   it("an availability failure gives one daemon_unresponsive entry and a harness failure an agent observation_invalid", async () => {
@@ -451,9 +463,12 @@ describe("evidence failures", () => {
 
   it("keeps 1000 all-failure cycles bounded, deduplicated and published", async () => {
     const world = new World();
+    const observer = observerFor(world);
+    // The instance start resolves first; from then on every cycle publishes whatever fails.
+    await cycle(observer);
+    world.advance(OBSERVER_PERIOD);
     for (const name of ["readRecords", "readBootId", "printFullAgent", "readFullAgentState", "readProcesses", "collectCanaryFacts", "printHarness"] as const) world.fail.add(name);
     world.availability = "reject";
-    const observer = observerFor(world);
     for (let i = 0; i < 1000; i++) {
       const record = await cycle(observer);
       const failures = failuresOf(record);
@@ -461,7 +476,7 @@ describe("evidence failures", () => {
       expect(new Set(failures.map(f => `${f.component}:${f.reason}`)).size).toBe(failures.length);
       world.advance(OBSERVER_PERIOD);
     }
-    expect(world.published).toHaveLength(1000);
+    expect(world.published).toHaveLength(1001);
   });
 
   it("saturates overflow into one observation_invalid entry per component", () => {
@@ -656,5 +671,163 @@ describe("faults and sightings across a failed publish and a future stamp", () =
     world.advance(OBSERVER_PERIOD);
     const seedAt = world.now;
     expect(raw(await cycle(restarted)).canary_allow_sighting).toEqual({ captured_at_ms: seedAt, principal: "gate", daemon_instance: "daemon-fixture-1" });
+  });
+});
+
+describe("a failed boot or seed read never loses a published allow sighting", () => {
+  /** Publish an agent allow, then restart the daemon so only the observer record still carries it. */
+  async function sightingOnlyInObserverRecord(world: World, observer: LivenessObserver): Promise<number> {
+    await recoverToOk(world, observer);
+    const t = world.now - SECOND;
+    world.allowed = { captured_at_ms: t, principal: "agent" };
+    world.advance(OBSERVER_PERIOD);
+    await cycle(observer);
+    world.daemonInstance = "daemon-fixture-2";
+    world.allowed = null;
+    world.advance(OBSERVER_PERIOD);
+    await cycle(observer);
+    expect(raw(world.observerRecord as Record<string, unknown>).canary_allow_sighting).not.toBeNull();
+    return t;
+  }
+  /** Drive a healthy observer across the sighting's HISTORY_WINDOW and require the wall fault at every step, then its expiry. */
+  async function faultedAcrossWindow(world: World, observer: LivenessObserver, t: number): Promise<void> {
+    const steps = 6;
+    for (let i = 0; i <= steps; i++) {
+      const at = Math.min(t + HISTORY_WINDOW, world.now + (i === 0 ? OBSERVER_PERIOD : HISTORY_WINDOW / steps));
+      world.advance(at - world.now);
+      await cycle(observer);
+      expect(world.envelope().wall.reasons, `at sighting age ${world.now - t}`).toContain("canary_destination_allowed");
+      if (world.now >= t + HISTORY_WINDOW) break;
+    }
+    world.advance(1);
+    await cycle(observer);
+    expect(world.envelope().wall.reasons).not.toContain("canary_destination_allowed");
+  }
+
+  it("a failure record keeps the last validated boot, so a restarted observer still seeds the sighting", async () => {
+    const world = new World();
+    const t = await sightingOnlyInObserverRecord(world, observerFor(world));
+    const running = observerFor(world, world.collectors(), "observer-test-1b");
+    await cycle(running);
+    world.advance(OBSERVER_PERIOD);
+    world.fail.add("readBootId");
+    await cycle(running);
+    const failed = world.observerRecord as Record<string, unknown>;
+    expect(failed.boot_id).toBe(world.boot);
+    expect(raw(failed).canary_allow_sighting).not.toBeNull();
+    expect(failuresOf(failed)).toContainEqual({ component: "wall", reason: "time_untrusted" });
+    expect(failuresOf(failed)).toContainEqual({ component: "agent", reason: "time_untrusted" });
+    world.fail.delete("readBootId");
+    const restarted = observerFor(world, world.collectors(), "observer-test-2");
+    await faultedAcrossWindow(world, restarted, t);
+  });
+
+  it("an instance whose first boot read fails publishes nothing, so a later restart still seeds the sighting", async () => {
+    const world = new World();
+    const t = await sightingOnlyInObserverRecord(world, observerFor(world));
+    const predecessor = world.observerRecord;
+    const published = world.published.length;
+    const second = observerFor(world, world.collectors(), "observer-test-2");
+    world.fail.add("readBootId");
+    for (let i = 0; i < 3; i++) { world.advance(OBSERVER_PERIOD); await cycle(second); }
+    expect(world.published).toHaveLength(published);
+    expect(world.observerRecord).toBe(predecessor);
+    world.fail.delete("readBootId");
+    const third = observerFor(world, world.collectors(), "observer-test-3");
+    await faultedAcrossWindow(world, third, t);
+  });
+
+  it("an instance whose boot read recovers seeds from the predecessor record it never overwrote", async () => {
+    const world = new World();
+    const t = await sightingOnlyInObserverRecord(world, observerFor(world));
+    const predecessor = world.observerRecord;
+    const published = world.published.length;
+    const second = observerFor(world, world.collectors(), "observer-test-2");
+    world.fail.add("readBootId");
+    world.advance(OBSERVER_PERIOD);
+    await cycle(second);
+    expect(world.published, "the unresolved start publishes nothing").toHaveLength(published);
+    expect(world.observerRecord).toBe(predecessor);
+    world.fail.delete("readBootId");
+    await faultedAcrossWindow(world, second, t);
+  });
+
+  it.each(["collector failure", "read deadline"] as const)("a seed read that fails by %s is not proof of no seed: nothing publishes until it resolves", async variant => {
+    const world = new World();
+    const t = await sightingOnlyInObserverRecord(world, observerFor(world));
+    const published = world.published.length;
+    const second = observerFor(world, world.collectors(), "observer-test-2");
+    if (variant === "collector failure") world.fail.add("readRecords"); else world.recordsDeadline = true;
+    for (let i = 0; i < 3; i++) { world.advance(OBSERVER_PERIOD); await cycle(second); }
+    expect(world.published).toHaveLength(published);
+    expect(second.stats().sequence).toBe(0);
+    world.fail.delete("readRecords");
+    world.recordsDeadline = false;
+    await faultedAcrossWindow(world, second, t);
+  });
+
+  it("a valid boot, a failed read, then the same boot again: the fault is recorded, recovery is re-earned and the sighting survives", async () => {
+    for (const withSighting of [false, true]) {
+      const world = new World();
+      const observer = observerFor(world);
+      await recoverToOk(world, observer);
+      if (withSighting) {
+        world.allowed = { captured_at_ms: world.now - SECOND, principal: "gate" };
+        world.advance(OBSERVER_PERIOD);
+        await cycle(observer);
+        world.daemonInstance = "daemon-fixture-2";
+        world.allowed = null;
+      } else {
+        expect(world.envelope().wall.state.startsWith("wall_OK_")).toBe(true);
+      }
+      const sighting = raw(observer.latestRecord()!).canary_allow_sighting;
+      expect(sighting === null).toBe(!withSighting);
+      world.advance(OBSERVER_PERIOD);
+      world.fail.add("readBootId");
+      const failedUptime = world.uptime;
+      const failed = await cycle(observer);
+      expect(failed.boot_id, "the last validated boot").toBe(world.boot);
+      expect(wallRec(failed)).toEqual({ samples: [], fault_uptime_ms: failedUptime });
+      expect(agentRec(failed)).toEqual({ samples: [], fault_uptime_ms: failedUptime });
+      expect(raw(failed).canary_allow_sighting).toEqual(sighting);
+      world.fail.delete("readBootId");
+      world.advance(OBSERVER_PERIOD);
+      world.canaryAt = world.now - SECOND;
+      const resumed = await cycle(observer);
+      expect(raw(resumed).canary_allow_sighting).toEqual(sighting);
+      if (withSighting) {
+        // The retained sighting keeps the wall faulted through the failed read and after it, inside its window.
+        expect(world.envelope(failed).wall.reasons).toContain("canary_destination_allowed");
+        expect(world.envelope(resumed).wall.reasons).toContain("canary_destination_allowed");
+        world.advance(RECOVERY_GAP);
+        expect(raw(await cycle(observer)).canary_allow_sighting).toEqual(sighting);
+        expect(world.envelope().wall.reasons).toContain("canary_destination_allowed");
+        continue;
+      }
+      // Without one, the same boot keeps the failed cycle's fault and recovery is re-earned after it.
+      expect(wallRec(resumed).fault_uptime_ms, "the same boot keeps the fault").toBe(failedUptime);
+      expect(wallRec(resumed).samples).toHaveLength(1);
+      expect(world.envelope().wall.state).toBe("wall_RECOVERING");
+      world.advance(RECOVERY_GAP);
+      const paired = await cycle(observer);
+      expect(wallRec(paired).samples).toHaveLength(2);
+      expect(wallRec(paired).fault_uptime_ms).toBe(failedUptime);
+      expect(world.envelope().wall.state.startsWith("wall_OK_"), world.envelope().wall.reasons.join(",")).toBe(true);
+    }
+  });
+});
+
+describe("instance-start seed read resolution", () => {
+  const base = { directory: { status: "ok" as const }, daemon: { status: "absent" as const }, config: { status: "absent" as const }, readDeadlineHit: false };
+  it("resolves only a read that reached a verdict, and never reads a refused or unfinished read as no seed", () => {
+    expect(resolvedSeedRead({ ...base, observer: { status: "absent" } })).toEqual({ status: "absent" });
+    expect(resolvedSeedRead({ ...base, observer: { status: "unparsable" } })).toEqual({ status: "unparsable" });
+    expect(resolvedSeedRead({ ...base, observer: { status: "present", value: { a: 1 } } })).toEqual({ status: "present", value: { a: 1 } });
+    expect(resolvedSeedRead({ ...base, directory: { status: "absent" }, observer: { status: "absent" } })).toEqual({ status: "absent" });
+    for (const cause of ["owner", "mode", "size", "not_regular_file", "read_deadline"] as const) {
+      expect(resolvedSeedRead({ ...base, observer: { status: "custody_invalid", cause } }), cause).toBeNull();
+    }
+    expect(resolvedSeedRead({ ...base, directory: { status: "custody_invalid", cause: "owner" }, observer: { status: "absent" } })).toBeNull();
+    expect(resolvedSeedRead({ ...base, observer: { status: "absent" }, readDeadlineHit: true })).toBeNull();
   });
 });

@@ -166,6 +166,21 @@ export function retainedCaptureTime(capturedAtMs: number, observedAtMs: number):
 }
 
 // ---------------------------------------------------------------------------
+// Instance-start seed read.
+// ---------------------------------------------------------------------------
+/**
+ * This observer's own record as one completed read, or null when the read did not complete. Only a read that reached a
+ * verdict resolves the start: absent (no file, or no liveness directory), present, or unparsable bytes. A deadline, or a
+ * custody refusal of the file or its directory, says nothing about what the file holds, so it is never proof that no
+ * seed exists and the instance keeps withholding its own record rather than replacing one it could not read.
+ */
+export function resolvedSeedRead(read: LivenessReadResult): RecordRead | null {
+  if (read.readDeadlineHit || read.directory.status === "custody_invalid") return null;
+  if (read.directory.status === "absent") return { status: "absent" };
+  return read.observer.status === "custody_invalid" ? null : read.observer;
+}
+
+// ---------------------------------------------------------------------------
 // Observer.
 // ---------------------------------------------------------------------------
 export type ObserverState = "observer_IDLE" | "observer_COLLECTING" | "observer_EVALUATING" | "observer_PUBLISHING" | "observer_STOPPING";
@@ -192,8 +207,13 @@ export class LivenessObserver {
   private wallRecovery = emptyRecovery();
   private agentRecovery = emptyRecovery();
   private sighting: RetainedCanaryAllowSighting | null = null;
+  /**
+   * True until this instance has resolved its start: a validated boot read AND a completed read of its own record
+   * file. Until then the instance publishes nothing, because its record would replace a predecessor's record that may
+   * carry the only durable copy of an allow sighting.
+   */
   private seedPending = true;
-  private seedRead: RecordRead | null = null;
+  private withheldCycles = 0;
   private priorGateway: GatewayIdentity | null = null;
   private censusContext: CensusSamplingContext = { gateway: null, gatewayAlive: false, ipv4Set: null, bootId: null };
   private lastRecord: Record<string, unknown> | null = null;
@@ -242,8 +262,11 @@ export class LivenessObserver {
     await this.race(Promise.allSettled(waits).then(() => undefined), COLLECT_DEADLINE, undefined);
   }
 
-  stats(): { state: ObserverState; skipped: number; cycles: number; sequence: number; publishFailures: number } {
-    return { state: this.state, skipped: this.skipped, cycles: this.completedCycles, sequence: this.sequence, publishFailures: this.publishFailures };
+  stats(): { state: ObserverState; skipped: number; cycles: number; sequence: number; publishFailures: number; withheldCycles: number; startResolved: boolean } {
+    return {
+      state: this.state, skipped: this.skipped, cycles: this.completedCycles, sequence: this.sequence, publishFailures: this.publishFailures,
+      withheldCycles: this.withheldCycles, startResolved: !this.seedPending,
+    };
   }
 
   /** The most recently assembled record, for tests and diagnostics. */
@@ -317,19 +340,27 @@ export class LivenessObserver {
     const agentFailure = (reason: string): void => { if (agentKnown) failures.add("agent", reason); };
     if (!records.ok || records.value.readDeadlineHit) failures.add("wall", "observation_invalid");
 
-    // A failed boot read is an evidence failure for this cycle, never a boot change: it drops no sample, fault or sighting.
+    // A failed boot read is failed evidence for this cycle, never proof of a boot change: it runs no boot-change reset and
+    // keeps the last validated boot and the retained sighting. Both components carry time_untrusted, and the cycle is
+    // faulted by the ordinary recovery rule below; only a positively read different boot resets.
     const bootId = boot.ok && boot.value.length > 0 ? boot.value : null;
-    if (bootId === null) { failures.add("wall", "time_untrusted"); agentFailure("time_untrusted"); }
+    if (bootId === null) { failures.add("wall", "time_untrusted"); failures.add("agent", "time_untrusted"); }
     else if (this.bootId !== null && bootId !== this.bootId) this.resetForBoot();
     if (bootId !== null) this.bootId = bootId;
+    // The record names the last validated boot even when this cycle's read failed, so a restarted observer can still
+    // seed a sighting it carries; retaining the identity does not make this cycle's clock read trusted.
+    const recordBootId = bootId ?? this.bootId;
 
-    // The instance-start seed: this observer's own current-boot record can only add a retained allow sighting.
+    // The instance-start seed: this observer's own current-boot record can only add a retained allow sighting. A seed
+    // read that did not complete is never proof that no seed exists, so the start stays unresolved and nothing publishes.
+    let withhold = false;
     if (this.seedPending) {
-      if (this.completedCycles === 0) this.seedRead = records.ok ? records.value.observer : null;
-      if (bootId !== null) {
-        this.applySeed(this.seedRead, bootId, endedAt);
+      const seedRead = records.ok ? resolvedSeedRead(records.value) : null;
+      if (bootId !== null && seedRead !== null) {
+        this.applySeed(seedRead, bootId, endedAt);
         this.seedPending = false;
-        this.seedRead = null;
+      } else {
+        withhold = true;
       }
     }
 
@@ -402,13 +433,14 @@ export class LivenessObserver {
     }
 
     // Assemble the candidate. The raw keys must match OBSERVER_WALL_RAW and OBSERVER_AGENT_RAW in server/src/castle-wall/liveness/schema.ts.
-    this.sequence = Math.min(COUNTER_MAX, this.sequence + 1);
-    const sequence = this.sequence;
+    // A withheld cycle makes no publish attempt, so it consumes no sequence number.
+    const sequence = Math.min(COUNTER_MAX, this.sequence + 1);
+    if (!withhold) this.sequence = sequence;
     const build = (wall: ComponentRecovery, agent: ComponentRecovery): Record<string, unknown> => ({
       schema_version: LIVENESS_SCHEMA_VERSION,
       record: "observer",
       subject: { fortress_id: this.deps.fortressId, host_id: this.deps.hostId, platform: "darwin", operator_uid: this.deps.operatorUid, agent_uid: agentUid ?? null },
-      boot_id: bootId,
+      boot_id: recordBootId,
       config_generation: 0,
       sequence,
       observed_at: new Date(endedAt).toISOString(),
@@ -444,14 +476,20 @@ export class LivenessObserver {
       config: configRead,
     });
     // A new instance cannot know whether a fault was in progress when the previous one stopped, so its first cycle records one.
-    const first = this.completedCycles === 0;
+    // A withheld cycle is faulted too: its evidence is incomplete, and a sample must never name a sequence that was not published.
+    const faulted = this.completedCycles === 0 || withhold;
     const sample = { sequence, observed_uptime_ms: uptimeMs };
-    this.wallRecovery = advanceRecovery(this.wallRecovery, !first && wallCycleClean(envelope), sample);
-    this.agentRecovery = advanceRecovery(this.agentRecovery, !first && agentCycleClean(envelope), sample);
+    this.wallRecovery = advanceRecovery(this.wallRecovery, !faulted && wallCycleClean(envelope), sample);
+    this.agentRecovery = advanceRecovery(this.agentRecovery, !faulted && agentCycleClean(envelope), sample);
     const record = build(this.wallRecovery, this.agentRecovery);
     this.lastRecord = record;
     this.completedCycles = Math.min(COUNTER_MAX, this.completedCycles + 1);
 
+    if (withhold) {
+      // The predecessor's record stays in place and ages stale on its own; readers see observer_stale, never a lost fault.
+      this.withheldCycles = Math.min(COUNTER_MAX, this.withheldCycles + 1);
+      return;
+    }
     // observer_PUBLISHING: the sequence is consumed by the attempt, because a publish that reported failure may still have landed.
     this.state = "observer_PUBLISHING";
     this.lastPublish = this.deps.publisher.publish(record).catch(() => { this.publishFailures = Math.min(COUNTER_MAX, this.publishFailures + 1); });
@@ -466,8 +504,8 @@ export class LivenessObserver {
   }
 
   /** A seed only adds a fault: it can set a sighting when none is newer, never clear one. */
-  private applySeed(read: RecordRead | null, bootId: string, nowMs: number): void {
-    if (read === null || read.status !== "present") return;
+  private applySeed(read: RecordRead, bootId: string, nowMs: number): void {
+    if (read.status !== "present") return;
     const parsed = parseObserverRecord(read.value);
     if (!parsed.ok || parsed.envelope.boot_id !== bootId || !parsed.wall.ok) return;
     const seed = parsed.wall.value.canary_allow_sighting;
