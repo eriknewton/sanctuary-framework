@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 - Added `castle-wall liveness-status`, which reports wall, agent and coverage separately from stored evidence. `castle-wall status` and `castle-wall full-status` now exit 0 only when that wall evidence is fresh and complete, so a running daemon alone no longer exits 0; until the observer and lock-recovery telemetry ship, they exit 1 on every host. `install-full --preflight` checks for a stable Node path before any change.
-- The full Castle Wall daemon now keeps `liveness/daemon.json.publisher` beside `daemon.json`. It names the one daemon instance allowed to update `daemon.json`, so a stopping daemon cannot replace its successor's record.
+- The full Castle Wall daemon now maintains `liveness/daemon.json.publisher` alongside its stored liveness record.
 - Adds Linux business record codecs and verifiers only, plus pure shared history joins, strict recovery proposals and custody journal acknowledgments.
 - Added a private offline evidence snapshot verifier candidate, explicit capture diagnostics, fresh build outputs, artifact provenance, recipient instructions and a synthetic second-Mac drill procedure.
 
