@@ -199,6 +199,11 @@ export class LivenessObserver {
   private handle: unknown = null;
   private inFlight: Promise<void> | null = null;
   private lastPublish: Promise<void> | null = null;
+  /**
+   * The publisher drain in flight and the one handled continuation subscribed to it. A cycle whose publish returns the
+   * same drain reuses it, so a stalled drain retains one continuation however many cycles complete behind it.
+   */
+  private publishing: { drain: Promise<void>; handled: Promise<void> } | null = null;
   private skipped = 0;
   private sequence = 0;
   private completedCycles = 0;
@@ -492,7 +497,24 @@ export class LivenessObserver {
     }
     // observer_PUBLISHING: the sequence is consumed by the attempt, because a publish that reported failure may still have landed.
     this.state = "observer_PUBLISHING";
-    this.lastPublish = this.deps.publisher.publish(record).catch(() => { this.publishFailures = Math.min(COUNTER_MAX, this.publishFailures + 1); });
+    this.lastPublish = this.handledPublish(this.deps.publisher.publish(record));
+  }
+
+  /**
+   * One handled continuation per distinct drain. The publisher returns its in-flight drain to every call made while
+   * that drain runs (the call only replaces the one waiting record), so attaching a handler per call would grow without
+   * bound behind a stalled write. A failure is counted once per drain that rejected, which is the publisher's own unit:
+   * a record replaced while waiting was never attempted.
+   */
+  private handledPublish(drain: Promise<void>): Promise<void> {
+    if (this.publishing !== null && this.publishing.drain === drain) return this.publishing.handled;
+    const settle = (failed: boolean): void => {
+      if (failed) this.publishFailures = Math.min(COUNTER_MAX, this.publishFailures + 1);
+      if (this.publishing?.drain === drain) this.publishing = null;
+    };
+    const handled = drain.then(() => settle(false), () => settle(true));
+    this.publishing = { drain, handled };
+    return handled;
   }
 
   private resetForBoot(): void {

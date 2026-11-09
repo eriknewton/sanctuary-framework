@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { COUNTER_MAX, KILL_REAP_GRACE, MAX_COLLECTION_CHILDREN, TERM_GRACE } from "../../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
 import { LivenessObserver, type ObserverCollectors, type ObserverPublisher } from "../../../src/castle-wall/liveness/observer.js";
-import { LivenessRecordPublisher, type PublisherFileHandle, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
+import { LivenessRecordPublisher, nodePublisherFs, type PublisherFileHandle, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
 import {
   BoundedChildRunner,
   WATCH_CHILD_ENV,
@@ -336,6 +336,55 @@ describe("publication under the observer", () => {
     }
     for (let i = 1; i < fs.renamedSequences.length; i++) expect(fs.renamedSequences[i]!).toBeGreaterThan(fs.renamedSequences[i - 1]!);
     expect(fs.maxOpenTemps).toBe(1);
+    await observer.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("a publication stalled indefinitely under the observer", () => {
+  it("keeps one handled continuation on the stalled drain over 1000 cycles, then settles it once on rejection", async () => {
+    // The publisher's first filesystem step never settles until the test rejects it; every later attempt is refused at once.
+    let rejectHeld!: (error: Error) => void;
+    let mkdirCalls = 0;
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      mkdir: () => {
+        mkdirCalls++;
+        if (mkdirCalls === 1) return new Promise((_resolve, reject) => { rejectHeld = reject; });
+        return Promise.reject(Object.assign(new Error("fixture refusal"), { code: "EACCES" }));
+      },
+    };
+    const real = new LivenessRecordPublisher({ fortressPath: "/fortress-fixture-never-created", fileName: "observer.json", instance: "observer-stall-1", operatorUid: OPERATOR, fs });
+    // Count every reaction attached to each distinct drain the publisher returns, without changing the drain's identity.
+    const reactions = new Map<Promise<void>, number>();
+    const publisher: ObserverPublisher = {
+      publish: record => {
+        const drain = real.publish(record);
+        if (!reactions.has(drain)) {
+          reactions.set(drain, 0);
+          const then = drain.then.bind(drain);
+          drain.then = ((onFulfilled, onRejected) => { reactions.set(drain, reactions.get(drain)! + 1); return then(onFulfilled, onRejected); }) as typeof drain.then;
+        }
+        return drain;
+      },
+    };
+    const observer = observerWith(quietCollectors(() => Promise.resolve(absentRecords())), publisher);
+    for (let i = 0; i < 1000; i++) {
+      await observer.tick();
+      expect([...reactions.values()], `after cycle ${i + 1}`).toEqual([1]);
+    }
+    expect(observer.stats().sequence).toBe(1000);
+    expect(real.stats()).toEqual({ published: 0, failures: 0 });
+    rejectHeld(Object.assign(new Error("fixture stall released"), { code: "EIO" }));
+    for (let i = 0; i < 20 && observer.stats().publishFailures === 0; i++) await flush();
+    // One drain rejected: one failure counted, by the one continuation; the stalled drain gained no handler meanwhile.
+    expect(observer.stats().publishFailures).toBe(1);
+    expect([...reactions.values()]).toEqual([1]);
+    // The next cycle starts a new drain with its own single continuation, and its refusal is counted once.
+    await observer.tick();
+    for (let i = 0; i < 20 && observer.stats().publishFailures === 1; i++) await flush();
+    expect([...reactions.values()]).toEqual([1, 1]);
+    expect(observer.stats().publishFailures).toBe(2);
     await observer.stop();
   });
 });
