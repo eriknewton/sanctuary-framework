@@ -322,7 +322,10 @@ export function buildStoredSample(
 // ---------------------------------------------------------------------------
 export interface CensusRunInput {
   samples: readonly StoredCensusSample[];
-  gateway: { pid: number; generation: string };
+  /** The full identity of the gateway the observer reports as current; every credited sample must carry all of it. */
+  gateway: CensusGatewayIdentity;
+  /** The commissioned agent uid from config.json; a credited sample's gateway must run under it. */
+  agentUid: number;
   ipv4Set: readonly Ipv4Prefix[];
   bootId: string;
   nowMs: number;
@@ -340,6 +343,8 @@ export interface CensusRunResult {
   invalid: boolean;
   /** A current-boot sample whose clocks fail the record-timing rule; it is never credited. */
   timeUntrusted: boolean;
+  /** A sample of the current boot and generation whose process identity contradicts the current gateway. */
+  identityContradiction: boolean;
 }
 
 function storedRowQualifies(row: StoredCensusRow, ipv4Set: readonly Ipv4Prefix[]): boolean {
@@ -364,12 +369,25 @@ export function evaluateCensusRun(input: CensusRunInput): CensusRunResult {
   const clockTrusted = input.samples.map(sample =>
     sample.boot_id !== input.bootId || recordTiming(sample.observed_at, sample.observed_uptime_ms, input.nowMs, input.uptimeMs).ok);
   const timeUntrusted = clockTrusted.includes(false);
+  const current = input.gateway;
+  // A sample of the current boot and generation claims to describe the current gateway process.
+  const claimsCurrent = (sample: StoredCensusSample): boolean =>
+    sample.boot_id === input.bootId && sample.gateway.generation === current.generation;
+  // Every identity field is evidence, not only the pid: a pid can be reused by another process or another uid, so a
+  // credited sample must name the current gateway's pid, start identity and uid, and that uid must be the commissioned one.
+  const identityMatches = (sample: StoredCensusSample): boolean =>
+    sample.gateway.pid === current.pid &&
+    sample.gateway.start_identity === current.start_identity &&
+    (sample.gateway.uid === current.uid && sample.gateway.uid === input.agentUid);
+  const credited = input.samples.map((sample, position) => clockTrusted[position]! && claimsCurrent(sample) && identityMatches(sample));
+  // A current-generation sample that names another process is contradictory evidence, never an older generation to skip.
+  const identityContradiction = input.samples.some(sample => claimsCurrent(sample) && !identityMatches(sample));
   let generationStartMs: number | null = null;
   let counterRegression = false;
   let invalid = false;
   input.samples.forEach((sample, position) => {
     if (sample.other_rows >= COUNTER_MAX) invalid = true;
-    if (clockTrusted[position] && sample.boot_id === input.bootId && sample.gateway.generation === input.gateway.generation) {
+    if (credited[position]) {
       const time = parsedTimes[position]!;
       if (generationStartMs === null || time < generationStartMs) generationStartMs = time;
     }
@@ -388,11 +406,8 @@ export function evaluateCensusRun(input: CensusRunInput): CensusRunResult {
   let run: CensusRunResult["run"] = null;
   for (let end = input.samples.length - 1; end >= CENSUS_RUN && run === null; end--) {
     const window = input.samples.slice(end - CENSUS_RUN, end + 1);
-    const shared = clockTrusted.slice(end - CENSUS_RUN, end + 1).every(Boolean) && window.every(sample =>
-      sample.boot_id === input.bootId &&
-      sample.gateway.pid === input.gateway.pid &&
-      sample.gateway.generation === input.gateway.generation);
-    if (!shared) continue;
+    // Every sample of the window is credited: the reader's boot, the current generation, the full current identity and trusted clocks.
+    if (!credited.slice(end - CENSUS_RUN, end + 1).every(Boolean)) continue;
     let spaced = true;
     for (let i = 1; i < window.length; i++) {
       const gap = window[i]!.observed_uptime_ms - window[i - 1]!.observed_uptime_ms;
@@ -419,5 +434,5 @@ export function evaluateCensusRun(input: CensusRunInput): CensusRunResult {
   }
   // The reader-time bound: a run whose latest sample is older than the agent window no longer proves anything.
   if (run !== null && !(input.nowMs - run.latestObservedAtMs <= input.agentWindowMs)) run = null;
-  return { run, generationStartMs, counterRegression, invalid, timeUntrusted };
+  return { run, generationStartMs, counterRegression, invalid, timeUntrusted, identityContradiction };
 }

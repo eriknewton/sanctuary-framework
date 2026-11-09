@@ -502,10 +502,11 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
       if (failedLast && p.optional_reply.required) agent.add("optional_reply_failed");
       optionalReplyOk = !failedLast && success !== null && now - success <= agentWindowMs && now - success >= -LOCAL_JITTER;
     }
-    if (p.gateway !== null && p.census.status === "ok") {
+    if (p.gateway !== null && p.census.status === "ok" && agentUid !== undefined) {
       const result = evaluateCensusRun({
         samples: p.census.samples,
-        gateway: { pid: p.gateway.pid, generation: p.gateway.generation },
+        gateway: { pid: p.gateway.pid, start_identity: p.gateway.start_identity, uid: p.gateway.uid, generation: p.gateway.generation },
+        agentUid,
         ipv4Set: config.messaging_ipv4 ?? [],
         bootId,
         nowMs: now,
@@ -514,6 +515,8 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
       });
       if (result.invalid) agent.add("observation_invalid");
       if (result.timeUntrusted) agent.add("time_untrusted");
+      // A contradicting current-generation sample is DOWN-class, so it is never OK and never the initializing grace.
+      if (result.identityContradiction) agent.add("process_identity_unknown");
       if (result.counterRegression) agent.add("counter_regression");
       if (result.run === null) {
         const startMs = result.generationStartMs;

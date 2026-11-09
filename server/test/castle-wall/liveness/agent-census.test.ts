@@ -340,3 +340,47 @@ describe("census sample clocks", () => {
     expect(envelope.agent.state).not.toBe("agent_OK_PASSIVE");
   });
 });
+
+describe("census sample identity", () => {
+  /** The reference series as stored on disk: nonempty qualifying rows owned by the current gateway. */
+  const stored = (): StoredCensusSample[] => SERIES.map(sample => store(sample));
+  const evaluateStored = (samples: StoredCensusSample[], at: RawSample = LAST): LivenessEnvelope =>
+    evaluateLiveness(inputAt(at.observedAtMs, at.uptimeMs, samples));
+  /** Edit the gateway identity of already-stored samples, every one or those `which` selects. */
+  const editGateway = (samples: StoredCensusSample[], edit: Partial<StoredCensusSample["gateway"]>, which: (index: number) => boolean = () => true) =>
+    samples.map((sample, index) => which(index) ? { ...sample, gateway: { ...sample.gateway, ...edit } } : sample);
+  const OTHER_UID = 999;
+
+  it.each([
+    ["pid", { pid: GATEWAY_PID + 1 }],
+    ["start identity", { start_identity: "gateway-start-other" }],
+    ["uid", { uid: OTHER_UID }],
+  ] as const)("a stored series whose gateway %s alone differs is agent DOWN process_identity_unknown", (_field, edit) => {
+    const samples = editGateway(stored(), edit);
+    expect(samples.every(sample => sample.rows.length > 0)).toBe(true);
+    const envelope = evaluateStored(samples);
+    expect(envelope.agent.state).toBe("agent_DOWN");
+    expect(envelope.agent.reasons).toContain("process_identity_unknown");
+    expectWallOk(envelope);
+  });
+
+  it("one contradicting sample at the end of an otherwise healthy series is agent DOWN", () => {
+    const samples = editGateway(stored(), { start_identity: "gateway-start-other" }, index => index === SERIES.length - 1);
+    const envelope = evaluateStored(samples);
+    expect(envelope.agent.state).toBe("agent_DOWN");
+    expect(envelope.agent.reasons).toContain("process_identity_unknown");
+  });
+
+  it("a young generation whose samples contradict the current gateway is agent DOWN, never the initializing grace", () => {
+    const young = stored().slice(0, 2);
+    expect(evaluateStored(young, SERIES[1]!).agent.state).toBe("agent_INITIALIZING");
+    const contradicted = evaluateStored(editGateway(young, { uid: OTHER_UID }), SERIES[1]!);
+    expect(contradicted.agent.state).toBe("agent_DOWN");
+    expect(contradicted.agent.reasons).toContain("process_identity_unknown");
+  });
+
+  it("an older generation of the same boot with another process identity is excluded, not contradictory", () => {
+    const envelope = evaluateStored(editGateway(stored(), { generation: "generation-fixture-0", pid: GATEWAY_PID + 1, start_identity: "gateway-start-old" }));
+    expect(envelope.agent.reasons).toEqual(["agent_flow_stale"]);
+  });
+});
