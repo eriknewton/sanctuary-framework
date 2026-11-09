@@ -1,3 +1,4 @@
+// fail-before-exempt: The rows this change adds witness the isolation preload and the candidate build script under server/scripts, which this gate does not revert, so they pass on the reverted source by design; each is killed instead by a recorded single-predicate mutant of that script.
 import { beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, symlinkSync, chmodSync, lstatSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -71,10 +72,16 @@ describe("packed recipient consumer", () => {
     'import fs from "node:fs"; fs.utimesSync(process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/pack", 0, 0);',
     'import fs from "node:fs/promises"; await fs.readFile("/tmp/operator/.sanctuary/state");',
     'import cp from "node:child_process"; cp.execFileSync("/usr/bin/env", ["python3", "-c", "print(1)"]);',
+    // Computed specifiers and createRequire never appear as a static import, so the bundle text guard cannot see them; the runtime mediation must still deny them.
+    'const name = ["node", "net"].join(":"); const net = await import(name); net.connect(80, "127.0.0.1");',
+    'const name = ["node", "child_process"].join(":"); const cp = await import(name); cp.spawnSync("/bin/true", []);',
+    'import { createRequire } from "node:module"; createRequire(import.meta.url)("node:net").connect(80, "127.0.0.1");',
+    'import { createRequire } from "node:module"; createRequire(import.meta.url)("node:child_process").execFileSync("/usr/bin/env", ["true"]);',
   ])("isolation detects forbidden reach %s", attack => { const r = isolated(attack); expect(r.status).toBe(1); expect(r.stderr).toContain('"denied":1'); });
   it("package contains exactly its allowlisted bundle provenance and notices", () => {
     const files = c.packed.files.map((f: { path: string }) => f.path).sort();
-    expect(files).toEqual(["LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "dist/provenance.json", "dist/verify-evidence-pack.js", "package.json"].sort());
+    // Must match NON_RELEASE_MARKER written by buildCandidate in scripts/build-evidence-pack.mjs: only a fixture build packs the marker.
+    expect(files).toEqual(["LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "dist/provenance.json", "dist/verify-evidence-pack.js", "package.json", ...(c.fixture ? ["dist/NON_RELEASE"] : [])].sort());
     const pkg = JSON.parse(readFileSync(join(dirname(realpathSync(c.command)), "../package.json"), "utf8"));
     expect(pkg).toMatchObject({ private: true, author: "Erik Newton", license: "Apache-2.0", engines: { node: ">=22.0.0" }, bin: { "verify-evidence-pack": "dist/verify-evidence-pack.js" } }); expect(pkg.dependencies).toBeUndefined(); expect(pkg.scripts).toBeUndefined();
     const bundle = readFileSync(c.command, "utf8"); expect(bundle).not.toMatch(FORBIDDEN_BUNDLE);
@@ -205,6 +212,18 @@ it.each([false, true])("isolation refuses legacy exporter argv with writable %s"
   const { METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT, LINUX_METADATA_PROGRAM } = await import("../../src/evidence-pack/snapshot-offline-cli.js");
   for (const [command, prefix] of [["/usr/bin/xattr", []], ["/usr/bin/xattr", ["-p", "com.apple.provenance"]], ["python3", ["-c", LINUX_METADATA_PROGRAM]]] as const) {
     const attack = `import cp from "node:child_process"; cp.execFile(${JSON.stringify(command)}, [...${JSON.stringify(prefix)}, process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/key"], {env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:"ignore"}, () => {});`;
+    const result = isolated(attack, "PASS", false, writable);
+    expect(result.stderr).toContain('"denied":1'); expect(result.status).toBe(C.EXIT_FAIL);
+  }
+}, 120_000);
+
+it.each([false, true])("isolation refuses synchronous legacy exporter argv with closed options and writable %s", async writable => {
+  c ??= await candidateForTests();
+  const { METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT, LINUX_METADATA_PROGRAM } = await import("../../src/evidence-pack/snapshot-offline-cli.js");
+  // Each row uses an admitted subprocess key and the closed listing options, so only the exact argv shape can refuse it.
+  const closed = `{env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:["ignore","pipe","ignore"]}`;
+  for (const [key, command, prefix] of [["execFileSync", "/usr/bin/xattr", []], ["spawnSync", "/usr/bin/xattr", ["-p", "com.apple.provenance"]], ["execFileSync", "/usr/bin/python3", ["-c", LINUX_METADATA_PROGRAM]]] as const) {
+    const attack = `import cp from "node:child_process"; cp.${key}(${JSON.stringify(command)}, [...${JSON.stringify(prefix)}, process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/key"], ${closed});`;
     const result = isolated(attack, "PASS", false, writable);
     expect(result.stderr).toContain('"denied":1'); expect(result.status).toBe(C.EXIT_FAIL);
   }

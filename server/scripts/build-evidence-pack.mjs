@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,9 @@ const PRIVATE_ARCHIVE_MODE = 0o600;
 const SOURCE_FORMAT = "SANCTUARY_RELEASE_SOURCE_V1";
 // Must match the installed provenance consumer in snapshot-provenance.test.ts.
 const BUILD_FORMAT = "SANCTUARY_VERIFIER_BUILD_V1";
+// Must match the installed non-release marker consumer in snapshot-provenance.test.ts and the packed file list in snapshot-packed.test.ts.
+export const NON_RELEASE_MARKER = "NON_RELEASE";
+export const NON_RELEASE_TEXT = "Synthetic archive metadata is not release authentication.\n";
 const SHA = /^[0-9a-f]{40}$/;
 const HASH = /^[0-9a-f]{64}$/;
 export const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -38,7 +41,7 @@ with tarfile.open(sys.argv[1]) as archive:
                 shutil.copyfileobj(source, output)
 `, archive, staged], { timeout: TIMEOUT_MS });
 }
-export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA) {
+export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { nonRelease = false } = {}) {
   if (args.length !== 4 || args[0] !== "--source-metadata" || args[2] !== "--source-archive") throw new Error("Expected source metadata and source archive");
   const metadata = JSON.parse(readFileSync(args[1], "utf8"));
   const head = existsSync(join(root, ".git")) ? execFileSync("/usr/bin/git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
@@ -61,19 +64,27 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   const bundle = join(packageRoot, "dist/verify-evidence-pack.js");
   chmodSync(bundle, 0o755);
   writeFileSync(join(packageRoot, "dist/provenance.json"), JSON.stringify({ format: BUILD_FORMAT, package_version: pkg.version, source_revision: metadata.source_revision, source_archive_sha256: metadata.source_archive_sha256, verifier_sha256: digest(readFileSync(bundle)), dependency_lock_sha256: digest(readFileSync(join(root, "server/package-lock.json"))) }, null, 2) + "\n");
-  if (readdirSync(join(packageRoot, "dist")).sort().join() !== "provenance.json,verify-evidence-pack.js") throw new Error("Unexpected verifier artifact");
-  // Must match the output-directory witnesses in snapshot-provenance.test.ts.
+  // The marker lives inside the packed directory so a fixture tarball stays marked non-release after it leaves its build root.
+  if (nonRelease) writeFileSync(join(packageRoot, "dist", NON_RELEASE_MARKER), NON_RELEASE_TEXT, { flag: "wx" });
+  if (readdirSync(join(packageRoot, "dist")).sort().join() !== ["provenance.json", "verify-evidence-pack.js", ...(nonRelease ? [NON_RELEASE_MARKER] : [])].sort().join()) throw new Error("Unexpected verifier artifact");
+  const outputs = OUTPUT_DIRECTORIES.map(relative => ({ relative, destination: join(root, relative), entries: outputEntries(join(root, relative)) }));
   // Both flat output directories are cleared in place so stale files cannot travel into rebuilt artifacts across volumes.
-  for (const relative of ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"]) {
-    const destination = join(root, relative);
-    if (existsSync(destination)) {
-      const entries = readdirSync(destination, { withFileTypes: true });
-      // Unexpected directories refuse cleanup because build outputs are flat and recursive deletion is not authorized.
-      if (entries.some(entry => entry.isDirectory())) throw new Error("Unexpected output directory");
-      for (const entry of entries) unlinkSync(join(destination, entry.name));
-    }
+  for (const { relative, destination, entries } of outputs) {
+    for (const entry of entries) unlinkSync(join(destination, entry.name));
     cpSync(join(staged, relative), destination, { recursive: true });
   }
+}
+// Must match the output-directory witnesses in snapshot-provenance.test.ts.
+const OUTPUT_DIRECTORIES = ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"];
+function outputEntries(destination) {
+  let stat;
+  try { stat = lstatSync(destination); } catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  // A link or non-directory output would redirect in-place clearing to another tree, so every output path is checked before either is cleared.
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Unexpected output path");
+  const entries = readdirSync(destination, { withFileTypes: true });
+  // Unexpected directories refuse cleanup because build outputs are flat and recursive deletion is not authorized.
+  if (entries.some(entry => entry.isDirectory())) throw new Error("Unexpected output directory");
+  return entries;
 }
 // Test archives live outside git and are explicitly marked non-release; no fixture metadata authenticates a release.
 export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")) {
@@ -87,9 +98,9 @@ export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileU
   const metadata = join(root, "release-source.json");
   const revision = execFileSync("/usr/bin/git", ["-C", sourceRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   writeFileSync(metadata, JSON.stringify({ format: SOURCE_FORMAT, source_revision: revision, source_archive_sha256: digest(readFileSync(archive)) }));
-  writeFileSync(join(root, "NON_RELEASE_FIXTURE"), "Synthetic archive metadata is not release authentication.\n");
+  writeFileSync(join(root, "NON_RELEASE_FIXTURE"), NON_RELEASE_TEXT);
   symlinkSync(join(sourceRoot, "server/node_modules"), join(tree, "server/node_modules"), "dir");
-  await buildCandidate(["--source-metadata", metadata, "--source-archive", archive], tree, revision);
+  await buildCandidate(["--source-metadata", metadata, "--source-archive", archive], tree, revision, { nonRelease: true });
   const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--offline", "--pack-destination", root], { cwd: join(tree, "packages/evidence-pack-verifier"), encoding: "utf8", timeout: TIMEOUT_MS }))[0];
   const tarball = join(root, packed.filename), prefix = join(root, "installed");
   execFileSync("npm", ["install", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", "--offline", tarball], { encoding: "utf8", timeout: TIMEOUT_MS });
