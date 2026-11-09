@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { BUSINESS_KINDS, validateBusinessRecord } from "./linux-business-records.js";
 import { jcs } from "../smb/jcs.js";
 import { parseStrict } from "../smb/parse-strict.js";
 
@@ -15,7 +16,11 @@ export const ROLE_REGISTRY = [
       "append",
       "control",
       "counter",
-      "terminal"
+      "terminal",
+      "open",
+      "link",
+      "allowance",
+      "denial_overflow"
     ]
   },
   {
@@ -143,6 +148,8 @@ export function roleKid(role: SigningRole, epoch: number, publicKey: string): st
   return "k1:sha256:" + createHash("sha256").update(KID_DOMAIN).update(canonicalBytes({v: 1, role, epoch, public_key: publicKey})).digest("hex");
 }
 export const safeInteger = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+// Must match service.ts and record-signer.ts: the live adapter admits only the strict inert counter.
+export const INERT_PAYLOAD_SCHEMA = z.object({ count: safeInteger }).strict();
 const hexId = z.string().regex(/^[a-f0-9]{32}$/);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const u64 = z.string().regex(/^(0|[1-9][0-9]*)$/).refine(value => BigInt(value) <= 18446744073709551615n);
@@ -178,6 +185,10 @@ export function parseRecord(bytes: Uint8Array, role: SigningRole, payloadSchema:
     };
     if (!integersOnly(value)) return refuse();
     const parsed = recordSchema(role, payloadSchema, recordKind).parse(value);
+    // Must match records.rs: the inert count is distinct from the generated business counter branch.
+    const inert = payloadSchema === INERT_PAYLOAD_SCHEMA && recordKind === "counter" && INERT_PAYLOAD_SCHEMA.safeParse(parsed.payload).success;
+    // Only the inert adapter can interpret a count as transport evidence instead of a business observation.
+    if (role === ROLE_REGISTRY[0].role && (BUSINESS_KINDS as readonly string[]).includes(recordKind) && !inert && !validateBusinessRecord(parsed)) return refuse();
     if (parsed.role !== role || !Buffer.from(canonicalBytes(parsed)).equals(Buffer.from(bytes))) return refuse();
     return parsed;
   } catch { return refuse(); }

@@ -1,5 +1,7 @@
 # castle-wall-daemon
 
+The business record, activation anchor and protocol modules are public in the daemon crate but unused by boot.
+
 For one release, manifest verification accepts the exact legacy
 `castle-wall:<base64url(public-key)>` signing-key ID for the pinned key. New
 manifests always use the canonical 16-character SHA-256 fingerprint; legacy
