@@ -11,10 +11,10 @@
 
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { Writable } from "node:stream";
-import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { isAbsolute, join, normalize, sep } from "node:path";
 
 import { storageNamespacePathComponent } from "./namespace-component.js";
-import { FilesystemStorage } from "./filesystem.js";
+import { FilesystemStorage, serializeCapabilityError } from "./filesystem.js";
 import {
   cleanupFreshInitRecoveryResidue,
   isFreshFortressOrExactLockScaffold,
@@ -23,7 +23,7 @@ import {
 import { tightenStoragePermissions } from "./permissions.js";
 import { writeRecoveryKeyFile } from "../wrap/recovery-key-disclosure.js";
 import { runProvisionPinAlreadyLocked } from "../cli/castle-wall.js";
-import { readFileCustody, writeFileCustodyWithDurability, syncDirectoryStrict } from "./custody-fs.js";
+import { readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict } from "./custody-fs.js";
 
 interface Request {
   id: number;
@@ -91,6 +91,11 @@ async function mkdirRelative(relativePath: string, mode: number, strictDurabilit
   ) {
     throw new Error("directory-capability mkdir path must be normalized and relative");
   }
+  if (strictDurability) {
+    // The forwarded strict binding supplies cwd authority and every child barrier retains its captured descriptor.
+    await ensureDirectoryStrict(relativePath, mode, ".");
+    return;
+  }
   let cursor = ".";
   for (const part of relativePath.split(sep)) {
     cursor = join(cursor, part);
@@ -109,11 +114,7 @@ async function mkdirRelative(relativePath: string, mode: number, strictDurabilit
         });
       }
     }
-    if (strictDurability) {
-      // Must match ensureDirectoryStrict in custody-fs.ts: both the child and its parent need barriers.
-      await syncDirectoryStrict(cursor);
-      await syncDirectoryStrict(dirname(cursor));
-    }
+
   }
 }
 
@@ -364,25 +365,8 @@ async function main(): Promise<void> {
         process.send?.({
           id: raw.id,
           ok: false,
-          error: {
-            message: error instanceof Error ? error.message : String(error),
-            code:
-              error instanceof Error && "code" in error
-                ? String((error as NodeJS.ErrnoException).code)
-                : undefined,
-            kind:
-              error instanceof Error && "kind" in error
-                ? String((error as { kind?: unknown }).kind)
-                : undefined,
-            rawName:
-              error instanceof Error && "rawName" in error && typeof (error as { rawName?: unknown }).rawName === "string"
-                ? (error as { rawName: string }).rawName
-                : undefined,
-            rawNamespace:
-              error instanceof Error && "rawNamespace" in error && typeof (error as { rawNamespace?: unknown }).rawNamespace === "string"
-                ? (error as { rawNamespace: string }).rawNamespace
-                : undefined,
-          },
+          // Must match deserializeCapabilityError in filesystem.ts so every barrier failure crosses IPC.
+          error: serializeCapabilityError(error),
         });
       }
     })();

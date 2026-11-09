@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import ts from "typescript";
 
+// This guard refuses the known floating forms of a critical append; it is a refusal list, not a proof that no floating form exists.
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const TS_ROOTS = [dirname(ROOT)];
 const GENERATED_DIRECTORIES = new Set(["node_modules", "dist", ".git"]);

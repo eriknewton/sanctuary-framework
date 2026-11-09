@@ -176,14 +176,15 @@ export interface NamespaceLockStorageCapabilities {
 }
 
 /**
- * Explicit file, directory and newly created parent barriers at the Node API boundary.
+ * Explicit file and descriptor-verified directory barriers inside a strict namespace lock at the Node API boundary.
  * On Darwin, FileHandle.sync uses libuv's F_FULLFSYNC, then F_BARRIERFSYNC, then fsync fallback chain,
  * discarding earlier errors; strict means whatever that chain achieved and is not proven.
  * This bound must match audit-log-architecture.md and reorg-surface-manifest.md before recorder use.
  */
 export interface StrictDurabilityStorageCapabilities {
+  // Strict mutations require the lock below because only its held descriptors establish root and parent durability.
   // Must match the strict methods in filesystem.ts and the refusal list in read-only-guard.ts.
-  /** Bind strict operations to held directories after syncing every new parent. */
+  /** Verify and sync held namespace, root and root parent descriptors on every acquisition; the root parent must exist. */
   withStrictNamespaceLock<T>(
     namespace: string,
     lockFileName: string,

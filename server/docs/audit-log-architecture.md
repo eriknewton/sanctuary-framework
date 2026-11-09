@@ -320,6 +320,8 @@ Discrepancy recorded: the dispatch framing described a whole-log master-key-wrap
 
 ## Default-off strict storage foundation
 
+Strict mutations require `withStrictNamespaceLock`. Every acquisition verifies and syncs the held namespace, fortress root and root parent descriptors, including retries. The root parent must already exist. Directory creation below that boundary captures each no-follow descriptor immediately and repeats the captured chain barriers on every attempt. Publication and cleanup retain the publishing descriptor identity; worker errors preserve nested failure codes.
+
 `StrictDurabilityStorageCapabilities` is an explicit opt-in storage surface.
 `writeStrict`, `writeIfAbsentStrict` and `replaceIfEqualsStrict` require file,
 directory and new-parent barriers and propagate unsupported-directory-sync

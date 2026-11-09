@@ -137,7 +137,7 @@ to the frozen surfaces above or to existing callers:
 | Additive surface | Classification and bound |
 |---|---|
 | `StrictDurabilityStorageCapabilities` | Explicit opt-in interface; must match its methods in `storage/filesystem.ts` and `storage/read-only-guard.ts`. On Darwin, Node FileHandle.sync uses libuv's F_FULLFSYNC, then F_BARRIERFSYNC, then fsync fallback chain, discarding earlier errors; strict means whatever that chain achieved and is not proven. This bound must match `storage/interface.ts` and `docs/audit-log-architecture.md`; a native check or drilled bound is an S1b prerequisite. |
-| `writeStrict` | File, directory and parent barriers; no generic write fallback. |
+| `writeStrict` | File and descriptor-verified directory barriers inside a strict lock; every acquisition syncs held namespace, root and existing root parent handles; Darwin durability is not proven. |
 | `writeIfAbsentStrict` | Exclusive publication with strict barriers, preserving existing destination bytes. |
 | `replaceIfEqualsStrict` | Serialized comparison and strict replacement, preserving mismatched bytes. |
 | `withStrictNamespaceLock` | Strict parent setup and held directory binding through the existing kernel lock; no retained settlement receipt. |

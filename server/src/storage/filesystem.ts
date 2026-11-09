@@ -174,18 +174,49 @@ async function deleteStableFortressFile(root: string, name: string): Promise<boo
   }
 }
 
+export interface CapabilityError {
+  message: string;
+  code?: string;
+  kind?: string;
+  rawName?: string;
+  rawNamespace?: string;
+  errors?: CapabilityError[];
+  cause?: CapabilityError;
+}
+
+/** Preserve every strict failure across the private worker IPC boundary. */
+export function serializeCapabilityError(error: unknown): CapabilityError {
+  const value: CapabilityError = { message: error instanceof Error ? error.message : String(error) };
+  if (error instanceof Error) {
+    for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
+      const field = (error as unknown as Record<string, unknown>)[key];
+      if (typeof field === "string") value[key] = field;
+    }
+    // Inner errors carry independent barrier failures that must survive worker serialization.
+    if (error instanceof AggregateError) value.errors = error.errors.map(serializeCapabilityError);
+    if (error.cause !== undefined) value.cause = serializeCapabilityError(error.cause);
+  }
+  return value;
+}
+
+/** Reconstitute worker failures without discarding nested errno evidence. */
+export function deserializeCapabilityError(value: CapabilityError): Error {
+  const options = value.cause ? { cause: deserializeCapabilityError(value.cause) } : undefined;
+  const error = value.errors
+    ? new AggregateError(value.errors.map(deserializeCapabilityError), value.message, options)
+    : new Error(value.message, options);
+  for (const key of ["code", "kind", "rawName", "rawNamespace"] as const) {
+    if (value[key] !== undefined) Object.assign(error, { [key]: value[key] });
+  }
+  return error;
+}
+
 interface CapabilityResponse {
   id?: number;
   ready?: boolean;
   ok?: boolean;
   value?: unknown;
-  error?: {
-    message?: string;
-    code?: string;
-    kind?: string;
-    rawName?: string;
-    rawNamespace?: string;
-  };
+  error?: CapabilityError;
 }
 
 class DarwinDirectoryCapabilityClient {
@@ -210,17 +241,7 @@ class DarwinDirectoryCapabilityClient {
       if (raw.ok) {
         waiter.resolve(raw.value);
       } else {
-        const error = new Error(
-          raw.error?.message ?? "directory-capability worker operation failed",
-        ) as NodeJS.ErrnoException & {
-          kind?: string;
-          rawName?: string;
-          rawNamespace?: string;
-        };
-        if (raw.error?.code) error.code = raw.error.code;
-        if (raw.error?.kind) error.kind = raw.error.kind;
-        if (raw.error?.rawName) error.rawName = raw.error.rawName;
-        if (raw.error?.rawNamespace) error.rawNamespace = raw.error.rawNamespace;
+        const error = deserializeCapabilityError(raw.error ?? { message: "directory-capability worker operation failed" });
         waiter.reject(error);
       }
     });
@@ -427,6 +448,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * the ordinary path while the protected callback uses the held inode.
    */
   private readonly strictDurability = new AsyncLocalStorage<boolean>();
+  private readonly strictLockLease = new AsyncLocalStorage<{ active: boolean; assertHeld(): void }>();
   private readonly boundBasePath = new AsyncLocalStorage<BoundStorageContext>();
   /**
    * Create-with-fchown owner (fortress-ownership spec 2026-07-30): when set,
@@ -547,6 +569,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   ): Promise<T> {
     // Strict directory authority requires the kernel-backed path and cannot inherit an environmental degradation policy.
     const strictOptions = { ...options, kernelBacked: true, degradeOnEnvironmentalLoss: undefined };
+    // Test hooks can bypass lock custody, so only the existing test environment may forward them.
+    if (!process.env.VITEST) {
+      for (const key of Object.keys(strictOptions)) {
+        if (key.startsWith("__test")) delete (strictOptions as Record<string, unknown>)[key];
+      }
+    }
     return this.strictDurability.run(true, () => this.withNamespaceLock(namespace, lockFileName, operation, strictOptions));
   }
 
@@ -577,11 +605,14 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // is delegated to a child whose cwd is that exact inode. A rename or
     // replacement of the lexical fortress root cannot redirect a mutation.
     const namespaceComponent = storageNamespacePathComponent(namespace);
-    const firstCreatedRoot = await mkdir(this.basePath, { recursive: true, mode: 0o700 });
-    await mkdir(encodedNamespacePath(this.basePath, namespace), {
-      recursive: true,
-      mode: 0o700,
-    });
+    let expectedParent: Stats | undefined;
+    // A strict lock cannot establish durability for ancestors above its held parent.
+    if (this.strictDurability.getStore()) {
+      expectedParent = await lstat(dirname(this.basePath));
+      if (!expectedParent.isDirectory() || expectedParent.isSymbolicLink()) throw new Error("strict root parent must already be a directory");
+      try { await mkdir(this.basePath, { mode: 0o700 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    } else await mkdir(this.basePath, { recursive: true, mode: 0o700 });
     const strictDirectoryFlags = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY;
     // Strict capture refuses symlinks before granting held directory authority.
     const rootHandle = await open(this.basePath, this.strictDurability.getStore() ? strictDirectoryFlags : "r");
@@ -594,6 +625,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     let operationFailure: unknown;
     const cleanupFailures: unknown[] = [];
     try {
+      // Root identity is captured before creating children so child setup cannot replace its authority.
+      const capturedRoot = await rootHandle.stat();
       parentHandle = await open(dirname(this.basePath), this.strictDurability.getStore() ? strictDirectoryFlags : "r");
       const noFollow = typeof fsConstants.O_NOFOLLOW === "number"
         ? fsConstants.O_NOFOLLOW
@@ -601,6 +634,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       const directoryOnly = typeof fsConstants.O_DIRECTORY === "number"
         ? fsConstants.O_DIRECTORY
         : 0;
+      await mkdir(encodedNamespacePath(this.basePath, namespace), { recursive: false, mode: 0o700 }).catch(error => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
       namespaceHandle = await open(
         encodedNamespacePath(this.basePath, namespace),
         fsConstants.O_RDONLY | noFollow | directoryOnly,
@@ -616,7 +652,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         ? `/proc/self/fd/${namespaceHandle.fd}`
         : `/dev/fd/${namespaceHandle.fd}`;
       const [heldRoot, heldNamespace, childFromParent, namespaceFromRoot] = await Promise.all([
-        rootHandle.stat(),
+        Promise.resolve(capturedRoot),
         namespaceHandle.stat(),
         host === "linux"
           ? stat(join(descriptorParent, basename(this.basePath)))
@@ -646,6 +682,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         );
       }
       const heldParent = await parentHandle.stat();
+      // The parent barrier must retain the identity first verified before root creation.
+      if (expectedParent && (expectedParent.dev !== heldParent.dev || expectedParent.ino !== heldParent.ino)) throw new Error("strict root parent identity changed");
       if (host === "darwin") {
         rootClient = await DarwinDirectoryCapabilityClient.start(this.basePath, {
           dev: String(heldRoot.dev),
@@ -706,17 +744,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       if (this.strictDurability.getStore()) {
         // Parent authority belongs to the verified held handles, never to paths synced before capture.
         assertLexicalIdentity();
+        // Namespace contents remain uncertain until this held namespace descriptor completes its barrier.
         await namespaceHandle.sync();
+        // The namespace entry is durable only after this held root descriptor completes its barrier.
         await rootHandle.sync();
+        // The fortress entry is durable only after this held parent descriptor completes its barrier.
         await parentHandle.sync();
-        if (firstCreatedRoot !== undefined) {
-          const stop = dirname(firstCreatedRoot);
-          let cursor = dirname(this.basePath);
-          while (cursor !== stop && dirname(cursor) !== cursor) {
-            cursor = dirname(cursor);
-            await syncDirectoryStrict(cursor);
-          }
-        }
         assertLexicalIdentity();
       }
       // The descriptor-root binding must match assertAuditWriterAuthority in operational/audit-log.ts.
@@ -820,7 +853,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
               },
             } satisfies CrossProcessLockLease;
             boundLease.assertHeld();
-            const value = await operation(boundLease);
+            const authority = { active: true, assertHeld: () => lease.assertHeld() };
+            let value: T;
+            try {
+              // Strict mutation authority begins only inside the acquired lock callback and ends when it settles.
+              value = await this.strictLockLease.run(authority, () => operation(boundLease));
+            } finally { authority.active = false; }
             boundLease.assertHeld();
             return value;
           },
@@ -948,7 +986,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     let created = false;
     let publishedDirectory: Stats | undefined;
     try {
-      await writeFileCustodyWithDurability(stagedPath, checkedData, {
+      publishedDirectory = await writeFileCustodyWithDurability(stagedPath, checkedData, {
+        strictDirectoryBase: this.strictDirectoryBase(namespace),
         // Must match the required strictDurability option of writeFileCustodyWithDurability in custody-fs.ts so this write preserves every barrier.
         strictDurability,
         mode: 0o600,
@@ -961,7 +1000,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
             }
           : {}),
       });
-      publishedDirectory = strictDurability ? await stat(dirPath) : undefined;
+      // The custody descriptor supplies identity so exclusive publication cannot adopt a replacement directory.
       try {
         await link(stagedPath, filePath);
         created = true;
@@ -1029,7 +1068,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const dirPath = dirname(filePath);
     const lockName = `.${basename(filePath)}.compare-replace.lock`;
     // Even an absent comparison creates lock parents, so strict setup cannot wait for a matching row.
-    if (strictDurability) await ensureDirectoryStrict(dirPath, 0o700);
+    const directoryIdentity = strictDurability ? await ensureDirectoryStrict(dirPath, 0o700, this.strictDirectoryBase(namespace)) : undefined;
 
     // The lock covers the complete read -> compare -> atomic replacement
     // window. A plain read followed by rename is not CAS: two processes can
@@ -1037,19 +1076,33 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // second process re-read only after the winner has committed. A crashed
     // holder leaves a visible stale lock and future calls fail closed rather
     // than auto-breaking it with a racy unlink.
-    const replaced = await withPathLock(
+    let primaryFailure: unknown;
+    let replaced: boolean;
+    try { replaced = await withPathLock(
       dirPath,
       lockName,
       async () => {
-        const current = await this.readAtPath(filePath);
-        if (current === null || !constantTimeEqual(current, expected)) return false;
-        await this.atomicWriteFile(filePath, checkedData, true, strictDurability);
-        return true;
+        try {
+          // The comparison lock must cover the same parent that strict setup captured before its lockfile existed.
+          if (strictDurability) await syncDirectoryStrict(dirPath, directoryIdentity);
+          const current = await this.readAtPath(filePath);
+          if (current === null || !constantTimeEqual(current, expected)) return false;
+          await this.atomicWriteFile(filePath, checkedData, true, strictDurability);
+          return true;
+        } catch (error) {
+          if (strictDurability) primaryFailure = error;
+          throw error;
+        }
       },
       { metadata: { operation: "storage_compare_and_replace" } },
     );
-    // Strict completion also syncs the directory entry removed by comparison-lock cleanup.
-    if (strictDurability) await syncDirectoryStrict(dirPath);
+    } catch (error) {
+      // Legacy lock cleanup must retain the strict operation failure because both describe uncertain completion.
+      if (primaryFailure !== undefined && error !== primaryFailure) throw new AggregateError([primaryFailure, error], "strict comparison and cleanup failed", { cause: error });
+      throw error;
+    }
+    // Strict completion barriers the captured directory containing the removed comparison lock.
+    if (strictDurability) await syncDirectoryStrict(dirPath, directoryIdentity);
     return replaced;
   }
 
@@ -1075,10 +1128,18 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     await this.atomicWriteFile(filePath, checkedData, true, false);
   }
 
+  private strictDirectoryBase(namespace: string): string {
+    if (this.allowDirectoryCapabilityRootNamespace) return ".";
+    const bound = this.boundBasePath.getStore();
+    return bound?.lockedNamespace === namespace ? this.activeNamespacePath(namespace) : this.activeBasePath();
+  }
+
   private assertStrictDirectoryBinding(): void {
     const bound = this.boundBasePath.getStore();
-    // Legacy bindings may have created unsynced ancestors before capturing their descriptors.
-    if (bound && !bound.strictDurability) throw new Error("strict writes require a strict namespace binding");
+    const authority = this.strictLockLease.getStore();
+    // Only a live strict lock or its private worker executor supplies the held root and parent barriers.
+    if (!this.allowDirectoryCapabilityRootNamespace && (!bound?.strictDurability || !authority?.active)) throw new Error("strict writes require a strict namespace binding");
+    authority?.assertHeld();
   }
 
   /** Must match StrictDurabilityStorageCapabilities in interface.ts and worker strict dispatch. */
@@ -1099,17 +1160,23 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
 
   /** Exclusive strict publication; must match interface.ts and worker dispatch. */
   async writeIfAbsentStrict(namespace: string, key: string, data: Uint8Array): Promise<boolean> {
-    this.assertStrictDirectoryBinding();
+    assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     // Authorization belongs to the original prepared buffer, before its snapshot reaches the mode helper.
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    this.assertStrictDirectoryBinding();
     return this.writeIfAbsentMode(namespace, key, checkedData, true);
   }
 
   /** Strict serialized replacement; must match interface.ts and worker dispatch. */
   async replaceIfEqualsStrict(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean> {
-    this.assertStrictDirectoryBinding();
+    assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     // Authorization belongs to the original prepared buffer, before its snapshot reaches the mode helper.
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    this.assertStrictDirectoryBinding();
     return this.replaceIfEqualsMode(namespace, key, expected, checkedData, true);
   }
 
@@ -1122,7 +1189,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // For owner writes, writeFileCustody verifies the namespace dir exists
     // inside basePath before opening the temp file. It will not recursively
     // create parent dirs as root.
-    await writeFileCustodyWithDurability(filePath, data, {
+    const directoryIdentity = await writeFileCustodyWithDurability(filePath, data, {
+      strictDirectoryBase: this.allowDirectoryCapabilityRootNamespace ? "." : (this.boundBasePath.getStore()?.namespaceBasePath === dirname(filePath) ? dirname(filePath) : this.activeBasePath()),
       // Must match the required strictDurability option of writeFileCustodyWithDurability in custody-fs.ts so this write preserves every barrier.
       strictDurability,
       mode: 0o600,
@@ -1138,7 +1206,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           }
         : {}),
     });
-    if (syncFile) await (strictDurability ? syncDirectoryStrict(dirname(filePath)) : this.fsyncDirectoryLegacy(dirname(filePath)));
+    if (syncFile) await (strictDurability ? syncDirectoryStrict(dirname(filePath), directoryIdentity) : this.fsyncDirectoryLegacy(dirname(filePath)));
   }
 
   private async fsyncDirectoryLegacy(dirPath: string): Promise<void> {
