@@ -153,6 +153,19 @@ export function advanceRecovery(state: ComponentRecovery, clean: boolean, sample
 }
 
 // ---------------------------------------------------------------------------
+// Allow-sighting retention time.
+// ---------------------------------------------------------------------------
+/**
+ * The capture time the observer retains for an allow sighting. A sighting
+ * stamped after this cycle's observation time is retained as seen now: keeping
+ * the future stamp would never age out under HISTORY_WINDOW, and dropping it
+ * would clear a fault, so the stamp is clamped and the fault ages from now.
+ */
+export function retainedCaptureTime(capturedAtMs: number, observedAtMs: number): number {
+  return Math.min(capturedAtMs, observedAtMs);
+}
+
+// ---------------------------------------------------------------------------
 // Observer.
 // ---------------------------------------------------------------------------
 export type ObserverState = "observer_IDLE" | "observer_COLLECTING" | "observer_EVALUATING" | "observer_PUBLISHING" | "observer_STOPPING";
@@ -330,7 +343,7 @@ export class LivenessObserver {
         // An allow on the canary tuple is a wall fault that must outlive the daemon instance that saw it, so the newest sighting is kept across instances.
         if (seen !== null && (seen.principal === "agent" || seen.principal === "gate") &&
             (this.sighting === null || seen.captured_at_ms > this.sighting.captured_at_ms)) {
-          this.sighting = { captured_at_ms: seen.captured_at_ms, principal: seen.principal, daemon_instance: parsed.value.daemon_instance };
+          this.sighting = { captured_at_ms: retainedCaptureTime(seen.captured_at_ms, endedAt), principal: seen.principal, daemon_instance: parsed.value.daemon_instance };
         }
       }
     }
@@ -459,6 +472,6 @@ export class LivenessObserver {
     if (!parsed.ok || parsed.envelope.boot_id !== bootId || !parsed.wall.ok) return;
     const seed = parsed.wall.value.canary_allow_sighting;
     if (seed === null || nowMs - seed.captured_at_ms > HISTORY_WINDOW) return;
-    if (this.sighting === null || seed.captured_at_ms > this.sighting.captured_at_ms) this.sighting = { ...seed };
+    if (this.sighting === null || seed.captured_at_ms > this.sighting.captured_at_ms) this.sighting = { ...seed, captured_at_ms: retainedCaptureTime(seed.captured_at_ms, nowMs) };
   }
 }

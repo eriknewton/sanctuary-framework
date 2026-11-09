@@ -125,7 +125,8 @@ export type WatchChildResult =
 
 export type SlotState = "slot_IDLE" | "slot_RUNNING" | "slot_SETTLED" | "slot_EXPIRED" | "slot_TERMINATING" | "slot_POISONED";
 
-interface Slot { state: SlotState; exited: boolean }
+/** `owner` names the run that holds the slot, so a late event from an earlier child can never change a reused slot. */
+interface Slot { state: SlotState; exited: boolean; owner: object | null }
 
 export interface RunnerTimers {
   setTimeout(fire: () => void, ms: number): unknown;
@@ -143,7 +144,7 @@ export class BoundedChildRunner {
 
   constructor(private readonly options: { spawn: WatchSpawn; timers: RunnerTimers; maxSlots?: number }) {
     if (typeof options.spawn !== "function" || options.timers === undefined) throw new Error("bounded child runner requires spawn and timers");
-    this.slots = Array.from({ length: options.maxSlots ?? MAX_COLLECTION_CHILDREN }, () => ({ state: "slot_IDLE" as SlotState, exited: true }));
+    this.slots = Array.from({ length: options.maxSlots ?? MAX_COLLECTION_CHILDREN }, () => ({ state: "slot_IDLE" as SlotState, exited: true, owner: null }));
   }
 
   /** Slots currently owned by a child (every state but slot_IDLE). */
@@ -166,8 +167,13 @@ export class BoundedChildRunner {
     return new Promise<WatchChildResult>(resolve => {
       let settled = false;
       const settle = (result: WatchChildResult): void => { if (!settled) { settled = true; resolve(result); } };
+      const run = {};
       slot.state = "slot_RUNNING";
       slot.exited = false;
+      slot.owner = run;
+      // Every child event below first checks that this run still owns the slot: once the slot is idle and handed to a
+      // later run, an exit, close, output or timer of this child must not settle, release or poison the later child's slot.
+      const owns = (): boolean => slot.owner === run;
       let child: WatchChild;
       try {
         child = this.options.spawn(argv.file, argv.args, { env: { ...WATCH_CHILD_ENV }, cwd: "/", stdio: ["ignore", "pipe", "pipe"], shell: false });
@@ -184,6 +190,7 @@ export class BoundedChildRunner {
       let killHandle: unknown = null;
       let reapHandle: unknown = null;
       const observedExit = (): void => {
+        if (!owns()) return;
         slot.exited = true;
         timers.clearTimeout(killHandle);
         timers.clearTimeout(reapHandle);
@@ -191,7 +198,7 @@ export class BoundedChildRunner {
         if (slot.state !== "slot_RUNNING") slot.state = "slot_IDLE";
       };
       const terminate = (reason: "deadline" | "over_cap"): void => {
-        if (slot.state !== "slot_RUNNING") return;
+        if (!owns() || slot.state !== "slot_RUNNING") return;
         timers.clearTimeout(deadlineHandle);
         // The collector fails immediately; the slot stays owned until the child's exit is observed.
         settle({ status: "failed", reason });
@@ -200,13 +207,13 @@ export class BoundedChildRunner {
         try { child.kill("SIGTERM"); } catch { /* the exit observation decides the slot */ }
         slot.state = "slot_TERMINATING";
         killHandle = timers.setTimeout(() => {
-          if (slot.exited) return;
+          if (!owns() || slot.exited) return;
           try { child.kill("SIGKILL"); } catch { /* the exit observation decides the slot */ }
-          reapHandle = timers.setTimeout(() => { if (!slot.exited) slot.state = "slot_POISONED"; }, KILL_REAP_GRACE);
+          reapHandle = timers.setTimeout(() => { if (owns() && !slot.exited) slot.state = "slot_POISONED"; }, KILL_REAP_GRACE);
         }, TERM_GRACE);
       };
       const collect = (into: Buffer[]) => (chunk: Buffer | string): void => {
-        if (slot.state !== "slot_RUNNING") return;
+        if (!owns() || slot.state !== "slot_RUNNING") return;
         const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
         bytes += buffer.byteLength;
         // Over the cap the read fails and the child is terminated; no truncated prefix is ever returned.
@@ -216,16 +223,16 @@ export class BoundedChildRunner {
       child.stdout?.on("data", collect(stdout));
       child.stderr?.on("data", collect(stderr));
       child.on("error", () => {
-        if (child.pid === undefined) {
+        if (owns() && child.pid === undefined) {
           timers.clearTimeout(deadlineHandle);
           slot.exited = true;
           slot.state = "slot_IDLE";
           settle({ status: "failed", reason: "spawn_error" });
         }
       });
-      child.on("exit", () => { if (slot.state !== "slot_RUNNING") observedExit(); else slot.exited = true; });
+      child.on("exit", () => { if (!owns()) return; if (slot.state !== "slot_RUNNING") observedExit(); else slot.exited = true; });
       child.on("close", (code, signal) => {
-        if (slot.state === "slot_RUNNING") {
+        if (owns() && slot.state === "slot_RUNNING") {
           timers.clearTimeout(deadlineHandle);
           slot.state = "slot_SETTLED";
           settle({ status: "ok", code, signal, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") });
@@ -244,6 +251,8 @@ export const nodeWatchSpawn: WatchSpawn = (file, args, options) => nodeSpawn(fil
 // ---------------------------------------------------------------------------
 export interface WatchFs {
   lstatSync(path: string): fs.Stats;
+  /** Required: the canary bytes are accepted only from the inode the lstat described. */
+  fstatSync(fd: number): fs.Stats;
   openSync(path: string, flags: number, mode?: number): number;
   readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
   closeSync(fd: number): void;
@@ -271,12 +280,18 @@ function okText(result: WatchChildResult): string | null {
 
 const delay = (timers: RunnerTimers, ms: number): Promise<void> => new Promise(resolve => { timers.setTimeout(resolve, ms); });
 
-/** Read at most `cap + 1` bytes of a file opened with O_NOFOLLOW, so an extended file is detected without unbounded work. */
-function readCapped(io: WatchFs, path: string, cap: number): CollectedFact<Uint8Array> {
+/**
+ * Read at most `cap + 1` bytes of a file opened with O_NOFOLLOW, so an extended file is detected without unbounded work.
+ * The opened descriptor must be the inode `expected` names: a file replaced between the lstat and the open fails the read.
+ */
+function readCapped(io: WatchFs, path: string, cap: number, expected: { dev: number; ino: number }): CollectedFact<Uint8Array> {
   let fd: number;
   try { fd = io.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
   catch { return { status: "failed" }; }
   try {
+    // The ownership, mode and size facts come from the lstat, so the bytes are accepted only from that same file.
+    const opened = io.fstatSync(fd);
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino) return { status: "failed" };
     const buffer = Buffer.alloc(cap + 1);
     let total = 0;
     while (total < buffer.length) {
@@ -347,13 +362,19 @@ export function createWatchCollectors(options: WatchCollectorOptions): ObserverC
       return (await printSystem(label)).pid;
     },
     async collectCanaryFacts(agentUid): Promise<Omit<CanaryIntegrityFacts, "agentUid">> {
-      const plistStat = await fact<CanaryPlistStat>(async () => {
+      let plistStat: CollectedFact<CanaryPlistStat> = { status: "failed" };
+      let identity: { dev: number; ino: number } | null = null;
+      try {
         const s = io.lstatSync(CANARY_INSTALLED_PLIST_PATH);
-        return { isFile: s.isFile(), isSymbolicLink: s.isSymbolicLink(), uid: s.uid, gid: s.gid, mode: s.mode, size: s.size };
-      });
-      const plistBytes = plistStat.status === "ok" ? readCapped(io, CANARY_INSTALLED_PLIST_PATH, CANARY_PLIST_BYTES) : { status: "failed" as const };
+        identity = { dev: s.dev, ino: s.ino };
+        plistStat = { status: "ok", value: { isFile: s.isFile(), isSymbolicLink: s.isSymbolicLink(), uid: s.uid, gid: s.gid, mode: s.mode, size: s.size } };
+      } catch { /* an absent or unreadable plist reads failed */ }
+      const plistBytes: CollectedFact<Uint8Array> = identity === null
+        ? { status: "failed" } : readCapped(io, CANARY_INSTALLED_PLIST_PATH, CANARY_PLIST_BYTES, identity);
+      // The id chain and the system print hold separate slots (OBSERVER_CYCLE_CHILD_SET counts them apart) and run
+      // concurrently, so the facts need one CHILD_READ_DEADLINE, not two, and fit inside COLLECT_DEADLINE.
       // Both id calls share one CHILD_READ_DEADLINE: the second runs only with the time the first left.
-      const account = await fact(async () => {
+      const accountP = fact(async () => {
         const startedAt = nowMs();
         const name = okText(await runner.run({ command: "id_name", uid: agentUid }, CHILD_READ_DEADLINE))?.trim() ?? "";
         if (!canaryAccountNameValid(name)) throw new Error("account name read failed");
@@ -363,7 +384,8 @@ export function createWatchCollectors(options: WatchCollectorOptions): ObserverC
         if (!/^\d+$/.test(uidText)) throw new Error("account uid read failed");
         return { name, reverseUid: Number(uidText) };
       });
-      const print = await fact(() => printSystem(CANARY_LABEL));
+      const printP = fact(() => printSystem(CANARY_LABEL));
+      const [account, print] = await Promise.all([accountP, printP]);
       return { plistStat, plistBytes, account, print };
     },
     async runNetstat(): Promise<CensusChildResult> {

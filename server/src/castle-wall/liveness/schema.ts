@@ -587,6 +587,8 @@ const CONFIG_FIELDS = [
 const LAUNCHD_LABEL_TEXT = /^[A-Za-z0-9._-]+$/;
 // eslint-disable-next-line no-control-regex
 const CONTROL_TEXT = /[\x00-\x1f\x7f]/;
+/** Any character the process census splits argv on; must match the split in parseProcessRead in server/src/castle-wall/liveness/process-census.ts. */
+const ARGV_SEPARATOR_TEXT = /\s/;
 
 /**
  * Parse `config.json`. A bad `agent_uid`, `gate_uid`, `launchd_leeway_s`, wall
@@ -666,7 +668,10 @@ export function parseConfigRecord(value: unknown): ParsedConfig {
     const script_paths: string[] = [];
     if (list && list.length === 0) agent.fail("mcp.script_paths");
     list?.forEach((item, index) => {
-      const valid = typeof item === "string" && item.startsWith("/") && !CONTROL_TEXT.test(item) && new TextEncoder().encode(item).length <= PATH_BYTES;
+      // A path with whitespace can never equal one ps argv token, so its stale child would read not-stale; it is refused instead.
+      // The whitespace class must match the argv token split in parseProcessRead in server/src/castle-wall/liveness/process-census.ts.
+      const valid = typeof item === "string" && item.startsWith("/") && !CONTROL_TEXT.test(item) && !ARGV_SEPARATOR_TEXT.test(item) &&
+        new TextEncoder().encode(item).length <= PATH_BYTES;
       if (valid) script_paths.push(item); else agent.fail(`mcp.script_paths[${index}]`);
     });
     mcp = harness_label !== undefined && list !== undefined && list.length > 0 && script_paths.length === list.length ? { harness_label, script_paths } : undefined;

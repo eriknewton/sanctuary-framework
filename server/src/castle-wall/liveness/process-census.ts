@@ -65,6 +65,7 @@ export function parseProcessRead(text: string): ProcessRead {
   if (lines.length > PROCESS_ROWS) return { status: "failed", detail: "process_rows" };
   const rows: ProcessRow[] = [];
   for (const line of lines) {
+    // Must match ARGV_SEPARATOR_TEXT in server/src/castle-wall/liveness/schema.ts, which refuses a configured MCP script path this split could break.
     const tokens = line.trim().split(/\s+/);
     if (tokens.length <= LEADING_FIELDS + LSTART_TOKENS) return { status: "failed", detail: "row_shape" };
     const pid = uint(tokens[0]!, UINT32_MAX);

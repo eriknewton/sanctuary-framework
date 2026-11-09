@@ -64,6 +64,8 @@ export function checkCanaryIntegrity(facts: CanaryIntegrityFacts, checkedAtMs: n
   const passed =
     stat.isFile && !stat.isSymbolicLink && stat.uid === ROOT_UID && stat.gid === ROOT_GID &&
     (stat.mode & PERMISSION_MASK) === CANARY_PLIST_MODE && stat.size <= CANARY_PLIST_BYTES &&
+    // The hashed bytes must be the whole file the stat described; a size disagreement means they were read from another file.
+    bytes.byteLength === stat.size &&
     bytes.byteLength <= CANARY_PLIST_BYTES && createHash("sha256").update(bytes).digest("hex") === canaryPlistSha256(name) &&
     reverseUid === facts.agentUid &&
     print.valid && print.program === CANARY_PROGRAM && print.username === name &&

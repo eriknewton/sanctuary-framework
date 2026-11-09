@@ -137,6 +137,34 @@ describe("bounded child runner", () => {
     expect(await result).toEqual({ status: "failed", reason: "deadline" });
   });
 
+  it("never lets a late close from a released child settle, release or poison the next child on the same slot", async () => {
+    vi.useFakeTimers();
+    const { spawn, children } = fakeSpawner();
+    const runner = new BoundedChildRunner({ spawn, timers: fakeRunnerTimers, maxSlots: 1 });
+    // The first child exits but its pipes stay open past the deadline, so the slot is released on the observed exit.
+    const first = runner.run({ command: "ps" }, DEADLINE);
+    children[0]!.emit("exit", 0, null);
+    await vi.advanceTimersByTimeAsync(DEADLINE);
+    expect(await first).toEqual({ status: "failed", reason: "deadline" });
+    expect(runner.slotStates()).toEqual(["slot_IDLE"]);
+    let secondResult: unknown = null;
+    const second = runner.run({ command: "netstat" }, DEADLINE).then(result => { secondResult = result; return result; });
+    expect(runner.slotStates()).toEqual(["slot_RUNNING"]);
+    // The first child's pipes close now, while the second child owns the slot.
+    children[0]!.stdout.emit("data", Buffer.from("late output\n"));
+    children[0]!.emit("close", 0, null);
+    expect(runner.slotStates()).toEqual(["slot_RUNNING"]);
+    expect(runner.liveChildren()).toBe(1);
+    expect(await runner.run({ command: "ps" }, DEADLINE)).toEqual({ status: "failed", reason: "no_slot" });
+    children[1]!.stdout.emit("data", Buffer.from("second output\n"));
+    children[1]!.exitNow(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(secondResult).toEqual({ status: "ok", code: 0, signal: null, stdout: "second output\n", stderr: "" });
+    expect(await second).toEqual(secondResult);
+    expect(runner.slotStates()).toEqual(["slot_IDLE"]);
+    expect(children).toHaveLength(2);
+  });
+
   it("sends SIGKILL at TERM_GRACE to a child ignoring SIGTERM, and returns the slot when the exit is seen", async () => {
     vi.useFakeTimers();
     const { spawn, children } = fakeSpawner();

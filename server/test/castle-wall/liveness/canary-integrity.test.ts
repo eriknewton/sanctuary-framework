@@ -1,9 +1,9 @@
 /** The pure canary integrity checker over collected facts, and the production fact collector over fixtures. */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { checkCanaryIntegrity, type CanaryIntegrityFacts } from "../../../src/castle-wall/liveness/canary-integrity.js";
-import { CHILD_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
+import { CHILD_READ_DEADLINE, COLLECT_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
 import { CANARY_PLIST_BYTES, generateCanaryPlist, parseSystemJobPrint } from "../../../src/castle-wall/liveness/launchd-plists.js";
 import { BoundedChildRunner, createWatchCollectors, type WatchChild, type WatchSpawn } from "../../../src/cli/castle-wall-watch-collectors.js";
 import { EventEmitter } from "node:events";
@@ -45,6 +45,8 @@ describe("canary integrity conjunction", () => {
     ["size over the cap", f => { stat(f).size = CANARY_PLIST_BYTES + 1; }],
     ["one byte changed", f => { const b = Buffer.from(bytes); b[b.length - 2] = 0x41; f.plistBytes = { status: "ok", value: b }; }],
     ["bytes over the cap", f => { f.plistBytes = { status: "ok", value: Buffer.alloc(CANARY_PLIST_BYTES + 1) }; }],
+    ["a stat size larger than the hashed bytes", f => { stat(f).size = bytes.byteLength + 1; }],
+    ["a stat size smaller than the hashed bytes", f => { stat(f).size = bytes.byteLength - 1; }],
     ["file absent", f => { f.plistStat = { status: "failed" }; }],
     ["bytes unreadable", f => { f.plistBytes = { status: "failed" }; }],
     ["print absent", f => { f.print = { status: "ok", value: parseSystemJobPrint("") }; }],
@@ -68,8 +70,8 @@ describe("canary integrity conjunction", () => {
   });
 });
 
-/** A fake child that answers one argv with a fixed result, or never exits. */
-function scriptedSpawn(answers: (args: readonly string[]) => { code: number; stdout: string; stderr?: string } | "hang"): { spawn: WatchSpawn; argv: string[][] } {
+/** A fake child that answers one argv with a fixed result, after `delayMs` when given, or never exits. */
+function scriptedSpawn(answers: (args: readonly string[]) => { code: number; stdout: string; stderr?: string; delayMs?: number } | "hang"): { spawn: WatchSpawn; argv: string[][] } {
   const argv: string[][] = [];
   const spawn: WatchSpawn = (file, args) => {
     argv.push([file, ...args]);
@@ -78,12 +80,13 @@ function scriptedSpawn(answers: (args: readonly string[]) => { code: number; std
     child.kill = () => { queueMicrotask(() => { child.emit("exit", null, "SIGTERM"); child.emit("close", null, "SIGTERM"); }); return true; };
     const answer = answers(args);
     if (answer !== "hang") {
-      queueMicrotask(() => {
+      const respond = () => {
         child.stdout.emit("data", Buffer.from(answer.stdout));
         if (answer.stderr) child.stderr.emit("data", Buffer.from(answer.stderr));
         child.emit("exit", answer.code, null);
         child.emit("close", answer.code, null);
-      });
+      };
+      if (answer.delayMs === undefined) queueMicrotask(respond); else setTimeout(respond, answer.delayMs);
     }
     return child;
   };
@@ -92,8 +95,11 @@ function scriptedSpawn(answers: (args: readonly string[]) => { code: number; std
 
 describe("canary fact collector", () => {
   const timers = { setTimeout: (fire: () => void, ms: number) => setTimeout(fire, ms), clearTimeout: (h: unknown) => clearTimeout(h as NodeJS.Timeout) };
-  const fakeFs = (mode = 0o100644) => ({
-    lstatSync: () => ({ isFile: () => true, isSymbolicLink: () => false, uid: 0, gid: 0, mode, size: bytes.byteLength }) as never,
+  afterEach(() => { vi.useRealTimers(); });
+  /** The lstat names inode 41 on device 3; `openedIno` is the inode the opened descriptor reports. */
+  const fakeFs = (mode = 0o100644, openedIno = 41) => ({
+    lstatSync: () => ({ isFile: () => true, isSymbolicLink: () => false, uid: 0, gid: 0, mode, size: bytes.byteLength, dev: 3, ino: 41 }) as never,
+    fstatSync: () => ({ dev: 3, ino: openedIno }) as never,
     openSync: () => 7,
     readSync: (_fd: number, buffer: Uint8Array, offset: number) => { if (offset >= bytes.byteLength) return 0; buffer.set(bytes, offset); return bytes.byteLength; },
     closeSync: () => undefined,
@@ -109,11 +115,48 @@ describe("canary fact collector", () => {
     const collectors = createWatchCollectors({ runner, timers, fortressPath: "/nonexistent-fixture", operatorUid: 501, fs: fakeFs() });
     const facts = await collectors.collectCanaryFacts(AGENT_UID);
     expect(checkCanaryIntegrity({ agentUid: AGENT_UID, ...facts }, NOW)!.passed).toBe(true);
-    expect(argv).toEqual([
-      ["/usr/bin/id", "-un", String(AGENT_UID)],
-      ["/usr/bin/id", "-u", NAME],
+    expect(argv.slice().sort()).toEqual([
       ["/bin/launchctl", "print", "system/ai.sanctuaryprotocol.castle-wall.canary"],
+      ["/usr/bin/id", "-u", NAME],
+      ["/usr/bin/id", "-un", String(AGENT_UID)],
     ]);
+    // id -u runs only after id -un named the account.
+    expect(argv.findIndex(a => a[1] === "-un")).toBeLessThan(argv.findIndex(a => a[1] === "-u"));
+  });
+
+  it("refuses bytes from a file that is not the inode the lstat described", async () => {
+    const { spawn } = scriptedSpawn(args => {
+      if (args[0] === "-un") return { code: 0, stdout: `${NAME}\n` };
+      if (args[0] === "-u") return { code: 0, stdout: `${AGENT_UID}\n` };
+      return { code: 0, stdout: PRINTS.entries.canary_system!.stdout };
+    });
+    const runner = new BoundedChildRunner({ spawn, timers });
+    const facts = await createWatchCollectors({ runner, timers, fortressPath: "/nonexistent-fixture", operatorUid: 501, fs: fakeFs(0o100644, 42) }).collectCanaryFacts(AGENT_UID);
+    expect(facts.plistStat.status).toBe("ok");
+    expect(facts.plistBytes.status).toBe("failed");
+    expect(checkCanaryIntegrity({ agentUid: AGENT_UID, ...facts }, NOW)!.passed).toBe(false);
+  });
+
+  it("collects passing facts inside COLLECT_DEADLINE when the id chain and the system print each take most of a child deadline", async () => {
+    vi.useFakeTimers();
+    // Each child answers inside its own deadline; run one after another they would need longer than the cycle deadline.
+    const ID_STEP_MS = (CHILD_READ_DEADLINE * 3) / 8;
+    const PRINT_MS = (CHILD_READ_DEADLINE * 7) / 8;
+    expect(2 * ID_STEP_MS + PRINT_MS).toBeGreaterThan(COLLECT_DEADLINE);
+    const { spawn } = scriptedSpawn(args => {
+      if (args[0] === "-un") return { code: 0, stdout: `${NAME}\n`, delayMs: ID_STEP_MS };
+      if (args[0] === "-u") return { code: 0, stdout: `${AGENT_UID}\n`, delayMs: ID_STEP_MS };
+      return { code: 0, stdout: PRINTS.entries.canary_system!.stdout, delayMs: PRINT_MS };
+    });
+    const runner = new BoundedChildRunner({ spawn, timers });
+    const startedAt = Date.now();
+    let finishedAt: number | null = null;
+    const pending = createWatchCollectors({ runner, timers, fortressPath: "/nonexistent-fixture", operatorUid: 501, fs: fakeFs() })
+      .collectCanaryFacts(AGENT_UID).then(facts => { finishedAt = Date.now(); return facts; });
+    await vi.advanceTimersByTimeAsync(COLLECT_DEADLINE);
+    expect(finishedAt).not.toBeNull();
+    expect(finishedAt! - startedAt).toBeLessThan(COLLECT_DEADLINE);
+    expect(checkCanaryIntegrity({ agentUid: AGENT_UID, ...(await pending) }, NOW)!.passed).toBe(true);
   });
 
   it("fails when the id chain exceeds its one shared deadline", async () => {

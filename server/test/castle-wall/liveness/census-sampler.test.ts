@@ -121,6 +121,31 @@ describe("retention", () => {
     expect(h.series.snapshot()[0]!.observed_uptime_ms).toBe(h.clock.up);
   });
 
+  it("never credits the earlier gateway's sockets to the new generation when a netstat in flight resolves after the gateway changed", async () => {
+    const h = harness();
+    for (let i = 0; i < 5; i++) { await h.sampler.tick(); advance(h, CENSUS_PERIOD); }
+    const switchedAtUptime = h.clock.up;
+    let resolve: (result: CensusChildResult) => void = () => undefined;
+    h.output.next = () => new Promise<CensusChildResult>(done => { resolve = done; });
+    const attempt = h.sampler.tick();
+    // The observer selects a new gateway generation while the read started under the old one is still running.
+    const G2 = { ...GATEWAY, pid: GATEWAY.pid + 2, generation: "generation-fixture-2" };
+    h.ctx.value = context({ gateway: G2 });
+    resolve({ status: "ok", stdout: netstat(5000, 2) });
+    await attempt;
+    for (const sample of h.series.snapshot()) {
+      if (sample.gateway.generation === G2.generation) {
+        // Rows are taken for the new generation's pid only, so the old gateway's counters never enter its series.
+        expect(sample.gateway.pid).toBe(G2.pid);
+        expect(sample.rows).toEqual([]);
+      } else {
+        expect(sample.gateway.generation).toBe(GATEWAY.generation);
+        expect(sample.observed_uptime_ms).toBeLessThan(switchedAtUptime);
+      }
+    }
+    expect(new Set(h.series.snapshot().map(sample => sample.gateway.generation)).size).toBe(1);
+  });
+
   it("appends nothing on a failed attempt and keeps the series", async () => {
     const h = harness();
     for (let i = 0; i < 5; i++) { await h.sampler.tick(); advance(h, CENSUS_PERIOD); }

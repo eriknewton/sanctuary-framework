@@ -11,6 +11,7 @@ import {
   selectGateway,
   type ProcessRow,
 } from "../../../src/castle-wall/liveness/process-census.js";
+import { parseConfigRecord } from "../../../src/castle-wall/liveness/schema.js";
 import { BoundedChildRunner, createWatchCollectors, type WatchChild, type WatchSpawn } from "../../../src/cli/castle-wall-watch-collectors.js";
 
 const FIXTURE = JSON.parse(readFileSync(join(__dirname, "fixtures", "process-census.json"), "utf8")) as {
@@ -108,6 +109,30 @@ describe("MCP stale child", () => {
     expect(checkMcpStaleChild([rows(), rows()], null, MCP).status).toBe("invalid");
     const restarted = rows(FIXTURE.text.replace(" 75400      1   502 Sun Nov  9 07:50:00", " 75400      1   502 Sun Nov  9 07:50:30"));
     expect(checkMcpStaleChild([rows(), restarted], FIXTURE.harness_pid, MCP).status).toBe("invalid");
+  });
+});
+
+describe("MCP script path config", () => {
+  const BASE_CONFIG = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")).base.config.value as Record<string, unknown>;
+  const withScripts = (script_paths: string[]) => parseConfigRecord({ ...BASE_CONFIG, mcp: { harness_label: MCP.mcp.harness_label, script_paths } });
+
+  it("refuses a script path the whitespace argv split could never match, so its stale child cannot read not stale", () => {
+    const spaced = "/opt/agent fixture/mcp/server.js";
+    // The split argv of a child running the spaced path never holds the whole path, so the check would miss it.
+    const child = rows(`${FIXTURE.text}${line(90001, 1, FIXTURE.agent_uid, "Sun Nov  9 08:01:00 2026", `/bin/node ${spaced}`)}\n`);
+    expect(child.some(row => row.argv.includes(spaced))).toBe(false);
+    for (const path of [spaced, "/opt/agent\u00a0fixture/server.js"]) {
+      const parsed = withScripts([FIXTURE.mcp_script, path]);
+      expect(parsed.ok, path).toBe(true);
+      if (!parsed.ok) continue;
+      expect(parsed.value.mcp, path).toBeUndefined();
+      expect(parsed.agentInvalid, path).toContain("mcp.script_paths[1]");
+    }
+  });
+
+  it("accepts an absolute script path without whitespace", () => {
+    const parsed = withScripts([FIXTURE.mcp_script]);
+    expect(parsed.ok && parsed.value.mcp).toEqual({ harness_label: MCP.mcp.harness_label, script_paths: [FIXTURE.mcp_script] });
   });
 });
 

@@ -13,13 +13,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { CANARY_LABEL, CHILD_READ_DEADLINE, OBSERVER_LABEL } from "../../src/castle-wall/liveness/constants.js";
+import { CANARY_LABEL, CHILD_READ_DEADLINE, OBSERVER_LABEL, SECOND, WATCH_THROTTLE_INTERVAL_S } from "../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../src/castle-wall/liveness/census-sampler.js";
 import { CANARY_INSTALLED_PLIST_PATH, generateCanaryPlist, parseSystemJobPrint } from "../../src/castle-wall/liveness/launchd-plists.js";
 import { LivenessObserver, type ObserverCollectors } from "../../src/castle-wall/liveness/observer.js";
 import { parseFullAgentPrint } from "../../src/cli/castle-wall-full-agent.js";
 import {
   COMMISSIONING_LINE,
+  OBSERVER_STAYS_LOADED_LINE,
   WATCH_EXIT_CANARY_PENDING,
   WATCH_EXIT_CANARY_STILL_INSTALLED,
   WATCH_EXIT_FAILED,
@@ -73,6 +74,9 @@ class Launchd {
   canaryPrint: { code: number; stdout: string; stderr: string } | "hang" = PRINTS.captured_system_not_found!;
   idName = NAME;
   idUid = String(AGENT_UID);
+  /** Pids the loaded observer print reports, one per print; the last one repeats. Empty keeps the fixture pid. */
+  observerPids: number[] = [];
+  lastObserverPid: number | null = null;
   calls: string[][] = [];
   envs: Array<Record<string, string>> = [];
   spawn: WatchSpawn = (file, args, options) => {
@@ -94,7 +98,13 @@ class Launchd {
   private answer(file: string, args: readonly string[]): { code: number; stdout: string; stderr: string } | "hang" {
     if (file === "/usr/bin/id") return args[0] === "-un" ? { code: 0, stdout: `${this.idName}\n`, stderr: "" } : { code: 0, stdout: `${this.idUid}\n`, stderr: "" };
     if (file !== "/bin/launchctl") return { code: 1, stdout: "", stderr: "unexpected" };
-    if (args[0] === "print" && args[1]!.startsWith("gui/")) return this.observerLoaded ? PRINTS.observer_gui! : PRINTS.gui_not_found!;
+    if (args[0] === "print" && args[1]!.startsWith("gui/")) {
+      if (!this.observerLoaded) return PRINTS.gui_not_found!;
+      if (this.observerPids.length === 0) return PRINTS.observer_gui!;
+      const pid = this.observerPids.length > 1 ? this.observerPids.shift()! : this.observerPids[0]!;
+      this.lastObserverPid = pid;
+      return { ...PRINTS.observer_gui!, stdout: PRINTS.observer_gui!.stdout.replace(`pid = ${OBSERVER_PID}`, `pid = ${pid}`) };
+    }
     if (args[0] === "print" && args[1] === `system/${CANARY_LABEL}`) return this.canaryPrint;
     if (args[0] === "bootstrap") { if (!this.bootstrapOk) return { code: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error\n" }; this.observerLoaded = true; return { code: 0, stdout: "", stderr: "" }; }
     if (args[0] === "bootout") { if (this.bootoutUnloads) this.observerLoaded = false; return { code: 0, stdout: "", stderr: "" }; }
@@ -174,6 +184,7 @@ function world(options: { fortressName?: string; liveness?: boolean } = {}): Wor
       fdPaths.set(fd, path);
       return fd;
     },
+    fstatSync: fd => fs.fstatSync(fd),
     readSync: (fd, buffer, offset, length, position) => fs.readSync(fd, buffer, offset, length, position),
     closeSync: fd => { fdPaths.delete(fd); fs.closeSync(fd); },
     writeSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
@@ -274,6 +285,23 @@ describe("install-watch", () => {
     expectNoEscalationOrConfigWrite(w);
   });
 
+  it("reaches exit 0 only after sleeping a full stable window past the restart throttle, restarting the window on a pid change", async () => {
+    // One sample interval beyond the observer's launchd ThrottleInterval, as the installer's stable window is defined.
+    const STABLE_WINDOW = WATCH_THROTTLE_INTERVAL_S * SECOND + SECOND;
+    for (const restartAfter of [0, 3]) {
+      const w = world();
+      const RESTARTED_PID = OBSERVER_PID + 1;
+      w.launchd.observerPids = [...Array<number>(restartAfter).fill(OBSERVER_PID), RESTARTED_PID];
+      const slept: Array<{ ms: number; afterPid: number | null }> = [];
+      const code = await runInstallWatch(["--fortress", w.fortress], ctx(w, { sleep: async ms => { slept.push({ ms, afterPid: w.launchd.lastObserverPid }); } }));
+      expect(code, `restart after ${restartAfter}`).toBe(WATCH_EXIT_INSTALLED);
+      expect(w.out.text).toContain(`running pid=${RESTARTED_PID}.`);
+      // Only time slept after the restarted pid was first seen counts toward its window.
+      const sinceRestart = slept.filter(entry => entry.afterPid === RESTARTED_PID).reduce((sum, entry) => sum + entry.ms, 0);
+      expect(sinceRestart, `restart after ${restartAfter}`).toBeGreaterThanOrEqual(STABLE_WINDOW);
+    }
+  });
+
   it("prints exactly the attended install text and exits 5 when integrity fails", async () => {
     const w = world();
     w.facts.plistStat = { status: "failed" } as never;
@@ -325,6 +353,8 @@ describe("install-watch", () => {
     expect(await runInstallWatch(["--fortress", w.fortress], ctx(w))).toBe(WATCH_EXIT_FAILED);
     expect(w.out.text).not.toContain("Run these two commands");
     expect(w.err.text).toContain("does not match the generated bytes");
+    expect(w.err.text.endsWith(OBSERVER_STAYS_LOADED_LINE)).toBe(true);
+    expect(w.launchd.observerLoaded).toBe(true);
   });
 
   it("exits 1 before any write when the fortress is owned by another uid", async () => {
@@ -343,6 +373,9 @@ describe("install-watch", () => {
     expect(existsSync(stagedPath(w))).toBe(false);
     expect(w.out.text).not.toContain("Run these two commands");
     expect(w.err.text).toContain("could not be resolved in both directions");
+    // Rollback covers the write and bootstrap steps only, so the operator is told the observer is still loaded.
+    expect(w.err.text.endsWith(OBSERVER_STAYS_LOADED_LINE)).toBe(true);
+    expect(w.launchd.observerLoaded).toBe(true);
   });
 
   it("refuses non-darwin and root before any write", async () => {

@@ -583,3 +583,78 @@ describe("allow-sighting retention", () => {
     }
   });
 });
+
+describe("faults and sightings across a failed publish and a future stamp", () => {
+  it("carries a fault and an allow sighting from a cycle whose publish failed into the next published record", async () => {
+    const world = new World();
+    const observer = observerFor(world);
+    await recoverToOk(world, observer);
+    // A wall fault on a cycle whose publish fails: the next, clean cycle's file still names that fault and holds one sample.
+    world.advance(OBSERVER_PERIOD);
+    world.fullLoaded = false;
+    world.publishFailNext = true;
+    const faultUptime = world.uptime;
+    let publishedBefore = world.published.length;
+    await cycle(observer);
+    expect(world.published).toHaveLength(publishedBefore);
+    world.fullLoaded = true;
+    world.advance(OBSERVER_PERIOD);
+    world.canaryAt = world.now - SECOND;
+    await cycle(observer);
+    let onDisk = world.published[world.published.length - 1]!;
+    expect(onDisk).toBe(world.observerRecord);
+    expect(wallRec(onDisk).fault_uptime_ms).toBe(faultUptime);
+    expect(wallRec(onDisk).samples).toHaveLength(1);
+    expect(world.envelope(onDisk).wall.state).toBe("wall_RECOVERING");
+    // An allow sighting on a cycle whose publish fails, then a new daemon instance that saw none: the file still holds it.
+    world.advance(OBSERVER_PERIOD);
+    world.allowed = { captured_at_ms: world.now - SECOND, principal: "agent" };
+    const sightedAt = world.allowed.captured_at_ms;
+    world.publishFailNext = true;
+    publishedBefore = world.published.length;
+    await cycle(observer);
+    expect(world.published).toHaveLength(publishedBefore);
+    world.daemonInstance = "daemon-fixture-2";
+    world.allowed = null;
+    world.advance(OBSERVER_PERIOD);
+    await cycle(observer);
+    onDisk = world.published[world.published.length - 1]!;
+    expect(onDisk).toBe(world.observerRecord);
+    expect(raw(onDisk).canary_allow_sighting).toEqual({ captured_at_ms: sightedAt, principal: "agent", daemon_instance: "daemon-fixture-1" });
+    const env = world.envelope(onDisk);
+    expect(env.wall.reasons).toContain("canary_destination_allowed");
+    expect(env.wall.state).toBe("wall_DOWN");
+  });
+
+  it("retains a future-stamped allow as seen now, so it still faults the wall and ages out HISTORY_WINDOW later instead of never", async () => {
+    const world = new World();
+    const observer = observerFor(world);
+    await recoverToOk(world, observer);
+    world.allowed = { captured_at_ms: world.now + 10 * HISTORY_WINDOW, principal: "agent" };
+    world.advance(OBSERVER_PERIOD);
+    const seenAt = world.now;
+    const record = await cycle(observer);
+    expect(raw(record).canary_allow_sighting).toEqual({ captured_at_ms: seenAt, principal: "agent", daemon_instance: "daemon-fixture-1" });
+    world.daemonInstance = "daemon-fixture-2";
+    world.allowed = null;
+    world.advance(OBSERVER_PERIOD);
+    await cycle(observer);
+    expect(world.envelope().wall.reasons).toContain("canary_destination_allowed");
+    world.advance(seenAt + HISTORY_WINDOW - world.now);
+    expect(raw(await cycle(observer)).canary_allow_sighting).not.toBeNull();
+    world.advance(1);
+    expect(raw(await cycle(observer)).canary_allow_sighting).toBeNull();
+  });
+
+  it("seeds a future-stamped sighting from its own record as seen at the seed, never as a stamp that cannot age", async () => {
+    const world = new World();
+    await cycle(observerFor(world));
+    const seeded = structuredClone(world.observerRecord) as Record<string, unknown>;
+    raw(seeded).canary_allow_sighting = { captured_at_ms: world.now + 10 * HISTORY_WINDOW, principal: "gate", daemon_instance: "daemon-fixture-1" };
+    world.observerRecord = seeded;
+    const restarted = observerFor(world, world.collectors(), "observer-test-2");
+    world.advance(OBSERVER_PERIOD);
+    const seedAt = world.now;
+    expect(raw(await cycle(restarted)).canary_allow_sighting).toEqual({ captured_at_ms: seedAt, principal: "gate", daemon_instance: "daemon-fixture-1" });
+  });
+});
