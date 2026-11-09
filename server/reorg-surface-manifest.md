@@ -128,3 +128,24 @@ JSON and a `kind` beginning `surrogate_`; its help strings did not change.
 - `[castle-wall] AUDIT-EXIT-FENCE`; must match `AUDIT-EXIT-FENCE` in `server/src/cli/castle-wall-full-agent-state.ts`.
 - `[castle-wall] FULL-AGENT-CRASH-LOOP-STOP`; must match `FULL-AGENT-CRASH-LOOP-STOP` in `server/src/cli/castle-wall-full-agent-state.ts`.
 - `castle-wall full-status` and `castle-wall status` exit codes changed: both exit 0 only when the shared liveness evaluator reads the wall OK over stored evidence, 3 for a wall TTL warning or degraded wall, and 1 otherwise, including a running pid with no liveness records and non-darwin (`unsupported_adapter`). Every existing output line is byte-identical; three `Liveness wall:`, `Liveness agent:` and `Liveness coverage:` lines are appended. Exit codes must match the exit constants in `server/src/castle-wall/liveness/constants.ts`.
+
+
+## Default-off strict storage additions
+
+These additive internal APIs are classified as behavior additions, with no change
+to the frozen surfaces above or to existing callers:
+
+| Additive surface | Classification and bound |
+|---|---|
+| `StrictDurabilityStorageCapabilities` | Explicit opt-in interface; must match its methods in `storage/filesystem.ts` and `storage/read-only-guard.ts`. On Darwin, Node FileHandle.sync uses libuv's F_FULLFSYNC, then F_BARRIERFSYNC, then fsync fallback chain, discarding earlier errors; strict means whatever that chain achieved and is not proven. This bound must match `storage/interface.ts` and `docs/audit-log-architecture.md`; a native check or drilled bound is an S1b prerequisite. |
+| `writeStrict` | File and descriptor-verified directory barriers inside a strict lock; every acquisition syncs held namespace, root and existing root parent handles; Darwin durability is not proven. |
+| `writeIfAbsentStrict` | Exclusive publication with strict barriers, preserving existing destination bytes. |
+| `replaceIfEqualsStrict` | Serialized comparison and strict replacement, preserving mismatched bytes. |
+| `withStrictNamespaceLock` | Strict parent setup and held directory binding through the existing kernel lock; no retained settlement receipt. |
+| `WriteFileCustodyOptions.strictDurability` | Public legacy wrapper retains its optional flag; storage internals call `writeFileCustodyWithDurability` with a required durability choice. |
+| `ensureDirectoryStrict`, `syncDirectoryStrict` | Internal custody helpers with propagating sync errors; no benign-error classification. |
+| Darwin `writeStrict`, `writeIfAbsentStrict`, `replaceIfEqualsStrict`, `writeFileStrict`, `mkdirStrict` requests | Internal worker dispatch; must match the strict dispatch in `storage/filesystem.ts`. |
+
+No receipt, pin or seal API or persisted audit format is added. Existing encrypted
+bytes, namespace encoding, modes, cryptographic labels and legacy API signatures
+remain unchanged. The new methods are not added to package exports or boot paths.

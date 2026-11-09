@@ -38,6 +38,7 @@ const GUARDED_INTERFACES = [
   "StorageBackend",
   "FilesystemStorageCapabilities",
   "NamespaceLockStorageCapabilities",
+  "StrictDurabilityStorageCapabilities",
 ];
 
 /**
@@ -57,7 +58,8 @@ const GUARDED_INTERFACES = [
 function interfaceMethodNames(source: string, interfaceName: string): string[] {
   const header = new RegExp(`interface\\s+${interfaceName}\\s*{`).exec(source);
   if (!header) {
-    throw new Error(`interface ${interfaceName} not found in storage/interface.ts`);
+    // Missing declarations cannot silently shrink the guarded method set.
+    throw new Error(`interface not found: ${interfaceName}`);
   }
   let depth = 0;
   let end = -1;
@@ -106,6 +108,10 @@ describe("ReadOnlyStorageGuard interface parity", () => {
     expect(declared).toContain("read");
     expect(declared).toContain("writeDurable");
     expect(declared).toContain("withNamespaceLock");
+    expect(declared).toContain("withStrictNamespaceLock");
+    expect(declared).toContain("writeStrict");
+    expect(declared).toContain("writeIfAbsentStrict");
+    expect(declared).toContain("replaceIfEqualsStrict");
   });
 
   it("classifies every declared storage method, and classifies nothing else", () => {
@@ -133,4 +139,8 @@ it("classifies names-only enumeration and preserves its optional capability", as
   const storage = new MemoryStorage();
   await storage.write("fixture", "key", new Uint8Array([1]));
   expect(await new ReadOnlyStorageGuard(storage).listKeys!("fixture")).toEqual(["key"]);
+});
+
+it("refuses a missing guarded interface", () => {
+  expect(() => interfaceMethodNames("", "MissingInterface")).toThrow(/interface not found/);
 });
