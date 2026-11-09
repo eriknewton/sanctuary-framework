@@ -72,7 +72,7 @@ describe("packed recipient consumer", () => {
     'import fs from "node:fs"; fs.utimesSync(process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/pack", 0, 0);',
     'import fs from "node:fs/promises"; await fs.readFile("/tmp/operator/.sanctuary/state");',
     'import cp from "node:child_process"; cp.execFileSync("/usr/bin/env", ["python3", "-c", "print(1)"]);',
-    // Computed specifiers and createRequire never appear as a static import, so the bundle text guard cannot see them; the runtime mediation must still deny them.
+    // These rows cover computed dynamic import specifiers and createRequire loads of builtin modules, each of which the runtime mediation must deny.
     'const name = ["node", "net"].join(":"); const net = await import(name); net.connect(80, "127.0.0.1");',
     'const name = ["node", "child_process"].join(":"); const cp = await import(name); cp.spawnSync("/bin/true", []);',
     'import { createRequire } from "node:module"; createRequire(import.meta.url)("node:net").connect(80, "127.0.0.1");',

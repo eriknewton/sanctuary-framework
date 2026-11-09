@@ -89,7 +89,7 @@ it("buildCandidate entry positive control stages the same fixture once the envir
   expect(outcome).not.toContain("Source provenance refused"); expect(staged).toEqual(["pack-archive", "pack-source"]); expect(tree).toEqual([]);
 });
 
-// Must match OUTPUT_DIRECTORIES and outputEntries in scripts/build-evidence-pack.mjs.
+// Must match OUTPUT_DIRECTORIES and checkOutput in scripts/build-evidence-pack.mjs.
 const OUTPUTS = ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"];
 describe("rebuild output paths are all checked before either is cleared", () => {
   let c: Awaited<ReturnType<typeof prepareFixtureCandidate>>;
@@ -115,5 +115,47 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     expect(listing(other)).toEqual(otherBefore);
     expect(listing(faulted)).toEqual(faultedBefore);
     expect(lstatSync(destination).isSymbolicLink()).toBe(kind === "symlink");
+  }, 120_000);
+  const build = (root: string, options = {}) => buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], root, SOURCE, options);
+  const listing = (path: string) => existsSync(path) ? readdirSync(path).sort() : null;
+  // Must match the output-chain walk in checkOutput in scripts/build-evidence-pack.mjs: each ancestor here lies on one output chain.
+  const ANCESTORS = [["packages", OUTPUTS[0]], ["packages/evidence-pack-verifier", OUTPUTS[0]], ["server", OUTPUTS[1]]] as const;
+  it.each(ANCESTORS.flatMap(([ancestor, output]) => (["existing", "missing"] as const).map(final => [ancestor, final, output] as const)))("rebuild refuses a linked ancestor %s with the final directory %s at %s and changes neither output", async (ancestor, final, output) => {
+    const root = outputRoot(), other = join(root, OUTPUTS.find(path => path !== output)!), linked = join(root, ancestor), aside = linked + ".aside";
+    for (const path of OUTPUTS) writeFileSync(join(root, path, "stale.js"), "stale");
+    renameSync(linked, aside); symlinkSync(aside, linked, "dir");
+    // The real directory behind the link is where a clear or copy through the link would land.
+    const behind = join(aside, output.slice(ancestor.length + 1));
+    if (final === "missing") renameSync(behind, behind + ".moved");
+    const before = { other: listing(other), behind: listing(behind) };
+    await expect(build(root)).rejects.toThrow("Unexpected output path");
+    // Nothing is removed from either output and nothing is created through the link.
+    expect({ other: listing(other), behind: listing(behind) }).toEqual(before);
+    expect(lstatSync(linked).isSymbolicLink()).toBe(true);
+  }, 120_000);
+  it.each([...OUTPUTS.flatMap(output => (["directory", "symlink"] as const).map(kind => [kind, output] as const)), ["ancestor", OUTPUTS[1]] as const])("rebuild refuses %s replacement at %s between the check and the first removal", async (kind, output) => {
+    const root = outputRoot(), destination = join(root, output), original = destination + ".original", other = join(root, OUTPUTS.find(path => path !== output)!);
+    for (const path of OUTPUTS) writeFileSync(join(root, path, "stale.js"), "stale");
+    const expected = { destination: listing(destination), other: listing(other) };
+    let replaced = 0;
+    // The replacement keeps every name in place, so only the held directory identity distinguishes it from the checked output.
+    const outputsChecked = () => {
+      replaced += 1;
+      if (kind === "directory") { renameSync(destination, original); cpSync(original, destination, { recursive: true }); }
+      if (kind === "symlink") { renameSync(destination, original); symlinkSync(original, destination, "dir"); }
+      if (kind === "ancestor") { const server = join(root, "server"); renameSync(server, server + ".original"); symlinkSync(server + ".original", server, "dir"); }
+    };
+    await expect(build(root, { outputsChecked })).rejects.toThrow("Output path changed");
+    expect(replaced).toBe(1);
+    expect({ destination: listing(destination), other: listing(other) }).toEqual(expected);
+    if (kind !== "ancestor") expect(listing(original)).toEqual(expected.destination);
+  }, 120_000);
+  it("rebuild identity recheck admits unchanged outputs after the seam runs", async () => {
+    const root = outputRoot(), seen: string[][] = [];
+    for (const path of OUTPUTS) writeFileSync(join(root, path, "stale.js"), "stale");
+    // The seam runs once with both checked destinations and an unchanged tree still rebuilds, so the identity rows cannot be always-failing.
+    await build(root, { outputsChecked: (destinations: string[]) => seen.push(destinations) });
+    expect(seen).toEqual([OUTPUTS.map(path => join(realpathSync(root), path))]);
+    for (const path of OUTPUTS) expect(existsSync(join(root, path, "stale.js"))).toBe(false);
   }, 120_000);
 });

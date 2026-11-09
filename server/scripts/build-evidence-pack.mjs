@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,7 +41,7 @@ with tarfile.open(sys.argv[1]) as archive:
                 shutil.copyfileobj(source, output)
 `, archive, staged], { timeout: TIMEOUT_MS });
 }
-export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { nonRelease = false } = {}) {
+export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { nonRelease = false, outputsChecked } = {}) {
   if (args.length !== 4 || args[0] !== "--source-metadata" || args[2] !== "--source-archive") throw new Error("Expected source metadata and source archive");
   const metadata = JSON.parse(readFileSync(args[1], "utf8"));
   const head = existsSync(join(root, ".git")) ? execFileSync("/usr/bin/git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
@@ -67,24 +67,52 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   // The marker lives inside the packed directory so a fixture tarball stays marked non-release after it leaves its build root.
   if (nonRelease) writeFileSync(join(packageRoot, "dist", NON_RELEASE_MARKER), NON_RELEASE_TEXT, { flag: "wx" });
   if (readdirSync(join(packageRoot, "dist")).sort().join() !== ["provenance.json", "verify-evidence-pack.js", ...(nonRelease ? [NON_RELEASE_MARKER] : [])].sort().join()) throw new Error("Unexpected verifier artifact");
-  const outputs = OUTPUT_DIRECTORIES.map(relative => ({ relative, destination: join(root, relative), entries: outputEntries(join(root, relative)) }));
+  // The repository root is resolved once, so every output component below it is judged against one real anchor.
+  const base = realpathSync(root);
+  const outputs = OUTPUT_DIRECTORIES.map(relative => checkOutput(base, relative));
+  // Test-only seam: it runs after both outputs pass validation and before any removal, so a hardening test can change an output in that window.
+  outputsChecked?.(outputs.map(output => output.destination));
   // Both flat output directories are cleared in place so stale files cannot travel into rebuilt artifacts across volumes.
-  for (const { relative, destination, entries } of outputs) {
-    for (const entry of entries) unlinkSync(join(destination, entry.name));
-    cpSync(join(staged, relative), destination, { recursive: true });
+  for (const output of outputs) {
+    for (const entry of output.entries) { recheckOutputs(outputs); unlinkSync(join(output.destination, entry.name)); }
+    recheckOutputs(outputs);
+    cpSync(join(staged, output.relative), output.destination, { recursive: true });
+    if (!output.present) { output.held.push(directoryIdentity(output.destination) ?? refuseOutputPath()); output.present = true; }
   }
 }
 // Must match the output-directory witnesses in snapshot-provenance.test.ts.
 const OUTPUT_DIRECTORIES = ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"];
-function outputEntries(destination) {
-  let stat;
-  try { stat = lstatSync(destination); } catch (error) { if (error.code === "ENOENT") return []; throw error; }
-  // A link or non-directory output would redirect in-place clearing to another tree, so every output path is checked before either is cleared.
-  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Unexpected output path");
-  const entries = readdirSync(destination, { withFileTypes: true });
+const refuseOutputPath = () => { throw new Error("Unexpected output path"); };
+function directoryIdentity(path) {
+  const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  if (!stat) return undefined;
+  // A link or non-directory anywhere on an output chain would redirect in-place clearing or the copy to another tree.
+  if (stat.isSymbolicLink() || !stat.isDirectory()) refuseOutputPath();
+  return { path, dev: stat.dev, ino: stat.ino };
+}
+// Must match the output-chain and identity witnesses in snapshot-provenance.test.ts.
+function checkOutput(base, relative) {
+  const parts = relative.split("/"), held = [directoryIdentity(base) ?? refuseOutputPath()];
+  // Every component from the repository root down is examined, and only the final one may be absent, so no linked ancestor can carry the clear or the copy elsewhere.
+  for (let depth = 1; depth <= parts.length; depth++) {
+    const component = directoryIdentity(join(base, ...parts.slice(0, depth)));
+    if (component) held.push(component); else if (depth < parts.length) refuseOutputPath(); else break;
+  }
+  const deepest = held.at(-1).path, destination = join(base, relative), present = deepest === destination;
+  // The resolved deepest existing component must be its own lexical path, so a link the component walk could miss still refuses.
+  if (realpathSync(deepest) !== deepest) refuseOutputPath();
+  const entries = present ? readdirSync(destination, { withFileTypes: true }) : [];
   // Unexpected directories refuse cleanup because build outputs are flat and recursive deletion is not authorized.
   if (entries.some(entry => entry.isDirectory())) throw new Error("Unexpected output directory");
-  return entries;
+  return { relative, destination, held, present, entries };
+}
+function recheckOutputs(outputs) {
+  for (const { held, present, destination } of outputs) {
+    // Each held directory must still be the same real directory before every removal and copy, which closes replacement between check and use except by a writer who already owns the local checkout, since Node offers no descriptor-relative unlink.
+    for (const { path, dev, ino } of held) { const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false }); if (!stat || stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== dev || stat.ino !== ino) throw new Error("Output path changed"); }
+    // An output that was absent at the check must stay absent until its own copy creates it.
+    if (!present && lstatSync(destination, { throwIfNoEntry: false })) throw new Error("Output path changed");
+  }
 }
 // Test archives live outside git and are explicitly marked non-release; no fixture metadata authenticates a release.
 export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")) {
