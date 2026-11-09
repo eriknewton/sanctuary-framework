@@ -37,3 +37,6 @@ export type {
   SdwPrepared, SdwPrimarySigner, SdwPrimaryVerifier, SdwRecordTypes, SdwRecoveryResult,
   SdwSigningReceipt, SdwStorageBoundaryCapabilities, SdwStorageReason, SdwJournalAdmission,
 } from "./sdw-journal-contract.js";
+
+export { SignerPruneError, initialSignerPruneOutcome } from "./signer-prune-outcome.js";
+export type { SignerPruneOutcome, SignerPrunePhase } from "./signer-prune-outcome.js";

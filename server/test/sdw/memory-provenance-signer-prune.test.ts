@@ -179,7 +179,7 @@ async function fixture() {
   return { storage, local, direct, relayed, unusedA, unusedB, keys, known, adapter, bad, audit, pruner };
 }
 
-describe("C4 memory-provenance signer mark-and-sweep", () => {
+describe("memory-provenance signer mark-and-sweep", () => {
   it("retains direct, relayed, quarantined, and orphan-but-authenticated references and deletes only sorted zero-reference mappings", async () => {
     const f = await fixture();
     await f.bad.mark({
