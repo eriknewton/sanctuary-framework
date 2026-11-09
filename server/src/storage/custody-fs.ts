@@ -1,7 +1,7 @@
 import { constants as fsConstants, type Stats } from "node:fs";
 import { mkdir, open, rename, unlink, lstat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, join, relative, sep, resolve as resolvePath } from "node:path";
 import { isBenignDirectoryFsyncError } from "./directory-fsync.js";
 
 export type CustodyFsErrorCode =
@@ -21,7 +21,8 @@ export type CustodyFsErrorCode =
   | "parent_symlink_rejected"
   | "parent_mode_rejected"
   | "parent_uid_rejected"
-  | "parent_gid_rejected";
+  | "parent_gid_rejected"
+  | "strict_directory_missing";
 
 export class CustodyFsError extends Error {
   constructor(
@@ -104,6 +105,10 @@ export type ReadFileCustodyOptions =
   | ReadFileCustodyTextOptions;
 
 export interface WriteFileCustodyOptions {
+  /** Must match strictDurability in filesystem.ts and directory-capability-worker.ts. */
+  strictDurability?: boolean;
+  /** Existing held boundary through which strict directory barriers are repeated. */
+  strictDirectoryBase?: string;
   mode: number;
   /**
    * Create the parent directory before writing. Defaults to true. Set false for
@@ -405,7 +410,7 @@ export async function readFileCustodyWithStats(
   }
 }
 
-async function fsyncDirectory(dir: string): Promise<void> {
+async function fsyncDirectoryLegacy(dir: string): Promise<void> {
   let handle;
   try {
     handle = await open(dir, fsConstants.O_RDONLY);
@@ -415,6 +420,101 @@ async function fsyncDirectory(dir: string): Promise<void> {
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+/** Sync the captured directory only while its pathname still names that inode. */
+export async function syncDirectoryStrict(dir: string, expected?: Stats): Promise<void> {
+  // Descriptor roots name held authority, so the final dot avoids following a symlink at the opened component.
+  const path = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(dir) ? `${dir}/.` : dir;
+  const before = expected ?? await lstat(path);
+  const handle = await openExistingDirectoryNoFollow(path);
+  const failures: unknown[] = [];
+  try {
+    // A barrier on a substituted directory cannot establish durability for the published entry.
+    if (!before.isDirectory() || before.isSymbolicLink() || !sameFile(before, await handle.stat())) {
+      throw new Error("strict directory identity changed");
+    }
+    await handle.sync();
+    if (!sameFile(before, await lstat(path))) throw new Error("strict directory identity changed");
+  } catch (error) { failures.push(error); }
+  try { await handle.close(); } catch (error) { failures.push(error); }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "strict directory sync and close failed");
+}
+
+/** Capture and sync every directory from the held boundary through the leaf on every attempt. */
+export async function ensureDirectoryStrict(dir: string, mode: number, base: string): Promise<Stats> {
+  return syncDirectoryChainStrict(dir, base, mode);
+}
+
+/**
+ * Sync an existing chain from the held boundary through the leaf without creating anything.
+ * A missing component refuses with `strict_directory_missing`; must match the owner-mode
+ * strict callers in filesystem.ts (replaceIfEqualsMode) and writeFileCustodyWithDurability.
+ */
+export async function syncExistingDirectoryChainStrict(dir: string, base: string): Promise<Stats> {
+  return syncDirectoryChainStrict(dir, base, undefined);
+}
+
+/**
+ * Capture and sync the chain from the held boundary through the leaf on every attempt.
+ * An undefined `createMode` creates nothing, so a missing component refuses instead of being made.
+ */
+async function syncDirectoryChainStrict(dir: string, base: string, createMode: number | undefined): Promise<Stats> {
+  const suffix = relative(base, dir);
+  // The boundary limits creation and retries to directories covered by the caller's held authority.
+  if (suffix.split(sep).includes("..")) throw new Error("strict directory escapes its held boundary");
+  const entries: Array<{ path: string; handle: Awaited<ReturnType<typeof open>>; identity: Stats; closed: boolean }> = [];
+  const failures: unknown[] = [];
+  let identity!: Stats;
+  try {
+    let cursor = base;
+    for (const part of ["", ...suffix.split(sep).filter(Boolean)]) {
+      if (part) {
+        cursor = join(cursor, part);
+        if (createMode !== undefined) {
+          try { await mkdir(cursor, { mode: createMode }); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        }
+      }
+      const path = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(cursor) ? `${cursor}/.` : cursor;
+      let handle: Awaited<ReturnType<typeof open>>;
+      try { handle = await openExistingDirectoryNoFollow(path); }
+      catch (error) {
+        // Without creation authority an absent component is a refusal the caller can name, not an incidental open failure.
+        if (createMode === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new CustodyFsError("strict_directory_missing", "strict write without parent creation requires an existing directory", { cause: error });
+        }
+        throw error;
+      }
+      const entry = { path, handle, identity: undefined as unknown as Stats, closed: false };
+      entries.push(entry);
+      // Creation records descriptor identity immediately so a later name replacement cannot supply barrier evidence.
+      entry.identity = await handle.stat();
+      if (!entry.identity.isDirectory() || !sameFile(entry.identity, await lstat(path))) throw new Error("strict directory identity changed");
+      identity = entry.identity;
+    }
+    for (const entry of [...entries].reverse()) {
+      // Every retry syncs the same captured chain because an existing directory can still have an uncertain parent entry.
+      if (!sameFile(entry.identity, await entry.handle.stat()) || !sameFile(entry.identity, await lstat(entry.path))) throw new Error("strict directory identity changed");
+      await entry.handle.sync();
+      if (!sameFile(entry.identity, await lstat(entry.path))) throw new Error("strict directory identity changed");
+      entry.closed = true;
+      await entry.handle.close();
+    }
+    // Later parent barriers cannot excuse a child name that changed after its own barrier.
+    for (const entry of entries) {
+      if (!sameFile(entry.identity, await lstat(entry.path))) throw new Error("strict directory identity changed");
+    }
+  } catch (error) { failures.push(error); }
+  finally {
+    for (const entry of entries) {
+      if (!entry.closed) try { await entry.handle.close(); } catch (error) { failures.push(error); }
+    }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "strict directory setup and close failed");
+  return identity;
 }
 
 async function openExistingDirectoryNoFollow(
@@ -746,8 +846,24 @@ export async function writeFileCustody(
   data: string | Uint8Array,
   options: WriteFileCustodyOptions,
 ): Promise<void> {
+  await writeFileCustodyWithDurability(path, data, { ...options, strictDurability: options.strictDurability === true });
+}
+
+// Must match the required strictDurability argument at storage call sites in filesystem.ts and directory-capability-worker.ts.
+export async function writeFileCustodyWithDurability(
+  path: string,
+  data: string | Uint8Array,
+  options: WriteFileCustodyOptions & { strictDurability: boolean },
+): Promise<Stats | undefined> {
   const dir = dirname(path);
+  let publishedDirectory: Stats | undefined;
   let ownerGuard: NoFollowDirectoryGuard | undefined;
+  if (options.strictDurability && options.owner !== undefined && options.createParent !== false) {
+    // Owner writes may not create parents, yet a namespace made after the lock's root barrier still needs its own entry barrier;
+    // this runs before the owner guard so a missing directory refuses with the typed strict code rather than a guard failure.
+    if (!options.strictDirectoryBase) throw new Error("strict owner write requires a held boundary");
+    publishedDirectory = await syncExistingDirectoryChainStrict(dir, options.strictDirectoryBase);
+  }
   if (options.owner !== undefined && !options.stableDirectoryCapability) {
     // 2026-07-31 fix-round: verify containment BEFORE any recursive mkdir.
     // There is no mkdirat-style API here; creating missing parents by path as
@@ -756,13 +872,23 @@ export async function writeFileCustody(
     // already exist as real directories inside ownerBase.
     ownerGuard = await openNoFollowPathWithinBase(dir, options.ownerBase);
   }
+  const failures: unknown[] = [];
   try {
     await withOwnerEffectiveIdentity(options.owner, async (droppedToOwner) => {
       if (options.createParent !== false && options.owner === undefined) {
-        await mkdir(dir, {
-          recursive: true,
-          mode: options.parentMode ?? 0o700,
-        });
+        if (options.strictDurability) {
+          // A strict write needs the caller's held boundary so retries cannot forget a failed parent barrier.
+          if (!options.strictDirectoryBase) throw new Error("strict directory setup requires a held boundary");
+          publishedDirectory = await ensureDirectoryStrict(dir, options.parentMode ?? 0o700, options.strictDirectoryBase);
+        } else {
+          await mkdir(dir, { recursive: true, mode: options.parentMode ?? 0o700 });
+        }
+      }
+      if (options.strictDurability && ownerGuard) {
+        // Owner writes cannot skip uncertain parent barriers merely because creation is forbidden.
+        await ownerGuard.revalidate();
+        for (const entry of ownerGuard.handles) await entry.handle.sync();
+        await ownerGuard.revalidate();
       }
       await verifyParentCustody(path, options.parent);
       const tempPath = join(
@@ -770,9 +896,20 @@ export async function writeFileCustody(
         `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
       );
       let handle;
+      let directoryHandle;
+      let directoryIdentity: Stats | undefined;
       let cleanupTemp = true;
+      const writeFailures: unknown[] = [];
       try {
         await ownerGuard?.revalidate();
+        if (options.strictDurability) {
+          const directoryPath = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(dir) ? `${dir}/.` : dir;
+          directoryIdentity = publishedDirectory ?? await lstat(directoryPath);
+          directoryHandle = await openExistingDirectoryNoFollow(directoryPath);
+          // Publication and its barrier must refer to the same captured parent inode.
+          if (!directoryIdentity.isDirectory() || !sameFile(directoryIdentity, await directoryHandle.stat())) throw new Error("strict publication directory changed");
+          publishedDirectory = directoryIdentity;
+        }
         handle = await open(
           tempPath,
           fsConstants.O_WRONLY |
@@ -793,22 +930,48 @@ export async function writeFileCustody(
         await options.prepareTemp?.(tempPath);
         await handle.writeFile(data);
         await handle.sync();
-        await handle.close();
+        const completedHandle = handle;
         handle = undefined;
+        await completedHandle.close();
         await ownerGuard?.revalidate();
         await rename(tempPath, path);
         cleanupTemp = false;
-        await fsyncDirectory(dir);
-      } finally {
-        await handle?.close().catch(() => undefined);
+        if (directoryHandle) {
+          // A successful return requires the held publishing directory's barrier and unchanged identity.
+          await directoryHandle.sync();
+          const directoryPath = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(dir) ? `${dir}/.` : dir;
+          if (!sameFile(directoryIdentity!, await lstat(directoryPath))) throw new Error("strict publication directory changed");
+        } else await fsyncDirectoryLegacy(dir);
+      } catch (error) { writeFailures.push(error); }
+      finally {
+        // Deferred close and cleanup errors retain the primary failure as evidence of uncertain durability.
+        try { await handle?.close(); } catch (error) { if (options.strictDurability) writeFailures.push(error); }
         if (cleanupTemp) {
-          await unlink(tempPath).catch(() => undefined);
+          try {
+            await unlink(tempPath);
+            if (options.strictDurability && directoryHandle) await directoryHandle.sync();
+          } catch (error) {
+            if (options.strictDurability && (error as NodeJS.ErrnoException).code !== "ENOENT") writeFailures.push(error);
+          }
         }
+        try { await directoryHandle?.close(); } catch (error) { writeFailures.push(error); }
       }
+      if (writeFailures.length === 1) throw writeFailures[0];
+      if (writeFailures.length > 1) throw new AggregateError(writeFailures, "strict file write and cleanup failed");
     });
-  } finally {
+  } catch (error) { failures.push(error); }
+  finally {
     if (ownerGuard !== undefined) {
-      await ownerGuard.close();
+      if (options.strictDurability) {
+        // Every held owner descriptor contributes close errors without replacing a write failure.
+        for (const entry of ownerGuard.handles) {
+          try { await entry.handle.close(); } catch (error) { failures.push(error); }
+        }
+      } else await ownerGuard.close();
     }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "strict owner write and close failed");
+  // Must match writeIfAbsentMode in filesystem.ts so publication retains the custody descriptor identity.
+  return publishedDirectory;
 }
