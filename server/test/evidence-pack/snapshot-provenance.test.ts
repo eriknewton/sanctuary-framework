@@ -35,7 +35,7 @@ describe("installed immutable version", () => {
 
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { extractSourceArchive, prepareFixtureCandidate, buildCandidate } from "../../scripts/build-evidence-pack.mjs";
-import { mkdirSync, existsSync, renameSync, symlinkSync, unlinkSync, rmdirSync } from "node:fs";
+import { mkdirSync, existsSync, renameSync, symlinkSync, cpSync } from "node:fs";
 it.each([SOURCE, undefined])("release provenance still refuses a missing explicit revision with head %s", head => { expect(() => validateSource(metadata, archive, undefined, head)).toThrow("Source provenance refused"); });
 it.each(["symlink", "hardlink", "fifo"])("source archive refuses nonregular member %s before extraction", kind => {
   const root = mkdtempSync(join(tmpdir(), "archive-members-")), archive = join(root, "source.tar"), target = join(root, "staged"); mkdirSync(target);
@@ -94,25 +94,26 @@ const OUTPUTS = ["packages/evidence-pack-verifier/dist", "server/evidence-pack-d
 describe("rebuild output paths are all checked before either is cleared", () => {
   let c: Awaited<ReturnType<typeof prepareFixtureCandidate>>;
   beforeAll(async () => { c = await prepareFixtureCandidate(); }, 120_000);
+  // Each row builds into its own minimal root holding copies of the fixture outputs, so a row that removes files cannot disturb another.
+  function outputRoot(): string {
+    const root = mkdtempSync(join(tmpdir(), "output-paths-")); mkdirSync(join(root, "server"));
+    symlinkSync(join(c.tree, "server/node_modules"), join(root, "server/node_modules"), "dir");
+    cpSync(join(c.tree, "server/package-lock.json"), join(root, "server/package-lock.json"));
+    for (const output of OUTPUTS) cpSync(join(c.tree, output), join(root, output), { recursive: true });
+    return root;
+  }
   it.each(OUTPUTS.flatMap(output => ["symlink", "file", ...(output === OUTPUTS[1] ? ["subdirectory"] : [])].map(kind => [kind, output])))("rebuild refuses a %s at %s before any removal", async (kind, output) => {
-    const destination = join(c.tree, output), aside = destination + ".aside", other = join(c.tree, OUTPUTS.find(path => path !== output)!);
+    const root = outputRoot(), destination = join(root, output), aside = destination + ".aside", other = join(root, OUTPUTS.find(path => path !== output)!);
     const listing = (path: string) => readdirSync(path).sort();
-    const otherBefore = listing(other); writeFileSync(join(other, "stale.js"), "stale");
+    writeFileSync(join(other, "stale.js"), "stale"); const otherBefore = listing(other);
     if (kind === "symlink") { renameSync(destination, aside); writeFileSync(join(aside, "stale.js"), "stale"); symlinkSync(aside, destination, "dir"); }
     if (kind === "file") { renameSync(destination, aside); writeFileSync(destination, "not a directory"); }
     if (kind === "subdirectory") mkdirSync(join(destination, "nested"));
-    const faultedBefore = kind === "file" ? listing(aside) : listing(destination);
-    try {
-      await expect(buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], c.tree, SOURCE)).rejects.toThrow(kind === "subdirectory" ? "Unexpected output directory" : "Unexpected output path");
-      // Nothing is removed from either output, including the tree a link points at, when any output path is refused.
-      expect(listing(other)).toEqual([...otherBefore, "stale.js"].sort());
-      expect(kind === "file" ? listing(aside) : listing(destination)).toEqual(faultedBefore);
-    } finally {
-      unlinkSync(join(other, "stale.js"));
-      if (kind === "symlink") { unlinkSync(destination); unlinkSync(join(aside, "stale.js")); renameSync(aside, destination); }
-      if (kind === "file") { unlinkSync(destination); renameSync(aside, destination); }
-      if (kind === "subdirectory") rmdirSync(join(destination, "nested"));
-    }
+    const faulted = kind === "file" ? aside : destination, faultedBefore = listing(faulted);
+    await expect(buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], root, SOURCE)).rejects.toThrow(kind === "subdirectory" ? "Unexpected output directory" : "Unexpected output path");
+    // Nothing is removed from either output, including the tree a link points at, when any output path is refused.
     expect(listing(other)).toEqual(otherBefore);
+    expect(listing(faulted)).toEqual(faultedBefore);
+    expect(lstatSync(destination).isSymbolicLink()).toBe(kind === "symlink");
   }, 120_000);
 });
