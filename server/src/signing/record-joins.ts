@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { verifyIndexedRecord, type OuterRecordIndex } from "../linux-business/producer-custody.js";
+import { verifyIndexedRecord, type BusinessPin, type OuterRecordIndex } from "../linux-business/producer-custody.js";
 import type { RolePin } from "./strict-verifier.js";
 import { createHash } from "node:crypto";
 import { canonicalBytes, LINUX_FIELDS } from "./contract.js";
@@ -16,6 +16,39 @@ export interface JoinState {
   flow_state: { history: JoinRecord[] };
 }
 export interface JoinResult { refusal_code: string | null; final_state: JoinState; }
+// Must match JOIN_STATE_SCHEMA in records.rs and state_schema in record_join_vectors.json, which both executors pin as a whole set.
+export const JOIN_STATE_SCHEMA = Object.freeze({
+  pin: {role: "text", epoch: "safe_u64", kid: "text", public_key: "text", identity_id: "id", machine_id: "id"},
+  grant: {boot_id: "id", activation_id: "id", lease_id: "id", generation: "safe_u64", expires_ns: "u64_text"},
+  policy: {policy_digest: "digest", runtime_digest: "digest", config_digest: "digest", agent_uids: "safe_u64_list", vendors: "vendor_list"},
+  anchor: {sequence: "safe_u64", commitment: "commitment", lease_id: "id", generation: "safe_u64", captured_at_boottime_ns: "u64_text"},
+  flow_state: {history: "history"},
+} as const);
+const U64_MAX = 18446744073709551615n; // 2^64 - 1.
+const isObject = (v: unknown): v is ObjectValue => v !== null && typeof v === "object" && !Array.isArray(v);
+const exactKeys = (v: unknown, keys: readonly string[]): v is ObjectValue => isObject(v) && Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
+const safeU64 = (v: unknown): boolean => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+// Must match state_token in records.rs: each token admits one exact representation.
+const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
+  text: v => typeof v === "string",
+  // Thirty-two lowercase hex digits encode a sixteen-byte identifier; sixty-four encode a SHA-256 digest.
+  id: v => typeof v === "string" && /^[a-f0-9]{32}$/.test(v),
+  digest: v => typeof v === "string" && /^sha256:[a-f0-9]{64}$/.test(v),
+  commitment: v => v === "GENESIS" || STATE_TOKENS.digest(v),
+  safe_u64: safeU64,
+  // Canonical decimal text only: no sign, whitespace, radix prefix, leading zero or u64 overflow.
+  u64_text: v => typeof v === "string" && /^(0|[1-9][0-9]*)$/.test(v) && BigInt(v) <= U64_MAX,
+  safe_u64_list: v => Array.isArray(v) && v.every(safeU64),
+  vendor_list: v => Array.isArray(v) && v.every(e => exactKeys(e, ["address", "port"]) && typeof e.address === "string" && safeU64(e.port)),
+  // Retained history holds only bounded, schema-valid records, so history lookups interpret the same values in both executors.
+  history: v => Array.isArray(v) && v.length <= JOIN_HISTORY_MAX && v.every(e => exactKeys(e, ["body", "outer"]) && isObject(e.outer) && validateBusinessRecord(e.body)),
+};
+/** Parse the relying-party join state against the one shared state schema before any record field is read. */
+export function joinStateValid(state: unknown): state is JoinState {
+  const schema = JOIN_STATE_SCHEMA as Record<string, Record<string, string>>;
+  return exactKeys(state, Object.keys(schema)) && Object.entries(schema).every(([name, fields]) =>
+    exactKeys(state[name], Object.keys(fields)) && Object.entries(fields).every(([key, token]) => STATE_TOKENS[token]((state[name] as ObjectValue)[key])));
+}
 const get = (value: Json | undefined, path: string): Json | undefined => {
   for (const key of path.split(".")) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -36,13 +69,16 @@ export function joinCommitment(record: JoinRecord): string {
 export function advance(state: JoinState, record: JoinRecord): JoinResult {
   const fail = (refusal_code: string): JoinResult => ({refusal_code, final_state: state});
   try {
-    const b = record.body, p = b.payload, history = state.flow_state.history;
+    // Must match records.rs advance: malformed relying-party state refuses before any record field is read, so INPUT precedes SCHEMA.
+    if (!joinStateValid(state)) return fail("INPUT");
+    const b = (isObject(record) ? record.body : undefined) as ObjectValue, history = state.flow_state.history;
     const prior = (sequence: Json | undefined, kind: string) => history.find(r => r.body.sequence === sequence && r.body.record_kind === kind)?.body;
     // Generated validation owns every intra-record predicate before history values are interpreted.
     if (!validateBusinessRecord(b)) return fail("SCHEMA");
+    const p = b.payload;
     // The outer index must match every indexed signed field so storage cannot relabel an authentic body.
     const index = LINUX_FIELDS.filter(key => !key.endsWith("_digest"));
-    if (!equal(Object.keys(record.outer).sort(), [...index, "machine_id", "signature"].sort()) ||
+    if (!isObject(record.outer) || !equal(Object.keys(record.outer).sort(), [...index, "machine_id", "signature"].sort()) ||
         [...index, "machine_id"].some(key => !equal(record.outer[key], b[key]))) return fail("OUTER");
     // The enrolled subject and reconciled grant bind the producer rather than trusting its self-description.
     if (["role", "epoch", "kid", "identity_id", "machine_id"].some(key => !equal(b[key], state.pin[key]))) return fail("PIN");
@@ -65,7 +101,9 @@ export function advance(state: JoinState, record: JoinRecord): JoinResult {
         get(p, "boundary") === "activation_start" || !changedLease || integer(b.generation) <= integer(state.anchor.generation) ||
         !equal(get(p, "previous_lease_id"), state.anchor.lease_id) || !equal(get(p, "previous_generation"), state.anchor.generation)) ||
         !equal(get(p, "previous_sequence"), state.anchor.sequence) || !equal(get(p, "previous_commitment"), state.anchor.commitment) ||
-        (get(p, "boundary") === "restart" && integer(get(p, "gap.first_ns")) > integer(state.anchor.captured_at_boottime_ns))) return fail("BOUNDARY");
+        // Must match records.rs: a restart gap covers the checkpoint at both ends, as a counter epoch change does.
+        (get(p, "boundary") === "restart" && (integer(get(p, "gap.first_ns")) > integer(state.anchor.captured_at_boottime_ns) ||
+          integer(get(p, "gap.last_ns")) < integer(state.anchor.captured_at_boottime_ns)))) return fail("BOUNDARY");
     }
     const context = get(p, "context"), flow = get(context, "flow");
     const opened = prior(get(flow, "open_sequence"), "open");
@@ -166,9 +204,12 @@ export function advance(state: JoinState, record: JoinRecord): JoinResult {
 
 /** Verify the original signed body and index, then return only a fully admitted join state. */
 export function verifyBusinessJoin(state: JoinState, record: JoinRecord): JoinResult {
-  const authentic = verifyIndexedRecord(canonicalBytes(record.body), record.outer.signature as string,
-    state.pin as unknown as RolePin, record.outer as unknown as OuterRecordIndex, z.unknown(), record.body.record_kind as string);
   const result = advance(state, record);
+  if (result.refusal_code !== null) return result;
+  // Must match records.rs verify: the business pin is the enrolled subject plus the relying grant's activation, lease and generation.
+  const pin: BusinessPin = {...(state.pin as unknown as RolePin), activation_id: state.grant.activation_id as string, lease_id: state.grant.lease_id as string, generation: state.grant.generation as number};
+  const authentic = verifyIndexedRecord(canonicalBytes(record.body), record.outer.signature as string,
+    pin, record.outer as unknown as OuterRecordIndex, z.unknown(), record.body.record_kind as string);
   // An accepted join carries producer evidence only after the independent strict verifier admits the original signature.
-  return result.refusal_code !== null || authentic ? result : {refusal_code: "AUTH", final_state: state};
+  return authentic ? result : {refusal_code: "AUTH", final_state: state};
 }

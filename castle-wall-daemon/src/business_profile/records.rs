@@ -17,26 +17,25 @@ pub fn decode(bytes: &[u8]) -> Option<Value> {
     Some(body)
 }
 
+/// Must match BUSINESS_PIN_FIELDS in producer-custody.ts and verify_pin_fields in closure_vectors.json: the one business verify contract binds the enrolled subject and the grant's activation, lease and generation.
+pub const VERIFY_PIN_FIELDS: &[&str] = &[
+    "role",
+    "epoch",
+    "kid",
+    "identity_id",
+    "machine_id",
+    "activation_id",
+    "lease_id",
+    "generation",
+];
 /// Verify the record against an independently enrolled role, identity, machine and key pin.
 pub fn verify(bytes: &[u8], signature: &[u8], pin: &Value, public_key: &[u8]) -> bool {
     let Some(body) = decode(bytes) else {
         return false;
     };
-    // The pin describes the producer subject, so a signature alone cannot substitute another enrolled identity.
-    // Must match SigningGrant in record-signer.ts: the enrolled grant binds activation, lease and generation.
-    if [
-        "role",
-        "epoch",
-        "kid",
-        "identity_id",
-        "machine_id",
-        "activation_id",
-        "lease_id",
-        "generation",
-    ]
-    .iter()
-    .any(|key| body[*key] != pin[*key])
-    {
+    // The pin describes the producer subject and grant, so a signature alone cannot substitute another identity or lease.
+    // Must match SigningGrant in record-signer.ts and verifyIndexedRecord in producer-custody.ts.
+    if VERIFY_PIN_FIELDS.iter().any(|key| body[*key] != pin[*key]) {
         return false;
     }
     let Some(epoch) = body["epoch"].as_u64() else {
@@ -58,6 +57,116 @@ pub fn verify(bytes: &[u8], signature: &[u8], pin: &Value, public_key: &[u8]) ->
 // Must match record-joins.ts and all three record_join_vectors.json consumers, including refusal precedence and retained state.
 pub const JOIN_HISTORY_MAX: usize = 64; // The design retains sixty-four replay records without live eviction.
 pub const COUNTER_PERIOD_NS: u64 = 1_000_000_000; // One second in nanoseconds.
+/// Must match JOIN_STATE_SCHEMA in record-joins.ts and state_schema in record_join_vectors.json, which both executors pin as a whole set.
+pub const JOIN_STATE_SCHEMA: &[(&str, &[(&str, &str)])] = &[
+    (
+        "pin",
+        &[
+            ("role", "text"),
+            ("epoch", "safe_u64"),
+            ("kid", "text"),
+            ("public_key", "text"),
+            ("identity_id", "id"),
+            ("machine_id", "id"),
+        ],
+    ),
+    (
+        "grant",
+        &[
+            ("boot_id", "id"),
+            ("activation_id", "id"),
+            ("lease_id", "id"),
+            ("generation", "safe_u64"),
+            ("expires_ns", "u64_text"),
+        ],
+    ),
+    (
+        "policy",
+        &[
+            ("policy_digest", "digest"),
+            ("runtime_digest", "digest"),
+            ("config_digest", "digest"),
+            ("agent_uids", "safe_u64_list"),
+            ("vendors", "vendor_list"),
+        ],
+    ),
+    (
+        "anchor",
+        &[
+            ("sequence", "safe_u64"),
+            ("commitment", "commitment"),
+            ("lease_id", "id"),
+            ("generation", "safe_u64"),
+            ("captured_at_boottime_ns", "u64_text"),
+        ],
+    ),
+    ("flow_state", &[("history", "history")]),
+];
+const SAFE_INTEGER: u64 = 9_007_199_254_740_991; // Largest exact JavaScript integer, 2^53 - 1.
+const ID_HEX_LENGTH: usize = 32; // Sixteen-byte identifiers in lowercase hex.
+const DIGEST_HEX_LENGTH: usize = 64; // SHA-256 digests in lowercase hex.
+fn lower_hex(s: &str, length: usize) -> bool {
+    s.len() == length
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+fn safe_u64(v: &Value) -> bool {
+    v.as_u64().is_some_and(|n| n <= SAFE_INTEGER)
+}
+/// Must match STATE_TOKENS in record-joins.ts: each token admits one exact representation.
+fn state_token(token: &str, v: &Value) -> bool {
+    match token {
+        "text" => v.is_string(),
+        "id" => v.as_str().is_some_and(|s| lower_hex(s, ID_HEX_LENGTH)),
+        "digest" => v
+            .as_str()
+            .and_then(|s| s.strip_prefix("sha256:"))
+            .is_some_and(|s| lower_hex(s, DIGEST_HEX_LENGTH)),
+        "commitment" => v == "GENESIS" || state_token("digest", v),
+        "safe_u64" => safe_u64(v),
+        // Canonical decimal text only: no sign, whitespace, radix prefix, leading zero or u64 overflow.
+        "u64_text" => v.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.bytes().all(|c| c.is_ascii_digit())
+                && (s == "0" || !s.starts_with('0'))
+                && s.parse::<u64>().is_ok()
+        }),
+        "safe_u64_list" => v.as_array().is_some_and(|a| a.iter().all(safe_u64)),
+        "vendor_list" => v.as_array().is_some_and(|a| {
+            a.iter().all(|e| {
+                e.as_object().is_some_and(|o| o.len() == 2)
+                    && e["address"].is_string()
+                    && safe_u64(&e["port"])
+            })
+        }),
+        // Retained history holds only bounded, schema-valid records, so history lookups interpret the same values in both executors.
+        "history" => v.as_array().is_some_and(|a| {
+            a.len() <= JOIN_HISTORY_MAX
+                && a.iter().all(|e| {
+                    e.as_object().is_some_and(|o| o.len() == 2)
+                        && e["outer"].is_object()
+                        && e.get("body").is_some_and(records_schema::valid)
+                })
+        }),
+        _ => false,
+    }
+}
+/// Parse the relying-party join state against the one shared state schema before any record field is read.
+pub fn join_state_valid(state: &Value) -> bool {
+    state
+        .as_object()
+        .is_some_and(|o| o.len() == JOIN_STATE_SCHEMA.len())
+        && JOIN_STATE_SCHEMA.iter().all(|(name, fields)| {
+            state[*name]
+                .as_object()
+                .is_some_and(|o| o.len() == fields.len())
+                && fields.iter().all(|(key, token)| {
+                    state[*name]
+                        .get(*key)
+                        .is_some_and(|v| state_token(token, v))
+                })
+        })
+}
 fn number(value: &Value) -> Result<u64, &'static str> {
     value
         .as_u64()
@@ -98,6 +207,10 @@ pub fn join_commitment(record: &Value) -> Option<String> {
 }
 /// Pure history validation only; callers authenticate the checkpoint and verify signatures separately.
 pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
+    // Malformed relying-party state refuses before any record field is read, so INPUT precedes SCHEMA in both executors.
+    if !join_state_valid(state) {
+        return Err("INPUT");
+    }
     let b = &record["body"];
     let p = &b["payload"];
     let history = state["flow_state"]["history"].as_array().ok_or("INPUT")?;
@@ -171,8 +284,11 @@ pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
             })
             || p["previous_sequence"] != anchor["sequence"]
             || p["previous_commitment"] != anchor["commitment"]
+            // Must match record-joins.ts: a restart gap covers the checkpoint at both ends, as a counter epoch change does.
             || (p["boundary"] == "restart"
-                && number(&p["gap"]["first_ns"])? > number(&anchor["captured_at_boottime_ns"])?)
+                && (number(&p["gap"]["first_ns"])? > number(&anchor["captured_at_boottime_ns"])?
+                    || number(&p["gap"]["last_ns"])?
+                        < number(&anchor["captured_at_boottime_ns"])?))
         {
             return Err("BOUNDARY");
         }

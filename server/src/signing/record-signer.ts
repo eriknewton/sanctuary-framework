@@ -9,7 +9,7 @@ export interface InstalledBusiness { readonly [installedBusiness]: never; }
 
 /** Exact-message provider, never a digest or caller-selected domain service. */
 export interface ExactMessageProvider { sign(message: Uint8Array): Uint8Array; }
-// Must match records.rs verify: the grant binds activation, lease and generation to the enrolled subject.
+// Must match records.rs verify and BusinessPin in linux-business/producer-custody.ts: the grant binds activation, lease and generation to the enrolled subject.
 export interface SigningGrant extends RolePin {
   readonly activation_id: string; readonly lease_id: string; readonly generation: number;
 }

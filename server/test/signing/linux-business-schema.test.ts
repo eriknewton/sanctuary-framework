@@ -88,7 +88,7 @@ it.each(closure.verify)("closure signing pin $id", c => {
 });
 
 import {execFileSync} from "node:child_process";
-import {mkdtempSync, writeFileSync, unlinkSync, rmdirSync} from "node:fs";
+import {mkdtempSync, writeFileSync, unlinkSync, rmdirSync, readdirSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join, resolve} from "node:path";
 const generatorVectors = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/generator_vectors.json", "utf8")) as {
@@ -140,4 +140,35 @@ it("shared positive bodies cover the full nested choice set", () => {
   for (const c of closure.schema.filter((c: {accept: boolean}) => c.accept)) walk(schema.record, "record", actual, c.body);
   expect([...actual].sort()).toEqual([...expected].sort());
   expect([...actual].sort()).toEqual(closure.coverage);
+});
+
+import * as custodyModule from "../../src/linux-business/producer-custody.js";
+// Must match linux_business_schema.rs::closure_pin_vectors and records.rs verify: the same shared pin vectors run through the business verifier.
+it.each(closure.verify)("closure business verify pin $id", c => {
+  const seed = new Uint8Array(32).fill(7), public_key = Buffer.from(ed25519.getPublicKey(seed)).toString("base64url");
+  const kid = roleKid(role, 1, public_key);
+  const body = {...c.body, kid};
+  const pin = {role, epoch: 1, public_key, kid, identity_id: body.identity_id, machine_id: body.machine_id, activation_id: body.activation_id, lease_id: body.lease_id, generation: body.generation, ...c.pin_change};
+  const outer = Object.fromEntries(["sequence", "prior_commitment", "captured_at_unix_ms", "captured_at_boottime_ns", "machine_id", "boot_id", "activation_id", "lease_id", "generation"].map(k => [k, (body as Record<string, unknown>)[k]]));
+  const bytes = canonicalBytes(body), signature = Buffer.from(ed25519.sign(recordMessage(role, bytes), seed)).toString("base64url");
+  expect(custodyModule.verifyIndexedRecord(bytes, signature, pin as never, outer as never, z.unknown(), body.record_kind)).toBe(c.accept);
+  // The plain subject verifier keeps its documented subject-only contract and ignores the grant fields.
+  if (!("identity_id" in c.pin_change || "machine_id" in c.pin_change || "kid" in c.pin_change || "epoch" in c.pin_change)) expect(verifyRecord(bytes, signature, pin as never, z.unknown(), body.record_kind)).toBe(true);
+});
+it("closure business verify binds exactly the shared pin field set", () => {
+  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
+  expect([...custodyModule.BUSINESS_PIN_FIELDS]).toEqual(value.verify_pin_fields);
+  expect(closure.verify.filter(c => !c.accept).map(c => Object.keys(c.pin_change)[0]).sort()).toEqual(value.verify_pin_fields.filter((k: string) => k !== "role").sort());
+});
+// Must match vector_manifest.json and every other consumer: the exact corpus bytes and each group count are pinned in one place.
+it.each([["closure_vectors.json"], ["generator_vectors.json"]])("%s bytes and group counts match the shared manifest", name => {
+  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8")).files[name];
+  const bytes = readFileSync("../castle-wall-daemon/src/business_profile/" + name), value = JSON.parse(bytes.toString("utf8"));
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.sha256);
+  expect(Object.fromEntries(Object.keys(manifest.cases).map(group => [group, value[group].length]))).toEqual(manifest.cases);
+});
+it("every shared corpus beside the business schema is pinned by the manifest", () => {
+  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8"));
+  const corpora = readdirSync("../castle-wall-daemon/src/business_profile").filter(name => /_vectors\.json$/.test(name) && !["public_vectors.json", "role_vectors.json"].includes(name)).sort();
+  expect(Object.keys(manifest.files).sort()).toEqual(corpora);
 });

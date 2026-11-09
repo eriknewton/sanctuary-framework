@@ -2,6 +2,35 @@ use castle_wall_daemon::business_profile::{
     activation_anchor as anchor, protocol_transitions, records, records_schema,
 };
 use serde_json::{json, Value};
+const MANIFEST: &str = include_str!("../src/business_profile/vector_manifest.json");
+/// Must match vector_manifest.json and every TS consumer: a corpus is read only after its exact bytes and every group count match the manifest.
+fn corpus(name: &str) -> Value {
+    use sha2::{Digest, Sha256};
+    let bytes = match name {
+        "closure_vectors.json" => include_str!("../src/business_profile/closure_vectors.json"),
+        "record_join_vectors.json" => {
+            include_str!("../src/business_profile/record_join_vectors.json")
+        }
+        "generator_vectors.json" => include_str!("../src/business_profile/generator_vectors.json"),
+        _ => panic!("unpinned corpus {name}"),
+    };
+    let manifest: Value = serde_json::from_str(MANIFEST).unwrap();
+    let entry = &manifest["files"][name];
+    assert_eq!(
+        json!(hex::encode(Sha256::digest(bytes.as_bytes()))),
+        entry["sha256"],
+        "{name}"
+    );
+    let value: Value = serde_json::from_str(bytes).unwrap();
+    for (group, count) in entry["cases"].as_object().unwrap() {
+        assert_eq!(
+            json!(value[group].as_array().unwrap().len()),
+            *count,
+            "{name} {group}"
+        );
+    }
+    value
+}
 fn sample(node: &Value, definitions: &Value) -> Value {
     match node["type"].as_str().unwrap() {
         "ref" => sample(&definitions[node["name"].as_str().unwrap()], definitions),
@@ -127,10 +156,7 @@ fn generated_transition_complement() {
 }
 #[test]
 fn anchor_proposals_and_outside_receipt() {
-    let old: Value =
-        serde_json::from_str::<Value>(include_str!("../src/business_profile/closure_vectors.json"))
-            .unwrap()["anchor"]
-            .clone();
+    let old: Value = corpus("closure_vectors.json")["anchor"].clone();
     let receipt = anchor::anchor_digest(&old).unwrap();
     assert!(anchor::reconcile(
         &old,
@@ -219,10 +245,7 @@ fn every_business_branch_verifies_only_for_its_enrolled_subject() {
 #[test]
 fn shared_join_vectors() {
     // Must match both TS join executors: every corpus id, result and complete final state participates without filtering.
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../src/business_profile/record_join_vectors.json"
-    ))
-    .unwrap();
+    let corpus = corpus("record_join_vectors.json");
     assert_eq!(corpus["version"], 1); // Initial shared join format version.
     assert_eq!(corpus["schema_digest"], records_schema::SCHEMA_DIGEST);
     let cases = corpus["cases"].as_array().unwrap();
@@ -264,15 +287,24 @@ fn shared_join_vectors() {
 #[test]
 fn closure_anchor_vectors() {
     // Must match closure_vectors.json and activation-anchor.test.ts: full id and result equality forbids filtering.
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for c in corpus["anchors"].as_array().unwrap() {
         let m = json!({"version":1,"op":c["op"],"request_id":c["request_id"],"expected":c["old"],"next":c["next"]});
         let result = anchor::propose(&c["old"], &m);
-        actual.push(json!([c["id"], result.is_some()]));
-        expected.push(json!([c["id"], c["accept"]]));
+        // The whole returned tuple is compared, so a wrong accepted proposal cannot pass on its accept bit.
+        let want = if c["accept"] == true {
+            if c["next"].is_null() {
+                c["old"].clone()
+            } else {
+                c["next"].clone()
+            }
+        } else {
+            Value::Null
+        };
+        actual.push(json!([c["id"], result.unwrap_or(Value::Null)]));
+        expected.push(json!([c["id"], want]));
     }
     eprintln!("CLOSURE_RESULTS {}", json!(actual));
     assert_eq!(actual, expected);
@@ -280,8 +312,7 @@ fn closure_anchor_vectors() {
 #[test]
 fn closure_reconcile_vectors() {
     // Must match closure_vectors.json and activation-anchor.test.ts, including both drain fields.
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for c in corpus["reconcile"].as_array().unwrap() {
@@ -303,8 +334,7 @@ fn closure_reconcile_vectors() {
 #[test]
 fn closure_schema_vectors() {
     // Must match closure_vectors.json and linux-business-schema.test.ts: no nested choice is sampled by a language-local list.
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     let cases = corpus["schema"].as_array().unwrap();
     let ids: std::collections::BTreeSet<_> =
         cases.iter().map(|c| c["id"].as_str().unwrap()).collect();
@@ -339,8 +369,7 @@ fn closure_schema_vectors() {
 fn closure_pin_vectors() {
     use castle_wall_daemon::business_profile::{role_kid, signer_contract};
     use ed25519_dalek::{Signer, SigningKey};
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     let key = SigningKey::from_bytes(&[7; 32]); // Public synthetic Ed25519 seed length.
     let public = key.verifying_key().to_bytes();
     let role = signer_contract::ROLE_REGISTRY[0].0;
@@ -379,8 +408,7 @@ fn closure_nested_choice_coverage() {
     use std::collections::BTreeSet;
     // Must match linux-business-schema.test.ts: derive both sets from the schema and all accepted shared bodies.
     let schema: Value = serde_json::from_str(records_schema::SCHEMA_AST).unwrap();
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     fn fits(n: &Value, v: &Value, defs: &Value) -> bool {
         match n["type"].as_str().unwrap() {
             "ref" => fits(&defs[n["name"].as_str().unwrap()], v, defs),
@@ -486,8 +514,7 @@ fn closure_nested_choice_coverage() {
 
 #[test]
 fn closure_full_id_sets() {
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     for name in ["anchors", "reconcile", "schema", "verify"] {
         let cases = corpus[name].as_array().unwrap();
         let ids: std::collections::BTreeSet<_> =
@@ -498,8 +525,7 @@ fn closure_full_id_sets() {
 
 #[test]
 fn closure_reserve_latch_commit_sequence() {
-    let corpus: Value =
-        serde_json::from_str(include_str!("../src/business_profile/closure_vectors.json")).unwrap();
+    let corpus = corpus("closure_vectors.json");
     let cases = corpus["anchors"].as_array().unwrap();
     let case = |id: &str| cases.iter().find(|c| c["id"] == id).unwrap();
     let mut state = case("reserve")["old"].clone();
@@ -517,4 +543,72 @@ fn closure_reserve_latch_commit_sequence() {
     );
     assert!(!accepted);
     assert_eq!(state, case("latch")["next"]);
+}
+
+#[test]
+fn shared_manifest_pins_every_k1c_corpus() {
+    let manifest: Value = serde_json::from_str(MANIFEST).unwrap();
+    let names: Vec<&String> = manifest["files"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        names,
+        [
+            "closure_vectors.json",
+            "generator_vectors.json",
+            "record_join_vectors.json"
+        ]
+    );
+    for name in names {
+        corpus(name);
+    }
+}
+#[test]
+fn closure_activation_return_sequence() {
+    // Must match activation-anchor.test.ts: A to B to A refuses while a later identity continues.
+    let corpus = corpus("closure_vectors.json");
+    let cases = corpus["anchors"].as_array().unwrap();
+    let case = |id: &str| cases.iter().find(|c| c["id"] == id).unwrap();
+    let message = |c: &Value, expected: &Value| json!({"version":1,"op":c["op"],"request_id":c["request_id"],"expected":expected,"next":c["next"]});
+    let forward = case("advance_activation");
+    let state = anchor::propose(&forward["old"], &message(forward, &forward["old"])).unwrap();
+    let back = case("advance-activation-return");
+    assert_eq!(state, back["old"]);
+    assert_eq!(
+        back["next"]["activation_id"],
+        forward["old"]["activation_id"]
+    );
+    assert!(anchor::propose(&state, &message(back, &state)).is_none());
+    let onward = case("advance-activation-forward");
+    assert_eq!(
+        anchor::propose(&state, &message(onward, &state)),
+        Some(onward["next"].clone())
+    );
+}
+#[test]
+fn shared_named_field_sets() {
+    // Must match activation-anchor.ts, producer-custody.ts and record-joins.ts: each named set equals the shared corpus as a whole.
+    let closure = corpus("closure_vectors.json");
+    assert_eq!(
+        json!(anchor::PREPARE_CHANGED_FIELDS),
+        closure["prepare_changed_fields"]
+    );
+    assert_eq!(
+        json!(records::VERIFY_PIN_FIELDS),
+        closure["verify_pin_fields"]
+    );
+    let joins = corpus("record_join_vectors.json");
+    let table: serde_json::Map<String, Value> = records::JOIN_STATE_SCHEMA
+        .iter()
+        .map(|(name, fields)| {
+            (
+                name.to_string(),
+                Value::Object(
+                    fields
+                        .iter()
+                        .map(|(k, t)| (k.to_string(), json!(t)))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(Value::Object(table), joins["state_schema"]);
 }

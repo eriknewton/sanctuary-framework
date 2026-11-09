@@ -66,3 +66,29 @@ it("closure reserve-latch-commit sequence", () => {
   expect(() => proposeAnchor(state, {version: 1, op: commit.op, request_id: commit.request_id, expected: state, next: commit.next})).toThrow("K1_REFUSED");
   expect(state).toEqual(latch.next);
 });
+
+it("closure activation identities never return: A to B to A refuses", () => {
+  const cases = new Map(closure.anchors.map(c => [c.id, c]));
+  const forward = cases.get("advance_activation")!, back = cases.get("advance-activation-return")!, onward = cases.get("advance-activation-forward")!;
+  const state = proposeAnchor(forward.old, {version: 1, op: forward.op, request_id: forward.request_id, expected: forward.old, next: forward.next} as AnchorMessage);
+  expect(state).toEqual(back.old);
+  expect(back.next!.activation_id).toBe(forward.old.activation_id);
+  expect(() => proposeAnchor(state, {version: 1, op: back.op, request_id: back.request_id, expected: state, next: back.next} as AnchorMessage)).toThrow("K1_REFUSED");
+  expect(proposeAnchor(state, {version: 1, op: onward.op, request_id: onward.request_id, expected: state, next: onward.next} as AnchorMessage)).toEqual(onward.next);
+});
+
+import {createHash} from "node:crypto";
+import * as anchorModule from "../../src/linux-business/activation-anchor.js";
+// Must match vector_manifest.json and every other consumer: the exact corpus bytes and each group count are pinned in one place.
+it("closure corpus bytes and group counts match the shared manifest", () => {
+  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8")).files["closure_vectors.json"];
+  const bytes = readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json"), value = JSON.parse(bytes.toString("utf8"));
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.sha256);
+  expect(Object.fromEntries(Object.keys(manifest.cases).map(group => [group, value[group].length]))).toEqual(manifest.cases);
+  expect(closure.anchors.length).toBe(manifest.cases.anchors);
+  expect(closure.reconcile.length).toBe(manifest.cases.reconcile);
+});
+it("closure PREPARE field set is the shared corpus set", () => {
+  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
+  expect([...anchorModule.PREPARE_CHANGED_FIELDS]).toEqual(value.prepare_changed_fields);
+});

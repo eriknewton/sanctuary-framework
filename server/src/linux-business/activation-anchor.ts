@@ -33,6 +33,8 @@ export type ActivationAnchor = z.infer<typeof anchorSchema>;
 // Must match protocol_transitions.rs: the recovery rule generates the entire denied operation set.
 export const ANCHOR_OPS = Object.freeze([...protocol.anchor.ops]) as readonly [string, ...string[]];
 export const LATCH_DENIED_OPS = Object.freeze(ANCHOR_OPS.filter(op => op !== protocol.anchor.recovery_op));
+// Must match PREPARE_CHANGED_FIELDS in activation_anchor.rs and prepare_changed_fields in closure_vectors.json, which both languages pin as a whole set.
+export const PREPARE_CHANGED_FIELDS = Object.freeze(["enrollment_revision", "transaction_id", "descriptor_digest", "roster_digest", "custody_envelope_digest"] as const);
 const messageSchema = z.object({version: z.literal(ANCHOR_VERSION), op: z.enum(ANCHOR_OPS), request_id: id,
   expected: anchorSchema, next: anchorSchema.nullable()}).strict();
 export type AnchorMessage = z.infer<typeof messageSchema>;
@@ -83,7 +85,7 @@ export function proposeAnchor(current: ActivationAnchor, message: AnchorMessage)
       // Consecutive custody revisions bind a transaction to one closed, settled anchor.
       if (old.retired || old.transaction_id !== null || old.reserved_sequence !== old.committed_sequence ||
           next.enrollment_revision !== old.enrollment_revision + 1 || next.transaction_id !== m.request_id) return refuse();
-      changed = ["enrollment_revision", "transaction_id", "descriptor_digest", "roster_digest", "custody_envelope_digest"]; break;
+      changed = [...PREPARE_CHANGED_FIELDS]; break;
     case "LATCH":
       // Recovery revisions increase so a later proposal cannot erase an earlier integrity event.
       if (!next.recovery_required || next.recovery_revision !== old.recovery_revision + 1) return refuse();
@@ -98,8 +100,10 @@ export function proposeAnchor(current: ActivationAnchor, message: AnchorMessage)
       changed = ["generation_high_water"];
       if (m.op !== "ADVANCE_GENERATION") {
         const field = m.op === "ADVANCE_ACTIVATION" ? "activation_id" : "boot_id";
-        // An identity advance changes its named identity so a replay cannot claim a new boundary.
+        // An identity advance changes its named identity, and with the strictly increasing generation no (identity, generation) pair repeats.
         if (next[field] === old[field]) return refuse();
+        // Must match activation_anchor.rs: fixed-length lowercase hex identities compare in numeric order and strictly increase, so an earlier activation can never return.
+        if (m.op === "ADVANCE_ACTIVATION" && next.activation_id <= old.activation_id) return refuse();
         changed.push(field);
       }
       break;

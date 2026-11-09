@@ -41,3 +41,16 @@ it("an accepted join still requires its original strict signature", () => {
   bad.outer.signature = "A".repeat(86); // Unpadded base64url for sixty-four zero bytes is eighty-six characters.
   expect(verifyBusinessJoin(row.initial, bad)).toEqual({refusal_code: "AUTH", final_state: row.initial});
 });
+
+import { createHash } from "node:crypto";
+import * as joins from "../../src/signing/record-joins.js";
+// Must match vector_manifest.json and every other consumer: the exact corpus bytes and case count are pinned in one place.
+it("verifier corpus bytes and case count match the shared manifest", () => {
+  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8")).files["record_join_vectors.json"];
+  const bytes = readFileSync("../castle-wall-daemon/src/business_profile/record_join_vectors.json");
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.sha256);
+  expect({cases: corpus.cases.length}).toEqual(manifest.cases);
+});
+it("verifier join state schema is the shared corpus table", () => {
+  expect(joins.JOIN_STATE_SCHEMA).toEqual((corpus as unknown as {state_schema: unknown}).state_schema);
+});

@@ -45,10 +45,25 @@ it("every accepted business join remains unsignable before the counting provider
   const seed = new Uint8Array(32).fill(7); // Deterministic public fixture seed, matching the corpus signatures.
   const signer = createRecordSigner(grant, {sign(message) { calls++; return ed25519.sign(message, seed); }}, z.unknown(), "counter");
   for (const row of corpus.cases) for (const record of row.records) {
+    // The malformed-record vector has no body to present.
+    if (record === null) continue;
     expect(() => signer.signRecord({role: ROLE_REGISTRY[0].role, epoch: grant.epoch, preimage_bytes: canonicalBytes(record.body)})).toThrow("K1_REFUSED");
   }
   expect(calls).toBe(0);
   const inert = {...first.records[0].body, record_kind: "counter", payload: {count: 1}};
   expect(signer.signRecord({role: grant.role, epoch: grant.epoch, preimage_bytes: canonicalBytes(inert)}).kid).toBe(grant.kid);
   expect(calls).toBe(1);
+});
+
+import { createHash } from "node:crypto";
+import * as joins from "../../src/signing/record-joins.js";
+// Must match vector_manifest.json and every other consumer: the exact corpus bytes and case count are pinned in one place.
+it("worker corpus bytes and case count match the shared manifest", () => {
+  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8")).files["record_join_vectors.json"];
+  const bytes = readFileSync("../castle-wall-daemon/src/business_profile/record_join_vectors.json");
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.sha256);
+  expect({cases: corpus.cases.length}).toEqual(manifest.cases);
+});
+it("worker join state schema is the shared corpus table", () => {
+  expect(joins.JOIN_STATE_SCHEMA).toEqual((corpus as unknown as {state_schema: unknown}).state_schema);
 });

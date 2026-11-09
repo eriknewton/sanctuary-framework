@@ -85,6 +85,8 @@ const expectedImports={
     "zod"
   ]
 };
+// Must match the src/ entry literals in tsup.config.ts and tsup.boot-runtime.config.ts, including the separately bundled worker and boot runtime.
+const KNOWN_BUILD_ROOTS = ["index.ts", "intelligence/index.ts", "cli.ts", "cli/linux-policy-sign.ts", "transparency/offline-cli.ts", "proxy/response-worker.ts", "storage/directory-capability-worker.ts", "signing/worker.ts", "cli/castle-wall-boot-daemon.ts"];
 function ast(name:string){return ts.createSourceFile(name,readFileSync(resolve(sourceRoot,name),"utf8"),ts.ScriptTarget.Latest,true);}
 function imports(name:string){return ast(name).statements.filter(ts.isImportDeclaration).map(n=>(n.moduleSpecifier as ts.StringLiteral).text).sort();}
 function dependencies(name:string){
@@ -138,8 +140,10 @@ it("pins native crash settlement bytes and excludes classifier paths from all li
     }
     visit(source);
   }
+  // A configuration moved to a variable or glob must not silently shrink the root set, so the known entries are named.
+  expect(buildRoots.length).toBeGreaterThan(0);
+  for (const entry of KNOWN_BUILD_ROOTS) expect(buildRoots, entry).toContain(entry);
   roots.push(...buildRoots);
-  for (const entry of buildRoots) expect(roots).toContain(entry);
   roots.forEach(n=>walk(resolve(sourceRoot,n)));
   expect(forbidden.filter(n=>seen.has(n))).toEqual([]);
   for(const file of files){const source=ast(file);const declarations:string[]=[];function visit(node:ts.Node){if(ts.isClassDeclaration(node)&&node.name?.text==="InstalledBusiness")declarations.push(file);ts.forEachChild(node,visit);}visit(source);expect(declarations).toEqual([]);}

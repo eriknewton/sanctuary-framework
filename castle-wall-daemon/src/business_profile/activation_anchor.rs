@@ -4,6 +4,14 @@ use sha2::{Digest, Sha256};
 // Must match linux-business/activation-anchor.ts, including every field and operation.
 pub const MAX_BYTES: usize = 65536;
 pub use super::protocol_transitions::ANCHOR_OPS as OPS;
+/// Must match PREPARE_CHANGED_FIELDS in activation-anchor.ts and prepare_changed_fields in closure_vectors.json, which both languages pin as a whole set.
+pub const PREPARE_CHANGED_FIELDS: &[&str] = &[
+    "enrollment_revision",
+    "transaction_id",
+    "descriptor_digest",
+    "roster_digest",
+    "custody_envelope_digest",
+];
 const SAFE_INTEGER: u64 = 9007199254740991; // Largest exact JavaScript integer.
 const FIELDS: &[&str] = &[
     "version",
@@ -204,13 +212,7 @@ pub fn propose(old: &Value, message: &Value) -> Option<Value> {
             {
                 return None;
             }
-            &[
-                "enrollment_revision",
-                "transaction_id",
-                "descriptor_digest",
-                "roster_digest",
-                "custody_envelope_digest",
-            ]
+            PREPARE_CHANGED_FIELDS
         }
         "LATCH" => {
             if next["recovery_required"] != true
@@ -233,14 +235,14 @@ pub fn propose(old: &Value, message: &Value) -> Option<Value> {
             }
             match m["op"].as_str()? {
                 "ADVANCE_ACTIVATION" => {
-                    // An activation advance changes its identity so a replay cannot claim a new boundary.
-                    if next["activation_id"] == old["activation_id"] {
+                    // Must match activation-anchor.ts: fixed-length lowercase hex identities compare in numeric order and strictly increase, so an earlier activation can never return.
+                    if next["activation_id"].as_str()? <= old["activation_id"].as_str()? {
                         return None;
                     }
                     &["generation_high_water", "activation_id"]
                 }
                 "ADVANCE_BOOT" => {
-                    // A boot advance changes its identity so a replay cannot claim a new boundary.
+                    // A boot advance changes its identity, and with the strictly increasing generation no (boot, generation) pair repeats.
                     if next["boot_id"] == old["boot_id"] {
                         return None;
                     }
