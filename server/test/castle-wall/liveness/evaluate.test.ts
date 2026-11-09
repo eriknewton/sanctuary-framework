@@ -332,6 +332,16 @@ describe("freshness", () => {
     }
   });
 
+  it("an observer that references no daemon record is evidence_incomplete with complete recovery evidence, and OK once it references the current instance", () => {
+    const unreferenced = evaluate(set(O + "raw.daemon_ref", null));
+    expect(unreferenced.wall.reasons).toEqual(["evidence_incomplete"]);
+    expect(unreferenced.wall.state).toBe("wall_DOWN");
+    expect(unreferenced.exit_code).toBe(1);
+    const referenced = evaluate(set(O + "raw.daemon_ref", { daemon_instance: "daemon-fixture-1", sequence: 100 }));
+    expectWallOk(referenced);
+    expect(referenced.wall.reasons).toEqual(["none"]);
+  });
+
   it("recovers to OK once a fresh observer record references the current instance, with the daemon sequence ahead of the reference", () => {
     const restarted = [set(D + "daemon_instance", "daemon-fixture-2"), set(D + "sequence", 5)];
     const coherent = evaluate(...restarted, set(O + "raw.daemon_ref", { daemon_instance: "daemon-fixture-2", sequence: 4 }));
