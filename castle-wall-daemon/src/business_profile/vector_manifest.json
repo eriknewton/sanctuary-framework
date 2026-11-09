@@ -3,7 +3,7 @@
   "contract": "Must match every consumer of these corpora in server/test and castle-wall-daemon/tests: each consumer reads this file and checks the SHA-256 of the exact corpus bytes and every group count before executing a case.",
   "files": {
     "closure_vectors.json": {
-      "sha256": "328bce74b073718bcc26df990641eab607e42e8ebf2656e17babc44453a994bc",
+      "sha256": "fbc7281cca86b4bff4dcc808351f2fd462f16881593a5406020d0f1cf8b4b95b",
       "cases": {
         "anchors": 29,
         "reconcile": 4,
@@ -11,7 +11,9 @@
         "verify": 8,
         "coverage": 128,
         "prepare_changed_fields": 5,
-        "verify_pin_fields": 8
+        "verify_pin_fields": 8,
+        "drain_tuple_fields": 5,
+        "recover": 7
       }
     },
     "generator_vectors.json": {

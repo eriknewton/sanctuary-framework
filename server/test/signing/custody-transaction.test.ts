@@ -178,12 +178,10 @@ it.each([
   expect(advanceTransaction(state, {op: "D_ACK", anchor: preparedAck}).journal.drain_ack.prepare).toEqual(preparedAck);
 });
 it("closure a recovery acknowledgment names the reconciled drain tuple", () => {
-  // The transaction began against a later generation than the anchor it reconciled, so only the reconciliation binding refuses.
+  // The transaction began against a later generation than the drain it reconciles, so the drain disagrees with the prior anchor outside the drained tuple and RECONCILE refuses.
   const later = {...prior, generation_high_water: 1};
-  let state = beginTransaction({...journal, operation: "RECOVER"}, later);
-  state = advanceTransaction(state, {op: "RECONCILE", input: recovered});
-  state = toPhase(state, "D_PREPARE");
-  expect(() => advanceTransaction(state, {op: "D_ACK", anchor: {...preparedAck, generation_high_water: 1}})).toThrow("K1_REFUSED");
+  const state = beginTransaction({...journal, operation: "RECOVER"}, later);
+  expect(() => advanceTransaction(state, {op: "RECONCILE", input: recovered})).toThrow("K1_REFUSED");
   let aligned = advanceTransaction(beginTransaction({...journal, operation: "RECOVER"}), {op: "RECONCILE", input: recovered});
   aligned = toPhase(aligned, "D_PREPARE");
   expect(advanceTransaction(aligned, {op: "D_ACK", anchor: preparedAck}).journal.drain_ack.prepare).toEqual(preparedAck);
@@ -203,4 +201,27 @@ it("closure a cut persists through write and readback and then refuses replay", 
   for (const event of [{op: "NEXT"}, {op: "RECONCILE", input: recovered}, {op: "D_ACK", anchor: preparedAck}] as const)
     expect(() => advanceTransaction(state, event)).toThrow("K1_REFUSED");
   expect(transactionComplete(state)).toBe(false);
+});
+
+// Must match the recover group in closure_vectors.json and linux_business_schema.rs: every recovery case executes with its original id.
+type RecoverCase = {id: string; transaction: Pick<CustodyTransaction, "transaction_id" | "old" | "next">; prior: typeof prior; drain: typeof prior; ack: typeof prior; refused_at: "RECONCILE" | "D_ACK" | null};
+const recoverCases = (JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")) as {recover: RecoverCase[]}).recover;
+/** Run one shared recovery case through begin, RECONCILE, D_ACK and COMPLETE, naming the stage that refused. */
+function runRecovery(c: RecoverCase): "RECONCILE" | "D_ACK" | "COMPLETE" | "INCOMPLETE" {
+  let state = beginTransaction({...journal, ...c.transaction, operation: "RECOVER"}, c.prior);
+  try {
+    state = advanceTransaction(state, {op: "RECONCILE", input: {custody: c.drain, drain: c.drain, outside_receipt_digest: anchorDigest(c.drain), original_tail_digest: c.drain.committed_digest}});
+  } catch { return "RECONCILE"; }
+  state = toPhase(state, "D_PREPARE");
+  try { state = advanceTransaction(state, {op: "D_ACK", anchor: c.ack}); } catch { return "D_ACK"; }
+  state = advanceTransaction(toPhase(state, "D_COMMIT"), {op: "D_ACK", anchor: {...c.ack, transaction_id: null}});
+  state = persist(toPhase(state, "COMPLETE"));
+  return transactionComplete(state) ? "COMPLETE" : "INCOMPLETE";
+}
+it.each(recoverCases)("closure recovery acknowledgment $id", c => {
+  expect(runRecovery(c)).toBe(c.refused_at ?? "COMPLETE");
+});
+it("closure recovery cases execute as one full id set", () => {
+  expect(recoverCases.map(c => [c.id, runRecovery(c)])).toEqual(recoverCases.map(c => [c.id, c.refused_at ?? "COMPLETE"]));
+  expect(new Set(recoverCases.map(c => c.id)).size).toBe(recoverCases.length);
 });

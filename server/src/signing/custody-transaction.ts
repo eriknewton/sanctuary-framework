@@ -2,7 +2,7 @@ import { z } from "zod";
 import { canonicalBytes, refuse, safeInteger } from "./contract.js";
 import { parseStrict } from "../smb/parse-strict.js";
 import { advancePersistence, persistenceComplete, preparePersistence, type PersistenceEvent, type PersistenceState } from "./durable-store.js";
-import { ANCHOR_VERSION, anchorSchema, proposeAnchor, reconcile, type ActivationAnchor, type ReconciliationInput } from "../linux-business/activation-anchor.js";
+import { ANCHOR_VERSION, anchorSchema, proposeAnchor, reconcile, recoveryPrepareBase, type ActivationAnchor, type ReconciliationInput } from "../linux-business/activation-anchor.js";
 
 // Must match durable-store.ts and protocol-transitions.json: COMPLETE is a persistence phase, never authority.
 export const TRANSACTION_VERSION = 2; // Revision two persists cuts, drain acknowledgments and recovery comparison.
@@ -26,7 +26,7 @@ export function decodeTransaction(bytes: Uint8Array): CustodyTransaction {
 }
 export interface TransactionState {
   readonly journal: CustodyTransaction; readonly persistence: PersistenceState; readonly recovery_required: boolean;
-  /** The drain anchor observed before PREPARE; the prepare acknowledgment must be exactly one PREPARE step from it. */
+  /** The drain anchor observed before PREPARE; the prepare acknowledgment is exactly one PREPARE step from it, carrying the reconciled drained tuple for a recovery. */
   readonly prior_anchor: ActivationAnchor;
 }
 function equal(a: unknown, b: unknown): boolean { return Buffer.from(canonicalBytes(a)).equals(Buffer.from(canonicalBytes(b))); }
@@ -56,9 +56,9 @@ function prepareAckValid(state: TransactionState, ack: ActivationAnchor | null):
     try { proposeAnchor(before, {version: ANCHOR_VERSION, op: "PREPARE", request_id: j.transaction_id, expected: before, next: ack}); return true; }
     catch { return false; }
   };
-  if (!preparedFrom(state.prior_anchor)) return false;
-  // A recovery acknowledgment names the same drained tuple that the recorded reconciliation compared.
-  return j.operation !== "RECOVER" || (j.reconciliation !== null && preparedFrom(j.reconciliation.input.drain));
+  // Must match recoveryPrepareBase in activation-anchor.ts: a recovery steps from the prior anchor carrying the reconciled drained tuple, any other transaction from the prior anchor itself.
+  const base = j.operation !== "RECOVER" ? state.prior_anchor : j.reconciliation === null ? null : recoveryPrepareBase(state.prior_anchor, j.reconciliation.input.drain);
+  return base !== null && preparedFrom(base);
 }
 function commitAckValid(prepare: ActivationAnchor | null, commit: ActivationAnchor | null): boolean {
   // The commit acknowledgment may only clear the transaction in the exact prepared drain tuple.
@@ -84,8 +84,10 @@ export function advanceTransaction(state: TransactionState, event: TransactionEv
   if (event.op === "RECONCILE") {
     // Only an exact outside receipt and fully drained old custody revision can support same-epoch completion.
     // A recorded reconciliation is write-once, so the drain tuple an acknowledgment must name cannot be replaced.
+    // A drain that disagrees with the prior anchor outside the drained tuple is inconsistent with it, so it refuses here where that is detected.
     if (state.journal.operation !== "RECOVER" || state.journal.phase !== "PREPARED" || state.journal.reconciliation !== null ||
-        reconcile(event.input) !== "CONSISTENT" || event.input.custody.enrollment_revision !== state.journal.old.revision ||
+        reconcile(event.input) !== "CONSISTENT" || recoveryPrepareBase(state.prior_anchor, event.input.drain) === null ||
+        event.input.custody.enrollment_revision !== state.journal.old.revision ||
         event.input.custody.custody_envelope_digest !== state.journal.old.digest) return refuse();
     const journal = {...state.journal, reconciliation: {result: "CONSISTENT" as const, input: reconciliationSchema.parse(event.input)}};
     return {...state, journal, persistence: preparePersistence(journal)};

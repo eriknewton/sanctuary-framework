@@ -12,6 +12,14 @@ pub const PREPARE_CHANGED_FIELDS: &[&str] = &[
     "roster_digest",
     "custody_envelope_digest",
 ];
+/// Must match DRAIN_TUPLE_FIELDS in activation-anchor.ts and drain_tuple_fields in closure_vectors.json, which both languages pin as a whole set; reconcile is defined over exactly this set.
+pub const DRAIN_TUPLE_FIELDS: &[&str] = &[
+    "reserved_sequence",
+    "committed_sequence",
+    "committed_digest",
+    "drained_sequence",
+    "drained_digest",
+];
 const SAFE_INTEGER: u64 = 9007199254740991; // Largest exact JavaScript integer.
 const FIELDS: &[&str] = &[
     "version",
@@ -281,8 +289,33 @@ pub fn reconcile(
         && custody["recovery_required"] == false
         && custody["retired"] == false
         && custody["transaction_id"].is_null()
-        // A matching custody copy cannot certify records that the drain has not acknowledged.
-        && drain["drained_sequence"] == drain["committed_sequence"]
-        && drain["drained_digest"] == drain["committed_digest"]
-        && drain["reserved_sequence"] == drain["committed_sequence"]
+        // A matching custody copy cannot certify records that the drain has not acknowledged, so every drained tuple field is settled at the committed tail.
+        && DRAIN_TUPLE_FIELDS.iter().all(|field| {
+            let settled = if field.ends_with("_sequence") {
+                "committed_sequence"
+            } else {
+                "committed_digest"
+            };
+            drain[*field] == drain[settled]
+        })
+}
+/// The anchor a recovery PREPARE steps from: the prior anchor carrying the reconciled drain's drained tuple, or None when the drain disagrees with the prior anchor anywhere else.
+/// Must match recoveryPrepareBase in activation-anchor.ts and the recover group in closure_vectors.json.
+pub fn recovery_prepare_base(prior: &Value, drain: &Value) -> Option<Value> {
+    if !valid(prior) || !valid(drain) {
+        return None;
+    }
+    let (before, after) = (prior.as_object()?, drain.as_object()?);
+    // Outside the drained tuple the drain must be the prior anchor itself, so a recovery cannot carry in a foreign generation, identity or latch history.
+    if before.iter().any(|(key, value)| {
+        !DRAIN_TUPLE_FIELDS.contains(&key.as_str()) && after.get(key) != Some(value)
+    }) {
+        return None;
+    }
+    let mut base = before.clone();
+    for field in DRAIN_TUPLE_FIELDS {
+        base.insert(field.to_string(), after.get(*field)?.clone());
+    }
+    let base = Value::Object(base);
+    valid(&base).then_some(base)
 }

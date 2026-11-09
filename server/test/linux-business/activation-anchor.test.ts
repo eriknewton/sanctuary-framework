@@ -92,3 +92,13 @@ it("closure PREPARE field set is the shared corpus set", () => {
   const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
   expect([...anchorModule.PREPARE_CHANGED_FIELDS]).toEqual(value.prepare_changed_fields);
 });
+it("closure drained tuple field set is the shared corpus set", () => {
+  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
+  expect([...anchorModule.DRAIN_TUPLE_FIELDS]).toEqual(value.drain_tuple_fields);
+});
+// Must match recoveryPrepareBase in activation-anchor.ts and recovery_prepare_base in activation_anchor.rs: the base is the prior anchor carrying the drain's drained tuple, or null.
+it("closure recovery prepare bases match the shared recover group as a full id set", () => {
+  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")) as {recover: Array<{id: string; prior: ActivationAnchor; drain: ActivationAnchor; refused_at: string | null}>};
+  const base = (c: {prior: ActivationAnchor; drain: ActivationAnchor}) => anchorModule.recoveryPrepareBase(c.prior, c.drain);
+  expect(value.recover.map(c => [c.id, base(c)])).toEqual(value.recover.map(c => [c.id, c.refused_at === "RECONCILE" ? null : c.drain]));
+});

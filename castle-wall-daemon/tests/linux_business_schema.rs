@@ -612,3 +612,45 @@ fn shared_named_field_sets() {
         .collect();
     assert_eq!(Value::Object(table), joins["state_schema"]);
 }
+#[test]
+fn closure_recover_vectors() {
+    // Must match the recover group in closure_vectors.json and custody-transaction.test.ts: full id, refusal stage and base tuple equality forbids filtering.
+    let corpus = corpus("closure_vectors.json");
+    assert_eq!(
+        json!(anchor::DRAIN_TUPLE_FIELDS),
+        corpus["drain_tuple_fields"]
+    );
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for c in corpus["recover"].as_array().unwrap() {
+        let drain = &c["drain"];
+        // Every drain is itself consistent, so a refusal below comes from the prior-anchor binding alone.
+        assert!(anchor::reconcile(
+            drain,
+            drain,
+            anchor::anchor_digest(drain).as_deref(),
+            drain["committed_digest"].as_str()
+        ));
+        let base = anchor::recovery_prepare_base(&c["prior"], drain);
+        let stage = match &base {
+            None => json!("RECONCILE"),
+            Some(base) => {
+                let m = json!({"version":1,"op":"PREPARE","request_id":c["transaction"]["transaction_id"],"expected":base,"next":c["ack"]});
+                if anchor::propose(base, &m).as_ref() == Some(&c["ack"]) {
+                    Value::Null
+                } else {
+                    json!("D_ACK")
+                }
+            }
+        };
+        actual.push(json!([c["id"], stage, base.unwrap_or(Value::Null)]));
+        let want = if c["refused_at"] == "RECONCILE" {
+            Value::Null
+        } else {
+            drain.clone()
+        };
+        expected.push(json!([c["id"], c["refused_at"], want]));
+    }
+    eprintln!("CLOSURE_RESULTS {}", json!(actual));
+    assert_eq!(actual, expected);
+}

@@ -35,6 +35,8 @@ export const ANCHOR_OPS = Object.freeze([...protocol.anchor.ops]) as readonly [s
 export const LATCH_DENIED_OPS = Object.freeze(ANCHOR_OPS.filter(op => op !== protocol.anchor.recovery_op));
 // Must match PREPARE_CHANGED_FIELDS in activation_anchor.rs and prepare_changed_fields in closure_vectors.json, which both languages pin as a whole set.
 export const PREPARE_CHANGED_FIELDS = Object.freeze(["enrollment_revision", "transaction_id", "descriptor_digest", "roster_digest", "custody_envelope_digest"] as const);
+// Must match DRAIN_TUPLE_FIELDS in activation_anchor.rs and drain_tuple_fields in closure_vectors.json, which both languages pin as a whole set; reconcile below is defined over exactly this set.
+export const DRAIN_TUPLE_FIELDS = Object.freeze(["reserved_sequence", "committed_sequence", "committed_digest", "drained_sequence", "drained_digest"] as const);
 const messageSchema = z.object({version: z.literal(ANCHOR_VERSION), op: z.enum(ANCHOR_OPS), request_id: id,
   expected: anchorSchema, next: anchorSchema.nullable()}).strict();
 export type AnchorMessage = z.infer<typeof messageSchema>;
@@ -127,9 +129,22 @@ export function reconcile(input: ReconciliationInput): "CONSISTENT" | "RECOVERY_
     if (input.outside_receipt_digest !== anchorDigest(drain) || input.original_tail_digest !== drain.committed_digest ||
         custody.recovery_required || drain.recovery_required || custody.retired || drain.retired ||
         custody.transaction_id !== null || drain.transaction_id !== null ||
-        // A matching custody copy cannot certify records that the drain has not acknowledged.
-        drain.drained_sequence !== drain.committed_sequence || drain.drained_digest !== drain.committed_digest ||
-        drain.reserved_sequence !== drain.committed_sequence || !equal(custody, drain)) return "RECOVERY_REQUIRED";
+        // A matching custody copy cannot certify records that the drain has not acknowledged, so every drained tuple field is settled at the committed tail.
+        DRAIN_TUPLE_FIELDS.some(field => drain[field] !== drain[field.endsWith("_sequence") ? "committed_sequence" : "committed_digest"]) ||
+        !equal(custody, drain)) return "RECOVERY_REQUIRED";
     return "CONSISTENT";
   } catch { return "RECOVERY_REQUIRED"; }
+}
+/** The anchor a recovery PREPARE steps from: the prior anchor carrying the reconciled drain's drained tuple, or null when the drain disagrees with the prior anchor anywhere else. */
+export function recoveryPrepareBase(prior: ActivationAnchor, drain: ActivationAnchor): ActivationAnchor | null {
+  // Must match recovery_prepare_base in activation_anchor.rs and the recover group in closure_vectors.json.
+  try {
+    const before = anchorSchema.parse(prior), after = anchorSchema.parse(drain);
+    const drained: readonly string[] = DRAIN_TUPLE_FIELDS;
+    // Outside the drained tuple the drain must be the prior anchor itself, so a recovery cannot carry in a foreign generation, identity or latch history.
+    for (const key of Object.keys(before) as (keyof ActivationAnchor)[]) if (!drained.includes(key) && !equal(before[key], after[key])) return null;
+    const base: Record<string, unknown> = {...before};
+    for (const field of DRAIN_TUPLE_FIELDS) base[field] = after[field];
+    return anchorSchema.parse(base);
+  } catch { return null; }
 }
