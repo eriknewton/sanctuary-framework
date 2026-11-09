@@ -35,14 +35,21 @@ export interface OuterRecordIndex {
   sequence: number; prior_commitment: string; captured_at_unix_ms: number; captured_at_boottime_ns: string;
   machine_id: string; boot_id: string; activation_id: string; lease_id: string; generation: number;
 }
+// Must match VERIFY_PIN_FIELDS in records.rs and verify_pin_fields in closure_vectors.json: the one business verify contract binds the enrolled subject and the grant.
+export const BUSINESS_PIN_FIELDS = Object.freeze(["role", "epoch", "kid", "identity_id", "machine_id", "activation_id", "lease_id", "generation"] as const);
+// Must match SigningGrant in signing/record-signer.ts and the pin read by records.rs verify.
+export interface BusinessPin extends RolePin { readonly activation_id: string; readonly lease_id: string; readonly generation: number; }
 // Must match the trusted record_kind selected by the signing and verification adapters in signing/contract.ts.
-export function verifyIndexedRecord(preimage: Uint8Array, signature: string, pin: RolePin, outer: OuterRecordIndex, payloadSchema: z.ZodType, recordKind: string): boolean {
+/** The business verify contract: records.rs verify plus the outer index; plain verifyRecord is the subject-only contract. */
+export function verifyIndexedRecord(preimage: Uint8Array, signature: string, pin: BusinessPin, outer: OuterRecordIndex, payloadSchema: z.ZodType, recordKind: string): boolean {
   try {
     if (pin.role !== "extension:linux-business-producer-v0") return false;
-    const body = parseRecord(preimage, pin.role as SigningRole, payloadSchema, recordKind);
+    const body = parseRecord(preimage, pin.role as SigningRole, payloadSchema, recordKind) as unknown as Record<string, unknown>;
     for (const key of ["sequence", "prior_commitment", "captured_at_unix_ms", "captured_at_boottime_ns", "machine_id", "boot_id", "activation_id", "lease_id", "generation"] as const) {
       if (body[key] !== outer[key]) return false;
     }
+    // A valid subject signature for another activation, lease or generation cannot verify under this grant.
+    if (BUSINESS_PIN_FIELDS.some(key => body[key] !== pin[key])) return false;
     return verifyRecord(preimage, signature, pin, payloadSchema, recordKind);
   } catch { return false; }
 }
