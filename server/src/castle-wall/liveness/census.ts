@@ -19,6 +19,7 @@ import {
   CENSUS_RUN,
   COUNTER_MAX,
 } from "./constants.js";
+import { recordTiming } from "./timing.js";
 
 /** The one preamble line netstat prints before its header. */
 export const CENSUS_PREAMBLE = "Active Internet connections (including servers)";
@@ -325,6 +326,8 @@ export interface CensusRunInput {
   ipv4Set: readonly Ipv4Prefix[];
   bootId: string;
   nowMs: number;
+  /** The reader's current uptime, so each current-boot sample's two clocks are checked against the reader's. */
+  uptimeMs: number;
   agentWindowMs: number;
 }
 
@@ -335,6 +338,8 @@ export interface CensusRunResult {
   generationStartMs: number | null;
   counterRegression: boolean;
   invalid: boolean;
+  /** A current-boot sample whose clocks fail the record-timing rule; it is never credited. */
+  timeUntrusted: boolean;
 }
 
 function storedRowQualifies(row: StoredCensusRow, ipv4Set: readonly Ipv4Prefix[]): boolean {
@@ -354,12 +359,17 @@ function identityKey(pid: number, row: StoredCensusRow): string {
  */
 export function evaluateCensusRun(input: CensusRunInput): CensusRunResult {
   const parsedTimes = input.samples.map(sample => parseIsoInstantWithOffset(sample.observed_at) ?? Number.NaN);
+  // Every current-boot sample passes the same clock rule as the envelope records before it is credited or dates a
+  // generation start: the fresh observer wrapper says nothing about the times nested inside it.
+  const clockTrusted = input.samples.map(sample =>
+    sample.boot_id !== input.bootId || recordTiming(sample.observed_at, sample.observed_uptime_ms, input.nowMs, input.uptimeMs).ok);
+  const timeUntrusted = clockTrusted.includes(false);
   let generationStartMs: number | null = null;
   let counterRegression = false;
   let invalid = false;
   input.samples.forEach((sample, position) => {
     if (sample.other_rows >= COUNTER_MAX) invalid = true;
-    if (sample.boot_id === input.bootId && sample.gateway.generation === input.gateway.generation) {
+    if (clockTrusted[position] && sample.boot_id === input.bootId && sample.gateway.generation === input.gateway.generation) {
       const time = parsedTimes[position]!;
       if (generationStartMs === null || time < generationStartMs) generationStartMs = time;
     }
@@ -378,7 +388,7 @@ export function evaluateCensusRun(input: CensusRunInput): CensusRunResult {
   let run: CensusRunResult["run"] = null;
   for (let end = input.samples.length - 1; end >= CENSUS_RUN && run === null; end--) {
     const window = input.samples.slice(end - CENSUS_RUN, end + 1);
-    const shared = window.every(sample =>
+    const shared = clockTrusted.slice(end - CENSUS_RUN, end + 1).every(Boolean) && window.every(sample =>
       sample.boot_id === input.bootId &&
       sample.gateway.pid === input.gateway.pid &&
       sample.gateway.generation === input.gateway.generation);
@@ -409,5 +419,5 @@ export function evaluateCensusRun(input: CensusRunInput): CensusRunResult {
   }
   // The reader-time bound: a run whose latest sample is older than the agent window no longer proves anything.
   if (run !== null && !(input.nowMs - run.latestObservedAtMs <= input.agentWindowMs)) run = null;
-  return { run, generationStartMs, counterRegression, invalid };
+  return { run, generationStartMs, counterRegression, invalid, timeUntrusted };
 }

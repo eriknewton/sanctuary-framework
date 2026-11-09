@@ -4,7 +4,6 @@
  * is ever stored as a verdict. It imports no filesystem, network or process
  * module so the same code ships in the contract bundle.
  */
-import { parseIsoInstantWithOffset } from "../../core/time.js";
 import {
   AGENT_WINDOW_BASE,
   AVAILABILITY_WINDOW,
@@ -49,6 +48,7 @@ import {
   type ObserverEnvelope,
   type ObserverWallPart,
 } from "./schema.js";
+import { recordTiming } from "./timing.js";
 
 // ---------------------------------------------------------------------------
 // Inputs.
@@ -131,19 +131,6 @@ class ReasonSet {
   ordered(): string[] {
     return this.values().sort((a, b) => (reasonPosition(b) ?? 0) - (reasonPosition(a) ?? 0));
   }
-}
-
-type Timing = { ok: true; ageMs: number } | { ok: false };
-
-/** Age of a record from both clocks; a future time or a divergence beyond LOCAL_JITTER is untrusted. */
-function recordTiming(observedAt: string, observedUptimeMs: number, nowMs: number, uptimeMs: number): Timing {
-  // Timestamps entering freshness arithmetic go through the one strict instant predicate; an unparsable time is untrusted.
-  const utcAge = nowMs - (parseIsoInstantWithOffset(observedAt) ?? Number.NaN);
-  const uptimeAge = uptimeMs - observedUptimeMs;
-  if (!Number.isFinite(utcAge) || utcAge < -LOCAL_JITTER || uptimeAge < 0) return { ok: false };
-  // Within one boot the two clocks progress together; a larger gap means one of them moved.
-  if (Math.abs(utcAge - uptimeAge) > LOCAL_JITTER) return { ok: false };
-  return { ok: true, ageMs: Math.max(0, utcAge, uptimeAge) };
 }
 
 /** Age of an embedded UTC time; null when absent, and undefined when it lies beyond LOCAL_JITTER in the future. */
@@ -522,9 +509,11 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
         ipv4Set: config.messaging_ipv4 ?? [],
         bootId,
         nowMs: now,
+        uptimeMs,
         agentWindowMs,
       });
       if (result.invalid) agent.add("observation_invalid");
+      if (result.timeUntrusted) agent.add("time_untrusted");
       if (result.counterRegression) agent.add("counter_regression");
       if (result.run === null) {
         const startMs = result.generationStartMs;

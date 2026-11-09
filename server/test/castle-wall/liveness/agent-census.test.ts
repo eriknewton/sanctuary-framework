@@ -8,6 +8,8 @@ import {
   CENSUS_PAIR_MIN,
   CENSUS_PERIOD,
   CENSUS_RUN,
+  HOUR,
+  LOCAL_JITTER,
   SECOND,
   agentWindow,
 } from "../../../src/castle-wall/liveness/constants.js";
@@ -289,5 +291,52 @@ describe("census availability and commissioning", () => {
     const envelope = evaluateLiveness({ ...input, observer: { status: "absent" } });
     expect(envelope.agent.state).toBe("agent_DOWN");
     expect(envelope.agent.reasons).toEqual(["observer_missing"]);
+  });
+});
+
+describe("census sample clocks", () => {
+  /** Edit already-stored samples, as a reader would find them on disk, then evaluate at the last sample's reader clock. */
+  const evaluateStored = (edit: (sample: StoredCensusSample) => StoredCensusSample): LivenessEnvelope =>
+    evaluateLiveness(inputAt(LAST.observedAtMs, LAST.uptimeMs, SERIES.map(sample => edit(store(sample)))));
+  const shiftUtc = (deltaMs: number) => (sample: StoredCensusSample): StoredCensusSample =>
+    ({ ...sample, observed_at: new Date(Date.parse(sample.observed_at) + deltaMs).toISOString() });
+  const shiftUptime = (deltaMs: number) => (sample: StoredCensusSample): StoredCensusSample =>
+    ({ ...sample, observed_uptime_ms: sample.observed_uptime_ms + deltaMs });
+  const DAY = 24 * HOUR;
+
+  it("the unedited stored series is the control and reads agent_OK_PASSIVE", () => {
+    const envelope = evaluateStored(sample => sample);
+    expect(envelope.agent.state).toBe("agent_OK_PASSIVE");
+    expect(envelope.agent.reasons).toEqual(["none"]);
+  });
+
+  it.each([
+    ["UTC times one day in the future", shiftUtc(DAY)],
+    ["UTC times one millisecond past the future jitter", shiftUtc(LOCAL_JITTER + 1)],
+    ["uptimes one hour in the past, so the two ages diverge", shiftUptime(-HOUR)],
+    ["uptimes one millisecond past the divergence jitter", shiftUptime(-(LOCAL_JITTER + 1))],
+    ["uptimes ahead of the reader's uptime, a negative age", shiftUptime(SECOND)],
+  ] as const)("%s read agent DOWN time_untrusted and leave the wall unchanged", (_name, edit) => {
+    const envelope = evaluateStored(edit);
+    expect(envelope.agent.state).toBe("agent_DOWN");
+    expect(envelope.agent.reasons).toContain("time_untrusted");
+    expect(envelope.agent.reasons).not.toContain("none");
+    expectWallOk(envelope);
+  });
+
+  it.each([
+    ["UTC times exactly the future jitter ahead", shiftUtc(LOCAL_JITTER)],
+    ["uptimes exactly the divergence jitter behind", shiftUptime(-LOCAL_JITTER)],
+  ] as const)("%s are accepted at the boundary", (_name, edit) => {
+    const envelope = evaluateStored(edit);
+    expect(envelope.agent.state).toBe("agent_OK_PASSIVE");
+    expect(envelope.agent.reasons).toEqual(["none"]);
+  });
+
+  it("an untrusted sample from another boot is never credited and is not read as untrusted time", () => {
+    const envelope = evaluateLiveness(inputAt(LAST.observedAtMs, LAST.uptimeMs,
+      SERIES.map(sample => shiftUtc(DAY)(store(sample, { bootId: "boot-fixture-previous" })))));
+    expect(envelope.agent.reasons).not.toContain("time_untrusted");
+    expect(envelope.agent.state).not.toBe("agent_OK_PASSIVE");
   });
 });
