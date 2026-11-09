@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only adds the discard-fixture marker comment the floating-append guard keys on; test behavior is unchanged
 /**
  * AuditLog flush() — v0.10.1 regression guard for the v0.10.0-rc.2 soak
  * finding where `sanctuary secrets audit` returned empty after a clean

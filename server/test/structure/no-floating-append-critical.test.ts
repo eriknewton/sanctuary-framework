@@ -1,3 +1,4 @@
+// fail-before-exempt: a structure guard over a rule main already satisfies; its refusal arms are killed by mutants in the closure record, not by base failure
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
