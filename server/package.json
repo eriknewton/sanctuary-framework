@@ -49,6 +49,7 @@
   ],
   "scripts": {
     "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/copy-model-manifest-v2-asset.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs && node scripts/copy-model-manifest-v2-asset.mjs",
+    "build:evidence-pack": "node scripts/build-evidence-pack.mjs",
     "build:boot-runtime": "tsup --config tsup.boot-runtime.config.ts",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
     "sign-release": "tsx scripts/sign-release-manifest.mjs",

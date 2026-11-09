@@ -182,19 +182,31 @@ it("a failed delivery never removes a file it did not write, even one substitute
   expect(await readFile(join(x.options.output, C.REPORT_FILENAME), "utf8")).toBe("substituted");
   expect(await readFile(join(x.options.output, "EXPORT_FAILED"), "utf8")).toBe("");
 });
-it.each([["com.apple.quarantine\n", ["com.apple.quarantine", ""]], ["\ncom.apple.provenance", ["", "com.apple.provenance"]], ["", []]])("Darwin capture keeps an interior empty name %j", async (stdout, names) => {
+it.each([["com.apple.quarantine\n", ["com.apple.quarantine", ""]], ["\ncom.apple.provenance", ["", "com.apple.provenance"]], ["", []]])("Darwin capture refuses interior empty names and admits an empty listing %j", async (stdout, names) => {
   const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
   const receipt = JSON.parse(await readFile(x.options.receipt, "utf8"));
-  const { promisify } = await import("node:util"), platform = process.platform;
-  const execute = vi.fn(async () => ({ stdout: stdout === "" ? "" : stdout + C.LF }));
-  vi.doMock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), execFile: Object.assign(vi.fn(), { [promisify.custom]: execute }) }));
+  const platform = process.platform;
+  const execute = vi.fn(() => Buffer.from(stdout === "" ? "" : stdout + C.LF));
+  const lookup = vi.fn(() => ({ status: C.EXIT_PASS }));
+  vi.doMock("node:child_process", async original => {
+    const { promisify } = await import("node:util");
+    return { ...await original<typeof import("node:child_process")>(), execFileSync: execute, spawnSync: lookup, execFile: Object.assign(vi.fn(), { [promisify.custom]: async () => ({ stdout: execute().toString() }) }) };
+  });
   try {
     Object.defineProperty(process, "platform", { value: "darwin" }); vi.doUnmock("../../src/evidence-pack/snapshot-trust-cli.js"); vi.resetModules();
     const adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js");
+    if (names.length > 0) {
+      await expect(adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest)).rejects.toThrow(C.HARD.unexpected_metadata);
+      expect(execute).toHaveBeenCalledOnce(); expect(lookup).not.toHaveBeenCalled();
+      return;
+    }
     const capture = await adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
     expect(capture.rootMetadata).toEqual(names);
     const result = verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE);
-    if (names.length > 0) expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata); else expect(result.status).toBe("PASS");
+    expect(result.status).toBe("PASS");
+    const paths = [x.options.output, ...capture.files.map(file => join(x.options.output, Buffer.from(file.name).toString()))];
+    expect(execute.mock.calls).toEqual(paths.map(path => ["/usr/bin/xattr", ["-s", path], expect.objectContaining({ shell: false, env: { LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] })]));
+    expect(lookup).not.toHaveBeenCalled();
   } finally { Object.defineProperty(process, "platform", { value: platform }); vi.doUnmock("node:child_process"); vi.resetModules(); }
 });
 it("capture closes the file handle when its first stat fails", async () => {
@@ -234,17 +246,22 @@ it.each(["unlink", "rmdir"] as const)("stage %s failure reports finalization and
 it("Darwin capture refuses allowed names that do not exist under their exact name", async () => {
   const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
   const receipt = JSON.parse(await readFile(x.options.receipt, "utf8"));
-  const { promisify } = await import("node:util"), platform = process.platform;
+  const platform = process.platform;
   // One attribute whose name joins two allowed names with LF lists exactly like two attributes; the exact-name lookup then fails.
-  const execute = vi.fn(async (_command: string, args: string[]) => { if (args[0] === "-p") throw new Error("No such xattr"); return { stdout: "com.apple.provenance\ncom.apple.quarantine\n" }; });
-  vi.doMock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), execFile: Object.assign(vi.fn(), { [promisify.custom]: execute }) }));
+  const execute = vi.fn(() => Buffer.from("com.apple.provenance\ncom.apple.quarantine\n"));
+  const lookup = vi.fn(() => ({ status: C.EXIT_FAIL }));
+  vi.doMock("node:child_process", async original => {
+    const { promisify } = await import("node:util");
+    return { ...await original<typeof import("node:child_process")>(), execFileSync: execute, spawnSync: lookup, execFile: Object.assign(vi.fn(), { [promisify.custom]: async (_command: string, args: string[]) => {
+      if (args.includes("-p")) throw new Error("No such xattr");
+      return { stdout: execute().toString() };
+    } }) };
+  });
   try {
     Object.defineProperty(process, "platform", { value: "darwin" }); vi.doUnmock("../../src/evidence-pack/snapshot-trust-cli.js"); vi.resetModules();
     const adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js");
-    const capture = await adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
-    expect(capture.rootMetadata).toEqual(["", ""]);
-    const result = verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE);
-    expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata);
+    await expect(adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest)).rejects.toThrow(C.HARD.unexpected_metadata);
+    expect(lookup).toHaveBeenCalledWith("/usr/bin/xattr", ["-s", "-p", C.OS_ATTACHED_METADATA[0], x.options.output], expect.objectContaining({ stdio: "ignore" }));
   } finally { Object.defineProperty(process, "platform", { value: platform }); vi.doUnmock("node:child_process"); vi.resetModules(); }
 });
 it.skipIf(process.platform !== "darwin")("on macOS a real LF-joined attribute name over genuine labels is refused", async () => {
@@ -253,24 +270,24 @@ it.skipIf(process.platform !== "darwin")("on macOS a real LF-joined attribute na
   // macOS gives every new file a genuine provenance label, so this joined name lists as two existing names and only the repeat refuses it.
   await promisify(execFile)("/usr/bin/xattr", ["-w", "com.apple.provenance\ncom.apple.quarantine", "x", join(x.options.output, C.REPORT_FILENAME)]);
   await promisify(execFile)("/usr/bin/xattr", ["-w", "com.apple.quarantine", "q", join(x.options.output, C.REPORT_FILENAME)]);
-  const capture = await captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
-  const result = verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE);
-  expect(result.status).toBe("FAIL"); expect(result.findings[0].code).toBe(C.HARD.unexpected_metadata);
+  await expect(captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest)).rejects.toThrow(C.HARD.unexpected_metadata);
 });
 it.each(["com.apple.provenance ", " com.apple.quarantine"])("Darwin capture preserves metadata bytes %j", async name => {
   const x = await exporterFixture(); expect(await exportSnapshot(x.options, x.deps)).toBe(C.EXIT_PASS);
   const receipt = JSON.parse(await readFile(x.options.receipt, "utf8"));
-  const { promisify } = await import("node:util"), platform = process.platform;
-  const execute = vi.fn(async () => ({ stdout: name + C.LF }));
-  vi.doMock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), execFile: Object.assign(vi.fn(), { [promisify.custom]: execute }) }));
+  const platform = process.platform;
+  const execute = vi.fn(() => Buffer.from(name + C.LF));
+  const lookup = vi.fn(() => ({ status: C.EXIT_PASS }));
+  vi.doMock("node:child_process", async original => {
+    const { promisify } = await import("node:util");
+    return { ...await original<typeof import("node:child_process")>(), execFileSync: execute, spawnSync: lookup, execFile: Object.assign(vi.fn(), { [promisify.custom]: async () => ({ stdout: execute().toString() }) }) };
+  });
   try {
     Object.defineProperty(process, "platform", { value: "darwin" }); vi.doUnmock("../../src/evidence-pack/snapshot-trust-cli.js"); vi.resetModules();
     const adapter = await import("../../src/evidence-pack/snapshot-trust-cli.js");
-    const capture = await adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest);
-    expect(capture.rootMetadata).toEqual([name]);
-    for (const file of capture.files) expect(file.metadata).toEqual([name]);
-    for (const call of execute.mock.calls as unknown as [string, string[]][]) expect(call).toEqual(["/usr/bin/xattr", [expect.any(String)], expect.any(Object)]);
-    expect(verifySnapshot(capture, { packKey: x.f.pack.public_key, descriptorBytes: await readFile(join(x.options.output, C.TRUST_FILENAME)), expectedManifestDigest: receipt.manifest_digest }, SOURCE).findings[0].code).toBe(C.HARD.unexpected_metadata);
+    await expect(adapter.captureSnapshotDirectory(x.options.output, x.f.pack.public_key, receipt.manifest_digest)).rejects.toThrow(C.HARD.unexpected_metadata);
+    expect(execute).toHaveBeenCalledOnce(); expect(lookup).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledWith("/usr/bin/xattr", ["-s", x.options.output], expect.objectContaining({ shell: false, env: { LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"] }));
   } finally { Object.defineProperty(process, "platform", { value: platform }); vi.doUnmock("node:child_process"); vi.resetModules(); }
 });
 
