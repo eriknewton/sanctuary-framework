@@ -124,7 +124,7 @@ export interface WatchCommandContext {
 /** Sampling interval while waiting for a stable observer pid. */
 const STABLE_SAMPLE_INTERVAL_MS = SECOND;
 // Observe one full sample interval beyond the observer's restart throttle, as install-full does for its job.
-const STABLE_WINDOW_MS = WATCH_THROTTLE_INTERVAL_S * SECOND + STABLE_SAMPLE_INTERVAL_MS;
+export const STABLE_WINDOW_MS = WATCH_THROTTLE_INTERVAL_S * SECOND + STABLE_SAMPLE_INTERVAL_MS;
 /** Twice the stable window: a job that restarts once inside it still has room to settle. */
 const STABLE_BUDGET_MS = 2 * STABLE_WINDOW_MS;
 /** Bytes of randomness in an observer instance label: 32 hex characters plus the prefix stay inside LABEL_BYTES. */

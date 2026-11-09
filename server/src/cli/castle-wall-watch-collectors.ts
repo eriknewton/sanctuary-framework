@@ -132,10 +132,17 @@ export interface RunnerTimers {
   setTimeout(fire: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
 }
+/**
+ * The production timers for the observer, the sampler, the runner and the watch verbs. Every handle is REFERENCED:
+ * these timers are what keeps the process alive through the process reread gap, the idle time between cycles and the
+ * installer's stability sleeps, because nothing else holds the event loop open there. An unreferenced handle lets
+ * Node exit 0 mid-cycle or mid-install, which reads as success to launchd and to the operator. The handles end by
+ * explicit cancellation instead: on settlement, at observer and sampler stop, and when a child's exit is observed.
+ */
 export const realRunnerTimers: RunnerTimers & ObserverTimers = {
-  setTimeout: (fire, ms) => { const t = setTimeout(fire, ms); t.unref?.(); return t; },
+  setTimeout: (fire, ms) => setTimeout(fire, ms),
   clearTimeout: handle => clearTimeout(handle as NodeJS.Timeout),
-  setInterval: (fire, ms) => { const t = setInterval(fire, ms); t.unref?.(); return t; },
+  setInterval: (fire, ms) => setInterval(fire, ms),
   clearInterval: handle => clearInterval(handle as NodeJS.Timeout),
 };
 
