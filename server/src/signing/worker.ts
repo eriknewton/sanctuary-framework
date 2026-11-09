@@ -1,4 +1,5 @@
 import { constants, openSync, closeSync, fstatSync, readSync, writeSync } from "node:fs";
+import { advance, type JoinState, type JoinRecord, type JoinResult } from "./record-joins.js";
 import { ReadStream, isatty } from "node:tty";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { unlockExistingMasterReadOnlyWithEnvelope } from "../core/master-custody.js";
@@ -12,6 +13,12 @@ import { decodeSignerFrame } from "../linux-business/producer-custody.js";
 import { parseStrict } from "../smb/parse-strict.js";
 import { publicFrame, workerSigner, LENGTH_BYTES } from "./service.js";
 import type { SigningGrant } from "./record-signer.js";
+
+/** Validation-only entrypoint; successful joins convey no signing or installed authority. */
+export function validateBusinessJoin(state: JoinState, record: JoinRecord): JoinResult {
+  // Must match records.rs::advance and the shared corpus consumers without widening service.ts inert dispatch.
+  return advance(state, record);
+}
 
 // Must match custody.rs: only private stdin/stdout and the validated terminal at fd3 survive exec.
 const TTY_FD = 3;
@@ -156,4 +163,5 @@ const acknowledgeWipe = () => {
   // main has wiped owned buffers before this acknowledgement; native reaping closes immutable library copies.
   writeSync(STDOUT_FD, publicFrame({op: "WIPED"})); process.exit(0);
 };
-void main().then(acknowledgeWipe, acknowledgeWipe);
+// Only the directly executed CommonJS release worker may enter the attended protocol.
+if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) void main().then(acknowledgeWipe, acknowledgeWipe);

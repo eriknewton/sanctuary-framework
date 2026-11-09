@@ -15,6 +15,7 @@ export function strictEncodingProfile(signature: Uint8Array, publicKey: Uint8Arr
 export function strictVerify(message: Uint8Array, signature: Uint8Array, publicKey: Uint8Array): boolean {
   return strictEncodingProfile(signature, publicKey) && verify(message, signature, publicKey);
 }
+// Must match the subject-only contract: role, epoch, kid, identity and machine. The business contract that also binds the grant is verifyIndexedRecord in linux-business/producer-custody.ts and verify in records.rs.
 export function verifyRecord(preimage: Uint8Array, signature: string, pin: RolePin, payloadSchema: z.ZodType, recordKind: string): boolean {
   try {
     // Must match the trusted record_kind selection in record-signer.ts and contract.ts.
