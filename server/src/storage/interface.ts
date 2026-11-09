@@ -157,6 +157,16 @@ export interface FilesystemStorageCapabilities {
  * Decorators MUST forward this capability deliberately; custody callers refuse
  * backends that omit it instead of silently running unlocked.
  */
+/**
+ * Lock options a storage caller may pass. No `__test*` key is part of this public type;
+ * filesystem lock test hooks arrive only through withFilesystemLockTestHooks in filesystem.ts,
+ * which must match the import-graph pin in filesystem-internal-importers.test.ts.
+ */
+export type NamespaceLockOptions = {
+  [K in keyof import("./cross-process-lock.js").CrossProcessLockOptions as K extends `__test${string}` ? never : K]:
+    import("./cross-process-lock.js").CrossProcessLockOptions[K];
+};
+
 export interface NamespaceLockStorageCapabilities {
   // These two `import("./cross-process-lock.js")` references are the ONLY edge
   // from interface.ts to cross-process-lock.ts, and cross-process-lock.ts imports
@@ -171,7 +181,7 @@ export interface NamespaceLockStorageCapabilities {
     namespace: string,
     lockFileName: string,
     operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
-    options?: import("./cross-process-lock.js").CrossProcessLockOptions,
+    options?: NamespaceLockOptions,
   ): Promise<T>;
 }
 
@@ -189,7 +199,7 @@ export interface StrictDurabilityStorageCapabilities {
     namespace: string,
     lockFileName: string,
     operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
-    options?: import("./cross-process-lock.js").CrossProcessLockOptions,
+    options?: NamespaceLockOptions,
   ): Promise<T>;
   /** Resolve only after file, directory and close barriers; rejection can follow visible publication. */
   writeStrict(namespace: string, key: string, data: Uint8Array): Promise<void>;

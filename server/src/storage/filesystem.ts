@@ -61,10 +61,11 @@ import type {
   FilesystemStorageCapabilities,
   NamespaceLockStorageCapabilities,
   StrictDurabilityStorageCapabilities,
+  NamespaceLockOptions,
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
-import { readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict, syncDirectoryStrict } from "./custody-fs.js";
+import { readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict, syncDirectoryStrict, syncExistingDirectoryChainStrict } from "./custody-fs.js";
 import {
   assertStorageMasterWriteBarrierHeld,
   CrossProcessLockError,
@@ -290,7 +291,7 @@ class DarwinDirectoryCapabilityClient {
       cwd,
       execArgv: [
         ...(sourceLoader ? ["--import", sourceLoader] : []),
-        // A fault preload can rewrite worker barriers, so only the existing test environment may add one.
+        // A fault preload can rewrite worker barriers, so it arrives only from withFilesystemLockTestHooks, and then only inside the test environment.
         ...(testPreload !== undefined && process.env.VITEST ? ["--import", testPreload] : []),
       ],
       // Never inherit Sanctuary credential variables into the helper. It gets
@@ -457,11 +458,51 @@ const directoryCapabilityWorkerExecutors = new WeakSet<object>();
  */
 const STRICT_NAMESPACE_LOCK: unique symbol = Symbol("sanctuary.strict-namespace-lock");
 
-/** Test-only lock options read by this module; must match workerFaultPreload in filesystem-strict-durability.test.ts. */
-interface DirectoryCapabilityTestOptions {
-  /** Module URL imported into each Darwin directory-capability worker; ignored outside VITEST. */
-  __testDirectoryCapabilityPreload?: string;
+/**
+ * Filesystem lock test hooks. They never travel in public lock options; only
+ * `withFilesystemLockTestHooks` sets them, and only test files may import it.
+ */
+export interface FilesystemLockTestHooks {
+  /** Module URL imported into each Darwin directory-capability worker; must match workerFaultPreload in filesystem-strict-durability.test.ts. */
+  directoryCapabilityPreload?: string;
+  /** Shorter per-operation Darwin capability bound. */
+  directoryCapabilityTimeoutMs?: number;
+  /** Observe Darwin cwd-capability worker PIDs. */
+  afterDirectoryCapabilityAcquired?: (storageRootPid: number, fortressRootPid: number, lockedNamespacePid?: number) => void;
+  /** Wrap one namespace-capability close so cleanup-failure aggregation can be proven. */
+  closeNamespaceCapability?: (
+    kind: "root-worker" | "parent-worker" | "namespace-worker" | "root-fd" | "parent-fd" | "namespace-fd",
+    close: () => Promise<unknown>,
+  ) => Promise<unknown>;
 }
+
+const filesystemLockTestHooks = new AsyncLocalStorage<FilesystemLockTestHooks>();
+
+/**
+ * Run `operation` with filesystem lock test hooks in scope. Must match the
+ * import-graph pin in filesystem-internal-importers.test.ts: no file under
+ * server/src or server/scripts imports this, so production never reaches it.
+ */
+export function withFilesystemLockTestHooks<T>(hooks: FilesystemLockTestHooks, operation: () => Promise<T>): Promise<T> {
+  return filesystemLockTestHooks.run(hooks, operation);
+}
+
+/** Every `__test*` key is removed because public lock options never carry test authority. */
+function withoutTestKeys<O extends object>(options: O): O {
+  const copy = { ...options };
+  for (const key of Object.keys(copy)) {
+    if (key.startsWith("__test")) delete (copy as Record<string, unknown>)[key];
+  }
+  return copy;
+}
+
+/** Hooks this module reads; stripped on every public entry so only the injection supplies them. */
+const FILESYSTEM_LOCK_HOOK_KEYS = [
+  "__testDirectoryCapabilityPreload",
+  "__testDirectoryCapabilityTimeoutMs",
+  "__testAfterDirectoryCapabilityAcquired",
+  "__testCloseNamespaceCapability",
+] as const;
 
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities, StrictDurabilityStorageCapabilities {
   private basePath: string;
@@ -590,18 +631,14 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     namespace: string,
     lockFileName: string,
     operation: Parameters<typeof withPathLock<T>>[2],
-    options: Parameters<typeof withPathLock<T>>[3] & DirectoryCapabilityTestOptions = {},
+    options: NamespaceLockOptions = {},
   ): Promise<T> {
     // Strict directory authority requires the kernel-backed path and cannot inherit an environmental degradation policy.
-    const strictOptions = { ...options, kernelBacked: true, degradeOnEnvironmentalLoss: undefined };
-    // Test hooks can bypass lock custody, so only the existing test environment may forward them.
-    if (!process.env.VITEST) {
-      for (const key of Object.keys(strictOptions)) {
-        if (key.startsWith("__test")) delete (strictOptions as Record<string, unknown>)[key];
-      }
-    }
+    // Test hooks can bypass lock custody, so a strict entry drops every one in every environment.
+    const strictOptions = { ...withoutTestKeys(options), kernelBacked: true, degradeOnEnvironmentalLoss: undefined };
     // Must match the STRICT_NAMESPACE_LOCK read in withNamespaceLock; the marker is the only way into strict mode.
-    const marked = Object.assign(strictOptions, { [STRICT_NAMESPACE_LOCK]: true as const });
+    // The marker goes on a fresh copy so the caller's options object is never mutated.
+    const marked = { ...strictOptions, [STRICT_NAMESPACE_LOCK]: true as const };
     return this.withNamespaceLock(namespace, lockFileName, operation, marked);
   }
 
@@ -609,17 +646,20 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     namespace: string,
     lockFileName: string,
     operation: Parameters<typeof withPathLock<T>>[2],
-    requestedOptions: Parameters<typeof withPathLock<T>>[3] & DirectoryCapabilityTestOptions = {},
+    requestedOptions: NamespaceLockOptions = {},
   ): Promise<T> {
     const strict = (requestedOptions as { [STRICT_NAMESPACE_LOCK]?: true })[STRICT_NAMESPACE_LOCK] === true;
-    let options = requestedOptions;
-    // Test hooks can bypass lock custody, so outside the test environment neither a strict lock nor a lock nested in strict authority may forward one.
-    if (!process.env.VITEST && (strict || (this.strictLockLease.getStore()?.strict === true && this.strictLockLease.getStore()?.active === true))) {
-      options = { ...requestedOptions };
-      for (const key of Object.keys(options)) {
-        if (key.startsWith("__test")) delete (options as Record<string, unknown>)[key];
-      }
+    const nestedInStrictAuthority = this.strictLockLease.getStore()?.strict === true && this.strictLockLease.getStore()?.active === true;
+    let options: Parameters<typeof withPathLock<T>>[3] = { ...requestedOptions };
+    if (strict || nestedInStrictAuthority) {
+      // Test hooks can bypass lock custody, so neither a strict lock nor a lock nested in strict authority forwards one, in any environment.
+      options = withoutTestKeys(options);
+    } else {
+      // The filesystem hooks come only from withFilesystemLockTestHooks, so a public caller can never set them.
+      // Generic withPathLock hooks forwarded by withCrossProcessLock still pass through on this legacy path.
+      for (const key of FILESYSTEM_LOCK_HOOK_KEYS) delete (options as Record<string, unknown>)[key];
     }
+    const testHooks = filesystemLockTestHooks.getStore();
     if (options.kernelBacked !== true) {
       return withPathLock(this.namespacePath(namespace), lockFileName, operation, options);
     }
@@ -724,22 +764,22 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         rootClient = await DarwinDirectoryCapabilityClient.start(this.basePath, {
           dev: String(heldRoot.dev),
           ino: String(heldRoot.ino),
-        }, this.owner, options.__testDirectoryCapabilityTimeoutMs, options.__testDirectoryCapabilityPreload);
+        }, this.owner, testHooks?.directoryCapabilityTimeoutMs, testHooks?.directoryCapabilityPreload);
         parentClient = await DarwinDirectoryCapabilityClient.start(
           dirname(this.basePath),
           { dev: String(heldParent.dev), ino: String(heldParent.ino) },
           this.owner,
-          options.__testDirectoryCapabilityTimeoutMs,
-          options.__testDirectoryCapabilityPreload,
+          testHooks?.directoryCapabilityTimeoutMs,
+          testHooks?.directoryCapabilityPreload,
         );
         namespaceClient = await DarwinDirectoryCapabilityClient.start(
           encodedNamespacePath(this.basePath, namespace),
           { dev: String(heldNamespace.dev), ino: String(heldNamespace.ino) },
           this.owner,
-          options.__testDirectoryCapabilityTimeoutMs,
-          options.__testDirectoryCapabilityPreload,
+          testHooks?.directoryCapabilityTimeoutMs,
+          testHooks?.directoryCapabilityPreload,
         );
-        options.__testAfterDirectoryCapabilityAcquired?.(
+        testHooks?.afterDirectoryCapabilityAcquired?.(
           rootClient.pid,
           parentClient.pid,
           namespaceClient.pid,
@@ -805,6 +845,14 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           lockFileName,
           async (lease) => {
             const authority = { active: true, strict, assertHeld: () => lease.assertHeld() };
+            // Internal fences around the callback; the public assertHeld adds the inactive-lease refusal on top.
+            const assertBound = (): void => {
+              lease.assertHeld();
+              rootClient?.assertAlive();
+              parentClient?.assertAlive();
+              namespaceClient?.assertAlive();
+              assertLexicalIdentity();
+            };
             // A kept strict lease must not reach a closed and possibly reused descriptor or a stopped worker after its callback settles.
             const leased = <A extends unknown[], R>(method: (...args: A) => Promise<R>): ((...args: A) => Promise<R>) =>
               strict
@@ -893,20 +941,18 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
                     )),
                 },
               assertHeld: () => {
-                lease.assertHeld();
-                rootClient?.assertAlive();
-                parentClient?.assertAlive();
-                namespaceClient?.assertAlive();
-                assertLexicalIdentity();
+                // A kept strict lease must not report a held lock after its callback settles.
+                if (strict && !authority.active) throw new Error("strict lock lease is no longer active");
+                assertBound();
               },
             } satisfies CrossProcessLockLease;
-            boundLease.assertHeld();
+            assertBound();
             let value: T;
             try {
               // Strict mutation authority begins only inside the acquired lock callback and ends when it settles.
               value = await this.strictLockLease.run(authority, () => operation(boundLease));
             } finally { authority.active = false; }
-            boundLease.assertHeld();
+            assertBound();
             return value;
           },
           options,
@@ -924,8 +970,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         close: () => Promise<unknown>,
       ): Promise<void> => {
         try {
-          if (options.__testCloseNamespaceCapability) {
-            await options.__testCloseNamespaceCapability(kind, close);
+          if (testHooks?.closeNamespaceCapability) {
+            await testHooks.closeNamespaceCapability(kind, close);
           } else {
             await close();
           }
@@ -1115,7 +1161,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const dirPath = dirname(filePath);
     const lockName = `.${basename(filePath)}.compare-replace.lock`;
     // Even an absent comparison creates lock parents, so strict setup cannot wait for a matching row.
-    const directoryIdentity = strictDurability ? await ensureDirectoryStrict(dirPath, 0o700, this.strictDirectoryBase(namespace)) : undefined;
+    // Owner mode may not create parents, so its strict comparison syncs an existing chain and refuses a missing one with a typed code.
+    const directoryIdentity = !strictDurability ? undefined
+      : this.owner !== undefined ? await syncExistingDirectoryChainStrict(dirPath, this.strictDirectoryBase(namespace))
+        : await ensureDirectoryStrict(dirPath, 0o700, this.strictDirectoryBase(namespace));
 
     // The lock covers the complete read -> compare -> atomic replacement
     // window. A plain read followed by rename is not CAS: two processes can

@@ -21,7 +21,8 @@ export type CustodyFsErrorCode =
   | "parent_symlink_rejected"
   | "parent_mode_rejected"
   | "parent_uid_rejected"
-  | "parent_gid_rejected";
+  | "parent_gid_rejected"
+  | "strict_directory_missing";
 
 export class CustodyFsError extends Error {
   constructor(
@@ -447,6 +448,15 @@ export async function ensureDirectoryStrict(dir: string, mode: number, base: str
 }
 
 /**
+ * Sync an existing chain from the held boundary through the leaf without creating anything.
+ * A missing component refuses with `strict_directory_missing`; must match the owner-mode
+ * strict callers in filesystem.ts (replaceIfEqualsMode) and writeFileCustodyWithDurability.
+ */
+export async function syncExistingDirectoryChainStrict(dir: string, base: string): Promise<Stats> {
+  return syncDirectoryChainStrict(dir, base, undefined);
+}
+
+/**
  * Capture and sync the chain from the held boundary through the leaf on every attempt.
  * An undefined `createMode` creates nothing, so a missing component refuses instead of being made.
  */
@@ -468,7 +478,15 @@ async function syncDirectoryChainStrict(dir: string, base: string, createMode: n
         }
       }
       const path = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(cursor) ? `${cursor}/.` : cursor;
-      const handle = await openExistingDirectoryNoFollow(path);
+      let handle: Awaited<ReturnType<typeof open>>;
+      try { handle = await openExistingDirectoryNoFollow(path); }
+      catch (error) {
+        // Without creation authority an absent component is a refusal the caller can name, not an incidental open failure.
+        if (createMode === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new CustodyFsError("strict_directory_missing", "strict write without parent creation requires an existing directory", { cause: error });
+        }
+        throw error;
+      }
       const entry = { path, handle, identity: undefined as unknown as Stats, closed: false };
       entries.push(entry);
       // Creation records descriptor identity immediately so a later name replacement cannot supply barrier evidence.
@@ -840,6 +858,12 @@ export async function writeFileCustodyWithDurability(
   const dir = dirname(path);
   let publishedDirectory: Stats | undefined;
   let ownerGuard: NoFollowDirectoryGuard | undefined;
+  if (options.strictDurability && options.owner !== undefined && options.createParent !== false) {
+    // Owner writes may not create parents, yet a namespace made after the lock's root barrier still needs its own entry barrier;
+    // this runs before the owner guard so a missing directory refuses with the typed strict code rather than a guard failure.
+    if (!options.strictDirectoryBase) throw new Error("strict owner write requires a held boundary");
+    publishedDirectory = await syncExistingDirectoryChainStrict(dir, options.strictDirectoryBase);
+  }
   if (options.owner !== undefined && !options.stableDirectoryCapability) {
     // 2026-07-31 fix-round: verify containment BEFORE any recursive mkdir.
     // There is no mkdirat-style API here; creating missing parents by path as
@@ -859,10 +883,6 @@ export async function writeFileCustodyWithDurability(
         } else {
           await mkdir(dir, { recursive: true, mode: options.parentMode ?? 0o700 });
         }
-      } else if (options.strictDurability && options.createParent !== false) {
-        // Owner writes may not create parents, yet a namespace made after the lock's root barrier still needs its own entry barrier.
-        if (!options.strictDirectoryBase) throw new Error("strict owner write requires a held boundary");
-        publishedDirectory = await syncDirectoryChainStrict(dir, options.strictDirectoryBase, undefined);
       }
       if (options.strictDurability && ownerGuard) {
         // Owner writes cannot skip uncertain parent barriers merely because creation is forbidden.
