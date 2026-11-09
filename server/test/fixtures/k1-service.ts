@@ -133,3 +133,24 @@ export async function releaseIsolationProbe(executable: string): Promise<boolean
     throw new Error("release probe did not settle or expose a socket");
   }finally{await reap(child);cleanup(root,[configPath],[control,custody]);}
 }
+
+import businessSchema from "../../src/signing/linux-business-records.schema.json";
+type SchemaNode = {type: string; value?: unknown; values?: string[]; min?: number; name?: string; encoding?: string; fields?: Record<string, SchemaNode>; branches?: SchemaNode[]};
+/** Synthetic public records exercise each strict branch without invoking a provider or operator store. */
+export function businessBodies(): Record<string, unknown>[] {
+  const definitions = businessSchema.definitions as unknown as Record<string, SchemaNode>;
+  const sample = (node: SchemaNode): unknown => {
+    switch (node.type) {
+      case "ref": return sample(definitions[node.name!]);
+      case "literal": return node.value;
+      case "enum": return node.values![0];
+      case "integer": return node.min!;
+      case "union": return sample(node.branches![0]);
+      case "object": return Object.fromEntries(Object.entries(node.fields!).map(([key, value]) => [key, sample(value)]));
+      case "string": return ({id: "a".repeat(32), digest: "sha256:" + "b".repeat(64), kid: "k1:sha256:" + "b".repeat(64), u64: "1", ipv4: "192.0.2.1", ipv6: "2001:db8::1"})[node.encoding!];
+      default: throw new Error("UNKNOWN_SCHEMA_NODE");
+    }
+  };
+  // Must match records_schema.rs and linux_business_schema.rs: every root branch supplies one positive fixture.
+  return businessSchema.record.branches.map(branch => sample(branch as unknown as SchemaNode) as Record<string, unknown>);
+}
