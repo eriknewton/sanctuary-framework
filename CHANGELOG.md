@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-- Added a default-off storage and audit foundation with separate strict storage methods under a required namespace lock, descriptor-bound barriers and audit promise checks; receipt, retention-pin and seal integration remains deferred.
+- Added a default-off storage and audit foundation with separate strict storage methods under a required namespace lock, descriptor-bound barriers and audit promise checks; receipt, retention-pin and seal integration remains deferred. Darwin directory-capability worker errors, including legacy operations, now keep nested `errors` and `cause` across the worker boundary and drop a non-string `code` or `kind`.
 - Added an isolated per-role record-signing contract and an encrypted key-provider with test fixtures. Nothing is wired into the daemon, a service or any existing export yet.
 - Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.
 - Added a pure evidence snapshot verification boundary over captured bytes and independent public pins. Recipient verification CLI and packaging are not included.

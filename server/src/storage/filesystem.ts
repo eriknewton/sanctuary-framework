@@ -265,6 +265,7 @@ class DarwinDirectoryCapabilityClient {
     identity: { dev: string; ino: string },
     owner?: { uid: number; gid: number },
     operationTimeoutMs = 5_000,
+    testPreload?: string,
   ): Promise<DarwinDirectoryCapabilityClient> {
     const sourceWorker = fileURLToPath(
       new URL("./directory-capability-worker.ts", import.meta.url),
@@ -287,7 +288,11 @@ class DarwinDirectoryCapabilityClient {
       owner === undefined ? "" : String(owner.gid),
     ], {
       cwd,
-      execArgv: sourceLoader ? ["--import", sourceLoader] : [],
+      execArgv: [
+        ...(sourceLoader ? ["--import", sourceLoader] : []),
+        // A fault preload can rewrite worker barriers, so only the existing test environment may add one.
+        ...(testPreload !== undefined && process.env.VITEST ? ["--import", testPreload] : []),
+      ],
       // Never inherit Sanctuary credential variables into the helper. It gets
       // only the one bounded operation payload over the private IPC channel.
       env: {
@@ -438,6 +443,26 @@ interface BoundStorageContext {
 // this is an internal capability token, not a caller-supplied namespace.
 const DARWIN_BOUND_NAMESPACE_TOKEN = "\0sanctuary-bound-namespace\0";
 
+/**
+ * Instances built by `createDirectoryCapabilityWorkerStorage` alone. Membership
+ * replaces a public constructor flag because the exemption skips the strict
+ * lock requirement, which only the worker's held cwd may stand in for.
+ */
+const directoryCapabilityWorkerExecutors = new WeakSet<object>();
+
+/**
+ * Marks the one lock entry that `withStrictNamespaceLock` makes. A module-private
+ * symbol cannot be supplied by a public caller, so a nested public
+ * `withNamespaceLock` never inherits strict mode from an enclosing callback.
+ */
+const STRICT_NAMESPACE_LOCK: unique symbol = Symbol("sanctuary.strict-namespace-lock");
+
+/** Test-only lock options read by this module; must match workerFaultPreload in filesystem-strict-durability.test.ts. */
+interface DirectoryCapabilityTestOptions {
+  /** Module URL imported into each Darwin directory-capability worker; ignored outside VITEST. */
+  __testDirectoryCapabilityPreload?: string;
+}
+
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities, StrictDurabilityStorageCapabilities {
   private basePath: string;
   /**
@@ -447,8 +472,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * Async-local binding keeps concurrent read-only users of this instance on
    * the ordinary path while the protected callback uses the held inode.
    */
-  private readonly strictDurability = new AsyncLocalStorage<boolean>();
-  private readonly strictLockLease = new AsyncLocalStorage<{ active: boolean; assertHeld(): void }>();
+  private readonly strictLockLease = new AsyncLocalStorage<{ active: boolean; strict: boolean; assertHeld(): void }>();
   private readonly boundBasePath = new AsyncLocalStorage<BoundStorageContext>();
   /**
    * Create-with-fchown owner (fortress-ownership spec 2026-07-30): when set,
@@ -459,19 +483,20 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * parent or chown failure fails the write.
    */
   private owner: { uid: number; gid: number } | undefined;
-  private readonly allowDirectoryCapabilityRootNamespace: boolean;
 
   constructor(
     basePath: string,
     options: {
       owner?: { uid: number; gid: number };
-      allowDirectoryCapabilityRootNamespace?: boolean;
     } = {}
   ) {
     this.basePath = basePath;
     this.owner = options.owner;
-    this.allowDirectoryCapabilityRootNamespace =
-      options.allowDirectoryCapabilityRootNamespace === true;
+  }
+
+  /** True only for the worker executor; no constructor option can set it. */
+  private get allowDirectoryCapabilityRootNamespace(): boolean {
+    return directoryCapabilityWorkerExecutors.has(this);
   }
 
   private activeBasePath(): string {
@@ -565,7 +590,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     namespace: string,
     lockFileName: string,
     operation: Parameters<typeof withPathLock<T>>[2],
-    options: Parameters<typeof withPathLock<T>>[3] = {},
+    options: Parameters<typeof withPathLock<T>>[3] & DirectoryCapabilityTestOptions = {},
   ): Promise<T> {
     // Strict directory authority requires the kernel-backed path and cannot inherit an environmental degradation policy.
     const strictOptions = { ...options, kernelBacked: true, degradeOnEnvironmentalLoss: undefined };
@@ -575,15 +600,26 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         if (key.startsWith("__test")) delete (strictOptions as Record<string, unknown>)[key];
       }
     }
-    return this.strictDurability.run(true, () => this.withNamespaceLock(namespace, lockFileName, operation, strictOptions));
+    // Must match the STRICT_NAMESPACE_LOCK read in withNamespaceLock; the marker is the only way into strict mode.
+    const marked = Object.assign(strictOptions, { [STRICT_NAMESPACE_LOCK]: true as const });
+    return this.withNamespaceLock(namespace, lockFileName, operation, marked);
   }
 
   async withNamespaceLock<T>(
     namespace: string,
     lockFileName: string,
     operation: Parameters<typeof withPathLock<T>>[2],
-    options: Parameters<typeof withPathLock<T>>[3] = {},
+    requestedOptions: Parameters<typeof withPathLock<T>>[3] & DirectoryCapabilityTestOptions = {},
   ): Promise<T> {
+    const strict = (requestedOptions as { [STRICT_NAMESPACE_LOCK]?: true })[STRICT_NAMESPACE_LOCK] === true;
+    let options = requestedOptions;
+    // Test hooks can bypass lock custody, so outside the test environment neither a strict lock nor a lock nested in strict authority may forward one.
+    if (!process.env.VITEST && (strict || (this.strictLockLease.getStore()?.strict === true && this.strictLockLease.getStore()?.active === true))) {
+      options = { ...requestedOptions };
+      for (const key of Object.keys(options)) {
+        if (key.startsWith("__test")) delete (options as Record<string, unknown>)[key];
+      }
+    }
     if (options.kernelBacked !== true) {
       return withPathLock(this.namespacePath(namespace), lockFileName, operation, options);
     }
@@ -607,7 +643,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const namespaceComponent = storageNamespacePathComponent(namespace);
     let expectedParent: Stats | undefined;
     // A strict lock cannot establish durability for ancestors above its held parent.
-    if (this.strictDurability.getStore()) {
+    if (strict) {
       expectedParent = await lstat(dirname(this.basePath));
       if (!expectedParent.isDirectory() || expectedParent.isSymbolicLink()) throw new Error("strict root parent must already be a directory");
       try { await mkdir(this.basePath, { mode: 0o700 }); }
@@ -615,7 +651,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     } else await mkdir(this.basePath, { recursive: true, mode: 0o700 });
     const strictDirectoryFlags = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY;
     // Strict capture refuses symlinks before granting held directory authority.
-    const rootHandle = await open(this.basePath, this.strictDurability.getStore() ? strictDirectoryFlags : "r");
+    const rootHandle = await open(this.basePath, strict ? strictDirectoryFlags : "r");
     let parentHandle: Awaited<ReturnType<typeof open>> | undefined;
     let namespaceHandle: Awaited<ReturnType<typeof open>> | undefined;
     let rootClient: DarwinDirectoryCapabilityClient | undefined;
@@ -627,7 +663,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     try {
       // Root identity is captured before creating children so child setup cannot replace its authority.
       const capturedRoot = await rootHandle.stat();
-      parentHandle = await open(dirname(this.basePath), this.strictDurability.getStore() ? strictDirectoryFlags : "r");
+      parentHandle = await open(dirname(this.basePath), strict ? strictDirectoryFlags : "r");
       const noFollow = typeof fsConstants.O_NOFOLLOW === "number"
         ? fsConstants.O_NOFOLLOW
         : 0;
@@ -688,18 +724,20 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         rootClient = await DarwinDirectoryCapabilityClient.start(this.basePath, {
           dev: String(heldRoot.dev),
           ino: String(heldRoot.ino),
-        }, this.owner, options.__testDirectoryCapabilityTimeoutMs);
+        }, this.owner, options.__testDirectoryCapabilityTimeoutMs, options.__testDirectoryCapabilityPreload);
         parentClient = await DarwinDirectoryCapabilityClient.start(
           dirname(this.basePath),
           { dev: String(heldParent.dev), ino: String(heldParent.ino) },
           this.owner,
           options.__testDirectoryCapabilityTimeoutMs,
+          options.__testDirectoryCapabilityPreload,
         );
         namespaceClient = await DarwinDirectoryCapabilityClient.start(
           encodedNamespacePath(this.basePath, namespace),
           { dev: String(heldNamespace.dev), ino: String(heldNamespace.ino) },
           this.owner,
           options.__testDirectoryCapabilityTimeoutMs,
+          options.__testDirectoryCapabilityPreload,
         );
         options.__testAfterDirectoryCapabilityAcquired?.(
           rootClient.pid,
@@ -741,7 +779,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           );
         }
       };
-      if (this.strictDurability.getStore()) {
+      if (strict) {
         // Parent authority belongs to the verified held handles, never to paths synced before capture.
         assertLexicalIdentity();
         // Namespace contents remain uncertain until this held namespace descriptor completes its barrier.
@@ -756,7 +794,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       const boundBasePath = host === "linux" ? descriptorRoot : this.basePath;
       operationResult = await this.boundBasePath.run({
         basePath: boundBasePath,
-        strictDurability: this.strictDurability.getStore() === true,
+        strictDurability: strict,
         lockedNamespace: namespace,
         ...(host === "linux" ? { namespaceBasePath: descriptorNamespace } : {}),
         ...(rootClient ? { darwinClient: rootClient } : {}),
@@ -766,6 +804,16 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           this.namespacePath(namespace),
           lockFileName,
           async (lease) => {
+            const authority = { active: true, strict, assertHeld: () => lease.assertHeld() };
+            // A kept strict lease must not reach a closed and possibly reused descriptor or a stopped worker after its callback settles.
+            const leased = <A extends unknown[], R>(method: (...args: A) => Promise<R>): ((...args: A) => Promise<R>) =>
+              strict
+                ? async (...args: A) => {
+                    if (!authority.active) throw new Error("strict lock lease is no longer active");
+                    authority.assertHeld();
+                    return method(...args);
+                  }
+                : method;
             const boundLease = {
               ...lease,
             stableStorageRoot: boundBasePath,
@@ -773,19 +821,19 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
               host === "linux" ? descriptorParent : dirname(this.basePath),
             ...(parentClient
               ? { stableFortressCapability: {
-                  tightenPermissions: () => parentClient!.call("tighten"),
-                  mkdir: (relativePath: string, mode: number) =>
-                    parentClient!.call(this.strictDurability.getStore() ? "mkdirStrict" : "mkdir", [relativePath, mode]),
-                  isFreshExceptLockScaffold: (name: string) =>
-                    parentClient!.call("isFreshExceptLockScaffold", [name]),
-                  writeRecoveryKey: (recoveryKey: string, fortressId?: string) =>
+                  tightenPermissions: leased(() => parentClient!.call("tighten")),
+                  mkdir: leased((relativePath: string, mode: number) =>
+                    parentClient!.call(strict ? "mkdirStrict" : "mkdir", [relativePath, mode])),
+                  isFreshExceptLockScaffold: leased((name: string) =>
+                    parentClient!.call("isFreshExceptLockScaffold", [name])),
+                  writeRecoveryKey: leased((recoveryKey: string, fortressId?: string) =>
                     parentClient!.call(
                       "writeRecoveryKey",
                       fortressId === undefined
                         ? [recoveryKey]
                         : [recoveryKey, fortressId],
-                    ),
-                  provisionPin: async (input: {
+                    )),
+                  provisionPin: leased(async (input: {
                     masterKey: Uint8Array;
                     globalPinnedPublicKeyPath?: string;
                   }): Promise<{
@@ -803,46 +851,46 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
                     } finally {
                       transfer.fill(0);
                     }
-                  },
+                  }),
                 } }
               : {}),
             stableFortressFiles: parentClient
               ? {
-                  read: async (name: string) => {
+                  read: leased(async (name: string) => {
                     const encoded = await parentClient!.call<string | null>("readFile", [name]);
                     return encoded === null
                       ? null
                       : new Uint8Array(Buffer.from(encoded, "base64"));
-                  },
-                  write: (name: string, data: Uint8Array, mode = 0o600) =>
-                    parentClient!.call(this.strictDurability.getStore() ? "writeFileStrict" : "writeFile", [
+                  }),
+                  write: leased((name: string, data: Uint8Array, mode = 0o600) =>
+                    parentClient!.call(strict ? "writeFileStrict" : "writeFile", [
                       name,
                       Buffer.from(data).toString("base64"),
                       mode,
-                    ]),
-                  delete: (name: string) => parentClient!.call("deleteFile", [name]),
-                  restoreFreshLockScaffold: (name: string) =>
-                    parentClient!.call("restoreFreshLockScaffold", [name]),
-                  cleanupFreshInitRecoveryResidue: (name: string) =>
-                    parentClient!.call("cleanupFreshInitRecoveryResidue", [name]),
+                    ])),
+                  delete: leased((name: string) => parentClient!.call<boolean>("deleteFile", [name])),
+                  restoreFreshLockScaffold: leased((name: string) =>
+                    parentClient!.call("restoreFreshLockScaffold", [name])),
+                  cleanupFreshInitRecoveryResidue: leased((name: string) =>
+                    parentClient!.call("cleanupFreshInitRecoveryResidue", [name])),
                 }
               : {
-                  read: async (name: string) => {
+                  read: leased(async (name: string) => {
                     const raw = await readStableFortressFile(descriptorParent, name);
                     return raw === null ? null : new Uint8Array(raw);
-                  },
-                  write: (name: string, data: Uint8Array, mode = 0o600) =>
-                    writeStableFortressFile(descriptorParent, name, data, mode, this.strictDurability.getStore() === true),
-                  delete: (name: string) =>
-                    deleteStableFortressFile(descriptorParent, name),
-                  restoreFreshLockScaffold: (name: string) =>
-                    restoreFreshFortressLockScaffold(descriptorParent, name),
-                  cleanupFreshInitRecoveryResidue: (name: string) =>
+                  }),
+                  write: leased((name: string, data: Uint8Array, mode = 0o600) =>
+                    writeStableFortressFile(descriptorParent, name, data, mode, strict)),
+                  delete: leased((name: string) =>
+                    deleteStableFortressFile(descriptorParent, name)),
+                  restoreFreshLockScaffold: leased((name: string) =>
+                    restoreFreshFortressLockScaffold(descriptorParent, name)),
+                  cleanupFreshInitRecoveryResidue: leased((name: string) =>
                     cleanupFreshInitRecoveryResidue(
                       descriptorParent,
                       name,
                       this.owner?.uid ?? process.getuid!(),
-                    ),
+                    )),
                 },
               assertHeld: () => {
                 lease.assertHeld();
@@ -853,7 +901,6 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
               },
             } satisfies CrossProcessLockLease;
             boundLease.assertHeld();
-            const authority = { active: true, assertHeld: () => lease.assertHeld() };
             let value: T;
             try {
               // Strict mutation authority begins only inside the acquired lock callback and ends when it settles.
@@ -1574,4 +1621,19 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
 
     return total;
   }
+}
+
+/**
+ * Build the Darwin worker executor, whose held cwd stands in for the strict lock.
+ * Must match the only callers, in directory-capability-worker.ts. It is not
+ * re-exported from the storage or package index, so no public construction path
+ * can opt out of the strict lock requirement.
+ */
+export function createDirectoryCapabilityWorkerStorage(
+  basePath: string,
+  owner?: { uid: number; gid: number },
+): FilesystemStorage {
+  const storage = new FilesystemStorage(basePath, owner ? { owner } : {});
+  directoryCapabilityWorkerExecutors.add(storage);
+  return storage;
 }

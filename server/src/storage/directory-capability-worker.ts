@@ -14,7 +14,8 @@ import { Writable } from "node:stream";
 import { isAbsolute, join, normalize, sep } from "node:path";
 
 import { storageNamespacePathComponent } from "./namespace-component.js";
-import { FilesystemStorage, serializeCapabilityError } from "./filesystem.js";
+// Must match createDirectoryCapabilityWorkerStorage in filesystem.ts, the only construction path for the worker exemption.
+import { createDirectoryCapabilityWorkerStorage, type FilesystemStorage, serializeCapabilityError } from "./filesystem.js";
 import {
   cleanupFreshInitRecoveryResidue,
   isFreshFortressOrExactLockScaffold,
@@ -114,7 +115,6 @@ async function mkdirRelative(relativePath: string, mode: number, strictDurabilit
         });
       }
     }
-
   }
 }
 
@@ -124,7 +124,7 @@ function strictWriteTarget(storage: FilesystemStorage, owner: { uid: number; gid
   // Must match the original-buffer authorization before strict worker dispatch in filesystem.ts.
   // The private IPC executor preserves parent-authorized bytes without reauthorizing a decoded buffer.
   return {
-    storage: new FilesystemStorage(storageNamespacePathComponent(parsed.namespace), { owner, allowDirectoryCapabilityRootNamespace: true }),
+    storage: createDirectoryCapabilityWorkerStorage(storageNamespacePathComponent(parsed.namespace), owner),
     namespace: DARWIN_BOUND_NAMESPACE_TOKEN,
     args: parsed.args,
   };
@@ -352,10 +352,7 @@ async function main(): Promise<void> {
   if (owner && (!Number.isSafeInteger(owner.uid) || !Number.isSafeInteger(owner.gid))) {
     throw new Error("invalid directory-capability owner identity");
   }
-  const storage = new FilesystemStorage(".", {
-    ...(owner ? { owner } : {}),
-    allowDirectoryCapabilityRootNamespace: true,
-  });
+  const storage = createDirectoryCapabilityWorkerStorage(".", owner);
   process.on("message", (raw: Request) => {
     void (async () => {
       try {

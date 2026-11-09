@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rename, stat, mkdir, realpath, symlink, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, rename, stat, mkdir, open, realpath, symlink, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
 import { runInNewContext } from "node:vm";
@@ -166,6 +166,8 @@ const strictWrite = (namespace: string, key: string, data: Uint8Array): Promise<
 const strictCreate = (namespace: string, key: string, data: Uint8Array): Promise<boolean> => boundOperation(() => storage.writeIfAbsentStrict(namespace, key, data));
 const strictReplace = (namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean> => boundOperation(() => storage.replaceIfEqualsStrict(namespace, key, expected, data));
 const strictMethod = (method: "writeStrict" | "writeIfAbsentStrict", namespace: string, key: string, data: Uint8Array) => method === "writeStrict" ? strictWrite(namespace, key, data) : strictCreate(namespace, key, data);
+// Strict mutations stay in this process only on Linux; on Darwin they run in the forked worker, which this file's vi.mock never reaches.
+const inProcessStrictPath = it.runIf(process.platform === "linux");
 
 function requireStrict(): void {
   // An old tree fails this loaded assertion rather than failing collection or calling an absent method.
@@ -220,7 +222,7 @@ describe("strict file and directory barriers", () => {
     })).rejects.toMatchObject({ errors: [{ code: "EINVAL" }, { code: "EIO" }] });
   });
 
-  it("successful readback does not excuse a post-publication directory failure", async () => {
+  inProcessStrictPath("successful readback does not excuse a post-publication directory failure", async () => {
     requireStrict();
     faults.path = join(root, NS);
     faults.afterFile = true;
@@ -265,7 +267,7 @@ describe("strict file and directory barriers", () => {
   });
 
   for (const operation of ["create", "replace"] as const) {
-    it(`${operation} propagates directory failure after a file barrier`, async () => {
+    inProcessStrictPath(`${operation} propagates directory failure after a file barrier`, async () => {
       requireStrict();
       if (operation === "replace") await strictWrite(NS, "key", DATA);
       faults.fileSynced = false;
@@ -357,17 +359,17 @@ describe("strict file and directory barriers", () => {
 });
 
 describe("strict completion witnesses", () => {
-  it("preserves file sync and close failures together", async () => {
+  inProcessStrictPath("preserves file sync and close failures together", async () => {
     faults.path = "FILE";
     faults.fileClose = true;
     await expect(strictWrite(NS, "key", DATA)).rejects.toMatchObject({ errors: [{ code: "EINVAL" }, { code: "EBADF" }] });
   });
-  it("refuses a file close failure after successful sync", async () => {
+  inProcessStrictPath("refuses a file close failure after successful sync", async () => {
     faults.fileClose = true;
     await expect(strictWrite(NS, "key", DATA)).rejects.toMatchObject({ code: "EBADF" });
   });
   for (const cleanup of ["ENOENT", "EIO", "sync"]) {
-    it(`preserves publication failure through cleanup ${cleanup}`, async () => {
+    inProcessStrictPath(`preserves publication failure through cleanup ${cleanup}`, async () => {
       faults.linkError = true;
       faults.cleanupError = cleanup;
       const failure = await strictCreate(NS, "key", DATA).catch(error => error);
@@ -419,7 +421,7 @@ it("refuses a directory replaced during barrier capture", async () => {
   faults.swapOnOpen = directory;
   await expect(syncDirectoryStrict(directory)).rejects.toThrow(/identity changed/);
 });
-it("refuses a publishing directory replaced after rename", async () => {
+inProcessStrictPath("refuses a publishing directory replaced after rename", async () => {
   await mkdir(join(root, NS), { mode: 0o700 });
   faults.swapOnPublish = join(root, NS);
   await expect(strictWrite(NS, "key", DATA)).rejects.toThrow(/changed/);
@@ -481,7 +483,7 @@ it("internal custody durability choice is required", async () => {
   expect(source).toContain("options: WriteFileCustodyOptions & { strictDurability: boolean }");
 });
 
-it("cleans a staged publication after its directory barrier fails", async () => {
+inProcessStrictPath("cleans a staged publication after its directory barrier fails", async () => {
   faults.path = join(root, NS);
   faults.afterFile = true;
   faults.once = true;
@@ -494,7 +496,7 @@ it("successful exclusive publication tolerates an absent staging name", async ()
   expect(await strictCreate(NS, "key", DATA)).toBe(true);
   expect(Buffer.from((await storage.read(NS, "key"))!)).toEqual(DATA);
 });
-it("absent staging still performs the final directory barrier", async () => {
+inProcessStrictPath("absent staging still performs the final directory barrier", async () => {
   faults.cleanupError = "ENOENT";
   faults.syncAfterAbsent = true;
   await expect(strictCreate(NS, "key", DATA)).rejects.toMatchObject({ code: "EINVAL" });
@@ -547,21 +549,21 @@ describe("strict authority closure", () => {
       expect(faults.events.filter(event => event.directory).map(event => event.path)).toContain(path);
     }
   });
-  it("comparison revalidates its parent after taking the path lock", async () => {
+  inProcessStrictPath("comparison revalidates its parent after taking the path lock", async () => {
     const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".lock", async () => {
       faults.swapCompare = join(root, "other");
       await expect(storage.replaceIfEqualsStrict("other", "absent", DATA, NEXT)).rejects.toThrow(/identity changed/);
     }, { runtimeRoot });
   });
-  it("exclusive publication retains the custody descriptor identity", async () => {
+  inProcessStrictPath("exclusive publication retains the custody descriptor identity", async () => {
     const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".lock", async () => {
       faults.swapAfterCustody = join(root, "other");
       await expect(storage.writeIfAbsentStrict("other", "key", DATA)).rejects.toThrow(/identity changed|publication and cleanup/);
     }, { runtimeRoot });
   });
-  it("comparison cleanup retains the primary strict error", async () => {
+  inProcessStrictPath("comparison cleanup retains the primary strict error", async () => {
     const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
     await storage.withStrictNamespaceLock(NS, ".lock", async () => {
       await storage.writeStrict(NS, "key", DATA);
@@ -639,7 +641,9 @@ it("continuing strict operations cover both namespaces and every comparison resu
 
 it.runIf(process.platform === "darwin")("Darwin worker preserves combined sync and close error codes", async () => {
   const identity = await stat(root);
+  // The worker imports named bindings, which see a patched default export only after syncBuiltinESMExports.
   const preload = `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 const original = fs.open;
 fs.open = async (...args) => {
   const handle = await original(...args);
@@ -649,7 +653,8 @@ fs.open = async (...args) => {
     handle.close = async () => { await close(); throw Object.assign(new Error("injected file close"), { code: "EBADF" }); };
   }
   return handle;
-};`;
+};
+syncBuiltinESMExports();`;
   const worker = fork(fileURLToPath(new URL("../../src/storage/directory-capability-worker.ts", import.meta.url)), [String(identity.dev), String(identity.ino)], {
     cwd: root, execArgv: ["--import", import.meta.resolve("tsx"), "--import", `data:text/javascript,${encodeURIComponent(preload)}`], stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
@@ -681,4 +686,308 @@ it("strict authority refuses mutations before the lock callback acquires its lea
   }, { runtimeRoot });
   expect(observed).toBe(true);
   expect(await storage.read(NS, "early")).toBeNull();
+});
+
+/** Faults the Darwin worker preload injects; must match __testDirectoryCapabilityPreload in filesystem.ts. */
+interface WorkerFaults {
+  fileSync?: string;
+  fileClose?: string;
+  directoryIno?: number;
+  directoryCode?: string;
+  directoryAfterFile?: boolean;
+  directoryOnce?: boolean;
+  directoryArmedBy?: "link" | "absentCleanup";
+  linkCode?: string;
+  claimCleanup?: "ENOENT" | "EIO";
+  swapOnPublish?: string;
+  swapOnCompareLock?: string;
+  swapAfterClaim?: string;
+  compareCleanup?: string;
+}
+
+/**
+ * Build a module the worker imports before it runs. It patches the default
+ * export of node:fs/promises and then calls syncBuiltinESMExports, because the
+ * worker and custody modules import named bindings that never see a default
+ * export patch otherwise. Directories are matched by inode, since each worker's
+ * paths are relative to its own held cwd.
+ */
+function workerFaultPreload(faults: WorkerFaults): string {
+  const source = `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const faults = ${JSON.stringify(faults)};
+const original = { open: fs.open, rename: fs.rename, link: fs.link, unlink: fs.unlink, rm: fs.rm, mkdir: fs.mkdir, readdir: fs.readdir };
+const state = { fileSynced: false, armed: faults.directoryArmedBy === undefined, claimed: false, fired: false };
+const injected = (code, message) => Object.assign(new Error(message), { code });
+async function swap(directory, moveEntries) {
+  await original.rename(directory, directory + "-held");
+  await original.mkdir(directory);
+  if (moveEntries) for (const name of await original.readdir(directory + "-held")) await original.rename(directory + "-held/" + name, directory + "/" + name);
+}
+fs.rename = async (...args) => {
+  await original.rename(...args);
+  if (String(args[1]).endsWith(".claim")) state.claimed = true;
+  if (faults.swapOnPublish && String(args[1]).endsWith(".enc")) { const directory = faults.swapOnPublish; faults.swapOnPublish = ""; await swap(directory, false); }
+};
+fs.link = async (...args) => {
+  if (faults.directoryArmedBy === "link") state.armed = true;
+  if (faults.linkCode) throw injected(faults.linkCode, "injected publication failure");
+  return original.link(...args);
+};
+fs.unlink = async (...args) => {
+  if (faults.claimCleanup && String(args[0]).endsWith(".claim")) {
+    if (faults.claimCleanup === "ENOENT") {
+      await original.unlink(...args);
+      if (faults.directoryArmedBy === "absentCleanup") state.armed = true;
+    }
+    throw injected(faults.claimCleanup, "injected cleanup failure");
+  }
+  return original.unlink(...args);
+};
+fs.rm = async (...args) => {
+  if (faults.compareCleanup && String(args[0]).endsWith(".compare-replace.lock")) throw injected(faults.compareCleanup, "injected comparison cleanup failure");
+  return original.rm(...args);
+};
+fs.open = async (...args) => {
+  const handle = await original.open(...args);
+  const path = String(args[0]);
+  if (faults.swapOnCompareLock && path.endsWith(".compare-replace.lock")) { const directory = faults.swapOnCompareLock; faults.swapOnCompareLock = ""; await swap(directory, false); }
+  const directory = (await handle.stat()).isDirectory();
+  const stagedFile = !directory && path.endsWith(".tmp");
+  const sync = handle.sync.bind(handle);
+  const close = handle.close.bind(handle);
+  handle.sync = async () => {
+    if (stagedFile) {
+      if (faults.fileSync) throw injected(faults.fileSync, "injected file barrier failure");
+      await sync();
+      state.fileSynced = true;
+      return;
+    }
+    if (directory && faults.directoryIno !== undefined && state.armed && (!faults.directoryAfterFile || state.fileSynced) &&
+        !(faults.directoryOnce && state.fired) && (await handle.stat()).ino === faults.directoryIno) {
+      state.fired = true;
+      throw injected(faults.directoryCode, "injected directory barrier failure");
+    }
+    return sync();
+  };
+  handle.close = async () => {
+    await close();
+    if (directory && faults.swapAfterClaim && state.claimed) { const directory = faults.swapAfterClaim; faults.swapAfterClaim = ""; await swap(directory, true); }
+    if (stagedFile && faults.fileClose) throw injected(faults.fileClose, "injected file close failure");
+  };
+  return handle;
+};
+syncBuiltinESMExports();
+`;
+  return `data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+const darwinWorkerPath = it.runIf(process.platform === "darwin");
+async function inWorkerLock<T>(faults: WorkerFaults | undefined, operation: () => Promise<T>, target: FilesystemStorage = storage): Promise<T> {
+  const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+  return target.withStrictNamespaceLock(NS, ".strict.lock", operation, {
+    runtimeRoot,
+    ...(faults ? { __testDirectoryCapabilityPreload: workerFaultPreload(faults) } : {}),
+  });
+}
+async function namespaceInode(namespace = NS): Promise<number> {
+  await mkdir(join(root, namespace), { recursive: true, mode: 0o700 });
+  return (await stat(join(root, namespace))).ino;
+}
+
+describe("Darwin worker barrier witnesses", () => {
+  darwinWorkerPath("worker: successful readback does not excuse a post-publication directory failure", async () => {
+    const directoryIno = await namespaceInode();
+    await inWorkerLock({ directoryIno, directoryCode: "EINVAL", directoryAfterFile: true }, async () => {
+      await expect(storage.writeStrict(NS, "key", DATA)).rejects.toMatchObject({ code: "EINVAL" });
+    });
+    expect(Buffer.from((await storage.read(NS, "key"))!)).toEqual(DATA);
+  });
+  darwinWorkerPath("worker: create propagates directory failure after a file barrier", async () => {
+    const directoryIno = await namespaceInode();
+    await inWorkerLock({ directoryIno, directoryCode: "EINVAL", directoryAfterFile: true }, async () => {
+      await expect(storage.writeIfAbsentStrict(NS, "key", DATA)).rejects.toMatchObject({ errors: [{ code: "EINVAL" }, { code: "EINVAL" }] });
+    });
+    expect(await storage.read(NS, "key")).toBeNull();
+  });
+  darwinWorkerPath("worker: replace propagates directory failure after a file barrier", async () => {
+    const directoryIno = await namespaceInode();
+    await inWorkerLock(undefined, () => storage.writeStrict(NS, "key", DATA));
+    await inWorkerLock({ directoryIno, directoryCode: "EINVAL", directoryAfterFile: true, directoryOnce: true }, async () => {
+      await expect(storage.replaceIfEqualsStrict(NS, "key", DATA, NEXT)).rejects.toMatchObject({ code: "EINVAL" });
+    });
+  });
+  darwinWorkerPath("worker: preserves file sync and close failures together", async () => {
+    await inWorkerLock({ fileSync: "EINVAL", fileClose: "EBADF" }, async () => {
+      await expect(storage.writeStrict(NS, "key", DATA)).rejects.toMatchObject({ errors: [{ code: "EINVAL" }, { code: "EBADF" }] });
+    });
+  });
+  darwinWorkerPath("worker: refuses a file close failure after successful sync", async () => {
+    await inWorkerLock({ fileClose: "EBADF" }, async () => {
+      await expect(storage.writeStrict(NS, "key", DATA)).rejects.toMatchObject({ code: "EBADF" });
+    });
+  });
+  darwinWorkerPath("worker: preserves publication failure through cleanup ENOENT", async () => {
+    await inWorkerLock({ linkCode: "EPERM", claimCleanup: "ENOENT" }, async () => {
+      await expect(storage.writeIfAbsentStrict(NS, "key", DATA)).rejects.toMatchObject({ code: "EPERM" });
+    });
+  });
+  darwinWorkerPath("worker: preserves publication failure through cleanup EIO", async () => {
+    await inWorkerLock({ linkCode: "EPERM", claimCleanup: "EIO" }, async () => {
+      await expect(storage.writeIfAbsentStrict(NS, "key", DATA)).rejects.toMatchObject({ errors: [{ code: "EPERM" }, { code: "EIO" }] });
+    });
+  });
+  darwinWorkerPath("worker: preserves publication failure through cleanup sync", async () => {
+    const directoryIno = await namespaceInode();
+    await inWorkerLock({ linkCode: "EPERM", directoryIno, directoryCode: "EINVAL", directoryArmedBy: "link" }, async () => {
+      await expect(storage.writeIfAbsentStrict(NS, "key", DATA)).rejects.toMatchObject({ errors: [{ code: "EPERM" }, { code: "EINVAL" }] });
+    });
+  });
+  darwinWorkerPath("worker: refuses a publishing directory replaced after rename", async () => {
+    await inWorkerLock({ swapOnPublish: join(root, "other") }, async () => {
+      await expect(storage.writeStrict("other", "key", DATA)).rejects.toThrow(/changed/);
+    });
+    expect(await readFile(join(root, "other-held", "key.enc"))).toEqual(DATA);
+  });
+  darwinWorkerPath("worker: cleans a staged publication after its directory barrier fails", async () => {
+    const directoryIno = await namespaceInode();
+    await inWorkerLock({ directoryIno, directoryCode: "EINVAL", directoryAfterFile: true, directoryOnce: true }, async () => {
+      await expect(storage.writeIfAbsentStrict(NS, "key", DATA)).rejects.toMatchObject({ code: "EINVAL" });
+    });
+    expect((await readdir(join(root, NS))).filter(name => name.endsWith(".claim"))).toEqual([]);
+  });
+  darwinWorkerPath("worker: absent staging still performs the final directory barrier", async () => {
+    const directoryIno = await namespaceInode();
+    await inWorkerLock({ claimCleanup: "ENOENT", directoryIno, directoryCode: "EINVAL", directoryArmedBy: "absentCleanup" }, async () => {
+      await expect(storage.writeIfAbsentStrict(NS, "key", DATA)).rejects.toMatchObject({ code: "EINVAL" });
+    });
+    expect(Buffer.from((await storage.read(NS, "key"))!)).toEqual(DATA);
+  });
+  darwinWorkerPath("worker: successful exclusive publication tolerates an absent staging name", async () => {
+    await inWorkerLock({ claimCleanup: "ENOENT" }, async () => {
+      expect(await storage.writeIfAbsentStrict(NS, "key", DATA)).toBe(true);
+    });
+    expect(Buffer.from((await storage.read(NS, "key"))!)).toEqual(DATA);
+  });
+  darwinWorkerPath("worker: comparison revalidates its parent after taking the path lock", async () => {
+    await inWorkerLock({ swapOnCompareLock: join(root, "other") }, async () => {
+      await expect(storage.replaceIfEqualsStrict("other", "absent", DATA, NEXT)).rejects.toThrow(/identity changed/);
+    });
+  });
+  darwinWorkerPath("worker: exclusive publication retains the custody descriptor identity", async () => {
+    await inWorkerLock({ swapAfterClaim: join(root, "other") }, async () => {
+      await expect(storage.writeIfAbsentStrict("other", "key", DATA)).rejects.toThrow(/identity changed|publication and cleanup/);
+    });
+  });
+  darwinWorkerPath("worker: comparison cleanup retains the primary strict error", async () => {
+    await inWorkerLock(undefined, () => storage.writeStrict(NS, "key", DATA));
+    await inWorkerLock({ fileSync: "EINVAL", compareCleanup: "EBUSY" }, async () => {
+      await expect(storage.replaceIfEqualsStrict(NS, "key", DATA, NEXT)).rejects.toMatchObject({ errors: [{ code: "EINVAL" }, { code: "EBUSY" }] });
+    });
+  });
+});
+
+describe("strict owner barriers, worker exemption, lease and nesting", () => {
+  const owner = (): { uid: number; gid: number } => ({ uid: process.getuid!(), gid: process.getgid!() });
+
+  inProcessStrictPath("owner-mode strict write syncs the root for a namespace created after acquisition", async () => {
+    const ownerStorage = new FilesystemStorage(root, { owner: owner() });
+    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    await ownerStorage.withStrictNamespaceLock("locked", ".strict.lock", async () => {
+      await new FilesystemStorage(root).write("later", "seed", DATA);
+      faults.path = root;
+      try {
+        await expect(ownerStorage.writeStrict("later", "key", DATA)).rejects.toMatchObject({ code: "EINVAL" });
+      } finally { faults.path = ""; }
+    }, { runtimeRoot });
+  });
+  darwinWorkerPath("worker: owner-mode strict write syncs the root for a namespace created after acquisition", async () => {
+    const ownerStorage = new FilesystemStorage(root, { owner: owner() });
+    await mkdir(join(root, NS), { mode: 0o700 });
+    const rootIno = (await stat(root)).ino;
+    await inWorkerLock({ directoryIno: rootIno, directoryCode: "EIO" }, async () => {
+      await new FilesystemStorage(root).write("later", "seed", DATA);
+      await expect(ownerStorage.writeStrict("later", "key", DATA)).rejects.toMatchObject({ code: "EIO" });
+    }, ownerStorage);
+  });
+
+  it("the public constructor cannot set the worker executor exemption", async () => {
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const exemptOptions = { allowDirectoryCapabilityRootNamespace: true } as unknown as ConstructorParameters<typeof FilesystemStorage>[1];
+      const exempt = new FilesystemStorage(join(root, "state"), exemptOptions);
+      await expect(exempt.writeStrict(NS, "key", DATA)).rejects.toThrow(/strict namespace binding/);
+      expect(await readdir(root)).toEqual([]);
+    } finally { process.chdir(originalCwd); }
+    for (const index of ["../../src/index.ts", "../../src/storage/index.ts"]) {
+      const source = await readFile(new URL(index, import.meta.url), "utf8");
+      expect(source, `${index} must not re-export the worker factory`).not.toContain("createDirectoryCapabilityWorkerStorage");
+    }
+  });
+
+  it.runIf(process.platform === "linux" || process.platform === "darwin")("a kept strict lease refuses every method after its callback settles", async () => {
+    storage = new FilesystemStorage(join(root, "state"));
+    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    let kept: lockModule.CrossProcessLockLease | undefined;
+    await storage.withStrictNamespaceLock(NS, ".strict.lock", async lease => { kept = lease; }, { runtimeRoot });
+    const decoy = join(root, "decoy");
+    await mkdir(decoy);
+    const held: Array<Awaited<ReturnType<typeof open>>> = [];
+    try {
+      // A Linux lease names its parent by descriptor number, so open the lowest free descriptors until that number points at the decoy.
+      const parentDescriptor = /^\/proc\/self\/fd\/(\d+)$/.exec(String(kept!.stableStorageParent))?.[1];
+      // Bound on descriptors opened while searching for reuse; one settlement frees far fewer than this.
+      const DECOY_DESCRIPTOR_LIMIT = 64;
+      while (parentDescriptor !== undefined && held.length < DECOY_DESCRIPTOR_LIMIT) {
+        const handle = await open(decoy, "r");
+        held.push(handle);
+        if (String(handle.fd) === parentDescriptor) break;
+      }
+      const methods = [
+        ...Object.entries(kept!.stableFortressFiles ?? {}),
+        ...Object.entries(kept!.stableFortressCapability ?? {}),
+      ] as Array<[string, (...args: unknown[]) => Promise<unknown>]>;
+      expect(methods.length).toBeGreaterThan(0);
+      for (const [name, method] of methods) {
+        await expect(method("leak", DATA), name).rejects.toThrow(/strict lock lease is no longer active/);
+      }
+    } finally {
+      for (const handle of held) await handle.close();
+    }
+    expect(await readdir(decoy)).toEqual([]);
+    expect(await readdir(root)).not.toContain("leak");
+  });
+
+  it.runIf(process.platform === "linux" || process.platform === "darwin")("a public lock nested in a strict callback does not inherit strict mode", async () => {
+    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const nestedRuntimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    await storage.withStrictNamespaceLock(NS, ".strict.lock", async () => {
+      await storage.withNamespaceLock("nested", ".nested.lock", async () => {
+        await expect(storage.writeStrict("nested", "key", DATA)).rejects.toThrow(/strict namespace binding/);
+      }, { runtimeRoot: nestedRuntimeRoot, kernelBacked: true });
+    }, { runtimeRoot });
+    expect(await storage.read("nested", "key")).toBeNull();
+  });
+
+  it.runIf(process.platform === "linux" || process.platform === "darwin")("a lock nested in strict authority discards test hooks outside the test environment", async () => {
+    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const nestedRuntimeRoot = await realpath(await mkdtemp(join(tmpdir(), "s1r-")));
+    const calls: string[] = [];
+    await storage.withStrictNamespaceLock(NS, ".strict.lock", async () => {
+      const previous = process.env.VITEST;
+      let nested: Promise<unknown>;
+      // Option sanitizing happens synchronously at entry, so the test environment is hidden only for that call.
+      delete process.env.VITEST;
+      try {
+        nested = storage.withNamespaceLock("nested", ".nested.lock", async () => undefined, {
+          runtimeRoot: nestedRuntimeRoot,
+          kernelBacked: true,
+          __testCloseNamespaceCapability: async (kind, close) => { calls.push(kind); await close(); },
+        });
+      } finally { process.env.VITEST = previous; }
+      await nested;
+    }, { runtimeRoot });
+    expect(calls).toEqual([]);
+  });
 });

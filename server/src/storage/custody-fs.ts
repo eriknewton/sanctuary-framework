@@ -443,6 +443,14 @@ export async function syncDirectoryStrict(dir: string, expected?: Stats): Promis
 
 /** Capture and sync every directory from the held boundary through the leaf on every attempt. */
 export async function ensureDirectoryStrict(dir: string, mode: number, base: string): Promise<Stats> {
+  return syncDirectoryChainStrict(dir, base, mode);
+}
+
+/**
+ * Capture and sync the chain from the held boundary through the leaf on every attempt.
+ * An undefined `createMode` creates nothing, so a missing component refuses instead of being made.
+ */
+async function syncDirectoryChainStrict(dir: string, base: string, createMode: number | undefined): Promise<Stats> {
   const suffix = relative(base, dir);
   // The boundary limits creation and retries to directories covered by the caller's held authority.
   if (suffix.split(sep).includes("..")) throw new Error("strict directory escapes its held boundary");
@@ -454,8 +462,10 @@ export async function ensureDirectoryStrict(dir: string, mode: number, base: str
     for (const part of ["", ...suffix.split(sep).filter(Boolean)]) {
       if (part) {
         cursor = join(cursor, part);
-        try { await mkdir(cursor, { mode }); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        if (createMode !== undefined) {
+          try { await mkdir(cursor, { mode: createMode }); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        }
       }
       const path = /^\/(?:proc\/self\/fd|dev\/fd)\/\d+$/.test(cursor) ? `${cursor}/.` : cursor;
       const handle = await openExistingDirectoryNoFollow(path);
@@ -849,6 +859,10 @@ export async function writeFileCustodyWithDurability(
         } else {
           await mkdir(dir, { recursive: true, mode: options.parentMode ?? 0o700 });
         }
+      } else if (options.strictDurability && options.createParent !== false) {
+        // Owner writes may not create parents, yet a namespace made after the lock's root barrier still needs its own entry barrier.
+        if (!options.strictDirectoryBase) throw new Error("strict owner write requires a held boundary");
+        publishedDirectory = await syncDirectoryChainStrict(dir, options.strictDirectoryBase, undefined);
       }
       if (options.strictDurability && ownerGuard) {
         // Owner writes cannot skip uncertain parent barriers merely because creation is forbidden.
