@@ -3,15 +3,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 // Must match linux-business/activation-anchor.ts, including every field and operation.
 pub const MAX_BYTES: usize = 65536;
-pub const OPS: &[&str] = &[
-    "READ",
-    "PREPARE",
-    "COMMIT",
-    "RESERVE",
-    "DRAIN",
-    "LATCH",
-    "RECOVERY_COMMIT",
-];
+pub use super::protocol_transitions::ANCHOR_OPS as OPS;
 const SAFE_INTEGER: u64 = 9007199254740991; // Largest exact JavaScript integer.
 const FIELDS: &[&str] = &[
     "version",
@@ -153,14 +145,20 @@ pub fn propose(old: &Value, message: &Value) -> Option<Value> {
     if !valid(old) || old != &m["expected"] {
         return None;
     }
+    // A recovery latch freezes the observed tail and transaction until the named recovery path proves completion.
+    // Must match LATCH_DENIED_OPS in activation-anchor.ts and the generated protocol rule.
+    if old["recovery_required"] == true
+        && super::protocol_transitions::LATCH_DENIED_OPS.contains(&m["op"].as_str()?)
+    {
+        return None;
+    }
     if m["op"] == "READ" {
         return Some(old.clone());
     }
     let next = &m["next"];
     let changed: &[&str] = match m["op"].as_str()? {
         "RESERVE" => {
-            if old["recovery_required"] == true
-                || old["retired"] == true
+            if old["retired"] == true
                 || !old["transaction_id"].is_null()
                 || old["reserved_sequence"] != old["committed_sequence"]
                 || n(next, "reserved_sequence") != n(old, "reserved_sequence") + 1
@@ -171,7 +169,8 @@ pub fn propose(old: &Value, message: &Value) -> Option<Value> {
         }
         "COMMIT" => {
             if !old["transaction_id"].is_null() {
-                if !next["transaction_id"].is_null() {
+                // The prepared request owns custody completion, so another request cannot settle it.
+                if m["request_id"] != old["transaction_id"] || !next["transaction_id"].is_null() {
                     return None;
                 }
                 &["transaction_id"]
@@ -197,8 +196,7 @@ pub fn propose(old: &Value, message: &Value) -> Option<Value> {
             &["drained_sequence", "drained_digest"]
         }
         "PREPARE" => {
-            if old["recovery_required"] == true
-                || old["retired"] == true
+            if old["retired"] == true
                 || !old["transaction_id"].is_null()
                 || old["reserved_sequence"] != old["committed_sequence"]
                 || n(next, "enrollment_revision") != n(old, "enrollment_revision") + 1
@@ -221,6 +219,35 @@ pub fn propose(old: &Value, message: &Value) -> Option<Value> {
                 return None;
             }
             &["recovery_required", "recovery_reason", "recovery_revision"]
+        }
+        "ADVANCE_GENERATION" | "ADVANCE_ACTIVATION" | "ADVANCE_BOOT" => {
+            // New grant identities require a settled tail and increasing generation to prevent reuse.
+            if old["retired"] == true
+                || !old["transaction_id"].is_null()
+                || old["reserved_sequence"] != old["committed_sequence"]
+                || old["drained_sequence"] != old["committed_sequence"]
+                || old["drained_digest"] != old["committed_digest"]
+                || n(next, "generation_high_water") != n(old, "generation_high_water") + 1
+            {
+                return None;
+            }
+            match m["op"].as_str()? {
+                "ADVANCE_ACTIVATION" => {
+                    // An activation advance changes its identity so a replay cannot claim a new boundary.
+                    if next["activation_id"] == old["activation_id"] {
+                        return None;
+                    }
+                    &["generation_high_water", "activation_id"]
+                }
+                "ADVANCE_BOOT" => {
+                    // A boot advance changes its identity so a replay cannot claim a new boundary.
+                    if next["boot_id"] == old["boot_id"] {
+                        return None;
+                    }
+                    &["generation_high_water", "boot_id"]
+                }
+                _ => &["generation_high_water"],
+            }
         }
         // Installed recovery evidence has no constructor here, so this codec cannot clear a latch.
         _ => return None,
@@ -252,5 +279,8 @@ pub fn reconcile(
         && custody["recovery_required"] == false
         && custody["retired"] == false
         && custody["transaction_id"].is_null()
+        // A matching custody copy cannot certify records that the drain has not acknowledged.
+        && drain["drained_sequence"] == drain["committed_sequence"]
+        && drain["drained_digest"] == drain["committed_digest"]
         && drain["reserved_sequence"] == drain["committed_sequence"]
 }

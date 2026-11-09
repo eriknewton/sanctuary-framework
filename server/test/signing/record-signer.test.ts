@@ -12,7 +12,7 @@ import { INTERNAL_SIGNING_DOMAIN_PREFIXES } from "../../src/core/signing-domains
 import {encodeSignerFrame} from "../../src/linux-business/producer-custody.js";
 import { decrypt } from "../../src/core/encryption.js";
 
-const schema = z.object({count: safeInteger}).strict();
+const schema = contract.INERT_PAYLOAD_SCHEMA;
 function fixture(role = ROLE_REGISTRY[0].role as typeof ROLE_REGISTRY[number]["role"]) {
   const key = randomBytes(32);
   const {storedIdentity, pin} = prepareRoleIdentity(role, 1, "a".repeat(32), key, [], []);

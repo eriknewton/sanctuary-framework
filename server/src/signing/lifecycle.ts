@@ -1,11 +1,21 @@
 import { refuse } from "./contract.js";
 import protocol from "./protocol-transitions.json";
+import {CUSTODY_STATE_NAMES} from "./linux-business-records.js";
 
 // Must match protocol-transitions.json and generated business_profile/protocol_transitions.rs in their entirety.
-export const CUSTODY_STATES = Object.freeze(protocol.states);
+export const CUSTODY_STATES = Object.freeze(CUSTODY_STATE_NAMES);
 export type CustodyState = typeof CUSTODY_STATES[number];
 /** Pure relation only; these guard names are not installed evidence or signing authority. */
-export const ALLOWED_TRANSITIONS = Object.freeze(protocol.rows.map(row => Object.freeze(row)));
+function custodyState(value: string): CustodyState {
+  // Must match generated CUSTODY_STATE_NAMES: a relation row cannot widen the destination type beyond named states.
+  if (!(CUSTODY_STATES as readonly string[]).includes(value)) return refuse();
+  return value as CustodyState;
+}
+export const ALLOWED_TRANSITIONS = Object.freeze(protocol.rows.map(row => {
+  const {cleanup_destination, ...rest} = row;
+  return Object.freeze({...rest, from: custodyState(row.from), to: custodyState(row.to),
+    ...(cleanup_destination ? {cleanup_destination: custodyState(cleanup_destination)} : {})});
+}));
 /** A granted transition: the next state and, for a LOCKING entry, the named state cleanup must settle into. */
 export interface TransitionResult { readonly to: CustodyState; readonly cleanup_destination: CustodyState | null; }
 export function transition(from: string, event: string, guard = "ALWAYS"): TransitionResult {

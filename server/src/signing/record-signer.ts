@@ -9,6 +9,7 @@ export interface InstalledBusiness { readonly [installedBusiness]: never; }
 
 /** Exact-message provider, never a digest or caller-selected domain service. */
 export interface ExactMessageProvider { sign(message: Uint8Array): Uint8Array; }
+// Must match records.rs verify: the grant binds activation, lease and generation to the enrolled subject.
 export interface SigningGrant extends RolePin {
   readonly activation_id: string; readonly lease_id: string; readonly generation: number;
 }
@@ -35,7 +36,7 @@ export function createRecordSigner(grant: SigningGrant, provider: ExactMessagePr
         checkEnvelopeSize(pin.role, body, preimage);
         // The signer adds the fixed role domain so a caller cannot substitute a digest or another protocol's message.
         const signature = Buffer.from(provider.sign(recordMessage(pin.role, preimage))).toString("base64url");
-        if (!verifyRecord(preimage, signature, pin, payloadSchema, recordKind)) return refuse();
+        if (!verifyRecord(preimage, signature, pin, pin.role === ROLE_REGISTRY[0].role && recordKind === "counter" ? INERT_PAYLOAD_SCHEMA : payloadSchema, recordKind)) return refuse();
         return {signature, kid: pin.kid};
       } catch { return refuse(); }
     },

@@ -198,5 +198,20 @@
       "to": "RETIRED",
       "guard": "ALWAYS"
     }
-  ]
+  ],
+  "anchor": {
+    "ops": [
+      "READ",
+      "PREPARE",
+      "COMMIT",
+      "RESERVE",
+      "DRAIN",
+      "LATCH",
+      "RECOVERY_COMMIT",
+      "ADVANCE_GENERATION",
+      "ADVANCE_ACTIVATION",
+      "ADVANCE_BOOT"
+    ],
+    "recovery_op": "RECOVERY_COMMIT"
+  }
 }

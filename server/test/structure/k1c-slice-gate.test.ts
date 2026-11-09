@@ -44,10 +44,12 @@ const expectedImports={
   ],
   "signing/lifecycle.ts": [
     "./contract.js",
+    "./linux-business-records.js",
     "./protocol-transitions.json"
   ],
   "linux-business/activation-anchor.ts": [
     "../signing/contract.js",
+    "../signing/protocol-transitions.json",
     "../smb/parse-strict.js",
     "node:crypto",
     "zod"
@@ -126,7 +128,42 @@ it("pins native crash settlement bytes and excludes classifier paths from all li
   const roots=files.filter(n=>n.startsWith("cli/")||n.startsWith("wrap/")||!n.includes("/")||n.startsWith("mcp/")||n==="signing/worker.ts");
   const seen=new Set<string>();
   const walk=(file:string)=>{if(seen.has(file))return;seen.add(file);for(const child of edges.get(file)??[])walk(child);};
+  const buildRoots: string[] = [];
+  // Build configurations own the complete additional root set, including the separately bundled boot runtime.
+  for (const config of ["tsup.config.ts", "tsup.boot-runtime.config.ts"]) {
+    const source = ts.createSourceFile(config, readFileSync(config, "utf8"), ts.ScriptTarget.Latest, true);
+    function visit(node: ts.Node) {
+      if (ts.isStringLiteral(node) && node.text.startsWith("src/") && node.text.endsWith(".ts")) buildRoots.push(node.text.slice("src/".length));
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+  }
+  roots.push(...buildRoots);
+  for (const entry of buildRoots) expect(roots).toContain(entry);
   roots.forEach(n=>walk(resolve(sourceRoot,n)));
   expect(forbidden.filter(n=>seen.has(n))).toEqual([]);
   for(const file of files){const source=ast(file);const declarations:string[]=[];function visit(node:ts.Node){if(ts.isClassDeclaration(node)&&node.name?.text==="InstalledBusiness")declarations.push(file);ts.forEachChild(node,visit);}visit(source);expect(declarations).toEqual([]);}
+});
+
+it("pins the inert constructor refusal and forbids installed value construction", () => {
+  const source = ast("signing/record-signer.ts");
+  const predicates: string[] = [];
+  function visit(node: ts.Node) {
+    if (ts.isIfStatement(node) && node.expression.getText().includes('recordKind !== "counter"')) predicates.push(node.expression.getText());
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  expect(predicates).toEqual(['grant.role === ROLE_REGISTRY[0].role && recordKind !== "counter" && recordKind !== "append"']);
+  const files = readdirSync(sourceRoot, {recursive: true}).filter((n): n is string => typeof n === "string" && n.endsWith(".ts"));
+  for (const file of files) {
+    const violations: string[] = [];
+    function inspect(node: ts.Node) {
+      if ((ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) && node.type.getText().includes("InstalledBusiness")) violations.push(node.getText());
+      if ((ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node)) && node.type?.getText().includes("InstalledBusiness")) violations.push(node.getText());
+      if (ts.isVariableDeclaration(node) && (node.name.getText() === "InstalledBusiness" || node.type?.getText().includes("InstalledBusiness")) && node.initializer) violations.push(node.getText());
+      ts.forEachChild(node, inspect);
+    }
+    inspect(ast(file));
+    expect(violations, file).toEqual([]);
+  }
 });

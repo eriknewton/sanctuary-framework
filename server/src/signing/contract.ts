@@ -186,8 +186,8 @@ export function parseRecord(bytes: Uint8Array, role: SigningRole, payloadSchema:
     if (!integersOnly(value)) return refuse();
     const parsed = recordSchema(role, payloadSchema, recordKind).parse(value);
     // Must match records.rs: the inert count is distinct from the generated business counter branch.
-    const inert = recordKind === "counter" && INERT_PAYLOAD_SCHEMA.safeParse(parsed.payload).success;
-    // Business verification always applies the generated body constraints, regardless of a caller payload adapter.
+    const inert = payloadSchema === INERT_PAYLOAD_SCHEMA && recordKind === "counter" && INERT_PAYLOAD_SCHEMA.safeParse(parsed.payload).success;
+    // Only the inert adapter can interpret a count as transport evidence instead of a business observation.
     if (role === ROLE_REGISTRY[0].role && (BUSINESS_KINDS as readonly string[]).includes(recordKind) && !inert && !validateBusinessRecord(parsed)) return refuse();
     if (parsed.role !== role || !Buffer.from(canonicalBytes(parsed)).equals(Buffer.from(bytes))) return refuse();
     return parsed;

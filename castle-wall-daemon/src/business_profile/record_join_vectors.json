@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "schema_digest": "sha256:5c509e051d0e61047ac1a8a6448b89fb5b74c5d04ec4e48ffeb64668c0de862c",
+  "schema_digest": "sha256:7497e1417093067e81679e1213dc50b09fd657aff225790a4a0c445f05003390",
   "cases": [
     {
       "id": "open-sequence-accept",

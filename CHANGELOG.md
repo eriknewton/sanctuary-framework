@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-- Adds Linux business record codecs and verifiers only, plus pure shared history joins, anchor and custody transaction formats.
+- Adds Linux business record codecs and verifiers only, plus pure shared history joins, strict recovery proposals and custody journal acknowledgments.
 
 - Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony, capability-free peers and restart-persistent worker uncertainty, monotonic kill deadlines, fault-latched cleanup settlement and cooperative cleanup that tolerates a concurrent LOCK. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.
 - Added evidence snapshot export, public trust descriptor export, independent pack key output, recipient instructions and a static extension authority registry. macOS and SELinux file labels no longer fail verification.

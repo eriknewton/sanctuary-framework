@@ -23,9 +23,19 @@ pub fn verify(bytes: &[u8], signature: &[u8], pin: &Value, public_key: &[u8]) ->
         return false;
     };
     // The pin describes the producer subject, so a signature alone cannot substitute another enrolled identity.
-    if ["role", "epoch", "kid", "identity_id", "machine_id"]
-        .iter()
-        .any(|key| body[*key] != pin[*key])
+    // Must match SigningGrant in record-signer.ts: the enrolled grant binds activation, lease and generation.
+    if [
+        "role",
+        "epoch",
+        "kid",
+        "identity_id",
+        "machine_id",
+        "activation_id",
+        "lease_id",
+        "generation",
+    ]
+    .iter()
+    .any(|key| body[*key] != pin[*key])
     {
         return false;
     }

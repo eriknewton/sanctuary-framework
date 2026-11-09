@@ -6,8 +6,6 @@
     "u64_max": "18446744073709551615",
     "max_bytes": 65536,
     "flow_max": 64,
-    "attempt_max": 64,
-    "replay_max": 64,
     "counter_period_ns": "1000000000"
   },
   "definitions": {
@@ -4795,5 +4793,8 @@
         ]
       }
     ]
+  },
+  "encodings": {
+    "ipv6": "rfc5952-unmapped"
   }
 }
