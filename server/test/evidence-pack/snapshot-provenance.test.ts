@@ -1,4 +1,4 @@
-// fail-before-exempt: The rows this change adds witness the candidate build script under server/scripts, which this gate does not revert, so they pass on the reverted source by design; each is killed instead by a recorded single-predicate mutant of that script.
+// fail-before-exempt: These rows exercise the candidate build script under server/scripts, which this gate does not revert; script mutation checks and unchanged-input controls cover the defended boundaries.
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import { readFileSync, writeFileSync, mkdtempSync, realpathSync, readdirSync, lstatSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -157,5 +157,59 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     await build(root, { outputsChecked: (destinations: string[]) => seen.push(destinations) });
     expect(seen).toEqual([OUTPUTS.map(path => join(realpathSync(root), path))]);
     for (const path of OUTPUTS) expect(existsSync(join(root, path, "stale.js"))).toBe(false);
+  }, 120_000);
+  // Must match verifyPublished, withdrawPublished and the failure bound in scripts/build-evidence-pack.mjs.
+  const RELEASE_DIST = ["provenance.json", "verify-evidence-pack.js"];
+  const published = (output: string) => output === OUTPUTS[0] ? RELEASE_DIST : listing(join(c.tree, output));
+  const otherThan = (output: string) => OUTPUTS.find(path => path !== output)!;
+  // A fault fires only at its own output and counts its calls, so every refusal row proves its fault was reached exactly once.
+  function at(output: string, fault: (destination: string) => void) {
+    let calls = 0;
+    return { seam: (destination: string) => { if (destination.endsWith("/" + output)) { calls += 1; fault(destination); } }, calls: () => calls };
+  }
+  it.each([[OUTPUTS[0], "Output path changed"], [OUTPUTS[1], "Published output refused: output identity changed"]] as const)("rebuild refuses an output directory replaced at %s between the final recheck and the copy", async (output, refusal) => {
+    const root = outputRoot(), destination = join(root, output);
+    const fault = at(output, path => { renameSync(path, path + ".original"); mkdirSync(path); writeFileSync(join(path, "unlisted.js"), "planted"); });
+    await expect(build(root, { beforeCopy: fault.seam })).rejects.toThrow(refusal);
+    expect(fault.calls()).toBe(1);
+    // The first output's replacement is caught by the second output's recheck, which withdraws nothing; the last output's is caught by verification, which withdraws only its own entries.
+    expect(listing(destination)).toEqual(output === OUTPUTS[1] ? ["unlisted.js"] : [...published(output)!, "unlisted.js"].sort());
+  }, 120_000);
+  it.each((["beforeCopy", "afterCopy"] as const).flatMap(stage => OUTPUTS.map(output => [stage, output] as const)))("rebuild refuses an entry added at %s to %s and withdraws only what it published", async (stage, output) => {
+    const root = outputRoot(), fault = at(output, path => writeFileSync(join(path, "unlisted.js"), "planted"));
+    await expect(build(root, { [stage]: fault.seam })).rejects.toThrow(`Published output refused: unexpected entry in ${output}; the destination is not trusted`);
+    expect(fault.calls()).toBe(1);
+    expect({ output: listing(join(root, output)), other: listing(join(root, otherThan(output))) }).toEqual({ output: ["unlisted.js"], other: [] });
+  }, 120_000);
+  it("rebuild refuses a published file whose bytes change after the copy while its size stays the same", async () => {
+    const root = outputRoot();
+    const fault = at(OUTPUTS[0], path => { const file = join(path, "verify-evidence-pack.js"), bytes = readFileSync(file); bytes[bytes.length - 1] ^= 1; writeFileSync(file, bytes); });
+    await expect(build(root, { afterCopy: fault.seam })).rejects.toThrow(`Published output refused: content changed in ${OUTPUTS[0]}`);
+    expect(fault.calls()).toBe(1);
+    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([[], []]);
+  }, 120_000);
+  it("release rebuild refuses a non-release marker planted in an output before the copy", async () => {
+    const root = outputRoot(), fault = at(OUTPUTS[1], path => writeFileSync(join(path, NON_RELEASE_MARKER), NON_RELEASE_TEXT));
+    await expect(build(root, { beforeCopy: fault.seam })).rejects.toThrow(`Published output refused: non-release marker in ${OUTPUTS[1]}`);
+    expect(fault.calls()).toBe(1);
+    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([[], [NON_RELEASE_MARKER]]);
+  }, 120_000);
+  it("a refusal after the first output is published leaves that output rebuilt and the second uncleared", async () => {
+    const root = outputRoot(), second = join(root, OUTPUTS[1]);
+    for (const path of OUTPUTS) writeFileSync(join(root, path, "stale.js"), "stale");
+    const before = listing(second);
+    // Replacing the second output with a same-named copy after the first is published makes the second output's first recheck refuse.
+    const fault = at(OUTPUTS[0], () => { renameSync(second, second + ".original"); cpSync(second + ".original", second, { recursive: true }); });
+    await expect(build(root, { afterCopy: fault.seam })).rejects.toThrow("Output path changed");
+    expect(fault.calls()).toBe(1);
+    // The documented nontransactional outcome: the first output holds the new build, and nothing in the second was removed.
+    expect({ first: listing(join(root, OUTPUTS[0])), second: listing(second), original: listing(second + ".original") }).toEqual({ first: RELEASE_DIST, second: before, original: before });
+  }, 120_000);
+  it.each([false, true])("rebuild with nonRelease %s publishes outputs equal to the staged package when the publication seams change nothing", async nonRelease => {
+    const root = outputRoot(), noop = () => undefined;
+    for (const path of OUTPUTS) writeFileSync(join(root, path, "stale.js"), "stale");
+    // Unchanged-input control: the same seams that refuse above admit an untouched publication, so the refusal rows cannot be always-failing.
+    await build(root, { nonRelease, beforeCopy: noop, afterCopy: noop });
+    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([nonRelease ? [...RELEASE_DIST, NON_RELEASE_MARKER].sort() : RELEASE_DIST, published(OUTPUTS[1])]);
   }, 120_000);
 });
