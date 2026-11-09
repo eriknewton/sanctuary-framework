@@ -42,6 +42,7 @@ import {
   type ReaderFileHandle,
   type ReaderFs,
 } from "../castle-wall/liveness/read-status.js";
+import { isPublicationClaimLabel } from "../castle-wall/liveness/record-store.js";
 import { queryMacOSEnforcementAvailability } from "../castle-wall/runtime/enforcement-availability.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import { FULL_AGENT_LABEL, LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS, parseFullAgentPrint } from "./castle-wall-full-agent.js";
@@ -416,7 +417,9 @@ export function createWatchCollectors(options: WatchCollectorOptions): ObserverC
     async readBootId() {
       const text = okText(await runner.run({ command: "sysctl_boot" }, CHILD_READ_DEADLINE));
       const bootId = text?.trim() ?? "";
-      if (bootId.length === 0 || bootId.length > LABEL_BYTES || CONTROL_TEXT.test(bootId)) throw new Error("boot id read failed");
+      // A boot the publication claim cannot carry is a failed read, so it takes the failed-evidence and startup-withholding
+      // paths; must match isPublicationClaimLabel in castle-wall/liveness/record-store.ts.
+      if (bootId.length === 0 || bootId.length > LABEL_BYTES || CONTROL_TEXT.test(bootId) || !isPublicationClaimLabel(bootId)) throw new Error("boot id read failed");
       return bootId;
     },
     queryAvailability: options.queryAvailability ?? (async () => {

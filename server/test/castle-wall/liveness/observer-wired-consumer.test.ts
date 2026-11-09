@@ -7,14 +7,14 @@
  */
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, unlinkSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, unlinkSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { OBSERVER_PERIOD } from "../../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
 import { LivenessObserver, type LivenessObserverDeps } from "../../../src/castle-wall/liveness/observer.js";
-import { LivenessPublicationError, LivenessRecordPublisher, parsePublicationClaim } from "../../../src/castle-wall/liveness/record-store.js";
+import { LivenessPublicationError, LivenessRecordPublisher, parsePublicationClaim, serializePublicationClaim } from "../../../src/castle-wall/liveness/record-store.js";
 import { parseObserverRecord } from "../../../src/castle-wall/liveness/schema.js";
 import * as watch from "../../../src/cli/castle-wall-watch.js";
 import { BoundedChildRunner, type WatchChild, type WatchSpawn } from "../../../src/cli/castle-wall-watch-collectors.js";
@@ -111,19 +111,71 @@ describe("production composition", () => {
   });
 
   it("binds the record publisher once, to the first validated boot, and refuses a publish before any boot validates", async () => {
-    const boots: Array<string | null> = [null, "boot-fixture-first", "boot-fixture-later"];
+    const boots: Array<string | null> = [null, "boot-fixture-first", "boot-fixture-first"];
     const built: string[] = [];
     let reads = 0;
+    let published = 0;
     const publisher = new watch.BootBoundObserverPublisher(() => boots[Math.min(reads++, boots.length - 1)]!, bootId => {
       built.push(bootId);
-      return { publish: () => Promise.resolve() } as unknown as LivenessRecordPublisher;
+      return { publish: () => { published++; return Promise.resolve(); } } as unknown as LivenessRecordPublisher;
     });
     await expect(publisher.publish({})).rejects.toBeInstanceOf(LivenessPublicationError);
     expect(publisher.current()).toBeNull();
     await publisher.publish({});
     await publisher.publish({});
     expect(built).toEqual(["boot-fixture-first"]);
+    expect(published).toBe(2);
     expect(publisher.current()).not.toBeNull();
+  });
+
+  it("refuses every publish once the validated boot differs from the boot its claim was bound to", async () => {
+    // A positive boot change would otherwise publish boot-B records under a boot-A claim; refusing lets the record age to DOWN.
+    const boots = ["boot-fixture-first", "boot-fixture-later", "boot-fixture-later", "boot-fixture-first"];
+    let reads = 0;
+    let published = 0;
+    const built: string[] = [];
+    const publisher = new watch.BootBoundObserverPublisher(() => boots[Math.min(reads++, boots.length - 1)]!, bootId => {
+      built.push(bootId);
+      return { publish: () => { published++; return Promise.resolve(); } } as unknown as LivenessRecordPublisher;
+    });
+    await publisher.publish({});
+    await expect(publisher.publish({})).rejects.toThrow(/boot changed/);
+    await expect(publisher.publish({})).rejects.toThrow(/boot changed/);
+    // Back on the bound boot, publishing resumes under the same claim.
+    await publisher.publish({});
+    expect(built).toEqual(["boot-fixture-first"]);
+    expect(published).toBe(2);
+  });
+
+  it("refuses a boot the claim cannot carry before any real publisher is built, whatever claim is on disk", async () => {
+    for (const existing of ["absent", "same-instance-null", "foreign"] as const) {
+      const root = mkdtempSync(join(tmpdir(), "lv-wired-"));
+      const dir = join(root, "liveness");
+      const claimPath = join(dir, "observer.json.publisher");
+      const instance = "observer-fixture-self";
+      let before: string | null = null;
+      if (existing !== "absent") {
+        mkdirSync(dir, { mode: 0o700 });
+        before = serializePublicationClaim({ instance: existing === "foreign" ? "observer-fixture-other" : instance, boot_id: null, instance_started_uptime_ms: 1 });
+        writeFileSync(claimPath, before, { mode: 0o600 });
+      }
+      let builds = 0;
+      const publisher = new watch.BootBoundObserverPublisher(() => "boot invalid", bootId => {
+        builds++;
+        return new LivenessRecordPublisher({ fortressPath: root, fileName: "observer.json", instance, bootId, instanceStartedUptimeMs: 2, operatorUid: UID });
+      });
+      for (let i = 0; i < 3; i++) await expect(publisher.publish({}), existing).rejects.toBeInstanceOf(LivenessPublicationError);
+      expect(builds, existing).toBe(0);
+      expect(publisher.current(), existing).toBeNull();
+      if (before === null) expect(existsSync(dir), existing).toBe(false);
+      else {
+        expect(readFileSync(claimPath, "utf8"), existing).toBe(before);
+        expect(readdirSync(dir), existing).toEqual(["observer.json.publisher"]);
+        unlinkSync(claimPath);
+        rmdirSync(dir);
+      }
+      rmdirSync(root);
+    }
   });
 
   it("fails at construction when any dependency, collector or sampler input is missing", () => {
@@ -162,7 +214,8 @@ describe("production composition", () => {
     const code = await watch.runRunWatch(["--fortress", root, "--launch-agent"], {
       platform: "darwin", euid: UID, runner, timers: scaledTimers, out: sink as never, err: sink as never, sleep: ms => new Promise(done => setTimeout(done, Math.ceil(ms / TIME_SCALE))),
       compose: input => { built = watch.composeProductionWatch(input); return built; },
-      waitForStop: async () => { for (let i = 0; i < 300 && built!.observer.stats().cycles < 100; i++) await built!.observer.tick(); },
+      // Startup withholding completes cycles without publishing, so drive to 100 publication attempts, not 100 cycles.
+      waitForStop: async () => { for (let i = 0; i < 400 && built!.observer.stats().sequence < 100; i++) await built!.observer.tick(); },
     });
     await Promise.all(publishes);
     publishSpy.mockRestore();

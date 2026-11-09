@@ -67,6 +67,16 @@ export function serializePublicationClaim(claim: PublicationClaim): string {
 const claimLabel = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= LABEL_BYTES && CLAIM_LABEL.test(value);
 
+/**
+ * Whether a boot or instance label is representable in a publication claim.
+ * Must match the boot check in `readBootId` in `cli/castle-wall-watch-collectors.ts` and the publish-time check
+ * in `BootBoundObserverPublisher` in `cli/castle-wall-watch.ts`: a boot the claim cannot carry is a failed boot read,
+ * never a claim with a null boot.
+ */
+export function isPublicationClaimLabel(value: unknown): value is string {
+  return claimLabel(value);
+}
+
 /** Strictly parse claim bytes: exactly the canonical serialization of a valid claim, else null. */
 export function parsePublicationClaim(text: string): PublicationClaim | null {
   let value: unknown;

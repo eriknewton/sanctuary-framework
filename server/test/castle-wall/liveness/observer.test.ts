@@ -408,6 +408,18 @@ describe("full service and session", () => {
     expect(vi.mocked(fullAgent.observeJob)).not.toHaveBeenCalled();
   });
 
+  it("treats a printable sysctl boot that the publication claim cannot carry as a failed boot read", async () => {
+    // A boot the claim grammar rejects would otherwise reach the publisher and become a null-boot claim.
+    for (const stdout of ["boot invalid\n", "boot/slash\n", "boot:colon\n"]) {
+      const runner = new BoundedChildRunner({ spawn: spawnFor({ "/usr/sbin/sysctl": { code: 0, stdout } }, []), timers: realTimers });
+      const real = createWatchCollectors({ runner, timers: realTimers, fortressPath: "/nonexistent-fixture", operatorUid: OPERATOR });
+      await expect(real.readBootId(), stdout).rejects.toThrow(/boot id read failed/);
+    }
+    const runner = new BoundedChildRunner({ spawn: spawnFor({ "/usr/sbin/sysctl": { code: 0, stdout: "6F3A1C2E-9B4D-4E7A-8C21-0D5E6F7A8B9C\n" } }, []), timers: realTimers });
+    const real = createWatchCollectors({ runner, timers: realTimers, fortressPath: "/nonexistent-fixture", operatorUid: OPERATOR });
+    expect(await real.readBootId()).toBe("6F3A1C2E-9B4D-4E7A-8C21-0D5E6F7A8B9C");
+  });
+
   it("gives start_identity null for a pid absent from ps, which reads process_identity_unknown", async () => {
     const world = new World();
     world.processes = [psRows().filter(r => r.pid !== 4242), psRows().filter(r => r.pid !== 4242)];

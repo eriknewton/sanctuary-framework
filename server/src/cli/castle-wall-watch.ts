@@ -38,7 +38,7 @@ import {
 } from "../castle-wall/liveness/launchd-plists.js";
 import { LivenessObserver, observerHostId, type LivenessObserverDeps, type ObserverClock, type ObserverPublisher, type ObserverTimers } from "../castle-wall/liveness/observer.js";
 import { readLivenessRecords } from "../castle-wall/liveness/read-status.js";
-import { LivenessPublicationError, LivenessRecordPublisher } from "../castle-wall/liveness/record-store.js";
+import { isPublicationClaimLabel, LivenessPublicationError, LivenessRecordPublisher } from "../castle-wall/liveness/record-store.js";
 import { parseConfigRecord } from "../castle-wall/liveness/schema.js";
 import { livenessFortressId } from "./castle-wall-liveness-status.js";
 import { LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS, parseFullAgentPrint } from "./castle-wall-full-agent.js";
@@ -420,6 +420,7 @@ export const productionObserverClock: ObserverClock = {
  */
 export class BootBoundObserverPublisher implements ObserverPublisher {
   private bound: LivenessRecordPublisher | null = null;
+  private boundBoot: string | null = null;
 
   constructor(
     private readonly bootOf: () => string | null,
@@ -427,11 +428,17 @@ export class BootBoundObserverPublisher implements ObserverPublisher {
   ) {}
 
   publish(record: unknown): Promise<void> {
+    const bootId = this.bootOf();
+    // A boot the claim cannot carry would become a null-boot claim the observer never validated; refuse before any
+    // publisher exists. Must match isPublicationClaimLabel in castle-wall/liveness/record-store.ts.
+    if (bootId === null || !isPublicationClaimLabel(bootId)) return Promise.reject(new LivenessPublicationError("observer publisher has no validated boot"));
     if (this.bound === null) {
-      const bootId = this.bootOf();
-      if (bootId === null) return Promise.reject(new LivenessPublicationError("observer publisher has no validated boot"));
       this.bound = this.build(bootId);
+      this.boundBoot = bootId;
     }
+    // The claim orders this instance by the boot it was bound to; a later validated boot would publish records under
+    // a stale claim, so every later publish refuses and the record ages to DOWN until a fresh observer starts.
+    if (bootId !== this.boundBoot) return Promise.reject(new LivenessPublicationError("observer boot changed since its publication claim"));
     return this.bound.publish(record);
   }
 
