@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- Added a default-off storage and audit foundation with separate strict storage methods under a required namespace lock, descriptor-bound barriers and audit promise checks; receipt, retention-pin and seal integration remains deferred. Darwin directory-capability worker errors, including legacy operations, now keep nested `errors` and `cause` across the worker boundary and drop a non-string `code` or `kind`. Owner-mode strict writes into a missing directory now refuse with the typed `strict_directory_missing` code.
 - Adds Linux business record codecs and verifiers only, plus pure shared history joins, strict recovery proposals and custody journal acknowledgments.
 - Added a private offline evidence snapshot verifier candidate, explicit capture diagnostics, fresh build outputs, artifact provenance, recipient instructions and a synthetic second-Mac drill procedure.
 

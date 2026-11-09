@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import { isMainThread } from "node:worker_threads";
 
-import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { FilesystemStorage, withFilesystemLockTestHooks } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
@@ -1426,7 +1426,11 @@ describe("withCrossProcessLock", () => {
     "fails closed without writing when the inode-bound directory worker dies",
     async () => {
       let capabilityPid = 0;
-      const operation = withCrossProcessLock(
+      const operation = withFilesystemLockTestHooks({
+        afterDirectoryCapabilityAcquired: (_storageRootPid, _fortressRootPid, namespacePid) => {
+          capabilityPid = namespacePid!;
+        },
+      }, () => withCrossProcessLock(
         storage,
         NS,
         LOCK,
@@ -1437,13 +1441,8 @@ describe("withCrossProcessLock", () => {
           lease.assertHeld();
           await storage.write(NS, "must-not-land", new Uint8Array([1, 2, 3]));
         },
-        {
-          kernelBacked: true,
-          __testAfterDirectoryCapabilityAcquired: (_storageRootPid, _fortressRootPid, namespacePid) => {
-            capabilityPid = namespacePid!;
-          },
-        },
-      );
+        { kernelBacked: true },
+      ));
       await expect(operation).rejects.toMatchObject({ kind: "holder-lost" });
       await expect(storage.read(NS, "must-not-land")).resolves.toBeNull();
     },
@@ -1483,23 +1482,22 @@ describe("withCrossProcessLock", () => {
   it.runIf(process.platform === "darwin" || process.platform === "linux")(
     "preserves the operation error and every namespace capability cleanup error in order",
     async () => {
-      const error = await withCrossProcessLock(
+      const error = await withFilesystemLockTestHooks({
+        closeNamespaceCapability: async (kind, close) => {
+          await close();
+          if (kind === "root-fd" || kind === "namespace-fd") {
+            throw new Error(`${kind} close failed`);
+          }
+        },
+      }, () => withCrossProcessLock(
         storage,
         NS,
         LOCK,
         async () => {
           throw new Error("operation failed");
         },
-        {
-          kernelBacked: true,
-          __testCloseNamespaceCapability: async (kind, close) => {
-            await close();
-            if (kind === "root-fd" || kind === "namespace-fd") {
-              throw new Error(`${kind} close failed`);
-            }
-          },
-        },
-      ).catch((cause) => cause as unknown);
+        { kernelBacked: true },
+      )).catch((cause) => cause as unknown);
 
       expect(error).toBeInstanceOf(AggregateError);
       expect((error as AggregateError).errors.map(String)).toEqual([
@@ -1514,19 +1512,18 @@ describe("withCrossProcessLock", () => {
   it.runIf(process.platform === "darwin" || process.platform === "linux")(
     "surfaces a lone descriptor cleanup error after a successful namespace operation",
     async () => {
-      const error = await withCrossProcessLock(
+      const error = await withFilesystemLockTestHooks({
+        closeNamespaceCapability: async (kind, close) => {
+          await close();
+          if (kind === "parent-fd") throw new Error("parent-fd close failed");
+        },
+      }, () => withCrossProcessLock(
         storage,
         NS,
         LOCK,
         async () => "completed",
-        {
-          kernelBacked: true,
-          __testCloseNamespaceCapability: async (kind, close) => {
-            await close();
-            if (kind === "parent-fd") throw new Error("parent-fd close failed");
-          },
-        },
-      ).catch((cause) => cause as unknown);
+        { kernelBacked: true },
+      )).catch((cause) => cause as unknown);
 
       expect(error).toEqual(new Error("parent-fd close failed"));
     },
@@ -1669,7 +1666,12 @@ describe("withCrossProcessLock", () => {
     "bounds a stuck directory worker and leaves the target absent",
     async () => {
       let capabilityPid = 0;
-      const operation = withCrossProcessLock(
+      const operation = withFilesystemLockTestHooks({
+        directoryCapabilityTimeoutMs: 40,
+        afterDirectoryCapabilityAcquired: (_storageRootPid, _fortressRootPid, namespacePid) => {
+          capabilityPid = namespacePid!;
+        },
+      }, () => withCrossProcessLock(
         storage,
         NS,
         LOCK,
@@ -1677,14 +1679,8 @@ describe("withCrossProcessLock", () => {
           process.kill(capabilityPid, "SIGSTOP");
           await storage.write(NS, "must-not-timeout-land", new Uint8Array([4, 5, 6]));
         },
-        {
-          kernelBacked: true,
-          __testDirectoryCapabilityTimeoutMs: 40,
-          __testAfterDirectoryCapabilityAcquired: (_storageRootPid, _fortressRootPid, namespacePid) => {
-            capabilityPid = namespacePid!;
-          },
-        },
-      );
+        { kernelBacked: true },
+      ));
       await expect(operation).rejects.toMatchObject({ kind: "holder-lost" });
       await expect(storage.read(NS, "must-not-timeout-land")).resolves.toBeNull();
     },
