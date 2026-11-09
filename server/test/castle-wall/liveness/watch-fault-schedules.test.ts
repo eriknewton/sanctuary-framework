@@ -10,8 +10,11 @@ import { COUNTER_MAX, KILL_REAP_GRACE, MAX_COLLECTION_CHILDREN, TERM_GRACE } fro
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
 import { LivenessObserver, type ObserverCollectors, type ObserverPublisher } from "../../../src/castle-wall/liveness/observer.js";
 import { LivenessRecordPublisher, nodePublisherFs, type PublisherFileHandle, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
+import type { ReaderFileHandle, ReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
 import {
   BoundedChildRunner,
+  createWatchCollectors,
+  RecordReadSlotHeld,
   WATCH_CHILD_ENV,
   WATCH_COMMANDS,
   watchCommandArgv,
@@ -385,6 +388,78 @@ describe("a publication stalled indefinitely under the observer", () => {
     for (let i = 0; i < 20 && observer.stats().publishFailures === 1; i++) await flush();
     expect([...reactions.values()]).toEqual([1, 1]);
     expect(observer.stats().publishFailures).toBe(2);
+    await observer.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("the observer's record read under repeated read deadlines", () => {
+  it("issues no new read while a timed-out read's operations or late cleanup are outstanding, then readmits", async () => {
+    // A filesystem whose every open is held until the test releases it; once `healthy`, opens fail ENOENT at once.
+    let opens = 0;
+    let healthy = false;
+    const heldOpens: Array<(handle: ReaderFileHandle) => void> = [];
+    const readerFs: ReaderFs = {
+      open: () => {
+        opens++;
+        if (healthy) return Promise.reject(Object.assign(new Error("absent"), { code: "ENOENT" }));
+        return new Promise(resolve => { heldOpens.push(resolve); });
+      },
+    };
+    // The reader's deadline fires only when the test says so.
+    const deadlines: Array<() => void> = [];
+    const readerDeadline = { after: (_ms: number, fire: () => void) => { deadlines.push(fire); return { cancel: () => undefined }; } };
+    const runner = new BoundedChildRunner({ spawn: () => { throw new Error("no child in this schedule"); }, timers: fakeRunnerTimers });
+    const production = createWatchCollectors({ runner, timers: fakeRunnerTimers, fortressPath: "/fortress-fixture-never-created", operatorUid: OPERATOR, readerFs, readerDeadline });
+    // Each cycle's record evidence: the read completed, hit its deadline, or was refused because the slot is held.
+    const outcomes: string[] = [];
+    const observer = observerWith(quietCollectors(() => production.readRecords().then(
+      read => { outcomes.push(read.readDeadlineHit ? "deadline" : "read"); return read; },
+      (error: unknown) => { outcomes.push(error instanceof RecordReadSlotHeld ? "held" : "error"); throw error; },
+    )), { publish: async () => undefined });
+    const last = () => outcomes[outcomes.length - 1];
+
+    // Wave 1 opens the fortress directory and stalls; its deadline fires and the cycle completes with failed evidence.
+    const first = observer.tick();
+    await flush();
+    expect(opens).toBe(1);
+    deadlines.shift()!();
+    await first;
+    expect(last()).toBe("deadline");
+    // 999 more deadline waves: every cycle completes with failed record evidence and none issues another read.
+    for (let wave = 1; wave < 1000; wave++) {
+      const cycle = observer.tick();
+      await flush();
+      // Checked before the cycle is awaited: a read admitted here would stall on the held filesystem.
+      expect(opens, `wave ${wave + 1}`).toBe(1);
+      await cycle;
+      expect(last()).toBe("held");
+    }
+    expect(deadlines).toHaveLength(0);
+    // The stalled open completes late with a handle whose close is itself slow: the slot stays held until that close settles.
+    let closeCalls = 0;
+    let finishClose!: () => void;
+    heldOpens.shift()!({
+      stat: () => Promise.resolve({ uid: OPERATOR, mode: 0o40700, size: 0, isFile: () => false, isDirectory: () => true }),
+      read: () => Promise.resolve({ bytesRead: 0 }),
+      close: () => { closeCalls++; return new Promise<void>(resolve => { finishClose = resolve; }); },
+    });
+    await flush();
+    expect(closeCalls, "the late handle goes to the cleanup owner").toBe(1);
+    const whileClosing = observer.tick();
+    await flush();
+    expect(opens, "held by the late close").toBe(1);
+    await whileClosing;
+    expect(last()).toBe("held");
+    // Once the late close settles the slot is free, and the next cycle starts a fresh read that completes.
+    healthy = true;
+    finishClose();
+    await flush();
+    await observer.tick();
+    expect(opens).toBe(2);
+    expect(last()).toBe("read");
+    expect(outcomes).toHaveLength(1002);
+    expect(heldOpens).toHaveLength(0);
     await observer.stop();
   });
 });

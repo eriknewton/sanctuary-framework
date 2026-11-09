@@ -34,7 +34,14 @@ import type { CanaryIntegrityFacts, CanaryPlistStat, CollectedFact } from "../ca
 import type { CensusChildResult } from "../castle-wall/liveness/census-sampler.js";
 import type { AvailabilityStatus, ObserverCollectors, ObserverTimers } from "../castle-wall/liveness/observer.js";
 import { parseProcessRead, type ProcessRow } from "../castle-wall/liveness/process-census.js";
-import { readLivenessRecords, type LivenessReadResult } from "../castle-wall/liveness/read-status.js";
+import {
+  nodeReaderFs,
+  readLivenessRecords,
+  type DeadlineClock,
+  type LivenessReadResult,
+  type ReaderFileHandle,
+  type ReaderFs,
+} from "../castle-wall/liveness/read-status.js";
 import { queryMacOSEnforcementAvailability } from "../castle-wall/runtime/enforcement-availability.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import { FULL_AGENT_LABEL, LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS, parseFullAgentPrint } from "./castle-wall-full-agent.js";
@@ -275,6 +282,10 @@ export interface WatchCollectorOptions {
   queryAvailability?: () => Promise<AvailabilityStatus>;
   /** INTERNAL/TEST: replaces the shared record reader. */
   readRecords?: () => Promise<LivenessReadResult>;
+  /** INTERNAL/TEST: the filesystem under the owned record read; production is the shared reader's own. */
+  readerFs?: ReaderFs;
+  /** INTERNAL/TEST: the shared reader's deadline clock. */
+  readerDeadline?: DeadlineClock;
   /** The clock the shared id-chain deadline is measured on; defaults to Date.now. */
   nowMs?: () => number;
   /** INTERNAL/TEST: replaces the full agent state store read. */
@@ -311,11 +322,77 @@ function readCapped(io: WatchFs, path: string, cap: number, expected: { dev: num
   finally { try { io.closeSync(fd); } catch { /* the read result already stands */ } }
 }
 
+// ---------------------------------------------------------------------------
+// The observer's owned record read.
+// ---------------------------------------------------------------------------
+/** The record collector's refusal while its one read slot is still held by an earlier read. */
+export class RecordReadSlotHeld extends Error {}
+
+/**
+ * The observer record collector's one read slot. The shared reader races its
+ * filesystem operations against STATUS_READ_DEADLINE and returns at the
+ * deadline, but it cannot cancel an open, stat, read or close already issued,
+ * and it hands a late handle to its cleanup owner. So the slot is held while
+ * the read runs AND while any operation it issued, or any handle it opened, has
+ * not settled; a cycle that finds the slot held fails its record evidence and
+ * issues no read. Repeated deadline waves against a stalled filesystem
+ * therefore leave at most one read's operations outstanding, never one per
+ * cycle (AGENTS rule 12).
+ */
+export class OwnedRecordReader {
+  private reading = false;
+  /** Issued filesystem operations not yet settled, plus opened handles whose close has not settled. */
+  private outstanding = 0;
+  private readonly tracked: ReaderFs;
+
+  constructor(private readonly read: (fs: ReaderFs) => Promise<LivenessReadResult>, inner: ReaderFs) {
+    const track = <T>(start: () => Promise<T>): Promise<T> => {
+      this.outstanding += 1;
+      let operation: Promise<T>;
+      try { operation = start(); } catch (error) { this.outstanding -= 1; return Promise.reject(error); }
+      return operation.finally(() => { this.outstanding -= 1; });
+    };
+    this.tracked = {
+      open: (path, flags) => track(async () => {
+        const handle = await inner.open(path, flags);
+        // Counted before the open settles, so there is no instant between the open and its close at which the slot reads free.
+        this.outstanding += 1;
+        let closing: Promise<void> | null = null;
+        const owned: ReaderFileHandle = {
+          stat: () => track(() => handle.stat()),
+          read: (buffer, offset, length, position) => track(() => handle.read(buffer, offset, length, position)),
+          close: () => {
+            closing ??= track(() => handle.close()).finally(() => { this.outstanding -= 1; });
+            return closing;
+          },
+        };
+        return owned;
+      }),
+    };
+  }
+
+  /** True while an earlier read, or anything it issued, has not settled. */
+  held(): boolean {
+    return this.reading || this.outstanding > 0;
+  }
+
+  /** One record read through the shared reader, or a refusal while the slot is held. */
+  async run(): Promise<LivenessReadResult> {
+    if (this.held()) throw new RecordReadSlotHeld("liveness record read slot held");
+    this.reading = true;
+    try { return await this.read(this.tracked); } finally { this.reading = false; }
+  }
+}
+
 /** The observer's production collectors over the bounded runner. */
 export function createWatchCollectors(options: WatchCollectorOptions): ObserverCollectors & { runNetstat(): Promise<CensusChildResult> } {
   const { runner, timers, fortressPath, operatorUid } = options;
   const io = options.fs ?? fs;
   const nowMs = options.nowMs ?? Date.now;
+  const recordReader = new OwnedRecordReader(
+    readerFs => readLivenessRecords({ fortressPath, operatorUid, fs: readerFs, deadline: options.readerDeadline }),
+    options.readerFs ?? nodeReaderFs,
+  );
   const psRead = async (): Promise<ProcessRow[]> => {
     const text = okText(await runner.run({ command: "ps" }, PROCESS_READ_DEADLINE));
     if (text === null) throw new Error("process read failed");
@@ -335,7 +412,7 @@ export function createWatchCollectors(options: WatchCollectorOptions): ObserverC
     catch { return { status: "failed" }; }
   };
   return {
-    readRecords: options.readRecords ?? (() => readLivenessRecords({ fortressPath, operatorUid })),
+    readRecords: options.readRecords ?? (() => recordReader.run()),
     async readBootId() {
       const text = okText(await runner.run({ command: "sysctl_boot" }, CHILD_READ_DEADLINE));
       const bootId = text?.trim() ?? "";
