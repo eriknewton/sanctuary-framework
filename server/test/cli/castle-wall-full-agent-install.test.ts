@@ -5,6 +5,8 @@ import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StoredPassphraseObservation } from "../../src/wrap/passphrase.js";
 import { CASTLE_WALL_BOOT_LABEL, type ExecFileResult } from "../../src/cli/castle-wall-boot.js";
+import { livenessFortressId } from "../../src/cli/castle-wall-liveness-status.js";
+import { resolveStableRuntime, STABLE_RUNTIME_REFUSAL_EXIT_CODE } from "../../src/cli/stable-runtime-path.js";
 const agentPath = "../../src/cli/castle-wall-full-agent.js";
 const statePath = "../../src/cli/castle-wall-full-agent-state.js";
 const api = await import(agentPath).catch(() => null) as typeof import("../../src/cli/castle-wall-full-agent.js") | null;
@@ -50,6 +52,8 @@ function fixture(fortressName = "fortress") {
     home, env: { HOME: home, SANCTUARY_STORAGE_PATH: fortress }, platform: "darwin", euid: 501,
     isTTY: true, cliPath: cli, execPath: process.execPath, out, err, fs: io,
     execFileFn: exec, observePassphrase: observe, sleep,
+    // Stable runtime selection has its own suite; this fixture's temp CLI is accepted as the validated lexical path.
+    stableRuntime: () => ({ ok: true, node: process.execPath, cli, nodeVersion: process.versions.node }),
   };
   return { setLoaded: (value: boolean) => { fullLoaded = value; }, io, setLoadedFortress: (value: string | null) => { loadedFortress = value; }, root, home, fortress, cli, out, err, ctx, exec, observe, sleep, write, setBoot: (value: boolean) => { bootLoaded = value; }, setPid: (value: number | null) => { pid = value; } };
 }
@@ -105,9 +109,12 @@ describe("full agent attended commands", () => {
     const f = fixture();
     expect(await api!.runInstallFull([], f.ctx)).toBe(0);
     new state!.FullAgentStateStore(f.fortress).admit();
-    expect(await api!.runFullStatus([], f.ctx)).toBe(0);
+    // A bound running job with no liveness records exits 1 under wall-only exits; the binding still succeeds with no refusal.
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
     const alias = join(f.root, "alias"); fs.symlinkSync(f.fortress, alias);
-    expect(await api!.runFullStatus(["--fortress", alias], f.ctx)).toBe(0);
+    expect(await api!.runFullStatus(["--fortress", alias], f.ctx)).toBe(1);
+    expect(f.out.text).toMatch(/Full LaunchAgent state=state_RUNNING charges=\d+ pid=1234\n/);
+    expect(f.err.text).toBe("");
     const other = join(f.root, "other");
     const plist = join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`);
     if (source === "plist" || source === "both-other") fs.writeFileSync(plist, api!.generateFullAgentPlist([process.execPath, f.cli, "castle-wall", "daemon", "--fortress", other, "--launch-agent"]));
@@ -241,7 +248,8 @@ describe("full agent attended commands", () => {
     const f = fixture(name);
     expect(await api!.runInstallFull([], f.ctx)).toBe(0);
     new state!.FullAgentStateStore(f.fortress).admit();
-    expect(await api!.runFullStatus([], f.ctx)).toBe(0);
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(f.out.text).toMatch(/Full LaunchAgent state=state_RUNNING charges=\d+ pid=1234\n/);
     f.setPid(null);
     expect(await api!.runFullStatus([], f.ctx)).toBe(1);
     expect(f.out.text).toContain("pid=none");
@@ -375,4 +383,168 @@ describe("full agent attended commands", () => {
     expect(f.err.text).toBe("Full LaunchAgent job state is INDETERMINATE.\n");
   });
 
+});
+
+type LivenessPatch = { op: "set" | "add" | "delete"; path: string; value?: unknown };
+const LIVENESS_STATES = JSON.parse(fs.readFileSync(join(__dirname, "..", "castle-wall", "liveness", "fixtures", "states.json"), "utf8")) as { base: Record<string, any>; rows: Array<{ name: string; patches: LivenessPatch[] }> };
+const LIVENESS_UID = process.getuid?.() ?? 0;
+/** Write the fixture's liveness records into a fortress, re-subjected to it, and inject the matching reader clock into the command context. */
+function withLiveness(f: ReturnType<typeof fixture>, patches: readonly LivenessPatch[], files: readonly string[] = ["daemon", "observer", "config"]) {
+  const input = structuredClone(LIVENESS_STATES.base);
+  for (const patch of patches) {
+    const keys = patch.path.split(".");
+    const last = keys.pop()!;
+    let target = input;
+    for (const key of keys) target = target[key];
+    if (patch.op === "delete") delete target[last];
+    else if (patch.op === "add") target[last] += patch.value as number;
+    else target[last] = structuredClone(patch.value);
+  }
+  fs.mkdirSync(join(f.fortress, "liveness"), { mode: 0o700 });
+  for (const name of files) {
+    if (input[name].status !== "present") continue;
+    const value = input[name].value;
+    if (value.subject) Object.assign(value.subject, { fortress_id: livenessFortressId(f.fortress), operator_uid: LIVENESS_UID });
+    fs.writeFileSync(join(f.fortress, "liveness", `${name}.json`), JSON.stringify(value), { mode: 0o600 });
+  }
+  f.ctx.liveness = { getuid: () => LIVENESS_UID, now: () => input.nowMs, hostClock: { read: async () => input.host, uptimeMs: () => input.host.uptimeMs } };
+}
+const livenessRow = (name: string) => LIVENESS_STATES.rows.find(row => row.name === name)!.patches;
+function livenessSnapshot(fortress: string): Record<string, { bytes: string; mode: number }> {
+  const dir = join(fortress, "liveness");
+  const files: Record<string, { bytes: string; mode: number }> = { ".": { bytes: "", mode: fs.statSync(dir).mode } };
+  for (const name of fs.readdirSync(dir).sort()) files[name] = { bytes: fs.readFileSync(join(dir, name), "base64"), mode: fs.statSync(join(dir, name)).mode };
+  return files;
+}
+function treeListing(root: string): string[] {
+  const entries: string[] = [];
+  const walk = (dir: string) => { for (const name of fs.readdirSync(dir).sort()) { const path = join(dir, name); const info = fs.lstatSync(path); entries.push(`${path}:${info.mode}:${info.size}:${info.mtimeMs}`); if (info.isDirectory()) walk(path); } };
+  walk(root);
+  return entries;
+}
+
+describe("full-status wall-only exit", () => {
+  async function installedAndRunning() {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    new state!.FullAgentStateStore(f.fortress).admit();
+    f.out.text = "";
+    return f;
+  }
+
+  it("a running pid with wall OK and agent DOWN exits 0, keeping the supervision line byte-identical", async () => {
+    const f = await installedAndRunning();
+    withLiveness(f, livenessRow("agent down process missing"));
+    expect(await api!.runFullStatus([], f.ctx), f.err.text).toBe(0);
+    expect(f.out.text).toMatch(/^Full LaunchAgent state=state_RUNNING charges=\d+ pid=1234\nLiveness wall: wall_OK_IDLE \(none\)\nLiveness agent: agent_DOWN \(agent_process_missing\)\n/);
+  });
+
+  it("wall DOWN with agent OK exits 1", async () => {
+    const f = await installedAndRunning();
+    withLiveness(f, [{ op: "delete", path: "daemon.value.raw.hooks.emission_tick" }]);
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(f.out.text).toContain("Liveness wall: wall_DOWN (evidence_incomplete)");
+    expect(f.out.text).toMatch(/^Liveness agent: agent_OK_/m);
+  });
+
+  it("pid alive alone is never exit 0: state_RUNNING, bound pid 1234 and no liveness records exits 1", async () => {
+    const f = await installedAndRunning();
+    f.ctx.liveness = { getuid: () => LIVENESS_UID, hostClock: { read: async () => ({ ok: false }), uptimeMs: () => LIVENESS_STATES.base.host.uptimeMs } };
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(f.out.text).toMatch(/^Full LaunchAgent state=state_RUNNING charges=\d+ pid=1234\n/);
+    expect(f.out.text).not.toMatch(/^Liveness wall: wall_OK_/m);
+  });
+
+  it("a fresh daemon.json with observer.json absent exits 1", async () => {
+    const f = await installedAndRunning();
+    withLiveness(f, [], ["daemon", "config"]);
+    expect(await api!.runFullStatus([], f.ctx)).toBe(1);
+    expect(f.out.text).toMatch(/^Liveness wall: wall_DOWN \([^)]*observer_missing/m);
+  });
+
+  it("full-status leaves every liveness file byte-identical and mode-identical", async () => {
+    const f = await installedAndRunning();
+    withLiveness(f, []);
+    fs.chmodSync(join(f.fortress, "liveness", "config.json"), 0o640);
+    const before = livenessSnapshot(f.fortress);
+    await api!.runFullStatus([], f.ctx);
+    expect(livenessSnapshot(f.fortress)).toEqual(before);
+  });
+});
+
+describe("install-full stable runtime preflight", () => {
+  const refusal = () => ({ ok: false as const, reason: "no stable Node candidate resolves to the running Node" });
+
+  it("an unstable runtime exits 78 before the credential lookup, any launchctl call and any write", async () => {
+    const f = fixture();
+    f.ctx.stableRuntime = refusal;
+    expect(await api!.runInstallFull([], f.ctx)).toBe(STABLE_RUNTIME_REFUSAL_EXIT_CODE);
+    expect(f.observe).not.toHaveBeenCalled();
+    expect(f.write).not.toHaveBeenCalled();
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(join(f.home, "Library"))).toBe(false);
+    expect(f.err.text).toContain("install-full refused an unstable runtime");
+  });
+
+  it("--preflight with a loaded old service and the boot daemon loaded validates, mutates nothing and reads no credential", async () => {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx)).toBe(0);
+    f.setBoot(true);
+    f.ctx.isTTY = false;
+    f.exec.mockClear(); f.write.mockClear(); f.observe.mockClear();
+    const before = treeListing(f.root);
+    expect(await api!.runInstallFull(["--preflight"], f.ctx), f.err.text).toBe(0);
+    expect(f.out.text).toContain(`install-full preflight valid: node=${process.execPath} cli=${f.cli}`);
+    f.ctx.stableRuntime = refusal;
+    expect(await api!.runInstallFull(["--preflight"], f.ctx)).toBe(STABLE_RUNTIME_REFUSAL_EXIT_CODE);
+    expect(treeListing(f.root)).toEqual(before);
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(f.write).not.toHaveBeenCalled();
+    expect(f.observe).not.toHaveBeenCalled();
+  });
+
+  it("--preflight keeps the unsupported-host refusal", async () => {
+    const f = fixture();
+    f.ctx.platform = "linux";
+    expect(await api!.runInstallFull(["--preflight"], f.ctx)).toBe(1);
+    f.ctx.platform = "darwin"; f.ctx.euid = 0;
+    expect(await api!.runInstallFull(["--preflight"], f.ctx)).toBe(1);
+  });
+
+  it("a Cellar execPath with an opt alias saves the lexical alias in the plist, never the Cellar realpath", async () => {
+    const f = fixture();
+    const prefix = join(f.root, "prefix");
+    const keg = join(prefix, "Cellar", "node", "22.11.0", "bin");
+    fs.mkdirSync(keg, { recursive: true, mode: 0o755 });
+    fs.writeFileSync(join(keg, "node"), "#!/bin/sh\n", { mode: 0o755 });
+    fs.mkdirSync(join(prefix, "opt"), { mode: 0o755 });
+    fs.symlinkSync(join("..", "Cellar", "node", "22.11.0"), join(prefix, "opt", "node"));
+    const pkg = join(prefix, "lib", "node_modules", "@sanctuary-framework", "mcp-server");
+    fs.mkdirSync(join(pkg, "dist"), { recursive: true, mode: 0o755 });
+    fs.writeFileSync(join(pkg, "dist", "cli.js"), "// fixture entry\n", { mode: 0o644 });
+    fs.writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@sanctuary-framework/mcp-server", engines: { node: ">=20" } }), { mode: 0o644 });
+    const optNode = join(prefix, "opt", "node", "bin", "node");
+    const cli = join(pkg, "dist", "cli.js");
+    f.ctx.execPath = join(keg, "node");
+    f.ctx.cliPath = cli;
+    // The fixture files are owned by whoever runs the suite, so custody is checked against that uid, not the fixture's 501.
+    // Failure mode: with the fixture uid the test passes only on a Mac whose operator is uid 501 and refuses on every Linux box.
+    f.ctx.stableRuntime = running => resolveStableRuntime({ ...running, operatorUid: process.getuid!(), nodeCandidates: [optNode], cliCandidates: [cli], tempRoots: [], runningNodeVersion: "22.11.0" });
+    // The fake launchd reports the arguments it was bootstrapped with, read back from the written plist.
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation((command, args) => {
+      const result = original(command, args);
+      return args[0] === "print" && args[1] === `gui/501/${api!.FULL_AGENT_LABEL}` ? { ...result, stdout: result.stdout.replace(`${process.execPath}\n${f.cli}`, `${optNode}\n${cli}`) } : result;
+    });
+    expect(await api!.runInstallFull([], f.ctx), f.err.text).toBe(0);
+    const plist = fs.readFileSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`), "utf8");
+    expect(plist).toContain(`<string>${optNode}</string>`);
+    expect(plist).not.toContain("Cellar");
+    fs.unlinkSync(join(prefix, "opt", "node"));
+    const second = fixture();
+    second.ctx.execPath = join(keg, "node"); second.ctx.cliPath = cli; second.ctx.stableRuntime = f.ctx.stableRuntime;
+    expect(await api!.runInstallFull([], second.ctx)).toBe(STABLE_RUNTIME_REFUSAL_EXIT_CODE);
+    expect(second.observe).not.toHaveBeenCalled();
+    expect(second.write).not.toHaveBeenCalled();
+  });
 });

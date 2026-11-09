@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only flips the castle-wall status exit expectation, which the test reaches through the built CLI; the fail-before check does not rebuild dist from base, so base passes
 import { describe, it, expect } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -85,7 +86,7 @@ describe("CLI help routing", () => {
       env: { SANCTUARY_CASTLE_HOSTAPP: "/nonexistent/CastleWallHostApp" },
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(stderr).not.toContain("Sanctuary MCP Server");
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 

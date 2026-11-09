@@ -46,6 +46,10 @@ function resolveSourceSha(): string {
 }
 
 const sourceSha = resolveSourceSha();
+// The bundled liveness contract. Must match LIVENESS_CONTRACT_ARTIFACT in
+// server/test/castle-wall/liveness/contract-bundle.test.ts. The shipped name
+// carries a schema version, never a build number.
+const LIVENESS_CONTRACT_ARTIFACT = "dist/liveness-contract.v1.mjs";
 
 export default defineConfig({
   entry: {
@@ -87,6 +91,11 @@ export default defineConfig({
           });
         },
       }],
+    });
+    // The shared liveness contract is its own closed, platform-neutral bundle beside the native worker, not a new entrypoint.
+    await buildNativeWorker({
+      entryPoints: ["src/castle-wall/liveness/contract.ts"], outfile: LIVENESS_CONTRACT_ARTIFACT,
+      bundle: true, platform: "neutral", format: "esm", target: "es2022",
     });
   },
 });
