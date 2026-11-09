@@ -148,7 +148,8 @@ describe("never qualifying", () => {
 
   const cases: Array<[string, (s: RawSample[]) => RawSample[], Parameters<typeof evaluateSeries>[1]?]> = [
     ["flat counters", s => editRows(s, row => ({ ...row, rxbytes: 49560 }))],
-    ["wrong pid", s => s, { store: { pid: 75400 }, gateway: { pid: 75400 } }],
+    // The sampler filter: rows owned by another pid never reach a stored sample. The reader's own pid binding is witnessed in "census sample identity".
+    ["rows owned by a pid other than the configured gateway, dropped by the sampler", s => s, { store: { pid: GATEWAY_PID + 1 }, gateway: { pid: GATEWAY_PID + 1 } }],
     ["address outside the set", s => editRows(s, row => ({ ...row, foreign: "198.51.100.10.443", foreignEndpoint: { ...row.foreignEndpoint, host: "198.51.100.10", ipv4: 3325256714 } }))],
     ["port other than 443", s => editRows(s, row => ({ ...row, foreign: "203.0.113.10.8443", foreignEndpoint: { ...row.foreignEndpoint, port: "8443", portNumber: 8443 } }))],
     ["CLOSE_WAIT", s => editRows(s, row => ({ ...row, tcp_state: "CLOSE_WAIT" }))],
@@ -350,6 +351,14 @@ describe("census sample identity", () => {
   const editGateway = (samples: StoredCensusSample[], edit: Partial<StoredCensusSample["gateway"]>, which: (index: number) => boolean = () => true) =>
     samples.map((sample, index) => which(index) ? { ...sample, gateway: { ...sample.gateway, ...edit } } : sample);
   const OTHER_UID = 999;
+
+  it("the control: the same stored series with every identity field matching forms a run and reads agent_OK_PASSIVE", () => {
+    const samples = stored();
+    expect(samples.every(sample => sample.rows.length > 0)).toBe(true);
+    const envelope = evaluateStored(samples);
+    expect(envelope.agent.state).toBe("agent_OK_PASSIVE");
+    expect(envelope.agent.reasons).toEqual(["none"]);
+  });
 
   it.each([
     ["pid", { pid: GATEWAY_PID + 1 }],
