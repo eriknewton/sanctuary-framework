@@ -35,7 +35,7 @@ describe("installed immutable version", () => {
 
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { extractSourceArchive, prepareFixtureCandidate, buildCandidate } from "../../scripts/build-evidence-pack.mjs";
-import { mkdirSync, existsSync, renameSync, symlinkSync, cpSync } from "node:fs";
+import { mkdirSync, existsSync, renameSync, symlinkSync, cpSync, unlinkSync } from "node:fs";
 it.each([SOURCE, undefined])("release provenance still refuses a missing explicit revision with head %s", head => { expect(() => validateSource(metadata, archive, undefined, head)).toThrow("Source provenance refused"); });
 it.each(["symlink", "hardlink", "fifo"])("source archive refuses nonregular member %s before extraction", kind => {
   const root = mkdtempSync(join(tmpdir(), "archive-members-")), archive = join(root, "source.tar"), target = join(root, "staged"); mkdirSync(target);
@@ -158,9 +158,9 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     expect(seen).toEqual([OUTPUTS.map(path => join(realpathSync(root), path))]);
     for (const path of OUTPUTS) expect(existsSync(join(root, path, "stale.js"))).toBe(false);
   }, 120_000);
-  // Must match verifyPublished, withdrawPublished and the failure bound in scripts/build-evidence-pack.mjs.
+  // Must match verifyPublished, changedSince and the failure bound in scripts/build-evidence-pack.mjs: a refused build deletes nothing.
   const RELEASE_DIST = ["provenance.json", "verify-evidence-pack.js"];
-  const published = (output: string) => output === OUTPUTS[0] ? RELEASE_DIST : listing(join(c.tree, output));
+  const published = (output: string) => output === OUTPUTS[0] ? RELEASE_DIST : listing(join(c.tree, output))!;
   const otherThan = (output: string) => OUTPUTS.find(path => path !== output)!;
   // A fault fires only at its own output and counts its calls, so every refusal row proves its fault was reached exactly once.
   function at(output: string, fault: (destination: string) => void) {
@@ -172,27 +172,63 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     const fault = at(output, path => { renameSync(path, path + ".original"); mkdirSync(path); writeFileSync(join(path, "unlisted.js"), "planted"); });
     await expect(build(root, { beforeCopy: fault.seam })).rejects.toThrow(refusal);
     expect(fault.calls()).toBe(1);
-    // The first output's replacement is caught by the second output's recheck, which withdraws nothing; the last output's is caught by verification, which withdraws only its own entries.
-    expect(listing(destination)).toEqual(output === OUTPUTS[1] ? ["unlisted.js"] : [...published(output)!, "unlisted.js"].sort());
+    // Whichever check catches the replacement, the copy that landed in it and the planted entry both stay.
+    expect(listing(destination)).toEqual([...published(output), "unlisted.js"].sort());
   }, 120_000);
-  it.each((["beforeCopy", "afterCopy"] as const).flatMap(stage => OUTPUTS.map(output => [stage, output] as const)))("rebuild refuses an entry added at %s to %s and withdraws only what it published", async (stage, output) => {
+  it.each((["beforeCopy", "afterCopy"] as const).flatMap(stage => OUTPUTS.map(output => [stage, output] as const)))("rebuild refuses an entry added at %s to %s and keeps every file", async (stage, output) => {
     const root = outputRoot(), fault = at(output, path => writeFileSync(join(path, "unlisted.js"), "planted"));
     await expect(build(root, { [stage]: fault.seam })).rejects.toThrow(`Published output refused: unexpected entry in ${output}; the destination is not trusted`);
     expect(fault.calls()).toBe(1);
-    expect({ output: listing(join(root, output)), other: listing(join(root, otherThan(output))) }).toEqual({ output: ["unlisted.js"], other: [] });
+    expect({ output: listing(join(root, output)), other: listing(join(root, otherThan(output))) }).toEqual({ output: [...published(output), "unlisted.js"].sort(), other: published(otherThan(output)) });
   }, 120_000);
   it("rebuild refuses a published file whose bytes change after the copy while its size stays the same", async () => {
-    const root = outputRoot();
-    const fault = at(OUTPUTS[0], path => { const file = join(path, "verify-evidence-pack.js"), bytes = readFileSync(file); bytes[bytes.length - 1] ^= 1; writeFileSync(file, bytes); });
+    const root = outputRoot(), file = join(root, OUTPUTS[0], "verify-evidence-pack.js");
+    let tampered = Buffer.alloc(0);
+    const fault = at(OUTPUTS[0], () => { tampered = readFileSync(file); tampered[tampered.length - 1] ^= 1; writeFileSync(file, tampered); });
     await expect(build(root, { afterCopy: fault.seam })).rejects.toThrow(`Published output refused: content changed in ${OUTPUTS[0]}`);
     expect(fault.calls()).toBe(1);
-    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([[], []]);
+    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual(OUTPUTS.map(published));
+    expect(readFileSync(file).equals(tampered)).toBe(true);
   }, 120_000);
   it("release rebuild refuses a non-release marker planted in an output before the copy", async () => {
     const root = outputRoot(), fault = at(OUTPUTS[1], path => writeFileSync(join(path, NON_RELEASE_MARKER), NON_RELEASE_TEXT));
     await expect(build(root, { beforeCopy: fault.seam })).rejects.toThrow(`Published output refused: non-release marker in ${OUTPUTS[1]}`);
     expect(fault.calls()).toBe(1);
-    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([[], [NON_RELEASE_MARKER]]);
+    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([RELEASE_DIST, [...published(OUTPUTS[1]), NON_RELEASE_MARKER].sort()]);
+  }, 120_000);
+  // A file at a staged name is not proof the build wrote it, so neither schedule below may delete the foreign file it plants.
+  it("rebuild refuses a directory of foreign files swapped in after the last copy and deletes none of them", async () => {
+    const root = outputRoot(), destination = join(root, OUTPUTS[1]), aside = destination + ".published";
+    const fault = at(OUTPUTS[1], path => { renameSync(path, aside); mkdirSync(path); writeFileSync(join(path, "export-evidence-pack.js"), "foreign"); writeFileSync(join(path, "unlisted.js"), "foreign"); });
+    await expect(build(root, { afterCopy: fault.seam })).rejects.toThrow("Published output refused: output identity changed");
+    expect(fault.calls()).toBe(1);
+    expect({ swapped: listing(destination), aside: listing(aside), first: listing(join(root, OUTPUTS[0])) }).toEqual({ swapped: ["export-evidence-pack.js", "unlisted.js"], aside: published(OUTPUTS[1]), first: RELEASE_DIST });
+    for (const name of ["export-evidence-pack.js", "unlisted.js"]) expect(readFileSync(join(destination, name), "utf8")).toBe("foreign");
+  }, 120_000);
+  it("rebuild refuses a published file replaced by a foreign inode after the last copy and keeps the foreign file", async () => {
+    const root = outputRoot(), file = join(root, OUTPUTS[1], "export-evidence-pack.js");
+    const fault = at(OUTPUTS[1], () => { unlinkSync(file); writeFileSync(file, "foreign"); });
+    await expect(build(root, { afterCopy: fault.seam })).rejects.toThrow(`Published output refused: content changed in ${OUTPUTS[1]}`);
+    expect(fault.calls()).toBe(1);
+    expect(readFileSync(file, "utf8")).toBe("foreign");
+    expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual(OUTPUTS.map(published));
+  }, 120_000);
+  // Must match the beforeHash seam and the second verification pass in scripts/build-evidence-pack.mjs.
+  it("release rebuild refuses a non-release marker created during verification just before the bundle is hashed", async () => {
+    const root = outputRoot();
+    let faults = 0;
+    const beforeHash = (path: string) => { if (path.endsWith(`/${OUTPUTS[0]}/verify-evidence-pack.js`)) { faults += 1; writeFileSync(join(dirname(path), NON_RELEASE_MARKER), NON_RELEASE_TEXT); } };
+    await expect(build(root, { beforeHash })).rejects.toThrow(`Published output refused: non-release marker in ${OUTPUTS[0]}`);
+    expect(faults).toBe(1);
+    expect(listing(join(root, OUTPUTS[0]))).toEqual([NON_RELEASE_MARKER, ...RELEASE_DIST]);
+  }, 120_000);
+  it("rebuild refuses an output directory replaced by an identical copy during verification before its first file is opened", async () => {
+    const root = outputRoot(), first = join(root, OUTPUTS[0]);
+    let faults = 0;
+    const beforeHash = (path: string) => { if (faults === 0) { faults += 1; const output = dirname(path); renameSync(output, output + ".original"); cpSync(output + ".original", output, { recursive: true }); } };
+    await expect(build(root, { beforeHash })).rejects.toThrow("Published output refused: output identity changed");
+    expect(faults).toBe(1);
+    expect({ copy: listing(first), original: listing(first + ".original") }).toEqual({ copy: RELEASE_DIST, original: RELEASE_DIST });
   }, 120_000);
   it("a refusal after the first output is published leaves that output rebuilt and the second uncleared", async () => {
     const root = outputRoot(), second = join(root, OUTPUTS[1]);
@@ -209,7 +245,7 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     const root = outputRoot(), noop = () => undefined;
     for (const path of OUTPUTS) writeFileSync(join(root, path, "stale.js"), "stale");
     // Unchanged-input control: the same seams that refuse above admit an untouched publication, so the refusal rows cannot be always-failing.
-    await build(root, { nonRelease, beforeCopy: noop, afterCopy: noop });
+    await build(root, { nonRelease, beforeCopy: noop, afterCopy: noop, beforeHash: noop });
     expect(OUTPUTS.map(path => listing(join(root, path)))).toEqual([nonRelease ? [...RELEASE_DIST, NON_RELEASE_MARKER].sort() : RELEASE_DIST, published(OUTPUTS[1])]);
   }, 120_000);
 });

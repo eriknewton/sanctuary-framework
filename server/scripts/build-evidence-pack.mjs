@@ -1,11 +1,12 @@
 // Failure bound: publication into the checkout is not transactional. Each removal is permanent before the next check runs, and the first output is
 // published before work on the second finishes, so a refusal partway through can leave one output holding the new build while the other is partly
-// cleared or still holds the old one. Only a refusal at post-publication verification withdraws anything, and then only the entries this build
-// published. After any nonzero exit neither output is trusted until a later build exits zero.
+// cleared or still holds the old one. No refusal deletes anything: a refused destination is left as found and must not be used, and the operator
+// rebuilds into a clean checkout. After any nonzero exit neither output is trusted until a later build exits zero.
 // Failure mode: after a refused build an output directory can still look complete from the outside; only the exit status says whether it is trusted.
-// Race bound: Node offers no descriptor-relative unlink or copy, so a writer that changes an output path between a check and its use can redirect that
-// one operation. Post-publication verification detects such a race whenever it leaves either output differing from the private staged package or
-// moves an output directory; it does not prevent the race, and a writer that redirects a removal and then repairs the output itself leaves no trace.
+// Race bound: Post-publication verification is a sequence of observations, not an atomic snapshot. It detects mismatches present when the relevant
+// identities, entries and bytes are checked. Concurrent changes after a relevant check, including changes during verification, can remain undetected
+// and the build can exit zero. It neither prevents redirected operations nor authenticates subsequent checkout contents.
+// Trust bound: the checkout copies are build convenience outputs, not the trust authority; release acceptance rests on the packed artifact and its verifier.
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync, realpathSync, opendirSync, openSync, fstatSync, readSync, closeSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -49,7 +50,7 @@ with tarfile.open(sys.argv[1]) as archive:
                 shutil.copyfileobj(source, output)
 `, archive, staged], { timeout: TIMEOUT_MS });
 }
-export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { nonRelease = false, outputsChecked, beforeCopy, afterCopy } = {}) {
+export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { nonRelease = false, outputsChecked, beforeCopy, afterCopy, beforeHash } = {}) {
   if (args.length !== 4 || args[0] !== "--source-metadata" || args[2] !== "--source-archive") throw new Error("Expected source metadata and source archive");
   const metadata = JSON.parse(readFileSync(args[1], "utf8"));
   const head = existsSync(join(root, ".git")) ? execFileSync("/usr/bin/git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
@@ -91,7 +92,7 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
     // Test-only seam: it runs after this output's copy and before verification, so a hardening test can change a published output.
     afterCopy?.(output.destination);
   }
-  verifyPublished(outputs, staged, nonRelease);
+  verifyPublished(outputs, staged, nonRelease, beforeHash);
 }
 // Must match the output-directory witnesses in snapshot-provenance.test.ts.
 const OUTPUT_DIRECTORIES = ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"];
@@ -121,7 +122,7 @@ function checkOutput(base, relative) {
 }
 function identityChange(outputs) {
   for (const { held, present, destination } of outputs) {
-    // Each held directory must still be the same real directory before every removal and copy; a replacement in the window after this check is a race this script detects at post-publication verification rather than prevents, since Node offers no descriptor-relative unlink or copy.
+    // Each held directory must still be the same real directory before every removal and copy; a replacement in the window after this check can only be observed later, never prevented, since Node offers no descriptor-relative unlink or copy.
     for (const { path, dev, ino } of held) { const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false }); if (!stat || stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== dev || stat.ino !== ino) return "output identity changed"; }
     // An output that was absent at the check must stay absent until its own copy creates it.
     if (!present && lstatSync(destination, { throwIfNoEntry: false })) return "output identity changed";
@@ -130,14 +131,23 @@ function identityChange(outputs) {
 }
 function recheckOutputs(outputs) { if (identityChange(outputs) !== undefined) throw new Error("Output path changed"); }
 // Must match the post-publication witnesses in snapshot-provenance.test.ts.
-function verifyPublished(outputs, staged, nonRelease) {
+function verifyPublished(outputs, staged, nonRelease, beforeHash) {
   const expected = outputs.map(output => inventory(join(staged, output.relative), Number.POSITIVE_INFINITY));
   let reason;
   // Any error while reading a published output is itself a refusal, so a vanished or unreadable entry can never count as verified.
-  try { reason = identityChange(outputs) ?? outputs.map((output, index) => publishedMismatch(output, join(staged, output.relative), expected[index], nonRelease)).find(found => found !== undefined); }
-  catch { reason = "published output unreadable"; }
+  try {
+    reason = identityChange(outputs);
+    const first = [];
+    for (const [index, output] of outputs.entries()) {
+      if (reason !== undefined) break;
+      const compared = publishedMismatch(output, join(staged, output.relative), expected[index], nonRelease, beforeHash);
+      reason = compared.reason; first.push(compared.found);
+    }
+    // A change made while the comparison ran shows up in this second pass as a moved directory or an inventory unlike the one just compared.
+    reason ??= identityChange(outputs) ?? outputs.map((output, index) => changedSince(output, first[index], nonRelease)).find(found => found !== undefined);
+  } catch { reason = "published output unreadable"; }
   if (reason === undefined) return;
-  outputs.forEach((output, index) => withdrawPublished(output, expected[index]));
+  // Nothing is deleted on refusal: the build cannot prove it owns any entry it finds now, so every file stays for the operator to inspect.
   throw new Error(`Published output refused: ${reason}; the destination is not trusted and must be rebuilt`);
 }
 // Entries are classified by lstat and never followed, and the walk stops one entry past the limit, so a planted link, special file or flood costs bounded work.
@@ -153,17 +163,32 @@ function inventory(directory, limit, prefix = "", rows = []) {
   } finally { handle.closeSync(); }
   return rows;
 }
-function publishedMismatch(output, stagedOutput, expected, nonRelease) {
+const carriesMarker = rows => rows.some(row => row.name.split("/").at(-1) === NON_RELEASE_MARKER);
+const inventoryKey = rows => JSON.stringify(rows.map(({ name, type, size }) => [name, type, size]).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+function publishedMismatch(output, stagedOutput, expected, nonRelease, beforeHash) {
   // The limit is one entry more than the staged package holds, which is the least work that still proves an extra entry exists.
   const found = inventory(output.destination, expected.length + 1), wanted = new Map(expected.map(row => [row.name, row]));
+  const refuse = reason => ({ reason: `${reason} in ${output.relative}`, found });
   // A release build refuses the fixture marker at any depth, so a marker planted in the checkout can never ride a release output into packaging.
-  if (!nonRelease && found.some(row => row.name.split("/").at(-1) === NON_RELEASE_MARKER)) return `non-release marker in ${output.relative}`;
+  if (!nonRelease && carriesMarker(found)) return refuse("non-release marker");
   // The published tree must hold exactly the staged names, so an entry merged in by the copy or planted afterwards refuses.
-  if (found.some(row => !wanted.has(row.name))) return `unexpected entry in ${output.relative}`;
-  if (found.length !== expected.length) return `missing entry in ${output.relative}`;
-  if (found.some(row => row.type !== wanted.get(row.name).type)) return `entry type changed in ${output.relative}`;
-  for (const row of expected) if (row.type === "file" && !sameBytes(join(output.destination, row.name), join(stagedOutput, row.name), row.size)) return `content changed in ${output.relative}`;
-  return undefined;
+  if (found.some(row => !wanted.has(row.name))) return refuse("unexpected entry");
+  if (found.length !== expected.length) return refuse("missing entry");
+  if (found.some(row => row.type !== wanted.get(row.name).type)) return refuse("entry type changed");
+  for (const row of expected) {
+    if (row.type !== "file") continue;
+    // Test-only seam: it runs before each published file is opened, so a hardening test can change an output while verification is under way.
+    beforeHash?.(join(output.destination, row.name));
+    if (!sameBytes(join(output.destination, row.name), join(stagedOutput, row.name), row.size)) return refuse("content changed");
+  }
+  return { reason: undefined, found };
+}
+// Must match the mid-verification witnesses in snapshot-provenance.test.ts.
+function changedSince(output, first, nonRelease) {
+  // The same one-past limit applies, so the second pass costs no more than the first.
+  const again = inventory(output.destination, first.length + 1);
+  if (!nonRelease && carriesMarker(again)) return `non-release marker in ${output.relative}`;
+  return inventoryKey(again) === inventoryKey(first) ? undefined : `output changed during verification in ${output.relative}`;
 }
 // The published file is opened without following a link and without blocking on a fifo, and at most one byte past the staged size is read, so a swapped entry can neither redirect nor stall nor inflate the comparison.
 function sameBytes(published, staged, size) {
@@ -177,19 +202,6 @@ function sameBytes(published, staged, size) {
     do { read = readSync(descriptor, buffer, length, buffer.length - length, null); length += read; } while (read > 0 && length < buffer.length);
     return length === size && digest(buffer.subarray(0, size)) === digest(readFileSync(staged));
   } finally { closeSync(descriptor); }
-}
-// Must match the withdrawal witnesses in snapshot-provenance.test.ts.
-function withdrawPublished(output, expected) {
-  const realDirectory = path => { const stat = lstatSync(path, { throwIfNoEntry: false }); return stat !== undefined && !stat.isSymbolicLink() && stat.isDirectory(); };
-  // Withdrawal follows no link: a chain that is no longer all real directories keeps everything, because a removal through it could land in another tree.
-  if (!output.held.every(({ path }) => realDirectory(path))) return;
-  for (const { name, type } of expected) {
-    const parts = name.split("/");
-    if (type !== "file" || !parts.slice(0, -1).every((_, depth) => realDirectory(join(output.destination, ...parts.slice(0, depth + 1))))) continue;
-    // Only a regular file at a name this build published is removed; the destination directory and every unlisted entry stay for inspection.
-    const path = join(output.destination, ...parts), stat = lstatSync(path, { throwIfNoEntry: false });
-    try { if (stat?.isFile()) unlinkSync(path); } catch { /* The refusal below already marks the destination untrusted, so a removal lost to a race changes nothing it reports. */ }
-  }
 }
 // Test archives live outside git and are explicitly marked non-release; no fixture metadata authenticates a release.
 export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")) {
