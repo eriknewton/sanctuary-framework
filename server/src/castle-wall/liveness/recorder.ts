@@ -241,6 +241,8 @@ export class LivenessRecorder {
   private verifiedAdmissions = 0;
   private primaryConfirmations = 0;
   private publishFailures = 0;
+  /** The drain in flight and the one handled continuation subscribed to it; queued ticks reuse it. */
+  private publishing: { drain: Promise<void>; handled: Promise<void> } | null = null;
 
   constructor(private readonly options: LivenessRecorderOptions) {
     this.now = options.now ?? Date.now;
@@ -319,9 +321,17 @@ export class LivenessRecorder {
       this.publishFailures = saturatingIncrement(this.publishFailures);
       return Promise.resolve();
     }
-    return this.publisher.publish(record).catch(() => {
-      this.publishFailures = saturatingIncrement(this.publishFailures);
-    });
+    const drain = this.publisher.publish(record);
+    // A tick queued behind a stalled drain gets that drain back from the publisher. The error accounting is attached
+    // once per drain, never once per tick, so a publication that never settles retains one continuation, not one per tick.
+    if (this.publishing !== null && this.publishing.drain === drain) return this.publishing.handled;
+    const settle = (failed: boolean): void => {
+      if (failed) this.publishFailures = saturatingIncrement(this.publishFailures);
+      if (this.publishing?.drain === drain) this.publishing = null;
+    };
+    const handled = drain.then(() => settle(false), () => settle(true));
+    this.publishing = { drain, handled };
+    return handled;
   }
 
   /**

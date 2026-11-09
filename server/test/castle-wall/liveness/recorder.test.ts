@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CANARY_IP, CANARY_PORT, CANARY_PROTOCOL, COUNTER_MAX, SECOND } from "../../../src/castle-wall/liveness/constants.js";
+import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
 import { LivenessRecorder, saturatingIncrement, type CanaryOriginSubjects } from "../../../src/castle-wall/liveness/recorder.js";
 import { parseDaemonRecord, REQUIRED_RECORDER_HOOKS } from "../../../src/castle-wall/liveness/schema.js";
 
@@ -15,7 +16,7 @@ const TICK_BOUND_MS = 2 * SECOND;
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function recorder(options: { lockRecovery?: () => { state: "not_instrumented" } } = {}) {
+function recorder(options: { lockRecovery?: () => { state: "not_instrumented" }; publisherFs?: PublisherFs } = {}) {
   const fortressPath = mkdtempSync(join(tmpdir(), "lv-rec-"));
   roots.push(fortressPath);
   let now = START;
@@ -154,5 +155,67 @@ describe("publication independent of the audit sink", () => {
     await expect(failing.emissionTick()).resolves.toBeUndefined();
     expect(failing.stats().failures).toBe(1);
     expect(r.stats().failures).toBe(0);
+  });
+});
+
+describe("stalled publication across repeated ticks", () => {
+  const TICKS = 1000;
+  /** Count every continuation subscribed to each drain the publisher hands back (catch and finally subscribe through then). */
+  function countSubscriptions() {
+    // A plain prototype patch, not a spy: a spy subscribes to every promise it returns and would be counted itself.
+    const original = LivenessRecordPublisher.prototype.publish;
+    const counts = new Map<Promise<void>, number>();
+    LivenessRecordPublisher.prototype.publish = function (this: LivenessRecordPublisher, record: unknown): Promise<void> {
+      const drain = original.call(this, record);
+      if (!counts.has(drain)) {
+        counts.set(drain, 0);
+        const then = drain.then.bind(drain);
+        drain.then = ((...args: Parameters<typeof then>) => { counts.set(drain, counts.get(drain)! + 1); return then(...args); }) as typeof drain.then;
+      }
+      return drain;
+    };
+    return { counts, restore: () => { LivenessRecordPublisher.prototype.publish = original; } };
+  }
+
+  it("a publication that never settles keeps one subscribed continuation however many ticks queue behind it", async () => {
+    const subscriptions = countSubscriptions();
+    try {
+      const { r } = recorder({ publisherFs: { ...nodePublisherFs, open: () => new Promise(() => undefined) } });
+      wireAll(r);
+      const first = r.emissionTick();
+      for (let i = 0; i < TICKS; i++) expect(r.emissionTick()).toBe(first);
+      expect(subscriptions.counts.size).toBe(1);
+      expect([...subscriptions.counts.values()]).toEqual([1]);
+    } finally {
+      subscriptions.restore();
+    }
+  });
+
+  it("a publication that rejects late is counted once and still kept one continuation", async () => {
+    const subscriptions = countSubscriptions();
+    const pending: Array<(error: Error) => void> = [];
+    let failing = false;
+    const lateFs: PublisherFs = {
+      ...nodePublisherFs,
+      open: () => failing ? Promise.reject(new Error("fixture late failure")) : new Promise((_resolve, reject) => { pending.push(reject); }),
+    };
+    try {
+      const { r } = recorder({ publisherFs: lateFs });
+      wireAll(r);
+      const first = r.emissionTick();
+      for (let i = 0; i < TICKS; i++) r.emissionTick();
+      failing = true;
+      for (const reject of pending.splice(0)) reject(new Error("fixture late failure"));
+      await expect(first).resolves.toBeUndefined();
+      expect(r.stats().failures).toBeGreaterThanOrEqual(1);
+      expect(subscriptions.counts.size).toBe(1);
+      expect([...subscriptions.counts.values()]).toEqual([1]);
+      // The next tick after settlement starts a new drain with its own single continuation.
+      await r.emissionTick();
+      expect(subscriptions.counts.size).toBe(2);
+      expect([...subscriptions.counts.values()]).toEqual([1, 1]);
+    } finally {
+      subscriptions.restore();
+    }
   });
 });
