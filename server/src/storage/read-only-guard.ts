@@ -29,6 +29,7 @@
 import { isSdwNamespace } from "../sdw/write-gate.js";
 import type {
   FilesystemStorageCapabilities,
+  StrictDurabilityStorageCapabilities,
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
@@ -77,6 +78,10 @@ export const READ_ONLY_STORAGE_MUTATING_METHODS = [
   "write",
   "delete",
   "writeDurable",
+  "writeStrict",
+  "withStrictNamespaceLock",
+  "writeIfAbsentStrict",
+  "replaceIfEqualsStrict",
   "writeIfAbsent",
   "replaceIfEquals",
   "withNamespaceLock",
@@ -111,7 +116,7 @@ export const READ_ONLY_STORAGE_DELEGATED_METHODS = [
  * refused write. So `writeDurable` is present and throws.
  */
 export class ReadOnlyStorageGuard
-  implements StorageBackend, FilesystemStorageCapabilities
+  implements StorageBackend, FilesystemStorageCapabilities, StrictDurabilityStorageCapabilities
 {
   private readonly inner: StorageBackend;
   private readonly innerCapabilities: Partial<FilesystemStorageCapabilities>;
@@ -152,6 +157,22 @@ export class ReadOnlyStorageGuard
 
   async write(namespace: string, key: string, _data: Uint8Array): Promise<void> {
     throw new ReadOnlyStorageViolationError("write", namespace, key);
+  }
+
+  // Must match StrictDurabilityStorageCapabilities in interface.ts: a guard never delegates strict mutations.
+  async writeStrict(namespace: string, key: string, _data: Uint8Array): Promise<void> {
+    // Diagnostic access cannot confer authority to perform a strict mutation.
+    throw new ReadOnlyStorageViolationError("writeStrict", namespace, key);
+  }
+
+  async writeIfAbsentStrict(namespace: string, key: string, _data: Uint8Array): Promise<boolean> {
+    // Diagnostic access cannot confer authority to perform a strict mutation.
+    throw new ReadOnlyStorageViolationError("writeIfAbsentStrict", namespace, key);
+  }
+
+  async replaceIfEqualsStrict(namespace: string, key: string, _expected: Uint8Array, _data: Uint8Array): Promise<boolean> {
+    // Diagnostic access cannot confer authority to perform a strict mutation.
+    throw new ReadOnlyStorageViolationError("replaceIfEqualsStrict", namespace, key);
   }
 
   async writeDurable(
@@ -198,6 +219,16 @@ export class ReadOnlyStorageGuard
       namespace,
       lockFileName,
     );
+  }
+
+  // Must match withStrictNamespaceLock in interface.ts because acquiring it creates lock state.
+  async withStrictNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    _operation: (lease: CrossProcessLockLease) => Promise<T>,
+    _options?: CrossProcessLockOptions,
+  ): Promise<T> {
+    throw new ReadOnlyStorageViolationError("withStrictNamespaceLock", namespace, lockFileName);
   }
 
   // ---- delegated ----

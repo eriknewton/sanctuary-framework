@@ -8,7 +8,7 @@
  * in the StateStore layer above.
  *
  * Every method declared on `StorageBackend`, `FilesystemStorageCapabilities`,
- * and `NamespaceLockStorageCapabilities`
+ * `StrictDurabilityStorageCapabilities`, and `NamespaceLockStorageCapabilities`
  * must be classified as mutating-or-delegated in `read-only-guard.ts` (must
  * match `READ_ONLY_STORAGE_MUTATING_METHODS` /
  * `READ_ONLY_STORAGE_DELEGATED_METHODS` there); full-set parity is enforced by
@@ -157,6 +157,16 @@ export interface FilesystemStorageCapabilities {
  * Decorators MUST forward this capability deliberately; custody callers refuse
  * backends that omit it instead of silently running unlocked.
  */
+/**
+ * Lock options a storage caller may pass. No `__test*` key is part of this public type;
+ * filesystem lock test hooks arrive only through withFilesystemLockTestHooks in filesystem.ts,
+ * which must match the import-graph pin in filesystem-internal-importers.test.ts.
+ */
+export type NamespaceLockOptions = {
+  [K in keyof import("./cross-process-lock.js").CrossProcessLockOptions as K extends `__test${string}` ? never : K]:
+    import("./cross-process-lock.js").CrossProcessLockOptions[K];
+};
+
 export interface NamespaceLockStorageCapabilities {
   // These two `import("./cross-process-lock.js")` references are the ONLY edge
   // from interface.ts to cross-process-lock.ts, and cross-process-lock.ts imports
@@ -171,6 +181,30 @@ export interface NamespaceLockStorageCapabilities {
     namespace: string,
     lockFileName: string,
     operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
-    options?: import("./cross-process-lock.js").CrossProcessLockOptions,
+    options?: NamespaceLockOptions,
   ): Promise<T>;
+}
+
+/**
+ * Explicit file and descriptor-verified directory barriers inside a strict namespace lock at the Node API boundary.
+ * On Darwin, FileHandle.sync uses libuv's F_FULLFSYNC, then F_BARRIERFSYNC, then fsync fallback chain,
+ * discarding earlier errors; strict means whatever that chain achieved and is not proven.
+ * This bound must match audit-log-architecture.md and reorg-surface-manifest.md before recorder use.
+ */
+export interface StrictDurabilityStorageCapabilities {
+  // Strict mutations require the lock below because only its held descriptors establish root and parent durability.
+  // Must match the strict methods in filesystem.ts and the refusal list in read-only-guard.ts.
+  /** Verify and sync held namespace, root and root parent descriptors on every acquisition; the root parent must exist. */
+  withStrictNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
+    options?: NamespaceLockOptions,
+  ): Promise<T>;
+  /** Resolve only after file, directory and close barriers; rejection can follow visible publication. */
+  writeStrict(namespace: string, key: string, data: Uint8Array): Promise<void>;
+  /** Publish exclusively with strict barriers; false leaves the existing destination unchanged. */
+  writeIfAbsentStrict(namespace: string, key: string, data: Uint8Array): Promise<boolean>;
+  /** Serialize comparison and strict replacement across processes. */
+  replaceIfEqualsStrict(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean>;
 }
