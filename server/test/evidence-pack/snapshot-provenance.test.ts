@@ -1,0 +1,70 @@
+import { describe, it, expect, beforeAll, vi } from "vitest";
+import { readFileSync, writeFileSync, mkdtempSync, realpathSync, readdirSync, lstatSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync, execFileSync } from "node:child_process";
+// @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
+import { validateSource, digest, candidateForTests } from "../../scripts/build-evidence-pack.mjs";
+const SOURCE = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const archive = Buffer.from("synthetic source archive");
+// Must match the source and installed build record schemas in scripts/build-evidence-pack.mjs.
+const metadata = { format: "SANCTUARY_RELEASE_SOURCE_V1", source_revision: SOURCE, source_archive_sha256: digest(archive) };
+describe("candidate provenance input boundary", () => {
+  it("accepts full matching git and archive provenance", () => { expect(validateSource(metadata, archive, SOURCE, SOURCE)).toEqual(metadata); });
+  it.each(["short", "uppercase", "head", "env", "archive", "extra", "missing"])("refuses %s provenance", kind => {
+    const m = { ...metadata }; if (kind === "short") m.source_revision = SOURCE.slice(0, 8); if (kind === "uppercase") m.source_revision = SOURCE.toUpperCase(); if (kind === "extra") Object.assign(m, { extra: true }); if (kind === "missing") delete (m as Partial<typeof m>).source_archive_sha256;
+    expect(() => validateSource(m, kind === "archive" ? Buffer.from("other") : archive, kind === "short" ? m.source_revision : kind === "env" ? "a".repeat(40) : SOURCE, kind === "short" ? m.source_revision : kind === "head" ? "b".repeat(40) : SOURCE)).toThrow("Source provenance refused");
+  });
+  it("build command refuses an eight-hex input before bundling", () => { const root = mkdtempSync(join(tmpdir(), "provenance-")); const m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive); const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a], { encoding: "utf8" }); expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); });
+});
+describe("installed immutable version", () => {
+  let c: Awaited<ReturnType<typeof candidateForTests>>;
+  beforeAll(async () => { c = await candidateForTests(); }, 120_000);
+  it("runtime environment cannot replace the baked revision", () => { const r = spawnSync(process.execPath, [c.command, "--version"], { env: { ...process.env, SANCTUARY_SOURCE_SHA: "e".repeat(40) }, encoding: "utf8" }); expect(r.status).toBe(0); expect(r.stdout).toBe(`verify-evidence-pack 0.1.0 source_revision=${SOURCE}\n`); });
+  it("provenance hashes the final bundle and marks fixture builds non-release", () => { const p = JSON.parse(readFileSync(join(dirname(realpathSync(c.command)), "provenance.json"), "utf8")); expect(Object.keys(p).sort()).toEqual(["format", "package_version", "source_revision", "source_archive_sha256", "verifier_sha256", "dependency_lock_sha256"].sort()); expect(p).toMatchObject({ format: "SANCTUARY_VERIFIER_BUILD_V1", package_version: "0.1.0", source_revision: SOURCE, source_archive_sha256: digest(readFileSync(c.archive)), verifier_sha256: digest(readFileSync(c.command)), dependency_lock_sha256: digest(readFileSync(join(c.tree, "server/package-lock.json"))) }); if (c.fixture) { expect(c.non_release).toBe(true); expect(readFileSync(join(c.root, "NON_RELEASE_FIXTURE"), "utf8")).toContain("not release authentication"); } });
+});
+
+// @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
+import { extractSourceArchive, prepareFixtureCandidate, buildCandidate } from "../../scripts/build-evidence-pack.mjs";
+import { mkdirSync, existsSync } from "node:fs";
+it.each([SOURCE, undefined])("release provenance still refuses a missing explicit revision with head %s", head => { expect(() => validateSource(metadata, archive, undefined, head)).toThrow("Source provenance refused"); });
+it.each(["symlink", "hardlink", "fifo"])("source archive refuses nonregular member %s before extraction", kind => {
+  const root = mkdtempSync(join(tmpdir(), "archive-members-")), archive = join(root, "source.tar"), target = join(root, "staged"); mkdirSync(target);
+  execFileSync("/usr/bin/python3", ["-I", "-S", "-c", `import tarfile,sys,io
+with tarfile.open(sys.argv[1], 'w') as archive:
+    safe=tarfile.TarInfo('safe'); safe.size=1; archive.addfile(safe,io.BytesIO(b'x'))
+    member=tarfile.TarInfo('member'); member.type={'symlink':tarfile.SYMTYPE,'hardlink':tarfile.LNKTYPE,'fifo':tarfile.FIFOTYPE}[sys.argv[2]]; member.linkname='safe'; archive.addfile(member)
+`, archive, kind]);
+  expect(() => extractSourceArchive(archive, target)).toThrow(); expect(existsSync(join(target, "safe"))).toBe(false);
+});
+it("source archive admits only regular files and directories", () => {
+  const root = mkdtempSync(join(tmpdir(), "archive-positive-")), source = join(root, "source"), target = join(root, "staged"), archive = join(root, "source.tar"); mkdirSync(source); mkdirSync(target); writeFileSync(join(source, "file"), "exact bytes"); execFileSync("tar", ["-cf", archive, "-C", source, "."]);
+  extractSourceArchive(archive, target); expect(readFileSync(join(target, "file"), "utf8")).toBe("exact bytes");
+});
+// Must match the in-place output replacement in scripts/build-evidence-pack.mjs.
+it.each(["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"])("rebuild clears stale files in place in %s", async output => {
+  const c = await prepareFixtureCandidate(), destination = join(c.tree, output);
+  const before = lstatSync(destination, { bigint: true });
+  writeFileSync(join(destination, "stale.js"), "stale");
+  await buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], c.tree, SOURCE);
+  expect(existsSync(join(destination, "stale.js"))).toBe(false);
+  expect(lstatSync(destination, { bigint: true }).ino).toBe(before.ino);
+  expect(lstatSync(destination, { bigint: true }).dev).toBe(before.dev);
+}, 120_000);
+it.each(["deleted", "mismatched"])("buildCandidate entry refuses %s environment revision before staging a file", async kind => {
+  const root = mkdtempSync(join(tmpdir(), "entry-provenance-")), tree = join(root, "tree"), staging = join(root, "staging");
+  mkdirSync(tree); mkdirSync(staging);
+  const source = join(root, "source"); mkdirSync(source); writeFileSync(join(source, "sentinel"), "must not be staged");
+  const a = join(root, "source.tar"), m = join(root, "source.json");
+  execFileSync("tar", ["-cf", a, "-C", source, "."]);
+  writeFileSync(m, JSON.stringify({ ...metadata, source_archive_sha256: digest(readFileSync(a)) }));
+  expect(existsSync(join(tree, ".git"))).toBe(false);
+  vi.stubEnv("TMPDIR", staging);
+  vi.stubEnv("SANCTUARY_SOURCE_SHA", kind === "deleted" ? undefined : (SOURCE[0] === "a" ? "b" : "a").repeat(SOURCE.length));
+  try {
+    // The omitted revision argument exercises the release entry's ambient input before any archive byte is staged.
+    await expect(buildCandidate(["--source-metadata", m, "--source-archive", a], tree)).rejects.toThrow("Source provenance refused");
+    expect(readdirSync(staging)).toEqual([]);
+    expect(readdirSync(tree)).toEqual([]);
+  } finally { vi.unstubAllEnvs(); }
+});

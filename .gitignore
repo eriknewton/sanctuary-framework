@@ -106,3 +106,5 @@ castle-wall-daemon/mutants.out.old/
 
 # Ignore lease guard fixtures that survive an interrupted test run.
 server/.lease-guard-*
+
+server/evidence-pack-dist/
