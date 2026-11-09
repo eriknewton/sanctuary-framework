@@ -61,6 +61,14 @@ export interface CensusSamplingContext {
   bootId: string | null;
 }
 
+/** True when two sampling contexts name the same boot and the same full gateway identity (pid, start, uid, generation). */
+export function sameSamplingIdentity(a: CensusSamplingContext, b: CensusSamplingContext): boolean {
+  if (a.bootId !== b.bootId) return false;
+  if (a.gateway === null || b.gateway === null) return a.gateway === b.gateway;
+  return a.gateway.pid === b.gateway.pid && a.gateway.start_identity === b.gateway.start_identity &&
+    a.gateway.uid === b.gateway.uid && a.gateway.generation === b.gateway.generation;
+}
+
 export interface SamplerTimers {
   setInterval(fire: () => void, ms: number): unknown;
   clearInterval(handle: unknown): void;
@@ -140,10 +148,18 @@ export class CensusSampler {
   private async attempt(): Promise<void> {
     this.attempts = Math.min(COUNTER_MAX, this.attempts + 1);
     this.lastRowVisits = 0;
+    // The boot and gateway identity are fixed before the read starts. A read is credited only to the generation it was
+    // taken under: if either changed while netstat ran (including a new start of the same pid), the attempt is refused,
+    // because the output may describe the earlier process.
+    const started = this.deps.context();
     let result: CensusChildResult;
     try { result = await this.deps.runNetstat(); }
     catch { result = { status: "failed" }; }
     const context = this.deps.context();
+    if (!sameSamplingIdentity(started, context)) {
+      this.lastOk = false;
+      return;
+    }
     // A failed attempt appends nothing; the retained same-generation samples stay because the evaluator's spacing refuses a gap.
     if (result.status !== "ok" || context.gateway === null || !context.gatewayAlive || context.ipv4Set === null || context.bootId === null) {
       this.lastOk = false;

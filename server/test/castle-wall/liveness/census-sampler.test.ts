@@ -146,6 +146,45 @@ describe("retention", () => {
     expect(new Set(h.series.snapshot().map(sample => sample.gateway.generation)).size).toBe(1);
   });
 
+  it.each([
+    ["a new start of the same pid", { start_identity: "Mon Nov  9 12:30:00 2026", generation: "generation-fixture-restart" }],
+    ["a new generation of the same pid and start", { generation: "generation-fixture-restart" }],
+    ["a different uid for the same pid", { uid: GATEWAY.uid + 1 }],
+  ] as const)("refuses a netstat read that resolves after %s, so old output is never stamped with the new identity", async (_case, change) => {
+    const h = harness();
+    for (let i = 0; i < 5; i++) { await h.sampler.tick(); advance(h, CENSUS_PERIOD); }
+    const before = JSON.stringify(h.series.snapshot());
+    const healthy = h.output.next;
+    let resolve: (result: CensusChildResult) => void = () => undefined;
+    h.output.next = () => new Promise<CensusChildResult>(done => { resolve = done; });
+    const attempt = h.sampler.tick();
+    h.output.next = healthy;
+    h.ctx.value = context({ gateway: { ...GATEWAY, ...change } });
+    resolve({ status: "ok", stdout: netstat(5000, 2) });
+    await attempt;
+    expect(h.sampler.latestAttemptOk()).toBe(false);
+    expect(JSON.stringify(h.series.snapshot())).toBe(before);
+    // The next read, started and finished under the new identity, is credited to it.
+    advance(h, CENSUS_PERIOD);
+    await h.sampler.tick();
+    expect(h.sampler.latestAttemptOk()).toBe(true);
+    expect(h.series.snapshot().at(-1)!.gateway).toEqual({ ...GATEWAY, ...change });
+  });
+
+  it("refuses a netstat read that resolves after a boot change", async () => {
+    const h = harness();
+    for (let i = 0; i < 5; i++) { await h.sampler.tick(); advance(h, CENSUS_PERIOD); }
+    const before = JSON.stringify(h.series.snapshot());
+    let resolve: (result: CensusChildResult) => void = () => undefined;
+    h.output.next = () => new Promise<CensusChildResult>(done => { resolve = done; });
+    const attempt = h.sampler.tick();
+    h.ctx.value = context({ bootId: "boot-fixture-next" });
+    resolve({ status: "ok", stdout: netstat(5000, 2) });
+    await attempt;
+    expect(h.sampler.latestAttemptOk()).toBe(false);
+    expect(JSON.stringify(h.series.snapshot())).toBe(before);
+  });
+
   it("appends nothing on a failed attempt and keeps the series", async () => {
     const h = harness();
     for (let i = 0; i < 5; i++) { await h.sampler.tick(); advance(h, CENSUS_PERIOD); }
