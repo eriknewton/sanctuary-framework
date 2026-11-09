@@ -8,6 +8,17 @@ import { resolveStoragePath } from "../paths.js";
 import { observeStoredPassphrase } from "../wrap/passphrase.js";
 import { consumeFlagValue } from "./argv.js";
 import {
+  evaluateFortressLiveness,
+  formatLivenessLines,
+  wallOnlyStatusExit,
+  type LivenessReaderContext,
+} from "./castle-wall-liveness-status.js";
+import {
+  resolveStableRuntime,
+  STABLE_RUNTIME_REFUSAL_EXIT_CODE,
+  type StableRuntimeResult,
+} from "./stable-runtime-path.js";
+import {
   CASTLE_WALL_BOOT_LABEL,
   FORBIDDEN_PLIST_ENV,
 } from "./castle-wall-boot.js";
@@ -136,6 +147,16 @@ export interface FullAgentCommandContext {
   observePassphrase?: typeof observeStoredPassphrase;
   sleep?: (ms: number) => Promise<void>;
   stateStore?: (fortress: string) => FullAgentStateStore;
+  /** INTERNAL/TEST: stable runtime selection; defaults to the Homebrew candidate list and the real filesystem. */
+  stableRuntime?: (running: { execPath: string; cliPath: string; operatorUid: number }) => StableRuntimeResult;
+  /** INTERNAL/TEST: the shared liveness reader's injected clock, boot provider and filesystem for `full-status`. */
+  liveness?: LivenessReaderContext;
+}
+
+/** Run stable runtime selection steps one to four against the running interpreter and CLI. */
+function stableRuntimeFor(ctx: AgentContext, input: FullAgentCommandContext): StableRuntimeResult {
+  const running = { execPath: input.execPath ?? process.execPath, cliPath: input.cliPath ?? process.argv[1]!, operatorUid: ctx.uid };
+  return (input.stableRuntime ?? resolveStableRuntime)(running);
 }
 
 function launchctl(command: string, args: string[]): FullAgentExecResult {
@@ -362,7 +383,17 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
     // state_PREFLIGHT: no host mutation precedes session, job and credential checks.
     const ctx = context(argv, input);
     if (refuseUnsupported(ctx)) return 1;
+    // state_PREFLIGHT_ONLY: --preflight validates paths and mutates nothing, so it skips the TTY, boot daemon and loaded-job checks.
+    if (argv.includes("--preflight")) {
+      const preflight = stableRuntimeFor(ctx, input);
+      if (!preflight.ok) { err.write(`install-full preflight refused: ${preflight.reason}\n`); return STABLE_RUNTIME_REFUSAL_EXIT_CODE; }
+      ctx.out.write(`install-full preflight valid: node=${preflight.node} cli=${preflight.cli}\n`);
+      return 0;
+    }
     if (!ctx.isTTY) { err.write("install-full requires an attended TTY session.\n"); return 2; }
+    // The stable runtime is validated before any job refusal, credential read or write, so a refusal never reaches the credential.
+    const runtime = stableRuntimeFor(ctx, input);
+    if (!runtime.ok) { err.write(`install-full refused an unstable runtime: ${runtime.reason}\n`); return STABLE_RUNTIME_REFUSAL_EXIT_CODE; }
     const bootJob = observeJob(ctx.exec, `system/${CASTLE_WALL_BOOT_LABEL}`);
     if (bootJob.state === "state_INDETERMINATE") throw new Error("Safe-mode boot daemon job state is INDETERMINATE.");
     if (bootJob.state === "state_LOADED") {
@@ -379,8 +410,8 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
       storagePath: ctx.fortressPath, home: ctx.home, readOnly: true, platformOverride: "darwin",
     });
     if (credential.status !== "found") { err.write("No stored credential is available for this fortress.\n"); return 1; }
-    const cli = ctx.io.realpathSync(input.cliPath ?? process.argv[1]!);
-    const plist = generateFullAgentPlist([input.execPath ?? process.execPath, cli, "castle-wall", "daemon", "--fortress", ctx.fortressPath, "--launch-agent"]);
+    // The lexical stable paths are saved, never a Cellar realpath that the next upgrade deletes.
+    const plist = generateFullAgentPlist([runtime.node, runtime.cli, "castle-wall", "daemon", "--fortress", ctx.fortressPath, "--launch-agent"]);
     if (!fullAgentLaunchAgentWellFormed(plist)) throw new Error("Full LaunchAgent validation failed.");
     // state_INSTALL: any failure after opening the plist enters rollback.
     ctx.io.mkdirSync(dirname(ctx.plist), { recursive: true });
@@ -397,6 +428,13 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
     // state_ARM: success requires a stable positive service-level pid.
     const pid = await stablePid(ctx, ctx.sleep);
     if (pid === null) throw new Error("Full LaunchAgent did not maintain a stable running pid; inspect full-status and its logs.");
+    // Selection step five: the rendered and loaded arguments must name the validated lexical paths.
+    const loaded = observeJob(ctx.exec, ctx.target);
+    const rendered = plistProgramArguments(plist);
+    if (loaded.state !== "state_LOADED" || loaded.arguments[0] !== runtime.node || loaded.arguments[1] !== runtime.cli ||
+        rendered[0] !== runtime.node || rendered[1] !== runtime.cli) {
+      throw new Error("Full LaunchAgent arguments do not name the validated stable runtime.");
+    }
     ctx.out.write(`Full LaunchAgent installed; running pid=${pid}.\n`);
     rollback = undefined;
     return 0;
@@ -442,7 +480,10 @@ export async function runFullStatus(argv: string[] = [], input: FullAgentCommand
     const state = ctx.state.read();
     const pid = printed.state === "state_LOADED" ? printed.pid : null;
     ctx.out.write(`Full LaunchAgent state=${state?.state ?? "state_ABSENT"} charges=${state?.charges_ms.length ?? 0} pid=${pid ?? "none"}\n`);
-    return state?.state === "state_RUNNING" && pid !== null ? 0 : 1;
+    // A running pid is supervision evidence only; the exit is the shared evaluator's wall verdict. Exit codes must match the exit constants in server/src/castle-wall/liveness/constants.ts.
+    const envelope = await evaluateFortressLiveness(ctx.fortressPath, { ...input.liveness, platform: ctx.platform });
+    ctx.out.write(formatLivenessLines(envelope));
+    return wallOnlyStatusExit(envelope);
   } catch { err.write("Full LaunchAgent state is unavailable; inspect its counter and logs.\n"); return 1; }
 }
 

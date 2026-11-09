@@ -1539,6 +1539,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runFullStatus(args.slice(1));
   }
 
+  if (command === "liveness-status") {
+    const { runLivenessStatus } = await import("./cli/castle-wall-liveness-status.js");
+    return runLivenessStatus(args.slice(1));
+  }
+
   if (command === "reset-full") {
     const { runResetFull } = await import("./cli/castle-wall-full-agent.js");
     return runResetFull(args.slice(1));
@@ -1826,8 +1831,24 @@ function printCastleWallHelp(): void {
                      credential only, NOT the fortress passphrase. install-boot auto-provisions it; --rotate replaces.
     install-full     Install the user-session full daemon (macOS, attended TTY).
                      Do not run install-full, reset-full or uninstall-full concurrently.
+                     --preflight  Check the Node and CLI paths are stable (no Homebrew Cellar
+                                  path) and change nothing; exit 0 valid, 78 refused.
     uninstall-full   Remove the user-session full daemon service (requires --yes).
     full-status      Show the full daemon restart state and running pid.
+                     Exits 0 only when stored wall liveness evidence reads OK (3 for a wall
+                     warning); a running pid alone exits 1. status exits the same way.
+    liveness-status  Report wall, agent and coverage liveness from stored evidence. Read-only:
+                     it never probes, repairs, renews or writes. --json prints one JSON object;
+                     --fortress <absolute path> targets a fortress. Exit 0 wall OK, 1 wall down,
+                     initializing or recovering, 3 wall TTL warning or degraded, 2 usage, 70 when
+                     it cannot evaluate (including a read past the read deadline). Agent and
+                     coverage never change the exit. Checks owner and mode bits only; ACL
+                     verification is a commissioning step.
+                     Agent census honesty bound:
+                     - the census is not adversarial, and a hostile agent can trickle bytes to look alive;
+                     - growth proves responses on one messaging-service connection of the gateway process, not update delivery (a 409 Conflict loop grows rx) and not handler or reply liveness; a sustained send burst on another connection can read alive while the updater is dead;
+                     - only IPv4 polling connections are observed; netstat truncates IPv6 addresses, so a gateway polling over IPv6 reads down;
+                     - the agent can kill or starve its canary, but cannot disable it or boot it out.
     reset-full       Unload and clear the full daemon counter, then start it if installed (TTY, --yes).
                      Do not run install-full, reset-full or uninstall-full concurrently.
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
