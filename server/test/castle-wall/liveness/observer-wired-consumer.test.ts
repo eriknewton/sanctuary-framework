@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { OBSERVER_PERIOD } from "../../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
 import { LivenessObserver, type LivenessObserverDeps } from "../../../src/castle-wall/liveness/observer.js";
@@ -18,8 +18,7 @@ import { LivenessRecordPublisher } from "../../../src/castle-wall/liveness/recor
 import { parseObserverRecord } from "../../../src/castle-wall/liveness/schema.js";
 import * as watch from "../../../src/cli/castle-wall-watch.js";
 import { BoundedChildRunner, type WatchChild, type WatchSpawn } from "../../../src/cli/castle-wall-watch-collectors.js";
-import { setKeychainExec } from "../../../src/wrap/keychain-exec.js";
-import { installInMemoryKeychainStore } from "../../setup/keychain-memory-store.js";
+import { inMemoryKeychainCalls } from "../../setup/keychain-memory-store.js";
 
 vi.mock("../../../src/cli/castle-wall-watch.js", async importOriginal => {
   const original = await importOriginal<typeof import("../../../src/cli/castle-wall-watch.js")>();
@@ -34,9 +33,7 @@ const PS_TEXT = (JSON.parse(readFileSync(join(FIX, "process-census.json"), "utf8
 const NETSTAT = readFileSync(join(FIX, "census", "netstat-anv-macos26.txt"), "utf8");
 const goldenArguments = (): string[] => [...(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(GOLDEN)![1]!).matchAll(/<string>([^<]*)<\/string>/g)].map(m => m[1]!);
 
-const credentialCalls: unknown[] = [];
-beforeAll(() => { setKeychainExec((cmd, args) => { credentialCalls.push([cmd, args]); throw new Error("no credential read is expected"); }); });
-afterAll(() => { installInMemoryKeychainStore(); });
+// The shared in-memory credential store logs every call it serves; no verb may reach it.
 
 /** Modelled children for every command a production cycle spawns. */
 function modelledSpawn(argv: string[][]): WatchSpawn {
@@ -156,7 +153,7 @@ describe("production composition", () => {
     expect(publishes.length).toBeGreaterThanOrEqual(100);
     const observer = built!.observer;
     expect(observer.stats().cycles).toBeGreaterThanOrEqual(100);
-    expect(credentialCalls).toEqual([]);
+    expect(inMemoryKeychainCalls()).toEqual([]);
     const recordPath = join(root, "liveness", "observer.json");
     const record = JSON.parse(readFileSync(recordPath, "utf8"));
     expect(parseObserverRecord(record).ok).toBe(true);

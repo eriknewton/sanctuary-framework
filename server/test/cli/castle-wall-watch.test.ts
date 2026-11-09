@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, symlinkSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CANARY_LABEL, CHILD_READ_DEADLINE, OBSERVER_LABEL, SECOND, WATCH_THROTTLE_INTERVAL_S } from "../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../src/castle-wall/liveness/census-sampler.js";
 import { CANARY_INSTALLED_PLIST_PATH, generateCanaryPlist, parseSystemJobPrint } from "../../src/castle-wall/liveness/launchd-plists.js";
@@ -35,8 +35,7 @@ import {
 } from "../../src/cli/castle-wall-watch.js";
 import { BoundedChildRunner, type WatchChild, type WatchSpawn } from "../../src/cli/castle-wall-watch-collectors.js";
 import { resolveStableRuntime, SANCTUARY_PACKAGE_NAME, STABLE_RUNTIME_REFUSAL_EXIT_CODE } from "../../src/cli/stable-runtime-path.js";
-import { setKeychainExec } from "../../src/wrap/keychain-exec.js";
-import { installInMemoryKeychainStore } from "../setup/keychain-memory-store.js";
+import { inMemoryKeychainCalls } from "../setup/keychain-memory-store.js";
 
 const UID = process.getuid!();
 const AGENT_UID = UID + 1;
@@ -56,10 +55,7 @@ const attendedInstall = (fortress: string) =>
   `/usr/bin/install -o root -g wheel -m 0644 '${fortress}/liveness/canary.plist' /Library/LaunchDaemons/ai.sanctuaryprotocol.castle-wall.canary.plist\n` +
   "/bin/launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.castle-wall.canary.plist\n";
 
-// The credential store is replaced by a counting refusal for this file; no verb may reach it.
-const credentialCalls: unknown[] = [];
-beforeAll(() => { setKeychainExec((cmd, args) => { credentialCalls.push([cmd, args]); throw new Error("no credential read is expected"); }); });
-afterAll(() => { installInMemoryKeychainStore(); });
+// The shared in-memory credential store logs every call it serves; no verb may reach it.
 
 class Sink extends Writable {
   text = "";
@@ -138,7 +134,7 @@ afterEach(() => {
       try { rmdirSync(dir); } catch { /* absent or holds a stray temp */ }
     }
   }
-  expect(credentialCalls).toEqual([]);
+  expect(inMemoryKeychainCalls()).toEqual([]);
   vi.useRealTimers();
 });
 
@@ -221,7 +217,7 @@ function expectNoEscalationOrConfigWrite(w: World): void {
   for (const env of w.launchd.envs) expect(env).toEqual({ PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" });
   expect(w.writeOpens.filter(p => p === watchConfigPath(w.fortress) || p.startsWith(`${watchConfigPath(w.fortress)}.`))).toEqual([]);
   expect(existsSync(watchConfigPath(w.fortress))).toBe(false);
-  expect(credentialCalls).toEqual([]);
+  expect(inMemoryKeychainCalls()).toEqual([]);
 }
 
 // ---------------------------------------------------------------------------
