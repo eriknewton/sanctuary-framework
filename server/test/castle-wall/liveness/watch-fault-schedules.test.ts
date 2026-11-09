@@ -5,6 +5,7 @@
  * write is paused while newer cycles complete.
  */
 import { EventEmitter } from "node:events";
+import { constants as fsConstants } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COUNTER_MAX, KILL_REAP_GRACE, MAX_COLLECTION_CHILDREN, TERM_GRACE } from "../../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
@@ -24,6 +25,10 @@ import {
 } from "../../../src/cli/castle-wall-watch-collectors.js";
 
 const OPERATOR = 501;
+/** The boot the quiet collectors read; the publication claim orders this instance by it. */
+const BOOT_FIXTURE = "boot-fixture-current";
+/** Any fixed instance start on the boot uptime clock: one instance per test, so nothing is ordered against it. */
+const INSTANCE_START = 1_000;
 afterEach(() => { vi.useRealTimers(); });
 
 /** Timers that never fire on their own, so a cycle ends only when its collectors settle. */
@@ -35,7 +40,7 @@ const inertTimers = {
 function quietCollectors(readRecords: ObserverCollectors["readRecords"]): ObserverCollectors {
   const refuse = () => Promise.reject(new Error("fixture collector refused"));
   return {
-    readRecords, readBootId: () => Promise.resolve("boot-fixture-current"), queryAvailability: () => Promise.resolve("live"),
+    readRecords, readBootId: () => Promise.resolve(BOOT_FIXTURE), queryAvailability: () => Promise.resolve("live"),
     printFullAgent: refuse, readFullAgentState: refuse, readProcesses: refuse, printHarness: refuse, collectCanaryFacts: refuse,
   };
 }
@@ -264,11 +269,12 @@ describe("publication under the observer", () => {
       return undefined;
     }
     async lstat(): Promise<{ uid: number; mode: number; isDirectory(): boolean }> { return { uid: OPERATOR, mode: 0o40700, isDirectory: () => true }; }
-    /** Record temps only; the lock and claim temps the publication fence writes are not record writes. */
+    /** Record temps only; the publication claim temps the publisher writes are not record writes. */
     private isRecordTemp(path: string): boolean {
-      return path.endsWith(".tmp") && !path.endsWith(".lock.tmp") && !path.endsWith(".publisher.tmp");
+      return path.endsWith(".tmp") && !path.endsWith(".publisher.tmp");
     }
-    async open(path: string): Promise<PublisherFileHandle> {
+    async open(path: string, flags: number): Promise<PublisherFileHandle> {
+      if ((flags & fsConstants.O_CREAT) === 0) return this.openExisting(path);
       if (this.files.has(path)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
       if (this.isRecordTemp(path)) {
         this.openTemps++;
@@ -278,9 +284,26 @@ describe("publication under the observer", () => {
       this.files.set(path, "");
       return {
         stat: async () => ({ uid: OPERATOR, mode: 0o100600, isFile: () => true }),
+        read: async () => ({ bytesRead: 0 }),
         writeFile: async text => { data = text; },
         sync: async () => undefined,
         close: async () => { if (this.files.has(path)) this.files.set(path, data); },
+      };
+    }
+    /** A read-only open of a stored file, as the publisher reads its claim. */
+    private openExisting(path: string): PublisherFileHandle {
+      const text = this.files.get(path);
+      if (text === undefined) throw Object.assign(new Error("absent"), { code: "ENOENT" });
+      const bytes = Buffer.from(text);
+      return {
+        stat: async () => ({ uid: OPERATOR, mode: 0o100600, isFile: () => true }),
+        read: async (buffer, offset, length, position) => {
+          const copied = bytes.copy(buffer, offset, position, Math.min(bytes.length, position + length));
+          return { bytesRead: copied };
+        },
+        writeFile: async () => { throw new Error("read-only fixture handle"); },
+        sync: async () => undefined,
+        close: async () => undefined,
       };
     }
     async rename(from: string, to: string): Promise<void> {
@@ -308,16 +331,11 @@ describe("publication under the observer", () => {
       if (text === undefined) throw Object.assign(new Error("absent"), { code: "ENOENT" });
       this.files.set(newPath, text);
     }
-    async readFile(path: string): Promise<string> {
-      const text = this.files.get(path);
-      if (text === undefined) throw Object.assign(new Error("absent"), { code: "ENOENT" });
-      return text;
-    }
   }
 
   it("never lets an older record overwrite a newer one, and keeps one write in flight with one waiting, over 1000 waves", async () => {
     const fs = new MemoryFs();
-    const publisher = new LivenessRecordPublisher({ fortressPath: "/fortress-fixture", fileName: "observer.json", instance: "observer-schedule-1", operatorUid: OPERATOR, fs });
+    const publisher = new LivenessRecordPublisher({ fortressPath: "/fortress-fixture", fileName: "observer.json", instance: "observer-schedule-1", bootId: BOOT_FIXTURE, instanceStartedUptimeMs: INSTANCE_START, operatorUid: OPERATOR, fs });
     const now = { ms: 1_794_225_600_000 };
     const observer = observerWith(quietCollectors(() => Promise.resolve(absentRecords())), publisher, now);
     const target = "/fortress-fixture/liveness/observer.json";
@@ -357,7 +375,7 @@ describe("a publication stalled indefinitely under the observer", () => {
         return Promise.reject(Object.assign(new Error("fixture refusal"), { code: "EACCES" }));
       },
     };
-    const real = new LivenessRecordPublisher({ fortressPath: "/fortress-fixture-never-created", fileName: "observer.json", instance: "observer-stall-1", operatorUid: OPERATOR, fs });
+    const real = new LivenessRecordPublisher({ fortressPath: "/fortress-fixture-never-created", fileName: "observer.json", instance: "observer-stall-1", bootId: BOOT_FIXTURE, instanceStartedUptimeMs: INSTANCE_START, operatorUid: OPERATOR, fs });
     // Count every reaction attached to each distinct drain the publisher returns, without changing the drain's identity.
     const reactions = new Map<Promise<void>, number>();
     const publisher: ObserverPublisher = {

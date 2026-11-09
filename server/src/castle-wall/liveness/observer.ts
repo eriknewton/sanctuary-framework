@@ -235,6 +235,11 @@ export class LivenessObserver {
     return this.censusContext;
   }
 
+  /** The last positively read boot identity; null until a boot read has validated. A failed read never clears it. */
+  validatedBootId(): string | null {
+    return this.bootId;
+  }
+
   start(): void {
     if (this.handle !== null || this.state === "observer_STOPPING") return;
     this.deps.sampler.start();

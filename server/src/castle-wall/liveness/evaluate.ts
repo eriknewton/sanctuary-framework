@@ -414,6 +414,9 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
       if (age === undefined) { wall.add("time_untrusted"); return null; }
       return age;
     };
+    // Gate 1 needs instance evidence: an observer that references no daemon record has not shown which instance it
+    // observed, so its wall evidence is incomplete for the current instance and can never support OK.
+    if (p.daemon_ref === null) wall.add("evidence_incomplete");
     // Gate 1 has two separate halves. Instance consistency: an observer whose daemon reference names another
     // instance observed a different process, so none of its wall evidence is credited toward OK for the current
     // instance; the wall reads recovering until a fresh observer record references the current instance. A matching

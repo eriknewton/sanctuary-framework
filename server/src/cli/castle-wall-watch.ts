@@ -36,9 +36,9 @@ import {
   systemJobNotFound,
   watchAgentLaunchAgentWellFormed,
 } from "../castle-wall/liveness/launchd-plists.js";
-import { LivenessObserver, observerHostId, type LivenessObserverDeps, type ObserverClock, type ObserverTimers } from "../castle-wall/liveness/observer.js";
+import { LivenessObserver, observerHostId, type LivenessObserverDeps, type ObserverClock, type ObserverPublisher, type ObserverTimers } from "../castle-wall/liveness/observer.js";
 import { readLivenessRecords } from "../castle-wall/liveness/read-status.js";
-import { LivenessRecordPublisher } from "../castle-wall/liveness/record-store.js";
+import { LivenessPublicationError, LivenessRecordPublisher } from "../castle-wall/liveness/record-store.js";
 import { parseConfigRecord } from "../castle-wall/liveness/schema.js";
 import { livenessFortressId } from "./castle-wall-liveness-status.js";
 import { LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS, parseFullAgentPrint } from "./castle-wall-full-agent.js";
@@ -412,6 +412,35 @@ export const productionObserverClock: ObserverClock = {
   uptimeMs: () => Math.floor(osUptime() * SECOND),
 };
 
+/**
+ * The observer's record publisher, built on its first publish from the boot the observer has validated. The publication
+ * claim orders this instance against another by boot and start, and a claim without a boot can never order itself, so
+ * it would refuse every publish; the observer withholds publishing until its start has a validated boot, so the first
+ * publish is the earliest point the boot is known. A publish with no validated boot is refused and builds nothing.
+ */
+export class BootBoundObserverPublisher implements ObserverPublisher {
+  private bound: LivenessRecordPublisher | null = null;
+
+  constructor(
+    private readonly bootOf: () => string | null,
+    private readonly build: (bootId: string) => LivenessRecordPublisher,
+  ) {}
+
+  publish(record: unknown): Promise<void> {
+    if (this.bound === null) {
+      const bootId = this.bootOf();
+      if (bootId === null) return Promise.reject(new LivenessPublicationError("observer publisher has no validated boot"));
+      this.bound = this.build(bootId);
+    }
+    return this.bound.publish(record);
+  }
+
+  /** The bound publisher, once the first publish has built it. */
+  current(): LivenessRecordPublisher | null {
+    return this.bound;
+  }
+}
+
 /** Build the observer with every collector, the sampler, the publisher and the clock as required arguments. */
 export function composeProductionWatch(input: ProductionWatchInput): { observer: LivenessObserver; sampler: CensusSampler; deps: LivenessObserverDeps; start(): void; stop(): Promise<void> } {
   const collectors = createWatchCollectors({ runner: input.runner, timers: input.timers, fortressPath: input.fortressPath, operatorUid: input.operatorUid });
@@ -425,7 +454,11 @@ export function composeProductionWatch(input: ProductionWatchInput): { observer:
     clock: input.clock,
     timers: input.timers,
   });
-  const publisher = new LivenessRecordPublisher({ fortressPath: input.fortressPath, fileName: OBSERVER_RECORD_FILE, instance, operatorUid: input.operatorUid });
+  // The instance start is read once, at composition, on the boot uptime clock the claim orders instances by.
+  const instanceStartedUptimeMs = input.clock.uptimeMs();
+  const publisher = new BootBoundObserverPublisher(() => observer?.validatedBootId() ?? null, bootId => new LivenessRecordPublisher({
+    fortressPath: input.fortressPath, fileName: OBSERVER_RECORD_FILE, instance, bootId, instanceStartedUptimeMs, operatorUid: input.operatorUid,
+  }));
   const deps: LivenessObserverDeps = {
     fortressId: livenessFortressId(input.fortressPath),
     hostId: observerHostId(input.hostname),

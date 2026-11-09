@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import { OBSERVER_PERIOD } from "../../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
 import { LivenessObserver, type LivenessObserverDeps } from "../../../src/castle-wall/liveness/observer.js";
-import { LivenessRecordPublisher } from "../../../src/castle-wall/liveness/record-store.js";
+import { LivenessPublicationError, LivenessRecordPublisher, parsePublicationClaim } from "../../../src/castle-wall/liveness/record-store.js";
 import { parseObserverRecord } from "../../../src/castle-wall/liveness/schema.js";
 import * as watch from "../../../src/cli/castle-wall-watch.js";
 import { BoundedChildRunner, type WatchChild, type WatchSpawn } from "../../../src/cli/castle-wall-watch-collectors.js";
@@ -99,13 +99,31 @@ describe("production composition", () => {
     expect(deps.sampler).toBeInstanceOf(CensusSampler);
     expect(composition.sampler).toBe(deps.sampler);
     expect(deps.series).toBeInstanceOf(CensusSeries);
-    expect(deps.publisher).toBeInstanceOf(LivenessRecordPublisher);
+    // The record publisher is bound on the first publish, once the observer has a validated boot to claim with.
+    expect(deps.publisher).toBeInstanceOf(watch.BootBoundObserverPublisher);
+    expect((deps.publisher as watch.BootBoundObserverPublisher).current()).toBeNull();
     expect(deps.clock).toBe(clock);
     expect(deps.timers).toBe(scaledTimers);
     expect(deps.operatorUid).toBe(UID);
     expect(deps.hostId).toMatch(/^host-[0-9a-f]{16}$/);
     expect(composition.observer).toBeInstanceOf(LivenessObserver);
     rmdirSync(root);
+  });
+
+  it("binds the record publisher once, to the first validated boot, and refuses a publish before any boot validates", async () => {
+    const boots: Array<string | null> = [null, "boot-fixture-first", "boot-fixture-later"];
+    const built: string[] = [];
+    let reads = 0;
+    const publisher = new watch.BootBoundObserverPublisher(() => boots[Math.min(reads++, boots.length - 1)]!, bootId => {
+      built.push(bootId);
+      return { publish: () => Promise.resolve() } as unknown as LivenessRecordPublisher;
+    });
+    await expect(publisher.publish({})).rejects.toBeInstanceOf(LivenessPublicationError);
+    expect(publisher.current()).toBeNull();
+    await publisher.publish({});
+    await publisher.publish({});
+    expect(built).toEqual(["boot-fixture-first"]);
+    expect(publisher.current()).not.toBeNull();
   });
 
   it("fails at construction when any dependency, collector or sampler input is missing", () => {
@@ -162,6 +180,11 @@ describe("production composition", () => {
     for (const call of argv.filter(c => c[0] === "/bin/launchctl")) expect(call[1]).toBe("print");
     // The publication fence leaves only the record and its current-publisher claim; no lock or temp survives.
     expect(readdirSync(join(root, "liveness")).sort()).toEqual(["observer.json", "observer.json.publisher"]);
+    // The claim orders this instance by the boot the observer validated and its start on the boot uptime clock.
+    const claim = parsePublicationClaim(readFileSync(`${recordPath}.publisher`, "utf8"));
+    expect(claim?.boot_id).toBe("boot-fixture-current");
+    expect(claim?.instance).toBe(record.observer_instance);
+    expect(Number.isSafeInteger(claim?.instance_started_uptime_ms)).toBe(true);
     unlinkSync(recordPath);
     unlinkSync(`${recordPath}.publisher`);
     rmdirSync(join(root, "liveness"));
