@@ -458,14 +458,15 @@ fn closure_nested_choice_coverage() {
             }
             "enum" => {
                 for (i, v) in n["values"].as_array().unwrap().iter().enumerate() {
-                    if value.is_none_or(|x| x == v) {
+                    // Written without Option::is_none_or (Rust 1.82) so the test builds on the crate's minimum Rust.
+                    if !matches!(value, Some(x) if x != v) {
                         target.insert(format!("{path}:{i}"));
                     }
                 }
             }
             "union" => {
                 for (i, b) in n["branches"].as_array().unwrap().iter().enumerate() {
-                    if value.is_none_or(|v| fits(b, v, defs)) {
+                    if !matches!(value, Some(v) if !fits(b, v, defs)) {
                         target.insert(format!("{path}:{i}"));
                         walk(b, &format!("{path}.branches.{i}"), defs, target, value);
                     }
