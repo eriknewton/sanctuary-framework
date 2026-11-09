@@ -30,10 +30,15 @@ describe("Linux business contract fixtures",()=>{
     try{
       const signature=createRecordSigner({...prepared.pin,...outer},provider,schema,"append").signRecord({role:prepared.pin.role,epoch:1,preimage_bytes:bytes}).signature;
       const sign=vi.spyOn(provider,"sign");
-      expect(verifyIndexedRecord(bytes,signature,prepared.pin,outer,schema,"append")).toBe(true);
-      provider.close();expect(verifyIndexedRecord(bytes,signature,prepared.pin,outer,schema,"append")).toBe(true);
-      for(const field of Object.keys(outer) as (keyof typeof outer)[])expect(verifyIndexedRecord(bytes,signature,prepared.pin,{...outer,[field]:typeof outer[field]==="number"?2:"different"},schema,"append")).toBe(false);
-      expect(verifyIndexedRecord(bytes,signature,{...prepared.pin,role:ROLE_REGISTRY[2].role},outer,schema,"append")).toBe(false);
+      // Must match records.rs verify: the business pin carries the grant's activation, lease and generation.
+      const pin={...prepared.pin,activation_id:outer.activation_id,lease_id:outer.lease_id,generation:outer.generation};
+      expect(verifyIndexedRecord(bytes,signature,pin,outer,schema,"append")).toBe(true);
+      provider.close();expect(verifyIndexedRecord(bytes,signature,pin,outer,schema,"append")).toBe(true);
+      for(const field of Object.keys(outer) as (keyof typeof outer)[])expect(verifyIndexedRecord(bytes,signature,pin,{...outer,[field]:typeof outer[field]==="number"?2:"different"},schema,"append")).toBe(false);
+      expect(verifyIndexedRecord(bytes,signature,{...pin,role:ROLE_REGISTRY[2].role},outer,schema,"append")).toBe(false);
+      // An authentic subject signature for this lease refuses under a pin that names another lease or generation.
+      for(const change of [{lease_id:"e".repeat(32)},{activation_id:"e".repeat(32)},{generation:7},{lease_id:"e".repeat(32),generation:7}])
+        expect(verifyIndexedRecord(bytes,signature,{...pin,...change},outer,schema,"append")).toBe(false);
       expect(sign).not.toHaveBeenCalled();
     }finally{provider.close();key.fill(0);}
   });
@@ -53,6 +58,6 @@ it("refuses a correctly signed retrospective record as live indexed evidence", (
     const {signature} = createRecordSigner({...prepared.pin, ...outer}, provider, schema, "retrospective")
       .signRecord({role: prepared.pin.role, epoch: 1, preimage_bytes: bytes});
     expect(verifyRecord(bytes, signature, prepared.pin, schema, "retrospective")).toBe(true);
-    expect(verifyIndexedRecord(bytes, signature, prepared.pin, outer, schema, "retrospective")).toBe(false);
+    expect(verifyIndexedRecord(bytes, signature, {...prepared.pin, activation_id: outer.activation_id, lease_id: outer.lease_id, generation: outer.generation}, outer, schema, "retrospective")).toBe(false);
   } finally { provider.close(); key.fill(0); }
 });

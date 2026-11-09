@@ -11,7 +11,7 @@ pub const ROLE_REGISTRY: &[(&str, &str, usize)] = &[
     ("evidence-pack:manifest-v0", "sanctuary.evidence-pack.manifest.k1.v1\n", 65536),
 ];
 pub const RECORD_KINDS: &[(&str, &[&str])] = &[
-    ("extension:linux-business-producer-v0", &["append", "control", "counter", "terminal"]),
+    ("extension:linux-business-producer-v0", &["append", "control", "counter", "terminal", "open", "link", "allowance", "denial_overflow"]),
     ("extension:linux-business-policy-v0", &["policy"]),
     ("extension:linux-business-retrospective-v0", &["retrospective"]),
     ("extension:model-recorder-v0", &["record"]),
