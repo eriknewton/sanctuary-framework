@@ -251,6 +251,9 @@ export class LivenessRecorder {
       fortressPath: options.fortressPath,
       fileName: DAEMON_RECORD_FILE,
       instance: options.instance,
+      // The claim orders this instance by the same boot and start uptime the record publishes.
+      bootId: options.bootId,
+      instanceStartedUptimeMs: options.instanceStartedUptimeMs,
       operatorUid: options.subject.operator_uid,
       fs: options.publisherFs,
     });

@@ -3,10 +3,17 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { STATUS_BYTES } from "../../../src/castle-wall/liveness/constants.js";
+import { LABEL_BYTES, STATUS_BYTES } from "../../../src/castle-wall/liveness/constants.js";
 import { evaluateLiveness } from "../../../src/castle-wall/liveness/evaluate.js";
 import { readLivenessRecords } from "../../../src/castle-wall/liveness/read-status.js";
-import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
+import {
+  LivenessRecordPublisher,
+  nodePublisherFs,
+  parsePublicationClaim,
+  PUBLICATION_CLAIM_BYTES,
+  serializePublicationClaim,
+  type PublisherFs,
+} from "../../../src/castle-wall/liveness/record-store.js";
 
 const UID = process.getuid?.() ?? 0;
 const roots: string[] = [];
@@ -16,10 +23,12 @@ function fortress(): string {
   roots.push(root);
   return root;
 }
-const publisher = (fortressPath: string, instance = "aaaaaaaaaaaaaaaa", fs?: PublisherFs) =>
-  new LivenessRecordPublisher({ fortressPath, fileName: "daemon.json", instance, operatorUid: UID, fs });
+/** Every fixture publisher runs on one boot; a later start uptime is the newer instance. */
+const BOOT = "boot-fixture";
+const publisher = (fortressPath: string, instance = "aaaaaaaaaaaaaaaa", fs?: PublisherFs, startedUptimeMs = 1_000) =>
+  new LivenessRecordPublisher({ fortressPath, fileName: "daemon.json", instance, bootId: BOOT, instanceStartedUptimeMs: startedUptimeMs, operatorUid: UID, fs });
 const target = (root: string) => join(root, "liveness", "daemon.json");
-/** After a settled publication only the record and the publication claim remain: no temp file and no held lock. */
+/** After a settled publication only the record and the publication claim remain: no temp file. */
 const SETTLED_ENTRIES = ["daemon.json", "daemon.json.publisher"];
 
 describe("publication", () => {
@@ -55,22 +64,53 @@ describe("publication", () => {
   it("keeps the old target and removes its temp when a write fails", async () => {
     const root = fortress();
     await publisher(root).publish({ sequence: 1 });
+    const recordTemp = join(root, "liveness", "daemon.json.bbbbbbbbbbbbbbbb.tmp");
     const fs: PublisherFs = { ...nodePublisherFs, open: async (path, flags, mode) => {
       const handle = await nodePublisherFs.open(path, flags, mode);
-      return { ...handle, stat: () => handle.stat(), close: () => handle.close(), sync: () => handle.sync(), writeFile: async () => { throw new Error("fixture write failure"); } };
+      if (path !== recordTemp) return handle;
+      return { stat: () => handle.stat(), read: (b, o, l, p) => handle.read(b, o, l, p), close: () => handle.close(), sync: () => handle.sync(), writeFile: async () => { throw new Error("fixture write failure"); } };
     } };
-    await expect(publisher(root, "bbbbbbbbbbbbbbbb", fs).publish({ sequence: 2 })).rejects.toThrow("fixture write failure");
+    // A newer instance on the same boot claims the record, then its record write fails.
+    await expect(publisher(root, "bbbbbbbbbbbbbbbb", fs, 2_000).publish({ sequence: 2 })).rejects.toThrow("fixture write failure");
     expect(JSON.parse(readFileSync(target(root), "utf8"))).toEqual({ sequence: 1 });
     expect(readdirSync(join(root, "liveness")).sort()).toEqual(SETTLED_ENTRIES);
   });
 
-  it("removes an earlier instance's temp on its first publish and never trusts it", async () => {
+  it("removes the superseded instance's temps on its first publish and never trusts them", async () => {
     const root = fortress();
     mkdirSync(join(root, "liveness"), { mode: 0o700 });
-    writeFileSync(join(root, "liveness", "daemon.json.0000000000000000.tmp"), JSON.stringify({ sequence: 99 }), { mode: 0o600 });
+    const earlier = "0000000000000000";
+    writeFileSync(join(root, "liveness", "daemon.json.publisher"), serializePublicationClaim({ instance: earlier, boot_id: BOOT, instance_started_uptime_ms: 500 }), { mode: 0o600 });
+    writeFileSync(join(root, "liveness", `daemon.json.${earlier}.tmp`), JSON.stringify({ sequence: 99 }), { mode: 0o600 });
+    writeFileSync(join(root, "liveness", `daemon.json.${earlier}.publisher.tmp`), "{}\n", { mode: 0o600 });
     await publisher(root).publish({ sequence: 1 });
     expect(readdirSync(join(root, "liveness")).sort()).toEqual(SETTLED_ENTRIES);
     expect(JSON.parse(readFileSync(target(root), "utf8"))).toEqual({ sequence: 1 });
+    expect(parsePublicationClaim(readFileSync(join(root, "liveness", "daemon.json.publisher"), "utf8"))?.instance).toBe("aaaaaaaaaaaaaaaa");
+  });
+
+  it("parses only the canonical claim serialization, and the largest valid claim is PUBLICATION_CLAIM_BYTES", () => {
+    const claim = { instance: "aaaaaaaaaaaaaaaa", boot_id: BOOT, instance_started_uptime_ms: 1_000 };
+    const text = serializePublicationClaim(claim);
+    expect(parsePublicationClaim(text)).toEqual(claim);
+    expect(parsePublicationClaim(serializePublicationClaim({ ...claim, boot_id: null }))).toEqual({ ...claim, boot_id: null });
+    for (const refused of [
+      text.trimEnd(),
+      ` ${text}`,
+      `${JSON.stringify({ boot_id: BOOT, instance: claim.instance, instance_started_uptime_ms: 1_000 })}\n`,
+      `${JSON.stringify({ ...claim, extra: true })}\n`,
+      `${JSON.stringify({ instance: claim.instance, boot_id: BOOT })}\n`,
+      `${JSON.stringify({ ...claim, instance: "" })}\n`,
+      `${JSON.stringify({ ...claim, instance: "a/b" })}\n`,
+      `${JSON.stringify({ ...claim, instance: "x".repeat(LABEL_BYTES + 1) })}\n`,
+      `${JSON.stringify({ ...claim, instance_started_uptime_ms: -1 })}\n`,
+      `${JSON.stringify({ ...claim, instance_started_uptime_ms: 1.5 })}\n`,
+      "null\n",
+      "[]\n",
+    ]) expect(parsePublicationClaim(refused), refused).toBeNull();
+    const largest = serializePublicationClaim({ instance: "x".repeat(LABEL_BYTES), boot_id: "y".repeat(LABEL_BYTES), instance_started_uptime_ms: Number.MAX_SAFE_INTEGER });
+    expect(parsePublicationClaim(largest)).not.toBeNull();
+    expect(Buffer.byteLength(largest)).toBe(PUBLICATION_CLAIM_BYTES);
   });
 
   it("refuses a liveness directory writable by group or other", async () => {

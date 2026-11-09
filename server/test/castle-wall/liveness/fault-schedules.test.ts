@@ -1,6 +1,6 @@
-/** Rule 8 and rule 12 fault schedules: slot waves, saturation, spam caps, paused publication, hostile record files and record budgets. */
+/** Rule 8 and rule 12 fault schedules: slot waves, saturation, spam caps, paused publication, claim reads, hostile record files and record budgets. */
 import { execFileSync } from "node:child_process";
-import { closeSync, constants as fsConstants, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -27,7 +27,16 @@ import {
 import { parseCensus } from "../../../src/castle-wall/liveness/census.js";
 import { evaluateLiveness, type LivenessInput } from "../../../src/castle-wall/liveness/evaluate.js";
 import { nodeReaderFs, readLivenessRecords, type DeadlineClock, type ReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
-import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
+import {
+  LivenessRecordPublisher,
+  nodePublisherFs,
+  PUBLICATION_CLAIM_BYTES,
+  serializePublicationClaim,
+  type LivenessPublisherOptions,
+  type PublisherDeadlineClock,
+  type PublisherFileHandle,
+  type PublisherFs,
+} from "../../../src/castle-wall/liveness/record-store.js";
 import { CanaryRecordingSlot, saturatingIncrement, type CanaryOriginSubjects } from "../../../src/castle-wall/liveness/recorder.js";
 import { parseDaemonRecord, parseObserverRecord } from "../../../src/castle-wall/liveness/schema.js";
 import { evaluateFortressLiveness, livenessFortressId, runLivenessStatus, wallOnlyStatusExit } from "../../../src/cli/castle-wall-liveness-status.js";
@@ -146,41 +155,58 @@ describe("slot waves", () => {
 describe("publication paused, then restart", () => {
   const OLD = "1111111111111111";
   const NEW = "2222222222222222";
+  const BOOT = "boot-fixture";
+  /** Both instances run on BOOT; the later start is the newer instance. */
+  const OLD_START = 1_000;
+  const NEW_START = 2_000;
   type Step = "open" | "write" | "rename";
-  const recordAt = (root: string) => JSON.parse(readFileSync(join(root, "liveness", "daemon.json"), "utf8")) as unknown;
+  const liveness = (root: string) => join(root, "liveness");
+  const recordAt = (root: string) => JSON.parse(readFileSync(join(liveness(root), "daemon.json"), "utf8")) as unknown;
+  const claimFile = (root: string) => join(liveness(root), "daemon.json.publisher");
+  const claimOf = (instance: string, start: number, boot: string | null = BOOT) =>
+    serializePublicationClaim({ instance, boot_id: boot, instance_started_uptime_ms: start });
+  const settled = (root: string) => readdirSync(liveness(root)).sort();
+  const make = (root: string, instance: string, start: number, fs?: PublisherFs, extra: Partial<LivenessPublisherOptions> = {}) =>
+    new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance, bootId: BOOT, instanceStartedUptimeMs: start, operatorUid: UID, fs, ...extra });
+  /** A handle forwarding to a real one, with any method replaced. */
+  const forward = (handle: PublisherFileHandle, over: Partial<PublisherFileHandle> = {}): PublisherFileHandle => ({
+    stat: () => handle.stat(), read: (b, o, l, p) => handle.read(b, o, l, p), writeFile: d => handle.writeFile(d), sync: () => handle.sync(), close: () => handle.close(), ...over,
+  });
+  /** A one-shot pause: `hold()` signals `reached`, then waits for `release()`. */
+  function pause() {
+    let release!: () => void;
+    const opened = new Promise<void>(resolve => { release = resolve; });
+    let reach!: () => void;
+    const reached = new Promise<void>(resolve => { reach = resolve; });
+    return { hold: async () => { reach(); await opened; }, reached, release };
+  }
+
   /** Pause the old publisher's second record write at one step, after its first publish has claimed the target. */
   function pausedAt(root: string, step: Step) {
-    const recordTemp = join(root, "liveness", `daemon.json.${OLD}.tmp`);
-    const target = join(root, "liveness", "daemon.json");
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    let reached!: () => void;
-    const atStep = new Promise<void>(resolve => { reached = resolve; });
+    const recordTemp = join(liveness(root), `daemon.json.${OLD}.tmp`);
+    const target = join(liveness(root), "daemon.json");
+    const gate = pause();
     let armed = false;
-    const pause = async () => { reached(); await gate; };
     const fs: PublisherFs = {
       ...nodePublisherFs,
       open: async (path, flags, mode) => {
-        if (armed && step === "open" && path === recordTemp) { armed = false; await pause(); }
+        if (armed && step === "open" && path === recordTemp) { armed = false; await gate.hold(); }
         const handle = await nodePublisherFs.open(path, flags, mode);
         if (path !== recordTemp) return handle;
-        return {
-          stat: () => handle.stat(), sync: () => handle.sync(), close: () => handle.close(),
-          writeFile: async data => { if (armed && step === "write") { armed = false; await pause(); } return handle.writeFile(data); },
-        };
+        return forward(handle, { writeFile: async data => { if (armed && step === "write") { armed = false; await gate.hold(); } return handle.writeFile(data); } });
       },
       rename: async (from, to) => {
-        if (armed && step === "rename" && to === target) { armed = false; await pause(); }
+        if (armed && step === "rename" && to === target) { armed = false; await gate.hold(); }
         return nodePublisherFs.rename(from, to);
       },
     };
-    return { fs, arm: () => { armed = true; }, atStep, release };
+    return { fs, arm: () => { armed = true; }, atStep: gate.reached, release: gate.release };
   }
 
   it.each(["open", "write", "rename"] as const)("a queued old snapshot and a late %s completion never overwrite the newer instance's record", async step => {
     const root = fortress();
     const paused = pausedAt(root, step);
-    const old = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: OLD, operatorUid: UID, fs: paused.fs });
+    const old = make(root, OLD, OLD_START, paused.fs);
     await old.publish({ sequence: 1 });
     paused.arm();
     const late = old.publish({ sequence: 2 });
@@ -189,33 +215,26 @@ describe("publication paused, then restart", () => {
     // A legitimate later tick queues behind the paused write.
     const queued = old.publish({ sequence: 3 });
     queued.catch(() => undefined);
-    const restarted = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: NEW, operatorUid: UID });
-    const newer = restarted.publish({ sequence: 5 });
-    if (step !== "rename") {
-      // Before the rename the old instance holds no lock, so the newer instance commits at once.
-      await newer;
-      expect(recordAt(root)).toEqual({ sequence: 5 });
-    }
+    await make(root, NEW, NEW_START).publish({ sequence: 5 });
+    expect(recordAt(root)).toEqual({ sequence: 5 });
     paused.release();
     await Promise.allSettled([late, queued]);
-    await newer;
-    // The paused rename was already inside the lock with a valid claim, so it may land, but only before the newer record.
+    // A paused rename was issued after its final check; the newer instance's claim removed the temp it would have renamed.
     expect(recordAt(root)).toEqual({ sequence: 5 });
-    // The old instance is superseded: its next snapshot is refused and the newer record stays.
-    await expect(old.publish({ sequence: 4 })).rejects.toThrow();
     expect(old.isRetired()).toBe(true);
+    await expect(old.publish({ sequence: 4 })).rejects.toThrow("retired");
     expect(recordAt(root)).toEqual({ sequence: 5 });
-    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
-    expect(readFileSync(join(root, "liveness", "daemon.json.publisher"), "utf8")).toBe(`${NEW}\n`);
+    expect(settled(root)).toEqual(["daemon.json", "daemon.json.publisher"]);
+    expect(readFileSync(claimFile(root), "utf8")).toBe(claimOf(NEW, NEW_START));
   });
 
   it("a retired publisher drops its waiting snapshot and creates nothing more", async () => {
     const root = fortress();
     const paused = pausedAt(root, "write");
-    const recordTemp = join(root, "liveness", `daemon.json.${OLD}.tmp`);
+    const recordTemp = join(liveness(root), `daemon.json.${OLD}.tmp`);
     let tempOpens = 0;
     const counting: PublisherFs = { ...paused.fs, open: (path, flags, mode) => { if (path === recordTemp) tempOpens++; return paused.fs.open(path, flags, mode); } };
-    const p = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: OLD, operatorUid: UID, fs: counting });
+    const p = make(root, OLD, OLD_START, counting);
     await p.publish({ sequence: 1 });
     paused.arm();
     const inFlight = p.publish({ sequence: 2 });
@@ -230,51 +249,296 @@ describe("publication paused, then restart", () => {
     expect(recordAt(root)).toEqual({ sequence: 1 });
     expect(tempOpens, "no snapshot is created after retirement").toBe(opensAtRetire);
     await expect(p.publish({ sequence: 4 })).rejects.toThrow("retired");
-    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
+    expect(settled(root)).toEqual(["daemon.json", "daemon.json.publisher"]);
   });
 
-  it("an old instance cannot check its claim while the newer instance holds the lock to establish its own", async () => {
+  it.each(["older", "newer"] as const)("a delayed first claim by the %s instance leaves the newer instance's claim and record", async delayed => {
     const root = fortress();
-    const ownerPath = join(root, "liveness", "daemon.json.publisher");
-    const oldPaused = pausedAt(root, "rename");
-    const old = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: OLD, operatorUid: UID, fs: oldPaused.fs });
-    await old.publish({ sequence: 1 });
-    // Hold the newer instance inside its startup critical section, after its sweep and before its claim lands.
-    let releaseClaim!: () => void;
-    const claimGate = new Promise<void>(resolve => { releaseClaim = resolve; });
-    let atClaim!: () => void;
-    const claimReached = new Promise<void>(resolve => { atClaim = resolve; });
-    const newFs: PublisherFs = { ...nodePublisherFs, rename: async (from, to) => { if (to === ownerPath) { atClaim(); await claimGate; } return nodePublisherFs.rename(from, to); } };
-    const restarted = new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: NEW, operatorUid: UID, fs: newFs });
-    const newer = restarted.publish({ sequence: 5 });
-    await claimReached;
-    oldPaused.arm();
-    const late = old.publish({ sequence: 2 });
-    late.catch(() => undefined);
-    // Give the old publisher time to reach its rename if anything let it past the held lock.
-    await new Promise(resolve => setTimeout(resolve, 100));
-    releaseClaim();
-    await newer;
-    oldPaused.release();
-    await late.catch(() => undefined);
-    expect(recordAt(root)).toEqual({ sequence: 5 });
+    const gate = pause();
+    // The delayed instance stops in directory validation, before it has read any claim.
+    const slow: PublisherFs = { ...nodePublisherFs, lstat: async path => { await gate.hold(); return nodePublisherFs.lstat(path); } };
+    const old = make(root, OLD, OLD_START, delayed === "older" ? slow : undefined);
+    const restarted = make(root, NEW, NEW_START, delayed === "newer" ? slow : undefined);
+    const first = delayed === "older" ? old : restarted;
+    const second = delayed === "older" ? restarted : old;
+    const delayedPublish = first.publish({ sequence: delayed === "older" ? 1 : 5 });
+    delayedPublish.catch(() => undefined);
+    await gate.reached;
+    await second.publish({ sequence: delayed === "older" ? 5 : 1 });
+    gate.release();
+    await Promise.allSettled([delayedPublish]);
+    // Whichever instance claimed first, the older one never commits over the newer one and ends retired.
+    await expect(old.publish({ sequence: 2 })).rejects.toThrow();
     expect(old.isRetired()).toBe(true);
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    expect(readFileSync(claimFile(root), "utf8")).toBe(claimOf(NEW, NEW_START));
+    await restarted.publish({ sequence: 6 });
+    expect(recordAt(root)).toEqual({ sequence: 6 });
+    expect(settled(root)).toEqual(["daemon.json", "daemon.json.publisher"]);
   });
 
-  it("a lock left by a holder whose process has exited is taken over", async () => {
+  it.each(["older", "newer"] as const)("concurrent first claims where the %s claim lands first leave the newer instance's claim and record", async landsFirst => {
     const root = fortress();
-    const lock = join(root, "liveness", "daemon.json.lock");
-    const deadPid = 2_000_000_000;
-    writeFileSync(lock, `${JSON.stringify({ pid: deadPid, instance: OLD })}\n`, { mode: 0o600 });
-    const checked: number[] = [];
-    const p = new LivenessRecordPublisher({
-      fortressPath: root, fileName: "daemon.json", instance: NEW, operatorUid: UID,
-      processExists: pid => { checked.push(pid); return pid !== deadPid; },
+    const oldClaim = pause();
+    const newClaim = pause();
+    const oldOpen = pause();
+    let oldClaimed = false;
+    const oldRecordTemp = join(liveness(root), `daemon.json.${OLD}.tmp`);
+    // Each instance stops at the step that lands its claim, after both have read the claim as absent.
+    const claimStep = (gate: ReturnType<typeof pause>, onLanded: () => void): PublisherFs => ({
+      ...nodePublisherFs,
+      link: async (from, to) => { if (to === claimFile(root)) await gate.hold(); try { await nodePublisherFs.link(from, to); } finally { onLanded(); } },
+      rename: async (from, to) => { if (to === claimFile(root)) await gate.hold(); await nodePublisherFs.rename(from, to); },
     });
+    const oldFs: PublisherFs = {
+      ...claimStep(oldClaim, () => { oldClaimed = true; }),
+      // The old instance's record write waits until the newer instance has published, so the outcome is deterministic.
+      open: async (path, flags, mode) => { if (path === oldRecordTemp) await oldOpen.hold(); return nodePublisherFs.open(path, flags, mode); },
+    };
+    const old = make(root, OLD, OLD_START, oldFs);
+    const restarted = make(root, NEW, NEW_START, claimStep(newClaim, () => undefined));
+    const oldFirst = old.publish({ sequence: 1 });
+    oldFirst.catch(() => undefined);
+    await oldClaim.reached;
+    const newFirst = restarted.publish({ sequence: 5 });
+    newFirst.catch(() => undefined);
+    await newClaim.reached;
+    if (landsFirst === "older") {
+      oldClaim.release();
+      await oldOpen.reached;
+      expect(oldClaimed).toBe(true);
+      expect(readFileSync(claimFile(root), "utf8")).toBe(claimOf(OLD, OLD_START));
+      newClaim.release();
+      await newFirst;
+    } else {
+      newClaim.release();
+      await newFirst;
+      oldClaim.release();
+    }
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    oldOpen.release();
+    await Promise.allSettled([oldFirst]);
+    await expect(old.publish({ sequence: 2 })).rejects.toThrow();
+    expect(old.isRetired()).toBe(true);
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    expect(readFileSync(claimFile(root), "utf8")).toBe(claimOf(NEW, NEW_START));
+    expect(settled(root)).toEqual(["daemon.json", "daemon.json.publisher"]);
+  });
+
+  it("a claim left by another boot is superseded by the current boot's instance even when its start uptime is later", async () => {
+    const root = fortress();
+    // The previous boot's daemon started later on its own uptime clock; uptimes of different boots are not comparable.
+    await make(root, OLD, NEW_START * 1_000, undefined, { bootId: "boot-previous" }).publish({ sequence: 1 });
+    await make(root, NEW, NEW_START).publish({ sequence: 5 });
+    expect(recordAt(root)).toEqual({ sequence: 5 });
+    expect(readFileSync(claimFile(root), "utf8")).toBe(claimOf(NEW, NEW_START));
+    expect(settled(root)).toEqual(["daemon.json", "daemon.json.publisher"]);
+  });
+
+  it.each(["removing the earlier instance's temps", "writing its own claim"] as const)("retirement while %s issues no later effect and leaves the earlier claim", async step => {
+    const root = fortress();
+    writeFileSync(claimFile(root), claimOf(OLD, OLD_START), { mode: 0o600 });
+    writeFileSync(join(liveness(root), `daemon.json.${OLD}.tmp`), JSON.stringify({ sequence: 99 }), { mode: 0o600 });
+    const ownClaimTemp = join(liveness(root), `daemon.json.${NEW}.publisher.tmp`);
+    const gate = pause();
+    let retired = false;
+    const afterRetire: string[] = [];
+    const note = (effect: string, path: string) => { if (retired) afterRetire.push(`${effect} ${path}`); };
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      mkdir: (path, options) => { note("mkdir", path); return nodePublisherFs.mkdir(path, options); },
+      link: (from, to) => { note("link", to); return nodePublisherFs.link(from, to); },
+      rename: (from, to) => { note("rename", to); return nodePublisherFs.rename(from, to); },
+      unlink: async path => {
+        // An effect is noted when it is issued; the paused unlink was issued before the retirement.
+        note("unlink", path);
+        if (step === "removing the earlier instance's temps" && path.includes(OLD)) await gate.hold();
+        return nodePublisherFs.unlink(path);
+      },
+      open: async (path, flags, mode) => {
+        note("open", path);
+        const handle = await nodePublisherFs.open(path, flags, mode);
+        if (step !== "writing its own claim" || path !== ownClaimTemp) return handle;
+        return forward(handle, { sync: async () => { await gate.hold(); return handle.sync(); } });
+      },
+    };
+    const p = make(root, NEW, NEW_START, fs);
+    const publishing = p.publish({ sequence: 5 });
+    publishing.catch(() => undefined);
+    await gate.reached;
+    p.retire();
+    retired = true;
+    gate.release();
+    await expect(publishing).rejects.toThrow("retired");
+    expect(readFileSync(claimFile(root), "utf8")).toBe(claimOf(OLD, OLD_START));
+    // The only effect after retirement is removing this instance's own unfinished claim temp.
+    expect(afterRetire.filter(effect => effect !== `unlink ${ownClaimTemp}`), "no effect follows the retirement").toEqual([]);
+    expect(settled(root).filter(name => name.includes(NEW))).toEqual([]);
+    expect(settled(root)).not.toContain("daemon.json");
+  });
+
+  it("retirement during the claim read before a commit leaves the target unchanged", async () => {
+    const root = fortress();
+    const gate = pause();
+    let armed = false;
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      open: async (path, flags, mode) => { if (armed && path === claimFile(root)) { armed = false; await gate.hold(); } return nodePublisherFs.open(path, flags, mode); },
+    };
+    const p = make(root, OLD, OLD_START, fs);
     await p.publish({ sequence: 1 });
-    expect(checked).toContain(deadPid);
+    armed = true;
+    const publishing = p.publish({ sequence: 2 });
+    publishing.catch(() => undefined);
+    await gate.reached;
+    p.retire();
+    gate.release();
+    await expect(publishing).rejects.toThrow("retired");
     expect(recordAt(root)).toEqual({ sequence: 1 });
-    expect(readdirSync(join(root, "liveness")).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
+    expect(settled(root)).toEqual(["daemon.json", "daemon.json.publisher"]);
+  });
+
+  it("retirement while a stale temp is removed before a create opens nothing", async () => {
+    const root = fortress();
+    const recordTemp = join(liveness(root), `daemon.json.${OLD}.tmp`);
+    const gate = pause();
+    let armed = false;
+    const opens: string[] = [];
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      unlink: async path => { if (armed && path === recordTemp) { armed = false; await gate.hold(); } return nodePublisherFs.unlink(path); },
+      open: (path, flags, mode) => { opens.push(path); return nodePublisherFs.open(path, flags, mode); },
+    };
+    const p = make(root, OLD, OLD_START, fs);
+    await p.publish({ sequence: 1 });
+    armed = true;
+    const publishing = p.publish({ sequence: 2 });
+    publishing.catch(() => undefined);
+    await gate.reached;
+    const opensAtRetire = opens.length;
+    p.retire();
+    gate.release();
+    await expect(publishing).rejects.toThrow("retired");
+    expect(opens.length, "no open follows the retirement").toBe(opensAtRetire);
+    expect(recordAt(root)).toEqual({ sequence: 1 });
+  });
+});
+
+describe("publication claim reads", () => {
+  const INSTANCE = "3333333333333333";
+  const OLDER = "1111111111111111";
+  const liveness = (root: string) => join(root, "liveness");
+  const claimFile = (root: string) => join(liveness(root), "daemon.json.publisher");
+  const olderTemp = (root: string) => join(liveness(root), `daemon.json.${OLDER}.tmp`);
+  const olderClaim = serializePublicationClaim({ instance: OLDER, boot_id: "boot-fixture", instance_started_uptime_ms: 1_000 });
+  const make = (root: string, fs?: PublisherFs, deadline?: PublisherDeadlineClock) =>
+    new LivenessRecordPublisher({ fortressPath: root, fileName: "daemon.json", instance: INSTANCE, bootId: "boot-fixture", instanceStartedUptimeMs: 2_000, operatorUid: UID, fs, claimReadDeadline: deadline });
+  /** A claim this instance would supersede, plus that instance's temp, so a claim read that granted ownership would delete it. */
+  function seedOlder(root: string, claimBytes: string | Buffer = olderClaim) {
+    writeFileSync(claimFile(root), claimBytes, { mode: 0o600 });
+    writeFileSync(olderTemp(root), "{}\n", { mode: 0o600 });
+  }
+  const unchanged = (root: string, claimBytes: string | Buffer) => {
+    expect(readFileSync(claimFile(root)).equals(Buffer.from(claimBytes)), "the claim bytes are unchanged").toBe(true);
+    expect(existsSync(olderTemp(root)), "nothing is deleted").toBe(true);
+    expect(existsSync(join(liveness(root), "daemon.json")), "no record is written").toBe(false);
+  };
+
+  it("an oversized claim grants nothing, deletes nothing, and reads at most PUBLICATION_CLAIM_BYTES + 1 bytes", async () => {
+    const root = fortress();
+    const oversized = Buffer.concat([Buffer.from(olderClaim), Buffer.alloc(2 * 1024 * 1024, 0x20)]);
+    seedOlder(root, oversized);
+    let requested = 0;
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      open: async (path, flags, mode) => {
+        const handle = await nodePublisherFs.open(path, flags, mode);
+        if (path !== claimFile(root)) return handle;
+        return { stat: () => handle.stat(), writeFile: d => handle.writeFile(d), sync: () => handle.sync(), close: () => handle.close(),
+          read: (b, o, l, p) => { requested += l; return handle.read(b, o, l, p); } };
+      },
+    };
+    await expect(make(root, fs).publish({ sequence: 1 })).rejects.toThrow("indeterminate");
+    expect(requested).toBeLessThanOrEqual(PUBLICATION_CLAIM_BYTES + 1);
+    unchanged(root, oversized);
+  });
+
+  it("a FIFO in place of the claim is refused without blocking", async () => {
+    const root = fortress();
+    execFileSync("mkfifo", ["-m", "600", claimFile(root)]);
+    writeFileSync(olderTemp(root), "{}\n", { mode: 0o600 });
+    const deadline = manualDeadline();
+    await expect(make(root, undefined, deadline.clock).publish({ sequence: 1 })).rejects.toThrow("indeterminate");
+    expect(deadline.fired()).toBe(false);
+    expect(existsSync(olderTemp(root))).toBe(true);
+    expect(existsSync(join(liveness(root), "daemon.json"))).toBe(false);
+  });
+
+  it("a descriptor that is not a regular file is refused before any byte is read", async () => {
+    const root = fortress();
+    seedOlder(root);
+    let reads = 0;
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      open: async (path, flags, mode) => {
+        const handle = await nodePublisherFs.open(path, flags, mode);
+        if (path !== claimFile(root)) return handle;
+        return { writeFile: d => handle.writeFile(d), sync: () => handle.sync(), close: () => handle.close(),
+          stat: async () => { const info = await handle.stat(); return { uid: info.uid, mode: info.mode, isFile: () => false }; },
+          read: (b, o, l, p) => { reads++; return handle.read(b, o, l, p); } };
+      },
+    };
+    await expect(make(root, fs).publish({ sequence: 1 })).rejects.toThrow("indeterminate");
+    expect(reads).toBe(0);
+    unchanged(root, olderClaim);
+  });
+
+  it("a claim with an unknown field is malformed and grants nothing", async () => {
+    const root = fortress();
+    const malformed = `${JSON.stringify({ instance: OLDER, boot_id: "boot-fixture", instance_started_uptime_ms: 1_000, extra: true })}\n`;
+    seedOlder(root, malformed);
+    await expect(make(root).publish({ sequence: 1 })).rejects.toThrow("indeterminate");
+    unchanged(root, malformed);
+  });
+
+  it("a claim that becomes unreadable after this instance owns it retires the publisher before any commit", async () => {
+    const root = fortress();
+    const p = make(root);
+    await p.publish({ sequence: 1 });
+    const corrupt = "not a claim\n";
+    writeFileSync(claimFile(root), corrupt, { mode: 0o600 });
+    await expect(p.publish({ sequence: 2 })).rejects.toThrow("indeterminate");
+    expect(p.isRetired()).toBe(true);
+    expect(JSON.parse(readFileSync(join(liveness(root), "daemon.json"), "utf8"))).toEqual({ sequence: 1 });
+    expect(readFileSync(claimFile(root), "utf8")).toBe(corrupt);
+    expect(readdirSync(liveness(root)).sort()).toEqual(["daemon.json", "daemon.json.publisher"]);
+  });
+
+  it("a claim read that outlives its deadline grants nothing, and its late result is discarded", async () => {
+    const root = fortress();
+    seedOlder(root);
+    const gate = { release: () => undefined as void };
+    let reached!: () => void;
+    const atRead = new Promise<void>(resolve => { reached = resolve; });
+    const fs: PublisherFs = {
+      ...nodePublisherFs,
+      open: async (path, flags, mode) => {
+        const handle = await nodePublisherFs.open(path, flags, mode);
+        if (path !== claimFile(root)) return handle;
+        return { stat: () => handle.stat(), writeFile: d => handle.writeFile(d), sync: () => handle.sync(), close: () => handle.close(),
+          read: async (b, o, l, p) => { reached(); await new Promise<void>(resolve => { gate.release = resolve; }); return handle.read(b, o, l, p); } };
+      },
+    };
+    const deadline = manualDeadline();
+    const publishing = make(root, fs, deadline.clock).publish({ sequence: 1 });
+    publishing.catch(() => undefined);
+    await atRead;
+    expect(deadline.scheduled()).toBe(true);
+    deadline.fire();
+    await expect(publishing).rejects.toThrow("indeterminate");
+    gate.release();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    unchanged(root, olderClaim);
   });
 });
 
