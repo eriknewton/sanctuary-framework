@@ -17,6 +17,8 @@ import {
 } from "../storage/exit-import-journal-record.js";
 export { MAX_EXIT_IMPORT_JOURNAL_LOCATIONS } from "../storage/exit-import-journal-record.js";
 
+import { SignerPruneError, initialSignerPruneOutcome } from "../storage/signer-prune-outcome.js";
+
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
@@ -2494,79 +2496,114 @@ export async function runJournaledMemoryProvenanceSignerPrune<T>(options: {
   readonly locations: readonly StagedLocation[];
   readonly operation: (context: JournaledExitAdmissionContext) => Promise<T>;
 }): Promise<T> {
-  const importId = MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY;
-  if (options.locations.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
-    throw new Error("Memory-provenance signer prune journal exceeds its location bound");
-  }
-  if (await hasInterruptedExitImport(options.storage)) {
-    throw new Error("An interrupted Exit import must be recovered before signer pruning");
-  }
-
-  // A crash after activation but before normal cleanup may leave this fixed,
-  // disposable witness behind. Under the shared admission lock it is safe to
-  // clear before publishing the next journal, keeping `_exit_imports` bounded.
-  await options.storage.delete(EXIT_IMPORT_NAMESPACE, importId, false);
-  if (await options.storage.read(EXIT_IMPORT_NAMESPACE, importId) !== null) {
-    throw new Error("Could not clear stale signer-prune completion marker");
-  }
-
-  const completionLocation = { namespace: EXIT_IMPORT_NAMESPACE, key: importId };
-  const snapshots = await snapshotStorageLocations(options.storage, [
-    ...options.locations,
-    completionLocation,
-  ]);
-  await writeImportJournal(options.storage, importId, options.identityId, snapshots);
-  let activated = false;
+  const outcome = initialSignerPruneOutcome();
   try {
-    const result = await options.operation({
-      importId,
-      recordPostImage: (namespace, key, bytes) =>
-        recordPostImage(options.storage, importId, namespace, key, bytes),
-    });
-    for (const snapshot of snapshots) {
-      if (!locationNeedsPostImageDivergenceCheck(snapshot.namespace)) continue;
-      const current = await options.storage.read(snapshot.namespace, snapshot.key);
-      const postImage = await readPostImageHash(options.storage, importId, snapshot);
-      if (classifyRestoreSafety(current, snapshot.data, postImage) === "diverged") {
-        throw new Error("Memory-provenance signer prune post-image verification diverged");
-      }
+    const importId = MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY;
+    if (options.locations.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
+      throw new Error("Memory-provenance signer prune journal exceeds its location bound");
     }
-    const completionBytes = stringToBytes(JSON.stringify({
-      import_id: importId,
-      identity_id: options.identityId,
-      activated_at: new Date().toISOString(),
-      kind: "memory_provenance_signer_prune_v1",
-    }));
-    await options.storage.write(EXIT_IMPORT_NAMESPACE, importId, completionBytes);
-    activated = true;
-    await deleteImportJournal(options.storage, importId);
+    if (await hasInterruptedExitImport(options.storage)) {
+      throw new Error("An interrupted Exit import must be recovered before signer pruning");
+    }
+
+    // A crash after activation but before normal cleanup may leave this fixed,
+    // disposable witness behind. Under the shared admission lock it is safe to
+    // clear before publishing the next journal, keeping `_exit_imports` bounded.
+    // An unverified marker deletion must retain recovery status.
+    outcome.phase = "uncertain";
     await options.storage.delete(EXIT_IMPORT_NAMESPACE, importId, false);
     if (await options.storage.read(EXIT_IMPORT_NAMESPACE, importId) !== null) {
-      throw new Error("Memory-provenance signer prune completion marker cleanup failed");
+      throw new Error("Could not clear stale signer-prune completion marker");
     }
-    return result;
+    outcome.phase = "not-started";
+
+    const completionLocation = { namespace: EXIT_IMPORT_NAMESPACE, key: importId };
+    const snapshots = await snapshotStorageLocations(options.storage, [
+      ...options.locations,
+      completionLocation,
+    ]);
+    try {
+      await writeImportJournal(options.storage, importId, options.identityId, snapshots);
+    } catch (error) {
+      // Publication can persist before rejecting; only observed absence proves no start.
+      outcome.phase = "uncertain";
+      if (await options.storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, importId) === null) {
+        outcome.phase = "not-started";
+      }
+      throw error;
+    }
+    // Must match SignerPruneOutcome in storage/signer-prune-outcome.ts and
+    // captured phase in sdw/memory-provenance-signer-prune.ts.
+    // Once the operation can mutate, no-commit requires verified pre-images.
+    outcome.phase = "uncertain";
+    let activationBytes: Uint8Array | undefined;
+    try {
+      const result = await options.operation({
+        importId,
+        recordPostImage: (namespace, key, bytes) =>
+          recordPostImage(options.storage, importId, namespace, key, bytes),
+      });
+      for (const snapshot of snapshots) {
+        if (!locationNeedsPostImageDivergenceCheck(snapshot.namespace)) continue;
+        const current = await options.storage.read(snapshot.namespace, snapshot.key);
+        const postImage = await readPostImageHash(options.storage, importId, snapshot);
+        if (classifyRestoreSafety(current, snapshot.data, postImage) === "diverged") {
+          throw new Error("Memory-provenance signer prune post-image verification diverged");
+        }
+      }
+      const completionBytes = stringToBytes(JSON.stringify({
+        import_id: importId,
+        identity_id: options.identityId,
+        activated_at: new Date().toISOString(),
+        kind: "memory_provenance_signer_prune_v1",
+      }));
+      activationBytes = completionBytes;
+      await options.storage.write(EXIT_IMPORT_NAMESPACE, importId, completionBytes);
+      // A durable activation is irreversible even when subsequent cleanup fails.
+      outcome.phase = "committed";
+      outcome.cleanup = "pending";
+      await deleteImportJournal(options.storage, importId);
+      await options.storage.delete(EXIT_IMPORT_NAMESPACE, importId, false);
+      if (await options.storage.read(EXIT_IMPORT_NAMESPACE, importId) !== null) {
+        throw new Error("Memory-provenance signer prune completion marker cleanup failed");
+      }
+      outcome.cleanup = "finished";
+      return result;
+    } catch (error) {
+      // Continuing paths: activated -> cleanup only; unactivated -> exact rollback.
+      // Refusal paths: failed/divergent restoration -> uncertain; never ordinary denial.
+      if (outcome.phase === "committed") throw error;
+      if (activationBytes !== undefined) {
+        // A write can persist and then reject. Never undo an observed activation;
+        // an unreadable or conflicting marker leaves the phase uncertain.
+        const marker = await options.storage.read(EXIT_IMPORT_NAMESPACE, importId);
+        if (marker !== null) {
+          if (Buffer.from(marker).equals(Buffer.from(activationBytes))) {
+            outcome.phase = "committed";
+            outcome.cleanup = "pending";
+          }
+          throw error;
+        }
+      }
+      const rollback = await restoreStorageSnapshots(options.storage, importId, snapshots);
+      if (rollback.failed.length > 0 || rollback.diverged.length > 0) {
+        throw new Error("Memory-provenance signer prune rollback could not be verified", { cause: error });
+      }
+      // A resolved write is insufficient: every restored byte must match its pre-image.
+      for (const snapshot of snapshots) {
+        const restored = await options.storage.read(snapshot.namespace, snapshot.key);
+        if (restored === null ? snapshot.data !== null :
+            snapshot.data === null || !Buffer.from(restored).equals(Buffer.from(snapshot.data))) {
+          throw new Error("Memory-provenance signer prune rollback verification failed", { cause: error });
+        }
+      }
+      // Restored bytes alone do not finish recovery while a journal remains.
+      await deleteImportJournal(options.storage, importId);
+      outcome.phase = "rolled-back";
+      throw error;
+    }
   } catch (error) {
-    // Once activation is durable, recovery must interpret the mutation as
-    // committed. A cleanup fault may leave bounded recovery evidence, but it
-    // must never roll back an already-activated prune.
-    if (activated) {
-      const partial = new Error(
-        "Memory-provenance signer prune committed but cleanup was incomplete; partial_scope",
-        { cause: error },
-      );
-      partial.name = "MemoryProvenanceSignerPrunePartialScopeError";
-      throw partial;
-    }
-    const rollback = await restoreStorageSnapshots(options.storage, importId, snapshots);
-    if (rollback.failed.length > 0 || rollback.diverged.length > 0) {
-      const partial = new Error(
-        "Memory-provenance signer prune rollback could not be verified; partial_scope",
-      );
-      partial.name = "MemoryProvenanceSignerPrunePartialScopeError";
-      throw partial;
-    }
-    await deleteImportJournal(options.storage, importId);
-    throw error;
+    throw new SignerPruneError(outcome, error);
   }
 }
 

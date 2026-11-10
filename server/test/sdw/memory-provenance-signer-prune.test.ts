@@ -179,7 +179,7 @@ async function fixture() {
   return { storage, local, direct, relayed, unusedA, unusedB, keys, known, adapter, bad, audit, pruner };
 }
 
-describe("C4 memory-provenance signer mark-and-sweep", () => {
+describe("memory-provenance signer mark-and-sweep", () => {
   it("retains direct, relayed, quarantined, and orphan-but-authenticated references and deletes only sorted zero-reference mappings", async () => {
     const f = await fixture();
     await f.bad.mark({
@@ -245,9 +245,10 @@ describe("C4 memory-provenance signer mark-and-sweep", () => {
     const key = knownSignerStorageKey(f.unusedA.did, "memory_provenance");
     const before = await f.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
     f.storage.failAfterSignerDelete = true;
-    await expect(f.pruner.prune({ approvalAuditId: "gate-fault" })).rejects.toThrow(
-      /post-delete fault/,
-    );
+    await expect(f.pruner.prune({ approvalAuditId: "gate-fault" })).rejects.toMatchObject({
+      name: "SignerPruneError", message: "signer prune failed", outcome: { phase: "rolled-back" },
+      cause: { cause: { message: expect.stringMatching(/post-delete fault/) } },
+    });
     expect(await f.storage.read(KNOWN_SIGNERS_NAMESPACE, key)).toEqual(before);
     expect(await f.storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
   });
@@ -262,7 +263,10 @@ describe("C4 memory-provenance signer mark-and-sweep", () => {
     f.storage.tamperReadKey = null;
     f.storage.corpusLists = 0;
     f.storage.mutateCorpusOnRelist = true;
-    await expect(f.pruner.prune({ approvalAuditId: "gate-race" })).rejects.toThrow(/changed/);
+    await expect(f.pruner.prune({ approvalAuditId: "gate-race" })).rejects.toMatchObject({
+      name: "SignerPruneError", message: "signer prune failed", outcome: { phase: "not-started" },
+      cause: { message: expect.stringMatching(/changed/) },
+    });
     expect(await f.storage.read(KNOWN_SIGNERS_NAMESPACE, unusedKey)).toEqual(before);
   });
 
@@ -302,7 +306,10 @@ describe("C4 memory-provenance signer mark-and-sweep", () => {
       const unusedKey = knownSignerStorageKey(f.unusedA.did, "memory_provenance");
       const before = await f.storage.read(KNOWN_SIGNERS_NAMESPACE, unusedKey);
       await expect(f.pruner.prune({ approvalAuditId: `gate-incomplete-${missingTarget}` }))
-        .rejects.toThrow(/disappeared/);
+        .rejects.toMatchObject({
+          name: "SignerPruneError", message: "signer prune failed", outcome: { phase: "not-started" },
+          cause: { message: expect.stringMatching(/disappeared/) },
+        });
       f.storage.vanishReadKey = null;
       expect(await f.storage.read(KNOWN_SIGNERS_NAMESPACE, unusedKey)).toEqual(before);
     }
@@ -313,7 +320,10 @@ describe("C4 memory-provenance signer mark-and-sweep", () => {
     const key = knownSignerStorageKey(f.unusedA.did, "memory_provenance");
     const before = await f.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
     f.storage.syntheticOverCap = true;
-    await expect(f.pruner.prune({ approvalAuditId: "gate-cap" })).rejects.toThrow(/cap/);
+    await expect(f.pruner.prune({ approvalAuditId: "gate-cap" })).rejects.toMatchObject({
+      name: "SignerPruneError", message: "signer prune failed", outcome: { phase: "not-started" },
+      cause: { message: expect.stringMatching(/cap/) },
+    });
     expect(await f.storage.read(KNOWN_SIGNERS_NAMESPACE, key)).toEqual(before);
   });
 

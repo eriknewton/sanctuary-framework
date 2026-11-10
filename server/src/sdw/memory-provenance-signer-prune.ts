@@ -8,6 +8,9 @@ import {
   KnownSignersStore,
   knownSignerStorageKey,
 } from "../reputation/known-signers-store.js";
+import {
+  SignerPruneError, initialSignerPruneOutcome, type SignerPruneOutcome,
+} from "../storage/signer-prune-outcome.js";
 import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 import { withExitAdmissionLock } from "../storage/exit-import-journal.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -98,26 +101,32 @@ export class MemoryProvenanceSignerPruner {
     readonly approvalAuditId: string;
     readonly identityId?: string;
   }): Promise<MemoryProvenanceSignerPruneResult> {
-    if (!/^[A-Za-z0-9:._-]{1,256}$/.test(input.approvalAuditId)) {
-      throw new Error("invalid signer-prune approval audit id");
-    }
-    return withExitAdmissionLock(this.options.storage, "memory_signer_prune", () =>
-      withSdwMemoryCorpusMutationLock(this.options.storage, () =>
-        withCrossProcessLock(
-          this.options.storage,
-          MEMORY_BATCH_LOCK_NAMESPACE,
-          sdwMemoryCorpusBatchLockFile(),
-          () => this.pruneUnderLocks(input),
-          { timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS },
+    const outcome = initialSignerPruneOutcome();
+    try {
+      if (!/^[A-Za-z0-9:._-]{1,256}$/.test(input.approvalAuditId)) {
+        throw new Error("invalid signer-prune approval audit id");
+      }
+      // Keep witnessed state outside every lock so release failures cannot erase it.
+      return await withExitAdmissionLock(this.options.storage, "memory_signer_prune", () =>
+        withSdwMemoryCorpusMutationLock(this.options.storage, () =>
+          withCrossProcessLock(
+            this.options.storage,
+            MEMORY_BATCH_LOCK_NAMESPACE,
+            sdwMemoryCorpusBatchLockFile(),
+            () => this.pruneUnderLocks(input, outcome),
+            { timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS },
+          ),
         ),
-      ),
-    );
+      );
+    } catch (error) {
+      throw new SignerPruneError(outcome, error);
+    }
   }
 
   private async pruneUnderLocks(input: {
     readonly approvalAuditId: string;
     readonly identityId?: string;
-  }): Promise<MemoryProvenanceSignerPruneResult> {
+  }, outcome: SignerPruneOutcome): Promise<MemoryProvenanceSignerPruneResult> {
     const listing = await this.listCorpus();
     const documents = new Map<string, SdwDocumentRecord>();
     for (const key of listing.documents) {
@@ -218,6 +227,7 @@ export class MemoryProvenanceSignerPruner {
       throw new Error("memory provenance corpus changed before signer deletion");
     }
 
+    // The durable plan must precede journal publication and every deletion.
     await this.options.auditLog.appendCritical({
       layer: "l1",
       operation: MEMORY_PROVENANCE_SIGNER_PRUNE_PLAN_AUDIT,
@@ -231,45 +241,77 @@ export class MemoryProvenanceSignerPruner {
       },
     });
 
+    let finalizationFailure: { cause: unknown } | undefined;
     if (deleted.length > 0) {
-      await runJournaledMemoryProvenanceSignerPrune({
-        storage: this.options.storage,
-        identityId: input.identityId ?? "principal",
-        locations: deleted.map((entry) => ({
-          namespace: KNOWN_SIGNERS_NAMESPACE,
-          key: entry.storage_key,
-        })),
-        operation: async ({ recordPostImage }) => {
-          for (const entry of deleted) {
-            // The intended null post-image is durable before the destructive
-            // mutation, so a kill at either boundary has an exact disposition.
-            await recordPostImage(KNOWN_SIGNERS_NAMESPACE, entry.storage_key, null);
-            if (!await this.options.storage.delete(
-              KNOWN_SIGNERS_NAMESPACE,
-              entry.storage_key,
-              true,
-            )) throw new Error("planned memory-provenance signer disappeared before delete");
-            if (await this.options.storage.read(KNOWN_SIGNERS_NAMESPACE, entry.storage_key) !== null) {
-              throw new Error("memory-provenance signer deletion was not durable");
+      try {
+        await runJournaledMemoryProvenanceSignerPrune({
+          storage: this.options.storage,
+          identityId: input.identityId ?? "principal",
+          locations: deleted.map((entry) => ({
+            namespace: KNOWN_SIGNERS_NAMESPACE,
+            key: entry.storage_key,
+          })),
+          operation: async ({ recordPostImage }) => {
+            for (const entry of deleted) {
+              // The intended null post-image is durable before the destructive
+              // mutation, so a kill at either boundary has an exact disposition.
+              await recordPostImage(KNOWN_SIGNERS_NAMESPACE, entry.storage_key, null);
+              if (!await this.options.storage.delete(
+                KNOWN_SIGNERS_NAMESPACE,
+                entry.storage_key,
+                true,
+              )) throw new Error("planned memory-provenance signer disappeared before delete");
+              if (await this.options.storage.read(KNOWN_SIGNERS_NAMESPACE, entry.storage_key) !== null) {
+                throw new Error("memory-provenance signer deletion was not durable");
+              }
             }
-          }
-        },
-      });
-      for (const entry of deleted) this.options.forgetSigner(entry.signer_did);
+          },
+        });
+      } catch (error) {
+        // Must match SignerPruneOutcome in storage/signer-prune-outcome.ts and its phase transitions in exit/bundle.ts.
+        // Capture it before an outer lock release can replace the thrown error.
+        Object.assign(outcome, error instanceof SignerPruneError
+          ? error.outcome : { phase: "uncertain" as const });
+        throw error;
+      }
+      outcome.phase = "committed";
+      outcome.cleanup = "finished";
+      outcome.finalization = "pending";
+      for (const entry of deleted) {
+        try {
+          this.options.forgetSigner(entry.signer_did);
+        } catch (cause) {
+          // Keep trying the bounded deletion set; one cache fault must not skip other DIDs.
+          finalizationFailure ??= { cause };
+        }
+      }
+      if (finalizationFailure === undefined) outcome.finalization = "finished";
     }
 
-    await this.options.auditLog.appendCritical({
-      layer: "l1",
-      operation: MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETE_AUDIT,
-      identity_id: input.identityId ?? "principal",
-      result: "success",
-      details: {
-        approval_audit_id: input.approvalAuditId,
-        exact_set_digest: exactSetDigest,
-        deleted: deleted.length,
-        scan_counts: scanned,
-      },
-    });
+    outcome.completionAudit = "pending";
+    try {
+      // Empty plans remain not-started; an audit failure cannot invent a deletion.
+      await this.options.auditLog.appendCritical({
+        layer: "l1",
+        operation: MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETE_AUDIT,
+        identity_id: input.identityId ?? "principal",
+        // The deletion committed, so this is a commit record; finalization_failed marks a cache fault after commit.
+        result: "success",
+        details: {
+          approval_audit_id: input.approvalAuditId,
+          exact_set_digest: exactSetDigest,
+          deleted: deleted.length,
+          finalization_failed: finalizationFailure !== undefined,
+          scan_counts: scanned,
+        },
+      });
+      outcome.completionAudit = "settled";
+    } catch (error) {
+      outcome.completionAudit = "failed";
+      throw error;
+    }
+    // A committed deletion still needs its audit record when cache maintenance fails.
+    if (finalizationFailure !== undefined) throw finalizationFailure.cause;
     return { deleted, exact_set_digest: exactSetDigest, scanned };
   }
 
