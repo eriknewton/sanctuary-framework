@@ -143,6 +143,22 @@
     "server/src/castle-wall/ipc/framing.ts",
     "server/src/castle-wall/ipc/index.ts",
     "server/src/castle-wall/ipc/messages.ts",
+    "server/src/castle-wall/liveness/canary-integrity.ts",
+    "server/src/castle-wall/liveness/census-sampler.ts",
+    "server/src/castle-wall/liveness/census.ts",
+    "server/src/castle-wall/liveness/constants.ts",
+    "server/src/castle-wall/liveness/contract.ts",
+    "server/src/castle-wall/liveness/evaluate.ts",
+    "server/src/castle-wall/liveness/index.ts",
+    "server/src/castle-wall/liveness/launchd-plists.ts",
+    "server/src/castle-wall/liveness/monitoring-origin.ts",
+    "server/src/castle-wall/liveness/observer.ts",
+    "server/src/castle-wall/liveness/process-census.ts",
+    "server/src/castle-wall/liveness/read-status.ts",
+    "server/src/castle-wall/liveness/record-store.ts",
+    "server/src/castle-wall/liveness/recorder.ts",
+    "server/src/castle-wall/liveness/schema.ts",
+    "server/src/castle-wall/liveness/timing.ts",
     "server/src/castle-wall/observe/adapter.ts",
     "server/src/castle-wall/observe/fold.ts",
     "server/src/castle-wall/observe/index.ts",
@@ -246,9 +262,12 @@
     "server/src/cli/castle-wall-full-agent-state.ts",
     "server/src/cli/castle-wall-full-agent.ts",
     "server/src/cli/castle-wall-linux-upgrade.ts",
+    "server/src/cli/castle-wall-liveness-status.ts",
     "server/src/cli/castle-wall-manifest-preflight.ts",
     "server/src/cli/castle-wall-observe.ts",
     "server/src/cli/castle-wall-signer-helper.ts",
+    "server/src/cli/castle-wall-watch-collectors.ts",
+    "server/src/cli/castle-wall-watch.ts",
     "server/src/cli/castle-wall.ts",
     "server/src/cli/check-updates.ts",
     "server/src/cli/checkpoint.ts",
@@ -293,6 +312,7 @@
     "server/src/cli/sdw-owner.ts",
     "server/src/cli/secrets.ts",
     "server/src/cli/sentinel.ts",
+    "server/src/cli/stable-runtime-path.ts",
     "server/src/cli/state-disclose.ts",
     "server/src/cli/status.ts",
     "server/src/cli/stdio-shutdown.ts",
@@ -666,6 +686,7 @@
     "server/src/linux-business/activation-anchor.ts",
     "server/src/linux-business/index.ts",
     "server/src/linux-business/producer-custody.ts",
+    "server/src/linux-business/profile-selection.ts",
     "server/src/lockdown/index.ts",
     "server/src/lockdown/status.ts",
     "server/src/mcp-child-fortress-refusal.ts",
@@ -994,6 +1015,7 @@
     "server/src/storage/read-only-guard.ts",
     "server/src/storage/sdw-fence.ts",
     "server/src/storage/sdw-journal-contract.ts",
+    "server/src/storage/signer-prune-outcome.ts",
     "server/src/storage/transient-read.ts",
     "server/src/strings.ts",
     "server/src/substrate/attribution.ts",
@@ -1343,6 +1365,41 @@
       "preimage": "{\"context\":[[\"named\",\"FunctionDeclaration\",[[\"Identifier\",\"startBrokerLivenessHeartbeat\"]]],[\"named\",\"VariableDeclaration\",[[\"Identifier\",\"interval\"]]],[\"call\",[[\"Identifier\",\"setInterval\"]],[[\"callback\"],[[\"Identifier\",\"intervalMs\"]]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"queueOperation\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"BROKER_DAEMON_HEARTBEAT_OPERATION\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
     },
     {
+      "path": "server/src/castle-wall/liveness/census-sampler.ts",
+      "rule": "@typescript-eslint/no-floating-promises",
+      "kind": "floating",
+      "fingerprint": "1a64a98da30fbedb35de6517eb3aefdaa971ded74df65ed31133aaddd7ab363a",
+      "preimage": "{\"context\":[[\"named\",\"ClassDeclaration\",[[\"Identifier\",\"CensusSampler\"]]],[\"named\",\"MethodDeclaration\",[[\"Identifier\",\"start\"]]],[\"call\",[[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"deps\"],[\"DotToken\",\".\"],[\"Identifier\",\"timers\"],[\"DotToken\",\".\"],[\"Identifier\",\"setInterval\"]],[[\"callback\"],[[\"Identifier\",\"CENSUS_PERIOD\"]]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"tick\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+    },
+    {
+      "path": "server/src/castle-wall/liveness/observer.ts",
+      "rule": "@typescript-eslint/no-floating-promises",
+      "kind": "floating",
+      "fingerprint": "274c626799e2d5017855ebd5a5fd4e5e31dd3b7038eb701988e3f34fce834617",
+      "preimage": "{\"context\":[[\"named\",\"ClassDeclaration\",[[\"Identifier\",\"LivenessObserver\"]]],[\"named\",\"MethodDeclaration\",[[\"Identifier\",\"start\"]]],[\"call\",[[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"deps\"],[\"DotToken\",\".\"],[\"Identifier\",\"timers\"],[\"DotToken\",\".\"],[\"Identifier\",\"setInterval\"]],[[\"callback\"],[[\"Identifier\",\"OBSERVER_PERIOD\"]]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"tick\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+    },
+    {
+      "path": "server/src/castle-wall/liveness/observer.ts",
+      "rule": "@typescript-eslint/no-floating-promises",
+      "kind": "floating",
+      "fingerprint": "7865f454fbebf3b90d956a9b691e1fd1738e209a706534d3a17b2f4c878960c9",
+      "preimage": "{\"context\":[[\"named\",\"ClassDeclaration\",[[\"Identifier\",\"LivenessObserver\"]]],[\"named\",\"MethodDeclaration\",[[\"Identifier\",\"start\"]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"tick\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+    },
+    {
+      "path": "server/src/castle-wall/liveness/read-status.ts",
+      "rule": "@typescript-eslint/no-floating-promises",
+      "kind": "floating",
+      "fingerprint": "9e19db17d00f0c4228d7c474632b15dfa46d6514c1786dac3897ea517b8314ec",
+      "preimage": "{\"context\":[[\"named\",\"FunctionDeclaration\",[[\"Identifier\",\"readLivenessRecords\"]]],[\"named\",\"VariableDeclaration\",[[\"Identifier\",\"bounded\"]]],[\"call\",[[\"Identifier\",\"operation\"],[\"DotToken\",\".\"],[\"Identifier\",\"then\"]],[[\"callback\"],[\"callback\"]]],[\"branch\",[[\"Identifier\",\"expired\"],[\"AmpersandAmpersandToken\",\"&&\"],[\"Identifier\",\"value\"],[\"ExclamationEqualsEqualsToken\",\"!==\"],[\"NullKeyword\",\"null\"],[\"AmpersandAmpersandToken\",\"&&\"],[\"TypeOfKeyword\",\"typeof\"],[\"Identifier\",\"value\"],[\"EqualsEqualsEqualsToken\",\"===\"],[\"StringLiteral\",\"\\\"object\\\"\"],[\"AmpersandAmpersandToken\",\"&&\"],[\"StringLiteral\",\"\\\"close\\\"\"],[\"InKeyword\",\"in\"],[\"Identifier\",\"value\"]],\"then\"]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"cleanup\"],[\"DotToken\",\".\"],[\"Identifier\",\"close\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"value\"],[\"AsKeyword\",\"as\"],[\"UnknownKeyword\",\"unknown\"],[\"AsKeyword\",\"as\"],[\"Identifier\",\"ReaderFileHandle\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+    },
+    {
+      "path": "server/src/castle-wall/provision/liveness-probe.ts",
+      "rule": "@typescript-eslint/no-floating-promises",
+      "kind": "floating",
+      "fingerprint": "38cf0dd7d536da5620dbb971fd97a208447eca3eeb0027026746c9376ac6c558",
+      "preimage": "{\"context\":[[\"named\",\"FunctionDeclaration\",[[\"Identifier\",\"telegramCall\"]]],[\"call\",[[\"Identifier\",\"pending\"],[\"DotToken\",\".\"],[\"Identifier\",\"then\"]],[[\"callback\"],[\"callback\"]]],[\"branch\",[[\"Identifier\",\"signal\"],[\"DotToken\",\".\"],[\"Identifier\",\"aborted\"]],\"then\"]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"res\"],[\"DotToken\",\".\"],[\"Identifier\",\"body\"],[\"QuestionDotToken\",\"?.\"],[\"Identifier\",\"cancel\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"DotToken\",\".\"],[\"Identifier\",\"catch\"],[\"OpenParenToken\",\"(\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"EqualsGreaterThanToken\",\"=>\"],[\"Identifier\",\"undefined\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+    },
+    {
       "path": "server/src/castle-wall/runtime/audit-consumer.ts",
       "rule": "@typescript-eslint/no-floating-promises",
       "kind": "floating",
@@ -1369,6 +1426,13 @@
       "kind": "floating",
       "fingerprint": "44a78f08a5c5f50d4c11784a024e487e0c1229a8c812cfce71ea813f90f3d773",
       "preimage": "{\"context\":[[\"named\",\"FunctionDeclaration\",[[\"Identifier\",\"startMacOSCastleWallDaemon\"]]],[\"named\",\"VariableDeclaration\",[[\"Identifier\",\"startAuditHeartbeatInterval\"]]],[\"call\",[[\"Identifier\",\"setInterval\"]],[[\"callback\"],[[\"Identifier\",\"auditHeartbeatIntervalSeconds\"],[\"AsteriskToken\",\"*\"],[\"FirstLiteralToken\",\"1000\"]]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"runAuditHeartbeat\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+    },
+    {
+      "path": "server/src/castle-wall/runtime/macos-daemon.ts",
+      "rule": "@typescript-eslint/no-floating-promises",
+      "kind": "floating",
+      "fingerprint": "7879c400da73edcc17b38f1fd9e81bdd52063ef27841a48159e0cf5dc6dfc461",
+      "preimage": "{\"context\":[[\"named\",\"FunctionDeclaration\",[[\"Identifier\",\"startMacOSCastleWallDaemon\"]]],[\"named\",\"VariableDeclaration\",[[\"Identifier\",\"startEmissionLivenessTimer\"]]],[\"call\",[[\"Identifier\",\"setInterval\"]],[[\"callback\"],[[\"Identifier\",\"emissionLivenessTickSeconds\"],[\"AsteriskToken\",\"*\"],[\"FirstLiteralToken\",\"1000\"]]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"livenessRecorder\"],[\"QuestionDotToken\",\"?.\"],[\"Identifier\",\"emissionTick\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
     },
     {
       "path": "server/src/castle-wall/runtime/macos-daemon.ts",
@@ -2649,7 +2713,7 @@
       "rule": "@typescript-eslint/no-floating-promises",
       "kind": "floating",
       "fingerprint": "9cc16e1b9efaf4f76627f59b3b697b55b25d4a2f0a7f680c44d858f221518ceb",
-      "preimage": "{\"context\":[[\"named\",\"ClassDeclaration\",[[\"Identifier\",\"DashboardApprovalChannel\"]]],[\"named\",\"MethodDeclaration\",[[\"Identifier\",\"startHttpServer\"]]],[\"new\",[[\"Identifier\",\"Promise\"]],[[\"callback\"]]],[\"named\",\"VariableDeclaration\",[[\"Identifier\",\"onStartupError\"]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"cleanupFailedHttpServer\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"server\"],[\"CloseParenToken\",\")\"],[\"DotToken\",\".\"],[\"Identifier\",\"finally\"],[\"OpenParenToken\",\"(\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"EqualsGreaterThanToken\",\"=>\"],[\"FirstPunctuation\",\"{\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"httpServer\"],[\"EqualsEqualsEqualsToken\",\"===\"],[\"Identifier\",\"server\"],[\"CloseParenToken\",\")\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"httpServer\"],[\"FirstAssignment\",\"=\"],[\"NullKeyword\",\"null\"],[\"SemicolonToken\",\";\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"err\"],[\"DotToken\",\".\"],[\"Identifier\",\"code\"],[\"EqualsEqualsEqualsToken\",\"===\"],[\"StringLiteral\",\"\\\"EADDRINUSE\\\"\"],[\"CloseParenToken\",\")\"],[\"FirstPunctuation\",\"{\"],[\"ConstKeyword\",\"const\"],[\"Identifier\",\"port\"],[\"FirstAssignment\",\"=\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"config\"],[\"DotToken\",\".\"],[\"Identifier\",\"port\"],[\"SemicolonToken\",\";\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"opts\"],[\"QuestionDotToken\",\"?.\"],[\"Identifier\",\"exitCleanOnAddrInUse\"],[\"CloseParenToken\",\")\"],[\"FirstPunctuation\",\"{\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"_addrInUse\"],[\"FirstAssignment\",\"=\"],[\"TrueKeyword\",\"true\"],[\"SemicolonToken\",\";\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"ExclamationToken\",\"!\"],[\"Identifier\",\"opts\"],[\"QuestionDotToken\",\"?.\"],[\"Identifier\",\"silentAddrInUse\"],[\"CloseParenToken\",\")\"],[\"FirstPunctuation\",\"{\"],[\"Identifier\",\"process\"],[\"DotToken\",\".\"],[\"Identifier\",\"stderr\"],[\"DotToken\",\".\"],[\"Identifier\",\"write\"],[\"OpenParenToken\",\"(\"],[\"TemplateHead\",\"`\\\\n  Sanctuary Dashboard: port ${\"],[\"Identifier\",\"port\"],[\"LastTemplateToken\",\"} already owned by another `\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`instance; standing down (single-owner).\\\\n\\\\n`\"],[\"CommaToken\",\",\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"Identifier\",\"resolve\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"ReturnKeyword\",\"return\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"Identifier\",\"process\"],[\"DotToken\",\".\"],[\"Identifier\",\"stderr\"],[\"DotToken\",\".\"],[\"Identifier\",\"write\"],[\"OpenParenToken\",\"(\"],[\"FirstTemplateToken\",\"`\\\\n  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\\\\n`\"],[\"PlusToken\",\"+\"],[\"TemplateHead\",\"`  \u2551  Port ${\"],[\"Identifier\",\"port\"],[\"LastTemplateToken\",\"} is already in use.                              \u2551\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  \u2551                                                              \u2551\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  \u2551  Another Sanctuary Dashboard may still be running.           \u2551\\\\n`\"],[\"PlusToken\",\"+\"],[\"TemplateHead\",\"`  \u2551  To fix: lsof -ti:${\"],[\"Identifier\",\"port\"],[\"LastTemplateToken\",\"} | xargs kill                        \u2551\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  \u2551  Then restart the dashboard.                                 \u2551\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\\\\n\\\\n`\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"Identifier\",\"reject\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"err\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
+      "preimage": "{\"context\":[[\"named\",\"ClassDeclaration\",[[\"Identifier\",\"DashboardApprovalChannel\"]]],[\"named\",\"MethodDeclaration\",[[\"Identifier\",\"startHttpServer\"]]],[\"new\",[[\"Identifier\",\"Promise\"]],[[\"callback\"]]],[\"named\",\"VariableDeclaration\",[[\"Identifier\",\"onStartupError\"]]]],\"statement\":[\"statement\",[[\"VoidKeyword\",\"void\"],[\"Identifier\",\"cleanupFailedHttpServer\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"server\"],[\"CloseParenToken\",\")\"],[\"DotToken\",\".\"],[\"Identifier\",\"finally\"],[\"OpenParenToken\",\"(\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"EqualsGreaterThanToken\",\"=>\"],[\"FirstPunctuation\",\"{\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"httpServer\"],[\"EqualsEqualsEqualsToken\",\"===\"],[\"Identifier\",\"server\"],[\"CloseParenToken\",\")\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"httpServer\"],[\"FirstAssignment\",\"=\"],[\"NullKeyword\",\"null\"],[\"SemicolonToken\",\";\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"err\"],[\"DotToken\",\".\"],[\"Identifier\",\"code\"],[\"EqualsEqualsEqualsToken\",\"===\"],[\"StringLiteral\",\"\\\"EADDRINUSE\\\"\"],[\"CloseParenToken\",\")\"],[\"FirstPunctuation\",\"{\"],[\"ConstKeyword\",\"const\"],[\"Identifier\",\"port\"],[\"FirstAssignment\",\"=\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"config\"],[\"DotToken\",\".\"],[\"Identifier\",\"port\"],[\"SemicolonToken\",\";\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"opts\"],[\"QuestionDotToken\",\"?.\"],[\"Identifier\",\"exitCleanOnAddrInUse\"],[\"CloseParenToken\",\")\"],[\"FirstPunctuation\",\"{\"],[\"ThisKeyword\",\"this\"],[\"DotToken\",\".\"],[\"Identifier\",\"_addrInUse\"],[\"FirstAssignment\",\"=\"],[\"TrueKeyword\",\"true\"],[\"SemicolonToken\",\";\"],[\"IfKeyword\",\"if\"],[\"OpenParenToken\",\"(\"],[\"ExclamationToken\",\"!\"],[\"Identifier\",\"opts\"],[\"QuestionDotToken\",\"?.\"],[\"Identifier\",\"silentAddrInUse\"],[\"CloseParenToken\",\")\"],[\"FirstPunctuation\",\"{\"],[\"Identifier\",\"process\"],[\"DotToken\",\".\"],[\"Identifier\",\"stderr\"],[\"DotToken\",\".\"],[\"Identifier\",\"write\"],[\"OpenParenToken\",\"(\"],[\"TemplateHead\",\"`\\\\n  Sanctuary Dashboard: port ${\"],[\"Identifier\",\"port\"],[\"LastTemplateToken\",\"} already owned by another `\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`instance; standing down (single-owner).\\\\n\\\\n`\"],[\"CommaToken\",\",\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"Identifier\",\"resolve\"],[\"OpenParenToken\",\"(\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"ReturnKeyword\",\"return\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"Identifier\",\"process\"],[\"DotToken\",\".\"],[\"Identifier\",\"stderr\"],[\"DotToken\",\".\"],[\"Identifier\",\"write\"],[\"OpenParenToken\",\"(\"],[\"FirstTemplateToken\",\"`\\\\n  ╔══════════════════════════════════════════════════════════════╗\\\\n`\"],[\"PlusToken\",\"+\"],[\"TemplateHead\",\"`  ║  Port ${\"],[\"Identifier\",\"port\"],[\"LastTemplateToken\",\"} is already in use.                              ║\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  ║                                                              ║\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  ║  Another Sanctuary Dashboard may still be running.           ║\\\\n`\"],[\"PlusToken\",\"+\"],[\"TemplateHead\",\"`  ║  To fix: lsof -ti:${\"],[\"Identifier\",\"port\"],[\"LastTemplateToken\",\"} | xargs kill                        ║\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  ║  Then restart the dashboard.                                 ║\\\\n`\"],[\"PlusToken\",\"+\"],[\"FirstTemplateToken\",\"`  ╚══════════════════════════════════════════════════════════════╝\\\\n\\\\n`\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"Identifier\",\"reject\"],[\"OpenParenToken\",\"(\"],[\"Identifier\",\"err\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"],[\"CloseBraceToken\",\"}\"],[\"CloseParenToken\",\")\"],[\"SemicolonToken\",\";\"]]],\"tokenPosition\":0}"
     },
     {
       "path": "server/src/principal-policy/dashboard.ts",
