@@ -24,7 +24,6 @@ import {
   type CanaryFailureRecord,
   type CanaryLateRecord,
   type DaemonCanaryEvidence,
-  type LockRecoveryField,
   type RecorderHook,
 } from "./schema.js";
 
@@ -222,8 +221,17 @@ export interface LivenessRecorderOptions {
   instance: string;
   origin: () => CanaryOriginSubjects;
   publisherFs?: PublisherFs;
-  /** Production publishes the uninstrumented lock field until lock-recovery telemetry lands. */
-  lockRecovery?: () => LockRecoveryField;
+  /**
+   * Must match createLivenessRecorder in runtime/macos-daemon.ts: seed before observing subsequent events.
+   * The installed exit fence ends hold-deadline lapses before any recovery event; this count covers self-held
+   * stale releases and unfenced compositions only. Fenced exits reach recent_restart through the restart charge.
+   * Must match the recovery listener in runtime/macos-daemon.ts: finite event time or NaN for a failed sample.
+   */
+  lockRecovery: {
+    count: number;
+    lastAtMs: number | null;
+    subscribe: (listener: (atMs: number) => void) => void;
+  };
 }
 
 export class LivenessRecorder {
@@ -241,11 +249,25 @@ export class LivenessRecorder {
   private verifiedAdmissions = 0;
   private primaryConfirmations = 0;
   private publishFailures = 0;
+  private lockRecoveryCount: number;
+  private lastLockRecoveryAtMs: number | null;
   /** The drain in flight and the one handled continuation subscribed to it; queued ticks reuse it. */
   private publishing: { drain: Promise<void>; handled: Promise<void> } | null = null;
 
   constructor(private readonly options: LivenessRecorderOptions) {
     this.now = options.now ?? Date.now;
+    // Require this daemon's audit source so missing instrumentation cannot silently publish complete evidence.
+    // Invalid source counts saturate so the evaluator cannot mistake malformed history for a clean observation.
+    this.lockRecoveryCount = Number.isInteger(options.lockRecovery.count) && options.lockRecovery.count >= 0
+      ? Math.min(COUNTER_MAX, options.lockRecovery.count) : COUNTER_MAX;
+    // Construction is the latest possible unobserved recovery time, preserving the full degradation window.
+    this.lastLockRecoveryAtMs = options.lockRecovery.lastAtMs ?? (this.lockRecoveryCount > 0 ? this.now() : null);
+    options.lockRecovery.subscribe(atMs => {
+      // Recovery observation has constant space and no audit writes or asynchronous work.
+      this.lockRecoveryCount = saturatingIncrement(this.lockRecoveryCount);
+      // A failed event sample retries this recorder's clock, never a null or a previous event's timestamp.
+      this.lastLockRecoveryAtMs = Number.isFinite(atMs) ? atMs : this.now();
+    });
     this.canarySlot = new CanaryRecordingSlot(options.origin, this.now);
     this.publisher = new LivenessRecordPublisher({
       fortressPath: options.fortressPath,
@@ -378,7 +400,7 @@ export class LivenessRecorder {
       raw: {
         process: { pid: this.options.pid },
         hooks,
-        lock_recovery: this.options.lockRecovery?.() ?? { state: "not_instrumented" },
+        lock_recovery: { state: "instrumented", count: this.lockRecoveryCount, last_at_ms: this.lastLockRecoveryAtMs },
         detector: {
           last_evaluate_at_ms: detector?.lastEvaluateAtMs ?? null,
           stalled: detector?.stalled ?? false,

@@ -4,8 +4,11 @@
  * deadlines, full-service and session fields, evidence failures, canary
  * integrity per cycle, and allow-sighting retention with its instance seed.
  */
+// fail-before-exempt: this change adds only a witness that an unclean full-agent exit reaches the reading as recent_restart; the chain it drives predates the change, so it passes on the base source.
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmdirSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { FullAgentStateStore } from "../../../src/cli/castle-wall-full-agent-state.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -392,6 +395,30 @@ describe("full service and session", () => {
       return child;
     };
   }
+
+  it("reports an unclean running predecessor through admission, the state collector and recent_restart", async () => {
+    const fortressPath = mkdtempSync(join(tmpdir(), "liveness-restart-"));
+    const world = new World();
+    const store = new FullAgentStateStore(fortressPath, { now: () => world.now });
+    try {
+      expect(store.admit().admitted).toBe(true);
+      expect(store.read()?.state).toBe("state_RUNNING");
+      // A fenced exit leaves RUNNING behind; the next process charges that unclean predecessor.
+      world.advance(SECOND);
+      const next = new FullAgentStateStore(fortressPath, { now: () => world.now });
+      expect(next.admit()).toMatchObject({ admitted: true, record: { charges_ms: [world.now] } });
+      const runner = new BoundedChildRunner({ spawn: spawnFor({}, []), timers: realTimers });
+      const collectors = createWatchCollectors({ fortressPath, operatorUid: OPERATOR, runner, timers: realTimers });
+      const observer = observerFor(world, { ...world.collectors(), readFullAgentState: () => collectors.readFullAgentState() });
+      const record = await cycle(observer);
+      expect(raw(record).full_service).toMatchObject({ last_charge_at_ms: world.now });
+      expect(world.envelope(record).wall.reasons).toContain("recent_restart");
+    } finally {
+      unlinkSync(store.path);
+      rmdirSync(store.directory);
+      rmdirSync(fortressPath);
+    }
+  });
 
   it("reads loaded and pid through the runner and parseFullAgentPrint, latched and the maximum charge from the state, start identity from ps, and never observeJob", async () => {
     const argv: string[][] = [];
