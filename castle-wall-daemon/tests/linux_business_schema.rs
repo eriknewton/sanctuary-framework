@@ -2,35 +2,9 @@ use castle_wall_daemon::business_profile::{
     activation_anchor as anchor, protocol_transitions, records, records_schema,
 };
 use serde_json::{json, Value};
-const MANIFEST: &str = include_str!("../src/business_profile/vector_manifest.json");
-/// Must match vector_manifest.json and every TS consumer: a corpus is read only after its exact bytes and every group count match the manifest.
-fn corpus(name: &str) -> Value {
-    use sha2::{Digest, Sha256};
-    let bytes = match name {
-        "closure_vectors.json" => include_str!("../src/business_profile/closure_vectors.json"),
-        "record_join_vectors.json" => {
-            include_str!("../src/business_profile/record_join_vectors.json")
-        }
-        "generator_vectors.json" => include_str!("../src/business_profile/generator_vectors.json"),
-        _ => panic!("unpinned corpus {name}"),
-    };
-    let manifest: Value = serde_json::from_str(MANIFEST).unwrap();
-    let entry = &manifest["files"][name];
-    assert_eq!(
-        json!(hex::encode(Sha256::digest(bytes.as_bytes()))),
-        entry["sha256"],
-        "{name}"
-    );
-    let value: Value = serde_json::from_str(bytes).unwrap();
-    for (group, count) in entry["cases"].as_object().unwrap() {
-        assert_eq!(
-            json!(value[group].as_array().unwrap().len()),
-            *count,
-            "{name} {group}"
-        );
-    }
-    value
-}
+#[path = "support/checked_corpus.rs"]
+mod checked_corpus;
+use checked_corpus::{corpus, MANIFEST};
 fn sample(node: &Value, definitions: &Value) -> Value {
     match node["type"].as_str().unwrap() {
         "ref" => sample(&definitions[node["name"].as_str().unwrap()], definitions),
@@ -555,7 +529,9 @@ fn shared_manifest_pins_every_k1c_corpus() {
         [
             "closure_vectors.json",
             "generator_vectors.json",
-            "record_join_vectors.json"
+            "public_vectors.json",
+            "record_join_vectors.json",
+            "role_vectors.json"
         ]
     );
     for name in names {

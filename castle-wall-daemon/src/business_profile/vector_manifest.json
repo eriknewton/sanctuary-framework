@@ -22,10 +22,22 @@
         "cases": 8
       }
     },
+    "public_vectors.json": {
+      "sha256": "6ca52097d0223e0dc1a714bb1344dfeae6be16f56cdd9655667a9458e58885cc",
+      "cases": {
+        "$root": 13
+      }
+    },
     "record_join_vectors.json": {
       "sha256": "f2dd9855e598c5ccb80a0fb68bdc7689e373aabc13ed8f2313803b8f807a8d81",
       "cases": {
         "cases": 158
+      }
+    },
+    "role_vectors.json": {
+      "sha256": "9bdad486173e8121494fe2ec2ba5edc21036d5a89717005adf415d6e0d8f73f7",
+      "cases": {
+        "$root": 8
       }
     }
   }
