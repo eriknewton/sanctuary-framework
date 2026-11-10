@@ -1,3 +1,4 @@
+import {requireCliTestRunner} from "../../src/cli/argv.js";
 import {mkdtempSync, rmdirSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
@@ -11,4 +12,4 @@ if (!state[key]) {
   state[key] = root;
   process.once("exit", () => { try { rmdirSync(root); } catch { /* Teardown must not throw from exit. */ } });
 }
-installSelectorRootsForTest(isolatedSelectorRoots(state[key]!));
+installSelectorRootsForTest(isolatedSelectorRoots(state[key]!), requireCliTestRunner("selectorRoots"));

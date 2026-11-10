@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
+import {WRAP_PROFILE_REFUSAL_EXIT_STATUS, appliesLinuxProfileSelection, selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 /**
  * Sanctuary wrap - CLI Entry Point
  *
@@ -218,7 +218,7 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
-import { argvTokenForDisplay } from "../cli/argv.js";
+import { requireCliTestRunner, argvTokenForDisplay } from "../cli/argv.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
 
@@ -305,9 +305,9 @@ export function __processShutdownCleanupCountForTest(): number {
   return processShutdownCleanups.size;
 }
 
+// Shared with injected selection roots through cli/argv.ts.
 function assertWrapCliTestHookAllowed(name: string): void {
-  if (process.env.NODE_ENV === "test" || process.env.VITEST !== undefined) return;
-  throw new Error(`${name} is test-only and is disabled outside the test runner.`);
+  requireCliTestRunner(name);
 }
 
 // FIX (N1-1 corrected, 2026-07-27): every registered cleanup starts an async
@@ -3310,6 +3310,11 @@ export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  if (deps.selectorRoots !== undefined) {
+    defaultSelectorRoots({
+      roots: deps.selectorRoots, assertTestRunner: requireCliTestRunner("selectorRoots"),
+    });
+  }
   // Memory installation must return before any account policy or ordinary protection setup.
   if (options.hermesMemory) {
     const allowed = new Set(["hermesMemory", "unwrap", "dryRun", "protectCommand"]);
@@ -3321,13 +3326,13 @@ export async function runWrap(
     if (__hermesParityTestHook.parity) assertWrapCliTestHookAllowed("__hermesParityTestHook");
     return runHermesPosture(options, __hermesPostureTestHook, __hermesParityTestHook.parity);
   }
-  if ((deps.osPlatform ?? (() => process.platform))() === "linux") {
+  if (appliesLinuxProfileSelection((deps.osPlatform ?? (() => process.platform))())) {
     const storagePath = effectiveFortressOverride(options) ?? resolveStoragePath();
     const selection = selectLinuxProfile(deps.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
     // Only a proven legacy selection may reach listeners, credentials or provisioning.
     if (selection.kind !== "LegacyV1") {
       process.stderr.write(`${profileRefusalText(selection)}\n`);
-      process.exit(2);
+      return process.exit(WRAP_PROFILE_REFUSAL_EXIT_STATUS);
     }
   }
   if (options.hermes) await refuseHermesMcpWithPosture();

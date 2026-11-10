@@ -834,7 +834,7 @@ mod selection_walk {
             if bytes.len() > SELECTOR_MAX_BYTES {
                 return Err(SelectorInvalid);
             }
-            // The selector names the profile and its enrollment; it grants nothing, and its digests are compared with custody and the drain before any key is opened.
+            // The selector names the profile and enrollment; only shape and canonical bytes are checked here, not digest agreement with custody or the drain. It grants nothing.
             let value: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|_| SelectorInvalid)?;
             if crate::smb::jcs::encode(&value)

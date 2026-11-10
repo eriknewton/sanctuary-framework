@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 - Adds Linux business record codecs and verifiers only, plus pure shared history joins, strict recovery proposals and custody journal acknowledgments. Linux hosts now select a producer profile before any path is prepared: a host carrying business enrollment evidence refuses to start the Castle Wall daemon, because installed business signing is not enabled; the raw producer key constructor is excluded from shipped builds.
+- On Linux, `sanctuary wrap`, `sanctuary protect` and `castle-wall daemon` require a mounted `/proc` and refuse to start without it.
 - Added a private offline evidence snapshot verifier candidate, explicit capture diagnostics, fresh build outputs, artifact provenance, recipient instructions and a synthetic second-Mac drill procedure.
 
 - Added an isolated per-role record-signing contract, encrypted key provider and inert native signer service with an attended terminal ceremony, capability-free peers and restart-persistent worker uncertainty, monotonic kill deadlines, fault-latched cleanup settlement and cooperative cleanup that tolerates a concurrent LOCK. Daemon boot, application writers and readers, Mac and pack adapters, and installed acceptance remain pending.

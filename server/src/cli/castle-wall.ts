@@ -1,4 +1,5 @@
-import {selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
+import {requireCliTestRunner} from "./argv.js";
+import {DAEMON_PROFILE_REFUSAL_EXIT_STATUS, appliesLinuxProfileSelection, selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 import { FULL_SUPERVISION_COMPLETION_CODES } from "../castle-wall/runtime/full-supervision-exit.js";
 import fs from "node:fs";
 import { CASTLE_WALL_STOP_EXIT_DEADLINE_MS } from "../castle-wall/constants.js";
@@ -2562,6 +2563,11 @@ export async function runDaemon(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
+  if (ctx.selectorRoots !== undefined) {
+    defaultSelectorRoots({
+      roots: ctx.selectorRoots, assertTestRunner: requireCliTestRunner("selectorRoots"),
+    });
+  }
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
@@ -2579,12 +2585,12 @@ export async function runDaemon(
   }
 
   const storagePath = resolveFortressArg(parsed.fortress, env);
-  if (platform === "linux") {
+  if (appliesLinuxProfileSelection(platform)) {
     const selection = selectLinuxProfile(ctx.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
     // Only a proven legacy selection may consult the opt-in or prepare storage.
     if (selection.kind !== "LegacyV1") {
       write(err, `${profileRefusalText(selection)}\n`);
-      return 1;
+      return DAEMON_PROFILE_REFUSAL_EXIT_STATUS;
     }
   }
 

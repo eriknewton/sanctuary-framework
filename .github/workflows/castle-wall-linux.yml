@@ -171,7 +171,7 @@ jobs:
       # Must match the legacy vector target in castle-wall-daemon/Cargo.toml.
       - name: cargo test legacy producer vectors
         working-directory: castle-wall-daemon
-        run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang
+        run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang --lib
 
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon

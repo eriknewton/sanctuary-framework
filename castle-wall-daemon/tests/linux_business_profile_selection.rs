@@ -352,6 +352,7 @@ fn main_refuses_before_all_routes_and_paths_but_legacy_continues() {
         let output = Command::new(binary)
             .arg("--test-profile-root")
             .arg(root.path())
+            .args(isolation::subprocess_args())
             .args(&route)
             .arg("--producer-key")
             .arg(effects.path().join("k/key"))

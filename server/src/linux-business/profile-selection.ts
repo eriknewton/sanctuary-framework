@@ -2,6 +2,11 @@ import fs from "node:fs";
 import {isAbsolute, relative, join} from "node:path";
 import {jcs} from "../smb/jcs.js";
 
+// Existing daemon refusal convention; pinned by linux-profile-selection-callers.test.ts.
+export const DAEMON_PROFILE_REFUSAL_EXIT_STATUS = 1;
+// Existing wrap refusal convention; pinned by linux-profile-selection-callers.test.ts.
+export const WRAP_PROFILE_REFUSAL_EXIT_STATUS = 2;
+
 // Must match config.rs and the complete inventory in profile_selector_vectors.json.
 export const BUSINESS_PROFILE_SELECTOR = "/etc/sanctuary/business-profile.json";
 export const BUSINESS_SIGNER_CONFIG = "/etc/sanctuary/business-signer.json";
@@ -27,6 +32,12 @@ export const MAX_RAW_CANDIDATES = 2; // One private and one public producer path
 const UNTRUSTED_WRITE_BITS = 0o022; // Group or other write lets another principal hide evidence.
 const DIRECTORY_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
 const TEST_ROOTS = Symbol.for("sanctuary.test.selector-roots");
+
+/** Production values agree, so Linux never skips selection. The host check only
+ * keeps simulated-Linux tests on other hosts on their base path: procfs is Linux-only. */
+export function appliesLinuxProfileSelection(platform: NodeJS.Platform): boolean {
+  return platform === "linux" && process.platform === "linux";
+}
 
 export interface SelectorRoots {
   readonly anchor: string;
@@ -54,13 +65,29 @@ export function isolatedSelectorRoots(root: string): IsolatedSelectorRoots {
   });
   return make({}, [], []);
 }
-/** The single worker setup installs this reset-stable test state. */
-export function installSelectorRootsForTest(roots: SelectorRoots): void {
-  (globalThis as Record<symbol, unknown>)[TEST_ROOTS] = roots;
+/** The CLI supplies the runner assertion; selection never consults the environment. */
+interface TestSelectorRoots {
+  readonly roots: SelectorRoots;
+  readonly assertTestRunner: () => void;
 }
-/** Callers forward explicit fixtures or use the process-wide worker fixture, otherwise production. */
-export function defaultSelectorRoots(): SelectorRoots {
-  return (globalThis as Record<symbol, SelectorRoots | undefined>)[TEST_ROOTS] ?? PRODUCTION_SELECTOR_ROOTS;
+function permittedRoots(input: TestSelectorRoots): SelectorRoots {
+  // Reject untyped callers too, before accessing even the supplied anchor.
+  if (typeof input.assertTestRunner !== "function") {
+    throw new Error("selectorRoots is test-only and is disabled outside the test runner.");
+  }
+  input.assertTestRunner();
+  return input.roots;
+}
+/** The single worker setup installs reset-stable roots together with their required permit. */
+export function installSelectorRootsForTest(roots: SelectorRoots, assertTestRunner: () => void): void {
+  const input = Object.freeze({roots, assertTestRunner});
+  permittedRoots(input);
+  (globalThis as Record<symbol, unknown>)[TEST_ROOTS] = input;
+}
+/** Explicit and worker fixtures require a runner permit; production needs neither it nor an environment read. */
+export function defaultSelectorRoots(input?: TestSelectorRoots): SelectorRoots {
+  const installed = input ?? (globalThis as Record<symbol, TestSelectorRoots | undefined>)[TEST_ROOTS];
+  return installed === undefined ? PRODUCTION_SELECTOR_ROOTS : permittedRoots(installed);
 }
 export type ProfileRefusal = "SelectorInvalid" | "InventoryAmbiguous" | "LegacyWithEnrollment" | "RawInventoryPresent";
 export type LinuxProfileSelection = {kind: "LegacyV1"; reason: "Explicit" | "NoBusinessEvidence"}
@@ -103,25 +130,39 @@ export function selectLinuxProfile(roots: SelectorRoots, candidates: readonly st
       throw Object.assign(new Error("selection parent"), {code: "EACCES"});
     }
   };
-  const directory = (path: string) => {
+  const pathComponents = (path: string | Buffer): Buffer[] => {
+    const bytes = Buffer.isBuffer(path) ? path : Buffer.from(path);
+    const parts: Buffer[] = [];
+    let start = 0;
+    for (let i = 0; i <= bytes.length; i++) {
+      if (i === bytes.length || bytes[i] === 0x2f) {
+        if (i > start) parts.push(bytes.subarray(start, i));
+        start = i + 1;
+      }
+    }
+    return parts;
+  };
+  const directory = (path: string | Buffer) => {
     let parent = held[0], current = "";
-    for (const component of path.split("/").filter(Boolean)) {
-      current = current ? `${current}/${component}` : component;
+    for (const component of pathComponents(path)) {
+      // Only test-seam labels are text; filesystem operations preserve name bytes.
+      current = current ? `${current}/${component}` : component.toString();
       seam(current, true);
       // Node/libuv opens with close-on-exec; the kernel magic link names the held parent only.
-      const fd = fs.openSync(`/proc/self/fd/${parent}/${component}`, DIRECTORY_FLAGS);
+      const fd = fs.openSync(Buffer.concat([Buffer.from(`/proc/self/fd/${parent}/`), component]), DIRECTORY_FLAGS);
       held.push(fd);
       trust(fd, current);
       parent = fd;
     }
     return parent;
   };
-  const present = (path: string) => {
-    seam(path, false);
-    const components = path.split("/");
-    const leaf = components.pop()!;
-    const fd = directory(components.join("/"));
-    fs.lstatSync(`/proc/self/fd/${fd}/${leaf}`);
+  const present = (path: string | Buffer) => {
+    seam(path.toString(), false);
+    const bytes = Buffer.isBuffer(path) ? path : Buffer.from(path);
+    const slash = bytes.lastIndexOf(0x2f);
+    const fd = directory(slash < 0 ? "" : bytes.subarray(0, slash));
+    const leaf = bytes.subarray(slash + 1);
+    fs.lstatSync(Buffer.concat([Buffer.from(`/proc/self/fd/${fd}/`), leaf]));
     return true;
   };
   try {
@@ -152,7 +193,7 @@ export function selectLinuxProfile(roots: SelectorRoots, candidates: readonly st
       }
       if (size > SELECTOR_MAX_BYTES) return refused("SelectorInvalid");
       try {
-        // The selector names the profile and its enrollment; it grants nothing, and its digests are compared with custody and the drain before any key is opened.
+        // The selector names the profile and enrollment; only shape and canonical bytes are checked here, not digest agreement with custody or the drain. It grants nothing.
         const value: unknown = JSON.parse(bytes.subarray(0, size).toString("utf8"));
         if (!validSelector(value) || !Buffer.from(jcs(value)).equals(bytes.subarray(0, size))) return refused("SelectorInvalid");
         selector = value.profile as "business" | "legacy-v1";
@@ -170,16 +211,18 @@ export function selectLinuxProfile(roots: SelectorRoots, candidates: readonly st
       try { fd = directory(root.slice(1)); }
       catch (error) { if (code(error) === "ENOENT") continue; return refused("InventoryAmbiguous"); }
       let dir: fs.Dir;
-      try { dir = fs.opendirSync(`/proc/self/fd/${fd}/.`, {bufferSize: 1}); }
+      // Node supports buffer names here; @types/node still narrows encoding and Dirent.name to text.
+      try { dir = fs.opendirSync(`/proc/self/fd/${fd}/.`, {bufferSize: 1, encoding: "buffer" as BufferEncoding}); }
       catch { return refused("RawInventoryPresent"); }
       try {
         let count = 0;
         for (;;) {
           const entry = dir.readSync();
           if (!entry) break;
-          if (entry.name === "." || entry.name === "..") continue;
+          const name = entry.name as unknown as Buffer;
+          if (name.equals(Buffer.from(".")) || name.equals(Buffer.from(".."))) continue;
           if (++count > RAW_INVENTORY_MAX_ENTRIES) return refused("RawInventoryPresent");
-          try { if (present(`${root.slice(1)}/${entry.name}/${suffix}`)) return refused("RawInventoryPresent"); }
+          try { if (present(Buffer.concat([Buffer.from(`${root.slice(1)}/`), name, Buffer.from(`/${suffix}`)]))) return refused("RawInventoryPresent"); }
           catch (error) { if (code(error) !== "ENOENT") return refused("RawInventoryPresent"); }
         }
       } catch { return refused("RawInventoryPresent"); }

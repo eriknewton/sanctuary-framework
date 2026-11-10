@@ -1,4 +1,4 @@
-import {afterEach, expect, it, vi} from "vitest";
+import {afterEach, describe, expect, it, vi} from "vitest";
 import {mkdtempSync, mkdirSync, readdirSync, writeFileSync, lstatSync, unlinkSync, rmdirSync} from "node:fs";
 import {join} from "node:path";
 import {Writable} from "node:stream";
@@ -11,6 +11,8 @@ vi.mock("../../src/castle-wall/runtime/index.js", async importOriginal => ({
   ...await importOriginal<object>(), isLinuxProducerSignedActivationRequested: runtime.optIn,
   maybeActivateLinuxProducerSignedCastleWall: runtime.activate,
 }));
+// These caller witnesses exercise the Linux procfs descriptor transport.
+describe.skipIf(process.platform !== "linux")("Linux profile callers", () => {
 const fixtureRoots: string[] = [];
 function clean(root: string): void {
   for (const name of readdirSync(root)) {
@@ -75,6 +77,12 @@ for (const optIn of [undefined, "0", "1"]) it(`wrap refuses business before cred
   expect(exit).toHaveBeenCalledExactlyOnceWith(2);
   expect(output.join("")).toBe(refusal("Business"));
   expect(readdirSync(f.storage)).toEqual([]);
+  // A returning exit stub must still terminate this branch before any hook.
+  exit.mockImplementation(() => undefined as never);
+  await expect(runWrap({agentGuided: true, protectCommand: true}, deps)).resolves.toBeUndefined();
+  expect(exit).toHaveBeenCalledTimes(2);
+  for (const [name, hook] of Object.entries(hooks)) expect(hook, name).toHaveBeenCalledTimes(name === "osPlatform" ? 2 : 0);
+  expect(readdirSync(f.storage)).toEqual([]);
 });
 it("wrap legacy reaches the existing credential consumer", async () => {
   const f = fixture(false), {hooks, deps, credential} = wrapHooks(f.selectorRoots);
@@ -96,4 +104,6 @@ for (const explicit of [true, false]) it(`wrap inventories the effective fortres
   expect(output.join("")).toBe(refusal("RawInventoryPresent"));
   expect(process.env.SANCTUARY_STORAGE_PATH).toBe(f.storage);
   expect(hooks.resolveCustodyCredential).toHaveBeenCalledTimes(0);
+});
+
 });

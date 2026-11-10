@@ -83,7 +83,8 @@ function cleanup(root: string): void {
 const corpus = loadCheckedCorpus("profile_selector_vectors.json") as Obj;
 if (!validate(corpus)) throw new Error("HARNESS_FAILURE: malformed selector corpus element");
 const actual: unknown[] = [];
-describe("shared selector corpus", () => {
+// Selection requires the Linux procfs descriptor transport.
+describe.skipIf(process.platform !== "linux")("shared selector corpus", () => {
   for (const c of corpus.cases) it(c.id, () => {
     const root = fs.mkdtempSync(join(tmpdir(), "k1-selector-"));
     try {
@@ -125,7 +126,8 @@ it("rejects the same malformed element set as Rust before execution", () => {
   duplicate.cases.push(duplicate.cases[0]);
   expect(validate(duplicate)).toBe(false);
 });
-it("bounds caller paths and closes every descriptor on refusal", () => {
+// Descriptor accounting requires Linux procfs.
+it.skipIf(process.platform !== "linux")("bounds caller paths and closes every descriptor on refusal", () => {
   const root = fs.mkdtempSync(join(tmpdir(), "k1-selector-"));
   try {
     fs.mkdirSync(join(root, selection.BUSINESS_CUSTODY_ROOT.slice(1)), {recursive: true});
@@ -138,3 +140,32 @@ it("bounds caller paths and closes every descriptor on refusal", () => {
     expect(fs.readdirSync("/proc/self/fd").length).toBe(before);
   } finally { cleanup(root); }
 });
+
+// Non-UTF-8 Linux directory names must reach the byte-preserving procfs probes.
+for (const [rawRoot, suffix] of [[selection.RAW_STATE_ROOT, selection.RAW_STATE_RELATIVE], [selection.RAW_RUNTIME_ROOT, selection.RAW_RUNTIME_RELATIVE]]) {
+  it.skipIf(process.platform !== "linux")(`finds raw inventory under a non-UTF-8 name in ${rawRoot}`, () => {
+    const root = fs.mkdtempSync(join(tmpdir(), "k1-selector-bytes-"));
+    const rawBase = join(root, rawRoot);
+    const entry = Buffer.concat([Buffer.from(`${rawBase}/`), Buffer.from([0xff])]);
+    const directories = [entry];
+    let parent = entry;
+    const parts = suffix.split("/");
+    for (const part of parts.slice(0, -1)) {
+      parent = Buffer.concat([parent, Buffer.from(`/${part}`)]);
+      directories.push(parent);
+    }
+    const key = Buffer.concat([parent, Buffer.from(`/${parts.at(-1)!}`)]);
+    try {
+      fs.mkdirSync(join(root, selection.BUSINESS_CUSTODY_ROOT), {recursive: true});
+      fs.mkdirSync(rawBase, {recursive: true});
+      for (const dir of directories) fs.mkdirSync(dir);
+      fs.writeFileSync(key, "untouched raw inventory");
+      expect(selection.selectLinuxProfile(selection.isolatedSelectorRoots(root), [])).toEqual({kind: "Refused", reason: "RawInventoryPresent"});
+      expect(fs.readFileSync(key, "utf8")).toBe("untouched raw inventory");
+    } finally {
+      if (fs.existsSync(key)) fs.unlinkSync(key);
+      for (const dir of directories.reverse()) if (fs.existsSync(dir)) fs.rmdirSync(dir);
+      cleanup(root);
+    }
+  });
+}

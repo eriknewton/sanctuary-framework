@@ -190,6 +190,7 @@ export async function runCliRaw(
   opts: RunCliOptions = {},
 ): Promise<RunCliResult> {
   const command = opts.command ?? "node";
+  // Isolation is keyed on the first argument; a child driver putting a global flag first must pass roots explicitly.
   const needsSelectionRoots = args[0] === "wrap" || args[0] === "protect"
     || args[0] === "castle-wall" && args[1] === "daemon";
   const prefixArgs = opts.prefixArgs ?? (needsSelectionRoots

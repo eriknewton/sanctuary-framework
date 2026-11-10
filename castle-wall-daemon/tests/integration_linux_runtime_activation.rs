@@ -4122,10 +4122,6 @@ mod tb10_agent_unit_against_real_systemd {
             &format!("--trusted-service-uid ${{SANCTUARY_TRUSTED_SERVICE_UID}} {table_tag}"),
             1,
         );
-        units.write_script(
-            "credential-selection.sh",
-            &format!("#!/bin/sh\n{ISOLATED_CREDENTIAL_SCRIPT}"),
-        );
         let derived = substitute(
             &derived,
             &format!("ExecStartPre={bin} --agent-credential-check %i"),
@@ -4150,9 +4146,39 @@ mod tb10_agent_unit_against_real_systemd {
         let derived = substitute(&derived, "StandardError=null", "StandardError=journal", 1);
         let (derived, mount) = units.workspace(&derived);
         units.write_unit(&template, &derived);
-        units.set_stop_order(vec![agent.clone(), wall.clone(), mount]);
+        units.set_stop_order(vec![agent.clone(), wall.clone(), mount.clone()]);
         units.reload();
 
+        // Start the workspace mount before creating the selector fixture, or
+        // the tmpfs would hide it. The shipped unit makes this path HOME and
+        // ReadWritePaths; /tmp, /var/tmp and /run/user are inaccessible.
+        assert!(systemctl(&["start", &mount]).status.success());
+        let profile_root = tempfile::Builder::new()
+            .prefix("credential-profile-")
+            .tempdir_in(units.path("workspace"))
+            .expect("agent-visible selector root");
+        std::os::unix::fs::chown(
+            profile_root.path(),
+            Some(TEST_AGENT_UID),
+            Some(TEST_AGENT_UID),
+        )
+        .expect("agent-owned selector root");
+        // Keep the shared credential invocation, replacing only its temp-dir
+        // preamble. TB9 retains the original script and its current behavior.
+        let credential_body = ISOLATED_CREDENTIAL_SCRIPT
+            .strip_prefix(
+                "profile_root=$(mktemp -d) || exit 2\ntrap 'rmdir \"$profile_root\"' EXIT HUP INT TERM\n",
+            )
+            .expect("shared credential fixture preamble");
+        units.write_script(
+            "credential-selection.sh",
+            &format!(
+                "#!/bin/sh\nprofile_root='{}'\n{credential_body}",
+                profile_root.path().display()
+            ),
+        );
+        // The existing settled teardown owns the fixture and its tmpfs mount.
+        units.own(profile_root);
         let out = systemctl(&["start", &agent]);
         let journal = || {
             Command::new("journalctl")
