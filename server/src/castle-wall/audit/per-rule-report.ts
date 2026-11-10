@@ -32,6 +32,7 @@
 
 import type { AuditEntry } from "../../operational/audit-log.js";
 import type { DecisionValue } from "../ipc/messages.js";
+import { isMonitoringOriginDrop } from "../liveness/monitoring-origin.js";
 
 /**
  * Sentinel bucket id for flows whose deciding verdict matched NO rule (baseline
@@ -236,6 +237,9 @@ export function attributeFlows(entries: AuditEntry[]): FlowAttribution[] {
   const flows: FlowAttribution[] = [];
   for (const entry of entries) {
     if (!FLOW_OPERATIONS.has(entry.operation)) continue;
+    // A canary drop is the wall's heartbeat and never counts toward a rule; drops only, an allow to the canary stays visible.
+    // Must match isMonitoringOriginDestination in server/src/castle-wall/liveness/monitoring-origin.ts.
+    if (isMonitoringOriginDrop(entry.operation, entry.details)) continue;
     const decision = categoryOf(entry);
     if (decision === null) continue;
     flows.push({

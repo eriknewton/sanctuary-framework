@@ -25,6 +25,7 @@
  *     existing `decision_response` envelope keyed by request_id.
  */
 
+import type { CanarySlotPort } from "../liveness/recorder.js";
 import { randomUUID } from "node:crypto";
 import { FlowAdmission, FlowCoalescer, FLOW_COALESCE_SUMMARY_OPERATION, flowCoalescingMetadata } from "./macos-flow-coalescing.js";
 import type { FlowClassification } from "./macos-flow-coalescing.js";
@@ -218,6 +219,12 @@ export interface MacOSFlowEventConsumerInput {
    */
   emissionLiveness?: EmissionLivenessNotes;
   /**
+   * Optional canary drop-recording slot from the full daemon's liveness
+   * recorder, passed unchanged into the producer audit consumer. Must match
+   * the `canarySlot` option in server/src/castle-wall/runtime/audit-consumer.ts.
+   */
+  canarySlot?: CanarySlotPort;
+  /**
    * Optional lease-delivery watchdog feed. Called only after an extension
    * availability report or flow-carried availability snapshot has passed the
    * producer-signature and replay gates and updated the store.
@@ -335,6 +342,7 @@ export class MacOSFlowEventConsumer {
             pinnedProducerKeyB64url: this.pinnedProducerKeyB64url,
             now: this.now,
             ...(this.coalesceLiveFlows ? { liveFlowCoalescer: this.coalescer } : {}),
+            ...(input.canarySlot !== undefined ? { canarySlot: input.canarySlot } : {}),
             // The extension signs flow decisions AND availability reports into
             // ONE shared seq/prior chain, but only flow decisions arrive here
             // — subset continuity (signature + strict seq monotonicity), never

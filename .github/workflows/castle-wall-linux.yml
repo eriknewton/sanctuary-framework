@@ -168,6 +168,14 @@ jobs:
         # assertions. A red here means an Arch assertion failed, not that sudo was absent.
         run: cargo test --locked --features arch-install --test linux_install_arch_parity --test linux_install_arch_fixtures --test linux_install_arch_cli
 
+      # Must match the legacy vector target in castle-wall-daemon/Cargo.toml.
+      - name: cargo test legacy producer vectors
+        working-directory: castle-wall-daemon
+        # The second command runs only the gated replay unit test, and the grep refuses a run that matched no test (a renamed
+        # test would otherwise pass with zero executed). Running the whole lib suite here put every timing-sensitive unit test
+        # under a second parallel run; failure mode seen: an unrelated owner-deadline test timed out in this step.
+        run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang && cargo test --locked --features legacy-raw-producer --lib ipc::producer_sig::tests::replayed_signature_fails_against_different_seq -- --exact 2>&1 | tee /dev/stderr | grep -q "test result. ok. 1 passed"
+
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -227,7 +235,7 @@ jobs:
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
-                       confined_agent_id test_isolation_gate; do
+                       linux_business_profile_selection confined_agent_id test_isolation_gate; do
           # suite-list-end: body through `done` must match WORKFLOW_SUITE_RAN_LOOP_BODY in castle-wall-daemon/tests/test_isolation_gate.rs
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"

@@ -72,6 +72,8 @@ name = "sanctuary-business-unlock"
 path = "src/bin/sanctuary-business-unlock.rs"
 
 [features]
+# The raw Ed25519 seed constructor exists only for the legacy v1 cross-language vectors; no shipped build line enables it.
+legacy-raw-producer = []
 # Pause points must never enter the default release feature graph.
 smb-test-hooks = []
 # Compiles the TEST-ISOLATION seams into the crate: `LinuxRuntimePaths::isolated_under`
@@ -199,3 +201,14 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# Must match the legacy vector step in .github/workflows/castle-wall-linux.yml.
+[[test]]
+name = "integration_producer_sig_cross_lang"
+path = "tests/integration_producer_sig_cross_lang.rs"
+required-features = ["legacy-raw-producer"]
+
+[[test]]
+name = "linux_business_profile_selection"
+path = "tests/linux_business_profile_selection.rs"
+required-features = ["test-isolation"]

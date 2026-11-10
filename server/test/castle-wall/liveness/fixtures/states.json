@@ -1,0 +1,1853 @@
+{
+  "description": "Liveness evaluator state fixtures: one base wall-OK input and one patch set per continuing row and refusal arm. Every value is a documentation or fixture value.",
+  "base": {
+    "nowMs": 1794225600000,
+    "platform": "darwin",
+    "host": {
+      "ok": true,
+      "bootId": "boot-fixture-current",
+      "uptimeMs": 36000000
+    },
+    "local": {
+      "fortress_id": "fortress-0123456789abcdef",
+      "platform": "darwin",
+      "operator_uid": 501
+    },
+    "directory": {
+      "status": "ok"
+    },
+    "daemon": {
+      "status": "present",
+      "value": {
+        "schema_version": 1,
+        "record": "daemon",
+        "subject": {
+          "fortress_id": "fortress-0123456789abcdef",
+          "host_id": "host-fixture",
+          "platform": "darwin",
+          "operator_uid": 501,
+          "agent_uid": 502
+        },
+        "boot_id": "boot-fixture-current",
+        "config_generation": 1,
+        "sequence": 100,
+        "observed_at": "2026-11-09T11:59:55.000Z",
+        "observed_uptime_ms": 35995000,
+        "collection": {
+          "started_at_ms": 1794225595000,
+          "ended_at_ms": 1794225595000
+        },
+        "evidence_failures": [],
+        "daemon_instance": "daemon-fixture-1",
+        "instance_started_uptime_ms": 32400000,
+        "daemon_period_ms": 15000,
+        "raw": {
+          "process": {
+            "pid": 4242
+          },
+          "hooks": {
+            "emission_tick": true,
+            "verified_admission": true,
+            "primary_confirmation": true,
+            "pending_evidence": true,
+            "canary_slot": true,
+            "heartbeat_flush": true
+          },
+          "lock_recovery": {
+            "state": "instrumented",
+            "count": 0,
+            "last_at_ms": null
+          },
+          "detector": {
+            "last_evaluate_at_ms": 1794225595000,
+            "stalled": false
+          },
+          "heartbeat": {
+            "last_durable_flush_at_ms": 1794225570000
+          },
+          "pending_evidence": {
+            "oldest_unresolved_age_ms": null,
+            "ingress_loss_pending": 0,
+            "coalesced_pending": 0,
+            "last_rejection_at_ms": null
+          },
+          "decisions": {
+            "verified_admissions": 12,
+            "primary_confirmations": 12,
+            "last_natural_primary_at_ms": null
+          },
+          "canary": {
+            "adapter": "uid",
+            "last_confirmation": {
+              "seq": 7,
+              "captured_at_ms": 1794225540000,
+              "confirmed_at_ms": 1794225541000,
+              "subject_uid": 502,
+              "dest_ip": "192.0.2.254",
+              "dest_port": 9,
+              "dest_protocol": "tcp",
+              "delivery": "live"
+            },
+            "last_failure": null,
+            "last_late": null,
+            "failure_count": 0,
+            "late_count": 0,
+            "last_destination_allowed": null
+          },
+          "lease": {
+            "deadline_ms": null
+          }
+        }
+      }
+    },
+    "observer": {
+      "status": "present",
+      "value": {
+        "schema_version": 1,
+        "record": "observer",
+        "subject": {
+          "fortress_id": "fortress-0123456789abcdef",
+          "host_id": "host-fixture",
+          "platform": "darwin",
+          "operator_uid": 501,
+          "agent_uid": 502
+        },
+        "boot_id": "boot-fixture-current",
+        "config_generation": 1,
+        "sequence": 50,
+        "observed_at": "2026-11-09T11:59:57.000Z",
+        "observed_uptime_ms": 35997000,
+        "collection": {
+          "started_at_ms": 1794225597000,
+          "ended_at_ms": 1794225597000
+        },
+        "evidence_failures": [],
+        "observer_instance": "observer-fixture-1",
+        "observer_period_ms": 10000,
+        "raw": {
+          "daemon_ref": {
+            "daemon_instance": "daemon-fixture-1",
+            "sequence": 100
+          },
+          "availability": {
+            "status": "live",
+            "resolved_at_ms": 1794225595000
+          },
+          "full_service": {
+            "loaded": true,
+            "latched": false,
+            "pid": 4242,
+            "start_identity": "full-start-fixture",
+            "last_charge_at_ms": null
+          },
+          "session": "full",
+          "canary_integrity": {
+            "passed": true,
+            "checked_at_ms": 1794225595000
+          },
+          "canary_allow_sighting": null,
+          "census": {
+            "status": "ok",
+            "samples": [
+              {
+                "observed_at": "2026-11-09T11:59:12.000Z",
+                "observed_uptime_ms": 35952000,
+                "boot_id": "boot-fixture-current",
+                "gateway": {
+                  "pid": 75399,
+                  "start_identity": "gateway-start-fixture",
+                  "uid": 502,
+                  "generation": "generation-fixture-1"
+                },
+                "rows": [
+                  {
+                    "local": "192.0.2.1.64719",
+                    "foreign": "203.0.113.10.443",
+                    "tcp_state": "ESTABLISHED",
+                    "rxbytes": 49560,
+                    "txbytes": 1000,
+                    "gencnt": "968d6d"
+                  }
+                ],
+                "other_rows": 3
+              },
+              {
+                "observed_at": "2026-11-09T11:59:27.000Z",
+                "observed_uptime_ms": 35967000,
+                "boot_id": "boot-fixture-current",
+                "gateway": {
+                  "pid": 75399,
+                  "start_identity": "gateway-start-fixture",
+                  "uid": 502,
+                  "generation": "generation-fixture-1"
+                },
+                "rows": [
+                  {
+                    "local": "192.0.2.1.64719",
+                    "foreign": "203.0.113.10.443",
+                    "tcp_state": "ESTABLISHED",
+                    "rxbytes": 51412,
+                    "txbytes": 1000,
+                    "gencnt": "968d6d"
+                  }
+                ],
+                "other_rows": 3
+              },
+              {
+                "observed_at": "2026-11-09T11:59:42.000Z",
+                "observed_uptime_ms": 35982000,
+                "boot_id": "boot-fixture-current",
+                "gateway": {
+                  "pid": 75399,
+                  "start_identity": "gateway-start-fixture",
+                  "uid": 502,
+                  "generation": "generation-fixture-1"
+                },
+                "rows": [
+                  {
+                    "local": "192.0.2.1.64719",
+                    "foreign": "203.0.113.10.443",
+                    "tcp_state": "ESTABLISHED",
+                    "rxbytes": 52338,
+                    "txbytes": 1000,
+                    "gencnt": "968d6d"
+                  }
+                ],
+                "other_rows": 3
+              },
+              {
+                "observed_at": "2026-11-09T11:59:57.000Z",
+                "observed_uptime_ms": 35997000,
+                "boot_id": "boot-fixture-current",
+                "gateway": {
+                  "pid": 75399,
+                  "start_identity": "gateway-start-fixture",
+                  "uid": 502,
+                  "generation": "generation-fixture-1"
+                },
+                "rows": [
+                  {
+                    "local": "192.0.2.1.64719",
+                    "foreign": "203.0.113.10.443",
+                    "tcp_state": "ESTABLISHED",
+                    "rxbytes": 54190,
+                    "txbytes": 1000,
+                    "gencnt": "968d6d"
+                  }
+                ],
+                "other_rows": 3
+              }
+            ]
+          },
+          "gateway": {
+            "pid": 75399,
+            "uid": 502,
+            "start_identity": "gateway-start-fixture",
+            "generation": "generation-fixture-1",
+            "alive": true
+          },
+          "optional_reply": null,
+          "mcp": null
+        },
+        "recovery": {
+          "wall": {
+            "samples": [
+              {
+                "sequence": 48,
+                "observed_uptime_ms": 35975000
+              },
+              {
+                "sequence": 50,
+                "observed_uptime_ms": 35997000
+              }
+            ],
+            "fault_uptime_ms": null
+          },
+          "agent": {
+            "samples": [
+              {
+                "sequence": 48,
+                "observed_uptime_ms": 35975000
+              },
+              {
+                "sequence": 50,
+                "observed_uptime_ms": 35997000
+              }
+            ],
+            "fault_uptime_ms": null
+          }
+        }
+      }
+    },
+    "config": {
+      "status": "present",
+      "value": {
+        "schema_version": 1,
+        "record": "config",
+        "agent_uid": 502,
+        "gate_uid": 503,
+        "launchd_leeway_s": 30,
+        "poll_backoff_cap_s": 0,
+        "messaging": {
+          "ipv4": [
+            {
+              "prefix": "203.0.113.0/24",
+              "source": "fixture"
+            }
+          ],
+          "ipv6": []
+        },
+        "gateway_selector": {
+          "process_name": "Python"
+        },
+        "ptb": {
+          "version": "22.6",
+          "timeout_s": 10,
+          "poll_interval_s": 0,
+          "separate_get_updates_request": true,
+          "http_version": "1.1",
+          "hermes_read_timeout_s": 20
+        },
+        "gateway_egress": "direct",
+        "commissioning": {
+          "wall": true,
+          "agent": true,
+          "alert_drill": true
+        }
+      }
+    }
+  },
+  "rows": [
+    {
+      "name": "wall OK idle",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [],
+      "expect": {
+        "wall": "wall_OK_IDLE",
+        "wall_alarm": false,
+        "exit": 0,
+        "wall_reasons": [
+          "none"
+        ],
+        "agent": "agent_OK_PASSIVE",
+        "coverage": "coverage_COMPLETE"
+      }
+    },
+    {
+      "name": "wall OK active",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.decisions.last_natural_primary_at_ms",
+          "value": 1794225570000
+        }
+      ],
+      "expect": {
+        "wall": "wall_OK_ACTIVE",
+        "wall_alarm": false,
+        "exit": 0
+      }
+    },
+    {
+      "name": "wall OK aged history",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.full_service.last_charge_at_ms",
+          "value": 1794223740000
+        }
+      ],
+      "expect": {
+        "wall": "wall_OK_AGED_HISTORY",
+        "wall_alarm": false,
+        "exit": 0
+      }
+    },
+    {
+      "name": "wall OK TTL countdown",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lease.deadline_ms",
+          "value": 1794226200000
+        }
+      ],
+      "expect": {
+        "wall": "wall_OK_TTL_COUNTDOWN",
+        "wall_alarm": false,
+        "exit": 0
+      }
+    },
+    {
+      "name": "wall TTL warning",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lease.deadline_ms",
+          "value": 1794225700000
+        }
+      ],
+      "expect": {
+        "wall": "wall_TTL_WARNING",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "ttl_expiring"
+        ]
+      }
+    },
+    {
+      "name": "wall TTL warning outranks degraded",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lease.deadline_ms",
+          "value": 1794225700000
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.raw.pending_evidence.oldest_unresolved_age_ms",
+          "value": 200000
+        }
+      ],
+      "expect": {
+        "wall": "wall_TTL_WARNING",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "audit_backlog",
+          "ttl_expiring"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded audit loss",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.pending_evidence.ingress_loss_pending",
+          "value": 1
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "audit_loss"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded audit backlog",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.pending_evidence.oldest_unresolved_age_ms",
+          "value": 200000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "audit_backlog"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded audit rejected",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.pending_evidence.last_rejection_at_ms",
+          "value": 1794225540000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "audit_rejected"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded heartbeat stale",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.heartbeat.last_durable_flush_at_ms",
+          "value": 1794225400000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "heartbeat_stale"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded emission stall",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.detector.stalled",
+          "value": true
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "emission_stall"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded recent restart",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.full_service.last_charge_at_ms",
+          "value": 1794225000000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "recent_restart"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded write lock recovery",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lock_recovery.last_at_ms",
+          "value": 1794225000000
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lock_recovery.count",
+          "value": 1
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "write_lock_recovery"
+        ]
+      }
+    },
+    {
+      "name": "wall degraded recording unconfirmed",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.last_failure",
+          "value": {
+            "seq": 8,
+            "admitted_at_ms": 1794225560000,
+            "failed_at_ms": 1794225561000
+          }
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.failure_count",
+          "value": 1
+        }
+      ],
+      "expect": {
+        "wall": "wall_DEGRADED",
+        "wall_alarm": true,
+        "exit": 3,
+        "wall_reasons": [
+          "recording_unconfirmed"
+        ]
+      }
+    },
+    {
+      "name": "wall recovering",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.recovery.wall.fault_uptime_ms",
+          "value": 35980000
+        }
+      ],
+      "expect": {
+        "wall": "wall_RECOVERING",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons": [
+          "recovering"
+        ]
+      }
+    },
+    {
+      "name": "wall initializing new instance",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.instance_started_uptime_ms",
+          "value": 35940000
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.last_confirmation",
+          "value": null
+        }
+      ],
+      "expect": {
+        "wall": "wall_INITIALIZING",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons": [
+          "initializing"
+        ]
+      }
+    },
+    {
+      "name": "wall initializing first fire after boot",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "host.uptimeMs",
+          "value": 100000
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.boot_id",
+          "value": "boot-fixture-previous"
+        },
+        {
+          "op": "set",
+          "path": "observer.value.boot_id",
+          "value": "boot-fixture-previous"
+        }
+      ],
+      "expect": {
+        "wall": "wall_INITIALIZING",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons": [
+          "initializing"
+        ],
+        "agent": "agent_DOWN",
+        "coverage": "coverage_UNAVAILABLE"
+      }
+    },
+    {
+      "name": "wall down after host sleep",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "add",
+          "path": "nowMs",
+          "value": 7200000
+        },
+        {
+          "op": "add",
+          "path": "host.uptimeMs",
+          "value": 7200000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "observer_stale",
+          "daemon_telemetry_stale",
+          "canary_failed"
+        ]
+      }
+    },
+    {
+      "name": "wall safe mode",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.session",
+          "value": "safe_mode_only"
+        }
+      ],
+      "expect": {
+        "wall": "wall_SAFE_MODE",
+        "wall_alarm": true,
+        "exit": 1
+      }
+    },
+    {
+      "name": "wall logged out",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.session",
+          "value": "logged_out"
+        }
+      ],
+      "expect": {
+        "wall": "wall_LOGGED_OUT",
+        "wall_alarm": true,
+        "exit": 1
+      }
+    },
+    {
+      "name": "wall reboot no login",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.session",
+          "value": "reboot_no_login"
+        }
+      ],
+      "expect": {
+        "wall": "wall_REBOOT_NO_LOGIN",
+        "wall_alarm": true,
+        "exit": 1
+      }
+    },
+    {
+      "name": "wall down canary failed: no confirmation",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.last_confirmation",
+          "value": null
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "canary_failed"
+        ]
+      }
+    },
+    {
+      "name": "wall down canary failed: confirmation too old",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.last_confirmation.captured_at_ms",
+          "value": 1794225000000
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.last_confirmation.confirmed_at_ms",
+          "value": 1794225000000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "canary_failed"
+        ]
+      }
+    },
+    {
+      "name": "wall down canary unprovisioned: integrity false",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.canary_integrity.passed",
+          "value": false
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "canary_unprovisioned"
+        ]
+      }
+    },
+    {
+      "name": "wall down canary allow retained across daemon restart",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.daemon_instance",
+          "value": "daemon-fixture-2"
+        },
+        {
+          "op": "set",
+          "path": "observer.value.raw.daemon_ref",
+          "value": {
+            "daemon_instance": "daemon-fixture-2",
+            "sequence": 100
+          }
+        },
+        {
+          "op": "set",
+          "path": "observer.value.raw.canary_allow_sighting",
+          "value": {
+            "captured_at_ms": 1794225000000,
+            "principal": "agent",
+            "daemon_instance": "daemon-fixture-1"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "canary_destination_allowed"
+        ]
+      }
+    },
+    {
+      "name": "wall ok canary allow aged out of history window",
+      "table": "wall",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.canary_allow_sighting",
+          "value": {
+            "captured_at_ms": 1794223799999,
+            "principal": "gate",
+            "daemon_instance": "daemon-fixture-1"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_OK_IDLE",
+        "wall_alarm": false,
+        "exit": 0,
+        "wall_reasons": [
+          "none"
+        ]
+      }
+    },
+    {
+      "name": "wall down canary destination allowed",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.last_destination_allowed",
+          "value": {
+            "captured_at_ms": 1794225000000,
+            "principal": "agent"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "canary_destination_allowed"
+        ]
+      }
+    },
+    {
+      "name": "wall down crash latched",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.full_service.latched",
+          "value": true
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "crash_latched"
+        ]
+      }
+    },
+    {
+      "name": "wall down enforcement not live",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.availability.status",
+          "value": "not_live"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "enforcement_not_live"
+        ]
+      }
+    },
+    {
+      "name": "wall down availability stale",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.availability.resolved_at_ms",
+          "value": 1794225560000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "enforcement_not_live"
+        ]
+      }
+    },
+    {
+      "name": "wall down daemon unresponsive",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.availability.status",
+          "value": "unresponsive"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "daemon_unresponsive"
+        ]
+      }
+    },
+    {
+      "name": "wall down daemon missing",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.full_service.loaded",
+          "value": false
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "daemon_missing"
+        ]
+      }
+    },
+    {
+      "name": "wall down process identity unknown",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.full_service.pid",
+          "value": null
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "process_identity_unknown"
+        ]
+      }
+    },
+    {
+      "name": "wall down detector stale",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.detector.last_evaluate_at_ms",
+          "value": 1794225540000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "detector_stale"
+        ]
+      }
+    },
+    {
+      "name": "wall down daemon telemetry stale",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.observed_at",
+          "value": "2026-11-09T11:59:00.000Z"
+        },
+        {
+          "op": "set",
+          "path": "daemon.value.observed_uptime_ms",
+          "value": 35940000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "daemon_telemetry_stale"
+        ]
+      }
+    },
+    {
+      "name": "wall down observer stale",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.observed_at",
+          "value": "2026-11-09T11:59:20.000Z"
+        },
+        {
+          "op": "set",
+          "path": "observer.value.observed_uptime_ms",
+          "value": 35960000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "observer_stale"
+        ]
+      }
+    },
+    {
+      "name": "wall down observer missing",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer",
+          "value": {
+            "status": "absent"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "observer_missing"
+        ]
+      }
+    },
+    {
+      "name": "wall down lease expired",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lease.deadline_ms",
+          "value": 1794225599999
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "lease_expired"
+        ]
+      }
+    },
+    {
+      "name": "wall down counter regression",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.daemon_ref.sequence",
+          "value": 101
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "counter_regression"
+        ]
+      }
+    },
+    {
+      "name": "wall down time untrusted: future record",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.observed_at",
+          "value": "2026-11-09T12:00:10.000Z"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "time_untrusted"
+        ]
+      }
+    },
+    {
+      "name": "wall down time untrusted: clock divergence",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.observed_uptime_ms",
+          "value": 35970000
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "time_untrusted"
+        ]
+      }
+    },
+    {
+      "name": "wall down time untrusted: null boot",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.boot_id",
+          "value": null
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "time_untrusted"
+        ]
+      }
+    },
+    {
+      "name": "wall down observation invalid: unknown field",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.healthy",
+          "value": true
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "observation_invalid"
+        ]
+      }
+    },
+    {
+      "name": "wall down observation invalid: wrong subject",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.subject.fortress_id",
+          "value": "fortress-other"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "observation_invalid"
+        ]
+      }
+    },
+    {
+      "name": "wall down custody invalid",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon",
+          "value": {
+            "status": "custody_invalid",
+            "cause": "mode"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "custody_invalid"
+        ]
+      }
+    },
+    {
+      "name": "wall down evidence incomplete: hook missing",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "delete",
+          "path": "daemon.value.raw.hooks.canary_slot"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "evidence_incomplete"
+        ]
+      }
+    },
+    {
+      "name": "wall down evidence incomplete: lock not instrumented",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.lock_recovery",
+          "value": {
+            "state": "not_instrumented"
+          }
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "evidence_incomplete"
+        ]
+      }
+    },
+    {
+      "name": "wall down unsupported adapter",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "daemon.value.raw.canary.adapter",
+          "value": "unsupported"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "unsupported_adapter"
+        ]
+      }
+    },
+    {
+      "name": "wall down commissioning unproven: leeway unset",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "delete",
+          "path": "config.value.launchd_leeway_s"
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "commissioning_unproven"
+        ]
+      }
+    },
+    {
+      "name": "wall down commissioning unproven: wall flag false",
+      "table": "wall",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "config.value.commissioning.wall",
+          "value": false
+        }
+      ],
+      "expect": {
+        "wall": "wall_DOWN",
+        "wall_alarm": true,
+        "exit": 1,
+        "wall_reasons_include": [
+          "commissioning_unproven"
+        ]
+      }
+    },
+    {
+      "name": "agent OK passive",
+      "table": "agent",
+      "kind": "continuing",
+      "patches": [],
+      "expect": {
+        "agent": "agent_OK_PASSIVE",
+        "agent_alarm": false,
+        "exit": 0
+      }
+    },
+    {
+      "name": "agent OK optional reply",
+      "table": "agent",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.optional_reply",
+          "value": {
+            "required": false,
+            "last_success_at_ms": 1794225590000,
+            "last_failure_at_ms": null
+          }
+        }
+      ],
+      "expect": {
+        "agent": "agent_OK_OPTIONAL_REPLY",
+        "agent_alarm": false,
+        "exit": 0
+      }
+    },
+    {
+      "name": "agent degraded stale mcp",
+      "table": "agent",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.mcp",
+          "value": {
+            "stale_child": true
+          }
+        }
+      ],
+      "expect": {
+        "agent": "agent_DEGRADED_STALE_MCP",
+        "agent_alarm": true,
+        "exit": 0
+      }
+    },
+    {
+      "name": "agent recovering",
+      "table": "agent",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.recovery.agent.fault_uptime_ms",
+          "value": 35960000
+        }
+      ],
+      "expect": {
+        "agent": "agent_RECOVERING",
+        "agent_alarm": true,
+        "exit": 0
+      }
+    },
+    {
+      "name": "agent initializing",
+      "table": "agent",
+      "kind": "continuing",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.census.samples",
+          "value": [
+            {
+              "observed_at": "2026-11-09T11:59:42.000Z",
+              "observed_uptime_ms": 35982000,
+              "boot_id": "boot-fixture-current",
+              "gateway": {
+                "pid": 75399,
+                "start_identity": "gateway-start-fixture",
+                "uid": 502,
+                "generation": "generation-fixture-1"
+              },
+              "rows": [
+                {
+                  "local": "192.0.2.1.64719",
+                  "foreign": "203.0.113.10.443",
+                  "tcp_state": "ESTABLISHED",
+                  "rxbytes": 52338,
+                  "txbytes": 1000,
+                  "gencnt": "968d6d"
+                }
+              ],
+              "other_rows": 3
+            },
+            {
+              "observed_at": "2026-11-09T11:59:57.000Z",
+              "observed_uptime_ms": 35997000,
+              "boot_id": "boot-fixture-current",
+              "gateway": {
+                "pid": 75399,
+                "start_identity": "gateway-start-fixture",
+                "uid": 502,
+                "generation": "generation-fixture-1"
+              },
+              "rows": [
+                {
+                  "local": "192.0.2.1.64719",
+                  "foreign": "203.0.113.10.443",
+                  "tcp_state": "ESTABLISHED",
+                  "rxbytes": 54190,
+                  "txbytes": 1000,
+                  "gencnt": "968d6d"
+                }
+              ],
+              "other_rows": 3
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "agent": "agent_INITIALIZING",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons": [
+          "initializing"
+        ]
+      }
+    },
+    {
+      "name": "agent unmonitored",
+      "table": "agent",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "config.value.commissioning.agent",
+          "value": false
+        }
+      ],
+      "expect": {
+        "agent": "agent_UNMONITORED",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons": [
+          "agent_unmonitored"
+        ],
+        "coverage": "coverage_WALL_ONLY"
+      }
+    },
+    {
+      "name": "agent down process missing",
+      "table": "agent",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.gateway.alive",
+          "value": false
+        }
+      ],
+      "expect": {
+        "agent": "agent_DOWN",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons_include": [
+          "agent_process_missing"
+        ]
+      }
+    },
+    {
+      "name": "agent down flow stale",
+      "table": "agent",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.census.samples",
+          "value": [
+            {
+              "observed_at": "2026-11-09T11:56:40.000Z",
+              "observed_uptime_ms": 35800000,
+              "boot_id": "boot-fixture-current",
+              "gateway": {
+                "pid": 75399,
+                "start_identity": "gateway-start-fixture",
+                "uid": 502,
+                "generation": "generation-fixture-1"
+              },
+              "rows": [
+                {
+                  "local": "192.0.2.1.64719",
+                  "foreign": "203.0.113.10.443",
+                  "tcp_state": "ESTABLISHED",
+                  "rxbytes": 1,
+                  "txbytes": 1000,
+                  "gencnt": "968d6d"
+                }
+              ],
+              "other_rows": 3
+            },
+            {
+              "observed_at": "2026-11-09T11:56:55.000Z",
+              "observed_uptime_ms": 35815000,
+              "boot_id": "boot-fixture-current",
+              "gateway": {
+                "pid": 75399,
+                "start_identity": "gateway-start-fixture",
+                "uid": 502,
+                "generation": "generation-fixture-1"
+              },
+              "rows": [
+                {
+                  "local": "192.0.2.1.64719",
+                  "foreign": "203.0.113.10.443",
+                  "tcp_state": "ESTABLISHED",
+                  "rxbytes": 1,
+                  "txbytes": 1000,
+                  "gencnt": "968d6d"
+                }
+              ],
+              "other_rows": 3
+            },
+            {
+              "observed_at": "2026-11-09T11:57:10.000Z",
+              "observed_uptime_ms": 35830000,
+              "boot_id": "boot-fixture-current",
+              "gateway": {
+                "pid": 75399,
+                "start_identity": "gateway-start-fixture",
+                "uid": 502,
+                "generation": "generation-fixture-1"
+              },
+              "rows": [
+                {
+                  "local": "192.0.2.1.64719",
+                  "foreign": "203.0.113.10.443",
+                  "tcp_state": "ESTABLISHED",
+                  "rxbytes": 1,
+                  "txbytes": 1000,
+                  "gencnt": "968d6d"
+                }
+              ],
+              "other_rows": 3
+            },
+            {
+              "observed_at": "2026-11-09T11:57:25.000Z",
+              "observed_uptime_ms": 35845000,
+              "boot_id": "boot-fixture-current",
+              "gateway": {
+                "pid": 75399,
+                "start_identity": "gateway-start-fixture",
+                "uid": 502,
+                "generation": "generation-fixture-1"
+              },
+              "rows": [
+                {
+                  "local": "192.0.2.1.64719",
+                  "foreign": "203.0.113.10.443",
+                  "tcp_state": "ESTABLISHED",
+                  "rxbytes": 1,
+                  "txbytes": 1000,
+                  "gencnt": "968d6d"
+                }
+              ],
+              "other_rows": 3
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "agent": "agent_DOWN",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons": [
+          "agent_flow_stale"
+        ]
+      }
+    },
+    {
+      "name": "agent down census unavailable",
+      "table": "agent",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.census.status",
+          "value": "unavailable"
+        }
+      ],
+      "expect": {
+        "agent": "agent_DOWN",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons_include": [
+          "census_unavailable"
+        ]
+      }
+    },
+    {
+      "name": "agent down identity unknown",
+      "table": "agent",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.gateway.uid",
+          "value": 999
+        }
+      ],
+      "expect": {
+        "agent": "agent_DOWN",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons_include": [
+          "process_identity_unknown"
+        ]
+      }
+    },
+    {
+      "name": "agent down optional reply required and failed",
+      "table": "agent",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.optional_reply",
+          "value": {
+            "required": true,
+            "last_success_at_ms": null,
+            "last_failure_at_ms": 1794225590000
+          }
+        }
+      ],
+      "expect": {
+        "agent": "agent_DOWN",
+        "agent_alarm": true,
+        "exit": 0,
+        "agent_reasons_include": [
+          "optional_reply_failed"
+        ]
+      }
+    },
+    {
+      "name": "coverage complete",
+      "table": "coverage",
+      "kind": "continuing",
+      "patches": [],
+      "expect": {
+        "coverage": "coverage_COMPLETE",
+        "coverage_alarm": false,
+        "exit": 0
+      }
+    },
+    {
+      "name": "coverage wall only",
+      "table": "coverage",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "config.value.commissioning.agent",
+          "value": false
+        }
+      ],
+      "expect": {
+        "coverage": "coverage_WALL_ONLY",
+        "coverage_alarm": true,
+        "exit": 0
+      }
+    },
+    {
+      "name": "coverage legacy partial",
+      "table": "coverage",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "legacyCollectorOnly",
+          "value": true
+        }
+      ],
+      "expect": {
+        "coverage": "coverage_LEGACY_PARTIAL",
+        "coverage_alarm": true,
+        "exit": 0
+      }
+    },
+    {
+      "name": "coverage unavailable observer missing",
+      "table": "coverage",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer",
+          "value": {
+            "status": "absent"
+          }
+        }
+      ],
+      "expect": {
+        "coverage": "coverage_UNAVAILABLE",
+        "coverage_alarm": true,
+        "exit": 1
+      }
+    },
+    {
+      "name": "coverage unavailable canary unprovisioned",
+      "table": "coverage",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "observer.value.raw.canary_integrity",
+          "value": null
+        }
+      ],
+      "expect": {
+        "coverage": "coverage_UNAVAILABLE",
+        "coverage_alarm": true,
+        "exit": 1
+      }
+    },
+    {
+      "name": "coverage unavailable leeway unset",
+      "table": "coverage",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "delete",
+          "path": "config.value.launchd_leeway_s"
+        }
+      ],
+      "expect": {
+        "coverage": "coverage_UNAVAILABLE",
+        "coverage_alarm": true,
+        "exit": 1
+      }
+    },
+    {
+      "name": "coverage unavailable non-darwin",
+      "table": "coverage",
+      "kind": "refusal",
+      "patches": [
+        {
+          "op": "set",
+          "path": "platform",
+          "value": "linux"
+        }
+      ],
+      "expect": {
+        "coverage": "coverage_UNAVAILABLE",
+        "coverage_alarm": true,
+        "exit": 1,
+        "wall": "wall_DOWN",
+        "wall_reasons": [
+          "unsupported_adapter"
+        ]
+      }
+    }
+  ]
+}

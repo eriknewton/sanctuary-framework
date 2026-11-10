@@ -116,6 +116,9 @@ fn boot_with_only_example_com_443_allowed() -> (DaemonHandle, TempDir) {
         // ISOLATION (AGENTS.md, "the operator's machine is not a fixture"): the
         // host lock, ownership journal, and journal MAC key land in this run's
         // temp root, never in /var/lib/sanctuary.
+        test_selector_roots: Some(castle_wall_daemon::config::SelectorRoots::isolated_under(
+            dir.path(),
+        )),
         linux_runtime_paths: isolation::runtime_paths(),
         test_boot_time_shutdown_requested: false,
         test_delay_before_ready_ms: None,

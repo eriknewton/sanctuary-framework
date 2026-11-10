@@ -1,4 +1,6 @@
 #![cfg(target_os = "linux")]
+#[path = "support/checked_corpus.rs"]
+mod checked_corpus;
 use castle_wall_daemon::business_profile::{signer_contract::*, signer_service::*};
 use serde_json::json;
 fn header() -> serde_json::Value {
@@ -79,8 +81,7 @@ fn deadline_and_grant_bind_request() {
 }
 #[test]
 fn worker_response_never_forwards_extra_secret_fields() {
-    let rows: serde_json::Value =
-        serde_json::from_str(include_str!("../src/business_profile/role_vectors.json")).unwrap();
+    let rows: serde_json::Value = checked_corpus::corpus("role_vectors.json");
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let row = &rows[0];
     let grant = json!({"kid":row["kid"],"public_key":URL_SAFE_NO_PAD.encode(hex::decode(row["public_key"].as_str().unwrap()).unwrap())});

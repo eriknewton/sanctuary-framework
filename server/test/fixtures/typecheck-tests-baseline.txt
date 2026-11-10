@@ -18,8 +18,8 @@ test/castle-wall/export/exporter.test.ts(618,43): error TS2493: Tuple type '[]' 
 test/castle-wall/ipc/macos-flow-events.test.ts(1136,13): error TS2322: Type '() => Promise<{ status: "verified"; }>' is not assignable to type '() => Promise<AuditChainVerdict>'.
 test/castle-wall/provision/exclusive-arm.test.ts(637,21): error TS2352: Conversion of type 'undefined' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/castle-wall/provision/exclusive-arm.test.ts(637,42): error TS2493: Tuple type '[]' of length '0' has no element at index '1'.
-test/castle-wall/provision/liveness-probe.test.ts(629,46): error TS7006: Parameter 'path' implicitly has an 'any' type.
-test/castle-wall/provision/liveness-probe.test.ts(629,52): error TS7006: Parameter 'options' implicitly has an 'any' type.
+test/castle-wall/provision/liveness-probe.test.ts(641,46): error TS7006: Parameter 'path' implicitly has an 'any' type.
+test/castle-wall/provision/liveness-probe.test.ts(641,52): error TS7006: Parameter 'options' implicitly has an 'any' type.
 test/castle-wall/provision/orchestrate.test.ts(1818,7): error TS2322: Type 'Mock<() => Promise<{ kind: "released-repark-failed"; generation_id: number; reparkError: string; }>>' is not assignable to type 'Mock<() => Promise<{ kind: "released"; generation_id: number; }>>'.
 test/castle-wall/provision/orchestrate.test.ts(186,5): error TS2322: Type 'Mock<() => Promise<{ plan: { action: string; accountName: string; uid: number; }; uid: number; }>>' is not assignable to type '() => Promise<{ plan: AccountProvisionPlan; uid: number; }>'.
 test/castle-wall/provision/orchestrate.test.ts(1897,9): error TS2322: Type 'Mock<Procedure | Constructable>' is not assignable to type '((armTargetUid: number | undefined, intent: "observe" | "clear") => Promise<ExclusiveRoutingResidue>) | undefined'.
@@ -67,8 +67,8 @@ test/cli/auto-trigger-audit.test.ts(47,75): error TS2345: Argument of type '() =
 test/cli/castle-wall-audit-verify.test.ts(115,7): error TS2739: Type '{ host: string; ip: string; port: number; protocol: "tcp"; }' is missing the following properties from type 'IpcDestination': hostname_source, opaque
 test/cli/castle-wall-repair-custody.test.ts(140,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
 test/cli/castle-wall-repair-custody.test.ts(141,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
-test/cli/castle-wall.test.ts(1782,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
-test/cli/castle-wall.test.ts(1782,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1833,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1833,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
 test/cli/singleton-audit-writes.test.ts(179,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(217,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(239,8): error TS7006: Parameter 'c' implicitly has an 'any' type.
@@ -945,13 +945,13 @@ test/wrap/init.test.ts(844,12): error TS18047: 'unlocked.envelope' is possibly '
 test/wrap/legacy-filename-compat.test.ts(38,26): error TS2322: Type 'Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'Promise<DashboardHandle>'.
 test/wrap/port-fallback.test.ts(33,9): error TS2322: Type '(opts: { port: number; host?: string | undefined; mode: "co-located" | "standalone"; authToken: string; serverVersion: string; }) => Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'DashboardStarter'.
 test/wrap/port-fallback.test.ts(83,11): error TS2322: Type '(opts: { port: number; host?: string | undefined; mode: "co-located" | "standalone"; authToken: string; serverVersion: string; }) => Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'DashboardStarter'.
-test/wrap/protect-automation-blockers.test.ts(1057,27): error TS2304: Cannot find name 'WrapOptions'.
-test/wrap/protect-automation-blockers.test.ts(1057,46): error TS2304: Cannot find name 'WrapOptions'.
-test/wrap/protect-automation-blockers.test.ts(469,55): error TS2322: Type 'number' is not assignable to type 'Observed<number>'.
-test/wrap/protect-automation-blockers.test.ts(719,53): error TS2322: Type 'number' is not assignable to type 'Observed<number>'.
-test/wrap/protect-automation-blockers.test.ts(952,23): error TS2304: Cannot find name 'DashboardHandle'.
-test/wrap/protect-automation-blockers.test.ts(961,21): error TS2304: Cannot find name 'DashboardHandle'.
-test/wrap/protect-automation-blockers.test.ts(998,35): error TS2322: Type 'number' is not assignable to type 'Observed<number>'.
+test/wrap/protect-automation-blockers.test.ts(1070,27): error TS2304: Cannot find name 'WrapOptions'.
+test/wrap/protect-automation-blockers.test.ts(1070,46): error TS2304: Cannot find name 'WrapOptions'.
+test/wrap/protect-automation-blockers.test.ts(477,55): error TS2322: Type 'number' is not assignable to type 'Observed<number>'.
+test/wrap/protect-automation-blockers.test.ts(732,53): error TS2322: Type 'number' is not assignable to type 'Observed<number>'.
+test/wrap/protect-automation-blockers.test.ts(965,23): error TS2304: Cannot find name 'DashboardHandle'.
+test/wrap/protect-automation-blockers.test.ts(974,21): error TS2304: Cannot find name 'DashboardHandle'.
+test/wrap/protect-automation-blockers.test.ts(1011,35): error TS2322: Type 'number' is not assignable to type 'Observed<number>'.
 test/wrap/protect-no-dashboard-daemon-cleanup.test.ts(51,5): error TS2322: Type '(value: T | PromiseLike<T>) => void' is not assignable to type '(value?: T | PromiseLike<T> | undefined) => void'.
 test/wrap/upsilon2-per-adapter-redirect.test.ts(65,37): error TS2554: Expected 0 arguments, but got 1.
 test/wrap/wrap-cli.test.ts(1051,9): error TS2322: Type 'Mock<Procedure | Constructable>' is not assignable to type '((agentConfig: AgentConfig, sanctuaryCommand: string, sanctuaryArgs: string[], sanctuaryEnv?: Record<string, string> | undefined, additionalEntries?: AuxiliaryMcpServerEntry[] | undefined) => Promise<...>) | undefined'.

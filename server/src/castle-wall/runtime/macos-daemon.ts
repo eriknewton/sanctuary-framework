@@ -73,7 +73,10 @@ import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { buildChainAnchorSourceFromAuditLog } from "./audit-consumer.js";
 import { seedMacOSAuditProducerStateFromLocalAnchor } from "./macos-audit-producer-state.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
-import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
+import { protectionSubjectForUid, protectionSubjectFromAgentOrigin } from "../subject-binding.js";
+import { hostname as osHostname, uptime as osUptime } from "node:os";
+import { LivenessRecorder, type CanaryOriginSubjects, type PendingEvidenceCounts } from "../liveness/recorder.js";
+import { SECOND as LIVENESS_SECOND, COUNTER_MAX as LIVENESS_COUNTER_MAX } from "../liveness/constants.js";
 import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
   CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH,
@@ -297,6 +300,13 @@ export interface MacOSCastleWallDaemonInput {
    * login daemon. Purely advisory for messaging — it is not a trust signal.
    */
   daemonMode?: "safe" | "full";
+  /**
+   * Liveness telemetry boot and uptime source for the full daemon, read once
+   * at start. Production passes `sysctl kern.bootsessionuuid` and
+   * `os.uptime()`; when absent the record carries `boot_id: null`, which reads
+   * time_untrusted, and uptime comes from `os.uptime()`.
+   */
+  livenessHostClock?: { bootId(): Promise<string | null>; uptimeMs(): number };
   activeConfigPath?: string;
   listenerFactory?: (options: MacOSCastleWallListenerOptions) => MacOSCastleWallListenerHandle;
   /**
@@ -950,8 +960,18 @@ export async function startMacOSCastleWallDaemon(
   // `audit_write_degraded_count` marker used for dropped reload audit writes,
   // keeping the degradation visible in the tamper-evident chain without adding
   // a new audit operation or enum.
+  let lastWriteLockRecoveryAtMs: number | null = null;
+  let writeLockRecoverySink: ((atMs: number) => void) | null = null;
   input.auditLog.onWriteLockRecovery(() => {
+    // Record the marker before fallible telemetry; sample each event so a clock failure cannot reuse an earlier recovery time.
+    // With the installed exit fence, a hold-deadline lapse exits before this event: this count covers self-held stale
+    // releases and unfenced compositions only; the fenced class reaches recent_restart through the restart charge.
     degradedCarry.record();
+    lastWriteLockRecoveryAtMs = null;
+    let atMs = Number.NaN;
+    try { atMs = nowMs(); lastWriteLockRecoveryAtMs = atMs; } catch { /* The recorder retries with its own clock. */ }
+    // Must match LivenessRecorderOptions.lockRecovery in liveness/recorder.ts: finite event time or NaN for a failed sample.
+    try { writeLockRecoverySink?.(atMs); } catch { /* Telemetry cannot interrupt recovery. */ }
   });
   const agentEgressProbeIntervalSeconds =
     input.agentEgressProbeIntervalSeconds ??
@@ -1148,6 +1168,8 @@ export async function startMacOSCastleWallDaemon(
     emissionLivenessTimer = setInterval(() => {
       try {
         emissionLivenessWatchdog.evaluate();
+        // Publish after each evaluation, never awaited and never from an audit-append continuation, so a held sink cannot stop it.
+        void livenessRecorder?.emissionTick();
       } catch (err) {
         // SAFETY: a throwing evaluate (e.g. a throwing onStall callback) must
         // never take down enforcement; surface it on the operator channel and
@@ -1243,6 +1265,10 @@ export async function startMacOSCastleWallDaemon(
     },
   });
 
+  // The full daemon's liveness recorder. It is independent telemetry: a failure here never disables enforcement or releases an audit lock.
+  const livenessRecorder = daemonMode === "full"
+    ? await createLivenessRecorder(input, () => manifestState.signed.manifest.agent_origin, nowMs, () => lastWriteLockRecoveryAtMs, listener => { writeLockRecoverySink = listener; })
+    : null;
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
       currentSnapshot() {
@@ -1307,7 +1333,8 @@ export async function startMacOSCastleWallDaemon(
     defaultApprovalTimeoutSeconds: DEFAULT_PENDING_APPROVAL_TIMEOUT_SECONDS,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,
-    emissionLiveness: emissionLivenessWatchdog,
+    emissionLiveness: livenessRecorder !== null ? livenessRecorder.bindEmissionNotes(emissionLivenessWatchdog) : emissionLivenessWatchdog,
+    ...(livenessRecorder !== null ? { canarySlot: livenessRecorder.bindCanarySlot() } : {}),
     coalesceLiveFlows: true,
     now: nowMs,
     onVerifiedAvailabilityReport: noteVerifiedAvailabilityReport,
@@ -1318,6 +1345,12 @@ export async function startMacOSCastleWallDaemon(
       leaseDeliveryContradictions.delete(subscriberId);
     },
   });
+  if (livenessRecorder !== null) {
+    livenessRecorder.bindPendingEvidence(() => pendingEvidenceCounts(consumer.getPendingEvidenceSnapshot()));
+    livenessRecorder.bindEmissionTick(() => emissionLivenessWatchdog.snapshot());
+    livenessRecorder.bindLeaseDeadline(() => operatorLeaseDeadlineMs);
+    livenessRecorder.bindHeartbeatFlush();
+  }
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
     socketPath,
@@ -1637,7 +1670,9 @@ export async function startMacOSCastleWallDaemon(
           },
           "success",
         );
-        if (!stopBudgetLapsed) await input.auditLog.flushDurable();
+        // The successful flush time is recorded only after flushDurable resolves, never when the stop budget skipped it.
+        if (livenessRecorder !== null) await livenessRecorder.flushHeartbeat(stopBudgetLapsed, () => input.auditLog.flushDurable());
+        else if (!stopBudgetLapsed) await input.auditLog.flushDurable();
       } catch {
         // A heartbeat write failure must never crash the daemon or take down
         // enforcement. The reader's silent-death detection fails toward an
@@ -2093,6 +2128,8 @@ export async function startMacOSCastleWallDaemon(
     phase = "state_STOP_TIMERS";
     stopLeaseHeartbeat(); stopResolverLifecycleTimer(); stopAuditHeartbeat();
     stopAgentEgressProbeTimer(); stopEmissionLivenessTimer();
+    // With the tick stopped, retire liveness publication so a queued snapshot of this instance never lands after a successor's.
+    livenessRecorder?.retire();
     if (pendingRequests.size > 0) consumer.noteIngressDrop("approval_shutdown", pendingRequests.size);
     pendingRequests.clear();
     // Cleanup initiation is guaranteed; an unsettled cleanup cannot be called complete.
@@ -3119,4 +3156,75 @@ function isPidAlive(pid: number): boolean {
       : undefined;
     return code === "EPERM";
   }
+}
+
+/** Hex digits of the opaque host id; it names the host without publishing its hostname. */
+const LIVENESS_HOST_ID_HEX_DIGITS = 16;
+/** 8 random bytes (64 bits) name one daemon instance and its one publication temp file. */
+const LIVENESS_INSTANCE_BYTES = 8;
+
+/** Count pending evidence as two saturating integers for the liveness record. */
+function pendingEvidenceCounts(evidence: { ingress_loss_pending: { counts: Record<string, number> }; coalesced_pending: { coalesced_evidence_pending?: unknown; pending_keys?: unknown } }): PendingEvidenceCounts {
+  let ingressLossPending = 0;
+  for (const count of Object.values(evidence.ingress_loss_pending.counts)) {
+    ingressLossPending = Math.min(LIVENESS_COUNTER_MAX, ingressLossPending + (Number.isSafeInteger(count) && count > 0 ? count : 0));
+  }
+  const pending = evidence.coalesced_pending.coalesced_evidence_pending;
+  const coalescedPending = typeof pending === "number" && Number.isSafeInteger(pending) && pending > 0 ? pending : 0;
+  return { ingressLossPending, coalescedPending };
+}
+
+/**
+ * Canary origin subjects from the loaded signed manifest, re-read per call so
+ * a reload is honored. An absent origin or NAT mode reads as an unsupported
+ * adapter.
+ */
+function canaryOriginFrom(fortressId: string, origin: { mode?: unknown; agent_uid?: unknown; gate_uid?: unknown } | undefined | null): CanaryOriginSubjects {
+  if (!origin || origin.mode !== "uid" || typeof origin.agent_uid !== "number") {
+    return { adapter: "unsupported", agentUid: null, gateUid: null, agentSubject: null, gateSubject: null };
+  }
+  const gateUid = typeof origin.gate_uid === "number" ? origin.gate_uid : null;
+  return {
+    adapter: "uid",
+    agentUid: origin.agent_uid,
+    gateUid,
+    agentSubject: protectionSubjectForUid(fortressId, origin.agent_uid),
+    gateSubject: gateUid === null ? null : protectionSubjectForUid(fortressId, gateUid),
+  };
+}
+
+/** Build the full daemon's recorder; the boot identity is read once here. */
+async function createLivenessRecorder(
+  input: MacOSCastleWallDaemonInput,
+  agentOrigin: () => { mode?: unknown; agent_uid?: unknown; gate_uid?: unknown } | undefined | null,
+  now: () => number,
+  lastWriteLockRecoveryAtMs: () => number | null,
+  subscribeWriteLockRecovery: (listener: (atMs: number) => void) => void,
+): Promise<LivenessRecorder> {
+  const uptimeMs = input.livenessHostClock?.uptimeMs ?? (() => Math.floor(osUptime() * LIVENESS_SECOND));
+  // A failed boot read publishes boot_id null, which every reader takes as untrusted time.
+  const bootId = await (input.livenessHostClock?.bootId() ?? Promise.resolve(null)).catch(() => null);
+  return new LivenessRecorder({
+    fortressPath: input.fortressPath,
+    subject: {
+      fortress_id: input.fortressId,
+      host_id: `host-${createHash("sha256").update(osHostname()).digest("hex").slice(0, LIVENESS_HOST_ID_HEX_DIGITS)}`,
+      platform: input.platform ?? process.platform,
+      operator_uid: process.getuid?.() ?? -1,
+    },
+    bootId,
+    instanceStartedUptimeMs: uptimeMs(),
+    uptimeMs,
+    now,
+    pid: process.pid,
+    instance: randomBytes(LIVENESS_INSTANCE_BYTES).toString("hex"),
+    origin: () => canaryOriginFrom(input.fortressId, agentOrigin()),
+    // Must match LivenessRecorderOptions.lockRecovery in liveness/recorder.ts: seed before observing subsequent events.
+    lockRecovery: {
+      // Seed after the boot read so recoveries since the first subscription are not lost before recorder construction.
+      count: input.auditLog.getWriteLockRecoveryCount(),
+      lastAtMs: lastWriteLockRecoveryAtMs(),
+      subscribe: subscribeWriteLockRecovery,
+    },
+  });
 }

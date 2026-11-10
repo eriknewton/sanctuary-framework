@@ -1,5 +1,6 @@
+import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
+const checkedClosureVectors = loadCheckedCorpus("closure_vectors.json") as Record<string, unknown>;
 import {it,expect} from "vitest";
-import {readFileSync} from "node:fs";
 import {anchorSchema, anchorDigest} from "../../src/linux-business/activation-anchor.js";
 import {canonicalBytes} from "../../src/signing/contract.js";
 import * as custody from "../../src/signing/custody-transaction.js";
@@ -7,7 +8,7 @@ import {advanceTransaction,transactionComplete,decodeTransaction,classifyCustody
 import {DURABILITY_STEPS,preparePersistence} from "../../src/signing/durable-store.js";
 const journal:CustodyTransaction={version:2,cut:false,reconciliation:null,drain_ack:{prepare:null,commit:null},transaction_id:"a".repeat(32),operation:"ROTATE",old:{revision:1,digest:"sha256:"+"b".repeat(64)},next:{revision:2,digest:"sha256:"+"c".repeat(64)},phase:"PREPARED"};
 // Must match closure_vectors.json: journal acknowledgments use the shared public anchor tuple.
-const baseAnchor = anchorSchema.parse(JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")).anchor);
+const baseAnchor = anchorSchema.parse(checkedClosureVectors.anchor);
 // The pre-transaction anchor names the journal's old custody revision and envelope digest.
 const prior = {...baseAnchor, enrollment_revision: journal.old.revision, custody_envelope_digest: journal.old.digest};
 const beginTransaction = (j: CustodyTransaction, before = prior) => custody.beginTransaction(j, before);
@@ -205,7 +206,7 @@ it("closure a cut persists through write and readback and then refuses replay", 
 
 // Must match the recover group in closure_vectors.json and linux_business_schema.rs: every recovery case executes with its original id.
 type RecoverCase = {id: string; transaction: Pick<CustodyTransaction, "transaction_id" | "old" | "next">; prior: typeof prior; drain: typeof prior; ack: typeof prior; refused_at: "RECONCILE" | "D_ACK" | null};
-const recoverCases = (JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")) as {recover: RecoverCase[]}).recover;
+const recoverCases = (checkedClosureVectors as {recover: RecoverCase[]}).recover;
 /** Run one shared recovery case through begin, RECONCILE, D_ACK and COMPLETE, naming the stage that refused. */
 function runRecovery(c: RecoverCase): "RECONCILE" | "D_ACK" | "COMPLETE" | "INCOMPLETE" {
   let state = beginTransaction({...journal, ...c.transaction, operation: "RECOVER"}, c.prior);

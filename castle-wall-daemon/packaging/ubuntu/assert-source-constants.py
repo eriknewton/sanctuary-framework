@@ -161,8 +161,19 @@ def main():
     state_dir = one(r"^StateDirectory=(\S+)$", unit, "StateDirectory")
     if one(r"^WantedBy=(\S+)$", unit, "WantedBy") != "multi-user.target" or unit.count("[Install]") != 1:
         fail("pinned unit is not installable under its expected target")
-    runtime_root = one(r'let runtime_dir = PathBuf::from\(format!\("(/run/[^"{]+)/\{\}"', config, "fortress runtime root")
-    state_root = one(r'let state_dir = PathBuf::from\(format!\("(/var/lib/[^"{]+)/\{\}"', config, "fortress state root")
+    # The fortress roots are named constants in config.rs and the per-fortress directories are derived from them. This is a
+    # textual drift tripwire, not name resolution: it requires one declaration of each root name of any kind (so no shadow
+    # and no second cfg arm), one binding of each directory, and that binding to be the constant-derived line. The compiled
+    # value is pinned separately by the resolved-path unit tests in config.rs.
+    # Must match RAW_RUNTIME_ROOT and RAW_STATE_ROOT in castle-wall-daemon/src/config.rs.
+    runtime_root = one(r'^pub const RAW_RUNTIME_ROOT: &str = "(/run/[^"]+)";$', config, "fortress runtime root")
+    state_root = one(r'^pub const RAW_STATE_ROOT: &str = "(/var/lib/[^"]+)";$', config, "fortress state root")
+    for name in ("RAW_RUNTIME_ROOT", "RAW_STATE_ROOT"):
+        one(r'\b(?:const|static|let)\s+(?:mut\s+)?' + name + r'\b', config, name + " declaration of any kind")
+    one(r'\blet\s+(?:mut\s+)?runtime_dir\b', config, "fortress runtime directory binding")
+    one(r'\blet\s+(?:mut\s+)?state_dir\b', config, "fortress state directory binding")
+    one(r'^\s*let runtime_dir = PathBuf::from\(RAW_RUNTIME_ROOT\)\.join\(&fortress_id\);$', config, "fortress runtime directory derivation")
+    one(r'^\s*let state_dir = PathBuf::from\(RAW_STATE_ROOT\)\.join\(&fortress_id\);$', config, "fortress state directory derivation")
     expected = {
         "ENV_PATH": env,
         "DAEMON_PATH": start.split()[0],

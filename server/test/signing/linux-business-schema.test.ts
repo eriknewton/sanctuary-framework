@@ -1,3 +1,6 @@
+import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
+const checkedGeneratorVectors = loadCheckedCorpus("generator_vectors.json") as Record<string, unknown>;
+const checkedClosureVectors = loadCheckedCorpus("closure_vectors.json") as Record<string, unknown>;
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -61,7 +64,7 @@ describe("generated business schema", () => {
 
 // Must match closure_vectors.json and linux_business_schema.rs: every shared body executes with its original id.
 type ClosureBody = Record<string, unknown> & {identity_id: string; machine_id: string; activation_id: string; lease_id: string; generation: number; record_kind: string};
-const closure = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")) as {
+const closure = checkedClosureVectors as {
   schema: Array<{id: string; body: ClosureBody; accept: boolean}>;
   verify: Array<{id: string; body: ClosureBody; pin_change: Partial<ClosureBody>; accept: boolean}>;
   coverage: string[];
@@ -91,7 +94,7 @@ import {execFileSync} from "node:child_process";
 import {mkdtempSync, writeFileSync, unlinkSync, rmdirSync, readdirSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join, resolve} from "node:path";
-const generatorVectors = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/generator_vectors.json", "utf8")) as {
+const generatorVectors = checkedGeneratorVectors as {
   cases: Array<{id: string; changes: Array<{path: Array<string | number>; value: unknown}>}>;
 };
 it.each(generatorVectors.cases)("generator refuses $id", c => {
@@ -156,19 +159,12 @@ it.each(closure.verify)("closure business verify pin $id", c => {
   if (!("identity_id" in c.pin_change || "machine_id" in c.pin_change || "kid" in c.pin_change || "epoch" in c.pin_change)) expect(verifyRecord(bytes, signature, pin as never, z.unknown(), body.record_kind)).toBe(true);
 });
 it("closure business verify binds exactly the shared pin field set", () => {
-  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
+  const value = checkedClosureVectors as {verify_pin_fields: string[]};
   expect([...custodyModule.BUSINESS_PIN_FIELDS]).toEqual(value.verify_pin_fields);
   expect(closure.verify.filter(c => !c.accept).map(c => Object.keys(c.pin_change)[0]).sort()).toEqual(value.verify_pin_fields.filter((k: string) => k !== "role").sort());
 });
-// Must match vector_manifest.json and every other consumer: the exact corpus bytes and each group count are pinned in one place.
-it.each([["closure_vectors.json"], ["generator_vectors.json"]])("%s bytes and group counts match the shared manifest", name => {
-  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8")).files[name];
-  const bytes = readFileSync("../castle-wall-daemon/src/business_profile/" + name), value = JSON.parse(bytes.toString("utf8"));
-  expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.sha256);
-  expect(Object.fromEntries(Object.keys(manifest.cases).map(group => [group, value[group].length]))).toEqual(manifest.cases);
-});
 it("every shared corpus beside the business schema is pinned by the manifest", () => {
   const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8"));
-  const corpora = readdirSync("../castle-wall-daemon/src/business_profile").filter(name => /_vectors\.json$/.test(name) && !["public_vectors.json", "role_vectors.json"].includes(name)).sort();
+  const corpora = readdirSync("../castle-wall-daemon/src/business_profile").filter(name => /_vectors\.json$/.test(name)).sort();
   expect(Object.keys(manifest.files).sort()).toEqual(corpora);
 });

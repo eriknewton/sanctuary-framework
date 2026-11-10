@@ -31,6 +31,7 @@
 import { isIP } from "node:net";
 
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
+import { isMonitoringOriginDestination } from "../castle-wall/liveness/monitoring-origin.js";
 import {
   candidateKey,
   candidateKeyDigest,
@@ -252,6 +253,10 @@ function validatedObservedDestinationsRead(
     if (!candidate) {
       return { ok: false, records: [], reason: MALFORMED_OBSERVED_DESTINATIONS_REASON };
     }
+    // A canary drop candidate (including one stored before the upgrade) is the wall's heartbeat, not an observed destination; drops only.
+    // Must match isMonitoringOriginDestination in server/src/castle-wall/liveness/monitoring-origin.ts.
+    if (candidate.would_be_disposition === "denied" &&
+        isMonitoringOriginDestination({ ip: candidate.ip, port: candidate.port, protocol: candidate.protocol, host: candidate.host })) continue;
     records.push(candidate);
   }
   return { ok: true, records };

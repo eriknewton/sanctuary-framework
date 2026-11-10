@@ -1,3 +1,5 @@
+import {requireCliTestRunner} from "./argv.js";
+import {DAEMON_PROFILE_REFUSAL_EXIT_STATUS, appliesLinuxProfileSelection, selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 import { FULL_SUPERVISION_COMPLETION_CODES } from "../castle-wall/runtime/full-supervision-exit.js";
 import fs from "node:fs";
 import { CASTLE_WALL_STOP_EXIT_DEADLINE_MS } from "../castle-wall/constants.js";
@@ -124,6 +126,14 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { consumeFlagValue } from "./argv.js";
+import { LIVENESS_EXIT_DOWN } from "../castle-wall/liveness/constants.js";
+import {
+  evaluateFortressLiveness,
+  formatLivenessLines,
+  productionDaemonLivenessClock,
+  wallOnlyStatusExit,
+  type LivenessReaderContext,
+} from "./castle-wall-liveness-status.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -194,8 +204,12 @@ export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_D
 const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 
 export interface CastleWallCommandContext {
+  /** Explicit isolated inventory for tests; production uses the root-owned inventory. */
+  selectorRoots?: SelectorRoots;
   out?: Writable;
   err?: Writable;
+  /** INTERNAL/TEST: the shared liveness reader's injected clock, boot provider and filesystem for `status`. */
+  liveness?: LivenessReaderContext;
   /** INTERNAL/TEST: route operator warnings across the Darwin capability boundary. */
   warn?: (message: string) => void;
   env?: NodeJS.ProcessEnv;
@@ -689,8 +703,8 @@ function formatDeadManLeaseStatus(
   const enforcementActive = contentFilterState === "enabled";
   const label =
     lease.armed && !enforcementActive
-      ? "Dead-man lease (advisory broadcast, not enforcement): armed"
-      : `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}`;
+      ? "Last CLI arm request (advisory, not enforcement): armed"
+      : `Last CLI arm request (advisory): ${lease.armed ? "armed" : "disarmed"}`;
   return (
     `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
@@ -2441,7 +2455,7 @@ export async function runStatus(
 
   if (platform !== "darwin") {
     write(out, "Castle Wall sysext: not applicable (non-macOS)\n");
-    return 0;
+    return appendLivenessAndExit(out, storagePath, platform, ctx);
   }
 
   // F3 - surface the GLOBAL pin (the actual enforcement anchor) and a
@@ -2527,7 +2541,28 @@ export async function runStatus(
   if (lease) {
     write(out, formatDeadManLeaseStatus(lease, contentFilterState));
   }
-  return 0;
+  return appendLivenessAndExit(out, storagePath, platform, ctx);
+}
+
+/**
+ * Append the three Liveness lines and return the wall-only exit. Exit codes
+ * must match the exit constants in server/src/castle-wall/liveness/constants.ts.
+ */
+async function appendLivenessAndExit(
+  out: Writable,
+  storagePath: string,
+  platform: NodeJS.Platform | string,
+  ctx: CastleWallCommandContext,
+): Promise<number> {
+  try {
+    const envelope = await evaluateFortressLiveness(storagePath, { ...ctx.liveness, platform });
+    write(out, formatLivenessLines(envelope));
+    // The status exit is the shared evaluator's wall verdict; earlier lines never set it.
+    return wallOnlyStatusExit(envelope);
+  } catch {
+    // The shared reader could not evaluate, which is never a wall OK.
+    return LIVENESS_EXIT_DOWN;
+  }
 }
 
 /**
@@ -2559,6 +2594,11 @@ export async function runDaemon(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
+  if (ctx.selectorRoots !== undefined) {
+    defaultSelectorRoots({
+      roots: ctx.selectorRoots, assertTestRunner: requireCliTestRunner("selectorRoots"),
+    });
+  }
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
@@ -2573,6 +2613,16 @@ export async function runDaemon(
   if (launchAgent && argv.includes("--safe-mode")) {
     write(err, "--launch-agent cannot be combined with --safe-mode.\n");
     return 2;
+  }
+
+  const storagePath = resolveFortressArg(parsed.fortress, env);
+  if (appliesLinuxProfileSelection(platform)) {
+    const selection = selectLinuxProfile(ctx.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
+    // Only a proven legacy selection may consult the opt-in or prepare storage.
+    if (selection.kind !== "LegacyV1") {
+      write(err, `${profileRefusalText(selection)}\n`);
+      return DAEMON_PROFILE_REFUSAL_EXIT_STATUS;
+    }
   }
 
   // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
@@ -2615,7 +2665,7 @@ export async function runDaemon(
   // back to resolveStoragePath(env) when no flag is given, preserving prior
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
-  const storagePath = resolveFortressArg(parsed.fortress, env);
+
   if (launchAgent) {
     const { fullAgentAdmissionRefusal } = await import("./castle-wall-full-agent.js");
     const refusal = fullAgentAdmissionRefusal(ctx.getppid?.() ?? process.ppid, process.pid,
@@ -2954,6 +3004,8 @@ export async function runDaemon(
         // token). This is the console-login enforcement path that holds the
         // fortress key + reaches the audit-producer signing service.
         daemonMode: "full",
+        // The liveness recorder reads the boot identity once at start through the same provider as the reader.
+        livenessHostClock: ctx.liveness?.daemonHostClock ?? productionDaemonLivenessClock,
         ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
         ...(localSign ? { localSign: true } : {}),
         ...(resolvedSignerClient

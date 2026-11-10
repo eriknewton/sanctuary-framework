@@ -102,8 +102,13 @@ if (role === "wrap") {
   await fsPromises.mkdir(join(home, ".hermes"), { mode: 0o700 });
   await fsPromises.copyFile(new URL("../harness/fixtures/hermes.json", import.meta.url), join(home, ".hermes/cli-config.json"));
   const { runWrap } = await import("../../src/wrap/cli.js");
+  const { isolatedSelectorRoots } = await import("../../src/linux-business/profile-selection.js");
+  const selectionRoot = await fsPromises.mkdtemp(join(home, "selector-"));
+  const { rmdirSync } = await import("node:fs");
+  process.once("exit", () => { try { rmdirSync(selectionRoot); } catch { /* Teardown must not throw from exit. */ } });
   report("READY");
   await runWrap({ hermes: true, noOpen: true, noDashboard: true }, {
+    selectorRoots: isolatedSelectorRoots(selectionRoot),
     runAutoProvisionForWrap: async () => ({ ran: true, outcome: { kind: "aborted", stage: "root-check", reason: "fixture install refused", rolledBack: false, rehomeAttempted: false } }),
     openBrowser: async () => undefined,
     resolvePassphrase: async () => ({ value: "fixture-passphrase", location: "test-keychain", source: "generated" }),

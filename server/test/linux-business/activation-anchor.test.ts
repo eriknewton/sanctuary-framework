@@ -1,9 +1,10 @@
+import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
+const checkedClosureVectors = loadCheckedCorpus("closure_vectors.json") as Record<string, unknown>;
 import {it,expect} from "vitest";
-import {readFileSync} from "node:fs";
 import {anchorSchema,anchorDigest,decodeAnchorMessage,proposeAnchor,reconcile,ANCHOR_OPS,type ActivationAnchor,type AnchorMessage} from "../../src/linux-business/activation-anchor.js";
 import {canonicalBytes} from "../../src/signing/contract.js";
 // Must match the anchor field in closure_vectors.json and linux_business_schema.rs.
-export const anchor=anchorSchema.parse(JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json","utf8")).anchor);
+export const anchor=anchorSchema.parse(checkedClosureVectors.anchor);
 const request="c".repeat(32),digest="sha256:"+"d".repeat(64);
 function message(op:AnchorMessage["op"],expected=anchor,next:ActivationAnchor|null=null):AnchorMessage{return {version:1,op,request_id:request,expected,next};}
 it("canonical anchor messages preserve exact complete tuples",()=>{
@@ -42,7 +43,7 @@ it("outside receipt and original tail are independently required for same-epoch 
 });
 
 // Must match closure_vectors.json and linux_business_schema.rs: every proposal and reconciliation id executes.
-const closure = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")) as {
+const closure = checkedClosureVectors as {
   anchors: Array<{id: string; op: string; request_id: string; old: ActivationAnchor; next: ActivationAnchor | null; accept: boolean}>;
   reconcile: Array<{id: string; anchor: ActivationAnchor; accept: boolean}>;
 };
@@ -77,28 +78,18 @@ it("closure activation identities never return: A to B to A refuses", () => {
   expect(proposeAnchor(state, {version: 1, op: onward.op, request_id: onward.request_id, expected: state, next: onward.next} as AnchorMessage)).toEqual(onward.next);
 });
 
-import {createHash} from "node:crypto";
 import * as anchorModule from "../../src/linux-business/activation-anchor.js";
-// Must match vector_manifest.json and every other consumer: the exact corpus bytes and each group count are pinned in one place.
-it("closure corpus bytes and group counts match the shared manifest", () => {
-  const manifest = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/vector_manifest.json", "utf8")).files["closure_vectors.json"];
-  const bytes = readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json"), value = JSON.parse(bytes.toString("utf8"));
-  expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.sha256);
-  expect(Object.fromEntries(Object.keys(manifest.cases).map(group => [group, value[group].length]))).toEqual(manifest.cases);
-  expect(closure.anchors.length).toBe(manifest.cases.anchors);
-  expect(closure.reconcile.length).toBe(manifest.cases.reconcile);
-});
 it("closure PREPARE field set is the shared corpus set", () => {
-  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
+  const value = checkedClosureVectors;
   expect([...anchorModule.PREPARE_CHANGED_FIELDS]).toEqual(value.prepare_changed_fields);
 });
 it("closure drained tuple field set is the shared corpus set", () => {
-  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8"));
+  const value = checkedClosureVectors;
   expect([...anchorModule.DRAIN_TUPLE_FIELDS]).toEqual(value.drain_tuple_fields);
 });
 // Must match recoveryPrepareBase in activation-anchor.ts and recovery_prepare_base in activation_anchor.rs: the base is the prior anchor carrying the drain's drained tuple, or null.
 it("closure recovery prepare bases match the shared recover group as a full id set", () => {
-  const value = JSON.parse(readFileSync("../castle-wall-daemon/src/business_profile/closure_vectors.json", "utf8")) as {recover: Array<{id: string; prior: ActivationAnchor; drain: ActivationAnchor; refused_at: string | null}>};
+  const value = checkedClosureVectors as {recover: Array<{id: string; prior: ActivationAnchor; drain: ActivationAnchor; refused_at: string | null}>};
   const base = (c: {prior: ActivationAnchor; drain: ActivationAnchor}) => anchorModule.recoveryPrepareBase(c.prior, c.drain);
   expect(value.recover.map(c => [c.id, base(c)])).toEqual(value.recover.map(c => [c.id, c.refused_at === "RECONCILE" ? null : c.drain]));
 });

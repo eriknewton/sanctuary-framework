@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {mkdtempSync, rmdirSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
+
 const autoProvisionMocks = vi.hoisted(() => ({
   runAutoProvisionForWrap: vi.fn(async () => ({ ran: false })),
   runEgressGateRepairForCli: vi.fn(),
@@ -22,7 +26,11 @@ describe("exclusive-egress repair/unprotect deferred shutdown signals", () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let stderrSpy: ReturnType<typeof vi.spyOn>;
 
+  let fortress: string;
+  let priorStoragePath: string | undefined;
   beforeEach(() => {
+    fortress = mkdtempSync(join(tmpdir(), "k1-signals-"));
+    priorStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     autoProvisionMocks.runAutoProvisionForWrap.mockClear();
     autoProvisionMocks.runEgressGateRepairForCli.mockReset();
     autoProvisionMocks.runEgressGateUnprotectForCli.mockReset();
@@ -36,6 +44,9 @@ describe("exclusive-egress repair/unprotect deferred shutdown signals", () => {
     __resetProcessShutdownStateForTest();
     stderrSpy.mockRestore();
     exitSpy.mockRestore();
+    if (priorStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+    else process.env.SANCTUARY_STORAGE_PATH = priorStoragePath;
+    rmdirSync(fortress);
   });
 
   it("threads beforeFirstMutation through --repair-egress-gate and exits on a deferred signal even if repair throws", async () => {
@@ -47,7 +58,7 @@ describe("exclusive-egress repair/unprotect deferred shutdown signals", () => {
     });
 
     await expect(
-      runWrap({ repairEgressGate: true, standDownAgent: true }),
+      runWrap({ fortress, repairEgressGate: true, standDownAgent: true }),
     ).rejects.toThrow("process.exit:143");
 
     expect(autoProvisionMocks.runEgressGateRepairForCli).toHaveBeenCalledTimes(1);
@@ -63,7 +74,7 @@ describe("exclusive-egress repair/unprotect deferred shutdown signals", () => {
     });
 
     await expect(
-      runWrap({ unprotectEgressGate: true, standDownAgent: true }),
+      runWrap({ fortress, unprotectEgressGate: true, standDownAgent: true }),
     ).rejects.toThrow("process.exit:143");
 
     expect(autoProvisionMocks.runEgressGateUnprotectForCli).toHaveBeenCalledTimes(1);

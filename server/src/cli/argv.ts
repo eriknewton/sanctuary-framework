@@ -342,3 +342,14 @@ export function caughtErrorForDisplay(cause: unknown): string {
   }
   return "error";
 }
+
+/** Shared CLI test-hook policy. The returned assertion carries this checked result into selection. */
+export function requireCliTestRunner(name: string): () => void {
+  const allowed = process.env.NODE_ENV === "test" || process.env.VITEST !== undefined;
+  const assertTestRunner = (): void => {
+    if (allowed) return;
+    throw new Error(`${name} is test-only and is disabled outside the test runner.`);
+  };
+  assertTestRunner();
+  return assertTestRunner;
+}

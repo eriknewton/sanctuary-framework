@@ -23,6 +23,7 @@ it("reaps and reports unclosed leases after file teardown while accepting releas
     "./test/setup/keychain-fake.ts",
     "./test/setup/homedir-follows-env.ts",
     "./test/setup/master-write-leases.ts",
+    "./test/setup/selector-roots-isolation.ts",
   ]);
   expect(config.test?.sequence).toMatchObject({ setupFiles: "list", hooks: "stack" });
   const directory = await mkdtemp(join(serverRoot, ".lease-guard-"));

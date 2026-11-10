@@ -1,0 +1,29 @@
+{
+  "captured": "2026-11-09",
+  "tool": "/usr/sbin/netstat -anv -p tcp (read-only, operator account, no root)",
+  "files": {
+    "netstat-anv-macos26.txt": {
+      "host_role": "coordinator Mac",
+      "os": "macOS 26.6.2",
+      "build": "25G83",
+      "format": "one netstat output; a row subset kept, header lines byte-exact"
+    },
+    "netstat-anv-reference-host-idle.txt": {
+      "host_role": "reference host running the messaging gateway, idle",
+      "os": "macOS 26.6.2",
+      "build": "25G83",
+      "format": "six netstat outputs 15 s apart; each begins with a line '=== SAMPLE <n> observed_at=<UTC ISO> observed_uptime_ms=<ms since boot>'; header lines byte-exact",
+      "gateway_pid": 75399,
+      "messaging_set_ipv4": ["203.0.113.0/24"],
+      "qualifying_identity": "192.0.2.1.64719 -> 203.0.113.10.443, rxbytes 49560, 51412, 52338, 54190, 55116, 56968",
+      "frozen_close_wait": 3
+    }
+  },
+  "sanitization": [
+    "Only the Local Address and Foreign Address tokens were rewritten; every other byte of each kept row is as captured.",
+    "Messaging-service IPv4 addresses map to 203.0.113.0/24, other remote IPv4 to 198.51.100.0/24, local, private, loopback and CGNAT IPv4 to 192.0.2.0/24 (never .254).",
+    "IPv6: macOS netstat truncates IPv6 host text to at most 16 characters and drops the zone. A truncated host is replaced by an equal-length, equally unparsable stand-in under 2001:db8. No captured IPv6 host text was complete.",
+    "Rows of other processes were reduced to a neutral subset (system daemons, a browser helper, node, a messaging client, an empty process name, a process name with a space)."
+  ],
+  "absent": "No macOS 15 host was available; the accepted header set is the single macOS 26 header both files share."
+}

@@ -1,3 +1,4 @@
+// fail-before-exempt: the observer verbs help case reaches the built CLI, and the fail-before check does not rebuild dist from base, so base passes; the same help text is witnessed against the source in watch-constants
 import { describe, it, expect } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -77,6 +78,18 @@ describe("CLI help routing", () => {
     expect(stderr).not.toContain("Sanctuary MCP Server");
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 
+  it("sanctuary castle-wall help routes the observer verbs and names their exit codes", async () => {
+    const { code, stdout, stderr } = await runCli("castle-wall", "--help");
+
+    expect(code).toBe(0);
+    expect(stderr).not.toContain("Sanctuary MCP Server");
+    for (const verb of ["install-watch", "run-watch", "uninstall-watch"]) expect(stdout).toContain(`    ${verb} `);
+    expect(stdout).toContain("it is an installer result, not a liveness");
+    expect(stdout).toMatch(/Exit 5: the canary is not installed/);
+    expect(stdout).toMatch(/6 when the canary is still installed/);
+    expect(stdout).toMatch(/78 unstable Node or CLI path/);
+  }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
+
   it("sanctuary castle-wall status runs without starting MCP", async () => {
     // Point the host-app override at a path that cannot exist so status never
     // probes a real installed Castle Wall app (slow + machine-dependent); an
@@ -85,7 +98,7 @@ describe("CLI help routing", () => {
       env: { SANCTUARY_CASTLE_HOSTAPP: "/nonexistent/CastleWallHostApp" },
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(stderr).not.toContain("Sanctuary MCP Server");
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
 

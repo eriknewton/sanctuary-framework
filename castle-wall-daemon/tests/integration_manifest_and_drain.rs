@@ -148,6 +148,9 @@ fn boot_daemon_with_policy(rule_count: usize) -> BootedDaemon {
         // the suite lock held above serializes access to them, and one source for
         // the isolated paths is what keeps them from drifting per suite
         // (AGENTS rule 5).
+        test_selector_roots: Some(castle_wall_daemon::config::SelectorRoots::isolated_under(
+            dir.path(),
+        )),
         linux_runtime_paths: isolation::runtime_paths(),
         test_boot_time_shutdown_requested: false,
         test_delay_before_ready_ms: None,
@@ -1778,6 +1781,7 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
     let socket_path = dir.path().join("guard.sock");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"));
+    command.arg("--test-profile-root").arg(isolation::root());
     command
         .args(["--fortress-id", "deadbeef"])
         .arg("--socket-path")
@@ -2108,6 +2112,7 @@ fn tw_run(extra: &[&str], watchdog_usec: Option<String>, stop: TwStop) -> Option
     };
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"));
+    command.arg("--test-profile-root").arg(isolation::root());
     command
         .args(["--fortress-id", "deadbeef"])
         .arg("--socket-path")

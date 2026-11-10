@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.sanctuaryprotocol.castle-wall.watch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/opt/node/bin/node</string>
+		<string>/opt/homebrew/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js</string>
+		<string>castle-wall</string>
+		<string>run-watch</string>
+		<string>--fortress</string>
+		<string>/Users/operator-fixture/.sanctuary</string>
+		<string>--launch-agent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/opt/node/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/</string>
+</dict>
+</plist>
