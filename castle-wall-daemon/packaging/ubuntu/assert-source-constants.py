@@ -161,8 +161,15 @@ def main():
     state_dir = one(r"^StateDirectory=(\S+)$", unit, "StateDirectory")
     if one(r"^WantedBy=(\S+)$", unit, "WantedBy") != "multi-user.target" or unit.count("[Install]") != 1:
         fail("pinned unit is not installable under its expected target")
-    runtime_root = one(r'let runtime_dir = PathBuf::from\(format!\("(/run/[^"{]+)/\{\}"', config, "fortress runtime root")
-    state_root = one(r'let state_dir = PathBuf::from\(format!\("(/var/lib/[^"{]+)/\{\}"', config, "fortress state root")
+    # The fortress roots are named constants in config.rs; the per-fortress directories must be derived from exactly those
+    # constants, so a second literal root cannot appear beside them without this guard refusing.
+    # Must match RAW_RUNTIME_ROOT and RAW_STATE_ROOT in castle-wall-daemon/src/config.rs.
+    runtime_root = one(r'^pub const RAW_RUNTIME_ROOT: &str = "(/run/[^"]+)";$', config, "fortress runtime root")
+    state_root = one(r'^pub const RAW_STATE_ROOT: &str = "(/var/lib/[^"]+)";$', config, "fortress state root")
+    one(r'let runtime_dir = PathBuf::from\(RAW_RUNTIME_ROOT\)\.join\(&fortress_id\);', config, "fortress runtime directory derivation")
+    one(r'let state_dir = PathBuf::from\(RAW_STATE_ROOT\)\.join\(&fortress_id\);', config, "fortress state directory derivation")
+    if re.search(r'let (runtime|state)_dir = PathBuf::from\(format!', config):
+        fail("fortress directory built from a literal instead of the named root constant")
     expected = {
         "ENV_PATH": env,
         "DAEMON_PATH": start.split()[0],
