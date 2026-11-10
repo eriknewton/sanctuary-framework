@@ -6,26 +6,30 @@ import { ESLint } from 'eslint';
 import tseslint from 'typescript-eslint';
 import ts from 'typescript';
 import {
-  BASELINE_PATH, CONFIG_PATH, CONFIG, EXTENSIONS, POLICY, POLICY_DIGEST,
-  SEED_DIGEST, SEED_SOURCE_DIGEST, SOURCE_PREFIX, MAX_GIT_BYTES, MAX_SOURCE_BYTES,
-  MAX_SOURCE_FILES, MAX_HISTORY_COMMITS, digest,
+  BASELINE_PATH, CONFIG_PATH, CONFIG, EXTENSIONS, POLICY, SOURCE_PREFIX,
+  MAX_GIT_BYTES, MAX_SOURCE_BYTES, MAX_SOURCE_FILES, MAX_BASELINE_ENTRIES,
+  MAX_METADATA_BYTES, MODES, STATES, REANCHOR_LABEL, EMIT_ONLY_OPTIONS, digest,
 } from './policy.mjs';
 import { fingerprint, key } from './fingerprint.mjs';
 
 const EXIT_REFUSED = 1;
 const JSON_INDENT = 2;
 export function git(root, args) {
-  return execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: MAX_GIT_BYTES });
+  return execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: MAX_GIT_BYTES, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 function insist(condition, reason) {
   if (!condition) throw new Error(reason);
 }
 function readJson(root, name) {
-  return JSON.parse(readFileSync(path.join(root, name), 'utf8'));
+  const filename = path.resolve(root, name);
+  insist(lstatSync(filename).size <= MAX_METADATA_BYTES, 'metadata size refused');
+  return JSON.parse(readFileSync(filename, 'utf8'));
 }
 
 export function manifest(root) {
   const paths = git(root, ['ls-files', '-z']).split('\0').filter(Boolean);
+  const modes = new Map(git(root, ['ls-files', '--stage', '-z']).split('\0').filter(Boolean)
+    .map(row => [row.slice(row.indexOf('\t') + 1), row.split(' ')[0]]));
   const seen = new Set();
   const sources = [];
   for (const name of paths) {
@@ -33,6 +37,7 @@ export function manifest(root) {
       && !name.split('/').includes('..') && !seen.has(name), 'invalid or duplicate manifest path');
     seen.add(name);
     if (!name.startsWith(SOURCE_PREFIX) || !EXTENSIONS.includes(path.extname(name))) continue;
+    insist(modes.get(name) !== '120000', `linked source git mode: ${name}`);
     let component = root;
     // Missing files and links fail closed; a disappearing source cannot reduce lint coverage.
     for (const part of name.split('/')) {
@@ -51,15 +56,62 @@ export function sourceDigest(root, sources) {
   return digest(JSON.stringify(sources.map(name => [name, digest(readFileSync(path.join(root, name)))])));
 }
 
+// Stable object ordering is shared by compiler and fixed-policy verification.
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(name => [name, canonical(value[name])]));
+  return value;
+}
+const serialize = value => JSON.stringify(canonical(value));
+function assertPolicy() {
+  // Fixed design policy, must match policy.mjs and the policy mutation witnesses.
+  const expected = {
+    '@typescript-eslint/no-floating-promises': ['error', { ignoreVoid: false, ignoreIIFE: false, checkThenables: true }],
+    '@typescript-eslint/no-misused-promises': ['error', {
+      checksConditionals: true, checksSpreads: true,
+      checksVoidReturn: { arguments: true, attributes: true, inheritedMethods: true, properties: true, returns: true, variables: true },
+    }],
+  };
+  insist(serialize(POLICY.rules) === serialize(expected) && POLICY.noInlineConfig === true
+    && serialize(EXTENSIONS) === serialize(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'])
+    && serialize(POLICY.extensions) === serialize(EXTENSIONS), 'fixed rule policy drift');
+}
+export function compilerDigest(root, options) {
+  const relative = (value, base = root) => {
+    const name = path.relative(root, path.resolve(base, value));
+    insist(name !== '..' && !name.startsWith(`..${path.sep}`) && !path.isAbsolute(name), 'compiler path outside repository');
+    return name.split(path.sep).join('/') || '.';
+  };
+  const normalized = {};
+  for (const [name, value] of Object.entries(options)) {
+    if (['configFilePath', 'pathsBasePath'].includes(name) || EMIT_ONLY_OPTIONS.includes(name)) continue;
+    const declaration = ts.optionDeclarations.find(option => option.name === name);
+    if (name === 'paths') {
+      normalized[name] = Object.fromEntries(Object.entries(value).map(([alias, targets]) =>
+        [alias, targets.map(target => relative(target, options.baseUrl ?? options.pathsBasePath ?? path.join(root, 'server')))]));
+    } else if (declaration?.isFilePath) normalized[name] = relative(value);
+    else if (declaration?.element?.isFilePath) normalized[name] = value.map(item => relative(item));
+    else if (declaration?.type instanceof Map) {
+      const enumName = [...declaration.type].find(([, number]) => number === value)?.[0];
+      insist(enumName !== undefined, `unknown compiler enum: ${name}`);
+      normalized[name] = enumName;
+    } else normalized[name] = value;
+  }
+  return digest(serialize(normalized));
+}
 export function validateBaseline(baseline) {
-  insist(baseline.policyDigest === POLICY_DIGEST, 'policy drift');
-  insist(Array.isArray(baseline.sources) && Array.isArray(baseline.entries), 'invalid baseline');
-  insist(baseline.sources.length <= MAX_SOURCE_FILES, 'baseline source cap');
-  insist(new Set(baseline.sources).size === baseline.sources.length, 'duplicate baseline source');
+  // Parent blobs validate structure only. Their digests deliberately belong to the previous tools.
+  insist(Array.isArray(baseline.entries) && baseline.entries.length <= MAX_BASELINE_ENTRIES, 'invalid baseline or entry cap');
+  const isDigest = value => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
+  // A trusted legacy seed has a policy digest; an unversioned blob is never an anchor.
+  insist((isDigest(baseline.compilerDigest) && isDigest(baseline.driftDigest))
+    || isDigest(baseline.policyDigest), 'invalid baseline digests');
   const identities = new Set();
   for (const entry of baseline.entries) {
     insist(POLICY.rules[entry.rule] && typeof entry.kind === 'string'
-      && baseline.sources.includes(entry.path), 'invalid baseline entry');
+      && typeof entry.path === 'string' && entry.path.startsWith(SOURCE_PREFIX)
+      && entry.path === path.posix.normalize(entry.path) && !entry.path.includes('\\')
+      && EXTENSIONS.includes(path.extname(entry.path)), 'invalid baseline entry');
     // Must match fingerprint.mjs: preimages retain context, statement and relative token position.
     const preimage = JSON.parse(entry.preimage);
     insist(Array.isArray(preimage.context) && Array.isArray(preimage.statement)
@@ -81,60 +133,135 @@ export function compare(current, baseline) {
   }
   for (const identity of retained) insist(actual.has(identity), `stale baseline: ${identity}`);
 }
-export function shrink(parent, current) {
+const sameSet = (left, right) => left.size === right.size && [...left].every(identity => right.has(identity));
+function tree(root, ref) {
+  return new Set(git(root, ['ls-tree', '-r', '--name-only', '-z', ref]).split('\0').filter(Boolean));
+}
+export function shrink(parent, current, baseTree, tipTree) {
   const trusted = validateBaseline(parent);
   const retained = validateBaseline(current);
-  for (const identity of retained) insist(trusted.has(identity), `parent-baseline addition: ${identity}`);
-  for (const source of parent.sources) insist(current.sources.includes(source), `hidden source: ${source}`);
+  const movable = new Map();
+  const signature = entry => JSON.stringify([entry.rule, entry.kind, entry.fingerprint]);
+  // Each removed identity donates once, and only if its entire source path disappeared.
+  for (const entry of parent.entries) {
+    if (retained.has(key(entry)) || tipTree.has(entry.path)) continue;
+    const id = signature(entry);
+    movable.set(id, (movable.get(id) ?? 0) + 1);
+  }
+  for (const entry of current.entries) {
+    if (trusted.has(key(entry))) continue;
+    const id = signature(entry);
+    insist(!baseTree.has(entry.path) && (movable.get(id) ?? 0) > 0, `new diagnostic: ${key(entry)}`);
+    movable.set(id, movable.get(id) - 1);
+  }
 }
-
-export function checkHistory(root, baseline, sources) {
-  // A shallow tip can conceal a removed key and launder its resurrection as the reviewed seed.
-  insist(git(root, ['rev-parse', '--is-shallow-repository']).trim() === 'false',
-    'trusted baseline history unavailable: shallow repository');
-  // State | Continuing evidence | Refusal
-  // INITIAL_SEED | Exact reviewed baseline and source digest | Missing or changed seed
-  // RETAINED | Every historical transition and current edit shrink | Added key or hidden source
-  // MEASURED | Full manifest/Program parity and known typed diagnostics | Coverage/type/config error
-  // ACCEPTED | Current identities equal retained identities | New, duplicate or stale identity
-  // The later measure/compare stages apply to both continuing history arms.
-  // Every first-parent baseline transition is checked, so an intermediate commit cannot launder additions.
-  const commits = git(root, ['log', '--first-parent', '--format=%H', '--', BASELINE_PATH])
-    .trim().split('\n').filter(Boolean).reverse();
-  insist(commits.length <= MAX_HISTORY_COMMITS, 'history cap exceeded');
-  let trusted;
-  for (const commit of commits) {
-    const previous = JSON.parse(git(root, ['show', `${commit}:${BASELINE_PATH}`]));
-    validateBaseline(previous);
-    if (!trusted) insist(digest(JSON.stringify(previous)) === SEED_DIGEST, 'unreviewed initial seed');
-    else shrink(trusted, previous);
-    trusted = previous;
+function context(root) {
+  if (process.env.GITHUB_ACTIONS !== 'true') return { mode: MODES.LOCAL, trusted: 'HEAD', labeled: false };
+  if (process.env.GITHUB_EVENT_NAME !== 'pull_request') return { mode: MODES.VERIFY, labeled: false };
+  try {
+    const event = readJson(root, process.env.GITHUB_EVENT_PATH);
+    const trusted = event.pull_request.base.sha;
+    insist(/^[a-f0-9]{40,64}$/u.test(trusted), 'invalid base sha');
+    // Must match fetch-depth: 2 and no ref in both lint workflows, and promise-hygiene-workflows.test.ts.
+    const MERGE_PARENT_COUNT = 2;
+    const parents = git(root, ['rev-list', '--parents', '-n', '1', 'HEAD']).trim().split(' ').slice(1);
+    insist(parents.length === MERGE_PARENT_COUNT && parents[0] === trusted, 'unproven merge base');
+    git(root, ['rev-parse', '--verify', `${trusted}^{commit}`]);
+    return { mode: MODES.TRANSITION, trusted,
+      labeled: event.pull_request.labels?.some(label => label.name === REANCHOR_LABEL) === true };
+  } catch {
+    throw new Error('trusted parent baseline not available');
   }
-  if (trusted) shrink(trusted, baseline);
-  else {
-    insist(digest(JSON.stringify(baseline)) === SEED_DIGEST, 'unreviewed initial seed');
-    insist(sourceDigest(root, sources) === SEED_SOURCE_DIGEST, 'initial source snapshot changed');
+}
+function trustedBaseline(root, trusted) {
+  try { git(root, ['rev-parse', '--verify', `${trusted}^{commit}`]); }
+  catch { throw new Error('trusted parent baseline not available'); }
+  try { git(root, ['cat-file', '-e', `${trusted}:${BASELINE_PATH}`]); }
+  catch {
+    // Only proven tree-path absence initializes; missing/corrupt objects never do.
+    insist(!tree(root, trusted).has(BASELINE_PATH), 'trusted parent baseline not available');
+    return undefined;
   }
+  try {
+    const baseline = JSON.parse(git(root, ['show', `${trusted}:${BASELINE_PATH}`]));
+    validateBaseline(baseline);
+    return baseline;
+  } catch { throw new Error('trusted parent baseline not available'); }
+}
+function checkTransition(root, baseline, measured, ctx) {
+  const parent = trustedBaseline(root, ctx.trusted);
+  if (!parent) {
+    insist(ctx.mode === MODES.TRANSITION && ctx.labeled, 'initialization requires reanchor label');
+    return STATES.INITIAL_SEED;
+  }
+  const tip = ctx.mode === MODES.LOCAL ? [] : ['HEAD'];
+  const changed = git(root, ['diff', '--name-only', '-z', ctx.trusted, ...tip, '--']).split('\0').filter(Boolean);
+  const sourceChanged = changed.some(name => name.startsWith(SOURCE_PREFIX));
+  const checkerFiles = ['run.mjs', 'fingerprint.mjs', 'policy.mjs'].map(name => `server/scripts/promise-hygiene/${name}`);
+  checkerFiles.push(CONFIG_PATH);
+  let checkerChanged = changed.some(name => checkerFiles.includes(name));
+  if (changed.includes('server/package.json')) {
+    const before = JSON.parse(git(root, ['show', `${ctx.trusted}:server/package.json`]));
+    const after = ctx.mode === MODES.LOCAL ? readJson(root, 'server/package.json')
+      : JSON.parse(git(root, ['show', 'HEAD:server/package.json']));
+    checkerChanged ||= before.scripts?.lint !== after.scripts?.lint;
+  }
+  insist(ctx.labeled || !checkerChanged || !sourceChanged, 'checker and source changes require reanchor label');
+  const unchanged = sameSet(validateBaseline(parent), validateBaseline(baseline));
+  const drift = parent.driftDigest !== measured.driftDigest || parent.compilerDigest !== measured.compilerDigest;
+  // Continuing paths: no drift -> conserved transition; drift/same set -> retained;
+  // drift/changed set -> labeled, source-unchanged reanchor. Exact measurement precedes all arms.
+  if (drift && !unchanged) {
+    insist(ctx.labeled && !sourceChanged, 'configuration drift');
+    return STATES.REANCHORED;
+  }
+  if (!drift) shrink(parent, baseline, tree(root, ctx.trusted), ctx.mode === MODES.LOCAL
+    ? new Set(git(root, ['ls-files', '-z']).split('\0').filter(Boolean)) : tree(root, 'HEAD'));
+  return STATES.RETAINED;
 }
 
 export async function measure(root) {
   const sources = manifest(root);
-  const versions = { eslint: ESLint.version, typescript: ts.version, typescriptEslint: tseslint.plugin.meta.version };
-  insist(JSON.stringify(versions) === JSON.stringify(POLICY.versions), 'installed version drift');
+  assertPolicy();
+  // Installed version metadata is data, never an executable or computed module import.
+  const versions = Object.fromEntries(Object.keys(POLICY.versions).map(name => [name, readJson(root, `server/node_modules/${name}/package.json`).version]));
+  insist(serialize(versions) === serialize(POLICY.versions), 'installed version drift');
   const lock = readJson(root, 'server/package-lock.json');
-  for (const [name, version] of Object.entries({ eslint: versions.eslint, typescript: versions.typescript, 'typescript-eslint': versions.typescriptEslint })) {
+  for (const [name, version] of Object.entries(versions)) {
     insist(lock.packages[`node_modules/${name}`]?.version === version, 'lockfile version drift');
   }
   const config = readJson(root, CONFIG_PATH);
   delete config['//'];
-  insist(JSON.stringify(config) === JSON.stringify(CONFIG), 'configuration drift');
+  // Hygiene coverage is fixed; effective semantic options inherited or overridden are drift-tracked.
+  insist(serialize(config.include) === serialize(CONFIG.include) && serialize(config.exclude) === serialize(CONFIG.exclude)
+    && Object.entries(CONFIG.compilerOptions).every(([name, value]) => config.compilerOptions?.[name] === value), 'configuration drift');
   const configFile = ts.readConfigFile(path.join(root, CONFIG_PATH), ts.sys.readFile);
   const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.join(root, 'server'));
   insist(!configFile.error && parsed.errors.length === 0, 'configuration parse failure');
+  const compiler = compilerDigest(root, parsed.options);
+  const driftDigest = digest(serialize({ versions, lock: digest(readFileSync(path.join(root, 'server/package-lock.json'))), compilerDigest: compiler }));
   const program = ts.createProgram(sources.map(name => path.join(root, name)), parsed.options);
   const programSources = program.getSourceFiles().map(file => path.relative(root, file.fileName).split(path.sep).join('/'))
-    .filter(name => name.startsWith(SOURCE_PREFIX) && EXTENSIONS.includes(path.extname(name))).sort();
-  insist(JSON.stringify(programSources) === JSON.stringify(sources), 'Program/manifest mismatch');
+    .filter(name => !name.split('/').includes('node_modules') && EXTENSIONS.includes(path.extname(name))).sort();
+  const targets = new Set(sources);
+  const tracked = new Map(git(root, ['ls-files', '--stage', '-z']).split('\0').filter(Boolean)
+    .map(row => [row.slice(row.indexOf('\t') + 1), row.split(' ')[0]]));
+  const acceptedDeclarations = [];
+  for (const name of programSources) {
+    if (targets.has(name)) continue;
+    // Declarations contain no executable statements and are never lint targets here.
+    // Only tracked regular declarations with no linked component may extend the Program.
+    insist(/\.d\.(?:ts|mts|cts)$/u.test(name) && tracked.has(name)
+      && tracked.get(name) === '100644', `Program/manifest mismatch: ${name}`);
+    let component = root;
+    for (const part of name.split('/')) {
+      component = path.join(component, part);
+      insist(!lstatSync(component).isSymbolicLink(), `Program/manifest mismatch: ${name}`);
+    }
+    insist(lstatSync(component).isFile(), `Program/manifest mismatch: ${name}`);
+    acceptedDeclarations.push(name);
+  }
+  insist(sources.every(name => programSources.includes(name)), 'Program/manifest mismatch');
   const checker = program.getTypeChecker();
   // JavaScript is type-aware without checkJs; unresolved module edges must still refuse coverage.
   for (const name of sources) {
@@ -160,6 +287,7 @@ export async function measure(root) {
     getCurrentDirectory: () => root, getCanonicalFileName: name => name, getNewLine: () => '\n',
   })}`);
   const lint = new ESLint({
+    // ESLint 10: true disables lookup. Project config must never execute or weaken these rules.
     cwd: path.join(root, 'server'), overrideConfigFile: true, ignore: false,
     overrideConfig: [{
       files: ['**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}'],
@@ -187,19 +315,30 @@ export async function measure(root) {
     }
   }
   entries.sort((left, right) => key(left).localeCompare(key(right)));
-  insist(new Set(entries.map(key)).size === entries.length, 'fingerprint collision');
-  return { sources, entries, notices };
+  const collisions = entries.length - new Set(entries.map(key)).size;
+  insist(collisions === 0, `fingerprint collision: ${collisions}`);
+  insist(entries.length <= MAX_BASELINE_ENTRIES, 'baseline entry cap');
+  return { sources, entries, notices, acceptedDeclarations, compilerDigest: compiler, driftDigest };
 }
 
 export async function run(root) {
+  const ctx = context(root);
   const baseline = readJson(root, BASELINE_PATH);
   validateBaseline(baseline);
-  const sources = manifest(root);
-  for (const name of baseline.sources) insist(sources.includes(name), `missing source file: ${name}`);
-  checkHistory(root, baseline, sources);
   const measured = await measure(root);
+  // A candidate cannot copy an old digest while using different effective options.
+  insist(baseline.compilerDigest === measured.compilerDigest && baseline.driftDigest === measured.driftDigest, 'stored configuration drift');
   compare(measured.entries, baseline);
-  return { state: 'RETAINED', files: measured.sources.length, diagnostics: measured.entries.length, inertDisableNotices: measured.notices.length };
+  // State | Continuing evidence | Refusal
+  // INITIAL_SEED | proven base path absence, label, exact set | unproven base or missing label
+  // RETAINED | exact set, valid conservation or drift with unchanged identities | new/stale key
+  // REANCHORED | label, no source change, exact set and computed digests | configuration drift
+  // VERIFIED | exact set and computed digests, no transition | new/stale key or digest lie
+  // ADVISORY | LOCAL transition against committed HEAD | same transition refusals, advisory only
+  const transition = ctx.mode === MODES.VERIFY ? STATES.VERIFIED : checkTransition(root, baseline, measured, ctx);
+  return { mode: ctx.mode, state: ctx.mode === MODES.LOCAL ? STATES.ADVISORY : transition,
+    ...(ctx.mode === MODES.LOCAL ? { transition, notice: 'advisory, CI is the gate' } : {}),
+    files: measured.sources.length, diagnostics: measured.entries.length, inertDisableNotices: measured.notices.length };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -208,7 +347,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     insist(process.argv.length === 2, 'unexpected arguments; no regeneration mode exists');
     console.log(JSON.stringify(await run(root), null, JSON_INDENT));
   } catch (error) {
-    console.error(`Promise hygiene refused: ${error.message}`);
+    console.error(`Promise hygiene refused: ${error.message}${process.env.GITHUB_ACTIONS !== 'true' ? '; advisory, CI is the gate' : ''}`);
     process.exitCode = EXIT_REFUSED;
   }
 }

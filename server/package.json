@@ -79,7 +79,7 @@
     "typecheck:tests": "node scripts/check-typecheck-baseline.mjs",
     "typecheck:tests:raw": "tsc -p tsconfig.typecheck.json --pretty false",
     "typecheck:tests:update": "node scripts/check-typecheck-baseline.mjs --update",
-    "lint": "eslint src/ --max-warnings 0 && node scripts/promise-hygiene/run.mjs",
+    "lint": "sh -c 'eslint src/ --max-warnings 0 \"$@\" && node scripts/promise-hygiene/run.mjs' --",
     "refresh-reorg-evidence": "tsx scripts/refresh-reorg-evidence.ts",
     "check-import-cycles": "tsx scripts/check-import-cycles.ts",
     "check-import-cycles:baseline": "tsx scripts/check-import-cycles.ts > test/fixtures/import-cycle-baseline.txt",
