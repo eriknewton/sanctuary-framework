@@ -182,6 +182,10 @@ const _: () = assert!(
 /// Errors emitted by the daemon lifecycle.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
+    #[error("business profile selected; installed business signing is not enabled in this build")]
+    BusinessProfileNotEnabled,
+    #[error("profile selection refused ({0})")]
+    ProfileRefused(crate::config::ProfileRefusal),
     #[error("F-1 startup failure: {0}")]
     StartupConfig(String),
     /// The boot manifest load did not leave an armed identity behind. A
@@ -280,6 +284,9 @@ pub fn disarm_with(
 /// Map a daemon error to a FailureMode for disposition routing.
 pub fn mode_for_error(err: &DaemonError) -> FailureMode {
     match err {
+        DaemonError::BusinessProfileNotEnabled | DaemonError::ProfileRefused(_) => {
+            FailureMode::StartupPolicyParseFailed
+        }
         DaemonError::StartupConfig(_) => FailureMode::StartupPolicyParseFailed,
         DaemonError::PinnedKeyLoad(_) => FailureMode::StartupPolicyParseFailed,
         DaemonError::IpcBind(_) => FailureMode::StartupIpcBindFailed,
@@ -1611,6 +1618,25 @@ pub struct DaemonExitReport {
 /// Boot the daemon. On success returns a handle; the caller is responsible
 /// for calling `supervise_until_shutdown` then `stop`.
 pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
+    let selection = match crate::config::select_profile(
+        &config.selector_roots(),
+        &[&config.producer_key_path, &config.producer_pub_key_path],
+    ) {
+        // Continuing path: boot obtains its own legacy proof before any path, pin, WAL or producer access.
+        crate::config::ProfileSelection::LegacyV1(selection) => selection,
+        crate::config::ProfileSelection::Business(_) => {
+            return Err(DaemonError::BusinessProfileNotEnabled)
+        }
+        crate::config::ProfileSelection::Refused(reason) => {
+            return Err(DaemonError::ProfileRefused(reason))
+        }
+    };
+    // SAFETY: stderr records the proven legacy startup reason without key material.
+    eprintln!(
+        "castle-wall-daemon: legacy v1 profile selected ({:?})",
+        selection.reason()
+    );
+
     #[cfg(target_os = "linux")]
     config
         .validate_server_profile()
@@ -1696,6 +1722,7 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     // events would silently downgrade the read-side authenticity basis, which
     // the fail-closed contract forbids.
     let producer_signer = crate::ipc::producer_sig::ProducerSigner::load_or_generate(
+        &selection,
         &config.producer_key_path,
         &config.producer_pub_key_path,
     )
@@ -3134,6 +3161,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let pinned = write_pinned_key(dir, &signing);
         let config = DaemonConfig {
+            test_selector_roots: Some(crate::config::SelectorRoots::isolated_under(dir.path())),
             fortress_id: "deadbeef".to_string(),
             socket_path: dir.path().join("filter.sock"),
             policy_dir: dir.path().to_path_buf(),

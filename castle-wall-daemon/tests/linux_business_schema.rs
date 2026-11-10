@@ -529,6 +529,7 @@ fn shared_manifest_pins_every_k1c_corpus() {
         [
             "closure_vectors.json",
             "generator_vectors.json",
+            "profile_selector_vectors.json",
             "public_vectors.json",
             "record_join_vectors.json",
             "role_vectors.json"

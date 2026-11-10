@@ -22,6 +22,13 @@
         "cases": 8
       }
     },
+    "profile_selector_vectors.json": {
+      "sha256": "339b3fe9b77bda0a02500c4356f9c77b374254fe4a8776392215284500d404da",
+      "cases": {
+        "reasons": 6,
+        "cases": 103
+      }
+    },
     "public_vectors.json": {
       "sha256": "6ca52097d0223e0dc1a714bb1344dfeae6be16f56cdd9655667a9458e58885cc",
       "cases": {

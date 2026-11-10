@@ -207,3 +207,8 @@ strip = true
 name = "integration_producer_sig_cross_lang"
 path = "tests/integration_producer_sig_cross_lang.rs"
 required-features = ["legacy-raw-producer"]
+
+[[test]]
+name = "linux_business_profile_selection"
+path = "tests/linux_business_profile_selection.rs"
+required-features = ["test-isolation"]

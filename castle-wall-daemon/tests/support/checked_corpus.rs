@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 pub const REQUIRED_CORPORA: &[&str] = &[
     "closure_vectors.json",
     "generator_vectors.json",
+    "profile_selector_vectors.json",
     "public_vectors.json",
     "record_join_vectors.json",
     "role_vectors.json",
@@ -103,6 +104,9 @@ pub fn corpus(name: &str) -> Value {
         "closure_vectors.json" => include_str!("../../src/business_profile/closure_vectors.json"),
         "generator_vectors.json" => {
             include_str!("../../src/business_profile/generator_vectors.json")
+        }
+        "profile_selector_vectors.json" => {
+            include_str!("../../src/business_profile/profile_selector_vectors.json")
         }
         "public_vectors.json" => include_str!("../../src/business_profile/public_vectors.json"),
         "record_join_vectors.json" => {

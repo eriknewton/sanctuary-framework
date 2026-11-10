@@ -92,6 +92,7 @@ fn value_options() -> Vec<&'static str> {
     // behavior they arm never compiles into a release build either way.
     #[cfg(feature = "test-isolation")]
     {
+        value_options.push("--test-profile-root");
         value_options.push("--test-health-interval-ms");
         value_options.push("--test-shutdown-at");
         // LINUX-STOP-PATH-BUDGET-01: the stop-guard deadline and nft-binary seams
@@ -331,11 +332,52 @@ fn main() -> ExitCode {
     code
 }
 
+// Must match RestartPreventExitStatus in systemd/sanctuary-castle-wall.service.
+const PROFILE_REFUSED_EXIT: u8 = 78;
+
 fn run_daemon_main() -> ExitCode {
     // `mut` is used only by the feature-gated isolation-flag strip below; the
     // allow keeps a production build warning-clean without a second code path.
     #[cfg_attr(not(feature = "test-isolation"), allow(unused_mut))]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "test-isolation")]
+    let test_profile_root = if let Some(index) =
+        args.iter().position(|a| a == "--test-profile-root")
+    {
+        let root = match args.get(index + 1) {
+            Some(path) if std::path::Path::new(path).is_dir() => std::path::PathBuf::from(path),
+            _ => {
+                // SAFETY: stderr is the command-line refusal surface before logging exists.
+                eprintln!("castle-wall-daemon: --test-profile-root requires an existing directory");
+                return ExitCode::from(2); // Command-line usage refusal.
+            }
+        };
+        args.drain(index..=index + 1);
+        Some(root)
+    } else {
+        None
+    };
+    #[cfg(feature = "test-isolation")]
+    let roots = test_profile_root
+        .as_deref()
+        .map(castle_wall_daemon::config::SelectorRoots::isolated_under)
+        .unwrap_or_else(castle_wall_daemon::config::SelectorRoots::production);
+    #[cfg(not(feature = "test-isolation"))]
+    let roots = castle_wall_daemon::config::SelectorRoots::production();
+    // Continuing path: only legacy selection reaches any route, other isolation strip or argv parser.
+    match castle_wall_daemon::config::select_profile(&roots, &[]) {
+        castle_wall_daemon::config::ProfileSelection::LegacyV1(_) => (),
+        castle_wall_daemon::config::ProfileSelection::Business(_) => {
+            // SAFETY: stderr is the fixed profile refusal surface.
+            eprintln!("castle-wall-daemon: business profile selected; installed business signing is not enabled in this build");
+            return ExitCode::from(PROFILE_REFUSED_EXIT);
+        }
+        castle_wall_daemon::config::ProfileSelection::Refused(reason) => {
+            // SAFETY: stderr is the fixed profile refusal surface; reason names carry no paths or keys.
+            eprintln!("castle-wall-daemon: profile selection refused ({reason})");
+            return ExitCode::from(PROFILE_REFUSED_EXIT);
+        }
+    }
 
     // W1a/W1b (LINUX-STOP-LOSS-RACE-01): the two wired-consumer test seams.
     // Declared outside the block below so their parsed values survive it; both
@@ -544,6 +586,12 @@ fn run_daemon_main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(feature = "test-isolation")]
+    if let Some(root) = test_profile_root {
+        config.test_selector_roots = Some(
+            castle_wall_daemon::config::SelectorRoots::isolated_under(&root),
+        );
+    }
     // A162: applied to `config` BEFORE `daemon::boot` runs, unlike
     // `test_health_interval_ms` and `arm_test_shutdown_at_pre_recovery` (both
     // applied after boot returns a handle) -- this seam's sites run INSIDE
@@ -591,6 +639,15 @@ fn run_daemon_main() -> ExitCode {
     let handle = match daemon::boot(config) {
         Ok(h) => h,
         Err(err) => {
+            if matches!(
+                err,
+                daemon::DaemonError::BusinessProfileNotEnabled
+                    | daemon::DaemonError::ProfileRefused(_)
+            ) {
+                // SAFETY: stderr is the fixed profile refusal surface, including independent boot reselection.
+                eprintln!("castle-wall-daemon: {err}");
+                return ExitCode::from(PROFILE_REFUSED_EXIT);
+            }
             let mode = daemon::mode_for_error(&err);
             let disposition = castle_wall_daemon::failure::default_disposition(mode);
             // SAFETY: stderr is the CLI refuse-to-start contract here, not a
@@ -925,5 +982,24 @@ mod agent_verb_dispatch_tests {
         for flag in castle_wall_daemon::agent_start::AGENT_VERB_VALUE_FLAGS {
             assert!(actual.contains(flag), "{flag} must be a value option");
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_selection_tests {
+    use super::*;
+    #[test]
+    fn profile_refusal_matches_the_service_restart_prevention() {
+        let unit = include_str!("../systemd/sanctuary-castle-wall.service");
+        assert!(unit
+            .lines()
+            .any(|line| line == format!("RestartPreventExitStatus={PROFILE_REFUSED_EXIT}")));
+    }
+    #[cfg(not(feature = "test-isolation"))]
+    #[test]
+    fn release_parser_does_not_accept_the_selection_root_flag() {
+        assert!(
+            matches!(DaemonConfig::from_argv(["--test-profile-root","/unused"]),Err(ConfigError::Unknown(flag)) if flag=="--test-profile-root")
+        );
     }
 }

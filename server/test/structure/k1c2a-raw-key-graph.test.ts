@@ -26,3 +26,45 @@ it("excludes the raw seed constructor and all its callers from shipped builds", 
     }
   }
 });
+
+it("keeps both selection tokens sealed and roots isolated only in test builds", () => {
+  const config = read("castle-wall-daemon/src/config.rs");
+  for (const token of ["LegacyV1Selection", "BusinessSelection"]) {
+    expect(config).toMatch(new RegExp(`pub struct ${token} \\{\\s*_sealed: Sealed`));
+    expect(config).not.toMatch(new RegExp(`#\\[derive\\([^\\]]*(?:Clone|Copy|Default)[^\\]]*\\)\\]\\s*pub struct ${token}`));
+    const body = config.match(new RegExp(`impl ${token} \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "";
+    expect(body).not.toMatch(/pub fn (?:new|default|from)/);
+    const construction = config.slice(config.indexOf("pub fn select_profile("), config.indexOf("mod selection_walk"));
+    const whole = [...config.matchAll(new RegExp(`${token} \\{\\s*_sealed: Sealed(?:,|\\s*\\})`, "g"))].length;
+    const inside = [...construction.matchAll(new RegExp(`${token} \\{\\s*_sealed: Sealed(?:,|\\s*\\})`, "g"))].length;
+    expect(whole).toBe(inside + 1); // The struct definition is the one non-construction occurrence.
+  }
+  expect(read("castle-wall-daemon/src/ipc/producer_sig.rs")).toMatch(/pub fn load_or_generate\(\s*_selection: &crate::config::LegacyV1Selection,/);
+  const roots = config.match(/pub struct SelectorRoots \{([\s\S]*?)\n\}/)![1];
+  expect(roots).not.toMatch(/\bpub\b/);
+  for (const constructor of ["isolated_under", "expect_owner_at", "deny_lookup", "deny_open"]) {
+    const source = config.slice(config.indexOf("impl SelectorRoots"));
+    expect(source).toMatch(new RegExp(`#\\[cfg\\(any\\(test, feature = "test-isolation"\\)\\)\\]\\s*pub fn ${constructor}`));
+  }
+  for (const file of ["main.rs", "daemon.rs"]) expect(read(`castle-wall-daemon/src/${file}`)).not.toContain("business_profile");
+  expect(config).toContain('#[cfg(not(target_os = "linux"))]');
+  expect(config).toContain("production_roots_trust_only_root_without_seams");
+  expect(config).toContain("non_linux_returns_implicit_legacy_without_lookups");
+});
+
+it("pins policy literals and excludes alternate root or token constructors", () => {
+  const config = read("castle-wall-daemon/src/config.rs");
+  for (const [constant, literal, files] of [
+    ["BUSINESS_SIGNER_PEER_POLICY", "/etc/sanctuary/business-signer-peer.json", ["sanctuary-business-signer.rs", "sanctuary-business-unlock.rs"]],
+    ["BUSINESS_SIGNER_CONTROLLER_POLICY", "/etc/sanctuary/business-signer-controller.json", ["sanctuary-business-signer.rs"]],
+  ] as const) {
+    expect(config).toMatch(new RegExp(`${constant}: &str =\\s*"${literal}"`));
+    for (const file of files) expect(read(`castle-wall-daemon/src/bin/${file}`)).toContain(`"${literal}"`);
+  }
+  for (const name of readdirSync(resolve(root, "castle-wall-daemon/src"), {recursive: true})) {
+    if (typeof name !== "string" || !name.endsWith(".rs") || name === "config.rs") continue;
+    const source = read(`castle-wall-daemon/src/${name}`);
+    expect(source).not.toMatch(/impl(?:<[^>]*>)?\s+(?:SelectorRoots|LegacyV1Selection|BusinessSelection)\b/);
+    expect(source).not.toMatch(/(?:LegacyV1Selection|BusinessSelection)\s*\{\s*_sealed/);
+  }
+});

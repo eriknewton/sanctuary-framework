@@ -124,7 +124,12 @@ impl ProducerSigner {
     /// the 32-byte verifying key (world-readable) so the consumer can pin it.
     /// On generation both files are written; on load the public file is
     /// (re)written to stay consistent with the loaded private key.
-    pub fn load_or_generate(key_path: &Path, pub_path: &Path) -> Result<Self, ProducerSigError> {
+    // Only a legacy v1 selection proven by on-disk evidence may open or create the raw producer key; a business host never reaches this line.
+    pub fn load_or_generate(
+        _selection: &crate::config::LegacyV1Selection,
+        key_path: &Path,
+        pub_path: &Path,
+    ) -> Result<Self, ProducerSigError> {
         for path in [key_path, pub_path] {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| ProducerSigError::Io {
@@ -408,6 +413,17 @@ fn validate_key_parent(path: &Path) -> Result<(), ProducerSigError> {
 
 #[cfg(test)]
 mod tests {
+    fn legacy_selection() -> crate::config::LegacyV1Selection {
+        let root = tempfile::TempDir::new().unwrap();
+        match crate::config::select_profile(
+            &crate::config::SelectorRoots::isolated_under(root.path()),
+            &[],
+        ) {
+            crate::config::ProfileSelection::LegacyV1(token) => token,
+            other => panic!("empty test inventory must select legacy: {other:?}"),
+        }
+    }
+
     use super::*;
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use tempfile::TempDir;
@@ -437,7 +453,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
-        let signer = ProducerSigner::load_or_generate(&key_path, &pub_path).unwrap();
+        let signer =
+            ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
 
         let sig_b64 = signer.sign_event("{\"event_type\":\"egress_blocked\"}", 1718000000000, 42);
         let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -475,7 +492,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("nested/audit-producer.key");
         let pub_path = dir.path().join("nested/audit-producer.pub");
-        ProducerSigner::load_or_generate(&key_path, &pub_path).unwrap();
+        ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -494,9 +511,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
-        let first = ProducerSigner::load_or_generate(&key_path, &pub_path).unwrap();
+        let first =
+            ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
         let first_pub = first.public_key_b64url();
-        let second = ProducerSigner::load_or_generate(&key_path, &pub_path).unwrap();
+        let second =
+            ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
         assert_eq!(
             first_pub,
             second.public_key_b64url(),
@@ -512,12 +531,12 @@ mod tests {
         let key_path = dir.path().join("audit-producer.key");
         let pub_path = dir.path().join("audit-producer.pub");
         // First boot generates a 0600 key.
-        ProducerSigner::load_or_generate(&key_path, &pub_path).unwrap();
+        ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path).unwrap();
         // Loosen it to world-readable and re-load: must refuse.
         let mut perms = fs::metadata(&key_path).unwrap().permissions();
         perms.set_mode(0o644);
         fs::set_permissions(&key_path, perms).unwrap();
-        match ProducerSigner::load_or_generate(&key_path, &pub_path) {
+        match ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path) {
             Err(ProducerSigError::InsecurePermissions { .. }) => {}
             Err(other) => panic!("expected InsecurePermissions, got {other:?}"),
             Ok(_) => panic!("expected a world-readable private key to be refused"),
@@ -539,7 +558,7 @@ mod tests {
             perms.set_mode(0o600);
             fs::set_permissions(&key_path, perms).unwrap();
         }
-        match ProducerSigner::load_or_generate(&key_path, &pub_path) {
+        match ProducerSigner::load_or_generate(&legacy_selection(), &key_path, &pub_path) {
             Err(ProducerSigError::KeyLength { .. }) => {}
             Err(other) => panic!("expected KeyLength error, got {other:?}"),
             Ok(_) => panic!("expected load to reject a wrong-length private key"),

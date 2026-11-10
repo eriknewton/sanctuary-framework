@@ -111,7 +111,12 @@ fn journal_auth_key_path() -> PathBuf {
 /// argv every spawned daemon in this suite carries so the SUBPROCESS lands on the
 /// same isolated table and paths as the in-process boots.
 fn isolation_args() -> Vec<String> {
-    isolation::subprocess_args()
+    let mut args = isolation::subprocess_args();
+    args.extend([
+        "--test-profile-root".into(),
+        isolation::root().display().to_string(),
+    ]);
+    args
 }
 
 /// Run the shipped binary's explicit `--disarm` recovery action AGAINST THE
@@ -209,6 +214,9 @@ fn fresh_config(dir: &TempDir) -> DaemonConfig {
         trusted_service_uid: Some(unsafe { libc::geteuid() }),
         // The host-global lock / ownership journal / journal MAC key all land in
         // the suite's temp root, never in /var/lib/sanctuary.
+        test_selector_roots: Some(castle_wall_daemon::config::SelectorRoots::isolated_under(
+            dir.path(),
+        )),
         linux_runtime_paths: isolated_paths(),
         test_boot_time_shutdown_requested: false,
         test_delay_before_ready_ms: None,
@@ -234,6 +242,9 @@ fn fresh_confining_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         wal_ttl: Duration::from_secs(86_400),
         wal_size_cap_bytes: 16 * 1024 * 1024,
         trusted_service_uid: Some(unsafe { libc::geteuid() }),
+        test_selector_roots: Some(castle_wall_daemon::config::SelectorRoots::isolated_under(
+            dir.path(),
+        )),
         linux_runtime_paths: isolated_paths(),
         test_boot_time_shutdown_requested: false,
         test_delay_before_ready_ms: None,
@@ -2684,13 +2695,18 @@ const TB9_EXIT_USAGE: i32 = 64;
 /// table tag: it is drained before the verb route, so the verb's own argv stays
 /// exact. (`--isolated-runtime-root` and `--trusted-service-uid` from
 /// `isolation_args()` are daemon flags and would make it a usage error.)
-fn tb9_isolated_table_tail() -> [String; 2] {
+fn tb9_isolated_table_tail() -> [String; 4] {
     let args = isolation_args();
     let at = args
         .iter()
         .position(|a| a == "--isolated-castle-table-tag")
         .expect("isolation carries a table tag");
-    [args[at].clone(), args[at + 1].clone()]
+    [
+        args[at].clone(),
+        args[at + 1].clone(),
+        "--test-profile-root".into(),
+        isolation::root().display().to_string(),
+    ]
 }
 
 fn tb9_gate(uid: u32, trusted: u32, extra: &[&str]) -> std::process::Output {
@@ -2799,20 +2815,27 @@ fn tb9_world_executable_binary(dir: &TempDir) -> PathBuf {
     copy
 }
 
+// The fixture is created after the uid transition, so selection never depends on root bypassing permissions.
+const ISOLATED_CREDENTIAL_SCRIPT: &str = r#"profile_root=$(mktemp -d) || exit 2
+trap 'rmdir "$profile_root"' EXIT HUP INT TERM
+"$1" --test-profile-root "$profile_root" --agent-credential-check "$2"
+"#;
 fn tb9_credential_check(binary: &Path, setpriv: Option<&[&str]>) -> std::process::Output {
     let uid = TEST_AGENT_UID.to_string();
     let mut command = match setpriv {
         Some(flags) => {
             let mut c = Command::new("setpriv");
-            c.args(flags).arg("--").arg(binary);
+            c.args(flags).arg("--").arg("/bin/sh");
             c
         }
-        None => Command::new(binary),
+        None => Command::new("/bin/sh"),
     };
     command
-        .args(["--agent-credential-check", &uid])
+        .args(["-c", ISOLATED_CREDENTIAL_SCRIPT, "profile-fixture"])
+        .arg(binary)
+        .arg(uid)
         .output()
-        .expect("run the credential check")
+        .expect("run the credential check with child-owned selection roots")
 }
 
 /// Reaps the spawned daemon and removes the isolated table and journal on
@@ -4097,6 +4120,16 @@ mod tb10_agent_unit_against_real_systemd {
             &derived,
             "--trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}",
             &format!("--trusted-service-uid ${{SANCTUARY_TRUSTED_SERVICE_UID}} {table_tag}"),
+            1,
+        );
+        units.write_script(
+            "credential-selection.sh",
+            &format!("#!/bin/sh\n{ISOLATED_CREDENTIAL_SCRIPT}"),
+        );
+        let derived = substitute(
+            &derived,
+            &format!("ExecStartPre={bin} --agent-credential-check %i"),
+            &format!("ExecStartPre=/bin/sh {d}/credential-selection.sh {bin} %i"),
             1,
         );
         let derived = substitute(
