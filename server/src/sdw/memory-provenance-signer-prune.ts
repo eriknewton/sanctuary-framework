@@ -268,7 +268,7 @@ export class MemoryProvenanceSignerPruner {
           },
         });
       } catch (error) {
-        // Must match the journal's SignerPruneOutcome in exit/bundle.ts.
+        // Must match SignerPruneOutcome in storage/signer-prune-outcome.ts and its phase transitions in exit/bundle.ts.
         // Capture it before an outer lock release can replace the thrown error.
         Object.assign(outcome, error instanceof SignerPruneError
           ? error.outcome : { phase: "uncertain" as const });
@@ -295,6 +295,7 @@ export class MemoryProvenanceSignerPruner {
         layer: "l1",
         operation: MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETE_AUDIT,
         identity_id: input.identityId ?? "principal",
+        // The deletion committed, so this is a commit record; finalization_failed marks a cache fault after commit.
         result: "success",
         details: {
           approval_audit_id: input.approvalAuditId,

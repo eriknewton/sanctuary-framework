@@ -1,7 +1,6 @@
 /** Internal evidence carried across journal, cache, audit and lock boundaries. */
 // Must match phase transitions in exit/bundle.ts and sdw/memory-provenance-signer-prune.ts,
-// and the projection in
-// sdw/memory-provenance-signer-prune-tools.ts; error names are not evidence.
+// and the projection in sdw/memory-provenance-signer-prune-tools.ts. Error names are not evidence.
 export type SignerPrunePhase = "not-started" | "rolled-back" | "uncertain" | "committed";
 
 export interface SignerPruneOutcome {

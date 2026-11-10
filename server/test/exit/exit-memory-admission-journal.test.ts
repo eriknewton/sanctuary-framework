@@ -250,7 +250,7 @@ describe("C4 shared Exit memory-admission journal", () => {
     expect(await committedStorage.list("_exit_imports")).toHaveLength(0);
   });
 
-  it("retains recovery evidence and surfaces partial_scope on prune divergence", async () => {
+  it("retains recovery evidence and reports an uncertain outcome on prune divergence", async () => {
     const storage = new MemoryStorage();
     const key = "memprov.diverged";
     await storage.write("_known_signers", key, stringToBytes("before"));
