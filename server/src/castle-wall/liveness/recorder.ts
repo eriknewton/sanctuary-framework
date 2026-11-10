@@ -221,7 +221,12 @@ export interface LivenessRecorderOptions {
   instance: string;
   origin: () => CanaryOriginSubjects;
   publisherFs?: PublisherFs;
-  /** Must match createLivenessRecorder in runtime/macos-daemon.ts: seed before observing subsequent events. */
+  /**
+   * Must match createLivenessRecorder in runtime/macos-daemon.ts: seed before observing subsequent events.
+   * The installed exit fence ends hold-deadline lapses before any recovery event; this count covers self-held
+   * stale releases and unfenced compositions only. Fenced exits reach recent_restart through the restart charge.
+   * Must match the recovery listener in runtime/macos-daemon.ts: finite event time or NaN for a failed sample.
+   */
   lockRecovery: {
     count: number;
     lastAtMs: number | null;
@@ -252,12 +257,16 @@ export class LivenessRecorder {
   constructor(private readonly options: LivenessRecorderOptions) {
     this.now = options.now ?? Date.now;
     // Require this daemon's audit source so missing instrumentation cannot silently publish complete evidence.
-    this.lockRecoveryCount = Math.min(COUNTER_MAX, options.lockRecovery.count);
-    this.lastLockRecoveryAtMs = options.lockRecovery.lastAtMs;
+    // Invalid source counts saturate so the evaluator cannot mistake malformed history for a clean observation.
+    this.lockRecoveryCount = Number.isInteger(options.lockRecovery.count) && options.lockRecovery.count >= 0
+      ? Math.min(COUNTER_MAX, options.lockRecovery.count) : COUNTER_MAX;
+    // Construction is the latest possible unobserved recovery time, preserving the full degradation window.
+    this.lastLockRecoveryAtMs = options.lockRecovery.lastAtMs ?? (this.lockRecoveryCount > 0 ? this.now() : null);
     options.lockRecovery.subscribe(atMs => {
       // Recovery observation has constant space and no audit writes or asynchronous work.
       this.lockRecoveryCount = saturatingIncrement(this.lockRecoveryCount);
-      this.lastLockRecoveryAtMs = atMs;
+      // A failed event sample retries this recorder's clock, never a null or a previous event's timestamp.
+      this.lastLockRecoveryAtMs = Number.isFinite(atMs) ? atMs : this.now();
     });
     this.canarySlot = new CanaryRecordingSlot(options.origin, this.now);
     this.publisher = new LivenessRecordPublisher({

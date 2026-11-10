@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CANARY_IP, CANARY_PORT, CANARY_PROTOCOL, COUNTER_MAX, SECOND } from "../../../src/castle-wall/liveness/constants.js";
 import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
 import { LivenessRecorder, saturatingIncrement, type CanaryOriginSubjects, type LivenessRecorderOptions } from "../../../src/castle-wall/liveness/recorder.js";
+import { evaluateLiveness } from "../../../src/castle-wall/liveness/evaluate.js";
 import { parseDaemonRecord, REQUIRED_RECORDER_HOOKS } from "../../../src/castle-wall/liveness/schema.js";
 
 const START = Date.parse("2026-11-09T12:00:00.000Z");
@@ -69,6 +70,36 @@ describe("record shape", () => {
   it("clamps an over-cap recovery seed before publishing", () => {
     const { r } = recorder({ lockRecovery: { count: COUNTER_MAX + 1, lastAtMs: START, subscribe: () => undefined } });
     expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: COUNTER_MAX, last_at_ms: START });
+  });
+
+  it("timestamps unobserved positive history at construction and degrades the evaluator", () => {
+    const { r } = recorder({ lockRecovery: { count: 1, lastAtMs: null, subscribe: () => undefined } });
+    const recovery = (r.buildRecord().raw as any).lock_recovery;
+    expect(recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: START });
+    const input = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")).base;
+    input.nowMs = START;
+    input.daemon.value.raw.lock_recovery = recovery;
+    expect(evaluateLiveness(input).wall.reasons).toContain("write_lock_recovery");
+  });
+
+  // Half an event is non-integral; negative and non-numeric histories are invalid as well.
+  it.each([-1, 1 / 2, Number.NaN])("saturates malformed recovery seed %s so the evaluator refuses it", count => {
+    const { r } = recorder({ lockRecovery: { count, lastAtMs: null, subscribe: () => undefined } });
+    const recovery = (r.buildRecord().raw as any).lock_recovery;
+    expect(recovery.count).toBe(COUNTER_MAX);
+    const input = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")).base;
+    input.daemon.value.raw.lock_recovery = recovery;
+    expect(evaluateLiveness(input).wall.reasons).toContain("observation_invalid");
+  });
+
+  it("retries the recorder clock for a failed event sample instead of retaining the previous time", () => {
+    let observe!: (atMs: number) => void;
+    const { r, advance } = recorder({ lockRecovery: {
+      count: 1, lastAtMs: START, subscribe: listener => { observe = listener; },
+    } });
+    advance(SECOND);
+    observe(Number.NaN);
+    expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: 2, last_at_ms: START + SECOND });
   });
 
   it("omits a hook that was never bound, so the reader sees no wired flag", () => {

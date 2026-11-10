@@ -28,7 +28,8 @@ const BOOT = "boot-wired-fixture";
 const UPTIME = 5_000_000;
 // A short real hold deadline forces recovery without waiting for the production deadline.
 const LOCK_HOLD_MS = SECOND / 10;
-const TICK_SECONDS = 1 / 100; // One hundred publication ticks per second in this fixture.
+const PUBLICATION_TICKS_PER_SECOND = 100; // One hundred publication ticks per second in this fixture.
+const TICK_SECONDS = 1 / PUBLICATION_TICKS_PER_SECOND;
 const STATES = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")) as { base: any }; // Untyped fixture JSON, patched by path.
 
 const hermeticGlobalPinPath = (fortressPath: string) => join(fortressPath, "test-system", "castle-pinned-pubkey.bin");
@@ -81,12 +82,12 @@ describe("wired daemon recorder", () => {
     return { fortressPath, masterKey, auditLog };
   }
   const daemonJson = (fortressPath: string) => join(fortressPath, "liveness", "daemon.json");
-  async function waitForSequence(fortressPath: string, atLeast: number): Promise<Record<string, any>> {
+  async function waitForSequence(fortressPath: string, atLeast: number, atLeastRecoveries = 0): Promise<Record<string, any>> {
     for (let i = 0; i < 400; i++) {
       const text = await readFile(daemonJson(fortressPath), "utf8").catch(() => null);
       if (text !== null) {
         const record = JSON.parse(text) as Record<string, any>;
-        if (record.sequence >= atLeast) return record;
+        if (record.sequence >= atLeast && record.raw.lock_recovery.count >= atLeastRecoveries) return record;
       }
       await new Promise(resolve => setTimeout(resolve, 10));
     }
@@ -140,19 +141,21 @@ describe("wired daemon recorder", () => {
   it("publishes a forced recovery and the evaluator degrades through the history boundary only", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress(LOCK_HOLD_MS);
     const recoveredAt = STATES.base.nowMs - HISTORY_WINDOW;
+    let now = recoveredAt - SECOND;
     const handle = await startDaemon({
       fortressPath, fortressId: "fortress-test", masterKey, localSign: true, auditLog, platform: "darwin",
       activeConfigPath: join(fortressPath, "active.json"), listenerFactory: fakeListenerFactory,
-      now: () => recoveredAt, emissionLivenessTickSeconds: TICK_SECONDS,
+      now: () => now, emissionLivenessTickSeconds: TICK_SECONDS,
       livenessHostClock: { bootId: async () => BOOT, uptimeMs: () => UPTIME },
     });
     try {
       const before = await waitForSequence(fortressPath, 1);
+      now = recoveredAt;
       await forceRecovery(auditLog);
       expect(auditLog.getWriteLockRecoveryCount()).toBe(1);
       // Let an already-started publication drain before reading the next complete tick.
       const afterRecovery = await waitForSequence(fortressPath, before.sequence + 1);
-      const record = await waitForSequence(fortressPath, afterRecovery.sequence + 1);
+      const record = await waitForSequence(fortressPath, afterRecovery.sequence + 1, 1);
       expect(parseDaemonRecord(record).ok).toBe(true);
       expect(record.raw.lock_recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: recoveredAt });
       // The remaining gates use the existing valid fixture; lock evidence is the exact published consumer value.
@@ -176,10 +179,11 @@ describe("wired daemon recorder", () => {
   it("seeds a recovery during the boot read before the recorder subscribes", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress(LOCK_HOLD_MS);
     const recoveredAt = STATES.base.nowMs;
+    let now = recoveredAt;
     const handle = await startDaemon({
       fortressPath, fortressId: "fortress-test", masterKey, localSign: true, auditLog, platform: "darwin",
       activeConfigPath: join(fortressPath, "active.json"), listenerFactory: fakeListenerFactory,
-      now: () => recoveredAt, emissionLivenessTickSeconds: TICK_SECONDS,
+      now: () => now, emissionLivenessTickSeconds: TICK_SECONDS,
       livenessHostClock: {
         bootId: async () => { await forceRecovery(auditLog); return BOOT; },
         uptimeMs: () => UPTIME,
@@ -189,13 +193,56 @@ describe("wired daemon recorder", () => {
       expect(auditLog.getWriteLockRecoveryCount()).toBe(1);
       const record = await waitForSequence(fortressPath, 1);
       expect(record.raw.lock_recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: recoveredAt });
+      now += SECOND;
       await forceRecovery(auditLog);
-      const next = await waitForSequence(fortressPath, record.sequence + 1);
-      const later = await waitForSequence(fortressPath, next.sequence + 1);
-      expect(later.raw.lock_recovery.count).toBe(2); // The seeded event plus one subscribed event, with no double count.
+      // Recovery can span many ticks; wait beyond the latest publication, not merely beyond the boot record.
+      const current = JSON.parse(await readFile(daemonJson(fortressPath), "utf8"));
+      const next = await waitForSequence(fortressPath, current.sequence + 1);
+      const later = await waitForSequence(fortressPath, next.sequence + 1, 2);
+      // The seeded event plus one subscribed event, with no double count and the new event time.
+      expect(later.raw.lock_recovery).toEqual({ state: "instrumented", count: 2, last_at_ms: now });
     } finally {
       await handle.stop();
     }
+  });
+
+  it("keeps the degradation marker and retries event time when the recovery clock throws", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress(LOCK_HOLD_MS);
+    let now = STATES.base.nowMs - SECOND;
+    let failNextClockRead = false;
+    const observedAudit = new Proxy(auditLog, {
+      get(target, key) {
+        if (key === "onWriteLockRecovery") return (listener: () => void) => target.onWriteLockRecovery(() => {
+          failNextClockRead = true;
+          listener();
+        });
+        const value = Reflect.get(target, key, target) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const handle = await startDaemon({
+      fortressPath, fortressId: "fortress-test", masterKey, localSign: true, auditLog: observedAudit, platform: "darwin",
+      activeConfigPath: join(fortressPath, "active.json"), listenerFactory: fakeListenerFactory,
+      now: () => {
+        if (failNextClockRead) { failNextClockRead = false; throw new Error("fixture clock failure"); }
+        return now;
+      },
+      emissionLivenessTickSeconds: TICK_SECONDS,
+      livenessHostClock: { bootId: async () => BOOT, uptimeMs: () => UPTIME },
+    });
+    try {
+      await waitForSequence(fortressPath, 1);
+      now += SECOND;
+      await forceRecovery(auditLog);
+      const current = JSON.parse(await readFile(daemonJson(fortressPath), "utf8"));
+      const record = await waitForSequence(fortressPath, current.sequence + 1, 1);
+      expect.soft(record.raw.lock_recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: now });
+    } finally {
+      await handle.stop();
+    }
+    const { entries } = await auditLog.query({ layer: "l1" });
+    const markers = entries.filter(entry => entry.operation === "castle_wall_heartbeat" || entry.operation === "filter_stopped");
+    expect(markers.reduce((sum, entry) => sum + Number(entry.details?.audit_write_degraded_count ?? 0), 0)).toBe(1);
   });
 
   it("keeps publishing on the tick while the durable audit flush is held", async () => {
