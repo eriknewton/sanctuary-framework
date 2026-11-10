@@ -168,6 +168,11 @@ jobs:
         # assertions. A red here means an Arch assertion failed, not that sudo was absent.
         run: cargo test --locked --features arch-install --test linux_install_arch_parity --test linux_install_arch_fixtures --test linux_install_arch_cli
 
+      # Must match the legacy vector target in castle-wall-daemon/Cargo.toml.
+      - name: cargo test legacy producer vectors
+        working-directory: castle-wall-daemon
+        run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang
+
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

@@ -624,3 +624,37 @@ fn linux_workflow_suite_ran_loop_matches_the_gated_target_set() {
          one documented extra self-check target"
     );
 }
+
+// This is skip accounting only; the dedicated feature-enabled CI step runs the vectors.
+#[cfg(not(feature = "legacy-raw-producer"))]
+#[test]
+fn skipped_integration_producer_sig_cross_lang_requires_legacy_raw_producer() {
+    let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
+    let blocks: Vec<_> = manifest
+        .split("[[test]]")
+        .filter(|block| {
+            block
+                .lines()
+                .any(|line| line == r#"name = "integration_producer_sig_cross_lang""#)
+        })
+        .collect();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "the legacy vector target must be declared exactly once"
+    );
+    let features: Vec<_> = blocks[0]
+        .lines()
+        .filter(|line| line.starts_with("required-features"))
+        .collect();
+    assert_eq!(features, [r#"required-features = ["legacy-raw-producer"]"#]);
+}
+
+#[test]
+fn legacy_vector_ci_step_exists_exactly_once() {
+    let workflow =
+        std::fs::read_to_string(crate_root().join("../.github/workflows/castle-wall-linux.yml"))
+            .unwrap();
+    assert_eq!(workflow.matches("run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang").count(), 1,
+        "the legacy vector CI step must execute exactly once");
+}

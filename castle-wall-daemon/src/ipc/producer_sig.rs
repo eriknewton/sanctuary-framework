@@ -222,6 +222,8 @@ impl ProducerSigner {
     }
 
     /// Construct directly from an in-memory signing key (tests).
+    // Shipped builds cannot construct a producer from an unselected raw seed.
+    #[cfg(feature = "legacy-raw-producer")]
     pub fn from_signing_key(signing_key: SigningKey) -> Self {
         Self { signing_key }
     }
@@ -451,6 +453,7 @@ mod tests {
         vk.verify(&message, &signature).expect("sig must verify");
     }
 
+    #[cfg(feature = "legacy-raw-producer")]
     #[test]
     fn replayed_signature_fails_against_different_seq() {
         let signer = ProducerSigner::from_signing_key(SigningKey::generate(&mut OsRng));
