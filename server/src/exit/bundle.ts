@@ -2509,17 +2509,29 @@ export async function runJournaledMemoryProvenanceSignerPrune<T>(options: {
     // A crash after activation but before normal cleanup may leave this fixed,
     // disposable witness behind. Under the shared admission lock it is safe to
     // clear before publishing the next journal, keeping `_exit_imports` bounded.
+    // An unverified marker deletion must retain recovery status.
+    outcome.phase = "uncertain";
     await options.storage.delete(EXIT_IMPORT_NAMESPACE, importId, false);
     if (await options.storage.read(EXIT_IMPORT_NAMESPACE, importId) !== null) {
       throw new Error("Could not clear stale signer-prune completion marker");
     }
+    outcome.phase = "not-started";
 
     const completionLocation = { namespace: EXIT_IMPORT_NAMESPACE, key: importId };
     const snapshots = await snapshotStorageLocations(options.storage, [
       ...options.locations,
       completionLocation,
     ]);
-    await writeImportJournal(options.storage, importId, options.identityId, snapshots);
+    try {
+      await writeImportJournal(options.storage, importId, options.identityId, snapshots);
+    } catch (error) {
+      // Publication can persist before rejecting; only observed absence proves no start.
+      outcome.phase = "uncertain";
+      if (await options.storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, importId) === null) {
+        outcome.phase = "not-started";
+      }
+      throw error;
+    }
     // Must match SignerPruneOutcome in storage/signer-prune-outcome.ts and
     // captured phase in sdw/memory-provenance-signer-prune.ts.
     // Once the operation can mutate, no-commit requires verified pre-images.
@@ -2585,8 +2597,9 @@ export async function runJournaledMemoryProvenanceSignerPrune<T>(options: {
           throw new Error("Memory-provenance signer prune rollback verification failed", { cause: error });
         }
       }
-      outcome.phase = "rolled-back";
+      // Restored bytes alone do not finish recovery while a journal remains.
       await deleteImportJournal(options.storage, importId);
+      outcome.phase = "rolled-back";
       throw error;
     }
   } catch (error) {

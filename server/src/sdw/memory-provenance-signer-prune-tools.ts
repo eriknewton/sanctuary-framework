@@ -82,6 +82,7 @@ export function createMemoryProvenanceSignerPruneTool(options: {
                 : "deletion committed, lock finalization unavailable";
           return failure(message, { committed: true, audited: outcome.completionAudit === "settled" });
         }
+        // Pending is unreachable today: the pruner settles or fails it before throwing.
         if (outcome.completionAudit === "failed" || outcome.completionAudit === "pending") {
           return failure("audit unavailable");
         }

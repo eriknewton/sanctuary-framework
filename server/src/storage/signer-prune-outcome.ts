@@ -1,5 +1,6 @@
 /** Internal evidence carried across journal, cache, audit and lock boundaries. */
-// Must match phase transitions in exit/bundle.ts and the projection in
+// Must match phase transitions in exit/bundle.ts and sdw/memory-provenance-signer-prune.ts,
+// and the projection in
 // sdw/memory-provenance-signer-prune-tools.ts; error names are not evidence.
 export type SignerPrunePhase = "not-started" | "rolled-back" | "uncertain" | "committed";
 
@@ -24,10 +25,9 @@ export class SignerPruneError extends Error {
   readonly outcome: Readonly<SignerPruneOutcome>;
 
   constructor(outcome: SignerPruneOutcome, cause: unknown) {
-    super(cause instanceof Error ? cause.message : "signer prune failed", { cause });
-    // Preserve the historical journal error name for existing internal callers;
-    // consumers must use outcome.phase, since the name conflates effect states.
-    this.name = "MemoryProvenanceSignerPrunePartialScopeError";
+    // Default error rendering must not reveal storage paths, keys or signer data.
+    super("signer prune failed", { cause });
+    this.name = "SignerPruneError";
     this.outcome = Object.freeze({ ...outcome });
   }
 }

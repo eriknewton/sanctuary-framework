@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-- Signer pruning now reports audit and finalization failures with accurate deletion status.
+- The memory provenance signer-prune tool now reports audit and finalization failures with accurate deletion status.
 
 - Added a private offline evidence snapshot verifier candidate, explicit capture diagnostics, fresh build outputs, artifact provenance, recipient instructions and a synthetic second-Mac drill procedure.
 

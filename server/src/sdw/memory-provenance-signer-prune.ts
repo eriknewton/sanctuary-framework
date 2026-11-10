@@ -241,6 +241,7 @@ export class MemoryProvenanceSignerPruner {
       },
     });
 
+    let finalizationFailure: { cause: unknown } | undefined;
     if (deleted.length > 0) {
       try {
         await runJournaledMemoryProvenanceSignerPrune({
@@ -276,10 +277,17 @@ export class MemoryProvenanceSignerPruner {
       outcome.phase = "committed";
       outcome.cleanup = "finished";
       outcome.finalization = "pending";
-      for (const entry of deleted) this.options.forgetSigner(entry.signer_did);
+      for (const entry of deleted) {
+        try {
+          this.options.forgetSigner(entry.signer_did);
+        } catch (cause) {
+          // Keep trying the bounded deletion set; one cache fault must not skip other DIDs.
+          finalizationFailure ??= { cause };
+        }
+      }
+      if (finalizationFailure === undefined) outcome.finalization = "finished";
     }
 
-    outcome.finalization = "finished";
     outcome.completionAudit = "pending";
     try {
       // Empty plans remain not-started; an audit failure cannot invent a deletion.
@@ -292,6 +300,7 @@ export class MemoryProvenanceSignerPruner {
           approval_audit_id: input.approvalAuditId,
           exact_set_digest: exactSetDigest,
           deleted: deleted.length,
+          finalization_failed: finalizationFailure !== undefined,
           scan_counts: scanned,
         },
       });
@@ -300,6 +309,8 @@ export class MemoryProvenanceSignerPruner {
       outcome.completionAudit = "failed";
       throw error;
     }
+    // A committed deletion still needs its audit record when cache maintenance fails.
+    if (finalizationFailure !== undefined) throw finalizationFailure.cause;
     return { deleted, exact_set_digest: exactSetDigest, scanned };
   }
 
