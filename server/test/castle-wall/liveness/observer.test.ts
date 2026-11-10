@@ -4,6 +4,7 @@
  * deadlines, full-service and session fields, evidence failures, canary
  * integrity per cycle, and allow-sighting retention with its instance seed.
  */
+// fail-before-exempt: this change adds only a witness that an unclean full-agent exit reaches the reading as recent_restart; the chain it drives predates the change, so it passes on the base source.
 import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, rmdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
