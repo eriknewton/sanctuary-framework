@@ -31,7 +31,8 @@ Every non-dependency Program file is compared to the manifest. Outside-manifest
 `.d.ts`, `.d.mts` and `.d.cts` files are permitted only when tracked with mode 100644
 and no symlink component. They are never lint targets because declarations contain
 no executable statements. The accepted set is computed afresh, not maintained as an
-allowlist. Executable modules outside the manifest still refuse.
+allowlist. A runtime file behind an accepted declaration is not measured.
+Executable modules outside the manifest still refuse.
 
 ## Re-anchor and seed procedure
 
@@ -71,7 +72,8 @@ committed. The PR TRANSITION gate supplies the authorization boundary.
 ## Trust, limits and cost
 
 Branch protection and reviewed PRs are the merge boundary. VERIFY checks the current
-snapshot, not history; a direct push can grow the baseline. Protect main against
+snapshot, not history; a direct push accepts an enlarged or restored baseline when
+its entries and digests exactly match the current measurement. Protect main against
 direct and force pushes. The label plus owner review authorizes re-anchors.
 Checker/source co-changes require the label, but this is defense in depth: a
 self-edited checker cannot prove its own integrity. Owner review of checker and
@@ -80,11 +82,13 @@ CODEOWNERS change is included here.
 
 ESLint 10 uses `overrideConfigFile: true` to disable config lookup. Project ESLint
 configuration cannot execute in the hygiene pass, and inline disables cannot hide
-diagnostics. The original ESLint pass retains its existing policy.
+diagnostics. The original ESLint pass retains its existing policy. Project lint
+configuration and pre-lint scripts run before the driver and are reviewed as source.
 
 These rules do not prove complete asynchronous ownership. Casts to `any`, unused
 bindings and inaccurate void-return declarations are limitations of the rules.
-Restoring a removed diagnostic, including by reverting a remediation, is refused.
+In pull-request TRANSITION mode, restoring a removed diagnostic, including by
+reverting a remediation, is refused.
 Existing pinned diagnostics need separately reviewed remediation.
 
 The second type-aware pass adds cost to ordinary lint. The round-one review

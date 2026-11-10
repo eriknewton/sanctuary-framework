@@ -6,9 +6,13 @@ import { expect, it } from 'vitest';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const yaml = createRequire(import.meta.url)('js-yaml') as { load: (source: string) => Workflow };
-type Step = { name?: string; run?: string; uses?: string; 'working-directory'?: string; with?: Record<string, unknown> };
+type Controls = { env?: Record<string, unknown>; 'continue-on-error'?: unknown };
+type Step = Controls & { name?: string; run?: string; uses?: string; 'working-directory'?: string; with?: Record<string, unknown> };
 type Defaults = { run?: { 'working-directory'?: string } };
-type Workflow = { defaults?: Defaults; jobs?: Record<string, { defaults?: Defaults; steps?: Step[] }> };
+type Job = Controls & { defaults?: Defaults; steps?: Step[] };
+type Workflow = Controls & { defaults?: Defaults; jobs?: Record<string, Job> };
+// Must match the mode-selection inputs in run.mjs's context().
+const MODE_INPUTS = ['GITHUB_ACTIONS', 'GITHUB_EVENT_NAME', 'GITHUB_EVENT_PATH'];
 // Must match both lint workflow checkouts and run.mjs's two-parent TRANSITION proof.
 const CHECKOUT_DEPTH = 2;
 const ROOT_DELEGATES_LINT = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8')).scripts?.lint === 'npm --prefix server run lint --';
@@ -32,7 +36,7 @@ function commands(script: string): string[][] {
   flushCommand(); return result;
 }
 function callers(files: Map<string, string>) {
-  const found: Array<{ id: string; checkout?: Step }> = [];
+  const found: Array<{ id: string; checkout?: Step; workflow: Workflow; job: Job; step: Step }> = [];
   for (const [file, source] of files) {
     const workflow = yaml.load(source);
     for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
@@ -46,7 +50,7 @@ function callers(files: Map<string, string>) {
           const prefix = args.indexOf('--prefix');
           const effective = prefix >= 0 ? posix.normalize(posix.join(cwd, args[prefix + 1]!)) : posix.normalize(cwd);
           const run = args.indexOf('run');
-          if ((effective === 'server' || (effective === '.' && ROOT_DELEGATES_LINT)) && run >= 0 && args[run + 1] === 'lint') found.push({ id: `${file}#${jobName}#${step.name}`, checkout });
+          if ((effective === 'server' || (effective === '.' && ROOT_DELEGATES_LINT)) && run >= 0 && args[run + 1] === 'lint') found.push({ id: `${file}#${jobName}#${step.name}`, checkout, workflow, job, step });
         }
       }
     }
@@ -57,7 +61,15 @@ function assertContract(files: Map<string, string>) {
   const found = callers(files);
   expect(found.map(item => item.id).sort()).toEqual(EXPECTED_CALLERS);
   expect(found.length).toBeGreaterThan(0);
-  for (const { checkout } of found) { expect(checkout?.with?.['fetch-depth']).toBe(CHECKOUT_DEPTH); expect(checkout?.with).not.toHaveProperty('ref'); }
+  for (const { checkout, workflow, job, step } of found) {
+    expect(checkout?.with?.['fetch-depth']).toBe(CHECKOUT_DEPTH); expect(checkout?.with).not.toHaveProperty('ref');
+    // Every lint caller must preserve event authority and propagate driver refusal to the check.
+    for (const scope of [workflow, job, step]) {
+      for (const name of MODE_INPUTS) expect(scope.env ?? {}).not.toHaveProperty(name);
+    }
+    for (const scope of [job, step]) expect(scope).not.toHaveProperty('continue-on-error');
+    expect(step.run).not.toMatch(/\|\|\s*(?:true\b|:(?=[\s;&|]|$))|;\s*true\b|\bset\s+\+e\b/u);
+  }
 }
 function workflows() {
   return new Map(readdirSync(resolve(ROOT, '.github/workflows')).filter(name => /\.ya?ml$/u.test(name)).map(name => [name, readFileSync(resolve(ROOT, '.github/workflows', name), 'utf8')]));
@@ -97,3 +109,31 @@ it('keeps tool updates outside the grouped dependency lane', () => {
   const server = config.updates.find(update => update.directory === '/server')!;
   expect(server.groups['server-minor-patch']?.['exclude-patterns']).toEqual(['eslint', 'typescript', 'typescript-eslint', '@typescript-eslint/*', '@eslint/js']);
 });
+
+// Each mutation preserves the caller and checkout, so only the added protection can refuse it.
+for (const caller of EXPECTED_CALLERS) {
+  const [file, jobName, stepName] = caller.split('#') as [string, string, string];
+  const mutate = (change: (workflow: Workflow, job: Job, step: Step) => void) => {
+    const files = workflows();
+    const codec = createRequire(import.meta.url)('js-yaml') as { load: (source: string) => Workflow; dump: (value: Workflow) => string };
+    const workflow = codec.load(files.get(file)!);
+    const job = workflow.jobs![jobName]!;
+    const step = job.steps!.find(item => item.name === stepName)!;
+    change(workflow, job, step);
+    files.set(file, codec.dump(workflow));
+    expect(() => assertContract(files)).toThrow();
+  };
+  for (const scope of ['workflow', 'job', 'step'] as const) {
+    for (const name of ['GITHUB_ACTIONS', 'GITHUB_EVENT_NAME', 'GITHUB_EVENT_PATH']) {
+      it(`refuses workflow context override ${caller} ${scope} ${name}`, () => {
+        mutate((workflow, job, step) => { ({ workflow, job, step }[scope]!).env = { [name]: 'fixture-override' }; });
+      });
+    }
+  }
+  for (const scope of ['job', 'step'] as const) it(`refuses workflow failure tolerance ${caller} ${scope}`, () => {
+    mutate((_workflow, job, step) => { ({ job, step }[scope]!)['continue-on-error'] = true; });
+  });
+  for (const mask of ['|| true', '|| :', '; true', 'set +e']) it(`refuses workflow failure masking ${caller} ${mask}`, () => {
+    mutate((_workflow, _job, step) => { step.run = mask === 'set +e' ? `${mask}\n${step.run}` : `${step.run!.trimEnd()} ${mask}`; });
+  });
+}

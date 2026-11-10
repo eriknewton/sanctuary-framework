@@ -18,6 +18,7 @@ const COMMAND_TIMEOUT = 60_000; // A tiny Program and subprocess startup get one
 const CASE_TIMEOUT = 180_000; // Multi-measure transition cases run sequentially within three minutes.
 const BUFFER_BYTES = 8 * 1024 * 1024; // Refusals are bounded to eight MiB per child.
 const JSON_INDENT = 2;
+const EXIT_REFUSED = 1; // Must match the refusal exit code in scripts/promise-hygiene/run.mjs.
 const EXTENSIONS = ['ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs'];
 const LABEL = 'promise-hygiene-reanchor';
 type Entry = { path: string; rule: string; kind: string; preimage: string; fingerprint: string };
@@ -238,7 +239,26 @@ describe('trusted transitions', () => {
   fixtureCase('consumes a move donor only once', () => { for (const name of ['one', 'two']) put(`server/src/${name}.ts`, read(SOURCE)); remove(SOURCE); git('add', '-A'); remeasure(); pr(); refuse('new diagnostic'); });
   fixtureCase('rejects a donor that is still tracked', () => { put('server/src/renamed.ts', read(SOURCE)); put(SOURCE, 'export {};\n'); git('add', '-A'); remeasure(); pr(); refuse('new diagnostic'); });
   fixtureCase('rejects a destination that was a clean base file', () => { put('server/src/clean.ts', read(SOURCE)); remove(SOURCE); git('add', '-A'); remeasure(); pr(); refuse('new diagnostic'); });
-  fixtureCase('rejects both tracked spellings in a case only move', () => { put('server/src/Sample-ts.ts', read(SOURCE)); put(SOURCE, 'export {};\n'); pr(); refuse('type/parser failure'); });
+  fixtureCase('rejects both tracked spellings in a case only move', () => {
+    // Git tree names are case-sensitive on every host; no conflicting worktree files are needed.
+    // Must match shrink() in run.mjs: a surviving donor path cannot fund a moved identity.
+    const destination = 'server/src/Sample-ts.ts';
+    const moved = { ...baseline, entries: baseline.entries.map(entry => entry.path === SOURCE ? { ...entry, path: destination } : entry) };
+    const result = command(['--input-type=module', '-e', `import {shrink} from './${DRIVER}';
+      shrink(${JSON.stringify(baseline)}, ${JSON.stringify(moved)}, new Set([${JSON.stringify(SOURCE)}]),
+        new Set([${JSON.stringify(SOURCE)}, ${JSON.stringify(destination)}]));`]);
+    expect(result.output).toContain('new diagnostic:');
+    expect(result.output).not.toContain('type/parser failure');
+    expect(result.status).toBe(EXIT_REFUSED);
+  });
+  fixtureCase('counts a rename out of the source prefix as a source change', () => {
+    git('config', 'diff.renames', 'true');
+    try {
+      put('server/moved-clean.ts', read('server/src/clean.ts')); remove('server/src/clean.ts');
+      put(DRIVER, read(DRIVER) + '\n// reviewed fixture comment\n');
+      pr(); refuse('checker and source changes require reanchor label');
+    } finally { git('config', '--unset', 'diff.renames'); }
+  });
   fixtureCase('compares the final tree after an unrelated second commit', () => { put(SOURCE, read(SOURCE) + 'void Promise.resolve("surviving");\n'); remeasure(); commit('first addition'); put('unrelated.txt', 'unrelated\n'); commit('second unrelated'); pr(); refuse('new diagnostic'); });
   fixtureCase('accepts removal of an intermediate addition before the final tree', () => { put(SOURCE, read(SOURCE) + 'void Promise.resolve("temporary");\n'); remeasure(); commit(); git('checkout', seedCommit, '--', SOURCE, BASELINE); pr(); accept('RETAINED'); });
   fixtureCase('proves a shallow synthetic merge with both parents', () => { pr(); put('.git/shallow', git('rev-parse', 'HEAD^1') + '\n' + git('rev-parse', 'HEAD^2') + '\n'); accept('RETAINED'); });
@@ -261,6 +281,19 @@ describe('trusted transitions', () => {
 });
 
 describe('configuration and isolation', () => {
+  fixtureCase('prints measured digest fields after a lockfile byte change', () => {
+    put('server/package-lock.json', read('server/package-lock.json') + '\n');
+    const measured = measure();
+    const result = command();
+    expect(result.status).toBe(EXIT_REFUSED);
+    expect(result.output).toContain('stored configuration drift');
+    expect(result.output).toContain(`${BASELINE}: compilerDigest=${measured.compilerDigest}, driftDigest=${measured.driftDigest}`);
+  });
+  for (const name of [BASELINE, CONFIG, 'server/package-lock.json']) fixtureCase(`refuses linked metadata ${name}`, () => {
+    const target = `${name}.target`;
+    put(target, read(name)); remove(name); link(name, join(root, target));
+    refuse('linked metadata');
+  });
   // Four drift/set combinations, each with and without the external label.
   for (const drift of [false, true]) for (const changed of [false, true]) for (const labeled of [false, true]) fixtureCase(`handles drift ${drift} identity change ${changed} label ${labeled}`, () => {
     // Nullable promise assignability changes with strictNullChecks, without a source edit.

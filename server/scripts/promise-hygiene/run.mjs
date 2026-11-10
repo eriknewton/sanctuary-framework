@@ -12,7 +12,7 @@ import {
 } from './policy.mjs';
 import { fingerprint, key } from './fingerprint.mjs';
 
-const EXIT_REFUSED = 1;
+const EXIT_REFUSED = 1; // Must match EXIT_REFUSED in promise-hygiene-baseline.test.ts.
 const JSON_INDENT = 2;
 export function git(root, args) {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: MAX_GIT_BYTES, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -20,10 +20,16 @@ export function git(root, args) {
 function insist(condition, reason) {
   if (!condition) throw new Error(reason);
 }
-function readJson(root, name) {
+function readMetadata(root, name) {
   const filename = path.resolve(root, name);
-  insist(lstatSync(filename).size <= MAX_METADATA_BYTES, 'metadata size refused');
-  return JSON.parse(readFileSync(filename, 'utf8'));
+  const stat = lstatSync(filename);
+  // Metadata must not follow a link around the shared size cap, including lockfile digest reads.
+  insist(!stat.isSymbolicLink(), `linked metadata: ${name}`);
+  insist(stat.size <= MAX_METADATA_BYTES, 'metadata size refused');
+  return readFileSync(filename);
+}
+function readJson(root, name) {
+  return JSON.parse(readMetadata(root, name).toString('utf8'));
 }
 
 export function manifest(root) {
@@ -143,6 +149,7 @@ export function shrink(parent, current, baseTree, tipTree) {
   const movable = new Map();
   const signature = entry => JSON.stringify([entry.rule, entry.kind, entry.fingerprint]);
   // Each removed identity donates once, and only if its entire source path disappeared.
+  // Must match the case-only conservation witness in promise-hygiene-baseline.test.ts.
   for (const entry of parent.entries) {
     if (retained.has(key(entry)) || tipTree.has(entry.path)) continue;
     const id = signature(entry);
@@ -156,6 +163,7 @@ export function shrink(parent, current, baseTree, tipTree) {
   }
 }
 function context(root) {
+  // These mode-selection inputs must match MODE_INPUTS in promise-hygiene-workflows.test.ts.
   if (process.env.GITHUB_ACTIONS !== 'true') return { mode: MODES.LOCAL, trusted: 'HEAD', labeled: false };
   if (process.env.GITHUB_EVENT_NAME !== 'pull_request') return { mode: MODES.VERIFY, labeled: false };
   try {
@@ -195,7 +203,8 @@ function checkTransition(root, baseline, measured, ctx) {
     return STATES.INITIAL_SEED;
   }
   const tip = ctx.mode === MODES.LOCAL ? [] : ['HEAD'];
-  const changed = git(root, ['diff', '--name-only', '-z', ctx.trusted, ...tip, '--']).split('\0').filter(Boolean);
+  // Source deletions remain changes even when Git could pair them with destinations outside coverage.
+  const changed = git(root, ['diff', '--no-renames', '--name-only', '-z', ctx.trusted, ...tip, '--']).split('\0').filter(Boolean);
   const sourceChanged = changed.some(name => name.startsWith(SOURCE_PREFIX));
   const checkerFiles = ['run.mjs', 'fingerprint.mjs', 'policy.mjs'].map(name => `server/scripts/promise-hygiene/${name}`);
   checkerFiles.push(CONFIG_PATH);
@@ -226,7 +235,8 @@ export async function measure(root) {
   // Installed version metadata is data, never an executable or computed module import.
   const versions = Object.fromEntries(Object.keys(POLICY.versions).map(name => [name, readJson(root, `server/node_modules/${name}/package.json`).version]));
   insist(serialize(versions) === serialize(POLICY.versions), 'installed version drift');
-  const lock = readJson(root, 'server/package-lock.json');
+  const lockBytes = readMetadata(root, 'server/package-lock.json');
+  const lock = JSON.parse(lockBytes.toString('utf8'));
   for (const [name, version] of Object.entries(versions)) {
     insist(lock.packages[`node_modules/${name}`]?.version === version, 'lockfile version drift');
   }
@@ -239,7 +249,7 @@ export async function measure(root) {
   const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.join(root, 'server'));
   insist(!configFile.error && parsed.errors.length === 0, 'configuration parse failure');
   const compiler = compilerDigest(root, parsed.options);
-  const driftDigest = digest(serialize({ versions, lock: digest(readFileSync(path.join(root, 'server/package-lock.json'))), compilerDigest: compiler }));
+  const driftDigest = digest(serialize({ versions, lock: digest(lockBytes), compilerDigest: compiler }));
   const program = ts.createProgram(sources.map(name => path.join(root, name)), parsed.options);
   const programSources = program.getSourceFiles().map(file => path.relative(root, file.fileName).split(path.sep).join('/'))
     .filter(name => !name.split('/').includes('node_modules') && EXTENSIONS.includes(path.extname(name))).sort();
@@ -327,7 +337,9 @@ export async function run(root) {
   validateBaseline(baseline);
   const measured = await measure(root);
   // A candidate cannot copy an old digest while using different effective options.
-  insist(baseline.compilerDigest === measured.compilerDigest && baseline.driftDigest === measured.driftDigest, 'stored configuration drift');
+  // Print computed values for review; a refusal never rewrites the stored anchor.
+  insist(baseline.compilerDigest === measured.compilerDigest && baseline.driftDigest === measured.driftDigest,
+    `stored configuration drift; review and update ${BASELINE_PATH}: compilerDigest=${measured.compilerDigest}, driftDigest=${measured.driftDigest}`);
   compare(measured.entries, baseline);
   // State | Continuing evidence | Refusal
   // INITIAL_SEED | proven base path absence, label, exact set | unproven base or missing label
