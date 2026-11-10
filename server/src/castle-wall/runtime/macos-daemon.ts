@@ -960,8 +960,18 @@ export async function startMacOSCastleWallDaemon(
   // `audit_write_degraded_count` marker used for dropped reload audit writes,
   // keeping the degradation visible in the tamper-evident chain without adding
   // a new audit operation or enum.
+  let lastWriteLockRecoveryAtMs: number | null = null;
+  let writeLockRecoverySink: ((atMs: number) => void) | null = null;
   input.auditLog.onWriteLockRecovery(() => {
+    // Record the marker before fallible telemetry; sample each event so a clock failure cannot reuse an earlier recovery time.
+    // With the installed exit fence, a hold-deadline lapse exits before this event: this count covers self-held stale
+    // releases and unfenced compositions only; the fenced class reaches recent_restart through the restart charge.
     degradedCarry.record();
+    lastWriteLockRecoveryAtMs = null;
+    let atMs = Number.NaN;
+    try { atMs = nowMs(); lastWriteLockRecoveryAtMs = atMs; } catch { /* The recorder retries with its own clock. */ }
+    // Must match LivenessRecorderOptions.lockRecovery in liveness/recorder.ts: finite event time or NaN for a failed sample.
+    try { writeLockRecoverySink?.(atMs); } catch { /* Telemetry cannot interrupt recovery. */ }
   });
   const agentEgressProbeIntervalSeconds =
     input.agentEgressProbeIntervalSeconds ??
@@ -1257,7 +1267,7 @@ export async function startMacOSCastleWallDaemon(
 
   // The full daemon's liveness recorder. It is independent telemetry: a failure here never disables enforcement or releases an audit lock.
   const livenessRecorder = daemonMode === "full"
-    ? await createLivenessRecorder(input, () => manifestState.signed.manifest.agent_origin, nowMs)
+    ? await createLivenessRecorder(input, () => manifestState.signed.manifest.agent_origin, nowMs, () => lastWriteLockRecoveryAtMs, listener => { writeLockRecoverySink = listener; })
     : null;
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
@@ -3188,6 +3198,8 @@ async function createLivenessRecorder(
   input: MacOSCastleWallDaemonInput,
   agentOrigin: () => { mode?: unknown; agent_uid?: unknown; gate_uid?: unknown } | undefined | null,
   now: () => number,
+  lastWriteLockRecoveryAtMs: () => number | null,
+  subscribeWriteLockRecovery: (listener: (atMs: number) => void) => void,
 ): Promise<LivenessRecorder> {
   const uptimeMs = input.livenessHostClock?.uptimeMs ?? (() => Math.floor(osUptime() * LIVENESS_SECOND));
   // A failed boot read publishes boot_id null, which every reader takes as untrusted time.
@@ -3207,5 +3219,12 @@ async function createLivenessRecorder(
     pid: process.pid,
     instance: randomBytes(LIVENESS_INSTANCE_BYTES).toString("hex"),
     origin: () => canaryOriginFrom(input.fortressId, agentOrigin()),
+    // Must match LivenessRecorderOptions.lockRecovery in liveness/recorder.ts: seed before observing subsequent events.
+    lockRecovery: {
+      // Seed after the boot read so recoveries since the first subscription are not lost before recorder construction.
+      count: input.auditLog.getWriteLockRecoveryCount(),
+      lastAtMs: lastWriteLockRecoveryAtMs(),
+      subscribe: subscribeWriteLockRecovery,
+    },
   });
 }

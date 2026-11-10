@@ -383,7 +383,7 @@ export const REASON_REGISTRY: readonly ReasonRegistryEntry[] = Object.freeze(
     entry("ttl_expiring", "TTL_WARNING", W, "n/a"),
     entry("stale_mcp_child", "n/a", null, "DEGRADED_STALE_MCP"),
     entry("recent_restart", "DEGRADED", W, "n/a"),
-    // Produced only once lock-recovery telemetry is instrumented.
+    // The full daemon records its audit write-lock recoveries for the history window.
     entry("write_lock_recovery", "DEGRADED", W, "n/a"),
     entry("audit_backlog", "DEGRADED", W, "n/a"),
     entry("audit_loss", "DEGRADED", W, "n/a"),

@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CANARY_IP, CANARY_PORT, CANARY_PROTOCOL, COUNTER_MAX, SECOND } from "../../../src/castle-wall/liveness/constants.js";
 import { LivenessRecordPublisher, nodePublisherFs, type PublisherFs } from "../../../src/castle-wall/liveness/record-store.js";
-import { LivenessRecorder, saturatingIncrement, type CanaryOriginSubjects } from "../../../src/castle-wall/liveness/recorder.js";
+import { LivenessRecorder, saturatingIncrement, type CanaryOriginSubjects, type LivenessRecorderOptions } from "../../../src/castle-wall/liveness/recorder.js";
+import { evaluateLiveness } from "../../../src/castle-wall/liveness/evaluate.js";
 import { parseDaemonRecord, REQUIRED_RECORDER_HOOKS } from "../../../src/castle-wall/liveness/schema.js";
 
 const START = Date.parse("2026-11-09T12:00:00.000Z");
@@ -16,7 +17,7 @@ const TICK_BOUND_MS = 2 * SECOND;
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function recorder(options: { lockRecovery?: () => { state: "not_instrumented" }; publisherFs?: PublisherFs } = {}) {
+function recorder(options: { lockRecovery?: LivenessRecorderOptions["lockRecovery"]; publisherFs?: PublisherFs } = {}) {
   const fortressPath = mkdtempSync(join(tmpdir(), "lv-rec-"));
   roots.push(fortressPath);
   let now = START;
@@ -25,7 +26,7 @@ function recorder(options: { lockRecovery?: () => { state: "not_instrumented" };
     fortressPath,
     subject: { fortress_id: "fortress-fixture", host_id: "host-fixture", platform: "darwin", operator_uid: UID },
     bootId: "boot-fixture", instanceStartedUptimeMs: uptime, uptimeMs: () => uptime, now: () => now, pid: 4242, instance: "abcdef0123456789",
-    origin: () => ORIGIN, ...options,
+    origin: () => ORIGIN, lockRecovery: { count: 0, lastAtMs: null, subscribe: () => undefined }, ...options,
   });
   return {
     r, fortressPath,
@@ -42,15 +43,63 @@ function wireAll(r: LivenessRecorder) {
 }
 
 describe("record shape", () => {
-  it("builds a record the strict parser accepts, with every wired hook and the uninstrumented lock field", () => {
+  it("builds a record the strict parser accepts, with every wired hook and the instrumented lock field", () => {
     const { r } = recorder();
     wireAll(r);
     const record = r.buildRecord();
     const parsed = parseDaemonRecord(record);
     expect(parsed.ok, JSON.stringify(parsed)).toBe(true);
     expect(Object.keys((record.raw as any).hooks).sort()).toEqual([...REQUIRED_RECORDER_HOOKS].sort());
-    expect((record.raw as any).lock_recovery).toEqual({ state: "not_instrumented" });
+    expect((record.raw as any).lock_recovery).toEqual({ state: "instrumented", count: 0, last_at_ms: null });
     expect(record).toMatchObject({ boot_id: "boot-fixture", instance_started_uptime_ms: 3_600_000, observed_uptime_ms: 3_600_000, sequence: 1, subject: { agent_uid: 502 } });
+  });
+
+  it("seeds recovery history and saturates subsequent events without losing their time", () => {
+    let observe!: (atMs: number) => void;
+    const { r } = recorder({ lockRecovery: {
+      count: COUNTER_MAX - 1, lastAtMs: START,
+      subscribe: listener => { observe = listener; },
+    } });
+    expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: COUNTER_MAX - 1, last_at_ms: START });
+    observe(START + SECOND);
+    expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: COUNTER_MAX, last_at_ms: START + SECOND });
+    observe(START + SECOND + SECOND);
+    expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: COUNTER_MAX, last_at_ms: START + SECOND + SECOND });
+  });
+
+  it("clamps an over-cap recovery seed before publishing", () => {
+    const { r } = recorder({ lockRecovery: { count: COUNTER_MAX + 1, lastAtMs: START, subscribe: () => undefined } });
+    expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: COUNTER_MAX, last_at_ms: START });
+  });
+
+  it("timestamps unobserved positive history at construction and degrades the evaluator", () => {
+    const { r } = recorder({ lockRecovery: { count: 1, lastAtMs: null, subscribe: () => undefined } });
+    const recovery = (r.buildRecord().raw as any).lock_recovery;
+    expect(recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: START });
+    const input = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")).base;
+    input.nowMs = START;
+    input.daemon.value.raw.lock_recovery = recovery;
+    expect(evaluateLiveness(input).wall.reasons).toContain("write_lock_recovery");
+  });
+
+  // Half an event is non-integral; negative and non-numeric histories are invalid as well.
+  it.each([-1, 1 / 2, Number.NaN])("saturates malformed recovery seed %s so the evaluator refuses it", count => {
+    const { r } = recorder({ lockRecovery: { count, lastAtMs: null, subscribe: () => undefined } });
+    const recovery = (r.buildRecord().raw as any).lock_recovery;
+    expect(recovery.count).toBe(COUNTER_MAX);
+    const input = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")).base;
+    input.daemon.value.raw.lock_recovery = recovery;
+    expect(evaluateLiveness(input).wall.reasons).toContain("observation_invalid");
+  });
+
+  it("retries the recorder clock for a failed event sample instead of retaining the previous time", () => {
+    let observe!: (atMs: number) => void;
+    const { r, advance } = recorder({ lockRecovery: {
+      count: 1, lastAtMs: START, subscribe: listener => { observe = listener; },
+    } });
+    advance(SECOND);
+    observe(Number.NaN);
+    expect((r.buildRecord().raw as any).lock_recovery).toEqual({ state: "instrumented", count: 2, last_at_ms: START + SECOND });
   });
 
   it("omits a hook that was never bound, so the reader sees no wired flag", () => {
@@ -150,6 +199,7 @@ describe("publication independent of the audit sink", () => {
     const { r } = recorder();
     const failing = new LivenessRecorder({
       fortressPath: "/nonexistent-fortress-path-for-fixture", subject: { fortress_id: "f", host_id: "h", platform: "darwin", operator_uid: UID },
+      lockRecovery: { count: 0, lastAtMs: null, subscribe: () => undefined },
       bootId: null, instanceStartedUptimeMs: 0, uptimeMs: () => 0, pid: 1, instance: "0123456789abcdef", origin: () => ORIGIN,
     });
     await expect(failing.emissionTick()).resolves.toBeUndefined();
