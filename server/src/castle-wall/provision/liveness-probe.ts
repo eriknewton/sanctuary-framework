@@ -34,6 +34,7 @@ import type {
   AgentLivenessProbeResult,
   CosLivenessUnverifiedReason,
 } from "./orchestrate.js";
+import { HTTP_BODY_BYTES, HTTP_BODY_READS, MAX_TIMER_DELAY_MS } from "../liveness/constants.js";
 import { stripTrailingSlashes } from "../../strings.js";
 
 export const TELEGRAM_LIVENESS_PROBE_CONFIG_RELATIVE_PATH = "config/liveness-probe/telegram.json";
@@ -60,6 +61,7 @@ export interface TelegramLivenessProbeConfig {
   chatId: string;
   /** The agent bot/user id expected to produce the correlated reply. */
   expectedSenderId: number;
+  /** Bounds the whole transport sequence: stale drain, send and reply. */
   timeoutMs: number;
   pollIntervalMs: number;
   maxDrainBatches: number;
@@ -258,6 +260,8 @@ export function parseTelegramLivenessProbeConfig(
     DEFAULT_TELEGRAM_LIVENESS_TIMEOUT_MS,
     source,
   );
+  // Node clamps larger delays to one millisecond, which cannot honor this budget.
+  if (timeoutMs > MAX_TIMER_DELAY_MS) throw configMalformed(source);
   const pollIntervalMs = optionalPositiveInteger(
     record,
     "poll_interval_ms",
@@ -300,8 +304,12 @@ export async function verifyTelegramAgentLivenessFromFortress(
 export async function runTelegramLivenessProbe(
   options: RunTelegramLivenessProbeOptions,
 ): Promise<AgentLivenessProbeResult> {
-  const ops = resolveProbeOps(options.ops);
+  const controller = new AbortController();
+  const ops = resolveProbeOps(options.ops, controller.signal);
   const nonce = ops.randomNonce();
+  // One deadline owns the drain, send and reply, so no transport stage renews the budget.
+  const transport = { signal: controller.signal, deadline: ops.nowMs() + options.config.timeoutMs };
+  const timer = setTimeout(() => controller.abort(), options.config.timeoutMs);
   let result: AgentLivenessProbeResult | undefined;
   let requestId: string | undefined;
   let responseId: string | undefined;
@@ -310,6 +318,7 @@ export async function runTelegramLivenessProbe(
       config: options.config,
       apiBaseUrl: options.apiBaseUrl,
       ops,
+      transport,
     });
     if (drain.detail !== undefined) {
       result = unverified("provider_failed", drain.detail);
@@ -319,6 +328,7 @@ export async function runTelegramLivenessProbe(
       config: options.config,
       apiBaseUrl: options.apiBaseUrl,
       ops,
+      transport,
       nonce,
     });
     if ("detail" in sent) {
@@ -330,6 +340,7 @@ export async function runTelegramLivenessProbe(
       config: options.config,
       apiBaseUrl: options.apiBaseUrl,
       ops,
+      transport,
       nonce,
       requestMessageId: sent.messageId,
       initialOffset: drain.nextOffset,
@@ -349,6 +360,7 @@ export async function runTelegramLivenessProbe(
     result = unverified("provider_failed", waited.detail);
     return result;
   } finally {
+    clearTimeout(timer);
     if (options.audit !== undefined) {
       await appendProbeAudit({
         audit: options.audit,
@@ -404,11 +416,24 @@ function optionalPositiveInteger(
   throw configMalformed(source);
 }
 
-function resolveProbeOps(partial: Partial<TelegramLivenessProbeOps> | undefined): TelegramLivenessProbeOps {
+function resolveProbeOps(
+  partial: Partial<TelegramLivenessProbeOps> | undefined,
+  signal: AbortSignal,
+): TelegramLivenessProbeOps {
   return {
     fetch: partial?.fetch ?? fetch,
     nowMs: partial?.nowMs ?? Date.now,
-    sleepMs: partial?.sleepMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    sleepMs: partial?.sleepMs ?? ((ms) => new Promise<void>((resolve) => {
+      // An aborted transport must not retain its default sleep timer or listener.
+      const done = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      if (signal.aborted) done();
+      else signal.addEventListener("abort", done, { once: true });
+    })),
     randomNonce: partial?.randomNonce ?? randomUUID,
   };
 }
@@ -421,49 +446,118 @@ function apiUrl(
   return `${stripTrailingSlashes(apiBaseUrl ?? DEFAULT_TELEGRAM_API_BASE_URL)}/bot${encodeURIComponent(token)}/${method}`;
 }
 
+interface ProbeTransport {
+  signal: AbortSignal;
+  deadline: number;
+}
+
+/** Stop waiting even when an injected transport does not cooperate with abort. */
+function untilAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      reject(new Error("Probe deadline elapsed"));
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+    operation.then(value => {
+      if (signal.aborted) abort();
+      else resolve(value);
+    }, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+async function readProbeBody(
+  res: Response,
+  transport: ProbeTransport,
+  nowMs: () => number,
+): Promise<unknown> {
+  const { signal, deadline } = transport;
+  if (res.body === null) throw new Error("Missing probe response body");
+  const reader = res.body.getReader();
+  let cancelled = false;
+  const cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", cancel, { once: true });
+  // Cap bytes before decoding or parsing, including a final chunk that crosses the limit.
+  const bytes = new Uint8Array(HTTP_BODY_BYTES);
+  let length = 0;
+  let reads = 0;
+  try {
+    for (;;) {
+      // Settled reads can starve timers; clock and work bounds also count empty chunks.
+      if (signal.aborted || nowMs() >= deadline) throw new Error("Probe deadline elapsed");
+      // Must match HTTP_BODY_READS in ../liveness/constants.ts.
+      if (reads >= HTTP_BODY_READS) throw new Error("Probe response exceeds read limit");
+      reads += 1;
+      const chunk = await untilAbort(reader.read(), signal);
+      if (chunk.done) break;
+      if (length + chunk.value.byteLength > HTTP_BODY_BYTES) throw new Error("Probe response exceeds byte limit");
+      bytes.set(chunk.value, length);
+      length += chunk.value.byteLength;
+    }
+    if (signal.aborted || nowMs() >= deadline) throw new Error("Probe deadline elapsed");
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length))) as unknown;
+  } catch (error) {
+    cancel();
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 async function telegramCall(input: {
   config: TelegramLivenessProbeConfig;
   apiBaseUrl: string | undefined;
   ops: TelegramLivenessProbeOps;
+  transport: ProbeTransport;
   method: "sendMessage" | "getUpdates";
   body: Record<string, unknown>;
   failureDetail: TelegramLivenessProbeFailureDetail;
 }): Promise<TelegramCallOk> {
-  let res: Response;
   try {
-    res = await input.ops.fetch(apiUrl(input.apiBaseUrl, input.config.botToken, input.method), {
+    const { signal, deadline } = input.transport;
+    if (signal.aborted || input.ops.nowMs() >= deadline) throw new Error("Probe deadline elapsed");
+    const pending = input.ops.fetch(apiUrl(input.apiBaseUrl, input.config.botToken, input.method), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(input.body),
+      signal,
     });
-  } catch (err) {
-    throw new TelegramLivenessProbeRequestError((err as Error).message, input.failureDetail);
+    // A response delivered after abort cannot become reply evidence or retain an unread body.
+    void pending.then(res => {
+      if (signal.aborted) void res.body?.cancel().catch(() => undefined);
+    }, () => undefined);
+    const res = await untilAbort(pending, signal);
+    const record = await readProbeBody(res, input.transport, input.ops.nowMs);
+    if (signal.aborted || input.ops.nowMs() >= deadline) throw new Error("Probe deadline elapsed");
+    // HTTP rate limiting remains authoritative even when the envelope lacks a boolean ok.
+    if (res.status === 429 || (isRecord(record) && record.error_code === 429)) {
+      throw new TelegramLivenessProbeRequestError("Telegram Bot API rate limited the probe", "rate_limited");
+    }
+    if (!isRecord(record) || typeof record.ok !== "boolean") throw new Error("Invalid probe response");
+    if (!res.ok || !record.ok) throw new Error("Probe request failed");
+    return { body: record, result: record.result };
+  } catch (error) {
+    // Provider text and exception causes can contain credentials; only fixed local text leaves transport.
+    throw new TelegramLivenessProbeRequestError("Probe request failed",
+      error instanceof TelegramLivenessProbeRequestError ? error.detail : input.failureDetail);
   }
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch (err) {
-    throw new TelegramLivenessProbeRequestError((err as Error).message, input.failureDetail);
-  }
-  const record = body && typeof body === "object" && !Array.isArray(body)
-    ? body as Record<string, unknown>
-    : {};
-  if (res.status === 429 || record.error_code === 429) {
-    throw new TelegramLivenessProbeRequestError("Telegram Bot API rate limited the probe", "rate_limited");
-  }
-  if (!res.ok || record.ok !== true) {
-    throw new TelegramLivenessProbeRequestError(
-      typeof record.description === "string" ? record.description : `Telegram Bot API ${input.method} failed`,
-      input.failureDetail,
-    );
-  }
-  return { body: record, result: record.result };
 }
 
 async function sendProbeMessage(input: {
   config: TelegramLivenessProbeConfig;
   apiBaseUrl: string | undefined;
   ops: TelegramLivenessProbeOps;
+  transport: ProbeTransport;
   nonce: string;
 }): Promise<
   | { messageId: number }
@@ -475,6 +569,7 @@ async function sendProbeMessage(input: {
       config: input.config,
       apiBaseUrl: input.apiBaseUrl,
       ops: input.ops,
+      transport: input.transport,
       method: "sendMessage",
       failureDetail: "send_failed",
       body: {
@@ -504,6 +599,7 @@ async function getUpdates(input: {
   config: TelegramLivenessProbeConfig;
   apiBaseUrl: string | undefined;
   ops: TelegramLivenessProbeOps;
+  transport: ProbeTransport;
   offset: number | undefined;
 }): Promise<TelegramUpdate[]> {
   const body: Record<string, unknown> = {
@@ -515,6 +611,7 @@ async function getUpdates(input: {
     config: input.config,
     apiBaseUrl: input.apiBaseUrl,
     ops: input.ops,
+    transport: input.transport,
     method: "getUpdates",
     failureDetail: "send_ok_no_reply",
     body,
@@ -522,24 +619,51 @@ async function getUpdates(input: {
   if (!Array.isArray(call.result)) {
     throw new TelegramLivenessProbeRequestError("Telegram Bot API getUpdates returned a non-array result", "send_ok_no_reply");
   }
-  return call.result.filter((item): item is TelegramUpdate =>
-    item !== null && typeof item === "object" && !Array.isArray(item),
-  );
+  // Validate every nested field before reply attribution consumes it.
+  if (!call.result.every(isTelegramUpdate)) {
+    throw new TelegramLivenessProbeRequestError("Invalid probe updates", "send_ok_no_reply");
+  }
+  return call.result;
+}
+
+function isTelegramUpdate(value: unknown): value is TelegramUpdate {
+  return isRecord(value) && Number.isSafeInteger(value.update_id) &&
+    (value.message === undefined || isTelegramMessage(value.message));
+}
+
+function isTelegramMessage(message: unknown): message is TelegramMessage {
+  if (!isRecord(message) || !Number.isSafeInteger(message.message_id)) return false;
+  for (const key of ["from", "chat", "reply_to_message"] as const) {
+    const nested = message[key];
+    if (nested === undefined) continue;
+    if (!isRecord(nested)) return false;
+    const id = nested[key === "reply_to_message" ? "message_id" : "id"];
+    if (!Number.isSafeInteger(id) && !(key === "chat" && typeof id === "string")) return false;
+  }
+  return (message.text === undefined || typeof message.text === "string") &&
+    (message.caption === undefined || typeof message.caption === "string");
 }
 
 async function drainStaleUpdates(input: {
   config: TelegramLivenessProbeConfig;
   apiBaseUrl: string | undefined;
   ops: TelegramLivenessProbeOps;
+  transport: ProbeTransport;
 }): Promise<{ nextOffset: number | undefined; detail?: TelegramLivenessProbeFailureDetail }> {
   let offset: number | undefined;
   let nonEmptyBatches = 0;
   for (;;) {
+    // A settled drain response must not renew the sequence deadline or imply a send.
+    if (input.transport.signal.aborted || input.ops.nowMs() >= input.transport.deadline) {
+      return { nextOffset: offset, detail: "send_failed" };
+    }
     let updates: TelegramUpdate[];
     try {
       updates = await getUpdates({ ...input, offset });
     } catch (err) {
-      return { nextOffset: offset, detail: errorDetail(err) };
+      const detail = errorDetail(err);
+      // No request has been sent during the drain, including its transport and schema refusals.
+      return { nextOffset: offset, detail: detail === "send_ok_no_reply" ? "send_failed" : detail };
     }
     if (updates.length === 0) return { nextOffset: offset };
     nonEmptyBatches += 1;
@@ -554,6 +678,7 @@ async function waitForReply(input: {
   config: TelegramLivenessProbeConfig;
   apiBaseUrl: string | undefined;
   ops: TelegramLivenessProbeOps;
+  transport: ProbeTransport;
   nonce: string;
   requestMessageId: number;
   initialOffset: number | undefined;
@@ -561,20 +686,24 @@ async function waitForReply(input: {
   responseMessageId?: number;
   detail: TelegramLivenessProbeFailureDetail;
 }> {
-  const deadline = input.ops.nowMs() + input.config.timeoutMs;
+  const deadline = input.transport.deadline;
   let offset = input.initialOffset;
   let bestFailure: TelegramLivenessProbeFailureDetail = "send_ok_no_reply";
   for (;;) {
+    // Settled fetches and injected sleeps must still obey the shared clock deadline.
+    if (input.transport.signal.aborted || input.ops.nowMs() >= deadline) return { detail: bestFailure };
     let updates: TelegramUpdate[];
     try {
       updates = await getUpdates({
         config: input.config,
         apiBaseUrl: input.apiBaseUrl,
         ops: input.ops,
+        transport: input.transport,
         offset,
       });
     } catch (err) {
-      return { detail: errorDetail(err) };
+      // A later transport failure cannot erase stronger reply evidence already observed.
+      return { detail: strongerReplyFailure(bestFailure, errorDetail(err)) };
     }
     offset = nextOffsetFromUpdates(updates, offset);
     const classified = classifyUpdates({
@@ -590,8 +719,13 @@ async function waitForReply(input: {
       bestFailure = strongerReplyFailure(bestFailure, classified.detail);
     }
     const remaining = deadline - input.ops.nowMs();
-    if (remaining <= 0) return { detail: bestFailure };
-    await input.ops.sleepMs(Math.min(input.config.pollIntervalMs, remaining));
+    if (remaining <= 0 || input.transport.signal.aborted) return { detail: bestFailure };
+    try {
+      await untilAbort(input.ops.sleepMs(Math.min(input.config.pollIntervalMs, remaining)), input.transport.signal);
+    } catch {
+      return { detail: bestFailure };
+    }
+    if (input.ops.nowMs() >= deadline || input.transport.signal.aborted) return { detail: bestFailure };
   }
 }
 

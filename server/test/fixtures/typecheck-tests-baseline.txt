@@ -18,8 +18,8 @@ test/castle-wall/export/exporter.test.ts(618,43): error TS2493: Tuple type '[]' 
 test/castle-wall/ipc/macos-flow-events.test.ts(1136,13): error TS2322: Type '() => Promise<{ status: "verified"; }>' is not assignable to type '() => Promise<AuditChainVerdict>'.
 test/castle-wall/provision/exclusive-arm.test.ts(637,21): error TS2352: Conversion of type 'undefined' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/castle-wall/provision/exclusive-arm.test.ts(637,42): error TS2493: Tuple type '[]' of length '0' has no element at index '1'.
-test/castle-wall/provision/liveness-probe.test.ts(629,46): error TS7006: Parameter 'path' implicitly has an 'any' type.
-test/castle-wall/provision/liveness-probe.test.ts(629,52): error TS7006: Parameter 'options' implicitly has an 'any' type.
+test/castle-wall/provision/liveness-probe.test.ts(641,46): error TS7006: Parameter 'path' implicitly has an 'any' type.
+test/castle-wall/provision/liveness-probe.test.ts(641,52): error TS7006: Parameter 'options' implicitly has an 'any' type.
 test/castle-wall/provision/orchestrate.test.ts(1818,7): error TS2322: Type 'Mock<() => Promise<{ kind: "released-repark-failed"; generation_id: number; reparkError: string; }>>' is not assignable to type 'Mock<() => Promise<{ kind: "released"; generation_id: number; }>>'.
 test/castle-wall/provision/orchestrate.test.ts(186,5): error TS2322: Type 'Mock<() => Promise<{ plan: { action: string; accountName: string; uid: number; }; uid: number; }>>' is not assignable to type '() => Promise<{ plan: AccountProvisionPlan; uid: number; }>'.
 test/castle-wall/provision/orchestrate.test.ts(1897,9): error TS2322: Type 'Mock<Procedure | Constructable>' is not assignable to type '((armTargetUid: number | undefined, intent: "observe" | "clear") => Promise<ExclusiveRoutingResidue>) | undefined'.

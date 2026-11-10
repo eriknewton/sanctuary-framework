@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- The optional Telegram liveness probe now bounds the full request sequence and response size and validates reply fields.
 - The full daemon now reports audit write-lock recoveries it observes in its own process, and the wall reads degraded for the history window after one. A recovery that ends the daemon is reported as a recent restart. `castle-wall status` still exits 1 until the observer is installed and commissioned.
 - Added `castle-wall liveness-status`, which reports wall, agent and coverage separately from stored evidence. `castle-wall status` and `castle-wall full-status` now exit 0 only when that wall evidence is fresh and complete, so a running daemon alone no longer exits 0; missing required evidence makes them exit 1. `install-full --preflight` checks for a stable Node path before any change.
 - Added the wall observer, installed with `castle-wall install-watch` and removed with `castle-wall uninstall-watch`. A correctly commissioned Mac still needs an attended drill to demonstrate a healthy wall reading. Missing monitoring reads the wall DOWN, while an agent that is not monitored reads UNMONITORED. The canary needs two commands run as root, which the CLI prints.

@@ -212,6 +212,15 @@ export const HISTORY_WINDOW = 30 * MINUTE;
 export const RECOVERY_GAP = 2 * OBSERVER_PERIOD;
 const KIB = 1024;
 export const STATUS_BYTES = 64 * KIB;
+/** Optional probe responses share the bounded status-record byte budget. */
+export const HTTP_BODY_BYTES = STATUS_BYTES;
+/** One read per possible byte plus a final EOF read; empty chunks consume the same work budget. */
+// Must match readProbeBody in ../provision/liveness-probe.ts and the read-budget witness in
+// server/test/castle-wall/provision/liveness-probe.test.ts.
+export const HTTP_BODY_READS = HTTP_BODY_BYTES + 1;
+/** Node timers honor at most the signed 32-bit maximum: 2^31 - 1 milliseconds. */
+// Must match MAX_TIMER_DELAY_MS in server/test/castle-wall/provision/liveness-probe.test.ts.
+export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 export const CONFIG_BYTES = 16 * KIB;
 /** Policy capacity: qualifying messaging-set candidates stored per sample. */
 export const CENSUS_PID_ROWS = 4;
