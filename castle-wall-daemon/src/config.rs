@@ -551,6 +551,7 @@ pub const SELECTOR_MAX_BYTES: usize = 512; // Next power of two above the maxima
 pub const SELECTOR_MODE: u32 = 0o600; // Enrollment selection is owner-readable and owner-writable only.
 pub const CANDIDATE_MAX_BYTES: usize = 4096 - 1; // Linux PATH_MAX includes the terminating NUL.
 pub const CANDIDATE_MAX_COMPONENTS: usize = CANDIDATE_MAX_BYTES.div_ceil(2); // One-byte names separated by slashes.
+
 // Work ceiling: 20 fixed directory opens, 64 * (6 + 3) raw parent opens,
 // and at most 2 * 2048 candidate parent opens. Each has one fstat; each
 // leaf has one no-follow probe. At most two extra descriptors hold the
