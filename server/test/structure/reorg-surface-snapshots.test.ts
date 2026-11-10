@@ -251,3 +251,28 @@ describe("reorg surface snapshot: operation-policy tiers", () => {
     ).toEqual(golden.tier2_anomaly);
   });
 });
+
+describe("reorg surface manifest: the liveness observer surface is recorded", () => {
+  const manifest = readFileSync(join(fileURLToPath(import.meta.url), "..", "..", "..", "reorg-surface-manifest.md"), "utf8");
+
+  it("records CANARY_LABEL and OBSERVER_LABEL with the values declared once in constants.ts", async () => {
+    const { CANARY_LABEL, OBSERVER_LABEL } = await import("../../src/castle-wall/liveness/constants.js");
+    expect(manifest).toContain(`- \`CANARY_LABEL = ${CANARY_LABEL}\`; declared once in \`server/src/castle-wall/liveness/constants.ts\``);
+    expect(manifest).toContain(`- \`OBSERVER_LABEL = ${OBSERVER_LABEL}\`; declared once in \`server/src/castle-wall/liveness/constants.ts\``);
+  });
+
+  it("records the three observer verbs in the CLI row and keeps them out of TOP_LEVEL_SUBCOMMANDS", async () => {
+    const row = manifest.split("\n").find(line => line.startsWith("| **CLI command surface**"))!;
+    expect(row).toContain("**`castle-wall install-watch`, `run-watch` and `uninstall-watch` recorded:**");
+    for (const verb of ["install-watch", "run-watch", "uninstall-watch"]) expect(row).toContain(`\`${verb}\``);
+    expect(row).toContain("`--launch-agent`");
+    const { TOP_LEVEL_SUBCOMMANDS } = await import("../../src/cli/subcommands.js");
+    for (const verb of ["install-watch", "run-watch", "uninstall-watch"]) expect(TOP_LEVEL_SUBCOMMANDS as readonly string[]).not.toContain(verb);
+  });
+
+  it("records the lease line display strings", () => {
+    expect(manifest).toContain("`Last CLI arm request (advisory): armed`");
+    expect(manifest).toContain("`Last CLI arm request (advisory): disarmed`");
+    expect(manifest).toContain("`Last CLI arm request (advisory, not enforcement): armed`");
+  });
+});

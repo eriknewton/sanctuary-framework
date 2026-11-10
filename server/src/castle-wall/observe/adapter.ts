@@ -49,6 +49,7 @@
  */
 
 import type { AuditEntry } from "../../operational/audit-log.js";
+import { isMonitoringOriginDrop } from "../liveness/monitoring-origin.js";
 import {
   verifiedCastleWallAuditAttribution,
   type AuditAttributionOptions,
@@ -113,6 +114,9 @@ export function flowEventFromAuditEntry(
   if (entry.operation !== BLOCKED_OPERATION) return null;
   const details = entry.details;
   if (!details) return null;
+  // The canary drop is the wall's own heartbeat, not agent traffic, so it never becomes a candidate; drops only, never allows.
+  // Must match isMonitoringOriginDestination in server/src/castle-wall/liveness/monitoring-origin.ts.
+  if (isMonitoringOriginDrop(entry.operation, details)) return null;
   const attribution = verifiedCastleWallAuditAttribution(entry, options);
   if (attribution === null || attribution.agentTemplate === null) return null;
   const flowAttribution: VerifiedFlowAttribution = {

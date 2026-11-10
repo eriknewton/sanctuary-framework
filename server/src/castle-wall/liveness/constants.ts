@@ -64,6 +64,24 @@ export const OBSERVATION_GAP = OBSERVER_PERIOD + LOCAL_JITTER + COLLECT_DEADLINE
 export const OBSERVER_WINDOW = 3 * OBSERVER_PERIOD;
 /** Bounds every reader operation, so a stalled filesystem read cannot hold a status command. */
 export const STATUS_READ_DEADLINE = COLLECT_DEADLINE;
+/** The pause between the two process reads of one cycle: one full termination allocation. */
+export const CENSUS_REREAD = TERM_GRACE + KILL_REAP_GRACE;
+/** One bounded process read; two reads plus the pause and one termination fit COLLECT_DEADLINE. */
+export const PROCESS_READ_DEADLINE = 1 * SECOND;
+/** 6 - 1 - 1 = 4 s: a child read plus its termination fits one cycle deadline. */
+export const CHILD_READ_DEADLINE = COLLECT_DEADLINE - TERM_GRACE - KILL_REAP_GRACE;
+/** The named children one observer cycle may hold at once, one slot each. */
+export const OBSERVER_CYCLE_CHILD_SET = Object.freeze([
+  "full_agent_print", "canary_print", "harness_print", "ps", "id_chain", "sysctl",
+] as const);
+/** 6: the length of the named per-cycle child set. */
+export const OBSERVER_CYCLE_CHILDREN = OBSERVER_CYCLE_CHILD_SET.length;
+/** The netstat sampler runs on its own timer and owns one slot. */
+export const CENSUS_CHILDREN = 1;
+/** 6 + 1 = 7: every per-cycle child plus the census child. */
+export const MAX_COLLECTION_CHILDREN = OBSERVER_CYCLE_CHILDREN + CENSUS_CHILDREN;
+/** launchd ThrottleInterval of the observer: a restarting observer cannot republish faster than its own period. */
+export const WATCH_THROTTLE_INTERVAL_S = OBSERVER_PERIOD / SECOND;
 
 // ---------------------------------------------------------------------------
 // Canary.
@@ -80,6 +98,11 @@ export const CANARY_PROTOCOL = "tcp";
  * that commissioning binds from `config.json`.
  *
  * Consumers exclude this monitoring-origin tuple.
+ *
+ * Must match `isMonitoringOriginDestination` in server/src/castle-wall/liveness/monitoring-origin.ts,
+ * and its four consumer call sites in server/src/castle-wall/observe/adapter.ts,
+ * server/src/evidence-pack/inventory.ts, server/src/principal-policy/posture.ts and
+ * server/src/castle-wall/audit/per-rule-report.ts.
  */
 export const CANARY_MONITORING_ORIGIN = Object.freeze({
   agent_uid: "commissioned-agent-uid",
@@ -130,6 +153,16 @@ export const CANARY_SLOT_REARM = CANARY_PERIOD / 2;
 export const CANARY_PRIMARY_NOMINAL_PER_DAY = DAY / CANARY_PERIOD;
 /** 86400 / 90 = 960, the hard ceiling on forced primary entries a day. */
 export const CANARY_PRIMARY_CAP_PER_DAY = DAY / CANARY_SLOT_REARM;
+/** 180: launchd StartInterval is in seconds. */
+export const CANARY_START_INTERVAL_S = CANARY_PERIOD / SECOND;
+/** 10: curl takes its connect and total deadlines in seconds. */
+export const CANARY_CURL_DEADLINE_S = CANARY_CONNECT_DEADLINE / SECOND;
+// Declared once here and imported everywhere; must match the CANARY_LABEL row in server/reorg-surface-manifest.md.
+/** launchd label of the root-owned canary LaunchDaemon, in the label family of the full agent. */
+export const CANARY_LABEL = "ai.sanctuaryprotocol.castle-wall.canary";
+// Declared once here and imported everywhere; must match the OBSERVER_LABEL row in server/reorg-surface-manifest.md.
+/** launchd label of the operator observer LaunchAgent. */
+export const OBSERVER_LABEL = "ai.sanctuaryprotocol.castle-wall.watch";
 
 // ---------------------------------------------------------------------------
 // Census and agent.
@@ -189,6 +222,12 @@ export const PROCESS_ROWS = 4096;
 export const CENSUS_INPUT_BYTES = PROCESS_BYTES;
 export const CENSUS_INPUT_ROWS = PROCESS_ROWS;
 export const MAX_MESSAGING_PREFIXES = 32;
+/** Policy capacity: script paths one config `mcp` block may name. */
+export const MAX_MCP_SCRIPT_PATHS = 8;
+/** Policy capacity: MCP candidate children one cycle may classify before the check fails closed. */
+export const MAX_STALE_CHILDREN = 16;
+/** 4 * 1024: four times the macOS PATH_MAX of 1024 bytes, a policy capacity for one configured path. */
+export const PATH_BYTES = 4 * KIB;
 /** Saturation point for every stored count; a saturated count reads observation_invalid. */
 export const COUNTER_MAX = Number.MAX_SAFE_INTEGER;
 /**
@@ -199,6 +238,8 @@ export const COUNTER_MAX = Number.MAX_SAFE_INTEGER;
  * STATUS_BYTES.
  */
 export const LABEL_BYTES = 64;
+/** An account name is a label in this contract. */
+export const ACCOUNT_NAME_MAX = LABEL_BYTES;
 /** 21 = "255.255.255.255" (15) + "." + "65535" (5): a stored census row is always an IPv4 `addr.port`. */
 export const CENSUS_ADDRESS_TEXT_MAX = 21;
 /** 16 hex digits: `gencnt` is a 64-bit socket generation count. */
@@ -212,6 +253,8 @@ export const RECOVERY_SAMPLES_PER_COMPONENT = 2;
 // Exit codes.
 // ---------------------------------------------------------------------------
 // Must match the exit mapping in server/src/cli/castle-wall-liveness-status.ts, server/src/cli/castle-wall.ts and server/src/cli/castle-wall-full-agent.ts.
+// The installer exits WATCH_EXIT_CANARY_PENDING (5) and WATCH_EXIT_CANARY_STILL_INSTALLED (6) in
+// server/src/cli/castle-wall-watch.ts must not equal any value in this block.
 /** Wall OK. */
 export const LIVENESS_EXIT_OK = 0;
 /** Wall INITIALIZING, DOWN, RECOVERING, SAFE_MODE, REBOOT_NO_LOGIN or LOGGED_OUT. */

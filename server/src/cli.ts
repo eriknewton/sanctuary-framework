@@ -1529,6 +1529,22 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runInstallFull(args.slice(1));
   }
 
+  // The run-watch argv must match generateWatchAgentPlist in server/src/castle-wall/liveness/launchd-plists.ts.
+  if (command === "install-watch") {
+    const { runInstallWatch } = await import("./cli/castle-wall-watch.js");
+    return runInstallWatch(args.slice(1));
+  }
+
+  if (command === "run-watch") {
+    const { runRunWatch } = await import("./cli/castle-wall-watch.js");
+    return runRunWatch(args.slice(1));
+  }
+
+  if (command === "uninstall-watch") {
+    const { runUninstallWatch } = await import("./cli/castle-wall-watch.js");
+    return runUninstallWatch(args.slice(1));
+  }
+
   if (command === "uninstall-full") {
     const { runUninstallFull } = await import("./cli/castle-wall-full-agent.js");
     return runUninstallFull(args.slice(1));
@@ -1834,6 +1850,24 @@ function printCastleWallHelp(): void {
                      --preflight  Check the Node and CLI paths are stable (no Homebrew Cellar
                                   path) and change nothing; exit 0 valid, 78 refused.
     uninstall-full   Remove the user-session full daemon service (requires --yes).
+    install-watch    Install the user-session liveness observer and stage the canary (macOS, as the
+                     operator, never root). --fortress <path>. Exit 0 means the observer is loaded and
+                     canary integrity passed in this run; it is an installer result, not a liveness
+                     reading (read liveness with liveness-status). Exit 5: the canary is not installed
+                     yet; it prints two commands to run as root, or says config.json must be
+                     commissioned first. Exit 1 failed or refused, 3 rollback incomplete, 2 usage,
+                     78 unstable Node or CLI path.
+                     Failure mode: an install without -o root -g wheel reads fine in a listing and
+                     fails integrity on every cycle as canary_unprovisioned.
+    run-watch        Run the observer in the foreground until Ctrl-C (the LaunchAgent runs it with
+                     --launch-agent, which prints nothing). --fortress <path>. Exit 0 on stop,
+                     1 refused (root, a fortress owned by another user, or not macOS), 2 usage.
+    uninstall-watch  Remove the observer LaunchAgent and the staged canary. --fortress <path>.
+                     Exit 0 only when the canary file is absent and launchd reports it not found;
+                     6 when the canary is still installed (it prints two commands to run as root);
+                     1 when the canary state cannot be read or removal failed; 3 partial removal.
+                     Failure mode: a canary left loaded after uninstall-watch keeps producing drops
+                     that no observer reads.
     full-status      Show the full daemon restart state and running pid.
                      Exits 0 only when stored wall liveness evidence reads OK (3 for a wall
                      warning); a running pid alone exits 1. status exits the same way.

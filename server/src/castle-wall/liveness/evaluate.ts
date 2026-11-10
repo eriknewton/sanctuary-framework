@@ -449,6 +449,10 @@ export function evaluateLiveness(input: LivenessInput): LivenessEnvelope {
     if (integrity === null || !integrity.passed || integrityAge === null || integrityAge > OBSERVER_WINDOW) {
       wall.add("canary_unprovisioned"); coverage.add("canary_unprovisioned");
     }
+    // The observer retains the daemon's allow sighting across a daemon restart, so a new
+    // daemon instance with an empty sighting cannot clear an allow the old instance saw inside the window.
+    const retainedAllowAge = stamp(p.canary_allow_sighting?.captured_at_ms ?? null);
+    if (retainedAllowAge !== null && retainedAllowAge <= HISTORY_WINDOW) wall.add("canary_destination_allowed");
     // Gate 12: two distinct recovery samples RECOVERY_GAP apart, after any fault, with a post-fault canary.
     const samples = p.recovery.samples;
     if (samples.length === 2) {

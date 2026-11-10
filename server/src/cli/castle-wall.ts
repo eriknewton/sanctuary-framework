@@ -699,8 +699,8 @@ function formatDeadManLeaseStatus(
   const enforcementActive = contentFilterState === "enabled";
   const label =
     lease.armed && !enforcementActive
-      ? "Dead-man lease (advisory broadcast, not enforcement): armed"
-      : `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}`;
+      ? "Last CLI arm request (advisory, not enforcement): armed"
+      : `Last CLI arm request (advisory): ${lease.armed ? "armed" : "disarmed"}`;
   return (
     `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`

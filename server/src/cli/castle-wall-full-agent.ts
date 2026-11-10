@@ -37,7 +37,7 @@ export const LAUNCHCTL_PRINT_SERVICE_NOT_FOUND_STATUS = 113;
 const LAUNCHD_PID = 1; // macOS launchd is the system's initial process.
 const LAUNCHCTL_TIMEOUT_MS = 10 * MS_PER_SECOND; // One local launchctl request budget.
 const STABLE_SAMPLE_INTERVAL_MS = MS_PER_SECOND;
-/** Distinguish incomplete rollback from success (0), ordinary failure (1) and usage refusal (2). */
+/** Distinguish incomplete rollback from success (0), ordinary failure (1) and usage refusal (2). Must match WATCH_EXIT_ROLLBACK_INCOMPLETE in server/src/cli/castle-wall-watch.ts. */
 export const FULL_AGENT_ROLLBACK_INCOMPLETE_EXIT_CODE = 3;
 const PROGRAM_ARGUMENT_COUNT = 7; // Interpreter, CLI, group, verb, fortress flag, fortress path, supervision flag.
 // must match FULL_AGENT_THROTTLE_INTERVAL_S derivation in server/src/cli/castle-wall-full-agent-state.ts.
@@ -196,7 +196,7 @@ function refuseUnsupported(ctx: AgentContext): boolean {
   return false;
 }
 /** Interpret only service-level fields and the service's own arguments block. */
-function parseFullAgentPrint(stdout: string): { valid: boolean; pid: number | null; arguments: string[] } {
+export function parseFullAgentPrint(stdout: string): { valid: boolean; pid: number | null; arguments: string[] } {
   const blocks: string[] = [];
   const args: string[] = [];
   let pid: number | null = null;
@@ -245,12 +245,12 @@ function parseFullAgentPrint(stdout: string): { valid: boolean; pid: number | nu
   return { valid: true, pid: pidFields === 1 && argumentBlocks === 1 ? pid : null, arguments: argumentBlocks === 1 ? args : [] };
 }
 
-type FullAgentPrint =
+export type FullAgentPrint =
   | { state: "state_LOADED"; pid: number | null; arguments: string[] }
   | { state: "state_UNLOADED" }
   | { state: "state_INDETERMINATE"; spawnFailure: boolean };
 
-function observeJob(exec: NonNullable<FullAgentCommandContext["execFileFn"]>, target: string): FullAgentPrint {
+export function observeJob(exec: NonNullable<FullAgentCommandContext["execFileFn"]>, target: string): FullAgentPrint {
   let printed: FullAgentExecResult;
   try { printed = exec("launchctl", ["print", target]); }
   catch { return { state: "state_INDETERMINATE", spawnFailure: true }; }

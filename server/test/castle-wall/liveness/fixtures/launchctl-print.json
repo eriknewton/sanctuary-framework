@@ -1,0 +1,50 @@
+{
+  "description": "launchctl print texts. Entries marked modelled are written to the documented launchctl shape; entries marked captured are a sanitized copy of a read-only operator capture on macOS 26.6.2 (2026-11-09): program path, argument values and the account name replaced with fixture values, line shape, indentation and field order kept. All pids, uids and paths are fixture values.",
+  "entries": {
+    "full_agent_gui": {
+      "kind": "modelled",
+      "code": 0,
+      "stdout": "gui/501/ai.sanctuaryprotocol.castle-wall.full = {\n\tactive count = 1\n\tpath = /Users/operator-fixture/Library/LaunchAgents/ai.sanctuaryprotocol.castle-wall.full.plist\n\ttype = LaunchAgent\n\tstate = running\n\n\tprogram = /opt/homebrew/opt/node/bin/node\n\targuments = {\n\t\t/opt/homebrew/opt/node/bin/node\n\t\t/opt/homebrew/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js\n\t\tcastle-wall\n\t\tdaemon\n\t\t--fortress\n\t\t/Users/operator-fixture/.sanctuary\n\t\t--launch-agent\n\t}\n\n\tenvironment = {\n\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\n\t}\n\n\tdomain = gui/501 [100005]\n\tpid = 4242\n\timmediate reason = speculative\n}\n",
+      "stderr": ""
+    },
+    "observer_gui": {
+      "kind": "modelled",
+      "code": 0,
+      "stdout": "gui/501/ai.sanctuaryprotocol.castle-wall.watch = {\n\tactive count = 1\n\tpath = /Users/operator-fixture/Library/LaunchAgents/ai.sanctuaryprotocol.castle-wall.watch.plist\n\ttype = LaunchAgent\n\tstate = running\n\n\tprogram = /opt/homebrew/opt/node/bin/node\n\targuments = {\n\t\t/opt/homebrew/opt/node/bin/node\n\t\t/opt/homebrew/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js\n\t\tcastle-wall\n\t\trun-watch\n\t\t--fortress\n\t\t/Users/operator-fixture/.sanctuary\n\t\t--launch-agent\n\t}\n\n\tenvironment = {\n\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\n\t}\n\n\tdomain = gui/501 [100005]\n\tpid = 4343\n\timmediate reason = speculative\n}\n",
+      "stderr": ""
+    },
+    "gui_not_found": {
+      "kind": "modelled",
+      "code": 113,
+      "stdout": "",
+      "stderr": "Could not find service \"ai.sanctuaryprotocol.castle-wall.watch\" in domain for user gui: 501\n"
+    },
+    "canary_system": {
+      "kind": "modelled",
+      "code": 0,
+      "stdout": "system/ai.sanctuaryprotocol.castle-wall.canary = {\n\tactive count = 0\n\tpath = /Library/LaunchDaemons/ai.sanctuaryprotocol.castle-wall.canary.plist\n\ttype = LaunchDaemon\n\tstate = not running\n\n\tprogram = /usr/bin/curl\n\targuments = {\n\t\t/usr/bin/curl\n\t\t-q\n\t\t--noproxy\n\t\t*\n\t\t--retry\n\t\t0\n\t\t--output\n\t\t/dev/null\n\t\t--silent\n\t\t--connect-timeout\n\t\t10\n\t\t--max-time\n\t\t10\n\t\thttp://192.0.2.254:9/\n\t}\n\n\tenvironment = {\n\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\n\t}\n\n\tdomain = system\n\tusername = sanctuary-agent-fixture\n}\n",
+      "stderr": ""
+    },
+    "harness_system": {
+      "kind": "modelled",
+      "code": 0,
+      "stdout": "system/ai.sanctuaryprotocol.agent-harness = {\n\tactive count = 1\n\tpath = /Library/LaunchDaemons/ai.sanctuaryprotocol.agent-harness.plist\n\ttype = LaunchDaemon\n\tstate = running\n\n\tprogram = /opt/agent-fixture/venv/bin/python\n\targuments = {\n\t\t/opt/agent-fixture/venv/bin/python\n\t\t-m\n\t\tagent_fixture.main\n\t\tgateway\n\t\trun\n\t\t--accept-hooks\n\t}\n\n\tenvironment = {\n\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\n\t}\n\n\tdomain = system\n\tusername = sanctuary-agent-fixture\n\tpid = 75400\n}\n",
+      "stderr": ""
+    },
+    "captured_system_running": {
+      "kind": "captured",
+      "captured": "2026-11-09",
+      "code": 0,
+      "stdout": "\tpath = /Library/LaunchDaemons/ai.sanctuaryprotocol.agent-harness.plist\n\ttype = LaunchDaemon\n\tstate = running\n\tprogram = /opt/agent-fixture/venv/bin/python\n\targuments = {\n\t\t/opt/agent-fixture/venv/bin/python\n\t\t-m\n\t\tagent_fixture.main\n\t\tgateway\n\t\trun\n\t\t--accept-hooks\n\t}\n\tdomain = system\n\tusername = sanctuary-agent-fixture\n\tpid = 75399\n\tspawn type = daemon (3)\n",
+      "stderr": ""
+    },
+    "captured_system_not_found": {
+      "kind": "captured",
+      "captured": "2026-11-09",
+      "code": 113,
+      "stdout": "",
+      "stderr": "Bad request.\nCould not find service \"ai.sanctuaryprotocol.castle-wall.canary\" in domain for system\n",
+      "note": "The capture recorded both lines without their stream; the label is substituted with the canary label."
+    }
+  }
+}
