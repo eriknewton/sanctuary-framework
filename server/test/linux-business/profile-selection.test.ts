@@ -65,10 +65,18 @@ function fixture(root: string, c: Obj): selection.IsolatedSelectorRoots {
 function snapshot(root: string): unknown[] {
   const rows: unknown[][] = [];
   const visit = (dir: string) => {
-    for (const name of fs.readdirSync(dir).sort()) {
-      const path = join(dir, name), st = fs.lstatSync(path);
-      rows.push([path.slice(root.length), st.mode, st.isSymbolicLink() ? fs.readlinkSync(path) : st.isFile() ? fs.readFileSync(path).toString("hex") : null]);
-      if (st.isDirectory()) visit(path);
+    // The entry type comes from the directory read and a file's mode and bytes from one descriptor, so no path is checked and
+    // then reopened: a link swapped in between could otherwise be followed out of the fixture.
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      const path = join(dir, entry.name), label = path.slice(root.length);
+      if (entry.isSymbolicLink()) rows.push([label, "link", fs.readlinkSync(path)]);
+      else if (entry.isFile()) {
+        const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try { rows.push([label, fs.fstatSync(fd).mode, fs.readFileSync(fd).toString("hex")]); } finally { fs.closeSync(fd); }
+      } else {
+        rows.push([label, entry.isDirectory() ? fs.lstatSync(path).mode : "other", null]);
+        if (entry.isDirectory()) visit(path);
+      }
     }
   };
   visit(root); return rows;
