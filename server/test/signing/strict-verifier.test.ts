@@ -1,3 +1,4 @@
+import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
 import {describe,it,expect} from "vitest";
 import {z} from "zod";
 import {strictVerify,verifyRecord,strictEncodingProfile} from "../../src/signing/strict-verifier.js";
@@ -188,4 +189,9 @@ describe("strict cross-language profile",()=>{
   expect(()=>decodeCanonical(changed,32)).toThrow("K1_REFUSED");
  });
  it("covers the whole role registry",()=>{expect(ROLE_VECTORS.map(row=>row.role).sort()).toEqual(ROLE_REGISTRY.map(row=>row.role).sort());});
+});
+
+it("checked public and role corpora equal the generator source arrays", () => {
+  expect(loadCheckedCorpus("public_vectors.json")).toEqual(PUBLIC_VECTORS);
+  expect(loadCheckedCorpus("role_vectors.json")).toEqual(ROLE_VECTORS);
 });

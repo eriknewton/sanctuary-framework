@@ -14,6 +14,7 @@ LAYOUT = runpy.run_path(str(HERE / 'install-layout.py'))
 DEPENDENCIES = runpy.run_path(str(HERE / 'install-dependencies.py'))
 # Must match the test-only flag families in src/main.rs, src/config.rs and the two business signer binaries in src/bin.
 SEAMS = {'--isolated-runtime-root': '/nonexistent/package-seam', '--isolated-castle-table-tag': 'p1check',
+         '--test-profile-root': '/nonexistent/package-seam',
          '--test-health-interval-ms': '1', '--test-shutdown-at': 'pre-recovery',
          '--test-stop-guard-deadline-secs': '1', '--test-nft-binary': '/bin/false',
          '--test-wedge-health-pass-after': '1', '--test-delay-before-ready-ms': '1',

@@ -592,6 +592,7 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "integration_kernel_binding",
         "integration_linux_runtime_activation",
         "integration_manifest_and_drain",
+        "linux_business_profile_selection",
     ]
     .into_iter()
     .map(String::from)
@@ -623,4 +624,225 @@ fn linux_workflow_suite_ran_loop_matches_the_gated_target_set() {
          `test-isolation` gated target set, plus `test_isolation_gate` as the \
          one documented extra self-check target"
     );
+}
+
+// This is skip accounting only; the dedicated feature-enabled CI step runs the vectors.
+#[cfg(not(feature = "legacy-raw-producer"))]
+#[test]
+fn skipped_integration_producer_sig_cross_lang_requires_legacy_raw_producer() {
+    let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
+    let blocks: Vec<_> = manifest
+        .split("[[test]]")
+        .filter(|block| {
+            block
+                .lines()
+                .any(|line| line == r#"name = "integration_producer_sig_cross_lang""#)
+        })
+        .collect();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "the legacy vector target must be declared exactly once"
+    );
+    let features: Vec<_> = blocks[0]
+        .lines()
+        .filter(|line| line.starts_with("required-features"))
+        .collect();
+    assert_eq!(features, [r#"required-features = ["legacy-raw-producer"]"#]);
+}
+
+#[test]
+fn legacy_vector_ci_step_exists_exactly_once() {
+    let workflow =
+        std::fs::read_to_string(crate_root().join("../.github/workflows/castle-wall-linux.yml"))
+            .unwrap();
+    assert_eq!(workflow.matches("run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang").count(), 1,
+        "the legacy vector CI step must execute exactly once");
+}
+
+#[test]
+fn gated_boot_and_spawn_helpers_supply_selection_roots() {
+    // The real-host install target is deliberately outside this gated set.
+    for (name, path) in integration_target_files() {
+        if !gated_targets().contains(&name) {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).unwrap();
+        if source.contains("CARGO_BIN_EXE_castle-wall-daemon") {
+            assert!(
+                source.contains("--test-profile-root"),
+                "{name} must isolate each daemon child"
+            );
+        }
+        if source.contains(&format!("{}::{}(", "daemon", "boot")) || source.contains("boot(config")
+        {
+            assert!(
+                source.contains("test_selector_roots"),
+                "{name} must isolate each library boot"
+            );
+        }
+    }
+    let helpers = [
+        (
+            "integration_failure_modes.rs",
+            "fresh_config",
+            "test_selector_roots",
+        ),
+        (
+            "integration_failure_modes.rs",
+            "verdict_deadline_fail_stops_subprocess_nonzero_without_clean_exit_claim",
+            "--test-profile-root",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "fresh_config",
+            "test_selector_roots",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "fresh_confining_config",
+            "test_selector_roots",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "isolation_args",
+            "--test-profile-root",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "tb9_isolated_table_tail",
+            "--test-profile-root",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "tb9_credential_check",
+            "ISOLATED_CREDENTIAL_SCRIPT",
+        ),
+        (
+            "integration_dns_bypass.rs",
+            "boot_with_only_example_com_443_allowed",
+            "test_selector_roots",
+        ),
+        (
+            "integration_manifest_and_drain.rs",
+            "boot_daemon_with_policy",
+            "test_selector_roots",
+        ),
+        (
+            "integration_manifest_and_drain.rs",
+            "t3w_run",
+            "--test-profile-root",
+        ),
+        (
+            "integration_manifest_and_drain.rs",
+            "tw_run",
+            "--test-profile-root",
+        ),
+        (
+            "integration_kernel_binding.rs",
+            "end_to_end_nftables_then_evaluate_then_audit",
+            "test_selector_roots",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "run_disarm",
+            "isolation_args()",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "fatal_control_path_is_loud_and_nonzero_in_the_real_subprocess",
+            "isolation_args()",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "boot_and_exit_cannot_report_success_after_a_failed_acquisition",
+            "isolation_args()",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "spawn_long_running_daemon",
+            "isolation_args()",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "spawn_long_running_daemon_with_extra_args",
+            "isolation_args()",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "tb9_gate",
+            "tb9_isolated_table_tail()",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "tb9_world_executable_binary",
+            "copy",
+        ),
+        (
+            "integration_linux_runtime_activation.rs",
+            "tb10_ix_the_real_verbs_admit_the_bound_instance_under_the_shipped_directives",
+            "ISOLATED_CREDENTIAL_SCRIPT",
+        ),
+        (
+            "linux_business_profile_selection.rs",
+            "main_refuses_before_all_routes_and_paths_but_legacy_continues",
+            "--test-profile-root",
+        ),
+        (
+            "linux_business_profile_selection.rs",
+            "boot_config",
+            "test_selector_roots",
+        ),
+    ];
+    let mut discovered = BTreeSet::new();
+    for (name, path) in integration_target_files() {
+        if !gated_targets().contains(&name) {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).unwrap();
+        let mut helper = "";
+        for line in source.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("fn ") {
+                helper = rest.split('(').next().unwrap();
+            }
+            if line.contains("CARGO_BIN_EXE_castle-wall-daemon") || line.contains("DaemonConfig {")
+            {
+                discovered.insert((format!("{name}.rs"), helper.to_string()));
+            }
+        }
+    }
+    let forwarding = [
+        "isolation_args",
+        "tb9_isolated_table_tail",
+        "tb9_credential_check",
+    ];
+    let expected: BTreeSet<_> = helpers
+        .iter()
+        .filter(|(_, helper, _)| !forwarding.contains(helper))
+        .map(|(file, helper, _)| (file.to_string(), helper.to_string()))
+        .collect();
+    assert_eq!(
+        discovered, expected,
+        "audit every config builder and binary helper"
+    );
+    for (file, helper, proof) in helpers {
+        let source = std::fs::read_to_string(crate_root().join("tests").join(file)).unwrap();
+        let body = source
+            .split(&format!("fn {helper}("))
+            .nth(1)
+            .expect("audited helper remains present")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(body.contains(proof), "{file} {helper} must carry {proof}");
+    }
+    let daemon = std::fs::read_to_string(crate_root().join("src/daemon.rs")).unwrap();
+    assert!(daemon
+        .split("fn fresh_config_in(")
+        .nth(1)
+        .unwrap()
+        .split("\n    #[test]")
+        .next()
+        .unwrap()
+        .contains("test_selector_roots"));
 }

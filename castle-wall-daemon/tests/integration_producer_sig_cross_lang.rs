@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-raw-producer")]
 //! Producer-signature CROSS-LANGUAGE byte-compat test (Slice L1 + Slice P).
 //!
 //! Verifies the SAME shared fixture
