@@ -1849,6 +1849,7 @@ function printCastleWallHelp(): void {
                      Do not run install-full, reset-full or uninstall-full concurrently.
                      --preflight  Check the Node and CLI paths are stable (no Homebrew Cellar
                                   path) and change nothing; exit 0 valid, 78 refused.
+                     Missing app: "install-full preflight refused: signer client unavailable"; install or approve the host app. An unapproved helper can surface after arming as "signer helper unreachable" on a checkpoint tick.
     uninstall-full   Remove the user-session full daemon service (requires --yes).
     install-watch    Install the user-session liveness observer and stage the canary (macOS, as the
                      operator, never root). --fortress <path>. Exit 0 means the observer is loaded and

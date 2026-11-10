@@ -51,6 +51,9 @@ export interface ResolveTransparencySignerInput {
   env?: NodeJS.ProcessEnv;
   /** "auto" (default): local when SANCTUARY_CASTLE_LOCAL_SIGN=1, else helper. */
   mode?: "auto" | "helper" | "local";
+  /** Explicit helper path takes precedence over the environment. */
+  // Path and mode must match TransparencyDaemonScheduledEmitInput.signer in server/src/cli/castle-wall.ts.
+  signerClientPath?: string;
   /** Override the shim runner (tests). */
   signerClientInvoke?: ShimInvoker;
   /** Override the root-owned global pin path (tests). */
@@ -78,7 +81,8 @@ export async function resolveTransparencySigner(
     );
   }
 
-  const clientBinaryPath = env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+  // The caller's resolved path binds checkpoint signing to its selected enforcement signer.
+  const clientBinaryPath = input.signerClientPath ?? env.SANCTUARY_CASTLE_SIGNER_CLIENT;
   if (!clientBinaryPath && !input.signerClientInvoke) {
     throw new TransparencyEmitError(
       "no checkpoint signer available: set SANCTUARY_CASTLE_SIGNER_CLIENT to the castle-wall-signer-client shim path (helper custody), or pass --local-sign / SANCTUARY_CASTLE_LOCAL_SIGN=1 for the dev local-key path; refusing to emit unsigned"

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- Scheduled checkpoints on the installed full service use the signer client the wall already resolved, and the install preflight reports its path.
+
 - The optional Telegram liveness probe now bounds the full request sequence and response size and validates reply fields.
 - The full daemon now reports audit write-lock recoveries it observes in its own process, and the wall reads degraded for the history window after one. A recovery that ends the daemon is reported as a recent restart. `castle-wall status` still exits 1 until the observer is installed and commissioned.
 - Added `castle-wall liveness-status`, which reports wall, agent and coverage separately from stored evidence. `castle-wall status` and `castle-wall full-status` now exit 0 only when that wall evidence is fresh and complete, so a running daemon alone no longer exits 0; missing required evidence makes them exit 1. `install-full --preflight` checks for a stable Node path before any change.
