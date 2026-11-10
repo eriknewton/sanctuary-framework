@@ -212,6 +212,8 @@ export const HISTORY_WINDOW = 30 * MINUTE;
 export const RECOVERY_GAP = 2 * OBSERVER_PERIOD;
 const KIB = 1024;
 export const STATUS_BYTES = 64 * KIB;
+/** Optional probe responses share the bounded status-record byte budget. */
+export const HTTP_BODY_BYTES = STATUS_BYTES;
 export const CONFIG_BYTES = 16 * KIB;
 /** Policy capacity: qualifying messaging-set candidates stored per sample. */
 export const CENSUS_PID_ROWS = 4;

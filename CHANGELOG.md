@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- The optional Telegram liveness probe now bounds the full request sequence and response size, validates reply fields and keeps provider error text out of results.
+
 - Added `castle-wall liveness-status`, which reports wall, agent and coverage separately from stored evidence. `castle-wall status` and `castle-wall full-status` now exit 0 only when that wall evidence is fresh and complete, so a running daemon alone no longer exits 0; until the observer and lock-recovery telemetry ship, they exit 1 on every host. `install-full --preflight` checks for a stable Node path before any change.
 - Added the wall observer, installed with `castle-wall install-watch` and removed with `castle-wall uninstall-watch`. A correctly commissioned Mac can reach a healthy wall reading once lock-recovery telemetry also lands. Missing monitoring reads the wall DOWN, while an agent that is not monitored reads UNMONITORED. The canary needs two commands run as root, which the CLI prints.
 - The full Castle Wall daemon now maintains `liveness/daemon.json.publisher` alongside its stored liveness record.

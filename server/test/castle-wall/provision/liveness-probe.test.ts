@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -21,6 +21,7 @@ import {
   type TelegramLivenessProbeAuditSink,
   type TelegramLivenessProbeConfig,
 } from "../../../src/castle-wall/provision/liveness-probe.js";
+import { HTTP_BODY_BYTES, STATUS_BYTES } from "../../../src/castle-wall/liveness/constants.js";
 import { readFileCustodyWithStats } from "../../../src/storage/custody-fs.js";
 
 const PROBE_TOKEN = "123456:PROBE_TOKEN";
@@ -108,6 +109,8 @@ class MockTelegramBotApi {
 const runningApis: MockTelegramBotApi[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   await Promise.all(runningApis.splice(0).map((api) => api.stop()));
 });
 
@@ -714,3 +717,150 @@ function jsonResponse(status: number, body: Record<string, unknown>): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+describe("bounded probe transport", () => {
+  it("uses the status byte budget for response bodies", () => {
+    expect(HTTP_BODY_BYTES).toBe(STATUS_BYTES);
+  });
+
+  it.each(["single chunk", "split chunks", "multibyte text"])("cancels an oversized %s before parsing", async (shape) => {
+    const cancel = vi.fn();
+    const bytes = shape === "multibyte text"
+      ? new TextEncoder().encode("é".repeat(STATUS_BYTES / 2) + " ")
+      : new Uint8Array(STATUS_BYTES + 1).fill(32);
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (shape === "split chunks") {
+          controller.enqueue(bytes.subarray(0, STATUS_BYTES));
+          controller.enqueue(bytes.subarray(STATUS_BYTES));
+        } else controller.enqueue(bytes);
+      },
+      cancel,
+    }));
+    const parse = vi.spyOn(JSON, "parse");
+    const json = vi.spyOn(response, "json").mockResolvedValue({ ok: true, result: [] });
+    const result = await runTelegramLivenessProbe({
+      config: BASE_CONFIG,
+      ops: { ...fakeOps(), fetch: vi.fn().mockResolvedValue(response) },
+    });
+    expect(result.kind).toBe("unverified");
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(parse).not.toHaveBeenCalled();
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it("accepts a body exactly at the byte limit and shares one signal through a complete round trip", async () => {
+    const api = await makeApi();
+    api.getUpdatesQueue = [[], (server) => [replyUpdate(server)]];
+    const signals: Array<AbortSignal | null | undefined> = [];
+    const fetcher: typeof fetch = async (url, init) => {
+      signals.push(init?.signal);
+      const response = await api.fetch(url, init);
+      if (signals.length !== 1) return response;
+      const text = await response.text();
+      return new Response(text.padEnd(STATUS_BYTES, " "));
+    };
+    const result = await runTelegramLivenessProbe({ config: BASE_CONFIG, ops: { ...fakeOps(), fetch: fetcher } });
+    expect(result.kind).toBe("round_trip");
+    expect(signals).toHaveLength(3);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals.every(signal => signal === signals[0])).toBe(true);
+  });
+
+  it.each(["drain", "send", "reply"])("aborts a stalled %s body at the outer deadline", async (stage) => {
+    vi.useFakeTimers();
+    const cancel = vi.fn();
+    const api = await makeApi();
+    const signals: Array<AbortSignal | null | undefined> = [];
+    const stallAt = ["drain", "send", "reply"].indexOf(stage);
+    let calls = 0;
+    let settled = false;
+    const fetcher: typeof fetch = async (url, init) => {
+      signals.push(init?.signal);
+      if (calls++ === stallAt) return new Response(new ReadableStream({ cancel }));
+      return api.fetch(url, init);
+    };
+    const result = runTelegramLivenessProbe({ config: BASE_CONFIG, ops: { ...fakeOps(), fetch: fetcher } });
+    void result.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(BASE_CONFIG.timeoutMs - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    expect(await result).toMatchObject({ kind: "unverified" });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(signals.every(signal => signal === signals[0])).toBe(true);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it("includes time spent draining and sending in the reply deadline", async () => {
+    vi.useFakeTimers();
+    const api = await makeApi();
+    const cancel = vi.fn();
+    let calls = 0;
+    let settled = false;
+    const fetcher: typeof fetch = async (url, init) => {
+      if (calls++ === 2) return new Response(new ReadableStream({ cancel }));
+      await new Promise(resolve => setTimeout(resolve, BASE_CONFIG.pollIntervalMs));
+      return api.fetch(url, init);
+    };
+    const result = runTelegramLivenessProbe({ config: BASE_CONFIG, ops: { ...fakeOps(), fetch: fetcher } });
+    void result.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(BASE_CONFIG.timeoutMs);
+    expect(settled).toBe(true);
+    expect(await result).toMatchObject({ kind: "unverified" });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(calls).toBe(3);
+  });
+
+  it("ignores a reply delivered after abort and cancels its unread body", async () => {
+    vi.useFakeTimers();
+    const api = await makeApi();
+    let deliver!: (response: Response) => void;
+    let calls = 0;
+    let settled = false;
+    const fetcher: typeof fetch = async (url, init) => {
+      if (calls++ === 2) return new Promise<Response>(resolve => { deliver = resolve; });
+      return api.fetch(url, init);
+    };
+    const result = runTelegramLivenessProbe({ config: BASE_CONFIG, ops: { ...fakeOps(), fetch: fetcher } });
+    void result.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(BASE_CONFIG.timeoutMs);
+    expect(settled).toBe(true);
+    expect(await result).toMatchObject({ kind: "unverified" });
+    const cancel = vi.fn();
+    deliver(new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify({ ok: true, result: [replyUpdate(api)] }))); },
+      cancel,
+    })));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(await result).toMatchObject({ kind: "unverified" });
+  });
+
+  it.each([null, [], { ok: "true", result: [] }, { ok: true, result: [null] },
+    { ok: true, result: [{ update_id: 1, message: null }] },
+    { ok: true, result: [{ update_id: 1, message: { message_id: 2, from: [] } }] },
+    { ok: true, result: [{ update_id: 1, message: { message_id: 2, text: {} } }] },
+  ])("refuses malformed response fields before reply attribution: %j", async (body) => {
+    const result = await runTelegramLivenessProbe({ config: BASE_CONFIG, ops: {
+      ...fakeOps(), fetch: vi.fn().mockResolvedValue(new Response(JSON.stringify(body))),
+    } });
+    expect(result).toMatchObject({ kind: "unverified" });
+  });
+
+  it.each(["fetch", "body", "provider", "invalid JSON"])("keeps token-bearing %s errors out of results and audit", async (stage) => {
+    const secret = `${PROBE_TOKEN} ${encodeURIComponent(PROBE_TOKEN)}`;
+    const audit = makeAudit();
+    const fetcher: typeof fetch = async () => {
+      if (stage === "fetch") throw new Error(secret);
+      if (stage === "body") return new Response(new ReadableStream({ start(controller) { controller.error(new Error(secret)); } }));
+      if (stage === "invalid JSON") return new Response(secret);
+      return jsonResponse(500, { ok: false, description: secret });
+    };
+    const result = await runTelegramLivenessProbe({ config: BASE_CONFIG, ops: { ...fakeOps(), fetch: fetcher }, audit: audit.audit });
+    expect(result.kind).toBe("unverified");
+    const rendered = JSON.stringify({ result, audit: audit.entries });
+    expect(rendered).not.toContain(PROBE_TOKEN);
+    expect(rendered).not.toContain(encodeURIComponent(PROBE_TOKEN));
+  });
+});
