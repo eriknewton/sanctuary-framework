@@ -6,7 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { AuditLog } from "../../../src/operational/audit-log.js";
+import { AuditLog, AuditLockHoldDeadlineError } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
@@ -17,7 +17,7 @@ import {
   type MacOSCastleWallDaemonInput,
   type MacOSCastleWallListenerOptions,
 } from "../../../src/castle-wall/runtime/index.js";
-import { canaryWindow, SECOND } from "../../../src/castle-wall/liveness/constants.js";
+import { canaryWindow, HISTORY_WINDOW, SECOND } from "../../../src/castle-wall/liveness/constants.js";
 import { evaluateLiveness } from "../../../src/castle-wall/liveness/evaluate.js";
 import { readLivenessRecords } from "../../../src/castle-wall/liveness/read-status.js";
 import { parseDaemonRecord, REQUIRED_RECORDER_HOOKS } from "../../../src/castle-wall/liveness/schema.js";
@@ -26,6 +26,9 @@ const silent = new Writable({ write(_chunk, _encoding, callback) { callback(); }
 const UID = process.getuid?.() ?? 0;
 const BOOT = "boot-wired-fixture";
 const UPTIME = 5_000_000;
+// A short real hold deadline forces recovery without waiting for the production deadline.
+const LOCK_HOLD_MS = SECOND / 10;
+const TICK_SECONDS = 1 / 100; // One hundred publication ticks per second in this fixture.
 const STATES = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")) as { base: any }; // Untyped fixture JSON, patched by path.
 
 const hermeticGlobalPinPath = (fortressPath: string) => join(fortressPath, "test-system", "castle-pinned-pubkey.bin");
@@ -64,7 +67,7 @@ describe("wired daemon recorder", () => {
   const tempDirs: string[] = [];
   afterEach(async () => { for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
 
-  async function provisionFortress() {
+  async function provisionFortress(writeLockHoldDeadlineMs?: number) {
     const fortressPath = await mkdtemp(join(tmpdir(), "cw-live-"));
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
@@ -74,7 +77,7 @@ describe("wired daemon recorder", () => {
     const pin = await runProvisionPin([], { out: silent, err: silent, globalPinnedPublicKeyPath: hermeticGlobalPinPath(fortressPath),
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey } });
     expect(pin).toBe(0);
-    const auditLog = new AuditLog(new FilesystemStorage(join(fortressPath, "state")), masterKey, { integrityMode: "lenient" });
+    const auditLog = new AuditLog(new FilesystemStorage(join(fortressPath, "state")), masterKey, { integrityMode: "lenient", writeLockHoldDeadlineMs });
     return { fortressPath, masterKey, auditLog };
   }
   const daemonJson = (fortressPath: string) => join(fortressPath, "liveness", "daemon.json");
@@ -102,7 +105,7 @@ describe("wired daemon recorder", () => {
       const parsed = parseDaemonRecord(record);
       expect(parsed.ok, JSON.stringify(parsed)).toBe(true);
       for (const hook of REQUIRED_RECORDER_HOOKS) expect(record.raw.hooks[hook], hook).toBe(true);
-      expect(record.raw.lock_recovery).toEqual({ state: "not_instrumented" });
+      expect(record.raw.lock_recovery).toEqual({ state: "instrumented", count: 0, last_at_ms: null });
       expect(record).toMatchObject({ boot_id: BOOT, instance_started_uptime_ms: UPTIME, subject: { fortress_id: "fortress-test", platform: "darwin", operator_uid: UID } });
       // No signed agent origin is loaded, so the canary adapter is unsupported, never a uid adapter by default.
       expect(record.raw.canary.adapter).toBe("unsupported");
@@ -117,6 +120,79 @@ describe("wired daemon recorder", () => {
         delete missing.daemon.value.raw.hooks[hook];
         expect(evaluateLiveness(missing).wall.reasons, hook).toContain("evidence_incomplete");
       }
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  async function forceRecovery(auditLog: AuditLog): Promise<void> {
+    // Exercise the shipped lock deadline with a held operation; no callback or recorder is injected.
+    const lock = auditLog as unknown as { withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T> };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await expect(lock.withAuditWriteLock(() => held)).rejects.toBeInstanceOf(AuditLockHoldDeadlineError);
+    } finally {
+      release();
+    }
+  }
+
+  it("publishes a forced recovery and the evaluator degrades through the history boundary only", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress(LOCK_HOLD_MS);
+    const recoveredAt = STATES.base.nowMs - HISTORY_WINDOW;
+    const handle = await startDaemon({
+      fortressPath, fortressId: "fortress-test", masterKey, localSign: true, auditLog, platform: "darwin",
+      activeConfigPath: join(fortressPath, "active.json"), listenerFactory: fakeListenerFactory,
+      now: () => recoveredAt, emissionLivenessTickSeconds: TICK_SECONDS,
+      livenessHostClock: { bootId: async () => BOOT, uptimeMs: () => UPTIME },
+    });
+    try {
+      const before = await waitForSequence(fortressPath, 1);
+      await forceRecovery(auditLog);
+      expect(auditLog.getWriteLockRecoveryCount()).toBe(1);
+      // Let an already-started publication drain before reading the next complete tick.
+      const afterRecovery = await waitForSequence(fortressPath, before.sequence + 1);
+      const record = await waitForSequence(fortressPath, afterRecovery.sequence + 1);
+      expect(parseDaemonRecord(record).ok).toBe(true);
+      expect(record.raw.lock_recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: recoveredAt });
+      // The remaining gates use the existing valid fixture; lock evidence is the exact published consumer value.
+      const input = structuredClone(STATES.base);
+      input.daemon.value.raw.lock_recovery = record.raw.lock_recovery;
+      for (const age of [HISTORY_WINDOW - 1, HISTORY_WINDOW]) {
+        input.nowMs = recoveredAt + age;
+        const wall = evaluateLiveness(input).wall;
+        expect(wall.reasons).toContain("write_lock_recovery");
+        expect(wall.state).toBe("wall_DEGRADED");
+      }
+      input.nowMs = recoveredAt + HISTORY_WINDOW + 1;
+      const aged = evaluateLiveness(input).wall;
+      expect(aged.reasons).not.toContain("write_lock_recovery");
+      expect(aged.state).toBe("wall_OK_AGED_HISTORY");
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it("seeds a recovery during the boot read before the recorder subscribes", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress(LOCK_HOLD_MS);
+    const recoveredAt = STATES.base.nowMs;
+    const handle = await startDaemon({
+      fortressPath, fortressId: "fortress-test", masterKey, localSign: true, auditLog, platform: "darwin",
+      activeConfigPath: join(fortressPath, "active.json"), listenerFactory: fakeListenerFactory,
+      now: () => recoveredAt, emissionLivenessTickSeconds: TICK_SECONDS,
+      livenessHostClock: {
+        bootId: async () => { await forceRecovery(auditLog); return BOOT; },
+        uptimeMs: () => UPTIME,
+      },
+    });
+    try {
+      expect(auditLog.getWriteLockRecoveryCount()).toBe(1);
+      const record = await waitForSequence(fortressPath, 1);
+      expect(record.raw.lock_recovery).toEqual({ state: "instrumented", count: 1, last_at_ms: recoveredAt });
+      await forceRecovery(auditLog);
+      const next = await waitForSequence(fortressPath, record.sequence + 1);
+      const later = await waitForSequence(fortressPath, next.sequence + 1);
+      expect(later.raw.lock_recovery.count).toBe(2); // The seeded event plus one subscribed event, with no double count.
     } finally {
       await handle.stop();
     }

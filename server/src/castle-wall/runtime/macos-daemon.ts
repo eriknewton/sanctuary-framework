@@ -960,7 +960,9 @@ export async function startMacOSCastleWallDaemon(
   // `audit_write_degraded_count` marker used for dropped reload audit writes,
   // keeping the degradation visible in the tamper-evident chain without adding
   // a new audit operation or enum.
+  let lastWriteLockRecoveryAtMs: number | null = null;
   input.auditLog.onWriteLockRecovery(() => {
+    lastWriteLockRecoveryAtMs = nowMs();
     degradedCarry.record();
   });
   const agentEgressProbeIntervalSeconds =
@@ -1257,7 +1259,7 @@ export async function startMacOSCastleWallDaemon(
 
   // The full daemon's liveness recorder. It is independent telemetry: a failure here never disables enforcement or releases an audit lock.
   const livenessRecorder = daemonMode === "full"
-    ? await createLivenessRecorder(input, () => manifestState.signed.manifest.agent_origin, nowMs)
+    ? await createLivenessRecorder(input, () => manifestState.signed.manifest.agent_origin, nowMs, () => lastWriteLockRecoveryAtMs)
     : null;
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
@@ -3188,6 +3190,7 @@ async function createLivenessRecorder(
   input: MacOSCastleWallDaemonInput,
   agentOrigin: () => { mode?: unknown; agent_uid?: unknown; gate_uid?: unknown } | undefined | null,
   now: () => number,
+  lastWriteLockRecoveryAtMs: () => number | null,
 ): Promise<LivenessRecorder> {
   const uptimeMs = input.livenessHostClock?.uptimeMs ?? (() => Math.floor(osUptime() * LIVENESS_SECOND));
   // A failed boot read publishes boot_id null, which every reader takes as untrusted time.
@@ -3207,5 +3210,15 @@ async function createLivenessRecorder(
     pid: process.pid,
     instance: randomBytes(LIVENESS_INSTANCE_BYTES).toString("hex"),
     origin: () => canaryOriginFrom(input.fortressId, agentOrigin()),
+    // Must match LivenessRecorderOptions.lockRecovery in liveness/recorder.ts: seed before observing subsequent events.
+    lockRecovery: {
+      // Seed after the boot read so recoveries since the first subscription are not lost before recorder construction.
+      count: input.auditLog.getWriteLockRecoveryCount(),
+      lastAtMs: lastWriteLockRecoveryAtMs(),
+      subscribe: listener => input.auditLog.onWriteLockRecovery(() => {
+        // Observation must never fail the append path, await work, or write audit bytes.
+        try { listener(lastWriteLockRecoveryAtMs()!); } catch { /* Telemetry cannot interrupt recovery. */ }
+      }),
+    },
   });
 }
