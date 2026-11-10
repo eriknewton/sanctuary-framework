@@ -1,0 +1,152 @@
+{
+  "description": "Audit details for the canary monitoring-origin tuple and its near misses, in the nested and flat stored shapes. Fixture values; the canary tuple is 192.0.2.254:9/tcp with no host.",
+  "cases": [
+    {
+      "name": "canary drop nested",
+      "operation": "egress_blocked",
+      "shape": "nested",
+      "details": {
+        "agent": {
+          "id": "agent-1",
+          "template": "claude-code"
+        },
+        "destination": {
+          "ip": "192.0.2.254",
+          "port": 9,
+          "protocol": "tcp"
+        },
+        "decision": "drop",
+        "rule_id": null,
+        "source": "macos_extension"
+      },
+      "excluded": true
+    },
+    {
+      "name": "canary drop flat",
+      "operation": "egress_blocked",
+      "shape": "flat",
+      "details": {
+        "agent_id": "agent-1",
+        "agent_template": "claude-code",
+        "dest_ip": "192.0.2.254",
+        "dest_port": 9,
+        "dest_protocol": "tcp",
+        "opaque": false,
+        "decision_provenance": "default_deny"
+      },
+      "excluded": true
+    },
+    {
+      "name": "near miss address",
+      "operation": "egress_blocked",
+      "shape": "nested",
+      "details": {
+        "agent": {
+          "id": "agent-1",
+          "template": "claude-code"
+        },
+        "destination": {
+          "ip": "192.0.2.253",
+          "port": 9,
+          "protocol": "tcp"
+        },
+        "decision": "drop",
+        "rule_id": null,
+        "source": "macos_extension"
+      },
+      "excluded": false
+    },
+    {
+      "name": "near miss port",
+      "operation": "egress_blocked",
+      "shape": "flat",
+      "details": {
+        "agent_id": "agent-1",
+        "agent_template": "claude-code",
+        "dest_ip": "192.0.2.254",
+        "dest_port": 10,
+        "dest_protocol": "tcp",
+        "opaque": false,
+        "decision_provenance": "default_deny"
+      },
+      "excluded": false
+    },
+    {
+      "name": "near miss protocol",
+      "operation": "egress_blocked",
+      "shape": "nested",
+      "details": {
+        "agent": {
+          "id": "agent-1",
+          "template": "claude-code"
+        },
+        "destination": {
+          "ip": "192.0.2.254",
+          "port": 9,
+          "protocol": "udp"
+        },
+        "decision": "drop",
+        "rule_id": null,
+        "source": "macos_extension"
+      },
+      "excluded": false
+    },
+    {
+      "name": "hostful nested",
+      "operation": "egress_blocked",
+      "shape": "nested",
+      "details": {
+        "agent": {
+          "id": "agent-1",
+          "template": "claude-code"
+        },
+        "destination": {
+          "ip": "192.0.2.254",
+          "port": 9,
+          "protocol": "tcp",
+          "host": "canary.example"
+        },
+        "decision": "drop",
+        "rule_id": null,
+        "source": "macos_extension"
+      },
+      "excluded": false
+    },
+    {
+      "name": "hostful flat",
+      "operation": "egress_blocked",
+      "shape": "flat",
+      "details": {
+        "agent_id": "agent-1",
+        "agent_template": "claude-code",
+        "dest_ip": "192.0.2.254",
+        "dest_port": 9,
+        "dest_protocol": "tcp",
+        "opaque": false,
+        "decision_provenance": "default_deny",
+        "dest_host": "canary.example"
+      },
+      "excluded": false
+    },
+    {
+      "name": "allow to canary",
+      "operation": "egress_allowed",
+      "shape": "nested",
+      "details": {
+        "agent": {
+          "id": "agent-1",
+          "template": "claude-code"
+        },
+        "destination": {
+          "ip": "192.0.2.254",
+          "port": 9,
+          "protocol": "tcp"
+        },
+        "decision": "allow",
+        "rule_id": null,
+        "source": "macos_extension"
+      },
+      "excluded": false
+    }
+  ]
+}

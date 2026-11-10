@@ -126,6 +126,14 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { consumeFlagValue } from "./argv.js";
+import { LIVENESS_EXIT_DOWN } from "../castle-wall/liveness/constants.js";
+import {
+  evaluateFortressLiveness,
+  formatLivenessLines,
+  productionDaemonLivenessClock,
+  wallOnlyStatusExit,
+  type LivenessReaderContext,
+} from "./castle-wall-liveness-status.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
@@ -200,6 +208,8 @@ export interface CastleWallCommandContext {
   selectorRoots?: SelectorRoots;
   out?: Writable;
   err?: Writable;
+  /** INTERNAL/TEST: the shared liveness reader's injected clock, boot provider and filesystem for `status`. */
+  liveness?: LivenessReaderContext;
   /** INTERNAL/TEST: route operator warnings across the Darwin capability boundary. */
   warn?: (message: string) => void;
   env?: NodeJS.ProcessEnv;
@@ -693,8 +703,8 @@ function formatDeadManLeaseStatus(
   const enforcementActive = contentFilterState === "enabled";
   const label =
     lease.armed && !enforcementActive
-      ? "Dead-man lease (advisory broadcast, not enforcement): armed"
-      : `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}`;
+      ? "Last CLI arm request (advisory, not enforcement): armed"
+      : `Last CLI arm request (advisory): ${lease.armed ? "armed" : "disarmed"}`;
   return (
     `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
@@ -2445,7 +2455,7 @@ export async function runStatus(
 
   if (platform !== "darwin") {
     write(out, "Castle Wall sysext: not applicable (non-macOS)\n");
-    return 0;
+    return appendLivenessAndExit(out, storagePath, platform, ctx);
   }
 
   // F3 - surface the GLOBAL pin (the actual enforcement anchor) and a
@@ -2531,7 +2541,28 @@ export async function runStatus(
   if (lease) {
     write(out, formatDeadManLeaseStatus(lease, contentFilterState));
   }
-  return 0;
+  return appendLivenessAndExit(out, storagePath, platform, ctx);
+}
+
+/**
+ * Append the three Liveness lines and return the wall-only exit. Exit codes
+ * must match the exit constants in server/src/castle-wall/liveness/constants.ts.
+ */
+async function appendLivenessAndExit(
+  out: Writable,
+  storagePath: string,
+  platform: NodeJS.Platform | string,
+  ctx: CastleWallCommandContext,
+): Promise<number> {
+  try {
+    const envelope = await evaluateFortressLiveness(storagePath, { ...ctx.liveness, platform });
+    write(out, formatLivenessLines(envelope));
+    // The status exit is the shared evaluator's wall verdict; earlier lines never set it.
+    return wallOnlyStatusExit(envelope);
+  } catch {
+    // The shared reader could not evaluate, which is never a wall OK.
+    return LIVENESS_EXIT_DOWN;
+  }
 }
 
 /**
@@ -2973,6 +3004,8 @@ export async function runDaemon(
         // token). This is the console-login enforcement path that holds the
         // fortress key + reaches the audit-producer signing service.
         daemonMode: "full",
+        // The liveness recorder reads the boot identity once at start through the same provider as the reader.
+        livenessHostClock: ctx.liveness?.daemonHostClock ?? productionDaemonLivenessClock,
         ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
         ...(localSign ? { localSign: true } : {}),
         ...(resolvedSignerClient

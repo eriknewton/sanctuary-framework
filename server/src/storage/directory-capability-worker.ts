@@ -13,7 +13,9 @@ import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { Writable } from "node:stream";
 import { isAbsolute, join, normalize, sep } from "node:path";
 
-import { FilesystemStorage } from "./filesystem.js";
+import { storageNamespacePathComponent } from "./namespace-component.js";
+// Must match createDirectoryCapabilityWorkerStorage in filesystem.ts, the only construction path for the worker exemption.
+import { createDirectoryCapabilityWorkerStorage, type FilesystemStorage, serializeCapabilityError } from "./filesystem.js";
 import {
   cleanupFreshInitRecoveryResidue,
   isFreshFortressOrExactLockScaffold,
@@ -22,7 +24,7 @@ import {
 import { tightenStoragePermissions } from "./permissions.js";
 import { writeRecoveryKeyFile } from "../wrap/recovery-key-disclosure.js";
 import { runProvisionPinAlreadyLocked } from "../cli/castle-wall.js";
-import { readFileCustody, writeFileCustody } from "./custody-fs.js";
+import { readFileCustody, writeFileCustodyWithDurability, ensureDirectoryStrict } from "./custody-fs.js";
 
 interface Request {
   id: number;
@@ -82,13 +84,18 @@ async function syncCwd(): Promise<void> {
   }
 }
 
-async function mkdirRelative(relativePath: string, mode: number): Promise<void> {
+async function mkdirRelative(relativePath: string, mode: number, strictDurability: boolean): Promise<void> {
   if (
     isAbsolute(relativePath) ||
     normalize(relativePath) !== relativePath ||
     relativePath.split(sep).some((part) => part === "" || part === "." || part === "..")
   ) {
     throw new Error("directory-capability mkdir path must be normalized and relative");
+  }
+  if (strictDurability) {
+    // The forwarded strict binding supplies cwd authority and every child barrier retains its captured descriptor.
+    await ensureDirectoryStrict(relativePath, mode, ".");
+    return;
   }
   let cursor = ".";
   for (const part of relativePath.split(sep)) {
@@ -111,6 +118,18 @@ async function mkdirRelative(relativePath: string, mode: number): Promise<void> 
   }
 }
 
+function strictWriteTarget(storage: FilesystemStorage, owner: { uid: number; gid: number } | undefined, request: Request): { storage: FilesystemStorage; namespace: string; args: unknown[] } {
+  const parsed = requestNamespaceArg(request);
+  if (request.boundNamespace) return { storage, ...parsed };
+  // Must match the original-buffer authorization before strict worker dispatch in filesystem.ts.
+  // The private IPC executor preserves parent-authorized bytes without reauthorizing a decoded buffer.
+  return {
+    storage: createDirectoryCapabilityWorkerStorage(storageNamespacePathComponent(parsed.namespace), owner),
+    namespace: DARWIN_BOUND_NAMESPACE_TOKEN,
+    args: parsed.args,
+  };
+}
+
 async function perform(
   storage: FilesystemStorage,
   owner: { uid: number; gid: number } | undefined,
@@ -125,6 +144,20 @@ async function perform(
       // state reaches this backend, and the child only preserves that write.
       await storage.write(namespace, String(args[0]), bytes(args[1]));
       return null;
+    }
+    // Must match StrictDurabilityStorageCapabilities in interface.ts and filesystem.ts dispatch.
+    case "writeStrict": {
+      const { storage: target, namespace, args } = strictWriteTarget(storage, owner, request);
+      await target.writeStrict(namespace, String(args[0]), bytes(args[1]));
+      return null;
+    }
+    case "writeIfAbsentStrict": {
+      const { storage: target, namespace, args } = strictWriteTarget(storage, owner, request);
+      return target.writeIfAbsentStrict(namespace, String(args[0]), bytes(args[1]));
+    }
+    case "replaceIfEqualsStrict": {
+      const { storage: target, namespace, args } = strictWriteTarget(storage, owner, request);
+      return target.replaceIfEqualsStrict(namespace, String(args[0]), bytes(args[1]), bytes(args[2]));
     }
     case "writeDurable": {
       const { namespace, args } = requestNamespaceArg(request);
@@ -174,8 +207,11 @@ async function perform(
     case "tighten":
       await tightenStoragePermissions(".");
       return null;
+    case "mkdirStrict":
+      await mkdirRelative(String(a[0]), Number(a[1]), true);
+      return null;
     case "mkdir":
-      await mkdirRelative(String(a[0]), Number(a[1]));
+      await mkdirRelative(String(a[0]), Number(a[1]), false);
       return null;
     case "isFreshExceptLockScaffold":
       return isFreshFortressOrExactLockScaffold(".", String(a[0]));
@@ -261,9 +297,12 @@ async function perform(
         throw error;
       }
     }
+    case "writeFileStrict":
     case "writeFile":
-      await writeFileCustody(singleFileName(a[0]), bytes(a[1]), {
+      await writeFileCustodyWithDurability(singleFileName(a[0]), bytes(a[1]), {
         mode: a[2] === undefined ? 0o600 : Number(a[2]),
+        // Must match writeStableFortressFile in filesystem.ts.
+        strictDurability: request.op === "writeFileStrict",
         createParent: false,
         ...(owner ? { owner, ownerBase: ".", stableDirectoryCapability: true } : {}),
       });
@@ -313,10 +352,7 @@ async function main(): Promise<void> {
   if (owner && (!Number.isSafeInteger(owner.uid) || !Number.isSafeInteger(owner.gid))) {
     throw new Error("invalid directory-capability owner identity");
   }
-  const storage = new FilesystemStorage(".", {
-    ...(owner ? { owner } : {}),
-    allowDirectoryCapabilityRootNamespace: true,
-  });
+  const storage = createDirectoryCapabilityWorkerStorage(".", owner);
   process.on("message", (raw: Request) => {
     void (async () => {
       try {
@@ -326,25 +362,8 @@ async function main(): Promise<void> {
         process.send?.({
           id: raw.id,
           ok: false,
-          error: {
-            message: error instanceof Error ? error.message : String(error),
-            code:
-              error instanceof Error && "code" in error
-                ? String((error as NodeJS.ErrnoException).code)
-                : undefined,
-            kind:
-              error instanceof Error && "kind" in error
-                ? String((error as { kind?: unknown }).kind)
-                : undefined,
-            rawName:
-              error instanceof Error && "rawName" in error && typeof (error as { rawName?: unknown }).rawName === "string"
-                ? (error as { rawName: string }).rawName
-                : undefined,
-            rawNamespace:
-              error instanceof Error && "rawNamespace" in error && typeof (error as { rawNamespace?: unknown }).rawNamespace === "string"
-                ? (error as { rawNamespace: string }).rawNamespace
-                : undefined,
-          },
+          // Must match deserializeCapabilityError in filesystem.ts so every barrier failure crosses IPC.
+          error: serializeCapabilityError(error),
         });
       }
     })();

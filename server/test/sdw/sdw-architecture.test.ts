@@ -20,6 +20,7 @@ import { relative, join, dirname, isAbsolute, normalize } from "node:path";
 import { describe, expect, it } from "vitest";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { READ_ONLY_STORAGE_MUTATING_METHODS } from "../../src/storage/read-only-guard.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { stateKey } from "../../src/sdw/grammar.js";
 import {
@@ -628,7 +629,7 @@ function findStorageBackendImplementationOffenders(source: string, path: string)
 
   const durableWriteBlocks = extractBalancedBlocks(
     source,
-    /\basync\s+writeDurable\s*\([^)]*\)\s*(?::\s*Promise<void>)?/g,
+    /\basync\s+(?:writeDurable|writeStrict|writeIfAbsentStrict|replaceIfEqualsStrict)\s*\([^)]*\)\s*(?::\s*Promise<[^>]+>)?/g,
   );
   for (const durableWrite of durableWriteBlocks) {
     if (
@@ -689,9 +690,9 @@ function writeBlockRefusesUnconditionally(block: string): boolean {
   );
   if (throwOnly === null) return false;
   const argumentText = throwOnly[1]!;
-  return !/(\bawait\b|\.\s*write\s*\(|\.\s*writeDurable\s*\(|\.\s*delete\s*\()/.test(
-    argumentText
-  );
+  // Must match READ_ONLY_STORAGE_MUTATING_METHODS in read-only-guard.ts, including strict mutations.
+  return !/\bawait\b/.test(argumentText) && !READ_ONLY_STORAGE_MUTATING_METHODS.some((method) =>
+    new RegExp(String.raw`(?:\.\s*${method}\s*\(|\[\s*["']${method}["']\s*\]\s*\()`).test(argumentText));
 }
 
 function storageWriteBlockUsesSdwGuard(block: string): boolean {
@@ -1039,3 +1040,11 @@ describe("SDW receipt subject ownership", () => {
     for (const name of ["sdwTransaction", "withSdwWriteSet", "withSdwJournalAdmission", "sdwSigningBytes", "parseSdwJournalRecord"]) expect(barrel).not.toHaveProperty(name);
   });
 });
+
+for (const method of ["writeStrict", "writeIfAbsentStrict", "replaceIfEqualsStrict"]) {
+  it(`recognizes the strict SDW gate for ${method}`, () => {
+    const source = `class Fixture implements StorageBackend { async ${method}(namespace, key, data) { await raw(data); } }`;
+    expect(findStorageBackendImplementationOffenders(source, "fixture.ts")).toHaveLength(1);
+    expect(writeBlockRefusesUnconditionally(`{ throw new Error(String(inner.${method}(ns, key, data))); }`)).toBe(false);
+  });
+}

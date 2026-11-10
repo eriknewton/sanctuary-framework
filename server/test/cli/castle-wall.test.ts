@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -47,12 +48,14 @@ import {
   runStatus,
   type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
+import { livenessFortressId } from "../../src/cli/castle-wall-liveness-status.js";
 import {
   LINUX_PRODUCER_SIGNED_ACTIVATION_ENV,
   type CastleWallActivationCompleteness,
 } from "../../src/castle-wall/runtime/linux-activation-gate.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
+import { parseTrustAnchor } from "../../src/cli/install.js";
 import { runInit } from "../../src/wrap/init.js";
 import {
   CrossProcessLockError,
@@ -539,7 +542,7 @@ describe("castle-wall CLI verbs", () => {
       platform: "linux",
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain(`Pinned key fingerprint: ${fingerprint(pub)}`);
   });
 
@@ -552,7 +555,7 @@ describe("castle-wall CLI verbs", () => {
       platform: "linux",
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain(
       "No pinned key provisioned. Run: sanctuary castle-wall provision-pin",
     );
@@ -567,7 +570,7 @@ describe("castle-wall CLI verbs", () => {
       platform: "linux",
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain("Castle Wall sysext: not applicable (non-macOS)");
   });
 
@@ -589,7 +592,7 @@ describe("castle-wall CLI verbs", () => {
       hostAppCandidates: [],
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain("Castle Wall sysext: [activated enabled]");
     expect(out.text()).not.toContain("Content filter:");
   });
@@ -639,7 +642,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain("Content filter: enabled");
       expect(calls).toEqual([[hostAppPath, "--headless", "status"]]);
     });
@@ -678,12 +681,60 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain("Content filter: enabled");
       expect(out.text()).toContain(
-        "Dead-man lease broadcast: disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
+        "Last CLI arm request (advisory): disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
       );
       expect(out.text()).not.toContain("Dead-man lease: disarmed");
+    });
+
+    async function leaseStatusText(armed: boolean, filterState: "enabled" | "disabled"): Promise<string> {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-lease.json"),
+        JSON.stringify({ armed, ttl_seconds: 60, heartbeat_interval_seconds: 5, updated_at: "2026-06-26T08:00:00.000Z", source: "castle-wall-cli" }, null, 2) + "\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({ stdout: JSON.stringify({ ok: true, action: "status", state: filterState }) + "\n", exitCode: 0 });
+      await runStatus([], {
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () => "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+      return out.text();
+    }
+
+    it("labels an armed lease as the last CLI arm request, advisory", async () => {
+      expect(await leaseStatusText(true, "enabled")).toContain(
+        "Last CLI arm request (advisory): armed; content-filter=enabled; ttl=60s; heartbeat=5s; updated=2026-06-26T08:00:00.000Z\n",
+      );
+    });
+
+    it("marks an armed lease not enforcement while the content filter is not enabled", async () => {
+      expect(await leaseStatusText(true, "disabled")).toContain(
+        "Last CLI arm request (advisory, not enforcement): armed; content-filter=disabled; ttl=60s; heartbeat=5s; updated=2026-06-26T08:00:00.000Z\n",
+      );
+    });
+
+    it("leaves the install probe's parse of the status text unchanged by the lease label", async () => {
+      // Replicates the probe's three parsed lines over the same fixture with the new and the previous label text.
+      const probe = (text: string) => ({
+        contentFilter: text.includes("Content filter: enabled") ? "enabled" : text.includes("Content filter: disabled") ? "disabled" : "unknown",
+        enforcement: text.includes("Enforcement availability: live") ? "live" : text.includes("Enforcement availability: unavailable") ? "unavailable" : "undetermined",
+        trustAnchor: parseTrustAnchor(text),
+      });
+      for (const [armed, state] of [[true, "enabled"], [true, "disabled"], [false, "enabled"]] as const) {
+        const text = await leaseStatusText(armed, state);
+        const previous = text
+          .replace("Last CLI arm request (advisory, not enforcement): armed", "Dead-man lease (advisory broadcast, not enforcement): armed")
+          .replace(/Last CLI arm request \(advisory\): (armed|disarmed)/, "Dead-man lease broadcast: $1");
+        expect(previous).not.toBe(text);
+        expect(probe(text)).toEqual(probe(previous));
+      }
     });
 
     it("reports the filter disabled (sysext installed but not filtering)", async () => {
@@ -706,7 +757,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain("Castle Wall sysext: [activated enabled]");
       expect(out.text()).toContain("Content filter: disabled");
     });
@@ -734,7 +785,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain(
         "Content filter: unknown (NEFilterManager load failed)",
       );
@@ -757,7 +808,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain(
         "Content filter: unknown (host app exited with code 4)",
       );
@@ -785,7 +836,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain(
         "Content filter: unknown (host app reported state 'needs_user_approval')",
       );
@@ -807,7 +858,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain("Content filter: unknown (spawn EACCES)");
     });
 
@@ -826,7 +877,7 @@ describe("castle-wall CLI verbs", () => {
         hostAppInvoke: invoke,
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain(
         "Castle Wall sysext: not applicable (non-macOS)",
       );
@@ -1284,7 +1335,7 @@ describe("castle-wall CLI verbs", () => {
       platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath },
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain("Pinned key fingerprint:");
   });
 
@@ -2418,7 +2469,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
       globalPinReader: async () => helper.pub,
       signerClientInvoke: helper.invoke,
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain(
       `Global pin (enforcement anchor): ${fingerprint(helper.pub)}`,
     );
@@ -2442,7 +2493,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
       globalPinReader: async () => otherPin,
       signerClientInvoke: helper.invoke,
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain(
       `Global pin (enforcement anchor): ${fingerprint(otherPin)}`,
     );
@@ -2465,7 +2516,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         throw enoent;
       },
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain(
       "Global pin (enforcement anchor): none (no global pin provisioned)",
     );
@@ -2486,7 +2537,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         throw eacces;
       },
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(out.text()).toContain(
       "Global pin (enforcement anchor): unreadable (root-owned; re-run with elevation to inspect)",
     );
@@ -2624,7 +2675,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         });
       })(),
     ).resolves.toBeUndefined(); // status must NEVER throw
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     // Degraded local-key warning is printed instead of throwing.
     expect(out.text()).toContain("Local fortress key: unreadable");
     // F3 global-pin verdict still prints (the whole point of degrading).
@@ -3210,5 +3261,135 @@ describe("formatEnforcementAvailabilityStatus (querier-blindness polish, spec 20
       const text = formatEnforcementAvailabilityStatus(availability(reason));
       expect(text).not.toContain("blind, not the wall");
     }
+  });
+});
+
+describe("castle-wall status wall-only exit", () => {
+  type LivenessPatch = { op: "set" | "add" | "delete"; path: string; value?: unknown };
+  const STATES = JSON.parse(readFileSync(join(__dirname, "..", "castle-wall", "liveness", "fixtures", "states.json"), "utf8")) as { base: Record<string, any>; rows: Array<{ name: string; patches: LivenessPatch[] }> };
+  const UID = process.getuid?.() ?? 0;
+  const SEED = ed25519.utils.randomPrivateKey();
+  const PIN = Buffer.from(ed25519.getPublicKey(SEED));
+  // The signer helper reports the same key as the global pin, so the trust anchor verdict is the matching one.
+  const signerClientInvoke: ShimInvoker = async () => ({ stdout: toBase64url(PIN), stderr: "", code: 0 });
+  const roots: string[] = [];
+  afterEach(async () => { for (const dir of roots.splice(0)) await rm(dir, { recursive: true, force: true }); });
+
+  async function statusFortress(patches: readonly LivenessPatch[] | null) {
+    const fortressPath = await mkdtemp(join(tmpdir(), "cw-status-live-"));
+    roots.push(fortressPath);
+    await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), PIN, { mode: 0o600 });
+    const input = structuredClone(STATES.base);
+    for (const patch of patches ?? []) {
+      const keys = patch.path.split(".");
+      const last = keys.pop()!;
+      let target = input;
+      for (const key of keys) target = target[key];
+      if (patch.op === "delete") delete target[last];
+      else if (patch.op === "add") target[last] += patch.value as number;
+      else target[last] = structuredClone(patch.value);
+    }
+    if (patches !== null) {
+      await mkdir(join(fortressPath, "liveness"), { mode: 0o700 });
+      for (const name of ["daemon", "observer", "config"]) {
+        if (input[name].status !== "present") continue;
+        const value = input[name].value;
+        if (value.subject) Object.assign(value.subject, { fortress_id: livenessFortressId(fortressPath), operator_uid: UID });
+        await writeFile(join(fortressPath, "liveness", `${name}.json`), JSON.stringify(value), { mode: 0o600 });
+      }
+    }
+    const liveness = { getuid: () => UID, now: () => input.nowMs, hostClock: { read: async () => input.host, uptimeMs: () => input.host.uptimeMs } };
+    return { fortressPath, liveness };
+  }
+  /** One darwin status fixture with the content filter enabled, live enforcement availability and a matching global pin. */
+  async function runDarwinStatus(fortressPath: string, liveness: object, platform = "darwin") {
+    const hostAppPath = join(fortressPath, "CastleWallHostApp");
+    await writeFile(hostAppPath, "#!/bin/sh\n", { mode: 0o755 });
+    const out = new CaptureStream();
+    const code = await runStatus(["--fortress", fortressPath], {
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      platform: platform as NodeJS.Platform,
+      execSyncFn: () => "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: async () => ({ stdout: JSON.stringify({ ok: true, action: "status", state: "enabled" }) + "\n", stderr: "", exitCode: 0 }),
+      globalPinReader: async () => PIN,
+      signerClientInvoke,
+      enforcementAvailabilityQuery: async () => ({ status: "live", reason: "ok", observed_at: "2026-11-09T11:59:55.000Z", freshness_window_ms: 30_000, active_connection_count: 1 }),
+      liveness,
+    });
+    return { code, text: out.text() };
+  }
+  const LIVENESS_LINE = /^Liveness (wall|agent|coverage): /;
+  const fingerprintOf = (key: Uint8Array) => createHash("sha256").update(key).digest("hex").slice(0, 16);
+  /** The lines this fixture printed before the liveness change, which the install probe parses; they must stay byte-identical. */
+  const baseLines = () => [
+    `Pinned key fingerprint: ${fingerprintOf(PIN)}`,
+    `Global pin (enforcement anchor): ${fingerprintOf(PIN)}`,
+  ];
+
+  it("live availability with no liveness records exits 1, and the earlier lines are unchanged", async () => {
+    const f = await statusFortress(null);
+    const { code, text } = await runDarwinStatus(f.fortressPath, f.liveness);
+    expect(code).toBe(1);
+    const lines = text.split("\n").filter(Boolean);
+    expect(lines.slice(0, 2)).toEqual(baseLines());
+    expect(lines).toContain("Content filter: enabled");
+    expect(lines).toContain("Enforcement availability: live (ok; observed=2026-11-09T11:59:55.000Z; active_connections=1)");
+    expect(lines.filter(line => line.startsWith("Trust anchor: "))).toHaveLength(1);
+    // The three Liveness lines are appended after every existing line, never interleaved.
+    expect(lines.slice(-3).map(line => line.split(":")[0])).toEqual(["Liveness wall", "Liveness agent", "Liveness coverage"]);
+    expect(lines.slice(0, -3).some(line => LIVENESS_LINE.test(line))).toBe(false);
+    expect(lines.at(-3)).not.toMatch(/^Liveness wall: wall_OK_/);
+    expect(text).not.toMatch(/protected|enforcing/);
+  });
+
+  it("install-parsed lines are byte-identical whether the wall reads OK or DOWN", async () => {
+    const none = await statusFortress(null);
+    const ok = await statusFortress([]);
+    const a = await runDarwinStatus(none.fortressPath, none.liveness);
+    const b = await runDarwinStatus(ok.fortressPath, ok.liveness);
+    const strip = (text: string, fortressPath: string) => text.split("\n").filter(line => !LIVENESS_LINE.test(line)).join("\n").split(fortressPath).join("<fortress>");
+    expect(strip(b.text, ok.fortressPath)).toBe(strip(a.text, none.fortressPath));
+    const installParsed = (text: string) => text.split("\n").filter(line => /^(Content filter|Enforcement availability|Trust anchor): /.test(line));
+    expect(installParsed(b.text)).toEqual(installParsed(a.text));
+    expect(installParsed(a.text)).toHaveLength(3);
+  });
+
+  it("wall OK with agent DOWN exits 0", async () => {
+    const f = await statusFortress(STATES.rows.find(row => row.name === "agent down process missing")!.patches);
+    const { code, text } = await runDarwinStatus(f.fortressPath, f.liveness);
+    expect(code).toBe(0);
+    expect(text).toContain("Liveness wall: wall_OK_IDLE (none)\nLiveness agent: agent_DOWN (agent_process_missing)\n");
+  });
+
+  it("wall DOWN with agent OK exits 1", async () => {
+    const f = await statusFortress([{ op: "delete", path: "daemon.value.raw.hooks.emission_tick" }]);
+    const { code, text } = await runDarwinStatus(f.fortressPath, f.liveness);
+    expect(code).toBe(1);
+    expect(text).toContain("Liveness wall: wall_DOWN (evidence_incomplete)");
+    expect(text).toMatch(/^Liveness agent: agent_OK_/m);
+  });
+
+  it("non-darwin keeps its existing line, then prints the Liveness lines and exits 1 with unsupported_adapter", async () => {
+    const f = await statusFortress([]);
+    const { code, text } = await runDarwinStatus(f.fortressPath, f.liveness, "linux");
+    expect(code).toBe(1);
+    expect(text).toContain("Castle Wall sysext: not applicable (non-macOS)\n");
+    expect(text).toContain("Liveness wall: wall_DOWN (unsupported_adapter)");
+  });
+
+  it("status leaves every liveness file byte-identical and mode-identical", async () => {
+    const f = await statusFortress([]);
+    await chmod(join(f.fortressPath, "liveness", "config.json"), 0o640);
+    const snapshot = async () => {
+      const dir = join(f.fortressPath, "liveness");
+      const entries: Array<[string, string, number]> = [[".", "", (await stat(dir)).mode]];
+      for (const name of ["config.json", "daemon.json", "observer.json"]) entries.push([name, (await readFile(join(dir, name))).toString("base64"), (await stat(join(dir, name))).mode]);
+      return entries;
+    };
+    const before = await snapshot();
+    await runDarwinStatus(f.fortressPath, f.liveness);
+    expect(await snapshot()).toEqual(before);
   });
 });

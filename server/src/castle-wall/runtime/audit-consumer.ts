@@ -15,7 +15,9 @@ import { isBlockedEgressSubject, parseBlockedEgressHost, parseBlockedEgressIp, p
  */
 
 import { createHash } from "node:crypto";
-import { FlowAdmission, FlowCoalescer, flowCoalescingMetadata } from "./macos-flow-coalescing.js";
+import { FlowAdmission, FlowCoalescer, flowCoalescingMetadata, type FlowCoalescingMetadata } from "./macos-flow-coalescing.js";
+import { CANARY_IP, CANARY_PORT, CANARY_PROTOCOL } from "../liveness/constants.js";
+import type { CanaryCandidate, CanarySlotPort } from "../liveness/recorder.js";
 import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import { mintConsumerBlockedEgress, type BlockedEgressProjection, type ConsumerMintedBlockedEgress } from "./blocked-egress-attribution.js";
 
@@ -422,6 +424,7 @@ export class AuditConsumer {
   };
   private readonly flowAdmission = new FlowAdmission();
   private readonly liveFlowCoalescer: FlowCoalescer | undefined;
+  private readonly canarySlot: CanarySlotPort | undefined;
   private lastAckedSeq: number | null = null;
   /**
    * The chain anchor: for producer-signed entries this is
@@ -498,6 +501,12 @@ export class AuditConsumer {
     options?: {
       /** Trusted macOS live-flow composition only; absent means primary persistence. */
       liveFlowCoalescer?: FlowCoalescer;
+      /**
+       * The full daemon's canary drop-recording slot. Must match the
+       * `canarySlot` input passed through server/src/castle-wall/runtime/macos-flow-events.ts.
+       * Absent means no canary admission and no allow sighting.
+       */
+      canarySlot?: CanarySlotPort;
       pinnedProducerKeyB64url?: string | null;
       /** Reject signed enforcement events older than this many ms. Default 5 min. */
       producerSigMaxAgeMs?: number;
@@ -550,6 +559,7 @@ export class AuditConsumer {
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
     this.liveFlowCoalescer = options?.liveFlowCoalescer;
+    this.canarySlot = options?.canarySlot;
     this.chainAnchorSource = options?.chainAnchorSource;
     this.chainContinuity = options?.chainContinuity ?? "complete";
   }
@@ -593,8 +603,48 @@ export class AuditConsumer {
     );
   }
 
+  /**
+   * The canary predicate at the verified point. Must match the canary tuple in
+   * server/src/castle-wall/liveness/constants.ts. It runs only after signature,
+   * live delivery and the macOS audit-token subject verified (non-null
+   * metadata). With a nil origin descriptor every flow is agent traffic and
+   * the over-blocking wall is outside the canary's scope.
+   */
+  private admitCanary(
+    eventType: string,
+    metadata: FlowCoalescingMetadata | null,
+    signedFlowFields: Record<string, unknown> | null,
+    identityId: string,
+    sigOutcome: SignatureOutcome,
+  ): boolean {
+    const slot = this.canarySlot;
+    if (slot === undefined) return false;
+    const onTuple = metadata !== null &&
+      metadata.destination.ip === CANARY_IP && metadata.destination.port === CANARY_PORT &&
+      metadata.destination.protocol === CANARY_PROTOCOL && metadata.destination.host === null;
+    const subjects = slot.subjects();
+    const capturedAtMs = sigOutcome.kind === "verified" ? sigOutcome.capturedAtUnixMs : null;
+    // Only an agent-uid or gate-uid allow to the canary tuple is a sighting; operator and other subjects are ignored.
+    if (onTuple && eventType === "egress_allowed" && signedFlowFields?.decision === "allow" && typeof capturedAtMs === "number") {
+      const principal = identityId === subjects.agentSubject ? "agent" : identityId === subjects.gateSubject ? "gate" : null;
+      if (principal !== null) slot.noteDestinationAllowed({ captured_at_ms: capturedAtMs, principal });
+    }
+    // An allow never admits: only a verified live drop of the agent subject to the exact tuple can force a primary.
+    const candidate: CanaryCandidate | null =
+      onTuple && metadata !== null && eventType === "egress_blocked" && signedFlowFields?.decision === "drop" &&
+      subjects.adapter === "uid" && subjects.agentUid !== null && subjects.agentSubject !== null &&
+      identityId === subjects.agentSubject && sigOutcome.kind === "verified" && typeof capturedAtMs === "number"
+        ? { seq: sigOutcome.seq, capturedAtMs, subjectUid: subjects.agentUid, destIp: metadata.destination.ip, destPort: metadata.destination.port, destProtocol: metadata.destination.protocol }
+        : null;
+    return slot.admit(candidate);
+  }
+
   /** Stop closes queued live admissions before any dependent teardown writes. */
-  closeFlowAdmission(): void { this.flowAdmission.close(); }
+  closeFlowAdmission(): void {
+    this.flowAdmission.close();
+    // Consumer stop settles an owned canary slot as a failure; a later settlement is ignored.
+    this.canarySlot?.stop();
+  }
   /** Wait for admitted live work to settle; the caller supplies the stop budget. */
   drainFlowAdmission(): Promise<void> { return this.flowAdmission.drain(); }
 
@@ -745,10 +795,19 @@ export class AuditConsumer {
       ((envelope.event.event_type === "egress_allowed" && signedFlowFields?.decision === "allow") ||
         (envelope.event.event_type === "egress_blocked" && signedFlowFields?.decision === "drop"))
       ? flowCoalescingMetadata(identityOutcome.identityId, { ...signedFlowFields, seq: sigOutcome.seq }) : null;
+    // Canary admission is evaluated first and unconditionally, so a pending primary never short-circuits it.
+    const canaryAdmitted = this.admitCanary(envelope.event.event_type, metadata, signedFlowFields, identityOutcome.identityId, sigOutcome);
     // Failed primary evidence can only be retired by the ordinary successful primary path below.
-    const classification = this.liveFlowCoalescer?.classify(metadata, this.pendingUnpersistedSeq !== null);
-    observer?.classify(classification?.kind ?? "head");
+    let classification: ReturnType<FlowCoalescer["classify"]> | undefined;
+    try {
+      classification = this.liveFlowCoalescer?.classify(metadata, this.pendingUnpersistedSeq !== null || canaryAdmitted);
+      observer?.classify(classification?.kind ?? "head");
+    } catch (error) {
+      if (canaryAdmitted) this.canarySlot?.settled(false);
+      throw error;
+    }
     if (classification?.kind === "coalesced") {
+      if (canaryAdmitted) this.canarySlot?.settled(false);
       this.lastAckedSeq = Number(envelope.event.details.seq);
       this.lastEventChainHash = chainBasis.hash;
       this.stats.coalescedCriticalEvents += 1;
@@ -788,12 +847,15 @@ export class AuditConsumer {
       // past it (no WAL truncation through an unpersisted event). The cursor /
       // chain anchor are deliberately NOT advanced and no ack is sent.
       classification?.settled(false);
+      if (canaryAdmitted) this.canarySlot?.settled(false);
       const failedSeq = Number(envelope.event.details.seq);
       if (Number.isSafeInteger(failedSeq)) this.pendingUnpersistedSeq = failedSeq;
       await this.emitPersistenceFailure(err, envelope.event);
       throw err;
     }
     classification?.settled(true);
+    // The canary confirmation is recorded only from the durable primary path, before the observer counts the emission.
+    if (canaryAdmitted) this.canarySlot?.settled(true);
     observer?.confirmed?.("primary");
     if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
       // No blocked-egress projection is published before its primary audit receipt is durably appended and flushed; projection failure never rewrites the enforcement outcome.

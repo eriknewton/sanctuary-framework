@@ -167,7 +167,10 @@ describe("C4 shared Exit memory-admission journal", () => {
           await storage.delete("_known_signers", key, true);
           throw new Error(boundary);
         },
-      })).rejects.toThrow(boundary);
+      })).rejects.toMatchObject({
+        name: "SignerPruneError", message: "signer prune failed",
+        outcome: { phase: "rolled-back" }, cause: { message: boundary },
+      });
       expect(await storage.read("_known_signers", key)).toEqual(before);
       expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
       expect(await storage.list(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE)).toHaveLength(0);
@@ -247,7 +250,7 @@ describe("C4 shared Exit memory-admission journal", () => {
     expect(await committedStorage.list("_exit_imports")).toHaveLength(0);
   });
 
-  it("retains recovery evidence and surfaces partial_scope on prune divergence", async () => {
+  it("retains recovery evidence and reports an uncertain outcome on prune divergence", async () => {
     const storage = new MemoryStorage();
     const key = "memprov.diverged";
     await storage.write("_known_signers", key, stringToBytes("before"));
@@ -261,7 +264,7 @@ describe("C4 shared Exit memory-admission journal", () => {
         await storage.write("_known_signers", key, stringToBytes("racer"));
         throw new Error("fault after divergence");
       },
-    })).rejects.toMatchObject({ name: "MemoryProvenanceSignerPrunePartialScopeError" });
+    })).rejects.toMatchObject({ name: "SignerPruneError", outcome: { phase: "uncertain" } });
     expect(bytesToString((await storage.read("_known_signers", key))!)).toBe("racer");
     expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
     expect(await storage.list(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE)).toHaveLength(1);

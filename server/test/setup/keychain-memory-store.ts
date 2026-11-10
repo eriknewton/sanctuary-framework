@@ -379,7 +379,16 @@ function runSecurityVerb(tokens: string[]): ExecResult {
   return fail(1, `security: unsupported verb '${verb}' in test fake`);
 }
 
+// Every credential-CLI call this fake serves, in order, so a test can assert that a path never reached the credential store without re-pointing the injection point itself.
+const credentialCallLog: Array<[string, string[]]> = [];
+
+/** The credential-CLI calls served since the last per-test reset. */
+export function inMemoryKeychainCalls(): ReadonlyArray<readonly [string, readonly string[]]> {
+  return credentialCallLog.map(([cmd, args]) => [cmd, [...args]] as const);
+}
+
 const fakeExec: KeychainExec = async (cmd, args, input) => {
+  credentialCallLog.push([cmd, [...args]]);
   // Two spellings reach here: `security` (wrap/keychain-custody.ts,
   // wrap/passphrase.ts) and the absolute `/usr/bin/security` (SECURITY_BIN in
   // disclosure/broker/keychain-backend.ts). Match on the basename so adding a
@@ -437,4 +446,5 @@ export function installInMemoryKeychainStore(): void {
 export function clearInMemoryKeychainStore(): void {
   store.clear();
   keychains.clear();
+  credentialCallLog.length = 0;
 }
