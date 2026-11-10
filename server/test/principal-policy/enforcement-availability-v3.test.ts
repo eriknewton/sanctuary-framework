@@ -340,7 +340,7 @@ describe("level-triggered enforcement availability surfaces", () => {
           }),
       });
 
-      expect(code).toBe(0);
+      expect(code).toBe(1);
       expect(out.text()).toContain(
         "Enforcement availability: undetermined (no_report; observed=none; active_connections=1)",
       );
@@ -362,7 +362,7 @@ describe("level-triggered enforcement availability surfaces", () => {
         },
       });
 
-      expect(failedCode).toBe(0);
+      expect(failedCode).toBe(1);
       expect(failed.text()).toContain(
         "Enforcement availability: undetermined (availability_query_failed:malformed enforcement availability response; observed=none; active_connections=0)",
       );

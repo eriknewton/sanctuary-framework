@@ -8,14 +8,17 @@ export const METADATA_OUTPUT_LIMIT = C.MAX_NAME_BYTES * C.MAX_FILES;
 export const METADATA_TIMEOUT_MS = 10_000; // Ten seconds bounds each metadata subprocess.
 // Must match the exact subprocess policy consumed by evidence-pack-drill-isolation.ts.
 export const LINUX_METADATA_PROGRAM = "import os,sys,json; print(json.dumps(os.listxattr(sys.argv[1], follow_symlinks=False)))";
-export function metadataNames(path: string, platform: string = process.platform, held?: Pick<BigIntStats, "dev" | "ino">): string[] {
+/** The dev and ino of the handle a caller already holds open on `path`. */
+export type HeldIdentity = Pick<BigIntStats, "dev" | "ino">;
+export function metadataNames(path: string, platform: string, held: HeldIdentity): string[] {
+  // A capture without the held identity cannot bind names to the bytes already read, so it refuses before any subprocess runs.
+  if (!held) throw new TypeError("Metadata capture requires the held identity");
   // Fixed OS paths, closed argv, no stdin and an empty environment prevent metadata enumeration from selecting code or credentials through ambient state.
   const options = { env: { LC_ALL: "C" }, shell: false as const, timeout: METADATA_TIMEOUT_MS, maxBuffer: METADATA_OUTPUT_LIMIT, stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"] };
   try {
     // Unsupported hosts cannot establish metadata capture and must report an environment finding.
     C.requireSnapshot(platform === "darwin" || platform === "linux", C.HARD.enumerator_unavailable);
     const recheck = () => {
-      if (!held) return;
       let current: BigIntStats;
       try { current = lstatSync(path, { bigint: true }); } catch { throw new C.SnapshotError(C.HARD.snapshot_changed); }
       // Each path enumeration must still name the held inode before its names can be consumed.

@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only adds the discard-fixture marker comment the floating-append guard keys on; test behavior is unchanged
 /**
  * AuditLog flush() — v0.10.1 regression guard for the v0.10.0-rc.2 soak
  * finding where `sanctuary secrets audit` returned empty after a clean
@@ -190,8 +191,8 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new FaultingWriteStorage();
     const log = new AuditLog(storage, generateRandomKey());
 
-    // Intentionally fire-and-forget: critical writes now share append()'s
-    // flush-time failure surfacing, so a voided durable write cannot disappear.
+    // Must match the critical-flush-discard-fixture allow entry in no-floating-append-critical.test.ts.
+    // critical-flush-discard-fixture
     void log.appendCritical({
       layer: "l1",
       operation: "state_write",

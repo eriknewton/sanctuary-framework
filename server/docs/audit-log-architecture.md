@@ -316,3 +316,44 @@ Primary implementation files inspected:
 - `server/docs/federation-protocol-v0.1-spec.md`
 
 Discrepancy recorded: the dispatch framing described a whole-log master-key-wrapped encrypted blob. The source implements individually encrypted per-entry files under `_audit`, using the `audit-log` HKDF purpose key. The migration guidance above follows the implementation rather than the dispatch assumption.
+
+
+## Default-off strict storage foundation
+
+Strict mutations require `withStrictNamespaceLock`. Every acquisition verifies and syncs the held namespace, fortress root and root parent descriptors, including retries. The root parent must already exist. Directory creation below that boundary captures each no-follow descriptor immediately and repeats the captured chain barriers on every attempt. Publication and cleanup retain the publishing descriptor identity; worker errors preserve nested failure codes. Owner-mode strict writes never create a missing parent directory; they refuse with the typed `strict_directory_missing` code.
+
+`StrictDurabilityStorageCapabilities` is an explicit opt-in storage surface.
+`writeStrict`, `writeIfAbsentStrict` and `replaceIfEqualsStrict` require file,
+directory and new-parent barriers and propagate unsupported-directory-sync
+errors surfaced by Node. On Darwin, Node FileHandle.sync uses libuv's F_FULLFSYNC,
+then F_BARRIERFSYNC, then fsync fallback chain, discarding earlier errors. Strict
+means whatever that chain achieved and is not proven. A native F_FULLFSYNC check
+or a drilled bound is a prerequisite before S1b relies on strict durability.
+This bound must match StrictDurabilityStorageCapabilities in storage/interface.ts
+and the strict additions in reorg-surface-manifest.md.
+`withStrictNamespaceLock` establishes barriers on verified held directory handles
+before the operation uses descriptor paths or Darwin workers. A strict write inside a legacy
+namespace binding refuses because that binding did not establish these barriers.
+The read-only guard refuses every strict mutation, including lock acquisition.
+Legacy `writeDurable` and legacy custody writes retain their existing tolerance.
+Exact readback can detect corruption; it cannot establish crash durability.
+
+The audit APIs `appendCriticalWithReceipt` and `sealThrough`, and a durable audit
+retention pin, are not implemented by this change. `appendCritical` remains the
+existing void-returning API and `flushDurable` is not a seal. Receipt integration
+requires shared settlement authority before any outcome can be represented as
+`committed { tuple, record_id }`, `not_committed { record_id }` or
+`commit_unknown { record_id }`. A committed tuple must be captured under the
+append hold after all strict barriers. A no-write outcome requires settled
+absence; entry, head, lease or late-write uncertainty must retain ownership.
+
+A future pin must durably protect the lowest linked sequence and charge the
+admission, terminal, control, checkpoint, sidecar and journal reserves under the
+same lock for every writer and pruner, including early returns. Missing or corrupt
+installed state and lowered quotas must refuse. A future `sealThrough(cut)` must
+fence and settle all writers and verify a unique, complete signed strict checkpoint
+covering the cut. Unsigned, gapped, pruned, split or unsettled ranges cannot be seals.
+These are integration requirements, not guarantees of the existing audit API.
+
+The added storage methods have no CLI, wrap, MCP or boot consumer. Darwin worker
+execution needs separate macOS validation; Linux fixtures do not establish it.

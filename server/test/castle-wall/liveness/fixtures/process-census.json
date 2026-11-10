@@ -1,0 +1,9 @@
+{
+  "description": "Process census fixture: documentation pids, uids, paths and start times only (fixture values). agent uid 502, gate uid 503, operator uid 501; gateway process name Python; harness pid 75400; MCP script /opt/agent-fixture/mcp/server.js.",
+  "agent_uid": 502,
+  "gateway_process_name": "Python",
+  "harness_pid": 75400,
+  "mcp_script": "/opt/agent-fixture/mcp/server.js",
+  "full_agent_pid": 4242,
+  "text": "     1      0     0 Sun Nov  9 07:40:00 2026 /sbin/launchd\n  4242      1   501 Sun Nov  9 07:45:10 2026 /opt/homebrew/opt/node/bin/node /opt/homebrew/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js castle-wall daemon --fortress /Users/operator-fixture/.sanctuary --launch-agent\n 75400      1   502 Sun Nov  9 07:50:00 2026 /opt/agent-fixture/venv/bin/python -m agent_fixture.main gateway run --accept-hooks\n 75399  75400   502 Sun Nov  9 07:57:01 2026 /opt/agent-fixture/venv/bin/Python -m agent_fixture.gateway\n 75500  75400   502 Sun Nov  9 07:51:00 2026 /opt/homebrew/opt/node/bin/node /opt/agent-fixture/mcp/server.js --stdio\n 80000      1   501 Sun Nov  9 08:00:00 2026 /opt/homebrew/opt/node/bin/node /Users/operator-fixture/unrelated.js\n 80001      1   503 Sun Nov  9 08:00:05 2026 /opt/agent-fixture/venv/bin/Python -m other.tool\n"
+}

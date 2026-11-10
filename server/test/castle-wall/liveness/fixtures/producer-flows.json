@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "about": "Model-only producer flows for the canary slot. Every flow is synthesized in the signed producer shape by the test harness; none is a real NetworkExtension capture, and no flow here implies a real operator-uid drop was ever observed. Omitted flow fields default to the canary tuple (192.0.2.254, port 9, tcp), no host, a drop, live delivery and the agent uid. Principals: agent is uid 502, gate is uid 503, operator is uid 501 (fixture values).",
+  "flows": [
+    { "name": "model-only valid denied canary from the agent", "flow": {}, "expect": { "admitted": true, "confirmed": true, "allow_sighting": null } },
+    { "name": "current-source operator allow to the canary tuple is ignored input", "flow": { "principal": "operator", "kind": "allow" }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null } },
+    { "name": "agent allow to the canary tuple is a destination-allowed sighting", "flow": { "kind": "allow" }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": "agent" } },
+    { "name": "gate allow to the canary tuple is a destination-allowed sighting", "flow": { "principal": "gate", "kind": "allow" }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": "gate" } },
+    { "name": "operator drop to the canary tuple", "flow": { "principal": "operator" }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null } },
+    { "name": "wrong uid drop to the canary tuple", "flow": { "uid": 9999 }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null } },
+    { "name": "unsigned drop: the producer signature does not verify", "flow": { "tamper": true }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null } },
+    { "name": "replayed drop: an identical delivery after the rearm interval", "flow": { "replay": true }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null } },
+    { "name": "coalesced canary inside the rearm interval", "flow": { "after_primary": true }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null, "coalesced": true } },
+    { "name": "write-ahead redelivery of the canary drop", "flow": { "delivery": "durable_wal" }, "expect": { "admitted": false, "confirmed": false, "allow_sighting": null } }
+  ]
+}

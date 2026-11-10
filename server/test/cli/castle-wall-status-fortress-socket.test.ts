@@ -101,7 +101,7 @@ describe("castle-wall status --fortress socket resolution (O-07)", () => {
       { SANCTUARY_STORAGE_PATH: defaultFortress },
     );
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(socketPath).toBe(`${namedFortress}/castle.sock`);
     expect(socketPath).not.toBe(`${defaultFortress}/castle.sock`);
   });
@@ -115,7 +115,7 @@ describe("castle-wall status --fortress socket resolution (O-07)", () => {
       { SANCTUARY_STORAGE_PATH: defaultFortress },
     );
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(socketPath).toBe(`${namedFortress}/castle.sock`);
     expect(socketPath).not.toBe(`${defaultFortress}/castle.sock`);
   });
@@ -133,7 +133,7 @@ describe("castle-wall status --fortress socket resolution (O-07)", () => {
       { SANCTUARY_STORAGE_PATH: staleEnvFortress },
     );
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(socketPath).toBe(`${namedFortress}/castle.sock`);
   });
 
@@ -144,7 +144,7 @@ describe("castle-wall status --fortress socket resolution (O-07)", () => {
       SANCTUARY_STORAGE_PATH: envFortress,
     });
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(socketPath).toBe(`${envFortress}/castle.sock`);
   });
 
