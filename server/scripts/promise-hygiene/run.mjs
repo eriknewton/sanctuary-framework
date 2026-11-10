@@ -35,9 +35,12 @@ function readMetadata(root, name) {
   try {
     const stat = fstatSync(descriptor);
     // Metadata must not follow a link around the shared size cap, including lockfile digest reads.
-    insist(stat.isFile(), `linked metadata: ${name}`);
+    insist(stat.isFile(), `metadata type refused: ${name}`);
     insist(stat.size <= MAX_METADATA_BYTES, 'metadata size refused');
-    return readFileSync(descriptor);
+    const bytes = readFileSync(descriptor);
+    // The read runs to end of file, so a file that grew after fstat is capped on what was read.
+    insist(bytes.length <= MAX_METADATA_BYTES, 'metadata size refused');
+    return bytes;
   } finally {
     closeSync(descriptor);
   }
