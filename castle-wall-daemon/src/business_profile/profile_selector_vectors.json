@@ -1,0 +1,3757 @@
+{
+  "version": 1,
+  "reasons": [
+    "Explicit",
+    "NoBusinessEvidence",
+    "SelectorInvalid",
+    "InventoryAmbiguous",
+    "LegacyWithEnrollment",
+    "RawInventoryPresent"
+  ],
+  "inventory": {
+    "evidence": [
+      {
+        "id": "1",
+        "path": "/etc/sanctuary/business-profile.json"
+      },
+      {
+        "id": "2",
+        "path": "/etc/sanctuary/business-signer.json"
+      },
+      {
+        "id": "3",
+        "path": "/etc/sanctuary/business-signer-peer.json"
+      },
+      {
+        "id": "4",
+        "path": "/etc/sanctuary/business-signer-controller.json"
+      },
+      {
+        "id": "5",
+        "path": "/etc/sanctuary/business-writer.json"
+      },
+      {
+        "id": "6",
+        "path": "/var/lib/sanctuary-business-signer"
+      },
+      {
+        "id": "7",
+        "path": "/var/lib/sanctuary-business-drain"
+      }
+    ],
+    "raw_roots": [
+      "/var/lib/sanctuary",
+      "/run/sanctuary"
+    ],
+    "raw_relative": {
+      "state": "policy/egress/audit-producer.key",
+      "runtime": "audit-producer.pub"
+    }
+  },
+  "cases": [
+    {
+      "id": "implicit-legacy",
+      "caller": "owner",
+      "layout": [],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "LegacyV1",
+        "reason": "NoBusinessEvidence"
+      }
+    },
+    {
+      "id": "implicit-legacy-keeps-raw",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "var/lib/sanctuary/fortress/policy/egress/audit-producer.key",
+          "mode": 384,
+          "content": "unchanged"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "LegacyV1",
+        "reason": "NoBusinessEvidence"
+      }
+    },
+    {
+      "id": "explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "LegacyV1",
+        "reason": "Explicit"
+      }
+    },
+    {
+      "id": "explicit-legacy-keeps-raw",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "var/lib/sanctuary/fortress/policy/egress/audit-producer.key",
+          "mode": 384,
+          "content": "unchanged"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "LegacyV1",
+        "reason": "Explicit"
+      }
+    },
+    {
+      "id": "business-selector",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "maximal-selector",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":9007199254740991,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "LegacyV1",
+        "reason": "Explicit"
+      }
+    },
+    {
+      "id": "evidence-2-alone",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-signer.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "evidence-2-explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-signer.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "LegacyWithEnrollment"
+      }
+    },
+    {
+      "id": "evidence-3-alone",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-signer-peer.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "evidence-3-explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-signer-peer.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "LegacyWithEnrollment"
+      }
+    },
+    {
+      "id": "evidence-4-alone",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-signer-controller.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "evidence-4-explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-signer-controller.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "LegacyWithEnrollment"
+      }
+    },
+    {
+      "id": "evidence-5-alone",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-writer.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "evidence-5-explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-writer.json",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "LegacyWithEnrollment"
+      }
+    },
+    {
+      "id": "evidence-6-alone",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary-business-signer",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "evidence-6-explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary-business-signer",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "LegacyWithEnrollment"
+      }
+    },
+    {
+      "id": "evidence-7-alone",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary-business-drain",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "evidence-7-explicit-legacy",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"legacy-v1\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary-business-drain",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "LegacyWithEnrollment"
+      }
+    },
+    {
+      "id": "evidence-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "symlink",
+          "path": "etc/sanctuary/business-signer.json",
+          "mode": 511,
+          "target": "absent"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "etc-sanctuary-denied",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "etc/sanctuary",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [
+          "etc/sanctuary"
+        ],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "etc-sanctuary-not-directory",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "etc-sanctuary-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "trusted",
+          "mode": 448
+        },
+        {
+          "type": "symlink",
+          "path": "etc/sanctuary",
+          "mode": 511,
+          "target": "trusted"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "etc-sanctuary-other-owner",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "etc/sanctuary",
+          "mode": 448
+        }
+      ],
+      "owners": {
+        "etc/sanctuary": "other"
+      },
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "etc-sanctuary-group-writable",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "etc/sanctuary",
+          "mode": 464
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "var-lib-denied",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "var/lib",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [
+          "var/lib"
+        ],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "var-lib-not-directory",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "var/lib",
+          "mode": 384,
+          "content": ""
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "var-lib-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "trusted",
+          "mode": 448
+        },
+        {
+          "type": "symlink",
+          "path": "var/lib",
+          "mode": 511,
+          "target": "trusted"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "var-lib-other-owner",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "var/lib",
+          "mode": 448
+        }
+      ],
+      "owners": {
+        "var/lib": "other"
+      },
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "var-lib-group-writable",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "var/lib",
+          "mode": 464
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "unprivileged-selector",
+      "caller": "unprivileged",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": [
+          "etc/sanctuary/business-profile.json"
+        ]
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "business-denied-drain",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [
+          "var/lib/sanctuary-business-drain"
+        ],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "selector-other-owner",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {
+        "etc/sanctuary/business-profile.json": "other"
+      },
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-mode",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 416,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-directory",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "dir",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-fifo",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "fifo",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "valid-selector",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "symlink",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 511,
+          "target": "valid-selector"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-two-links",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "hardlink",
+          "path": "second-name",
+          "mode": 384,
+          "target": "etc/sanctuary/business-profile.json"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-over-limit",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 "
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-noncanonical",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"version\": 1, \"profile\": \"business\", \"fortress_id\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"machine_id\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"enrollment_revision\": 1, \"digests\": {\"custody_envelope_digest\": \"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"roster_digest\": \"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"anchor_digest\": \"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-duplicate",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1,\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-version-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":0}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-version-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":true}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-version-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":\"1\"}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-profile-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"other\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-profile-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":null,\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-fortress_id-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-fortress_id-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-fortress_id-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":1,\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-machine_id-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"gggggggggggggggggggggggggggggggg\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-machine_id-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-machine_id-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":null,\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-enrollment_revision-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":0,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-enrollment_revision-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":-1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-enrollment_revision-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":true,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-enrollment_revision-3",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1.5,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-enrollment_revision-4",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":\"1\",\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-enrollment_revision-5",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":9007199254740992,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-digests-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":null,\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-digests-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":[],\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-digests-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":1,\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-digests-3",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":\"digest\",\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-missing-version",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\"}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-missing-profile",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-missing-fortress_id",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-missing-machine_id",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-missing-enrollment_revision",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-missing-digests",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "selector-extra",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"unknown\":true,\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-custody_envelope_digest-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":null,\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-custody_envelope_digest-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":1,\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-custody_envelope_digest-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-custody_envelope_digest-3",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-missing-custody_envelope_digest",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-roster_digest-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":null},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-roster_digest-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":1},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-roster_digest-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-roster_digest-3",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-missing-roster_digest",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-anchor_digest-0",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":null,\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-anchor_digest-1",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":1,\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-anchor_digest-2",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-anchor_digest-3",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-missing-anchor_digest",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "digest-extra",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"extra\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "SelectorInvalid"
+      }
+    },
+    {
+      "id": "var-lib-sanctuary-file",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "var/lib/sanctuary/fortress/policy/egress/audit-producer.key",
+          "mode": 384,
+          "content": "unchanged"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "var-lib-sanctuary-dir",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/fortress/policy/egress/audit-producer.key",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "var-lib-sanctuary-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "symlink",
+          "path": "var/lib/sanctuary/fortress/policy/egress/audit-producer.key",
+          "mode": 511,
+          "target": "absent"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "var-lib-sanctuary-cap-64",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f0",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f1",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f2",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f3",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f4",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f5",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f6",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f7",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f8",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f9",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f10",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f11",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f12",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f13",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f14",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f15",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f16",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f17",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f18",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f19",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f20",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f21",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f22",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f23",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f24",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f25",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f26",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f27",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f28",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f29",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f30",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f31",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f32",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f33",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f34",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f35",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f36",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f37",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f38",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f39",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f40",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f41",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f42",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f43",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f44",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f45",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f46",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f47",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f48",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f49",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f50",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f51",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f52",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f53",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f54",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f55",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f56",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f57",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f58",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f59",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f60",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f61",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f62",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f63",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "var-lib-sanctuary-cap-65",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f0",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f1",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f2",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f3",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f4",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f5",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f6",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f7",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f8",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f9",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f10",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f11",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f12",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f13",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f14",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f15",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f16",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f17",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f18",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f19",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f20",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f21",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f22",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f23",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f24",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f25",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f26",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f27",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f28",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f29",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f30",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f31",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f32",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f33",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f34",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f35",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f36",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f37",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f38",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f39",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f40",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f41",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f42",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f43",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f44",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f45",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f46",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f47",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f48",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f49",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f50",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f51",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f52",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f53",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f54",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f55",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f56",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f57",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f58",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f59",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f60",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f61",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f62",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f63",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f64",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "var-lib-sanctuary-untrusted",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary",
+          "mode": 464
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "run-sanctuary-file",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "run/sanctuary/fortress/audit-producer.pub",
+          "mode": 384,
+          "content": "unchanged"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "run-sanctuary-dir",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/fortress/audit-producer.pub",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "run-sanctuary-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "symlink",
+          "path": "run/sanctuary/fortress/audit-producer.pub",
+          "mode": 511,
+          "target": "absent"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "run-sanctuary-cap-64",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f0",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f1",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f2",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f3",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f4",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f5",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f6",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f7",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f8",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f9",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f10",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f11",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f12",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f13",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f14",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f15",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f16",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f17",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f18",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f19",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f20",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f21",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f22",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f23",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f24",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f25",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f26",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f27",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f28",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f29",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f30",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f31",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f32",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f33",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f34",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f35",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f36",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f37",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f38",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f39",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f40",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f41",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f42",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f43",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f44",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f45",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f46",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f47",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f48",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f49",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f50",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f51",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f52",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f53",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f54",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f55",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f56",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f57",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f58",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f59",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f60",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f61",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f62",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f63",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "run-sanctuary-cap-65",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f0",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f1",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f2",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f3",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f4",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f5",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f6",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f7",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f8",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f9",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f10",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f11",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f12",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f13",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f14",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f15",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f16",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f17",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f18",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f19",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f20",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f21",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f22",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f23",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f24",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f25",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f26",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f27",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f28",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f29",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f30",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f31",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f32",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f33",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f34",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f35",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f36",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f37",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f38",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f39",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f40",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f41",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f42",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f43",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f44",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f45",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f46",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f47",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f48",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f49",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f50",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f51",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f52",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f53",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f54",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f55",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f56",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f57",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f58",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f59",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f60",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f61",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f62",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f63",
+          "mode": 448
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary/f64",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "run-sanctuary-untrusted",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "run/sanctuary",
+          "mode": 464
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "InventoryAmbiguous"
+      }
+    },
+    {
+      "id": "candidate-file",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "file",
+          "path": "custom/audit.key",
+          "mode": 384,
+          "content": "unchanged"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [
+        "custom/audit.key"
+      ],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "candidate-dir",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "custom/audit.key",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [
+        "custom/audit.key"
+      ],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "candidate-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "symlink",
+          "path": "custom/audit.key",
+          "mode": 511,
+          "target": "absent"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [
+        "custom/audit.key"
+      ],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "candidate-absent",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [
+        "custom/audit.key"
+      ],
+      "expect": {
+        "kind": "Business",
+        "reason": null
+      }
+    },
+    {
+      "id": "candidate-over-byte-cap",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [
+        "x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/key"
+      ],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "raw-parent-symlink",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "trusted",
+          "mode": 448
+        },
+        {
+          "type": "symlink",
+          "path": "var/lib/sanctuary/f",
+          "mode": 511,
+          "target": "trusted"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "raw-parent-denied",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-profile.json",
+          "mode": 384,
+          "content": "{\"digests\":{\"anchor_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"custody_envelope_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"roster_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"enrollment_revision\":1,\"fortress_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"machine_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"profile\":\"business\",\"version\":1}"
+        },
+        {
+          "type": "dir",
+          "path": "var/lib/sanctuary/f",
+          "mode": 448
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [
+          "var/lib/sanctuary/f/policy"
+        ],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Refused",
+        "reason": "RawInventoryPresent"
+      }
+    }
+  ]
+}

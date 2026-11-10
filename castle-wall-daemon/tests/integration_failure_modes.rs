@@ -101,7 +101,10 @@ const IPC_NAMESPACE: &str = "castle-wall";
 
 #[test]
 fn verdict_deadline_fail_stops_subprocess_nonzero_without_clean_exit_claim() {
+    let _suite = isolation::guard();
     let output = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"))
+        .arg("--test-profile-root")
+        .arg(isolation::root())
         .arg("--test-trigger-nfqueue-deadline-fail-stop")
         .output()
         .expect("launch fail-stop probe subprocess");
@@ -298,6 +301,9 @@ fn fresh_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         // ISOLATION (AGENTS.md, "the operator's machine is not a fixture"): the
         // host lock, ownership journal, and journal MAC key land in this run's
         // temp root, never in /var/lib/sanctuary.
+        test_selector_roots: Some(castle_wall_daemon::config::SelectorRoots::isolated_under(
+            dir.path(),
+        )),
         linux_runtime_paths: isolation::runtime_paths(),
         test_boot_time_shutdown_requested: false,
         test_delay_before_ready_ms: None,

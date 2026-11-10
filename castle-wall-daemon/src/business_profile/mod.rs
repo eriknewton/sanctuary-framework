@@ -149,11 +149,15 @@ pub fn verify_role(
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/checked_corpus.rs"]
+mod checked_corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     // Must match the complete public vectors in server/test/signing/strict-verifier.test.ts via the generator.
     fn vectors() -> serde_json::Value {
-        serde_json::from_str(include_str!("public_vectors.json")).unwrap()
+        checked_corpus::corpus("public_vectors.json")
     }
     #[test]
     fn registered_kind_is_required_even_for_a_valid_signature() {
@@ -297,8 +301,7 @@ mod tests {
     }
     #[test]
     fn every_role_vector_and_legacy_refusal() {
-        let rows: serde_json::Value =
-            serde_json::from_str(include_str!("role_vectors.json")).unwrap();
+        let rows: serde_json::Value = checked_corpus::corpus("role_vectors.json");
         assert_eq!(rows.as_array().unwrap().len(), ROLE_REGISTRY.len());
         for row in rows.as_array().unwrap() {
             let role = row["role"].as_str().unwrap();

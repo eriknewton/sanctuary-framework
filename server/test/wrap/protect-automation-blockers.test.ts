@@ -39,7 +39,7 @@ import {
   vi,
 } from "vitest";
 import { spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -180,12 +180,20 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
       throw new Error(`process.exit:${code ?? 0}`);
     }) as never);
 
-    await expect(
-      runWrap({ noOpen: true, noDashboard: true, devDist: "/definitely/not/a/sanctuary-cli.js" }),
-    ).rejects.toThrow("process.exit:2");
+    const fortress = await mkdtemp(join(tmpdir(), "k1-listeners-"));
+    const priorStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    try {
+      await expect(
+        runWrap({ fortress, noOpen: true, noDashboard: true, devDist: "/definitely/not/a/sanctuary-cli.js" }),
+      ).rejects.toThrow("process.exit:2");
 
-    expect(process.listeners("SIGTERM")).toContain(handleProcessShutdownSignal);
-    expect(process.listeners("SIGINT")).toContain(handleProcessShutdownSignal);
+      expect(process.listeners("SIGTERM")).toContain(handleProcessShutdownSignal);
+      expect(process.listeners("SIGINT")).toContain(handleProcessShutdownSignal);
+    } finally {
+      if (priorStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = priorStoragePath;
+      await rmdir(fortress);
+    }
   });
 
   // FIX (N1-1 corrected, 2026-07-27): the handler must AWAIT every
@@ -655,10 +663,14 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
       const {
         runWrap,
       } = await import(${JSON.stringify(wrapCliModuleUrl)});
+      const {isolatedSelectorRoots} = await import("./src/linux-business/profile-selection.ts");
       const { mkdir, cp, mkdtemp } = await import("node:fs/promises");
       const { tmpdir } = await import("node:os");
       const { join } = await import("node:path");
       const tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-real-deferred-signal-"));
+      const selectionRoot = await mkdtemp(join(tmpdir(), "k1-selector-child-"));
+      const {rmdirSync} = await import("node:fs");
+      process.once("exit", () => { try { rmdirSync(selectionRoot); } catch { /* Teardown must not throw from exit. */ } });
       process.env.HOME = tmpHome;
       process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
       Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
@@ -668,6 +680,7 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
       const runPromise = runWrap(
         { hermes: true, noOpen: true, noDashboard: true },
         {
+          selectorRoots: isolatedSelectorRoots(selectionRoot),
           startDashboard: async () => { throw new Error("dashboard should not start"); },
           openBrowser: async () => {},
           resolvePassphrase: async () => ({ value: "test-passphrase", location: "test-keychain", source: "generated" }),

@@ -39,14 +39,14 @@ export async function acquireMasterWriteBarrier(...args: Parameters<typeof acqui
     // isolating. The second setup file makes `homedir()` follow the thread's
     // env, as it does in a process. See test/setup/homedir-follows-env.ts and
     // register row TEST-ISOLATION-SINGLE-WORKER-01.
-    setupFiles: ["./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts", "./test/setup/master-write-leases.ts"],
+    setupFiles: ["./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts", "./test/setup/master-write-leases.ts", "./test/setup/selector-roots-isolation.ts"],
     // Stack order runs the guard after every afterAll, but before beforeAll-returned cleanups, file-scoped fixture teardown and the file's own aroundAll teardown, none of which current tests use.
     sequence: { setupFiles: "list", hooks: "stack" },
     // Leaves a marker directory at the package root for the whole run. setupFiles
     // covers this process and children inherit VITEST by default, but a child
     // spawned with `env: {}` has neither; the marker is what a scrubbed
     // environment cannot erase. See test/setup/test-run-marker.ts.
-    globalSetup: ["./test/setup/test-run-marker.ts"],
+    globalSetup: ["./test/setup/test-run-marker.ts", "./test/setup/selector-host-precondition.ts"],
     environment: "node",
     // No network egress from unit tests: the wrap-time pinned-version
     // resolvability probe (wrap/cli.ts) and the startup update check both

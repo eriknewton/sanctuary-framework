@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {WRAP_PROFILE_REFUSAL_EXIT_STATUS, appliesLinuxProfileSelection, selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 /**
  * Sanctuary wrap - CLI Entry Point
  *
@@ -217,7 +218,7 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
-import { argvTokenForDisplay } from "../cli/argv.js";
+import { requireCliTestRunner, argvTokenForDisplay } from "../cli/argv.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
 
@@ -304,9 +305,9 @@ export function __processShutdownCleanupCountForTest(): number {
   return processShutdownCleanups.size;
 }
 
+// Shared with injected selection roots through cli/argv.ts.
 function assertWrapCliTestHookAllowed(name: string): void {
-  if (process.env.NODE_ENV === "test" || process.env.VITEST !== undefined) return;
-  throw new Error(`${name} is test-only and is disabled outside the test runner.`);
+  requireCliTestRunner(name);
 }
 
 // FIX (N1-1 corrected, 2026-07-27): every registered cleanup starts an async
@@ -726,16 +727,13 @@ interface LocalIntelligenceWrapResult {
  * Exported for unit tests that pin precedence without standing up the
  * whole wrap flow.
  */
-export function promoteFortressToStoragePath(options: {
-  fortress?: string;
-}): void {
-  if (options.fortress) {
-    process.env.SANCTUARY_STORAGE_PATH = options.fortress;
-    return;
-  }
-  if (process.env.SANCTUARY_FORTRESS_PATH) {
-    process.env.SANCTUARY_STORAGE_PATH = process.env.SANCTUARY_FORTRESS_PATH;
-  }
+function effectiveFortressOverride(options: {fortress?: string}): string | undefined {
+  return options.fortress || process.env.SANCTUARY_FORTRESS_PATH || undefined;
+}
+
+export function promoteFortressToStoragePath(options: {fortress?: string}): void {
+  const fortress = effectiveFortressOverride(options);
+  if (fortress) process.env.SANCTUARY_STORAGE_PATH = fortress;
 }
 
 /**
@@ -3175,6 +3173,8 @@ async function resolveProtectCredential(
 }
 
 export interface RunWrapDeps {
+  /** Explicit isolated inventory for tests; production uses the root-owned inventory. */
+  selectorRoots?: SelectorRoots;
   /** Stdin source for `--passphrase-stdin` (tests inject a Readable). */
   stdin?: NodeJS.ReadableStream;
   /**
@@ -3310,6 +3310,11 @@ export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  if (deps.selectorRoots !== undefined) {
+    defaultSelectorRoots({
+      roots: deps.selectorRoots, assertTestRunner: requireCliTestRunner("selectorRoots"),
+    });
+  }
   // Memory installation must return before any account policy or ordinary protection setup.
   if (options.hermesMemory) {
     const allowed = new Set(["hermesMemory", "unwrap", "dryRun", "protectCommand"]);
@@ -3320,6 +3325,15 @@ export async function runWrap(
     if (Object.keys(__hermesPostureTestHook).length) assertWrapCliTestHookAllowed("__hermesPostureTestHook");
     if (__hermesParityTestHook.parity) assertWrapCliTestHookAllowed("__hermesParityTestHook");
     return runHermesPosture(options, __hermesPostureTestHook, __hermesParityTestHook.parity);
+  }
+  if (appliesLinuxProfileSelection((deps.osPlatform ?? (() => process.platform))())) {
+    const storagePath = effectiveFortressOverride(options) ?? resolveStoragePath();
+    const selection = selectLinuxProfile(deps.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
+    // Only a proven legacy selection may reach listeners, credentials or provisioning.
+    if (selection.kind !== "LegacyV1") {
+      process.stderr.write(`${profileRefusalText(selection)}\n`);
+      return process.exit(WRAP_PROFILE_REFUSAL_EXIT_STATUS);
+    }
   }
   if (options.hermes) await refuseHermesMcpWithPosture();
   installProcessShutdownListeners();

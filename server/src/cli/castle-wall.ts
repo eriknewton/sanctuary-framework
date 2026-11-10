@@ -1,3 +1,5 @@
+import {requireCliTestRunner} from "./argv.js";
+import {DAEMON_PROFILE_REFUSAL_EXIT_STATUS, appliesLinuxProfileSelection, selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 import { FULL_SUPERVISION_COMPLETION_CODES } from "../castle-wall/runtime/full-supervision-exit.js";
 import fs from "node:fs";
 import { CASTLE_WALL_STOP_EXIT_DEADLINE_MS } from "../castle-wall/constants.js";
@@ -202,6 +204,8 @@ export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_D
 const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 
 export interface CastleWallCommandContext {
+  /** Explicit isolated inventory for tests; production uses the root-owned inventory. */
+  selectorRoots?: SelectorRoots;
   out?: Writable;
   err?: Writable;
   /** INTERNAL/TEST: the shared liveness reader's injected clock, boot provider and filesystem for `status`. */
@@ -2590,6 +2594,11 @@ export async function runDaemon(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
+  if (ctx.selectorRoots !== undefined) {
+    defaultSelectorRoots({
+      roots: ctx.selectorRoots, assertTestRunner: requireCliTestRunner("selectorRoots"),
+    });
+  }
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
@@ -2604,6 +2613,16 @@ export async function runDaemon(
   if (launchAgent && argv.includes("--safe-mode")) {
     write(err, "--launch-agent cannot be combined with --safe-mode.\n");
     return 2;
+  }
+
+  const storagePath = resolveFortressArg(parsed.fortress, env);
+  if (appliesLinuxProfileSelection(platform)) {
+    const selection = selectLinuxProfile(ctx.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
+    // Only a proven legacy selection may consult the opt-in or prepare storage.
+    if (selection.kind !== "LegacyV1") {
+      write(err, `${profileRefusalText(selection)}\n`);
+      return DAEMON_PROFILE_REFUSAL_EXIT_STATUS;
+    }
   }
 
   // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
@@ -2646,7 +2665,7 @@ export async function runDaemon(
   // back to resolveStoragePath(env) when no flag is given, preserving prior
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
-  const storagePath = resolveFortressArg(parsed.fortress, env);
+
   if (launchAgent) {
     const { fullAgentAdmissionRefusal } = await import("./castle-wall-full-agent.js");
     const refusal = fullAgentAdmissionRefusal(ctx.getppid?.() ?? process.ppid, process.pid,
