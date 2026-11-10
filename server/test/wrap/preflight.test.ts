@@ -1,6 +1,6 @@
 // fail-before-exempt: test-isolation only. This PR NEWLY lets a host whose ~/.ollama/models does not exist reach the plan, the consent prompt and the pull instead of refusing before consent, so these wrap paths (they force isTTY true over a temp HOME) now block on a consent prompt no test can answer whenever the host's own Ollama is reachable; this file stubs the ceremony and changes no assertion, so it passes with or without the source fix.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -1126,10 +1126,12 @@ describe("protect preflight", () => {
           },
         ],
       };
+      const fortress = await mkdtemp(join(tmpdir(), "k1-preflight-"));
+      const priorStoragePath = process.env.SANCTUARY_STORAGE_PATH;
       try {
         await expect(
           runWrap(
-            { protectCommand: true, hermes: true, preflight: true, preflightStrict: true },
+            { fortress, protectCommand: true, hermes: true, preflight: true, preflightStrict: true },
             { runProtectPreflight: async () => reachableUnverifiableReport },
           ),
         ).rejects.toThrow("process.exit:0");
@@ -1139,6 +1141,9 @@ describe("protect preflight", () => {
         expect(message).toContain("Venice");
         expect(message).toContain("could not be verified");
       } finally {
+        if (priorStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+        else process.env.SANCTUARY_STORAGE_PATH = priorStoragePath;
+        await rmdir(fortress);
         exitSpy.mockRestore();
         stderrSpy.mockRestore();
         consoleErrorSpy.mockRestore();
@@ -1639,10 +1644,12 @@ describe("protect preflight", () => {
         },
       ],
     };
+    const fortress = await mkdtemp(join(tmpdir(), "k1-preflight-"));
+    const priorStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     try {
       await expect(
         runWrap(
-          { protectCommand: true, hermes: true, preflightStrict: true },
+          { fortress, protectCommand: true, hermes: true, preflightStrict: true },
           { runProtectPreflight: async () => undeterminedOnlyStrictReport },
         ),
       ).rejects.toThrow("process.exit:2");
@@ -1654,6 +1661,9 @@ describe("protect preflight", () => {
       expect(message).toContain("--strict");
       expect(message).not.toContain("Fix the FAIL rows");
     } finally {
+      if (priorStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = priorStoragePath;
+      await rmdir(fortress);
       exitSpy.mockRestore();
       stderrSpy.mockRestore();
       consoleErrorSpy.mockRestore();
@@ -1666,10 +1676,12 @@ describe("protect preflight", () => {
     }) as never);
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fortress = await mkdtemp(join(tmpdir(), "k1-preflight-"));
+    const priorStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     try {
       await expect(
         runWrap(
-          { protectCommand: true, hermes: true },
+          { fortress, protectCommand: true, hermes: true },
           { runProtectPreflight: async () => failingReportFixture() },
         ),
       ).rejects.toThrow("process.exit:2");
@@ -1678,6 +1690,9 @@ describe("protect preflight", () => {
         "Sanctuary protect refused before any host mutation",
       );
     } finally {
+      if (priorStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = priorStoragePath;
+      await rmdir(fortress);
       exitSpy.mockRestore();
       stderrSpy.mockRestore();
       consoleErrorSpy.mockRestore();

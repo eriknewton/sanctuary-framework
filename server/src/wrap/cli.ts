@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 /**
  * Sanctuary wrap - CLI Entry Point
  *
@@ -726,16 +727,13 @@ interface LocalIntelligenceWrapResult {
  * Exported for unit tests that pin precedence without standing up the
  * whole wrap flow.
  */
-export function promoteFortressToStoragePath(options: {
-  fortress?: string;
-}): void {
-  if (options.fortress) {
-    process.env.SANCTUARY_STORAGE_PATH = options.fortress;
-    return;
-  }
-  if (process.env.SANCTUARY_FORTRESS_PATH) {
-    process.env.SANCTUARY_STORAGE_PATH = process.env.SANCTUARY_FORTRESS_PATH;
-  }
+function effectiveFortressOverride(options: {fortress?: string}): string | undefined {
+  return options.fortress || process.env.SANCTUARY_FORTRESS_PATH || undefined;
+}
+
+export function promoteFortressToStoragePath(options: {fortress?: string}): void {
+  const fortress = effectiveFortressOverride(options);
+  if (fortress) process.env.SANCTUARY_STORAGE_PATH = fortress;
 }
 
 /**
@@ -3175,6 +3173,8 @@ async function resolveProtectCredential(
 }
 
 export interface RunWrapDeps {
+  /** Explicit isolated inventory for tests; production uses the root-owned inventory. */
+  selectorRoots?: SelectorRoots;
   /** Stdin source for `--passphrase-stdin` (tests inject a Readable). */
   stdin?: NodeJS.ReadableStream;
   /**
@@ -3320,6 +3320,15 @@ export async function runWrap(
     if (Object.keys(__hermesPostureTestHook).length) assertWrapCliTestHookAllowed("__hermesPostureTestHook");
     if (__hermesParityTestHook.parity) assertWrapCliTestHookAllowed("__hermesParityTestHook");
     return runHermesPosture(options, __hermesPostureTestHook, __hermesParityTestHook.parity);
+  }
+  if ((deps.osPlatform ?? (() => process.platform))() === "linux") {
+    const storagePath = effectiveFortressOverride(options) ?? resolveStoragePath();
+    const selection = selectLinuxProfile(deps.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
+    // Only a proven legacy selection may reach listeners, credentials or provisioning.
+    if (selection.kind !== "LegacyV1") {
+      process.stderr.write(`${profileRefusalText(selection)}\n`);
+      process.exit(2);
+    }
   }
   if (options.hermes) await refuseHermesMcpWithPosture();
   installProcessShutdownListeners();

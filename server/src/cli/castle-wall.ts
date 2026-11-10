@@ -1,3 +1,4 @@
+import {selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 import { FULL_SUPERVISION_COMPLETION_CODES } from "../castle-wall/runtime/full-supervision-exit.js";
 import fs from "node:fs";
 import { CASTLE_WALL_STOP_EXIT_DEADLINE_MS } from "../castle-wall/constants.js";
@@ -194,6 +195,8 @@ export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_D
 const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 
 export interface CastleWallCommandContext {
+  /** Explicit isolated inventory for tests; production uses the root-owned inventory. */
+  selectorRoots?: SelectorRoots;
   out?: Writable;
   err?: Writable;
   /** INTERNAL/TEST: route operator warnings across the Darwin capability boundary. */
@@ -2575,6 +2578,16 @@ export async function runDaemon(
     return 2;
   }
 
+  const storagePath = resolveFortressArg(parsed.fortress, env);
+  if (platform === "linux") {
+    const selection = selectLinuxProfile(ctx.selectorRoots ?? defaultSelectorRoots(), rawCandidates(storagePath));
+    // Only a proven legacy selection may consult the opt-in or prepare storage.
+    if (selection.kind !== "LegacyV1") {
+      write(err, `${profileRefusalText(selection)}\n`);
+      return 1;
+    }
+  }
+
   // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
   // The daemon verb is macOS by default. On Linux it stays unsupported UNLESS the
   // operator explicitly opts in to the producer-signed close, in which case it
@@ -2615,7 +2628,7 @@ export async function runDaemon(
   // back to resolveStoragePath(env) when no flag is given, preserving prior
   // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
   // SANCTUARY_STORAGE_PATH upstream in cli.ts).
-  const storagePath = resolveFortressArg(parsed.fortress, env);
+
   if (launchAgent) {
     const { fullAgentAdmissionRefusal } = await import("./castle-wall-full-agent.js");
     const refusal = fullAgentAdmissionRefusal(ctx.getppid?.() ?? process.ppid, process.pid,

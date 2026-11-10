@@ -190,7 +190,11 @@ export async function runCliRaw(
   opts: RunCliOptions = {},
 ): Promise<RunCliResult> {
   const command = opts.command ?? "node";
-  const prefixArgs = opts.prefixArgs ?? [CLI_PATH];
+  const needsSelectionRoots = args[0] === "wrap" || args[0] === "protect"
+    || args[0] === "castle-wall" && args[1] === "daemon";
+  const prefixArgs = opts.prefixArgs ?? (needsSelectionRoots
+    ? ["--import", join(HELPER_DIR, "../../fixtures/selector-cli-child.mjs"), CLI_PATH]
+    : [CLI_PATH]);
   const attemptTimeoutMs = opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const backoffMs = opts.backoffMs ?? DEFAULT_BACKOFF;
