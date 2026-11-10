@@ -27,7 +27,8 @@ const UID = process.getuid?.() ?? 0;
 const BOOT = "boot-wired-fixture";
 const UPTIME = 5_000_000;
 // A short real hold deadline forces recovery without waiting for the production deadline.
-const LOCK_HOLD_MS = SECOND / 10;
+// One second: the forced hold must lapse, but the daemon's own appends share this deadline and took over 100 ms on a loaded CI runner.
+const LOCK_HOLD_MS = SECOND;
 const PUBLICATION_TICKS_PER_SECOND = 100; // One hundred publication ticks per second in this fixture.
 const TICK_SECONDS = 1 / PUBLICATION_TICKS_PER_SECOND;
 const STATES = JSON.parse(readFileSync(join(__dirname, "fixtures", "states.json"), "utf8")) as { base: any }; // Untyped fixture JSON, patched by path.
