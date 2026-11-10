@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,10 +31,18 @@ const journal = new Map<string, { text?: Buffer; link?: string }>();
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const read = (name: string) => readFileSync(join(root, name), 'utf8');
 const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+function snapshot(file: string): { text?: Buffer; link?: string } {
+  // One call decides link, file or absent; no separate existence check that could go stale.
+  try { return { link: readlinkSync(file) }; } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return {};
+    if (code !== 'EINVAL') throw error; // EINVAL means the path exists and is not a link.
+  }
+  return { text: readFileSync(file) };
+}
 function remember(name: string) {
   if (journal.has(name)) return;
-  const file = join(root, name);
-  journal.set(name, existsSync(file) ? lstatSync(file).isSymbolicLink() ? { link: readlinkSync(file) } : { text: readFileSync(file) } : {});
+  journal.set(name, snapshot(join(root, name)));
 }
 function put(name: string, text: string) {
   remember(name);
@@ -47,7 +55,7 @@ function restore() {
   // Restore every fixture write, including failure paths; retain empty temp directories, never recursive-delete.
   for (const [name, original] of [...journal].reverse()) {
     const file = join(root, name);
-    try { if (lstatSync(file).isFile() || lstatSync(file).isSymbolicLink()) unlinkSync(file); } catch { /* absent already */ }
+    try { unlinkSync(file); } catch { /* absent already, or a directory, which unlink refuses and is retained */ }
     if (original.link !== undefined) symlinkSync(original.link, file);
     else if (original.text !== undefined) writeFileSync(file, original.text);
   }

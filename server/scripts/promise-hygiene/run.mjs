@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ESLint } from 'eslint';
@@ -22,11 +22,25 @@ function insist(condition, reason) {
 }
 function readMetadata(root, name) {
   const filename = path.resolve(root, name);
-  const stat = lstatSync(filename);
-  // Metadata must not follow a link around the shared size cap, including lockfile digest reads.
-  insist(!stat.isSymbolicLink(), `linked metadata: ${name}`);
-  insist(stat.size <= MAX_METADATA_BYTES, 'metadata size refused');
-  return readFileSync(filename);
+  let descriptor;
+  try {
+    // O_NOFOLLOW refuses a link at open, so the checks below and the read share one descriptor
+    // and a file swapped in after the check cannot be the one that is read.
+    descriptor = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    // ELOOP is what open reports for a final-component link under O_NOFOLLOW (Linux and macOS).
+    insist(error?.code !== 'ELOOP', `linked metadata: ${name}`);
+    throw error;
+  }
+  try {
+    const stat = fstatSync(descriptor);
+    // Metadata must not follow a link around the shared size cap, including lockfile digest reads.
+    insist(stat.isFile(), `linked metadata: ${name}`);
+    insist(stat.size <= MAX_METADATA_BYTES, 'metadata size refused');
+    return readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 function readJson(root, name) {
   return JSON.parse(readMetadata(root, name).toString('utf8'));
