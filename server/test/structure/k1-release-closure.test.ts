@@ -1,7 +1,9 @@
 // fail-before-exempt: Marker propagation and platform independent source pins preserve existing absence properties; native entrypoint refusal is also checked with the marker present.
 import {it as test,expect} from "vitest";
 const it = process.platform === "linux" ? test : test.skip;
-import {readFileSync} from "node:fs";
+import {readFileSync, mkdtempSync, rmdirSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {execFileSync} from "node:child_process";
 test("worker closure excludes secret observers and credential injection",()=>{
   const worker=readFileSync("dist/k1/signing-worker.cjs","utf8");
@@ -46,8 +48,13 @@ test("release argument refusal precedes every production path read", () => {
   expect(production.indexOf("return Err(refused())")).toBeLessThan(production.indexOf("read_pinned("));
 });
 it("Linux only: release refuses retired transport and complete relay arguments", () => {
-  for (const args of [["--bridge"], ["--test-relay", "/tmp/absent-sign.sock", "{}"], ["--test-client", "/tmp/absent-sign.sock", "{}"]]) {
+  const root = mkdtempSync(join(tmpdir(), "k1-release-argv-"));
+  const socket = join(root, "sign.sock");
+  try {
+  for (const args of [["--bridge"], ["--test-relay", socket, "{}"], ["--test-client", socket, "{}"],
+    ["--test-service", join(root,"config"), join(root,"control"), join(root,"custody"), join(root,"node"), join(root,"worker"), "--test-boot-id", join(root,"boot-id")]]) {
     const result = spawnSync(nativeBinary("release", "signer"), args, {env:{VITEST:"true"}, encoding:"utf8", timeout:2000});
     expect(result.status).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).toBe("K1_REFUSED\n");
   }
+  } finally { rmdirSync(root); }
 });
