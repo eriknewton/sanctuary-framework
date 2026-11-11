@@ -28,7 +28,10 @@ it.skipIf(process.platform !== "linux")("relay readiness is the authenticated re
     const first = fixture.frames[0];
     expect(first.readUInt32BE()).toBe(first.length - LENGTH_BYTES);
     expect(first.subarray(LENGTH_BYTES)).toEqual(Buffer.from(canonicalBytes({op:"STATUS"})));
-    const reply = fixture.frames[1];
+    const chunks = Buffer.concat(fixture.frames.slice(1));
+    const replyLength = chunks.readUInt32BE() + LENGTH_BYTES;
+    expect(chunks.length).toBeGreaterThanOrEqual(replyLength);
+    const reply = chunks.subarray(0, replyLength);
     expect(reply.readUInt32BE()).toBe(reply.length - LENGTH_BYTES);
     expect(parsePublicFrame(reply.subarray(LENGTH_BYTES)).op).toBe("STATUS");
     expect((await fixture.client.status()).state).toBe("LOCKED");

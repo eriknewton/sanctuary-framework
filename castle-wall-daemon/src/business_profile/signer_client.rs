@@ -21,6 +21,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
+const PROTOCOL_VERSION: u8 = 1; // Version suffix of sanctuary.record-signer.v1.
 const NS_PER_MS: u64 = 1_000_000; // Nanoseconds in one millisecond.
 const ID_HEX_CHARS: usize = 16 * 2; // The protocol's 128-bit identifier encoded as hex.
 const DIGEST_HEX_CHARS: usize = 32 * 2; // SHA-256 bytes encoded as hex.
@@ -449,6 +450,7 @@ impl BusinessSignerClient {
             )?;
             self.settlement_end = None;
             let value = packet_value(&packet)?;
+            // An immediately queued duplicate refuses this result. A later duplicate is Unmatched at the next admission; authenticated S cannot renew the settled result.
             if signer_service::readable(socket.as_raw_fd()) {
                 return Err(Refusal::DuplicateReply);
             }
@@ -553,7 +555,7 @@ impl BusinessSignerClient {
             Ok(n) if n.to_string() == header.deadline_boottime_ns && n > now && n <= limit => n,
             _ => return self.fail(Refusal::Deadline),
         };
-        if header.v != 1
+        if header.v != PROTOCOL_VERSION
             || header.protocol != SIGNER_PROTOCOL
             || !hex_text(&json!(header.request_id), "", ID_HEX_CHARS)
         {

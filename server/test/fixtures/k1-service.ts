@@ -114,11 +114,12 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
       const boot=join(root,"boot-id"),notify=join(root,"notify.sock"); files.push(boot,notify);
       writeFileSync(boot,text,{mode:0o600});
       // A real datagram observer distinguishes startup refusal from merely refusing later client traffic.
-      const script = `import json,os,socket,subprocess,sys,time
+      const script = `import ctypes,json,os,socket,subprocess,sys,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)
 s.bind(sys.argv[1])
 s.settimeout(0.05)
-p=subprocess.Popen(sys.argv[2:],env={"NOTIFY_SOCKET":sys.argv[1],"VITEST":"true"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+# Linux prctl option 1 is PR_SET_PDEATHSIG; signal 9 is SIGKILL, so observer timeout death also kills S.
+p=subprocess.Popen(sys.argv[2:],preexec_fn=lambda: ctypes.CDLL(None).prctl(1, 9),env={"NOTIFY_SOCKET":sys.argv[1],"VITEST":"true"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 ready=0
 started=time.monotonic()
 end=started+2

@@ -24,6 +24,7 @@ use std::{
 };
 const NS_PER_MS: u64 = 1_000_000; // Nanoseconds per millisecond.
 const WAIT_MS: i32 = 2000; // Twice the signer request window, bounded fixture teardown margin.
+const SENDER_HOLD_US: u32 = SIGNER_HANDSHAKE_DEADLINE_MS as u32 * 1000; // Keep the foreign sender alive for the complete authentication handshake budget.
 const TICK_MS: u64 = 5; // Test polling cadence, below the handshake budget.
 const DEADLINE_WAVES: usize = 50; // Required repeated-admission fault schedule policy bound.
 static SCRIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -237,7 +238,7 @@ impl Script {
                                 let _ =
                                     signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
                                 unsafe {
-                                    libc::usleep(200_000);
+                                    libc::usleep(SENDER_HOLD_US);
                                     libc::_exit(0)
                                 }
                             } // Keep the sender alive through authenticated receipt.
@@ -720,7 +721,7 @@ impl Drop for ChildGuard {
     }
 }
 #[test]
-fn relay_sender_child() {
+fn child_relay_sender() {
     let Some(root) = std::env::var_os("SIGNER_RELAY_CHILD_ROOT") else {
         return;
     };
@@ -760,7 +761,7 @@ fn relay_rights(rights: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "relay_sender_child", "--nocapture"])
+        .args(["--exact", "child_relay_sender", "--nocapture"])
         .env("SIGNER_RELAY_CHILD_ROOT", root.path())
         .stdout(Stdio::null());
     if rights {
@@ -1113,7 +1114,7 @@ fn signer_pidfd_death_never_reconnects_even_with_a_live_socket() {
     let holder = signer_peer::listen(&root.path().join("hold.sock")).unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "relay_sender_child", "--nocapture"])
+        .args(["--exact", "child_relay_sender", "--nocapture"])
         .env("SIGNER_RELAY_CHILD_ROOT", root.path())
         .env("SIGNER_PIDFD_HOLD", "1")
         .stdout(std::process::Stdio::null());
