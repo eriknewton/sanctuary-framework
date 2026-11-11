@@ -1,4 +1,5 @@
 /** Canary and observer property lists, their well-formed checks, and the system-domain print parser. */
+// fail-before-exempt: a test-name correction only; the assertions and the parser are unchanged.
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -152,7 +153,7 @@ describe("system-domain print parser", () => {
     expect(parseSystemJobPrint("system/x = {\n}\n").valid).toBe(false);
   });
 
-  it("treats only the modelled not-found outcome as not found", () => {
+  it("treats only the captured not-found outcome as not found", () => {
     const nf = PRINTS.entries.captured_system_not_found!;
     expect(systemJobNotFound(nf, CANARY_LABEL)).toBe(true);
     expect(systemJobNotFound({ ...nf, stdout: nf.stderr, stderr: "" }, CANARY_LABEL)).toBe(true);

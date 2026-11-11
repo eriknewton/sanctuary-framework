@@ -1,9 +1,9 @@
 /** The real daemon composition wires the liveness recorder: daemon.json publishes with every hook, independent of a held audit sink. */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { AuditLog, AuditLockHoldDeadlineError } from "../../../src/operational/audit-log.js";
@@ -19,8 +19,18 @@ import {
 } from "../../../src/castle-wall/runtime/index.js";
 import { canaryWindow, HISTORY_WINDOW, SECOND } from "../../../src/castle-wall/liveness/constants.js";
 import { evaluateLiveness } from "../../../src/castle-wall/liveness/evaluate.js";
+import { observerHostId } from "../../../src/castle-wall/liveness/observer.js";
 import { readLivenessRecords } from "../../../src/castle-wall/liveness/read-status.js";
 import { parseDaemonRecord, REQUIRED_RECORDER_HOOKS } from "../../../src/castle-wall/liveness/schema.js";
+
+// Every host id the shared helper derives is recorded, so the wiring case can
+// prove the daemon calls the one derivation rather than a copy of it. The
+// wrapper returns the helper's own result, so no other case sees a change.
+const hostIdInputs = vi.hoisted(() => [] as string[]);
+vi.mock("../../../src/castle-wall/liveness/observer.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../../src/castle-wall/liveness/observer.js")>();
+  return { ...actual, observerHostId: (name: string) => { hostIdInputs.push(name); return actual.observerHostId(name); } };
+});
 
 const silent = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
 const UID = process.getuid?.() ?? 0;
@@ -122,6 +132,26 @@ describe("wired daemon recorder", () => {
         delete missing.daemon.value.raw.hooks[hook];
         expect(evaluateLiveness(missing).wall.reasons, hook).toContain("evidence_incomplete");
       }
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it("publishes the host id from the shared observer derivation", async () => {
+    hostIdInputs.length = 0;
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startDaemon({
+      fortressPath, fortressId: "fortress-test", masterKey, localSign: true, auditLog, platform: "darwin",
+      activeConfigPath: join(fortressPath, "active.json"), listenerFactory: fakeListenerFactory,
+      emissionLivenessTickSeconds: TICK_SECONDS,
+      livenessHostClock: { bootId: async () => BOOT, uptimeMs: () => UPTIME },
+    });
+    try {
+      const record = await waitForSequence(fortressPath, 1);
+      // Read before this case calls the helper itself: only the daemon's own call counts.
+      const daemonInputs = [...hostIdInputs];
+      expect(daemonInputs).toContain(hostname());
+      expect(record.subject.host_id).toBe(observerHostId(hostname()));
     } finally {
       await handle.stop();
     }
