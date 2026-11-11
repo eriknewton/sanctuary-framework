@@ -6,11 +6,12 @@
 // Race bound: Post-publication verification is a sequence of observations, not an atomic snapshot. It detects mismatches present when the relevant
 // identities, entries and bytes are checked. Concurrent changes after a relevant check, including changes during verification, can remain undetected
 // and the build can exit zero. It neither prevents redirected operations nor authenticates subsequent checkout contents.
-// Trust bound: the checkout copies are build convenience outputs, not the trust authority; release acceptance rests on the packed artifact and its verifier.
-import { createHash } from "node:crypto";
+// Trust bound: the checkout copies are build convenience outputs, not the trust authority; content acceptance uses check-evidence-pack-artifact and the SANCTUARY_EVIDENCE_CANDIDATE_V1 receipt.
+import { ARTIFACT_FORMAT, CANDIDATE_FORMAT, ARTIFACT_FILES, BIN, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, NON_RELEASE_MARKER, NON_RELEASE_TEXT, digest, registry, memberMode, parsePackage, parseCandidate, parseManifest, checkArtifact, requireValid, readBounded, artifactSuccess } from "../src/evidence-pack/artifact-policy.mjs";
+export { digest, NON_RELEASE_MARKER, NON_RELEASE_TEXT };
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync, realpathSync, opendirSync, openSync, fstatSync, readSync, closeSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, isAbsolute, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 const TIMEOUT_MS = 120_000;
@@ -20,11 +21,8 @@ const SOURCE_FORMAT = "SANCTUARY_RELEASE_SOURCE_V1";
 // Must match the installed provenance consumer in snapshot-provenance.test.ts.
 const BUILD_FORMAT = "SANCTUARY_VERIFIER_BUILD_V1";
 // Must match the installed non-release marker consumer in snapshot-provenance.test.ts and the packed file list in snapshot-packed.test.ts.
-export const NON_RELEASE_MARKER = "NON_RELEASE";
-export const NON_RELEASE_TEXT = "Synthetic archive metadata is not release authentication.\n";
 const SHA = /^[0-9a-f]{40}$/;
 const HASH = /^[0-9a-f]{64}$/;
-export const digest = bytes => createHash("sha256").update(bytes).digest("hex");
 export function validateSource(metadata, archive, revision, head) {
   // Exact metadata and full revisions prevent a basename or short hash from becoming build provenance.
   if (Object.keys(metadata).sort().join() !== "format,source_archive_sha256,source_revision" || metadata.format !== SOURCE_FORMAT || !SHA.test(metadata.source_revision) || !HASH.test(metadata.source_archive_sha256) || revision !== metadata.source_revision || (head !== undefined && head !== revision) || digest(archive) !== metadata.source_archive_sha256) throw new Error("Source provenance refused");
@@ -50,12 +48,16 @@ with tarfile.open(sys.argv[1]) as archive:
                 shutil.copyfileobj(source, output)
 `, archive, staged], { timeout: TIMEOUT_MS });
 }
-export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { nonRelease = false, outputsChecked, beforeCopy, afterCopy, beforeHash } = {}) {
-  if (args.length !== 4 || args[0] !== "--source-metadata" || args[2] !== "--source-archive") throw new Error("Expected source metadata and source archive");
+export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { outputsChecked, beforeCopy, afterCopy, beforeHash, packedBytes, copiesObserved, artifactWritten } = {}) {
+  // INPUTS_VALIDATED: artifact policy is required in the core entry, never defaulted from an option.
+  if (args.length !== 8 || args[0] !== "--source-metadata" || args[2] !== "--source-archive" || args[4] !== "--artifact-dir" || args[6] !== "--artifact-mode" || !["release", "fixture"].includes(args[7])) throw new Error("Expected source metadata, source archive, artifact directory and explicit mode");
+  const mode = args[7], nonRelease = mode === "fixture", artifactDir = args[5];
+  if (!isAbsolute(artifactDir) || resolve(artifactDir) !== artifactDir || realpathSync(dirname(artifactDir)) !== dirname(artifactDir) || OUTPUT_DIRECTORIES.some(path => artifactDir === join(root, path) || artifactDir.startsWith(join(root, path) + "/"))) throw new Error("Artifact destination refused");
   const metadata = JSON.parse(readFileSync(args[1], "utf8"));
   const head = existsSync(join(root, ".git")) ? execFileSync("/usr/bin/git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
   const archiveBytes = readFileSync(args[3]);
   validateSource(metadata, archiveBytes, revision, head);
+  mkdirSync(artifactDir, { mode: 0o700 }); // Exclusive creation refuses existing files, directories and links.
   // Hash validation precedes extraction, and only the validated archive supplies compiled source bytes.
   const staged = mkdtempSync(join(tmpdir(), "pack-source-"));
   // Extract the validated bytes from a private copy so the caller cannot swap the archive between hash and use.
@@ -65,17 +67,42 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   extractSourceArchive(archivePath, staged);
   symlinkSync(join(root, "server/node_modules"), join(staged, "server/node_modules"), "dir");
   const packageRoot = join(staged, "packages/evidence-pack-verifier");
-  const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+  // STAGED: the package semantics are the same contract the shipped checker consumes.
+  const pkg = parsePackage(readBounded(join(packageRoot, "package.json"), MAX_MANIFEST_BYTES));
   // The candidate stays private because publication and attribution require owner-controlled release intent.
-  if (pkg.private !== true || pkg.author !== "Erik Newton" || pkg.license !== "Apache-2.0" || pkg.scripts || pkg.dependencies || pkg.type !== "module" || pkg.engines.node !== ">=22.0.0" || JSON.stringify(pkg.files) !== JSON.stringify(["dist", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]) || JSON.stringify(pkg.bin) !== JSON.stringify({ "verify-evidence-pack": "dist/verify-evidence-pack.js" })) throw new Error("Candidate package contract refused");
   // Must match the definition consumed by tsup.evidence-pack.config.ts and snapshot-offline-cli.ts.
-  execFileSync(process.execPath, [join(root, "server/node_modules/tsup/dist/cli-default.js"), "--config", "tsup.evidence-pack.config.ts"], { cwd: join(staged, "server"), stdio: "inherit", timeout: TIMEOUT_MS, env: { ...process.env, SANCTUARY_SOURCE_SHA: revision } });
+  execFileSync(process.execPath, [join(root, "server/node_modules/tsup/dist/cli-default.js"), "--config", "tsup.evidence-pack.config.ts"], { cwd: join(staged, "server"), stdio: "inherit", timeout: TIMEOUT_MS, env: { ...process.env, SANCTUARY_SOURCE_SHA: revision, SANCTUARY_ARTIFACT_MODE: mode } });
   const bundle = join(packageRoot, "dist/verify-evidence-pack.js");
-  chmodSync(bundle, 0o755);
+  // A compiler surprise is a STOP, never an implicit registry extension.
+  if (readdirSync(join(packageRoot, "dist")).sort().join() !== Object.values(BIN).map(path => basename(path)).sort().join()) throw new Error("Unexpected verifier artifact");
+  for (const bin of Object.values(BIN)) chmodSync(join(packageRoot, bin), 0o755);
   writeFileSync(join(packageRoot, "dist/provenance.json"), JSON.stringify({ format: BUILD_FORMAT, package_version: pkg.version, source_revision: metadata.source_revision, source_archive_sha256: metadata.source_archive_sha256, verifier_sha256: digest(readFileSync(bundle)), dependency_lock_sha256: digest(readFileSync(join(root, "server/package-lock.json"))) }, null, 2) + "\n");
   // The marker lives inside the packed directory so a fixture tarball stays marked non-release after it leaves its build root.
   if (nonRelease) writeFileSync(join(packageRoot, "dist", NON_RELEASE_MARKER), NON_RELEASE_TEXT, { flag: "wx" });
-  if (readdirSync(join(packageRoot, "dist")).sort().join() !== ["provenance.json", "verify-evidence-pack.js", ...(nonRelease ? [NON_RELEASE_MARKER] : [])].sort().join()) throw new Error("Unexpected verifier artifact");
+  if (readdirSync(join(packageRoot, "dist")).sort().join() !== registry(mode).filter(path => path.startsWith("package/dist/")).map(path => basename(path)).sort().join()) throw new Error("Unexpected verifier artifact");
+  // Expected digests come only from the exact staged registry, before npm runs. No normalization was observed.
+  const members = registry(mode).map(path => {
+    const file = join(packageRoot, path.slice("package/".length));
+    chmodSync(file, memberMode(path));
+    const bytes = readBounded(file, MAX_ARTIFACT_BYTES);
+    return { path, type: "file", size_bytes: bytes.length, sha256: digest(bytes) };
+  });
+  // PACKED: npm's report locates a single file; it supplies no accepted content metadata.
+  const packDir = mkdtempSync(join(tmpdir(), "pack-compressed-"));
+  const report = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--offline", "--pack-destination", packDir], { cwd: packageRoot, encoding: "utf8", timeout: TIMEOUT_MS }));
+  if (!Array.isArray(report) || report.length !== 1 || typeof report[0].filename !== "string" || basename(report[0].filename) !== report[0].filename) throw new Error("Pack report refused");
+  let tarballBytes = readBounded(join(packDir, report[0].filename), MAX_ARTIFACT_BYTES);
+  // Fault injection is callable only from tests, never from arguments or environment.
+  if (packedBytes) tarballBytes = packedBytes(tarballBytes, { packageRoot, packDir });
+  const manifestBytes = Buffer.from(JSON.stringify({ format: ARTIFACT_FORMAT, mode, package_name: pkg.name, package_version: pkg.version, source_revision: revision, source_archive_sha256: metadata.source_archive_sha256, tarball_sha256: digest(tarballBytes), members }, null, 2) + "\n");
+  const receipt = requireValid(parseCandidate(Buffer.from(JSON.stringify({ format: CANDIDATE_FORMAT, mode, source_revision: revision, tarball: ARTIFACT_FILES.tarball, manifest: ARTIFACT_FILES.manifest, tarball_sha256: digest(tarballBytes), manifest_sha256: digest(manifestBytes) }))));
+  const pins = { ...receipt, dependency_lock_sha256: digest(readFileSync(join(root, "server/package-lock.json"))) };
+  // ARTIFACT_CHECKED: package.json is included in the fixed pre-pack hash comparison too.
+  requireValid(parseManifest(manifestBytes));
+  requireValid(checkArtifact(tarballBytes, manifestBytes, pins));
+  writeFileSync(join(artifactDir, receipt.tarball), tarballBytes, { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
+  writeFileSync(join(artifactDir, receipt.manifest), manifestBytes, { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
+  artifactWritten?.(artifactDir);
   // The repository root is resolved once, so every output component below it is judged against one real anchor.
   const base = realpathSync(root);
   const outputs = OUTPUT_DIRECTORIES.map(relative => checkOutput(base, relative));
@@ -93,6 +120,17 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
     afterCopy?.(output.destination);
   }
   verifyPublished(outputs, staged, nonRelease, beforeHash);
+  // COPIES_OBSERVED: these observations neither authenticate later checkout bytes nor authorize repacking.
+  copiesObserved?.(outputs.map(output => output.destination));
+  const finalTarball = readBounded(join(artifactDir, receipt.tarball), MAX_ARTIFACT_BYTES);
+  const finalManifest = readBounded(join(artifactDir, receipt.manifest), MAX_MANIFEST_BYTES);
+  requireValid(checkArtifact(finalTarball, finalManifest, pins));
+  // The archive-built checker must accept too, even when the checkout's policy differs from the source archive.
+  const checked = execFileSync(process.execPath, [join(packageRoot, BIN["check-evidence-pack-artifact"]), ...checkerArgs(artifactDir, receipt)], { encoding: "utf8", timeout: TIMEOUT_MS });
+  if (checked !== artifactSuccess(mode)) throw new Error("Shipped checker refused");
+  // READY is written last. Refusal never deletes outputs, including a partially completed first copy.
+  writeFileSync(join(artifactDir, ARTIFACT_FILES.receipt), JSON.stringify(receipt, null, 2) + "\n", { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
+  return receipt;
 }
 // Must match the output-directory witnesses in snapshot-provenance.test.ts.
 const OUTPUT_DIRECTORIES = ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"];
@@ -217,22 +255,52 @@ export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileU
   writeFileSync(metadata, JSON.stringify({ format: SOURCE_FORMAT, source_revision: revision, source_archive_sha256: digest(readFileSync(archive)) }));
   writeFileSync(join(root, "NON_RELEASE_FIXTURE"), NON_RELEASE_TEXT);
   symlinkSync(join(sourceRoot, "server/node_modules"), join(tree, "server/node_modules"), "dir");
-  await buildCandidate(["--source-metadata", metadata, "--source-archive", archive], tree, revision, { nonRelease: true });
-  const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--offline", "--pack-destination", root], { cwd: join(tree, "packages/evidence-pack-verifier"), encoding: "utf8", timeout: TIMEOUT_MS }))[0];
-  const tarball = join(root, packed.filename), prefix = join(root, "installed");
-  execFileSync("npm", ["install", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", "--offline", tarball], { encoding: "utf8", timeout: TIMEOUT_MS });
-  const command = join(prefix, "node_modules/.bin/verify-evidence-pack");
-  writeFileSync(join(root, "packed-consumer.json"), JSON.stringify({ non_release: true, tarball_sha256: digest(readFileSync(tarball)), integrity: packed.integrity, files: packed.files, command }, null, 2));
-  return { root, tree, command, tarball, packed, metadata, archive, non_release: true, fixture: true };
+  const artifactDir = join(root, "artifact");
+  await buildCandidate(["--source-metadata", metadata, "--source-archive", archive, "--artifact-dir", artifactDir, "--artifact-mode", "fixture"], tree, revision);
+  const checked = checkDescriptor(artifactDir);
+  const installed = installCandidate(artifactDir);
+  return { root, tree, ...installed, tarball: join(artifactDir, ARTIFACT_FILES.tarball), artifactDir, receipt: checked.receipt, packed: { files: checked.members.map(row => ({ path: row.path.slice("package/".length), size: row.size_bytes, mode: memberMode(row.path) })) }, metadata, archive, non_release: true, fixture: true };
 }
+/** Fixed-path descriptor consumer used before install and upload; a receipt supplies data, never a command. */
+export function checkDescriptor(artifactDir) {
+  if (!isAbsolute(artifactDir) || realpathSync(artifactDir) !== artifactDir || !lstatSync(artifactDir).isDirectory()) throw new Error("Artifact directory refused");
+  const receipt = requireValid(parseCandidate(readBounded(join(artifactDir, ARTIFACT_FILES.receipt), MAX_MANIFEST_BYTES)));
+  const checked = requireValid(checkArtifact(readBounded(join(artifactDir, receipt.tarball), MAX_ARTIFACT_BYTES), readBounded(join(artifactDir, receipt.manifest), MAX_MANIFEST_BYTES), receipt));
+  return { receipt, ...checked };
+}
+export function checkerArgs(artifactDir, receipt) {
+  return ["--tarball", join(artifactDir, receipt.tarball), "--manifest", join(artifactDir, receipt.manifest), "--expect-tarball-sha256", receipt.tarball_sha256, "--expect-manifest-sha256", receipt.manifest_sha256, "--expect-source-revision", receipt.source_revision, "--expect-mode", receipt.mode];
+}
+/** Install only the checked fixed artifact; executable paths are derived from this owned prefix. */
+export function installCandidate(artifactDir) {
+  const { receipt } = checkDescriptor(artifactDir), prefix = join(artifactDir, "installed");
+  execFileSync("npm", ["install", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", "--offline", join(artifactDir, receipt.tarball)], { encoding: "utf8", timeout: TIMEOUT_MS });
+  return { command: join(prefix, "node_modules/.bin/verify-evidence-pack"), checker: join(prefix, "node_modules/.bin/check-evidence-pack-artifact") };
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { await buildCandidate(process.argv.slice(2)); }
+  try {
+    const args = process.argv.slice(2);
+    if (args.length === 2 && args[0] === "--check-descriptor") checkDescriptor(args[1]);
+    else if (args.length === 2 && args[0] === "--install-candidate") {
+      installCandidate(args[1]);
+      const { receipt } = checkDescriptor(args[1]);
+      writeFileSync(join(args[1], "test-candidate.json"), JSON.stringify(receipt), { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
+      if (receipt.mode === "fixture") writeFileSync(join(args[1], "NON_RELEASE_FIXTURE"), NON_RELEASE_TEXT, { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
+    } else await buildCandidate(args);
+  }
   catch (error) { process.stderr.write(String(error) + "\n"); process.exitCode = 1; }
 }
 let fixtureCandidate;
 export async function candidateForTests() {
   // Must match the installed descriptor written in .github/workflows/evidence-pack-candidate.yml.
-  if (process.env.EVIDENCE_PACK_TEST_CANDIDATE) return JSON.parse(readFileSync(process.env.EVIDENCE_PACK_TEST_CANDIDATE, "utf8"));
+  if (process.env.EVIDENCE_PACK_TEST_CANDIDATE) {
+    const descriptor = process.env.EVIDENCE_PACK_TEST_CANDIDATE, artifactDir = dirname(descriptor);
+    const receipt = requireValid(parseCandidate(readBounded(descriptor, MAX_MANIFEST_BYTES)));
+    const checked = checkDescriptor(artifactDir);
+    if (JSON.stringify(receipt) !== JSON.stringify(checked.receipt)) throw new Error("Test receipt mismatch");
+    return { root: artifactDir, tree: resolve(dirname(fileURLToPath(import.meta.url)), "../.."), artifactDir, receipt, command: join(artifactDir, "installed/node_modules/.bin/verify-evidence-pack"), checker: join(artifactDir, "installed/node_modules/.bin/check-evidence-pack-artifact"), tarball: join(artifactDir, receipt.tarball), archive: join(artifactDir, "source.tar"), metadata: join(artifactDir, "release-source.json"), packed: { files: checked.members.map(row => ({ path: row.path.slice("package/".length), size: row.size_bytes, mode: memberMode(row.path) })) }, fixture: receipt.mode === "fixture", non_release: receipt.mode === "fixture" };
+  }
   fixtureCandidate ??= prepareFixtureCandidate();
   return fixtureCandidate;
 }

@@ -8,6 +8,7 @@ import { spawnSync, execFileSync } from "node:child_process";
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { validateSource, digest, candidateForTests, NON_RELEASE_MARKER, NON_RELEASE_TEXT } from "../../scripts/build-evidence-pack.mjs";
 const SOURCE = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const artifactArgs = (metadata: string, archive: string, fixture = false) => ["--source-metadata", metadata, "--source-archive", archive, "--artifact-dir", join(mkdtempSync(join(tmpdir(), "provenance-artifact-")), "artifact"), "--artifact-mode", fixture ? "fixture" : "release"];
 const archive = Buffer.from("synthetic source archive");
 // Must match the source and installed build record schemas in scripts/build-evidence-pack.mjs.
 const metadata = { format: "SANCTUARY_RELEASE_SOURCE_V1", source_revision: SOURCE, source_archive_sha256: digest(archive) };
@@ -17,7 +18,7 @@ describe("candidate provenance input boundary", () => {
     const m = { ...metadata }; if (kind === "short") m.source_revision = SOURCE.slice(0, 8); if (kind === "uppercase") m.source_revision = SOURCE.toUpperCase(); if (kind === "extra") Object.assign(m, { extra: true }); if (kind === "missing") delete (m as Partial<typeof m>).source_archive_sha256;
     expect(() => validateSource(m, kind === "archive" ? Buffer.from("other") : archive, kind === "short" ? m.source_revision : kind === "env" ? "a".repeat(40) : SOURCE, kind === "short" ? m.source_revision : kind === "head" ? "b".repeat(40) : SOURCE)).toThrow("Source provenance refused");
   });
-  it("build command refuses an eight-hex input before bundling", () => { const root = mkdtempSync(join(tmpdir(), "provenance-")); const m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive); const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a], { encoding: "utf8" }); expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); });
+  it("build command refuses an eight-hex input before bundling", () => { const root = mkdtempSync(join(tmpdir(), "provenance-")); const m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive); const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], { encoding: "utf8" }); expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); });
 });
 describe("installed immutable version", () => {
   let c: Awaited<ReturnType<typeof candidateForTests>>;
@@ -55,7 +56,7 @@ it.each(["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"])("
   const c = await prepareFixtureCandidate(), destination = join(c.tree, output);
   const before = lstatSync(destination, { bigint: true });
   writeFileSync(join(destination, "stale.js"), "stale");
-  await buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], c.tree, SOURCE);
+  await buildCandidate(artifactArgs(c.metadata, c.archive), c.tree, SOURCE);
   expect(existsSync(join(destination, "stale.js"))).toBe(false);
   expect(lstatSync(destination, { bigint: true }).ino).toBe(before.ino);
   expect(lstatSync(destination, { bigint: true }).dev).toBe(before.dev);
@@ -76,7 +77,7 @@ async function entryProvenance(kind: "deleted" | "mismatched" | "matching") {
     // The injection is proven before it is relied on, so an unredirected staging parent fails here instead of leaving the empty-staging check vacuous.
     expect(tmpdir()).toBe(staging);
     // The omitted revision argument exercises the release entry's ambient input before any archive byte is staged.
-    const outcome = await buildCandidate(["--source-metadata", m, "--source-archive", a], tree).then(() => "built", (error: Error) => error.message);
+    const outcome = await buildCandidate(["--source-metadata", m, "--source-archive", a, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], tree).then(() => "built", (error: Error) => error.message);
     return { outcome, staged: readdirSync(staging).map(name => name.replace(/-[^-]+$/, "")).sort(), tree: readdirSync(tree) };
   } finally { parent.mockRestore(); syncBuiltinESMExports(); vi.unstubAllEnvs(); }
 }
@@ -110,13 +111,13 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     if (kind === "file") { renameSync(destination, aside); writeFileSync(destination, "not a directory"); }
     if (kind === "subdirectory") mkdirSync(join(destination, "nested"));
     const faulted = kind === "file" ? aside : destination, faultedBefore = listing(faulted);
-    await expect(buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], root, SOURCE)).rejects.toThrow(kind === "subdirectory" ? "Unexpected output directory" : "Unexpected output path");
+    await expect(buildCandidate(artifactArgs(c.metadata, c.archive), root, SOURCE)).rejects.toThrow(kind === "subdirectory" ? "Unexpected output directory" : "Unexpected output path");
     // Nothing is removed from either output, including the tree a link points at, when any output path is refused.
     expect(listing(other)).toEqual(otherBefore);
     expect(listing(faulted)).toEqual(faultedBefore);
     expect(lstatSync(destination).isSymbolicLink()).toBe(kind === "symlink");
   }, 120_000);
-  const build = (root: string, options = {}) => buildCandidate(["--source-metadata", c.metadata, "--source-archive", c.archive], root, SOURCE, options);
+  const build = (root: string, options: { nonRelease?: boolean; outputsChecked?: (paths: string[]) => void; beforeCopy?: (path: string) => void; afterCopy?: (path: string) => void; beforeHash?: (path: string) => void } = {}) => { const { nonRelease = false, ...faults } = options; return buildCandidate(artifactArgs(c.metadata, c.archive, nonRelease), root, SOURCE, faults); };
   const listing = (path: string) => existsSync(path) ? readdirSync(path).sort() : null;
   // Must match the output-chain walk in checkOutput in scripts/build-evidence-pack.mjs: each ancestor here lies on one output chain.
   const ANCESTORS = [["packages", OUTPUTS[0]], ["packages/evidence-pack-verifier", OUTPUTS[0]], ["server", OUTPUTS[1]]] as const;
@@ -159,7 +160,7 @@ describe("rebuild output paths are all checked before either is cleared", () => 
     for (const path of OUTPUTS) expect(existsSync(join(root, path, "stale.js"))).toBe(false);
   }, 120_000);
   // Must match verifyPublished, changedSince and the failure bound in scripts/build-evidence-pack.mjs: a refused build deletes nothing.
-  const RELEASE_DIST = ["provenance.json", "verify-evidence-pack.js"];
+  const RELEASE_DIST = ["check-evidence-pack-artifact.js", "provenance.json", "verify-evidence-pack.js"];
   const published = (output: string) => output === OUTPUTS[0] ? RELEASE_DIST : listing(join(c.tree, output))!;
   const otherThan = (output: string) => OUTPUTS.find(path => path !== output)!;
   // A fault fires only at its own output and counts its calls, so every refusal row proves its fault was reached exactly once.
