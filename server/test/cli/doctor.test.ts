@@ -878,6 +878,38 @@ approval_channel:
     expect(check?.hint).toContain("could not be run");
     expect(check?.hint).toContain("ran but cannot import yaml");
   });
+it.each([
+  ["darwin", true, "FAIL"], ["darwin", false, "WARN"], ["linux", true, "WARN"],
+] as const)("scopes the wall liveness failure to %s with install %s", async (platform, installed, expected) => {
+  const doctor = await import("../../src/cli/doctor.js");
+  const { evaluateLiveness } = await import("../../src/castle-wall/liveness/evaluate.js");
+  const { readFileSync } = await import("node:fs");
+  const input = JSON.parse(readFileSync(new URL("../castle-wall/liveness/fixtures/states.json", import.meta.url), "utf8")).base;
+  input.observer.value.raw.canary_integrity.passed = false;
+  input.config.value.commissioning.agent = false;
+  const envelope = evaluateLiveness(input);
+  const projection = { evaluated_at: envelope.evaluated_at, served_age_ms: 0, schedule: [], exit_code: envelope.exit_code,
+    wall: { ...envelope.wall, cause: null }, agent: { ...envelope.agent, cause: null }, coverage: { ...envelope.coverage, cause: null } };
+  const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+  if (installed) await mkdir(join(fortress, "liveness"), { mode: 0o700 });
+  const { LivenessSurfaceSource } = await import("../../src/castle-wall/liveness/surface-reader.js");
+  const source = vi.spyOn(LivenessSurfaceSource.prototype, "readProjection").mockResolvedValue(projection);
+  const out = new Capture();
+  let code: number;
+  try {
+    code = await doctor.runDoctorCommand({ argv: ["--json"], out, storagePath: fortress, platform,
+      env: { SANCTUARY_PASSPHRASE: passphrase }, execSyncFn: () => "" });
+  } finally { source.mockRestore(); }
+  const allChecks = JSON.parse(out.text()).checks as Awaited<ReturnType<typeof doctor.runDoctorChecks>>;
+  const checks = allChecks.filter(check => check.name.startsWith("Castle Wall liveness"));
+  expect(allChecks.filter(check => !check.name.startsWith("Castle Wall liveness")).some(check => check.status === "FAIL")).toBe(false);
+  expect(code).toBe(expected === "FAIL" ? 1 : 0);
+  expect(checks.map(c => c.name)).toEqual(["Castle Wall liveness (wall)", "Castle Wall liveness (agent)", "Castle Wall liveness (coverage)"]);
+  expect(checks[0]!.status).toBe(expected);
+  expect(checks[1]).toMatchObject({ status: "WARN", message: "not monitored (no agent commissioning)" });
+  expect(checks[2]!.status).toBe("WARN");
+  expect(checks.some(c => c.status === "FAIL")).toBe(expected === "FAIL");
+});
 });
 
 describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
@@ -936,7 +968,7 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
   });
 });
 
-// Scope simulated authority to root-writer fixture work, then restore reader identity.
+// A1a: scope simulated authority to root-writer fixture work, then restore reader identity.
 async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> {
   __testSetAuditWriterUidForRole("root_daemon", 0);
   try { return await operation(); }
@@ -944,30 +976,3 @@ async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> 
 }
 resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));
 
-it.each([
-  ["darwin", true, "FAIL"], ["darwin", false, "WARN"], ["linux", true, "WARN"],
-] as const)("scopes the wall liveness failure to %s with install %s", async (platform, installed, expected) => {
-  const doctor = await import("../../src/cli/doctor.js");
-  const { evaluateLiveness } = await import("../../src/castle-wall/liveness/evaluate.js");
-  const { readFileSync } = await import("node:fs");
-  const input = JSON.parse(readFileSync(new URL("../castle-wall/liveness/fixtures/states.json", import.meta.url), "utf8")).base;
-  input.observer.value.raw.canary_integrity.passed = false;
-  input.config.value.commissioning.agent = false;
-  const envelope = evaluateLiveness(input);
-  const projection = { evaluated_at: envelope.evaluated_at, served_age_ms: 0, schedule: [], exit_code: envelope.exit_code,
-    wall: { ...envelope.wall, cause: null }, agent: { ...envelope.agent, cause: null }, coverage: { ...envelope.coverage, cause: null } };
-  const { createTempHome } = await import("../helpers/temp-fortress.js");
-  const home = await createTempHome("doctor-components");
-  let checks: Awaited<ReturnType<typeof doctor.runDoctorChecks>>;
-  try {
-    checks = (await doctor.runDoctorChecks({ storagePath: home.defaultFortressPath, platform,
-      env: { SANCTUARY_PASSPHRASE: "fixture-doctor-passphrase" }, execSyncFn: () => "",
-      livenessDirectoryExists: async () => installed, livenessSource: { readProjection: async () => projection } }))
-      .filter(check => check.name.startsWith("Castle Wall liveness"));
-  } finally { await home.cleanup(); }
-  expect(checks.map(c => c.name)).toEqual(["Castle Wall liveness (wall)", "Castle Wall liveness (agent)", "Castle Wall liveness (coverage)"]);
-  expect(checks[0]!.status).toBe(expected);
-  expect(checks[1]).toMatchObject({ status: "WARN", message: "not monitored (no agent commissioning)" });
-  expect(checks[2]!.status).toBe("WARN");
-  expect(checks.some(c => c.status === "FAIL")).toBe(expected === "FAIL");
-});
