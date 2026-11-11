@@ -237,8 +237,10 @@ export function parseSystemJobPrint(stdout: string): SystemJobPrint {
 }
 
 /**
- * True only for the modelled not-found outcome: exit 113, no service block,
- * and the `Could not find service "<label>"` line. Any other result cannot prove the job absent.
+ * True only for the captured not-found outcome in `captured_system_not_found`
+ * in server/test/castle-wall/liveness/fixtures/launchctl-print.json: exit 113,
+ * no service block, and the `Could not find service "<label>"` line.
+ * Any other result cannot prove the job absent.
  */
 export function systemJobNotFound(result: { code: number | null; stdout: string; stderr: string }, label: string): boolean {
   const text = `${result.stdout}\n${result.stderr}`;

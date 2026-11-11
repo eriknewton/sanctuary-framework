@@ -152,7 +152,7 @@ describe("system-domain print parser", () => {
     expect(parseSystemJobPrint("system/x = {\n}\n").valid).toBe(false);
   });
 
-  it("treats only the modelled not-found outcome as not found", () => {
+  it("treats only the captured not-found outcome as not found", () => {
     const nf = PRINTS.entries.captured_system_not_found!;
     expect(systemJobNotFound(nf, CANARY_LABEL)).toBe(true);
     expect(systemJobNotFound({ ...nf, stdout: nf.stderr, stderr: "" }, CANARY_LABEL)).toBe(true);
