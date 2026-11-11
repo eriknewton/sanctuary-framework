@@ -336,6 +336,9 @@ impl BusinessSignerClient {
                 revents: 0,
             };
             if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 return Err(Refusal::Transport);
             }
             if poll.revents == 0 {
@@ -557,6 +560,9 @@ impl BusinessSignerClient {
                     revents: 0,
                 };
                 if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
                     break;
                 }
                 if poll.revents != 0 {

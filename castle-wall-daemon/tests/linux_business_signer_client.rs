@@ -984,3 +984,66 @@ fn admission_clock_overflow_refuses_before_sending() {
     );
     assert_eq!(client.state(), SignerClientState::Settling);
 }
+
+static SIGNAL_DELIVERED: AtomicBool = AtomicBool::new(false);
+extern "C" fn test_signal(_: libc::c_int) {
+    SIGNAL_DELIVERED.store(true, Ordering::SeqCst);
+}
+fn interrupted_sign(settling: bool) {
+    let view = status();
+    let (reply, body) = signed();
+    let sent = Arc::new(AtomicBool::new(false));
+    let mut action = Action::reply(&reply);
+    action.delay = Some(Duration::from_millis(TICK_MS * 20));
+    action.sent = Some(sent.clone());
+    let counters = Arc::new(Counters::default());
+    let script = Script::counted(vec![Action::reply(&view), action], counters.clone());
+    let mut client = script.client();
+    bind(&mut client);
+    SIGNAL_DELIVERED.store(false, Ordering::SeqCst);
+    let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut handler: libc::sigaction = unsafe { std::mem::zeroed() };
+    handler.sa_sigaction = test_signal as *const () as usize;
+    // No SA_RESTART: SIGUSR2 must interrupt the target thread's blocking poll.
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &handler, &mut previous) },
+        0
+    );
+    let target = unsafe { libc::pthread_self() };
+    let signal = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(TICK_MS * 6));
+        assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGUSR2) }, 0);
+    });
+    let mut request = header(&view, &body, 1);
+    if settling {
+        request.deadline_boottime_ns = (1 + TICK_MS * NS_PER_MS).to_string();
+    }
+    let result = client.sign_record(request, &body);
+    let sends = counters.sends.lock().unwrap();
+    let settled_at_return = sent.load(Ordering::SeqCst);
+    drop(sends);
+    signal.join().unwrap();
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) },
+        0
+    );
+    assert!(SIGNAL_DELIVERED.load(Ordering::SeqCst));
+    if settling {
+        assert_eq!(result, Err(Refusal::Deadline));
+        assert!(
+            settled_at_return,
+            "signal released retained I/O before the late send"
+        );
+    } else {
+        assert!(result.is_ok(), "signal interrupted receipt: {result:?}");
+    }
+    client.close_and_settle();
+}
+#[test]
+fn signal_during_settlement_keeps_the_slot_until_late_send() {
+    interrupted_sign(true);
+}
+#[test]
+fn signal_during_receive_preserves_the_request() {
+    interrupted_sign(false);
+}
