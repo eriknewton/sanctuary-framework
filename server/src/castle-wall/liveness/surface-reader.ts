@@ -53,6 +53,8 @@ export class LivenessSurfaceSource {
     this.flight = flight;
     const deadline = this.options.deadline ?? realDeadlineClock;
     const timer = deadline.after(STATUS_READ_DEADLINE, () => {
+      // A released read cannot expire a later read or retain its admission.
+      if (this.flight !== flight) return;
       this.expired = this.deadlineSnapshot();
       finish(this.expired);
     });

@@ -95,6 +95,16 @@ function rank(component: typeof components[number], state: string): number {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("shared reader snapshot", () => {
+  it("ignores a released flight's stale deadline callback", async () => {
+    const input = base(), fs = filesystem(input), callbacks: (() => void)[] = [];
+    const source = new LivenessSurfaceSource({ ...options(input, fs.fs), deadline: {
+      after: (_ms, callback) => { callbacks.push(callback); return { cancel() {} }; },
+    } });
+    expect((await source.readProjection()).exit_code).toBe(0);
+    callbacks[0]!();
+    expect((await source.readProjection()).exit_code).toBe(0);
+    expect(fs.opens()).toBe(10);
+  });
   it.each(["healthy", "incomplete", "refused"])("preserves the envelope and one read for %s evidence", async kind => {
     const input = base();
     if (kind === "incomplete") record(input, "daemon").raw.lock_recovery = { state: "not_instrumented" };
