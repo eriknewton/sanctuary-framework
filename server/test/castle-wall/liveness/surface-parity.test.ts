@@ -10,7 +10,7 @@ import { evaluateLiveness, type LivenessInput } from "../../../src/castle-wall/l
 import { readAndEvaluateLiveness, readAndEvaluateLivenessWithInput, type ReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
 import { LivenessSurfaceSource, project } from "../../../src/castle-wall/liveness/surface-reader.js";
 import { buildLivenessSchedule, LIVENESS_SCHEDULE_FN_SOURCE, verdicts, type LivenessProjection, type LivenessVerdicts } from "../../../src/castle-wall/liveness/browser-contract.js";
-import { AGENT_WINDOW_BASE, HISTORY_WINDOW, OBSERVER_WINDOW, LOCAL_JITTER, SCHEDULE_STEPS, DISPLAY_PERIOD, SECOND, STATUS_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
+import { LIVENESS_SEVERITY_ORDER, AGENT_WINDOW_BASE, HISTORY_WINDOW, OBSERVER_WINDOW, LOCAL_JITTER, SCHEDULE_STEPS, DISPLAY_PERIOD, SECOND, STATUS_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { renderPostureHomeHTML } from "../../../src/principal-policy/posture-home-html.js";
 import { renderPostureAgentHTML } from "../../../src/principal-policy/posture-agent-html.js";
@@ -87,8 +87,7 @@ function projection(input = base()) { return project(evaluateLiveness(input), in
 const select = (p: LivenessProjection, age: number) => p.schedule.filter(entry => entry.after_ms <= age).at(-1)!.projection;
 const components = ["wall", "agent", "coverage"] as const;
 function rank(component: typeof components[number], state: string): number {
-  const order = component === "wall" ? ["OK", "RECOVERING", "DEGRADED", "TTL_WARNING"] : component === "agent"
-    ? ["OK", "RECOVERING", "DEGRADED_STALE_MCP", "INITIALIZING", "DOWN", "UNMONITORED"] : ["COMPLETE", "WALL_ONLY", "LEGACY_PARTIAL", "UNAVAILABLE"];
+  const order = LIVENESS_SEVERITY_ORDER[component];
   const name = state.slice(component.length + 1); const i = order.indexOf(name.startsWith("OK_") ? "OK" : name);
   return i < 0 ? order.length : i;
 }
@@ -184,6 +183,25 @@ describe("shared reader snapshot", () => {
 });
 
 describe("conservative evaluator schedule", () => {
+  it("keeps newer complete reasons at an equal severity collision", () => {
+    const p = projection(caseInput(cases.find(c => c.name === "equal severity collision")!));
+    expect(p.wall.reasons).toEqual(["evidence_incomplete"]);
+    expect(select(p, 0).wall).toEqual({ state: "wall_DOWN", alarm: true,
+      reasons: ["canary_unprovisioned", "evidence_incomplete"], cause: null });
+    expect(select(p, 0).exit_code).toBe(1);
+  });
+  it("keeps TTL warning above degraded at a wall collision", () => {
+    const p = projection(caseInput(cases.find(c => c.name === "TTL warning collision")!));
+    expect(p.wall.state).toBe("wall_DEGRADED");
+    expect(select(p, 0).wall).toEqual({ state: "wall_TTL_WARNING", alarm: true,
+      reasons: ["recent_restart", "ttl_expiring"], cause: null });
+    expect(select(p, 0).exit_code).toBe(3);
+  });
+  it("keeps unavailable coverage at an adjacent collision", () => {
+    const p = projection(caseInput(cases.find(c => c.name === "coverage collision")!));
+    expect(select(p, 2000).coverage).toEqual({ state: "coverage_UNAVAILABLE", alarm: true,
+      reasons: ["canary_unprovisioned"], cause: null });
+  });
   it.each(cases)("keeps complete verdicts and bounded precedence for $name", row => {
     const input = caseInput(row), p = projection(input);
     expect(p.schedule.length).toBeLessThanOrEqual(2 * SCHEDULE_STEPS + 1);

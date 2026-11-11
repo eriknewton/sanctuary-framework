@@ -450,3 +450,11 @@ export const CONFIG_RECORD_FILE = "config.json";
 export const DISPLAY_PERIOD = SECOND;
 /** One step strictly beyond the inclusive observer freshness window. */
 export const SCHEDULE_STEPS = Math.floor(OBSERVER_WINDOW / LOCAL_JITTER) + 1;
+
+/** Component severity shared by schedule construction and its consumers. */
+export const LIVENESS_SEVERITY_ORDER: Record<"wall" | "agent" | "coverage", readonly string[]> = {
+    wall: ["OK", "RECOVERING", "DEGRADED", "TTL_WARNING"],
+    agent: ["OK", "RECOVERING", "DEGRADED_STALE_MCP", "INITIALIZING", "DOWN", "UNMONITORED"],
+    coverage: ["COMPLETE", "WALL_ONLY", "LEGACY_PARTIAL", "UNAVAILABLE"],
+};
+

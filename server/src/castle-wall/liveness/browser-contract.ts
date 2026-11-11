@@ -1,6 +1,6 @@
 /** Evaluator projections and a bounded, conservative browser expiry schedule. */
 import { evaluateLiveness, type LivenessEnvelope, type LivenessInput } from "./evaluate.js";
-import { DISPLAY_PERIOD, LOCAL_JITTER, SCHEDULE_STEPS } from "./constants.js";
+import { DISPLAY_PERIOD, LOCAL_JITTER, SCHEDULE_STEPS, LIVENESS_SEVERITY_ORDER } from "./constants.js";
 
 type Verdict<S extends string> = { state: S; alarm: boolean; reasons: string[]; cause: string | null };
 export interface LivenessVerdicts {
@@ -26,14 +26,9 @@ const components = ["wall", "agent", "coverage"] as const;
 type Component = typeof components[number];
 /** Higher numbers are more severe, following the evaluator's component precedence. */
 function severity(component: Component, state: string): number {
-  const orders: Record<Component, readonly string[]> = {
-    wall: ["OK", "RECOVERING", "DEGRADED", "TTL_WARNING"],
-    agent: ["OK", "RECOVERING", "DEGRADED_STALE_MCP", "INITIALIZING", "DOWN", "UNMONITORED"],
-    coverage: ["COMPLETE", "WALL_ONLY", "LEGACY_PARTIAL", "UNAVAILABLE"],
-  };
   const name = state.slice(component.length + 1);
-  const index = orders[component].indexOf(name.startsWith("OK_") ? "OK" : name);
-  return index < 0 ? orders[component].length : index;
+  const index = LIVENESS_SEVERITY_ORDER[component].indexOf(name.startsWith("OK_") ? "OK" : name);
+  return index < 0 ? LIVENESS_SEVERITY_ORDER[component].length : index;
 }
 
 function compare(component: Component, next: LivenessVerdicts, previous: LivenessVerdicts): number {
