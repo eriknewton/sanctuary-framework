@@ -458,3 +458,11 @@ export const LIVENESS_SEVERITY_ORDER: Record<"wall" | "agent" | "coverage", read
     coverage: ["COMPLETE", "WALL_ONLY", "LEGACY_PARTIAL", "UNAVAILABLE"],
 };
 
+/** Component verdict shape shared by schedule and presentation consumers. */
+type Verdict<S extends string> = { state: S; alarm: boolean; reasons: string[]; cause: string | null };
+export interface LivenessVerdicts {
+  wall: Verdict<WallState>;
+  agent: Verdict<AgentState>;
+  coverage: Verdict<CoverageState>;
+  exit_code: number;
+}

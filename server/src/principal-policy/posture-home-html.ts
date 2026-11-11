@@ -356,6 +356,7 @@ export function renderPostureHomeHTML(): string {
   <section>
     <h2>Castle Wall</h2>
     <div class="panel" id="wall"><span class="empty">Loading…</span></div>
+    <div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>
   </section>
 
   <section>

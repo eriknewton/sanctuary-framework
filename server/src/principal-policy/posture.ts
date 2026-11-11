@@ -38,6 +38,7 @@
  * without a live HTTP server or a running daemon.
  */
 
+import type { LivenessVerdicts, WallState, AgentState, CoverageState } from "../castle-wall/liveness/constants.js";
 import { parseIsoInstantWithOffset } from "../core/index.js";
 import {
   auditChainVerdictClaimsClean,
@@ -2486,4 +2487,35 @@ function describeDestinations(rule: ReachRule): DestinationPredicate[] {
     out.push({ destination: "(any destination)", wildcard: true });
   }
   return out;
+}
+
+/** Presentation only: all three verdicts remain those of the shared evaluator. */
+export function buildLivenessBadges(projection: LivenessVerdicts) {
+  const words: Record<WallState | AgentState | CoverageState, string> = {
+    wall_OK_TTL_COUNTDOWN: "Healthy, lease counting down", wall_OK_AGED_HISTORY: "Healthy, past faults expired",
+    wall_OK_ACTIVE: "Healthy, active", wall_OK_IDLE: "Healthy, idle",
+    wall_RECOVERING: "Recovering", wall_DEGRADED: "Degraded", wall_TTL_WARNING: "Lease expires soon",
+    wall_DOWN: "Down", wall_INITIALIZING: "Starting", wall_SAFE_MODE: "Safe mode",
+    wall_REBOOT_NO_LOGIN: "Rebooted, login required", wall_LOGGED_OUT: "Logged out",
+    agent_OK_OPTIONAL_REPLY: "Healthy, reply received", agent_OK_PASSIVE: "Healthy, passive",
+    agent_RECOVERING: "Recovering", agent_DEGRADED_STALE_MCP: "Stale child process",
+    agent_INITIALIZING: "Starting", agent_DOWN: "Down", agent_UNMONITORED: "Not monitored",
+    coverage_COMPLETE: "Complete", coverage_WALL_ONLY: "Wall only",
+    coverage_LEGACY_PARTIAL: "Partial legacy coverage", coverage_UNAVAILABLE: "Unavailable",
+  };
+  const labels = { wall: "Wall", agent: "Agent", coverage: "Coverage" };
+  return (["wall", "agent", "coverage"] as const).map(component => {
+    const verdict = projection[component];
+    return { component, label: labels[component], state: verdict.state, alarm: verdict.alarm,
+      text: words[verdict.state] ?? "Unavailable", detail: verdict.reasons.join(", ") };
+  });
+}
+
+export function renderLivenessBadges(projection: LivenessVerdicts): string {
+  const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return buildLivenessBadges(projection).map(badge =>
+    '<span class="pill ' + (badge.alarm ? 'amber' : 'green') + '" data-liveness-component="' + badge.component +
+    '" data-state="' + escape(badge.state) + '" title="' + escape(badge.detail) + '"><strong>' +
+    badge.label + ':</strong> ' + escape(badge.text) + '</span>').join(' ');
 }

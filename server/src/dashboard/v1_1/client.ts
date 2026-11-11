@@ -1772,6 +1772,7 @@ function renderMain() {
   } else if (__renderCache.route !== state.route || __renderCache.html !== nextHtml || talkMain) {
     if (talkOwner && (talkOwner.host === main || talkMain)) disposeTalkOwner();
     main.innerHTML = nextHtml;
+    if (typeof livenessDisplay !== "undefined") livenessDisplay.render();
     didWrite = true;
     __renderCache.route = state.route;
     __renderCache.html = talkMain ? null : nextHtml;
@@ -5021,7 +5022,7 @@ function renderPostureScreen() {
     // An empty agent roster cannot establish that a full or unrecognized inbox page has no holds.
     if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && !approvalQueueEvidence().earned) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
     if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
-    return '<section class="overview-page">' + head + machineLine + posturePanelContent(home, "agents_roster", overviewFirstRun(home)) + '<div class="overview-tiles" aria-label="At a glance">' + posturePanelContent(home, "unwrapped", renderOverviewProtection(home)) + '</div>' + below.join("") + '</section>';
+    return '<section class="overview-page">' + head + machineLine + posturePanelContent(home, "agents_roster", overviewFirstRun(home)) + '<div class="overview-tiles" aria-label="At a glance">' + posturePanelContent(home, "unwrapped", renderOverviewProtection(home)) + '</div><div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>' + below.join("") + '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
@@ -5080,7 +5081,7 @@ function renderPostureScreen() {
   const metricCards =
     '<div class="overview-tiles" aria-label="At a glance">' +
       posturePanelContent(home, "unwrapped", renderOverviewProtection(home)) +
-      overviewTile("Castle Wall", posturePanelNote(home, "castle_wall") ? escHtml(posturePanelNote(home, "castle_wall")) : wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
+      overviewTile("Castle Wall", (posturePanelNote(home, "castle_wall") ? escHtml(posturePanelNote(home, "castle_wall")) : wallChip) + '<div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>', escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       // Two feeds, each named where it is counted. Open findings come from the anomaly detector (/api/anomaly/findings,
       // the same count as renderAnomalyFindingsCard on the Findings screen). When that answer is empty, the tile reports
@@ -5928,6 +5929,7 @@ function renderEnforcementScreen() {
       '<section class="card">',
         '<div class="card-head-row"><h3>Castle Wall</h3><span class="' + wall.cls + '">' + escHtml(wall.text) + '</span></div>',
         '<div class="evidence pm-foot">' + wallAgeHtml + '<a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>',
+        '<div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>',
         vaultNotice,
         '<div class="enforcement-layers">' + layers + '</div>',
         renderSourceRead("/api/sovereignty"),

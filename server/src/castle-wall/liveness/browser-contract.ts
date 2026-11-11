@@ -1,14 +1,9 @@
 /** Evaluator projections and a bounded, conservative browser expiry schedule. */
+import { buildLivenessBadges, renderLivenessBadges } from "../../principal-policy/posture.js";
 import { evaluateLiveness, type LivenessEnvelope, type LivenessInput } from "./evaluate.js";
-import { DISPLAY_PERIOD, LOCAL_JITTER, SCHEDULE_STEPS, LIVENESS_SEVERITY_ORDER } from "./constants.js";
+import { DISPLAY_PERIOD, LOCAL_JITTER, SCHEDULE_STEPS, LIVENESS_SEVERITY_ORDER, type LivenessVerdicts } from "./constants.js";
 
-type Verdict<S extends string> = { state: S; alarm: boolean; reasons: string[]; cause: string | null };
-export interface LivenessVerdicts {
-  wall: Verdict<LivenessEnvelope["wall"]["state"]>;
-  agent: Verdict<LivenessEnvelope["agent"]["state"]>;
-  coverage: Verdict<LivenessEnvelope["coverage"]["state"]>;
-  exit_code: number;
-}
+export type { LivenessVerdicts } from "./constants.js";
 export interface LivenessScheduleEntry { after_ms: number; projection: LivenessVerdicts }
 export interface LivenessProjection extends LivenessVerdicts {
   evaluated_at: string;
@@ -17,7 +12,7 @@ export interface LivenessProjection extends LivenessVerdicts {
 }
 
 export function verdicts(envelope: LivenessEnvelope): LivenessVerdicts {
-  const component = <S extends string>(v: { state: S; alarm: boolean; reasons: string[]; evidence?: { cause?: string } }): Verdict<S> =>
+  const component = <S extends string>(v: { state: S; alarm: boolean; reasons: string[]; evidence?: { cause?: string } }) =>
     ({ state: v.state, alarm: v.alarm, reasons: [...v.reasons], cause: v.evidence?.cause ?? null });
   return { wall: component(envelope.wall), agent: component(envelope.agent), coverage: component(envelope.coverage), exit_code: envelope.exit_code };
 }
@@ -77,6 +72,8 @@ export function buildLivenessSchedule(input: LivenessInput): LivenessScheduleEnt
 
 /** Must match the interpolation sites in posture-home-html.ts, posture-agent-html.ts and dashboard/v1_1/client.ts, via posture-html-shared.ts. */
 export const LIVENESS_SCHEDULE_FN_SOURCE = String.raw`
+${buildLivenessBadges.toString()}
+${renderLivenessBadges.toString()}
 function createLivenessDisplay(paint) {
   var installed = null, dateAnchor = 0, performanceAnchor = 0, base = 0, elapsed = 0;
   function age() {
@@ -121,14 +118,7 @@ function mountLivenessDisplay() {
       document.addEventListener('visibilitychange', display.render);
     }
     var box = document.getElementById('castle-wall-liveness');
-    if (!box) {
-      box = document.createElement('section'); box.id = 'castle-wall-liveness';
-      box.setAttribute('aria-label', 'Castle Wall liveness'); document.body.appendChild(box);
-    }
-    box.textContent = ['wall', 'agent', 'coverage'].map(function(component) {
-      var verdict = projection[component];
-      return component + ': ' + verdict.state + ' (' + verdict.reasons.join(', ') + ')';
-    }).join(' | ');
+    if (box) box.innerHTML = renderLivenessBadges(projection);
   });
   return display;
 }

@@ -1336,3 +1336,21 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
     expect(panel.receipts.attested).toBe(1);
   });
 });
+
+it("presents labelled liveness badges from unchanged component verdicts", async () => {
+  const projection = {
+    wall: { state: "wall_DOWN", alarm: true, reasons: ["observer_stale"], cause: null },
+    agent: { state: "agent_UNMONITORED", alarm: true, reasons: ["agent_not_configured"], cause: null },
+    coverage: { state: "coverage_UNAVAILABLE", alarm: true, reasons: ["observer_stale"], cause: null },
+    exit_code: 1,
+  } as const;
+  const { buildLivenessBadges, renderLivenessBadges } = await import("../../src/principal-policy/posture.js");
+  const badges = buildLivenessBadges(projection as any);
+  expect(badges.map(b => [b.label, b.text])).toEqual([["Wall", "Down"], ["Agent", "Not monitored"], ["Coverage", "Unavailable"]]);
+  const html = renderLivenessBadges(projection as any);
+  expect(html).toContain('data-state="wall_DOWN"');
+  expect(html).toContain('title="observer_stale"');
+  const visible = html.replace(/<[^>]*>/g, "");
+  expect(visible).toBe("Wall: Down Agent: Not monitored Coverage: Unavailable");
+  expect(visible).not.toMatch(/wall_DOWN|observer_stale|agent_UNMONITORED|coverage_UNAVAILABLE|\u2014/);
+});

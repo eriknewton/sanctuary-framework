@@ -317,7 +317,7 @@ describe("shipped browser clocks", () => {
       for (const t of instants) {
         page.tick(t, 0);
         expect(page.shown()).toEqual(select(scheduled, t));
-        for (const component of components) expect(page.elements.get("castle-wall-liveness").textContent).toContain(select(scheduled, t)[component].state);
+        for (const component of components) expect(page.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="' + select(scheduled, t)[component].state + '"');
       }
     }
     const performancePage = browser(exposed); performancePage.install(projection());
@@ -339,7 +339,7 @@ describe("shipped browser clocks", () => {
     for (let i = 0; i < 100; i++) { b.tick(2 * OBSERVER_WINDOW + i * SECOND, 2 * OBSERVER_WINDOW); b.install(fresh); }
     expect(b.intervals.length).toBe(intervalsBeforeEvidence + 1);
     expect(b.shown().wall.state).toBe("wall_DOWN");
-    expect(b.elements.get("castle-wall-liveness").textContent).toContain("wall_DOWN");
+    expect(b.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="wall_DOWN"');
     const aged = { ...fresh, evaluated_at: new Date(base().nowMs + 4 * OBSERVER_WINDOW).toISOString(), served_age_ms: OBSERVER_WINDOW + 1 };
     b.install(aged); expect(b.shown().wall.state).toBe("wall_DOWN");
     b.install(fresh); expect(b.shown().wall.state).toBe("wall_DOWN");
@@ -347,7 +347,7 @@ describe("shipped browser clocks", () => {
     b.install({ ...projection(), evaluated_at: "2026-11-09T12:00:00" });
     expect(b.shown().wall.state).toBe("wall_DOWN");
     b.listeners.visibilitychange!();
-    expect(b.elements.get("castle-wall-liveness").textContent).toContain("wall_DOWN");
+    expect(b.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="wall_DOWN"');
   });
 });
 
@@ -429,6 +429,7 @@ describe("component surface parity", () => {
     const res = response(); await handleRequest(apiDeps, request("/api/status"), res.res); same(res.json().castle_wall_liveness);
     const health = response(); await handlePostureRoute(deps, request("/api/posture/feature-health"), health.res, new URL("http://fixture/api/posture/feature-health"), "GET");
     same(health.json().castle_wall_liveness);
+    expect(health.json().liveness_rows.map((row: any) => row.state)).toEqual(components.map(c => expected[c].state));
     const rig = await startRig({ withOperatorIdentity: true });
     (rig.dashboard as any).baseline = null;
     vi.spyOn(LivenessSurfaceSource.prototype, "readProjection").mockImplementation(() => Promise.resolve(expected));

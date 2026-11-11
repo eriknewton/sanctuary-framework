@@ -103,6 +103,7 @@ export function renderPostureAgentHTML(): string {
   <section>
     <h2>Standing</h2>
     <div class="panel" id="standing"><span class="empty">Loading...</span></div>
+    <div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>
   </section>
 
   <section>

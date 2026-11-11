@@ -1,3 +1,4 @@
+import { buildLivenessHealthRows } from "./feature-health.js";
 import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
 /**
  * Sovereignty Posture Dashboard - Phase 1 route layer.
@@ -595,7 +596,8 @@ export async function handlePostureRoute(
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/feature-health`) {
       const panel = await buildFeatureHealth(deps);
-      writeJSON(res, 200, { ...panel, castle_wall_liveness: await deps.livenessSource.readProjection() });
+      const castle_wall_liveness = await deps.livenessSource.readProjection();
+      writeJSON(res, 200, { ...panel, castle_wall_liveness, liveness_rows: buildLivenessHealthRows(castle_wall_liveness) });
       return true;
     }
 
@@ -1355,9 +1357,10 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
   // Must match custodyObservation in protectionEvidenceSchema (protection-layers.ts): use the producer status, including fallback and stale reads.
   const snapshot = observeProtections(runtime(), { featureHealth, custodyExit: value("custody_exit", custody),
     custodyObservation: custody.status, now: now(), auditChain: undefined });
+  const liveness = await deps.livenessSource.readProjection();
   const home: PostureHome = {
     // Liveness is read for this response, outside every cached panel value.
-    castle_wall_liveness: await deps.livenessSource.readProjection(),
+    castle_wall_liveness: liveness,
     origin_machine: deps.originMachine, stream_available: deps.streamRegistry !== undefined,
     protection_layers: composeProtectionLayers(snapshot),
     producer_keys: { producer: deps.producerKeyObservation!, broker: deps.brokerProducerKeyObservation!,
@@ -1371,7 +1374,7 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
       feature_health: health.status, custody_exit: custody.status, federation: federation.status, query_privacy: query.status },
     audit_verification: deps.auditLog!.verificationCacheStats(),
     castle_wall: castleWall, digest: keysRestricted ? fallback.digest : value("digest", digest),
-    unwrapped: unwrappedValue, feature_health: featureHealth, custody_exit: value("custody_exit", custody),
+    unwrapped: unwrappedValue, feature_health: { ...featureHealth, liveness_rows: buildLivenessHealthRows(liveness) }, custody_exit: value("custody_exit", custody),
     federation: value("federation", federation), query_privacy: queryPrivacy, agents,
     protection_requested_count: agents.filter(a => a.policy_protected).length,
     protection_detected_count: records.length + unwrappedValue.unwrapped.length,

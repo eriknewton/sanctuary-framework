@@ -1060,3 +1060,19 @@ describe("feature-health - opt-in operator-declared expectation floors (event-dr
     ).toBe(false);
   });
 });
+
+it("presents labelled liveness rows from unchanged component verdicts", async () => {
+  const projection = {
+    wall: { state: "wall_DOWN", alarm: true, reasons: ["observer_stale"], cause: null },
+    agent: { state: "agent_UNMONITORED", alarm: true, reasons: ["agent_not_configured"], cause: null },
+    coverage: { state: "coverage_UNAVAILABLE", alarm: true, reasons: ["observer_stale"], cause: null },
+    exit_code: 1,
+  } as const;
+  const { buildLivenessHealthRows } = await import("../../src/principal-policy/feature-health.js");
+  const rows = buildLivenessHealthRows(projection as any);
+  expect(rows.map(row => [row.component, row.state, row.alarm])).toEqual([
+    ["wall", "wall_DOWN", true], ["agent", "agent_UNMONITORED", true], ["coverage", "coverage_UNAVAILABLE", true],
+  ]);
+  expect(rows.map(row => row.text)).toEqual(["Down", "Not monitored", "Unavailable"]);
+  expect(rows[0]!.detail).toBe("observer_stale");
+});
