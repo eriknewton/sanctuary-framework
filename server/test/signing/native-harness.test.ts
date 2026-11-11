@@ -62,3 +62,13 @@ it.skipIf(process.platform !== "linux")("startup with a valid boot id reaches RE
   try {expect((await fixture.probeBootId("01234567-89ab-cdef-0123-456789abcdef\n")).ready).toBe(1);}
   finally {await fixture.close();}
 });
+
+it.skipIf(process.platform !== "linux")("unending boot-id input refuses within the startup bound before READY", async () => {
+  const fixture = await serviceFixture();
+  try {
+    const observation = await fixture.probeBootId("", "/dev/zero");
+    expect(observation.ready).toBe(0);
+    expect(observation.code).toBe(1);
+    expect(observation.elapsedMs).toBeLessThan(2000);
+  } finally { await fixture.close(); }
+});

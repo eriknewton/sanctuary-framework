@@ -108,7 +108,7 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
     },
     async killController() {const relay=children.find(c => c.pid === child.pid)!; relay.kill("SIGKILL");await reap(relay);},
     async freshClient() {client=new RelayClient(clientChild());return client.status();},
-    async probeBootId(text: string) {
+    async probeBootId(text: string, bootIdPath?: string) {
       await client.close(); await reap(service);
       for (const socket of ["sign.sock", "lifecycle.sock"]) {const path=join(control,socket);if(existsSync(path))unlinkSync(path);}
       const boot=join(root,"boot-id"),notify=join(root,"notify.sock"); files.push(boot,notify);
@@ -120,7 +120,8 @@ s.bind(sys.argv[1])
 s.settimeout(0.05)
 p=subprocess.Popen(sys.argv[2:],env={"NOTIFY_SOCKET":sys.argv[1],"VITEST":"true"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 ready=0
-end=time.monotonic()+2
+started=time.monotonic()
+end=started+2
 try:
  while time.monotonic()<end:
   try:
@@ -134,8 +135,8 @@ finally:
  except subprocess.TimeoutExpired:
   p.kill();out,err=p.communicate()
  s.close()
-print(json.dumps({"ready":ready,"code":p.returncode,"stderr":err.decode()}))`;
-      return JSON.parse(execFileSync("python3",["-c",script,notify,binary,...serviceArgs,"--test-boot-id",boot],{encoding:"utf8",timeout:10_000})) as {ready:number;code:number;stderr:string};
+print(json.dumps({"ready":ready,"code":p.returncode,"stderr":err.decode(),"elapsedMs":(time.monotonic()-started)*1000}))`;
+      return JSON.parse(execFileSync("python3",["-c",script,notify,binary,...serviceArgs,"--test-boot-id",bootIdPath ?? boot],{encoding:"utf8",timeout:10_000})) as {ready:number;code:number;stderr:string;elapsedMs:number};
     },
     lockImmediate:()=>ceremony(true,passphrase,false,false,false),
     ceremonyHeld:()=>ceremony(false,passphrase,false,true),
