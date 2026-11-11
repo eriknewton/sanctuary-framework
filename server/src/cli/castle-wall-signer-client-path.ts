@@ -9,9 +9,9 @@ export interface SignerClientPathContext {
   getuid?: () => number;
 }
 
-// Resolver precedence must match resolveSignerClientPath in server/src/cli/castle-wall.ts.
-// Resolver precedence must match resolveSignerClientPath in server/src/cli/castle-wall-full-agent.ts.
-// Resolver precedence must match resolveSignerClientPath in server/src/cli/transparency.ts.
+// Resolver precedence must match the runDaemon, runRePin and reportGlobalPinAndVerdict call sites in server/src/cli/castle-wall.ts.
+// Discovery inputs must match the state_PREFLIGHT_SIGNER call site in server/src/cli/castle-wall-full-agent.ts.
+// Resolver precedence must match the runCheckpoint call site in server/src/cli/transparency.ts.
 /** Bundled path of the signer-client shim inside the installed host app. */
 const SIGNER_CLIENT_RELATIVE_BINARY =
   "Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client";

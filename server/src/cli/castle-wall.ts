@@ -2933,6 +2933,7 @@ export async function runDaemon(
         await releaseDaemonMasterSession();
         return 1; // Ordinary daemon startup refusal.
       }
+      // The startup refusal makes a scheduled callback with the environment-deferred kind unreachable on macOS.
       // Scheduled signing must have a concrete signer before enforcement reaches readiness.
       if (schedulingEnabled && checkpointSigner.kind === "linux-environment") {
         write(err, "Refusing to start: scheduled checkpoint signer unavailable; install or approve the Castle Wall host app.\n");

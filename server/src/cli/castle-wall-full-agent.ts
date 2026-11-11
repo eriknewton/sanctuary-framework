@@ -379,7 +379,15 @@ async function stablePid(ctx: AgentContext, sleep: (ms: number) => Promise<void>
 
 /** Resolve the installed signing client before credentials or installation side effects. */
 async function state_PREFLIGHT_SIGNER(ctx: AgentContext, input: FullAgentCommandContext): Promise<string | undefined> {
-  const signer = await resolveSignerClientPath(input.env ?? process.env, ctx.platform, input);
+  if ((input.env ?? process.env).SANCTUARY_CASTLE_SIGNER_CLIENT !== undefined) {
+    ctx.out.write("install-full: the installed service does not inherit SANCTUARY_CASTLE_SIGNER_CLIENT; the check used discovery.\n");
+  }
+  // The service inherits PATH only, so its home and owner-trusted discovery must replace installer-only overrides.
+  const signer = await resolveSignerClientPath({ HOME: ctx.home }, ctx.platform, {
+    signerClientCandidates: input.signerClientCandidates,
+    fileExistsFn: input.fileExistsFn,
+    getuid: input.getuid,
+  });
   // An unresolved client cannot support scheduled signing, so refuse before credential access or installation.
   if (!signer) ctx.err.write("install-full preflight refused: signer client unavailable; install or approve the Castle Wall host app.\n");
   return signer;
@@ -400,7 +408,8 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
       const signer = await state_PREFLIGHT_SIGNER(ctx, input);
       // A successful preflight must identify the client required for scheduled signing.
       if (!signer) return STABLE_RUNTIME_REFUSAL_EXIT_CODE;
-      ctx.out.write(`install-full preflight valid: node=${preflight.node} cli=${preflight.cli} signer=${signer}\n`);
+      ctx.out.write(`install-full preflight valid: node=${preflight.node} cli=${preflight.cli}\n`);
+      ctx.out.write(`install-full checkpoint signer: ${signer}\n`);
       return 0;
     }
     if (!ctx.isTTY) { err.write("install-full requires an attended TTY session.\n"); return 2; }

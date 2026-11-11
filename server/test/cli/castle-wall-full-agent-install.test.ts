@@ -513,8 +513,9 @@ describe("install-full stable runtime preflight", () => {
     f.ctx.isTTY = false;
     f.exec.mockClear(); f.write.mockClear(); f.observe.mockClear();
     const before = treeListing(f.root);
+    f.out.text = "";
     expect(await api!.runInstallFull(["--preflight"], f.ctx), f.err.text).toBe(0);
-    expect(f.out.text).toContain(`install-full preflight valid: node=${process.execPath} cli=${f.cli} signer=${f.signer}`);
+    expect(f.out.text).toBe(`install-full preflight valid: node=${process.execPath} cli=${f.cli}\ninstall-full checkpoint signer: ${f.signer}\n`);
     f.ctx.stableRuntime = refusal;
     expect(await api!.runInstallFull(["--preflight"], f.ctx)).toBe(STABLE_RUNTIME_REFUSAL_EXIT_CODE);
     expect(treeListing(f.root)).toEqual(before);
@@ -534,6 +535,28 @@ describe("install-full stable runtime preflight", () => {
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.write).not.toHaveBeenCalled();
     expect(treeListing(f.root)).toEqual(before);
+  });
+
+  it("installer-only signer overrides cannot satisfy either discovery preflight", async () => {
+    const observations = [];
+    for (const argv of [[], ["--preflight"]]) {
+      const f = fixture();
+      f.ctx.env!.SANCTUARY_CASTLE_SIGNER_CLIENT = f.signer;
+      f.ctx.signerClientPath = f.signer;
+      f.ctx.signerClientCandidates = [join(f.root, "absent-signer")];
+      expect(fs.existsSync(f.signer)).toBe(true);
+      const before = treeListing(f.root);
+      observations.push({ f, before, code: await api!.runInstallFull(argv, f.ctx) });
+    }
+    expect(observations.map(({ code }) => code)).toEqual([STABLE_RUNTIME_REFUSAL_EXIT_CODE, STABLE_RUNTIME_REFUSAL_EXIT_CODE]);
+    for (const { f, before } of observations) {
+      expect(f.err.text).toContain("install-full preflight refused: signer client unavailable");
+      expect(f.out.text.split("\n")).toContain("install-full: the installed service does not inherit SANCTUARY_CASTLE_SIGNER_CLIENT; the check used discovery.");
+      expect(f.observe).not.toHaveBeenCalled();
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.write).not.toHaveBeenCalled();
+      expect(treeListing(f.root)).toEqual(before);
+    }
   });
 
   it("--preflight keeps the unsupported-host refusal", async () => {
