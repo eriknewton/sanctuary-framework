@@ -330,12 +330,18 @@ describe("shipped browser clocks", () => {
     b.install(p);
     expect(b.intervals.length).toBe(intervalsBeforeEvidence + 1);
     expect(b.intervals.some(t => t.ms === DISPLAY_PERIOD)).toBe(true); expect(b.listeners.visibilitychange).toBeTypeOf("function");
+    let refreshed = p, refreshedAt = 0;
     for (let t = 0; t <= 2 * OBSERVER_WINDOW; t += DISPLAY_PERIOD) {
       b.tick(t, t);
-      if (t % (5 * SECOND) === 0) b.install({ ...projection(), evaluated_at: new Date(base().nowMs + t).toISOString() });
-      expect(b.shown().wall.state).toMatch(/^wall_OK_/);
+      if (t % (5 * SECOND) === 0) {
+        const input = advance(base(), t);
+        refreshed = project(evaluateLiveness(input), input, input.nowMs);
+        refreshedAt = t;
+        b.install(refreshed);
+      }
+      expect(b.shown()).toEqual(select(refreshed, t - refreshedAt));
     }
-    b.install(p); b.tick(2 * OBSERVER_WINDOW, 2 * OBSERVER_WINDOW); expect(b.shown().wall.state).toMatch(/^wall_OK_/);
+    b.install(p); b.tick(2 * OBSERVER_WINDOW, 2 * OBSERVER_WINDOW); expect(b.shown()).toEqual(select(refreshed, 2 * OBSERVER_WINDOW - refreshedAt));
     const fresh = projection(); fresh.evaluated_at = new Date(base().nowMs + 3 * OBSERVER_WINDOW).toISOString();
     b.install(fresh); expect(b.shown().wall.state).toMatch(/^wall_OK_/);
     for (let i = 0; i < 100; i++) { b.tick(2 * OBSERVER_WINDOW + i * SECOND, 2 * OBSERVER_WINDOW); b.install(fresh); }
