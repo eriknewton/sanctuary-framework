@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-11-07. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-11-10. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -106,7 +106,7 @@ Operator can export identity, state, reputation, and audit-chain material throug
 
 ### Local multi-agent coordination and Sovereignty Dashboard
 
-Wrap many agents on one machine. Coordinate workflows across them with handoff visualization. See them all in one dashboard at `http://localhost:3501`. While the dashboard's live stream is healthy it also refetches the approval inbox and agent status on a fixed schedule, so a quiet stream cannot leave those panels silently out of date. Menubar status app with click-to-approve. Plain-English activity log. Cross-harness approval inbox aggregating pending approvals from concurrent wrapped agents. **Why it matters:** operators run more than one agent; the substrate has to scale beyond a single wrap without forcing the operator into many control surfaces.
+Wrap many agents on one machine. Coordinate workflows across them with handoff visualization. See them all in one dashboard at `http://localhost:3501`. While the dashboard's live stream is healthy it also refetches the approval inbox and agent status on a fixed schedule, so a quiet stream cannot leave those panels silently out of date. Menubar status app with click-to-approve. Plain-English activity log. Cross-harness approval inbox aggregating pending approvals from concurrent wrapped agents. The inbox also projects two conditions the local agent registry can carry, a budget bucket at its warning or hard-cap line and an agent in the error state; a card stays open while the registry carries the condition and resolves on its own when it stops. No shipped producer writes budget caps or error status into the registry yet, so these cards appear only once one does. On macOS, an agent the operator has locked down from the console can have its network access restored from the same console: the restore is a Tier 1 approval, Castle Wall puts back the allow rules it removed at lockdown, and the activity log says whether the live reload was confirmed or only the rules on disk were restored. **Why it matters:** operators run more than one agent; the substrate has to scale beyond a single wrap without forcing the operator into many control surfaces.
 
 *Status: shipped.*
 
