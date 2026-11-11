@@ -445,3 +445,8 @@ export const LIVENESS_DIRECTORY = "liveness";
 export const DAEMON_RECORD_FILE = "daemon.json";
 export const OBSERVER_RECORD_FILE = "observer.json";
 export const CONFIG_RECORD_FILE = "config.json";
+
+/** Display refresh cadence, in milliseconds. */
+export const DISPLAY_PERIOD = SECOND;
+/** One step strictly beyond the inclusive observer freshness window. */
+export const SCHEDULE_STEPS = Math.floor(OBSERVER_WINDOW / LOCAL_JITTER) + 1;

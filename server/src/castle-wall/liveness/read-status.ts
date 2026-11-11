@@ -227,7 +227,7 @@ async function readRecord(fs: ReaderFs, bounded: Bounded, cleanup: HandleCleanup
 }
 
 /** Read and evaluate one fortress. The reader stores nothing and writes nothing. */
-export async function readAndEvaluateLiveness(options: {
+type ReadOptions = {
   fortressPath: string;
   fortressId: string;
   operatorUid: number;
@@ -236,12 +236,19 @@ export async function readAndEvaluateLiveness(options: {
   host: HostClockProvider;
   fs?: ReaderFs;
   deadline?: DeadlineClock;
-}): Promise<LivenessEnvelope> {
+};
+
+export async function readAndEvaluateLiveness(options: ReadOptions): Promise<LivenessEnvelope> {
+  return (await readAndEvaluateLivenessWithInput(options)).envelope;
+}
+
+/** Exposes the exact snapshot classified by the shared reader. */
+export async function readAndEvaluateLivenessWithInput(options: ReadOptions): Promise<{ envelope: LivenessEnvelope; input: LivenessInput }> {
   const local = { fortress_id: options.fortressId, platform: options.platform, operator_uid: options.operatorUid };
   const absent: RecordRead = { status: "absent" };
   if (options.platform !== "darwin") {
     // Off darwin the provider is never called; the wall reads unsupported_adapter.
-    return evaluateLiveness({ nowMs: options.nowMs(), platform: options.platform, host: { ok: false }, local, directory: { status: "absent" }, daemon: absent, observer: absent, config: absent });
+    return evaluatedSnapshot({ nowMs: options.nowMs(), platform: options.platform, host: { ok: false }, local, directory: { status: "absent" }, daemon: absent, observer: absent, config: absent });
   }
   const read = await readLivenessRecords({ fortressPath: options.fortressPath, operatorUid: options.operatorUid, fs: options.fs, deadline: options.deadline });
   const nothingPresent = read.directory.status !== "custody_invalid" && !read.readDeadlineHit &&
@@ -255,7 +262,7 @@ export async function readAndEvaluateLiveness(options: {
   } catch {
     host = { ok: false };
   }
-  return evaluateLiveness({
+  return evaluatedSnapshot({
     nowMs: options.nowMs(),
     platform: options.platform,
     host,
@@ -266,4 +273,24 @@ export async function readAndEvaluateLiveness(options: {
     config: read.config,
     readDeadlineHit: read.readDeadlineHit,
   });
+}
+
+function evaluatedSnapshot(input: LivenessInput): { envelope: LivenessEnvelope; input: LivenessInput } {
+  // Record objects are private JSON reads; copy the injected clock so freezing cannot affect its provider.
+  input = { ...input, host: { ...input.host } };
+  const envelope = evaluateLiveness(input);
+  // Freeze the exact evaluated evidence so a surface cannot change the snapshot behind its verdict.
+  freezeSnapshot(input);
+  return { envelope, input };
+}
+
+function freezeSnapshot(value: unknown): void {
+  // Invalid JSON records can be deeply nested; snapshot protection must not turn their refusal into a stack overflow.
+  const pending = [value];
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (next === null || typeof next !== "object" || Object.isFrozen(next)) continue;
+    Object.freeze(next);
+    for (const child of Object.values(next)) pending.push(child);
+  }
 }

@@ -1,3 +1,4 @@
+import type { LivenessProjection } from "../castle-wall/liveness/browser-contract.js";
 /**
  * Neutral type home for the composed posture-home payload (`PostureHome`).
  *
@@ -43,6 +44,7 @@ export const AUDIT_CHAIN_VERIFIED_MAX_AGE_MS = 10 * 60 * 1000; // Ten minutes, i
 /** Strict observation parser embedded by the SPA and both posture HTML renderers. */
 // Must match parseIsoInstantWithOffset in core/time.ts; the existing client-time-parity test
 // executes this through getClientScript, and all audit consumers embed these same bytes.
+// Must match timestamp parsing in LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
 export const POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE = String.raw`function parseEvidenceTimestamp(value) {
   if (typeof value !== "string") return undefined;
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
@@ -84,6 +86,7 @@ export const POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE = String.raw`function parseEv
  * endpoint. Built by `buildHome` in `posture-routes.ts`.
  */
 export interface PostureHome {
+  castle_wall_liveness?: LivenessProjection;
   /** Shared inventory; must match protection_layers in posture-home-html.ts and dashboard/v1_1/client.ts. Older producers may omit it. */
   protection_layers?: ProtectionLayerRow[];
   /** Must match the key-observation copy rendered by the posture-home consumers. */

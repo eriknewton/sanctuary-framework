@@ -1,3 +1,5 @@
+// Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+export { LIVENESS_SCHEDULE_FN_SOURCE } from "../castle-wall/liveness/browser-contract.js";
 /**
  * Shared client-side HTML/CSS fragments for the posture surfaces.
  *

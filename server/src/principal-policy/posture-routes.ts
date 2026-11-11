@@ -1,3 +1,4 @@
+import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
 /**
  * Sovereignty Posture Dashboard - Phase 1 route layer.
  *
@@ -164,6 +165,7 @@ export const POSTURE_EVIDENCE_PATH = "/posture/evidence";
  * mirrors the `buildV1AgentsDeps` pattern.
  */
 export interface PostureRouteDeps {
+  livenessSource?: Pick<LivenessSurfaceSource, "readProjection">;
   /** Must match ProtectionRuntimeProvider in protection-observations.ts; reads current session and consumers. */
   protectionRuntime?: ProtectionRuntimeProvider;
   /** Encrypted audit log (already unlocked). */
@@ -581,7 +583,7 @@ export async function handlePostureRoute(
   try {
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/castle-wall`) {
       const posture = await buildWallPosture(deps);
-      writeJSON(res, 200, posture);
+      writeJSON(res, 200, { ...posture, ...(deps.livenessSource ? { castle_wall_liveness: await deps.livenessSource.readProjection() } : {}) });
       return true;
     }
 
@@ -593,7 +595,7 @@ export async function handlePostureRoute(
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/feature-health`) {
       const panel = await buildFeatureHealth(deps);
-      writeJSON(res, 200, panel);
+      writeJSON(res, 200, { ...panel, ...(deps.livenessSource ? { castle_wall_liveness: await deps.livenessSource.readProjection() } : {}) });
       return true;
     }
 
@@ -1354,6 +1356,8 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
   const snapshot = observeProtections(runtime(), { featureHealth, custodyExit: value("custody_exit", custody),
     custodyObservation: custody.status, now: now(), auditChain: undefined });
   const home: PostureHome = {
+    // Liveness is read for this response, outside every cached panel value.
+    ...(deps.livenessSource ? { castle_wall_liveness: await deps.livenessSource.readProjection() } : {}),
     origin_machine: deps.originMachine, stream_available: deps.streamRegistry !== undefined,
     protection_layers: composeProtectionLayers(snapshot),
     producer_keys: { producer: deps.producerKeyObservation!, broker: deps.brokerProducerKeyObservation!,

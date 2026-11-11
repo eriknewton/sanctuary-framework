@@ -67,6 +67,10 @@ import {
   fortressFlagRefusalText,
   shellQuoteSingleArg,
 } from "./argv.js";
+import { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
+import type { LivenessProjection } from "../castle-wall/liveness/browser-contract.js";
+import { productionHostClock, livenessFortressId } from "./castle-wall-liveness-status.js";
+import { LIVENESS_DIRECTORY } from "../castle-wall/liveness/constants.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -159,6 +163,8 @@ export async function runDoctorCommand(
 }
 
 export async function runDoctorChecks(opts: {
+  livenessSource?: Pick<LivenessSurfaceSource, "readProjection">;
+  livenessDirectoryExists?: () => Promise<boolean>;
   env: NodeJS.ProcessEnv;
   storagePath: string;
   platform: NodeJS.Platform;
@@ -200,6 +206,7 @@ export async function runDoctorChecks(opts: {
     checks.push(checkRuntime());
     checks.push(await checkHermesConfigParser(opts));
     checks.push(await checkCastleWall(opts));
+    checks.push(...await checkCastleWallLiveness(opts));
     checks.push(await checkLinuxManifestAdmission(opts));
     const harnessIds = await collectWrappedHarnessAgentIds();
     checks.push(checkWrappedHarnessAgentIds(harnessIds));
@@ -1134,4 +1141,30 @@ policy, audit-chain integrity, runtime versions, the Hermes config parser,
 and Castle Wall status.
 `,
   );
+}
+
+/** Component checks preserve the evaluator's independent verdicts. */
+export async function checkCastleWallLiveness(opts: {
+  storagePath: string; platform: NodeJS.Platform;
+  livenessSource?: Pick<LivenessSurfaceSource, "readProjection">;
+  livenessDirectoryExists?: () => Promise<boolean>;
+}): Promise<DoctorCheck[]> {
+  const source = opts.livenessSource ?? new LivenessSurfaceSource({ fortressPath: opts.storagePath,
+    fortressId: livenessFortressId(opts.storagePath), host: productionHostClock, platform: opts.platform });
+  const projection = await source.readProjection();
+  const installed = opts.platform === "darwin" && await (opts.livenessDirectoryExists?.() ??
+    stat(join(opts.storagePath, LIVENESS_DIRECTORY)).then(info => info.isDirectory(), () => false));
+  return livenessDoctorChecks(projection, opts.platform, installed);
+}
+
+export function livenessDoctorChecks(projection: LivenessProjection, platform: string, installed: boolean): DoctorCheck[] {
+  return (["wall", "agent", "coverage"] as const).map(component => {
+    const verdict = projection[component];
+    // An unmonitored agent is a monitoring gap, so only an evaluator OK state earns OK.
+    const ok = component === "coverage" ? verdict.state === "coverage_COMPLETE" : verdict.state.startsWith(component + "_OK_");
+    return { name: `Castle Wall liveness (${component})`,
+      status: ok ? "OK" : component === "wall" && platform === "darwin" && installed ? "FAIL" : "WARN",
+      message: verdict.state === "agent_UNMONITORED" ? "not monitored (no agent commissioning)" : `${verdict.state}: ${verdict.reasons.join(", ")}`,
+      hint: "castle-wall liveness-status" };
+  });
 }

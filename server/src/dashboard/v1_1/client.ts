@@ -1,3 +1,4 @@
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "../../principal-policy/posture-html-shared.js";
 /**
  * Sanctuary v1.1 Dashboard Embedded Client Script
  *
@@ -79,6 +80,9 @@ const EVIDENCE_CHAIN_VERDICTS = {
 
 const CLIENT_SCRIPT = String.raw`
 "use strict";
+// Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+${LIVENESS_SCHEDULE_FN_SOURCE}
+const livenessDisplay = mountLivenessDisplay();
 
 // Must match parseIsoInstantWithOffset in server/src/core/time.ts: dashboard
 // freshness is a protection claim, so offset-less or normalised timestamps
@@ -640,6 +644,7 @@ function readResponse(url, init, deadlineMs, generation, refreshing) {
       throw error;
     }
     if (!body || typeof body !== "object" || body.error || !validateReadBody(key, body)) throw new Error("The latest result is unavailable.");
+    if (body.castle_wall_liveness) livenessDisplay.install(body.castle_wall_liveness);
     return { ok: res.ok, status: res.status, json: async function () { return body; } };
   })();
   const result = Promise.race([read, expired]).then(function (res) {

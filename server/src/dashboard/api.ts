@@ -62,6 +62,8 @@ import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 import { ASCII_LABEL_RE } from "../core/token-grammar.js";
 import type { DashboardReadFlightMap } from "./read-response.js";
+import { surfaceSourceFor, type LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
+import { productionHostClock, livenessFortressId } from "../cli/castle-wall-liveness-status.js";
 
 
 export { constantTimeEquals };
@@ -72,6 +74,8 @@ export interface ApprovalHandlers {
 }
 
 export interface APIDeps {
+  fortressPath?: string;
+  livenessSource?: Pick<LivenessSurfaceSource, "readProjection">;
   sources: AggregatorSources;
   /**
    * The started server's single bounded-read flight map. Required, and created
@@ -408,6 +412,7 @@ export async function handleRequest(
       {
         readFlightMap: deps.readFlightMap,
         panelStore: deps.panelStore,
+        livenessSource: apiLivenessSource(deps),
         // Must match composeAggregatorSources in aggregator.ts: preserve the current runtime provider.
         protectionRuntime: deps.sources.protectionRuntime,
         auditLog: deps.sources.auditLog ?? null,
@@ -584,6 +589,7 @@ export async function handleRequest(
   // ── Folded posture-page auxiliaries ─────────────────────────────────
   if (method === "GET" && path === "/api/status") {
     writeJSON(res, 200, {
+      castle_wall_liveness: await apiLivenessSource(deps).readProjection(),
       pending_count: deps.sources.pendingApprovals?.length ?? 0,
       connected_clients: 0,
       standalone_mode: false,
@@ -917,3 +923,8 @@ function redactStreamEventForPositionOnly(
 
 // Re-export helpers used by tests
 export type { ProtectionSnapshot, PendingApproval, ActivityEntry };
+
+function apiLivenessSource(deps: APIDeps): Pick<LivenessSurfaceSource, "readProjection"> {
+  const path = deps.fortressPath ?? "";
+  return deps.livenessSource ?? surfaceSourceFor(deps.readFlightMap, path, livenessFortressId(path), productionHostClock);
+}

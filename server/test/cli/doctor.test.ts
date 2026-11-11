@@ -2,7 +2,6 @@
  * Doctor distinguishes missing signature evidence from integrity findings.
  * AUDIT-VERIFY-UNSIGNED-1024
  */
-// fail-before-exempt: A1a root_daemon fixture identity only; existing assertions remain unchanged while readers use the operator uid.
 import { __testSetAuditWriterUidForRole } from "../../src/operational/audit-log.js";
 import { afterEach as resetAuditWriterAfterEach } from "vitest";
 
@@ -944,3 +943,31 @@ async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> 
   finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
 }
 resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));
+
+it.each([
+  ["darwin", true, "FAIL"], ["darwin", false, "WARN"], ["linux", true, "WARN"],
+] as const)("scopes the wall liveness failure to %s with install %s", async (platform, installed, expected) => {
+  const doctor = await import("../../src/cli/doctor.js");
+  const { evaluateLiveness } = await import("../../src/castle-wall/liveness/evaluate.js");
+  const { readFileSync } = await import("node:fs");
+  const input = JSON.parse(readFileSync(new URL("../castle-wall/liveness/fixtures/states.json", import.meta.url), "utf8")).base;
+  input.observer.value.raw.canary_integrity.passed = false;
+  input.config.value.commissioning.agent = false;
+  const envelope = evaluateLiveness(input);
+  const projection = { evaluated_at: envelope.evaluated_at, served_age_ms: 0, schedule: [], exit_code: envelope.exit_code,
+    wall: { ...envelope.wall, cause: null }, agent: { ...envelope.agent, cause: null }, coverage: { ...envelope.coverage, cause: null } };
+  const { createTempHome } = await import("../helpers/temp-fortress.js");
+  const home = await createTempHome("doctor-components");
+  let checks: Awaited<ReturnType<typeof doctor.runDoctorChecks>>;
+  try {
+    checks = (await doctor.runDoctorChecks({ storagePath: home.defaultFortressPath, platform,
+      env: { SANCTUARY_PASSPHRASE: "fixture-doctor-passphrase" }, execSyncFn: () => "",
+      livenessDirectoryExists: async () => installed, livenessSource: { readProjection: async () => projection } }))
+      .filter(check => check.name.startsWith("Castle Wall liveness"));
+  } finally { await home.cleanup(); }
+  expect(checks.map(c => c.name)).toEqual(["Castle Wall liveness (wall)", "Castle Wall liveness (agent)", "Castle Wall liveness (coverage)"]);
+  expect(checks[0]!.status).toBe(expected);
+  expect(checks[1]).toMatchObject({ status: "WARN", message: "not monitored (no agent commissioning)" });
+  expect(checks[2]!.status).toBe("WARN");
+  expect(checks.some(c => c.status === "FAIL")).toBe(expected === "FAIL");
+});

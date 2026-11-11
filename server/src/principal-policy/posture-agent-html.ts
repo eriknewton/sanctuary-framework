@@ -1,3 +1,4 @@
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
 /**
  * Sovereignty Posture Dashboard - per-agent drill-down HTML (Slice 4).
  *
@@ -127,6 +128,10 @@ export function renderPostureAgentHTML(): string {
 <script>
 (function () {
   "use strict";
+  ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
+  // Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+  ${LIVENESS_SCHEDULE_FN_SOURCE}
+  var livenessDisplay = mountLivenessDisplay();
   // Same auth model as the rest of the dashboard: loopback auto-auth or a
   // bearer token the operator pasted. We send credentials: same-origin so the
   // session cookie rides along; if a token is in the URL hash we use it.
@@ -213,6 +218,7 @@ export function renderPostureAgentHTML(): string {
   ${REL_TIME_FN_SOURCE}
 
   function renderPanelStatus(home) {
+    if (home.castle_wall_liveness) livenessDisplay.install(home.castle_wall_liveness);
     // Freshness accepts the same strict instant as the SPA, never a browser-local date.
     ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
     // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.

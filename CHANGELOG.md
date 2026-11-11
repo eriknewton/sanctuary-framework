@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+- Doctor, `sanctuary status`, the dashboards, posture and the health tools now show wall, agent and coverage readings from the same evaluator; browser pages show their readings going stale on their own when evidence stops.
+
 - Scheduled checkpoints on the installed full service use the signer client the wall already resolved, and the install preflight reports its path.
 
 - The optional Telegram liveness probe now bounds the full request sequence and response size and validates reply fields.

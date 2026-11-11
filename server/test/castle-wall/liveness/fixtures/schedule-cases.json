@@ -1,0 +1,10 @@
+{
+  "provenance": "Modelled record sets derived from states.json base; times are offsets in milliseconds relative to the fixture evaluation. Commissioning values remain fixture values.",
+  "cases": [
+    { "name": "healthy", "patches": [] },
+    { "name": "wall degraded with agent expiry", "charge_remaining_ms": 10000, "census_remaining_ms": 3000, "patches": [] },
+    { "name": "restart ages out", "charge_remaining_ms": 1000, "patches": [] },
+    { "name": "mixed step", "charge_remaining_ms": 1000, "census_remaining_ms": 1000, "patches": [] },
+    { "name": "adjacent collision", "charge_remaining_ms": 1000, "census_remaining_ms": 3000, "patches": [{ "path": "observer.value.raw.mcp", "value": { "stale_child": true } }] }
+  ]
+}
