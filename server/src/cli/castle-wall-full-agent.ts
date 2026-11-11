@@ -3,7 +3,7 @@ import { resolveSignerClientPath, type SignerClientPathContext } from "./castle-
 /** Attended installation and observation of the operator-user full daemon. */
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { resolveStoragePath } from "../paths.js";
@@ -139,6 +139,8 @@ export interface FullAgentCommandContext extends SignerClientPathContext {
   err?: Writable;
   env?: NodeJS.ProcessEnv;
   home?: string;
+  /** INTERNAL/TEST: signer discovery's account home; defaults to userInfo().homedir. */
+  signerAccountHome?: string;
   platform?: NodeJS.Platform;
   euid?: number;
   isTTY?: boolean;
@@ -382,8 +384,8 @@ async function state_PREFLIGHT_SIGNER(ctx: AgentContext, input: FullAgentCommand
   if ((input.env ?? process.env).SANCTUARY_CASTLE_SIGNER_CLIENT !== undefined) {
     ctx.out.write("install-full: the installed service does not inherit SANCTUARY_CASTLE_SIGNER_CLIENT; the check used discovery.\n");
   }
-  // The service inherits PATH only, so its home and owner-trusted discovery must replace installer-only overrides.
-  const signer = await resolveSignerClientPath({ HOME: ctx.home }, ctx.platform, {
+  // The plist supplies only PATH and does not copy installer-only overrides, so discovery uses the service account's password-database home.
+  const signer = await resolveSignerClientPath({ HOME: input.signerAccountHome ?? userInfo().homedir }, ctx.platform, {
     signerClientCandidates: input.signerClientCandidates,
     fileExistsFn: input.fileExistsFn,
     getuid: input.getuid,

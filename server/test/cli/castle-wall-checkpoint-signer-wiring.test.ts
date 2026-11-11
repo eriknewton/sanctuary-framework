@@ -1,5 +1,7 @@
 /** Scheduled and attended checkpoints consume the daemon's resolved signing client. */
 import { generateKeyPairSync } from "node:crypto";
+import { existsSync } from "node:fs";
+import { clearTimeout as clearRealTimeout, setTimeout as setRealTimeout } from "node:timers";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -50,7 +52,16 @@ const ROOT_UID = 0; // POSIX identity of an authoritative global pin, simulated 
 const CUSTODY_MODE = 0o700; // Owner-only fixture custody.
 const PASSPHRASE = "checkpoint-fixture-passphrase";
 const POLL_MS = 10; // Ten milliseconds between filesystem completion observations.
-const WAIT_MS = 5_000; // Five seconds bounds fixture startup and emission completion.
+const WAIT_MS = 5_000; // Five seconds bounds observation of fixture startup and emission completion.
+const DAEMON_STOP_DEADLINE_MS = WAIT_MS / 2; // Half the observation budget for cooperative daemon termination.
+const CHILD_REAP_DEADLINE_MS = WAIT_MS / 5; // One fifth of the observation budget for actual executable closure.
+const ROOT_REMOVAL_DEADLINE_MS = CHILD_REAP_DEADLINE_MS; // Filesystem cleanup gets the same budget as child closure.
+const CHILD_REAP_CALL_DEADLINE_MS = CHILD_REAP_DEADLINE_MS + POLL_MS; // One poll lets the inner child deadline report first.
+const ROOT_REMOVAL_CALL_DEADLINE_MS = ROOT_REMOVAL_DEADLINE_MS + POLL_MS; // One poll lets individual removal deadlines report first.
+// Two child reaps surround daemon termination, followed by root removal and one poll of scheduling margin.
+const cleanupDeadlineMs = (stopMs = DAEMON_STOP_DEADLINE_MS) => stopMs + CHILD_REAP_CALL_DEADLINE_MS * 2 + ROOT_REMOVAL_CALL_DEADLINE_MS + POLL_MS;
+// CHECKPOINT_WIRING_KEEP_FIXTURES=1 opts into retaining fixture material for diagnosis.
+const KEEP_FIXTURES_VALUE = "1";
 const SUCCESS = 0;
 const REFUSED = 1;
 const ONE_CHECKPOINT = 1;
@@ -118,28 +129,69 @@ else if (verb === "sign-manifest") console.log(sign(null, Buffer.concat(chunks),
 else process.exitCode = ${REFUSED};
 `, { mode: 0o700 }); // Owner-only executable fixture exercises the real shim spawning path.
 });
+class DaemonTeardownDeadlineError extends Error {
+  override name = "DaemonTeardownDeadlineError";
+  constructor(phase: string) { super(`daemon under test did not stop before the teardown deadline (${phase})`); }
+}
+
+async function withinDeadline<T>(work: Promise<T>, deadlineMs: number, phase: string): Promise<T> {
+  let timer: ReturnType<typeof setRealTimeout> | undefined;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setRealTimeout(() => reject(new DaemonTeardownDeadlineError(phase)), deadlineMs);
+  });
+  try {
+    // Real timers keep teardown bounded even while the scheduler's interval clock is faked.
+    return await Promise.race([work, expired]);
+  } finally { clearRealTimeout(timer); }
+}
+
+function throwTeardownErrors(errors: unknown[]) {
+  if (errors.length === 0) return;
+  const failure = errors.find(error => error instanceof DaemonTeardownDeadlineError) ?? errors[0];
+  if (failure instanceof Error) Object.assign(failure, { teardownErrors: errors.filter(error => error !== failure) });
+  throw failure;
+}
+
 async function reapChildren() {
   const pending = [...boundary.children];
-  // A helper timeout settles before close, so teardown must join the actual executable independently.
-  for (const [child] of pending) child.kill("SIGKILL");
-  await Promise.all(pending.map(([, closed]) => closed));
+  const errors: unknown[] = [];
+  // A helper timeout settles before close, so teardown must kill and join every actual executable independently.
+  for (const [child] of pending) {
+    try { child.kill("SIGKILL"); } catch (error) { errors.push(error); }
+  }
+  await withinDeadline(Promise.all(pending.map(([, closed]) => closed)), CHILD_REAP_DEADLINE_MS, "fixture executables");
+  throwTeardownErrors(errors);
+}
+
+async function removeRoots() {
+  if (process.env.CHECKPOINT_WIRING_KEEP_FIXTURES === KEEP_FIXTURES_VALUE) { roots.clear(); return; }
+  // Register all removals before waiting so one failed removal cannot skip another fixture root.
+  const removed = await withinDeadline(Promise.allSettled([...roots].map(async path => {
+    await withinDeadline(rm(path, { recursive: true, force: true }), ROOT_REMOVAL_DEADLINE_MS, "fixture root");
+    roots.delete(path);
+  })), ROOT_REMOVAL_CALL_DEADLINE_MS, "fixture roots");
+  throwTeardownErrors(removed.flatMap(result => result.status === "rejected" ? [result.reason] : []));
 }
 
 afterEach(async () => {
+  const errors: unknown[] = [];
   try {
-    // Pending cancellation survives slow startup and every registered run is awaited even after rejection.
-    await Promise.allSettled([...daemonCleanups].map(cleanup => cleanup()));
-    await reapChildren();
+    try {
+      // A run that never settles must not prevent child reaping or removal of registered roots.
+      const stopped = await withinDeadline(Promise.allSettled([...daemonCleanups].map(cleanup => cleanup())), cleanupDeadlineMs(), "registered daemons");
+      errors.push(...stopped.flatMap(result => result.status === "rejected" ? [result.reason] : []));
+    } catch (error) { errors.push(error); }
+    try { await withinDeadline(reapChildren(), CHILD_REAP_CALL_DEADLINE_MS, "remaining executables"); }
+    catch (error) { errors.push(error); }
+    try { await withinDeadline(removeRoots(), ROOT_REMOVAL_CALL_DEADLINE_MS, "remaining roots"); }
+    catch (error) { errors.push(error); }
   } finally {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     vi.useRealTimers();
-    // CHECKPOINT_WIRING_KEEP_FIXTURES=1 opts into retaining fixture material for diagnosis.
-    if (process.env.CHECKPOINT_WIRING_KEEP_FIXTURES !== "1") {
-      await Promise.all([...roots].map(path => rm(path, { recursive: true, force: true })));
-    }
-    roots.clear();
   }
+  // Vitest records a failed hook alongside a primary test failure rather than replacing that failure.
+  throwTeardownErrors(errors);
 });
 
 function fixture() {
@@ -168,10 +220,10 @@ async function observe(predicate: () => boolean, waitMs = WAIT_MS) {
   throw new Error("fixture observation deadline exceeded");
 }
 
-async function withDaemon(
+function startDaemon(
   f: ReturnType<typeof fixture>,
-  check: (state: { result: () => number | undefined }) => Promise<void>,
-  waitMs = WAIT_MS,
+  stopDeadlineMs = DAEMON_STOP_DEADLINE_MS,
+  start = () => runDaemon(["--fortress", root], f.ctx),
 ) {
   const prior = new Map(["SIGINT", "SIGTERM"].map(signal => [signal, new Set(process.rawListeners(signal))]));
   let result: number | undefined;
@@ -186,35 +238,69 @@ async function withDaemon(
   };
   process.on("newListener", onListener);
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-  const running = runDaemon(["--fortress", root], f.ctx).then(
+  const running = start().then(
     code => { result = code; },
     error => { failure = error; },
   ).finally(() => { settled = true; });
-  const cleanup = async () => {
-    cancellationPending = true;
-    deliverCancellation();
-    await reapChildren();
-    try {
-      // This awaits daemon termination and session release; fixture child close is joined separately.
-      await running;
-      await reapChildren();
-    } finally {
-      process.removeListener("newListener", onListener);
-      for (const name of ["SIGINT", "SIGTERM"]) {
-        for (const listener of process.rawListeners(name)) if (!prior.get(name)!.has(listener)) process.removeListener(name, listener);
-      }
-      daemonCleanups.delete(cleanup);
+  const disposeListeners = () => {
+    process.removeListener("newListener", onListener);
+    for (const name of ["SIGINT", "SIGTERM"]) {
+      for (const listener of process.rawListeners(name)) if (!prior.get(name)!.has(listener)) process.removeListener(name, listener);
     }
   };
+  let cleaning: Promise<void> | undefined;
+  const cleanup = () => cleaning ??= (async () => {
+    const errors: unknown[] = [];
+    try {
+      cancellationPending = true;
+      deliverCancellation();
+      await withinDeadline(reapChildren(), CHILD_REAP_CALL_DEADLINE_MS, "initial executable reap");
+      // In-process work that never settles ends with this test file's worker process, and the suite's master-write lease guard reports any lease it leaves.
+      await withinDeadline(running, stopDeadlineMs, "daemon termination");
+    } catch (error) { errors.push(error); }
+    finally {
+      try { await withinDeadline(reapChildren(), CHILD_REAP_CALL_DEADLINE_MS, "final executable reap"); }
+      catch (error) { errors.push(error); }
+      if (errors.length > 0) {
+        try { await withinDeadline(removeRoots(), ROOT_REMOVAL_CALL_DEADLINE_MS, "deadline roots"); }
+        catch (error) { errors.push(error); }
+      }
+      // Late readiness still needs the pending stop, so listener disposal follows settlement without an unbounded wait.
+      if (settled) disposeListeners();
+      else void running.then(disposeListeners);
+      daemonCleanups.delete(cleanup);
+    }
+    throwTeardownErrors(errors);
+  })();
   daemonCleanups.add(cleanup);
-  try {
-    await observe(() => settled || signal() !== undefined, waitMs);
-    if (failure) throw failure;
-    await check({ result: () => result });
-  } finally {
-    await cleanup();
+  return { cleanup, running, ready: () => settled || signal() !== undefined, result: () => result, failure: () => failure };
+}
+
+async function finishCleanup(cleanup: () => Promise<void>, primary?: { error: unknown }) {
+  try { await withinDeadline(cleanup(), cleanupDeadlineMs(), "daemon cleanup"); }
+  catch (error) {
+    // A cleanup failure remains attached to the original test error so it cannot replace the assertion or observation failure.
+    if (!primary) throw error;
+    if (primary.error instanceof Error) Object.assign(primary.error, { teardownError: error });
+    else console.error(error);
   }
-  if (failure) throw failure;
+  if (primary) throw primary.error;
+}
+
+async function withDaemon(
+  f: ReturnType<typeof fixture>,
+  check: (state: { result: () => number | undefined }) => Promise<void>,
+  waitMs = WAIT_MS,
+) {
+  const run = startDaemon(f);
+  let primary: { error: unknown } | undefined;
+  try {
+    await observe(run.ready, waitMs);
+    if (run.failure()) throw run.failure();
+    await check(run);
+  } catch (error) { primary = { error }; }
+  await withinDeadline(finishCleanup(run.cleanup, primary), cleanupDeadlineMs() + POLL_MS, "test cleanup");
+  if (run.failure()) throw run.failure();
 }
 
 async function tick(f: ReturnType<typeof fixture>) {
@@ -317,6 +403,54 @@ describe("checkpoint signer production wiring", () => {
     expect(f.stop).toHaveBeenCalledOnce();
     expect(schedule).toHaveBeenCalledOnce();
     expect(process.rawListeners("SIGTERM")).toEqual(listeners);
+    expect(daemonCleanups.size).toBe(0);
+    expect(boundary.children.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a pending start reports its teardown deadline, removes roots, and can still be released and joined", async () => {
+    const f = fixture();
+    const signals = ["SIGINT", "SIGTERM", "newListener"];
+    const listeners = signals.map(signal => process.rawListeners(signal));
+    const extraRoot = await mkdtemp("/tmp/checkpoint-wiring-");
+    roots.add(extraRoot);
+    const fixtureRoots = [...roots];
+    let release!: () => void;
+    let entered = false;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    // Stand in before custody acquisition because a real lease requires its directory ancestry to remain intact until release.
+    const start = vi.fn(async () => {
+      entered = true;
+      await held;
+      await new Promise<void>(resolve => process.once("SIGTERM", () => { void f.stop().then(resolve); }));
+      return SUCCESS;
+    });
+    const shortStopDeadlineMs = POLL_MS; // One observation poll deliberately expires while startup is held.
+    const returnDeadlineMs = cleanupDeadlineMs(shortStopDeadlineMs); // Includes both child joins and root removal after expiry.
+    const run = startDaemon(f, shortStopDeadlineMs, start);
+    try {
+      await observe(() => entered);
+      const started = performance.now();
+      const failure = await withinDeadline(run.cleanup(), returnDeadlineMs, "held start cleanup").catch((error: unknown) => error);
+      expect(performance.now() - started).toBeLessThan(returnDeadlineMs);
+      expect(failure).toBeInstanceOf(DaemonTeardownDeadlineError);
+      expect(failure).toMatchObject({ name: "DaemonTeardownDeadlineError", message: "daemon under test did not stop before the teardown deadline (daemon termination)" });
+      expect(fixtureRoots.every(path => !existsSync(path))).toBe(true);
+      expect(roots.size).toBe(0);
+      expect(f.stop).not.toHaveBeenCalled();
+      const primary = new Error("fixture primary assertion failure");
+      await expect(finishCleanup(run.cleanup, { error: primary })).rejects.toBe(primary);
+      expect(primary).toHaveProperty("teardownError", failure);
+    } finally {
+      release();
+      // Release only after the deadline assertions so joining proves that pending cancellation removes the late listener.
+      await withinDeadline(run.running, DAEMON_STOP_DEADLINE_MS, "released stand-in");
+    }
+    expect(run.failure()).toBeUndefined();
+    expect(run.result()).toBe(SUCCESS);
+    expect(f.stop).toHaveBeenCalledOnce();
+    expect(signals.map(signal => process.rawListeners(signal))).toEqual(listeners);
+    expect(fixtureRoots.every(path => !existsSync(path))).toBe(true);
     expect(daemonCleanups.size).toBe(0);
     expect(boundary.children.size).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
