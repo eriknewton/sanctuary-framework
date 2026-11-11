@@ -217,3 +217,8 @@ required-features = ["test-isolation"]
 name = "linux_business_signer_client"
 path = "tests/linux_business_signer_client.rs"
 required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_business_writer_protocol"
+path = "tests/linux_business_writer_protocol.rs"
+required-features = ["test-isolation"]

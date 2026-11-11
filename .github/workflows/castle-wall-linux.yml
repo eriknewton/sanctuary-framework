@@ -235,7 +235,7 @@ jobs:
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
-                       linux_business_profile_selection linux_business_signer_client confined_agent_id test_isolation_gate; do
+                       linux_business_profile_selection linux_business_signer_client linux_business_writer_protocol confined_agent_id test_isolation_gate; do
           # suite-list-end: body through `done` must match WORKFLOW_SUITE_RAN_LOOP_BODY in castle-wall-daemon/tests/test_isolation_gate.rs
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"
