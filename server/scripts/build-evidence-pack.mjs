@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 const TIMEOUT_MS = 120_000;
 const PRIVATE_ARCHIVE_MODE = 0o600;
+const sameNames = (found, expected) => { const a = [...found].sort(), b = [...expected].sort(); return a.length === b.length && a.every((name, index) => name === b[index]); };
 // Must match the source metadata fields in .github/workflows/evidence-pack-candidate.yml and snapshot-provenance.test.ts.
 const SOURCE_FORMAT = "SANCTUARY_RELEASE_SOURCE_V1";
 // Must match the installed provenance consumer in snapshot-provenance.test.ts.
@@ -78,12 +79,12 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   execFileSync(process.execPath, [join(root, "server/node_modules/tsup/dist/cli-default.js"), "--config", "tsup.evidence-pack.config.ts"], { cwd: join(staged, "server"), stdio: "inherit", timeout: TIMEOUT_MS, env: { ...process.env, SANCTUARY_SOURCE_SHA: revision, SANCTUARY_ARTIFACT_MODE: mode } });
   const bundle = join(packageRoot, "dist/verify-evidence-pack.js");
   // A compiler surprise is a STOP, never an implicit registry extension.
-  if (readdirSync(join(packageRoot, "dist")).sort().join() !== Object.values(BIN).map(path => basename(path)).sort().join()) throw new Error("Unexpected verifier artifact");
-  for (const bin of Object.values(BIN)) chmodSync(join(packageRoot, bin), 0o755);
+  if (!sameNames(readdirSync(join(packageRoot, "dist")), Object.values(BIN).map(path => basename(path)))) throw new Error("Unexpected verifier artifact");
+  for (const bin of Object.values(BIN)) chmodSync(join(packageRoot, bin), memberMode("package/" + bin));
   writeFileSync(join(packageRoot, "dist/provenance.json"), JSON.stringify({ format: BUILD_FORMAT, package_version: pkg.version, source_revision: metadata.source_revision, source_archive_sha256: metadata.source_archive_sha256, verifier_sha256: digest(readFileSync(bundle)), dependency_lock_sha256: digest(readFileSync(join(root, "server/package-lock.json"))) }, null, 2) + "\n");
   // The marker lives inside the packed directory so a fixture tarball stays marked non-release after it leaves its build root.
   if (nonRelease) writeFileSync(join(packageRoot, "dist", NON_RELEASE_MARKER), NON_RELEASE_TEXT, { flag: "wx" });
-  if (readdirSync(join(packageRoot, "dist")).sort().join() !== registry(mode).filter(path => path.startsWith("package/dist/")).map(path => basename(path)).sort().join()) throw new Error("Unexpected verifier artifact");
+  if (!sameNames(readdirSync(join(packageRoot, "dist")), registry(mode).filter(path => path.startsWith("package/dist/")).map(path => basename(path)))) throw new Error("Unexpected verifier artifact");
   // Expected digests come only from the exact staged registry, before npm runs. No normalization was observed.
   const members = registry(mode).map(path => {
     const file = join(packageRoot, path.slice("package/".length));
@@ -266,8 +267,9 @@ export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileU
   return { root, tree, ...installed, tarball: join(artifactDir, ARTIFACT_FILES.tarball), artifactDir, receipt: checked.receipt, packed: { files: checked.members.map(row => ({ path: row.path.slice("package/".length), size: row.size_bytes, mode: memberMode(row.path) })) }, metadata, archive, non_release: true, fixture: true };
 }
 /** Fixed-path descriptor consumer used before install and upload; a receipt supplies data, never a command. */
+// The trusted runner recheck is self-pinned by design; recipients require independent authenticated pins.
 export function checkDescriptor(artifactDir) {
-  if (!isAbsolute(artifactDir) || !lstatSync(artifactDir).isDirectory()) throw new Error("Artifact directory refused");
+  if (!isAbsolute(artifactDir) || resolve(artifactDir) !== artifactDir || !lstatSync(artifactDir).isDirectory()) throw new Error("Artifact directory refused");
   artifactDir = realpathSync(artifactDir);
   const receipt = requireValid(parseCandidate(readBounded(join(artifactDir, ARTIFACT_FILES.receipt), MAX_MANIFEST_BYTES)));
   const checked = requireValid(checkArtifact(readBounded(join(artifactDir, receipt.tarball), MAX_ARTIFACT_BYTES), readBounded(join(artifactDir, receipt.manifest), MAX_MANIFEST_BYTES), receipt));

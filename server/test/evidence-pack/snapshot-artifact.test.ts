@@ -25,7 +25,7 @@ function refusal(s: Sample, tar: Buffer, manifest: Buffer = retained(s, tar), ex
 }
 const script = resolve("scripts/build-evidence-pack.mjs");
 const cli = (s: Sample, args: string[]) => spawnSync(process.execPath, [s.checker, ...args], { encoding: "utf8", timeout: 30_000 });
-const yaml = createRequire(import.meta.url)("js-yaml") as { load(text: string): { jobs: Record<string, { steps: Array<{ name?: string; run?: string; uses?: string; with?: { path?: string } }> }> } };
+const yaml = createRequire(import.meta.url)("js-yaml") as { load(text: string): { jobs: Record<string, { steps: Array<{ name?: string; run?: string; uses?: string; with?: { path?: string; "if-no-files-found"?: string } }> }> } };
 function workflowPlan(text: string) {
   const steps = yaml.load(text).jobs.candidate!.steps;
   expect(text).not.toMatch(/npm\s+pack|\*\.tgz|continue-on-error:|^\s+if:|\|\|\s*true|always\(\)|failure\(\)/m);
@@ -42,6 +42,7 @@ function workflowPlan(text: string) {
   expect(steps[positions[2]!]!.run).toContain("node server/scripts/build-evidence-pack.mjs --install-candidate /tmp/c13/artifact");
   for (const position of [positions[3]!, positions[4]!]) expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-artifact.test.ts");
   const upload = steps.findIndex(s => s.uses?.startsWith("actions/upload-artifact@")); expect(upload).toBeGreaterThan(positions[5]!);
+  expect(steps[upload]!.with!["if-no-files-found"]).toBe("error");
   expect(steps[upload]!.with!.path!.trim().split(/\s+/).sort()).toEqual(["/tmp/c13/artifact/candidate.tgz", "/tmp/c13/artifact/artifact-manifest.json", "/tmp/c13/artifact/candidate.json", "/tmp/c13/artifact/release-source.json", "/tmp/c13/artifact/source.tar", "/tmp/c13/artifact/test-candidate.json", "/tmp/c13/source-ref.json"].sort());
 }
 describe("packed artifact authority", () => {
@@ -98,6 +99,10 @@ describe("packed artifact authority", () => {
     const tar = changed(release, rows => { rows[0]!.header.write("000777 \0", 100); }); expect(error(parseArchive(tar, "release"))).toBe("tar mode"); refusal(release, tar); control();
   });
   it("A10 consumes complete gzip and ustar with strict headers and ending", () => {
+    for (const [offset, byte] of [[0, 0], [1, 0], [2, 0], [3, 1]]) {
+      const tar = Buffer.from(release.tar); tar[offset!] = byte!;
+      expect(error(parseArchive(tar, "release"))).toBe("gzip header"); refusal(release, tar);
+    }
     const raw = tarBytes(entries(release.tar));
     const badChecksum = Buffer.from(raw); badChecksum[0] ^= 1;
     const badOctal = Buffer.from(raw); badOctal[124] = 0x80; checksum(badOctal.subarray(0, 512));
@@ -117,6 +122,9 @@ describe("packed artifact authority", () => {
   });
   it("A12 shared manifest parser rejects malformed elements and duplicate keys", () => {
     for (const manifest of malformed(release)) { expect(parseManifest(manifest).ok).toBe(false); refusal(release, release.tar, manifest); }
+    const alias = JSON.parse(release.manifest.toString()), keys = Object.keys(alias).sort();
+    delete alias[keys[0]!]; delete alias[keys[1]!]; alias[keys.slice(0, 2).join(",")] = true;
+    expect(error(parseManifest(Buffer.from(JSON.stringify(alias))))).toBe("manifest keys");
     expect(() => parseJson(Buffer.from('{"a":1,"\\u0061":2}'))).toThrow("duplicate key"); control();
   });
   it("A13 hashes do not substitute for package and provenance semantics", () => {
@@ -216,9 +224,24 @@ describe("packed artifact authority", () => {
     symlinkSync(release.dir, link, "dir");
     const before = readFileSync(join(release.dir, ARTIFACT_FILES.receipt));
     await expect(buildCandidate(buildArgs(release, link, "release"), root, release.receipt.source_revision)).rejects.toThrow(/EEXIST/);
-    expect(() => checkDescriptor(link)).toThrow("Artifact directory refused");
+    for (const path of [link, link + "/", link + "/."]) expect(() => checkDescriptor(path)).toThrow("Artifact directory refused");
     expect(readFileSync(join(release.dir, ARTIFACT_FILES.receipt))).toEqual(before); control();
   });
+  it("A23 compares dist names by element before and after generated metadata", async () => {
+    for (const phase of [1, 2]) {
+      const root = buildRoot(release), dir = join(scratch(), "artifact"); let calls = 0, faults = 0;
+      const read = fs.readdirSync;
+      // The spy wraps the overloaded API; this call site uses the string-name overload.
+      const listing = vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+        const names = Reflect.apply(read, fs, args);
+        if (String(args[0]).includes("pack-source-") && String(args[0]).endsWith("packages/evidence-pack-verifier/dist") && ++calls === phase) { faults++; return [names.sort().join(",")]; }
+        return names;
+      }) as typeof fs.readdirSync); syncBuiltinESMExports();
+      try { await expect(buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision)).rejects.toThrow("Unexpected verifier artifact"); }
+      finally { listing.mockRestore(); syncBuiltinESMExports(); }
+      expect(faults).toBe(1); expect(existsSync(join(dir, ARTIFACT_FILES.receipt))).toBe(false);
+    } control();
+  }, TIMEOUT);
   it("C1 release control with stable existing copies reaches the complete receipt", () => { control(); expect(checkDescriptor(release.dir).receipt.mode).toBe("release"); expect(readdirSync(join(release.tree, "packages/evidence-pack-verifier/dist")).sort()).toEqual(registry("release").filter(p => p.startsWith("package/dist/")).map(p => p.slice("package/dist/".length)).sort()); });
   it("C2 fixture control with initially absent copies reaches the complete receipt", () => { control(fixture); expect(checkDescriptor(fixture.dir).receipt.mode).toBe("fixture"); expect(installed(fixture).stdout).toBe(artifactSuccess("fixture")); });
   it("C4 valid archive and schema round-trip pin modes and all registry rows", () => {

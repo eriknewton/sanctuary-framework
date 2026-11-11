@@ -7,6 +7,9 @@ export const MAX_ARTIFACT_BYTES = 8 * MiB;
 export const MAX_TAR_BYTES = 16 * MiB;
 export const MAX_MANIFEST_BYTES = 64 * KiB;
 export const MAX_MEMBERS = 8; // Seven release files plus the fixture marker.
+// Frozen archive permissions: executable bins and read-only package data for group/other.
+const BIN_MODE = 0o755, FILE_MODE = 0o644;
+const GZIP_MAGIC = [0x1f, 0x8b], GZIP_DEFLATE = 8, GZIP_NO_FLAGS = 0; // RFC 1952 header identifiers.
 const BLOCK = 512, GZIP_HEADER = 10, GZIP_TRAILER = 8;
 const MAX_JSON_DEPTH = 16; // The schemas need at most three composite levels.
 export const NON_RELEASE_MARKER = "NON_RELEASE";
@@ -26,7 +29,11 @@ const fail = code => { throw new Error(code); };
 const need = (condition, code) => { if (!condition) fail(code); };
 const result = fn => { try { return { ok: true, value: fn() }; } catch (error) { return { ok: false, error: error instanceof Error ? error.message : "invalid" }; } };
 export function requireValid(parsed) { if (!parsed.ok) fail(parsed.error); return parsed.value; }
-const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join() === [...keys].sort().join();
+const exact = (value, keys) => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const found = Object.keys(value).sort(), expected = [...keys].sort();
+  return found.length === expected.length && found.every((key, index) => key === expected[index]);
+};
 const hash = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 const revision = value => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
 const modeValid = mode => mode === "release" || mode === "fixture";
@@ -37,7 +44,7 @@ export function registry(mode) {
   need(modeValid(mode), "mode");
   return ["LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "package.json", "dist/provenance.json", ...Object.values(BIN), ...(mode === "fixture" ? ["dist/" + NON_RELEASE_MARKER] : [])].map(path => "package/" + path).sort();
 }
-export const memberMode = path => Object.values(BIN).some(bin => path === "package/" + bin) ? 0o755 : 0o644;
+export const memberMode = path => Object.values(BIN).some(bin => path === "package/" + bin) ? BIN_MODE : FILE_MODE;
 /** Bounded, no-follow, regular-file read; short reads and growth cannot bypass the byte budget. */
 export function readBounded(path, limit) {
   need(Number.isSafeInteger(limit) && limit > 0, "read limit");
@@ -112,7 +119,7 @@ export function parseArchive(bytes, mode) { return result(() => {
   need(modeValid(mode), "mode");
   need(bytes.length <= MAX_ARTIFACT_BYTES && bytes.length >= GZIP_HEADER + GZIP_TRAILER, "compressed cap");
   // npm emits a fixed header without optional fields. A second deflate stream must never be ignored.
-  need(bytes[0] === 0x1f && bytes[1] === 0x8b && bytes[2] === 8 && bytes[3] === 0, "gzip header");
+  need(GZIP_MAGIC.every((byte, index) => bytes[index] === byte) && bytes[2] === GZIP_DEFLATE && bytes[3] === GZIP_NO_FLAGS, "gzip header");
   const compressed = bytes.subarray(GZIP_HEADER, -GZIP_TRAILER);
   const inflated = inflateRawSync(compressed, { maxOutputLength: MAX_TAR_BYTES, info: true });
   need(inflated.engine.bytesWritten === compressed.length, "gzip trailing");

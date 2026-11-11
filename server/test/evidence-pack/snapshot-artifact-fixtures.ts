@@ -8,7 +8,8 @@ import { digest, ARTIFACT_FILES, MAX_MANIFEST_BYTES, parseManifest, requireValid
 // @ts-expect-error Node build script deliberately has no TypeScript wrapper.
 import { prepareFixtureCandidate, candidateForTests, buildCandidate, checkerArgs, installCandidate } from "../../scripts/build-evidence-pack.mjs";
 export const ROOT = resolve("..");
-export const scratch = () => mkdtempSync(join(tmpdir(), "artifact-witness-"));
+const tempParent = mkdtempSync(join(tmpdir(), "artifact-witness-"));
+export const scratch = () => mkdtempSync(join(tempParent, "case-"));
 export interface Sample { dir: string; tar: Buffer; manifest: Buffer; receipt: Candidate; checker: string; tree: string; archive: string; metadata: string; command: string }
 export function sample(dir: string, checker: string, tree: string, archive: string, metadata: string, command: string): Sample { return { dir, tar: readFileSync(join(dir, ARTIFACT_FILES.tarball)), manifest: readFileSync(join(dir, ARTIFACT_FILES.manifest)), receipt: JSON.parse(readFileSync(join(dir, ARTIFACT_FILES.receipt), "utf8")), checker, tree, archive, metadata, command }; }
 export async function samples() {

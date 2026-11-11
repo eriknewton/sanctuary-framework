@@ -8,7 +8,10 @@ import { spawnSync, execFileSync } from "node:child_process";
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { validateSource, digest, candidateForTests, NON_RELEASE_MARKER, NON_RELEASE_TEXT } from "../../scripts/build-evidence-pack.mjs";
 const SOURCE = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-const artifactArgs = (metadata: string, archive: string, fixture = false) => ["--source-metadata", metadata, "--source-archive", archive, "--artifact-dir", join(mkdtempSync(join(tmpdir(), "provenance-artifact-")), "artifact"), "--artifact-mode", fixture ? "fixture" : "release"];
+const tempParent = mkdtempSync(join(tmpdir(), "provenance-witness-"));
+const scratch = (prefix: string) => mkdtempSync(join(tempParent, prefix));
+let artifactNumber = 0;
+const artifactArgs = (metadata: string, archive: string, fixture = false) => ["--source-metadata", metadata, "--source-archive", archive, "--artifact-dir", join(tempParent, `artifact-${artifactNumber++}`), "--artifact-mode", fixture ? "fixture" : "release"];
 const archive = Buffer.from("synthetic source archive");
 // Must match the source and installed build record schemas in scripts/build-evidence-pack.mjs.
 const metadata = { format: "SANCTUARY_RELEASE_SOURCE_V1", source_revision: SOURCE, source_archive_sha256: digest(archive) };
@@ -18,7 +21,7 @@ describe("candidate provenance input boundary", () => {
     const m = { ...metadata }; if (kind === "short") m.source_revision = SOURCE.slice(0, 8); if (kind === "uppercase") m.source_revision = SOURCE.toUpperCase(); if (kind === "extra") Object.assign(m, { extra: true }); if (kind === "missing") delete (m as Partial<typeof m>).source_archive_sha256;
     expect(() => validateSource(m, kind === "archive" ? Buffer.from("other") : archive, kind === "short" ? m.source_revision : kind === "env" ? "a".repeat(40) : SOURCE, kind === "short" ? m.source_revision : kind === "head" ? "b".repeat(40) : SOURCE)).toThrow("Source provenance refused");
   });
-  it("build command refuses an eight-hex input before bundling", () => { const root = mkdtempSync(join(tmpdir(), "provenance-")); const m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive); const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], { encoding: "utf8" }); expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); });
+  it("build command refuses an eight-hex input before bundling", () => { const root = scratch("provenance-"); const m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive); const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], { encoding: "utf8" }); expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); });
 });
 describe("installed immutable version", () => {
   let c: Awaited<ReturnType<typeof candidateForTests>>;
@@ -39,7 +42,7 @@ import { extractSourceArchive, prepareFixtureCandidate, buildCandidate } from ".
 import { mkdirSync, existsSync, renameSync, symlinkSync, cpSync, unlinkSync } from "node:fs";
 it.each([SOURCE, undefined])("release provenance still refuses a missing explicit revision with head %s", head => { expect(() => validateSource(metadata, archive, undefined, head)).toThrow("Source provenance refused"); });
 it.each(["symlink", "hardlink", "fifo"])("source archive refuses nonregular member %s before extraction", kind => {
-  const root = mkdtempSync(join(tmpdir(), "archive-members-")), archive = join(root, "source.tar"), target = join(root, "staged"); mkdirSync(target);
+  const root = scratch("archive-members-"), archive = join(root, "source.tar"), target = join(root, "staged"); mkdirSync(target);
   execFileSync("/usr/bin/python3", ["-I", "-S", "-c", `import tarfile,sys,io
 with tarfile.open(sys.argv[1], 'w') as archive:
     safe=tarfile.TarInfo('safe'); safe.size=1; archive.addfile(safe,io.BytesIO(b'x'))
@@ -48,7 +51,7 @@ with tarfile.open(sys.argv[1], 'w') as archive:
   expect(() => extractSourceArchive(archive, target)).toThrow(); expect(existsSync(join(target, "safe"))).toBe(false);
 });
 it("source archive admits only regular files and directories", () => {
-  const root = mkdtempSync(join(tmpdir(), "archive-positive-")), source = join(root, "source"), target = join(root, "staged"), archive = join(root, "source.tar"); mkdirSync(source); mkdirSync(target); writeFileSync(join(source, "file"), "exact bytes"); execFileSync("tar", ["-cf", archive, "-C", source, "."]);
+  const root = scratch("archive-positive-"), source = join(root, "source"), target = join(root, "staged"), archive = join(root, "source.tar"); mkdirSync(source); mkdirSync(target); writeFileSync(join(source, "file"), "exact bytes"); execFileSync("tar", ["-cf", archive, "-C", source, "."]);
   extractSourceArchive(archive, target); expect(readFileSync(join(target, "file"), "utf8")).toBe("exact bytes");
 });
 // Must match the in-place output replacement in scripts/build-evidence-pack.mjs.
@@ -63,7 +66,7 @@ it.each(["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"])("
 }, 120_000);
 // Must match the staging parent read through os.tmpdir() in buildCandidate in scripts/build-evidence-pack.mjs.
 async function entryProvenance(kind: "deleted" | "mismatched" | "matching") {
-  const root = mkdtempSync(join(tmpdir(), "entry-provenance-")), tree = join(root, "tree"), staging = join(root, "staging");
+  const root = scratch("entry-provenance-"), tree = join(root, "tree"), staging = join(root, "staging");
   mkdirSync(tree); mkdirSync(staging);
   const source = join(root, "source"); mkdirSync(source); writeFileSync(join(source, "sentinel"), "must not be staged");
   const a = join(root, "source.tar"), m = join(root, "source.json");
@@ -97,7 +100,7 @@ describe("rebuild output paths are all checked before either is cleared", () => 
   beforeAll(async () => { c = await prepareFixtureCandidate(); }, 120_000);
   // Each row builds into its own minimal root holding copies of the fixture outputs, so a row that removes files cannot disturb another.
   function outputRoot(): string {
-    const root = mkdtempSync(join(tmpdir(), "output-paths-")); mkdirSync(join(root, "server"));
+    const root = scratch("output-paths-"); mkdirSync(join(root, "server"));
     symlinkSync(join(c.tree, "server/node_modules"), join(root, "server/node_modules"), "dir");
     cpSync(join(c.tree, "server/package-lock.json"), join(root, "server/package-lock.json"));
     for (const output of OUTPUTS) cpSync(join(c.tree, output), join(root, output), { recursive: true });
