@@ -70,7 +70,10 @@ export class LivenessSurfaceSource {
       if (pending.size === 0) {
         const result = this.expired ?? snapshot;
         release(); finish(result);
-      } else finish(this.expired ?? snapshot);
+      } else {
+        this.expired ??= this.deadlineSnapshot();
+        finish(snapshot);
+      }
     }, () => {
       timer.cancel();
       this.expired ??= this.deadlineSnapshot(); finish(this.expired);

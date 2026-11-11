@@ -94,6 +94,26 @@ function rank(component: typeof components[number], state: string): number {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("shared reader snapshot", () => {
+  it("shares a deadline verdict after a returning reader leaves a close pending", async () => {
+    vi.useFakeTimers();
+    const input = base(), backing = filesystem(input);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const fs: ReaderFs = { open: async (...args) => ({ ...await backing.fs.open(...args), close: () => gate }) };
+    const read = vi.spyOn(readerModule, "readAndEvaluateLivenessWithInput").mockImplementation(async opts => {
+      const handle = await opts.fs!.open("daemon.json", 0);
+      void handle.close();
+      return { envelope: evaluateLiveness(input), input };
+    });
+    const source = new LivenessSurfaceSource(options(input, fs));
+    expect((await source.readProjection()).exit_code).toBe(0);
+    expect((await source.readProjection()).exit_code).toBe(70);
+    expect(read).toHaveBeenCalledTimes(1);
+    release(); await vi.advanceTimersByTimeAsync(1);
+    expect((await source.readProjection()).exit_code).toBe(0);
+    expect(read).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+  });
   it("ignores a released flight's stale deadline callback", async () => {
     const input = base(), fs = filesystem(input), callbacks: (() => void)[] = [];
     const source = new LivenessSurfaceSource({ ...options(input, fs.fs), deadline: {
