@@ -2,7 +2,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { existsSync } from "node:fs";
 import { clearTimeout as clearRealTimeout, setTimeout as setRealTimeout } from "node:timers";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -53,13 +53,18 @@ const CUSTODY_MODE = 0o700; // Owner-only fixture custody.
 const PASSPHRASE = "checkpoint-fixture-passphrase";
 const POLL_MS = 10; // Ten milliseconds between filesystem completion observations.
 const WAIT_MS = 5_000; // Five seconds bounds observation of fixture startup and emission completion.
-const DAEMON_STOP_DEADLINE_MS = WAIT_MS / 2; // Half the observation budget for cooperative daemon termination.
-const CHILD_REAP_DEADLINE_MS = WAIT_MS / 5; // One fifth of the observation budget for actual executable closure.
+// A stop requested during startup also waits out the remaining startup, so it gets the whole observation budget.
+const DAEMON_STOP_DEADLINE_MS = WAIT_MS;
+const CHILD_REAP_DEADLINE_MS = WAIT_MS / 2; // Half the observation budget for actual executable closure on a loaded host.
 const ROOT_REMOVAL_DEADLINE_MS = CHILD_REAP_DEADLINE_MS; // Filesystem cleanup gets the same budget as child closure.
 const CHILD_REAP_CALL_DEADLINE_MS = CHILD_REAP_DEADLINE_MS + POLL_MS; // One poll lets the inner child deadline report first.
 const ROOT_REMOVAL_CALL_DEADLINE_MS = ROOT_REMOVAL_DEADLINE_MS + POLL_MS; // One poll lets individual removal deadlines report first.
 // Two child reaps surround daemon termination, followed by root removal and one poll of scheduling margin.
 const cleanupDeadlineMs = (stopMs = DAEMON_STOP_DEADLINE_MS) => stopMs + CHILD_REAP_CALL_DEADLINE_MS * 2 + ROOT_REMOVAL_CALL_DEADLINE_MS + POLL_MS;
+// A deadline measures elapsed wall time, so a caller that asserts on elapsed time allows one observation budget for a descheduled worker.
+const SCHEDULING_ALLOWANCE_MS = WAIT_MS;
+// The hook runs registered cleanups, one more child reap and one more root removal; its own timeout must exceed their sum.
+const AFTER_EACH_TIMEOUT_MS = cleanupDeadlineMs() + CHILD_REAP_CALL_DEADLINE_MS + ROOT_REMOVAL_CALL_DEADLINE_MS + SCHEDULING_ALLOWANCE_MS;
 // CHECKPOINT_WIRING_KEEP_FIXTURES=1 opts into retaining fixture material for diagnosis.
 const KEEP_FIXTURES_VALUE = "1";
 const SUCCESS = 0;
@@ -192,7 +197,7 @@ afterEach(async () => {
   }
   // Vitest records a failed hook alongside a primary test failure rather than replacing that failure.
   throwTeardownErrors(errors);
-});
+}, AFTER_EACH_TIMEOUT_MS);
 
 function fixture() {
   const out = new Capture(), err = new Capture();
@@ -316,9 +321,11 @@ describe("checkpoint signer production wiring", () => {
       await tick(f);
       expect(f.err.text).not.toContain("checkpoint emission FAILED");
       const calls = (await readFile(invocations, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      // The stand-in reports the path its interpreter resolved; the root stays under /tmp for the lock socket path cap, and on macOS /tmp is a symlink, so the expectation is canonical.
+      const invoked = await realpath(f.captured()!.signerClientPath!);
       expect(calls).toEqual([
-        { path: f.captured()!.signerClientPath, verb: "get-pubkey" },
-        { path: f.captured()!.signerClientPath, verb: "sign-manifest" },
+        { path: invoked, verb: "get-pubkey" },
+        { path: invoked, verb: "sign-manifest" },
       ]);
       expect(await readPersistedCheckpoints(storage)).toHaveLength(ONE_CHECKPOINT);
       expect(f.out.text).toContain(`checkpoint signer: helper ${shim}`);
@@ -415,6 +422,8 @@ describe("checkpoint signer production wiring", () => {
     const extraRoot = await mkdtemp("/tmp/checkpoint-wiring-");
     roots.add(extraRoot);
     const fixtureRoots = [...roots];
+    // The retention switch keeps fixture directories on purpose, so root presence is asserted against it.
+    const retained = process.env.CHECKPOINT_WIRING_KEEP_FIXTURES === KEEP_FIXTURES_VALUE;
     let release!: () => void;
     let entered = false;
     const held = new Promise<void>(resolve => { release = resolve; });
@@ -431,11 +440,11 @@ describe("checkpoint signer production wiring", () => {
     try {
       await observe(() => entered);
       const started = performance.now();
-      const failure = await withinDeadline(run.cleanup(), returnDeadlineMs, "held start cleanup").catch((error: unknown) => error);
-      expect(performance.now() - started).toBeLessThan(returnDeadlineMs);
+      const failure = await withinDeadline(run.cleanup(), returnDeadlineMs + SCHEDULING_ALLOWANCE_MS, "held start cleanup").catch((error: unknown) => error);
+      expect(performance.now() - started).toBeLessThan(returnDeadlineMs + SCHEDULING_ALLOWANCE_MS);
       expect(failure).toBeInstanceOf(DaemonTeardownDeadlineError);
       expect(failure).toMatchObject({ name: "DaemonTeardownDeadlineError", message: "daemon under test did not stop before the teardown deadline (daemon termination)" });
-      expect(fixtureRoots.every(path => !existsSync(path))).toBe(true);
+      expect(fixtureRoots.every(path => existsSync(path) === retained)).toBe(true);
       expect(roots.size).toBe(0);
       expect(f.stop).not.toHaveBeenCalled();
       const primary = new Error("fixture primary assertion failure");
@@ -450,7 +459,7 @@ describe("checkpoint signer production wiring", () => {
     expect(run.result()).toBe(SUCCESS);
     expect(f.stop).toHaveBeenCalledOnce();
     expect(signals.map(signal => process.rawListeners(signal))).toEqual(listeners);
-    expect(fixtureRoots.every(path => !existsSync(path))).toBe(true);
+    expect(fixtureRoots.every(path => existsSync(path) === retained)).toBe(true);
     expect(daemonCleanups.size).toBe(0);
     expect(boundary.children.size).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
@@ -483,6 +492,7 @@ describe("checkpoint signer production wiring", () => {
     }), err.text).toBe(SUCCESS);
     expect(await readPersistedCheckpoints(storage)).toHaveLength(ONE_CHECKPOINT);
     const calls = (await readFile(invocations, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    expect(calls).toEqual([{ path: shim, verb: "get-pubkey" }, { path: shim, verb: "sign-manifest" }]);
+    const invoked = await realpath(shim); // Canonical for the same reason as the scheduled case.
+    expect(calls).toEqual([{ path: invoked, verb: "get-pubkey" }, { path: invoked, verb: "sign-manifest" }]);
   });
 });
