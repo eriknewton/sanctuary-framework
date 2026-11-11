@@ -1,5 +1,6 @@
-// Base has no artifact contract/receipt/checker. C1/C2 are unchanged-input controls; C4 is a new-feature control.
-// Private result records carry per-row fail-before and predicate-mutant evidence.
+// A1, A18 and A19 fail on a real pre-R1 base build (job 1368 result/base-witness.log).
+// A2-A17 and A20 exercise boundaries absent on that base; their evidence is named mutant kills, not fail-before.
+// C1/C2 are unchanged-input controls; C4 is a new-feature control.
 import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, symlinkSync, cpSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -170,6 +171,24 @@ describe("packed artifact authority", () => {
     for (const extra of [{ command: "/bin/true" }, { tarball: "../candidate.tgz" }, { manifest: "/tmp/manifest.json" }, { installPrefix: "/tmp/outside" }]) expect(parseCandidate(Buffer.from(JSON.stringify({ ...release.receipt, ...extra }))).ok).toBe(false);
     const args = checkerArgs(release.dir, release.receipt) as string[];
     for (const asyncFault of [false, true]) { const broken = { write: (_text: string): Promise<void> => { if (asyncFault) return Promise.reject(new Error("broken output")); throw new Error("broken output"); } }, good = { write: async (_text: string) => {} }; expect(await runArtifactCommand(args, "release", broken, good)).toBe(1); expect(await runArtifactCommand([], "release", good, broken)).toBe(1); expect(await runArtifactCommand(["--help"], "release", broken, good)).toBe(1); } control();
+  });
+  it("A21 anchors a symlinked ancestor for build and descriptor READY", async () => {
+    const root = buildRoot(release), parent = scratch(), alias = join(scratch(), "alias");
+    symlinkSync(parent, alias, "dir");
+    const dir = join(alias, "artifact");
+    const receipt = await buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision);
+    expect(receipt).toEqual(checkDescriptor(dir).receipt);
+    expect(checkDescriptor(join(parent, "artifact")).receipt).toEqual(receipt);
+    const child = spawnSync(process.execPath, [script, "--check-descriptor", dir], { encoding: "utf8", timeout: 30_000 });
+    expect(child.status).toBe(0); control();
+  }, TIMEOUT);
+  it("A22 refuses a final-component symlink in build and descriptor checks", async () => {
+    const root = buildRoot(release), link = join(scratch(), "artifact");
+    symlinkSync(release.dir, link, "dir");
+    const before = readFileSync(join(release.dir, ARTIFACT_FILES.receipt));
+    await expect(buildCandidate(buildArgs(release, link, "release"), root, release.receipt.source_revision)).rejects.toThrow(/EEXIST/);
+    expect(() => checkDescriptor(link)).toThrow("Artifact directory refused");
+    expect(readFileSync(join(release.dir, ARTIFACT_FILES.receipt))).toEqual(before); control();
   });
   it("C1 release control with stable existing copies reaches the complete receipt", () => { control(); expect(checkDescriptor(release.dir).receipt.mode).toBe("release"); expect(readdirSync(join(release.tree, "packages/evidence-pack-verifier/dist")).sort()).toEqual(registry("release").filter(p => p.startsWith("package/dist/")).map(p => p.slice("package/dist/".length)).sort()); });
   it("C2 fixture control with initially absent copies reaches the complete receipt", () => { control(fixture); expect(checkDescriptor(fixture.dir).receipt.mode).toBe("fixture"); expect(installed(fixture).stdout).toBe(artifactSuccess("fixture")); });

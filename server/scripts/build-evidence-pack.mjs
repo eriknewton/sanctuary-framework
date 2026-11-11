@@ -51,12 +51,16 @@ with tarfile.open(sys.argv[1]) as archive:
 export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(import.meta.url)), "../.."), revision = process.env.SANCTUARY_SOURCE_SHA, { outputsChecked, beforeCopy, afterCopy, beforeHash, packedBytes, copiesObserved, artifactWritten } = {}) {
   // INPUTS_VALIDATED: artifact policy is required in the core entry, never defaulted from an option.
   if (args.length !== 8 || args[0] !== "--source-metadata" || args[2] !== "--source-archive" || args[4] !== "--artifact-dir" || args[6] !== "--artifact-mode" || !["release", "fixture"].includes(args[7])) throw new Error("Expected source metadata, source archive, artifact directory and explicit mode");
-  const mode = args[7], nonRelease = mode === "fixture", artifactDir = args[5];
-  if (!isAbsolute(artifactDir) || resolve(artifactDir) !== artifactDir || realpathSync(dirname(artifactDir)) !== dirname(artifactDir) || OUTPUT_DIRECTORIES.some(path => artifactDir === join(root, path) || artifactDir.startsWith(join(root, path) + "/"))) throw new Error("Artifact destination refused");
+  const mode = args[7], nonRelease = mode === "fixture";
   const metadata = JSON.parse(readFileSync(args[1], "utf8"));
   const head = existsSync(join(root, ".git")) ? execFileSync("/usr/bin/git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
   const archiveBytes = readFileSync(args[3]);
   validateSource(metadata, archiveBytes, revision, head);
+  const destination = args[5], component = destination.split("/").at(-1);
+  if (!isAbsolute(destination) || resolve(destination) !== destination || !component || component === "." || component === "..") throw new Error("Artifact destination refused");
+  // Ancestors may relocate the whole artifact; anchor the parent once and create only a plain final component.
+  const parent = realpathSync(dirname(destination)), artifactDir = join(parent, basename(destination));
+  if (OUTPUT_DIRECTORIES.some(path => artifactDir === join(realpathSync(root), path) || artifactDir.startsWith(join(realpathSync(root), path) + "/"))) throw new Error("Artifact destination refused");
   mkdirSync(artifactDir, { mode: 0o700 }); // Exclusive creation refuses existing files, directories and links.
   // Hash validation precedes extraction, and only the validated archive supplies compiled source bytes.
   const staged = mkdtempSync(join(tmpdir(), "pack-source-"));
@@ -263,7 +267,8 @@ export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileU
 }
 /** Fixed-path descriptor consumer used before install and upload; a receipt supplies data, never a command. */
 export function checkDescriptor(artifactDir) {
-  if (!isAbsolute(artifactDir) || realpathSync(artifactDir) !== artifactDir || !lstatSync(artifactDir).isDirectory()) throw new Error("Artifact directory refused");
+  if (!isAbsolute(artifactDir) || !lstatSync(artifactDir).isDirectory()) throw new Error("Artifact directory refused");
+  artifactDir = realpathSync(artifactDir);
   const receipt = requireValid(parseCandidate(readBounded(join(artifactDir, ARTIFACT_FILES.receipt), MAX_MANIFEST_BYTES)));
   const checked = requireValid(checkArtifact(readBounded(join(artifactDir, receipt.tarball), MAX_ARTIFACT_BYTES), readBounded(join(artifactDir, receipt.manifest), MAX_MANIFEST_BYTES), receipt));
   return { receipt, ...checked };
