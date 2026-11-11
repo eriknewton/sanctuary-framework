@@ -1,5 +1,3 @@
-import { buildLivenessHealthRows } from "./feature-health.js";
-import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
 /**
  * Sovereignty Posture Dashboard - Phase 1 route layer.
  *
@@ -48,6 +46,9 @@ import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-read
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  *   GET /posture/evidence        - the Phase 2 Evidence View HTML shell.
  */
+import { buildLivenessHealthRows } from "./feature-health.js";
+import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
+
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { composeProtectionLayers } from "../agent-native/protection-layers.js";

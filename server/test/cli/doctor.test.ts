@@ -975,4 +975,3 @@ async function withRootDaemonWriter<T>(operation: () => Promise<T>): Promise<T> 
   finally { __testSetAuditWriterUidForRole("root_daemon", undefined); }
 }
 resetAuditWriterAfterEach(() => __testSetAuditWriterUidForRole("root_daemon", undefined));
-

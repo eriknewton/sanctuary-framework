@@ -1,4 +1,3 @@
-import { LIVENESS_SCHEDULE_FN_SOURCE } from "../../principal-policy/posture-html-shared.js";
 /**
  * Sanctuary v1.1 Dashboard Embedded Client Script
  *
@@ -27,6 +26,8 @@ import { LIVENESS_SCHEDULE_FN_SOURCE } from "../../principal-policy/posture-html
  * commas, colons, or parentheses.
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "../../principal-policy/posture-html-shared.js";
+
 
 import { MEMORY_SAVE_AUDIT_OPERATIONS, MEMORY_SAVE_INTENT_OPERATIONS } from "../../principal-policy/types.js";
 import { HUB_APPROVAL_PREVIEW_MAX_FIELDS, HUB_APPROVAL_PASSAGE_MAX_UNITS } from "../../contracts/v1.1/hub-events.js";
@@ -644,7 +645,9 @@ function readResponse(url, init, deadlineMs, generation, refreshing) {
       throw error;
     }
     if (!body || typeof body !== "object" || body.error || !validateReadBody(key, body)) throw new Error("The latest result is unavailable.");
-    if (body.castle_wall_liveness) livenessDisplay.install(body.castle_wall_liveness);
+    if (body.castle_wall_liveness) {
+      try { livenessDisplay.install(body.castle_wall_liveness); } catch { livenessDisplay.refuse(); }
+    }
     return { ok: res.ok, status: res.status, json: async function () { return body; } };
   })();
   const result = Promise.race([read, expired]).then(function (res) {

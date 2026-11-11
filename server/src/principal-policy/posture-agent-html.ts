@@ -1,4 +1,3 @@
-import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
 /**
  * Sovereignty Posture Dashboard - per-agent drill-down HTML (Slice 4).
  *
@@ -29,6 +28,8 @@ import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
  * Returns a string so the dashboard can serve it directly (mirrors
  * `renderPostureHomeHTML`).
  */
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
+
 
 import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "./posture-home-types.js";
 import {
@@ -219,7 +220,9 @@ export function renderPostureAgentHTML(): string {
   ${REL_TIME_FN_SOURCE}
 
   function renderPanelStatus(home) {
-    if (home.castle_wall_liveness) livenessDisplay.install(home.castle_wall_liveness);
+    if (home.castle_wall_liveness) {
+      try { livenessDisplay.install(home.castle_wall_liveness); } catch { livenessDisplay.refuse(); }
+    }
     // Freshness accepts the same strict instant as the SPA, never a browser-local date.
     ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
     // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.

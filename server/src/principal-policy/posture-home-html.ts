@@ -1,4 +1,3 @@
-import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
 /**
  * Sovereignty Posture Dashboard - Phase 1 home HTML.
  *
@@ -29,6 +28,8 @@ import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
  * Returns a string so the dashboard can serve it directly (mirrors
  * `generateDashboardHTML`).
  */
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
+
 
 import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "./posture-home-types.js";
 import type { FeatureHealthStatus } from "./feature-health.js";
@@ -1831,7 +1832,9 @@ export function renderPostureHomeHTML(): string {
   }
 
   function renderPanelStatus(home) {
-    if (home.castle_wall_liveness) livenessDisplay.install(home.castle_wall_liveness);
+    if (home.castle_wall_liveness) {
+      try { livenessDisplay.install(home.castle_wall_liveness); } catch { livenessDisplay.refuse(); }
+    }
     // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.
     var reasons = { budget_exceeded: "Time budget exceeded", producer_failed: "Observation failed", never_completed: "No completed observation", upstream_unavailable: "Required evidence unavailable", observation_superseded: "Newer evidence is available" };
     var MILLISECONDS_PER_SECOND = 1000; // One second contains one thousand milliseconds.

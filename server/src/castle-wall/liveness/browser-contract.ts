@@ -23,6 +23,7 @@ type Component = typeof components[number];
 function severity(component: Component, state: string): number {
   const name = state.slice(component.length + 1);
   const index = LIVENESS_SEVERITY_ORDER[component].indexOf(name.startsWith("OK_") ? "OK" : name);
+  // An unlisted state ranks as the most severe class, so unknown states cannot improve a verdict.
   return index < 0 ? LIVENESS_SEVERITY_ORDER[component].length : index;
 }
 
@@ -75,6 +76,10 @@ export const LIVENESS_SCHEDULE_FN_SOURCE = String.raw`
 ${buildLivenessBadges.toString()}
 ${renderLivenessBadges.toString()}
 function createLivenessDisplay(paint) {
+  var invalid = false;
+  var fallback = { wall: { state: "wall_DOWN", alarm: true, reasons: ["observation_invalid"], cause: null },
+    agent: { state: "agent_DOWN", alarm: true, reasons: ["observation_invalid"], cause: null },
+    coverage: { state: "coverage_UNAVAILABLE", alarm: true, reasons: ["observation_invalid"], cause: null }, exit_code: 1 };
   var installed = null, dateAnchor = 0, performanceAnchor = 0, base = 0, elapsed = 0;
   function age() {
     if (!installed) return 0;
@@ -82,6 +87,7 @@ function createLivenessDisplay(paint) {
     return elapsed;
   }
   function render() {
+    if (invalid) { paint(fallback); return; }
     if (!installed) return;
     var currentAge = age(), selected = installed.schedule[0];
     for (var i = 1; i < installed.schedule.length; i++) {
@@ -89,12 +95,32 @@ function createLivenessDisplay(paint) {
     }
     paint(selected.projection);
   }
+  function validVerdicts(value) {
+    return value && Number.isInteger(value.exit_code) && ['wall', 'agent', 'coverage'].every(function(component) {
+      var verdict = value[component];
+      return verdict && typeof verdict.state === 'string' && verdict.state.indexOf(component + '_') === 0 &&
+        typeof verdict.alarm === 'boolean' && Array.isArray(verdict.reasons) &&
+        verdict.reasons.every(function(reason) { return typeof reason === 'string'; }) &&
+        (verdict.cause === null || typeof verdict.cause === 'string');
+    });
+  }
+  function refuse() { invalid = true; render(); }
   function install(projection) {
-    if (!projection) return;
+    // Invalid age or shape must never leave a healthy first entry painted indefinitely.
+    var origin = projection && parseEvidenceTimestamp(projection.evaluated_at);
+    if (!projection || !Number.isFinite(projection.served_age_ms) || projection.served_age_ms < 0 ||
+        origin === undefined || !validVerdicts(projection) || !Array.isArray(projection.schedule) ||
+        projection.schedule.length === 0 || projection.schedule.length > ${2 * SCHEDULE_STEPS + 1} ||
+        !projection.schedule.every(function(entry, index, entries) {
+          return entry && Number.isFinite(entry.after_ms) && entry.after_ms >= 0 &&
+            (index === 0 ? entry.after_ms === 0 : entry.after_ms > entries[index - 1].after_ms) && validVerdicts(entry.projection);
+        }) || projection.schedule[projection.schedule.length - 1].after_ms !== ${SCHEDULE_STEPS * LOCAL_JITTER} ||
+        projection.schedule[projection.schedule.length - 1].projection.wall.state.indexOf('wall_OK_') === 0 ||
+        projection.schedule[projection.schedule.length - 1].projection.agent.state.indexOf('agent_OK_') === 0 ||
+        projection.schedule[projection.schedule.length - 1].projection.coverage.state !== 'coverage_UNAVAILABLE') { refuse(); return; }
     // Must match parseEvidenceTimestamp in POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE in posture-home-types.ts.
-    var origin = parseEvidenceTimestamp(projection.evaluated_at);
-    if (origin === undefined) return;
     if (installed && origin < parseEvidenceTimestamp(installed.evaluated_at)) return;
+    invalid = false;
     if (!installed || origin > parseEvidenceTimestamp(installed.evaluated_at)) {
       installed = projection;
       // Served age belongs to this evaluation; receiving the same evaluation cannot renew it.
@@ -106,7 +132,7 @@ function createLivenessDisplay(paint) {
     }
     render();
   }
-  return { install: install, render: render };
+  return { install: install, render: render, refuse: refuse };
 }
 function mountLivenessDisplay() {
   var observing = false;

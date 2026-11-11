@@ -5,6 +5,9 @@ import { STATUS_READ_DEADLINE } from "./constants.js";
 import { readAndEvaluateLivenessWithInput, nodeReaderFs, realDeadlineClock,
   type HostClockProvider, type ReaderFs, type ReaderFileHandle, type DeadlineClock } from "./read-status.js";
 
+// No account has this uid, so custody refuses on hosts without getuid.
+const NO_PROCESS_UID = -1;
+
 export function project(envelope: LivenessEnvelope, input: LivenessInput, nowMs = Date.now()): LivenessProjection {
   // The exact evaluated input owns the timestamp; serving never reparses its presentation string.
   return { evaluated_at: envelope.evaluated_at, served_age_ms: Math.max(0, nowMs - input.nowMs),
@@ -61,7 +64,7 @@ export class LivenessSurfaceSource {
       finish(this.expired);
     });
     const work = readAndEvaluateLivenessWithInput({ ...this.options, fs, host,
-      operatorUid: this.options.operatorUid ?? process.getuid?.() ?? -1,
+      operatorUid: this.options.operatorUid ?? process.getuid?.() ?? NO_PROCESS_UID,
       platform: this.options.platform ?? process.platform, nowMs: this.now });
     const release = () => {
       if (this.flight === flight) { this.flight = undefined; this.expired = undefined; }
@@ -85,6 +88,7 @@ export class LivenessSurfaceSource {
       // The shared reader can return before a raw open, read, close or host-clock operation settles.
       do {
         await Promise.allSettled([...pending]);
+        // One event-loop turn lets late cleanup register its remaining operations.
         await new Promise<void>(resolve => setTimeout(resolve, 0));
       } while (pending.size > 0);
       release();
@@ -100,7 +104,7 @@ export class LivenessSurfaceSource {
   private deadlineSnapshot(): Snapshot {
     const platform = this.options.platform ?? process.platform;
     const input: LivenessInput = { nowMs: this.now(), platform, host: { ok: false },
-      local: { fortress_id: this.options.fortressId, platform, operator_uid: this.options.operatorUid ?? process.getuid?.() ?? -1 },
+      local: { fortress_id: this.options.fortressId, platform, operator_uid: this.options.operatorUid ?? process.getuid?.() ?? NO_PROCESS_UID },
       directory: { status: "ok" }, daemon: { status: "custody_invalid", cause: "read_deadline" },
       observer: { status: "custody_invalid", cause: "read_deadline" }, config: { status: "absent" }, readDeadlineHit: true };
     return { envelope: evaluateLiveness(input), input };

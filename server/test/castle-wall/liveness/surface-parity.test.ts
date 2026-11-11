@@ -11,7 +11,7 @@ import { evaluateLiveness, type LivenessInput } from "../../../src/castle-wall/l
 import { readAndEvaluateLiveness, readAndEvaluateLivenessWithInput, type ReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
 import { LivenessSurfaceSource, project } from "../../../src/castle-wall/liveness/surface-reader.js";
 import { buildLivenessSchedule, LIVENESS_SCHEDULE_FN_SOURCE, verdicts, type LivenessProjection, type LivenessVerdicts } from "../../../src/castle-wall/liveness/browser-contract.js";
-import { LIVENESS_SEVERITY_ORDER, AGENT_WINDOW_BASE, HISTORY_WINDOW, OBSERVER_WINDOW, LOCAL_JITTER, SCHEDULE_STEPS, DISPLAY_PERIOD, SECOND, STATUS_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
+import { HTTP_BODY_BYTES, STATUS_BYTES, LIVENESS_SEVERITY_ORDER, AGENT_WINDOW_BASE, HISTORY_WINDOW, OBSERVER_WINDOW, LOCAL_JITTER, SCHEDULE_STEPS, DISPLAY_PERIOD, SECOND, STATUS_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { renderPostureHomeHTML } from "../../../src/principal-policy/posture-home-html.js";
 import { renderPostureAgentHTML } from "../../../src/principal-policy/posture-agent-html.js";
@@ -261,6 +261,7 @@ describe("conservative evaluator schedule", () => {
     observer.collection = { started_at_ms: input.nowMs, ended_at_ms: input.nowMs };
     observer.raw.canary_integrity.checked_at_ms = input.nowMs; observer.raw.availability.resolved_at_ms = input.nowMs;
     const schedule = buildLivenessSchedule(input);
+    expect(HTTP_BODY_BYTES).toBe(STATUS_BYTES);
     expect(SCHEDULE_STEPS).toBe(Math.floor(OBSERVER_WINDOW / LOCAL_JITTER) + 1);
     expect(SCHEDULE_STEPS * LOCAL_JITTER).toBeGreaterThan(OBSERVER_WINDOW); expect(DISPLAY_PERIOD).toBe(SECOND);
     expect(schedule[0]!.after_ms).toBe(0); expect(schedule.at(-1)!.after_ms).toBe(SCHEDULE_STEPS * LOCAL_JITTER);
@@ -307,6 +308,29 @@ const shipped = [
   ["posture agent", () => renderPostureAgentHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, "")],
 ] as const;
 describe("shipped browser clocks", () => {
+  it.each(shipped)("refuses malformed liveness projections in %s", (_name, source) => {
+    const script = source().replace("function createLivenessDisplay(paint)", "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
+    const malformed = [
+      (p: any) => { delete p.served_age_ms; }, (p: any) => { p.served_age_ms = NaN; },
+      (p: any) => { p.served_age_ms = Infinity; }, (p: any) => { p.served_age_ms = -1; },
+      (p: any) => { p.schedule = []; }, (p: any) => { p.schedule.length = 1; },
+      (p: any) => { p.schedule.at(-1).projection = p.schedule[0].projection; }, (p: any) => { p.schedule[0] = null; },
+      (p: any) => { p.schedule[0].after_ms = 1; }, (p: any) => { delete p.wall.reasons; },
+      (p: any) => { delete p.schedule[0].projection.wall.reasons; },
+      (p: any) => { p.schedule[0].projection = null; },
+    ];
+    for (const damage of malformed) {
+      const page = browser(script), valid = projection(), invalid = structuredClone(valid);
+      page.install(valid); damage(invalid);
+      expect(() => page.install(invalid)).not.toThrow();
+      page.tick(SECOND, SECOND);
+      expect(page.shown().wall.state).toBe("wall_DOWN");
+      expect(page.shown().agent.state).toBe("agent_DOWN");
+      expect(page.shown().coverage.state).toBe("coverage_UNAVAILABLE");
+      expect(page.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="wall_DOWN"');
+    }
+  });
+
   it.each(shipped)("expires and accepts only newer evaluation lifetimes in %s", (_name, source) => {
     const script = source(); expect(script).toContain(LIVENESS_SCHEDULE_FN_SOURCE);
     // Keep the embedded functions visible after the page IIFE exits.

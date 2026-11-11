@@ -1,4 +1,3 @@
-import type { LivenessProjection } from "../castle-wall/liveness/browser-contract.js";
 /**
  * Neutral type home for the composed posture-home payload (`PostureHome`).
  *
@@ -22,6 +21,8 @@ import type { LivenessProjection } from "../castle-wall/liveness/browser-contrac
  * The shared audit display-age bound and browser timestamp parser live here
  * so the three renderers do not depend on each other. It adds no member to the payload.
  */
+import type { LivenessProjection } from "../castle-wall/liveness/browser-contract.js";
+
 
 import type { ProducerKeyObservation, PosturePanelId, PosturePanelStatus } from "./panel-producer.js";
 import type { ProtectionLayerRow } from "../agent-native/protection-layers.js";

@@ -1,5 +1,3 @@
-// Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
-export { LIVENESS_SCHEDULE_FN_SOURCE } from "../castle-wall/liveness/browser-contract.js";
 /**
  * Shared client-side HTML/CSS fragments for the posture surfaces.
  *
@@ -18,6 +16,9 @@ export { LIVENESS_SCHEDULE_FN_SOURCE } from "../castle-wall/liveness/browser-con
  * value is a RAW CSS string interpolated verbatim into each page's inline
  * `<style>` tag. Keep them dependency free and side-effect free.
  */
+// Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+export { LIVENESS_SCHEDULE_FN_SOURCE } from "../castle-wall/liveness/browser-contract.js";
+
 
 import { PAPER_INK_ROOT_TOKENS_CSS } from "../dashboard/design-tokens.js";
 
