@@ -149,8 +149,8 @@ fn root_reconstructed_unit_directives_deny_filesystem_write() {
 #[test]
 fn production_store_is_pinned_beneath_role_root() {
     let mut config: Config = serde_json::from_value(serde_json::json!({
-        "controller":{"uid":0,"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
-        "launcher":{"uid":0,"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
+        "controller":{"uid":unsafe {libc::geteuid()},"gid":unsafe {libc::getegid()},"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
+        "launcher":{"uid":unsafe {libc::geteuid()},"gid":unsafe {libc::getegid()},"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
         "node_sha256":"0".repeat(64),"worker_sha256":"0".repeat(64),
         "grant":{"role":"extension:linux-business-producer-v0"},"fortress_id":"fixture-fortress",
         "roster_digest":"public","binding_high_water":0,"runtime":[]

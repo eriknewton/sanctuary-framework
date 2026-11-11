@@ -1,3 +1,4 @@
+// fail-before-exempt: the STATUS corpus and relay parser are new; existing frame and worker checks are regressions.
 import {it,expect} from "vitest";
 import {publicFrame,parsePublicFrame,RESPONSE_MAX_BYTES} from "../../src/signing/service.js";
 it("public response cap precedes allocation",()=>{expect(()=>publicFrame({op:"x".repeat(RESPONSE_MAX_BYTES)})).toThrow("K1_REFUSED");expect(parsePublicFrame(publicFrame({op:"READY"}))).toEqual({op:"READY"});});
@@ -21,4 +22,19 @@ it.skipIf(process.platform!=="linux")("Linux only: worker self-test names the di
     const body=JSON.parse(Buffer.from(sign.mock.calls[0][0]).subarray(Buffer.byteLength(UNLOCK_CHALLENGE_DOMAIN)).toString());
     expect(body.grant_digest).toBe("sha256:"+createHash("sha256").update(canonicalBytes(grant)).digest("hex"));expect(body).not.toHaveProperty("descriptor_digest");
   }finally{signer?.close();sign.mockRestore();key.fill(0);}
+});
+
+import {parseStatusPacket, statusCorpus} from "../fixtures/k1-relay-client.js";
+it.each(statusCorpus.cases)("STATUS packet $id follows the shared runtime schema", row => {
+  const parse = () => parseStatusPacket(Buffer.from(row.packet_hex,"hex"));
+  if (row.accept) expect(parse).not.toThrow(); else expect(parse).toThrow("K1_REFUSED");
+});
+it("STATUS corpus runs its complete unique case set", () => {
+  const observed = statusCorpus.cases.map(row => {
+    let accept = false;
+    try { parseStatusPacket(Buffer.from(row.packet_hex,"hex")); accept = true; } catch { /* A refusal is the observed corpus outcome. */ }
+    return [row.id, accept];
+  });
+  expect(new Set(statusCorpus.cases.map(row => row.id)).size).toBe(statusCorpus.cases.length);
+  expect(observed).toEqual(statusCorpus.cases.map(row => [row.id,row.accept]));
 });

@@ -593,6 +593,7 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "integration_linux_runtime_activation",
         "integration_manifest_and_drain",
         "linux_business_profile_selection",
+        "linux_business_signer_client",
     ]
     .into_iter()
     .map(String::from)

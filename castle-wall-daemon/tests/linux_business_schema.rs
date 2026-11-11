@@ -532,7 +532,8 @@ fn shared_manifest_pins_every_k1c_corpus() {
             "profile_selector_vectors.json",
             "public_vectors.json",
             "record_join_vectors.json",
-            "role_vectors.json"
+            "role_vectors.json",
+            "signer_status_vectors.json"
         ]
     );
     for name in names {

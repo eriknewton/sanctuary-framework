@@ -11,6 +11,7 @@ pub const REQUIRED_CORPORA: &[&str] = &[
     "public_vectors.json",
     "record_join_vectors.json",
     "role_vectors.json",
+    "signer_status_vectors.json",
 ];
 const SAFE_INTEGER_MAX: u64 = (1 << 53) - 1; // Largest exactly represented JSON integer in both runtimes.
 pub const MANIFEST: &str = include_str!("../../src/business_profile/vector_manifest.json");
@@ -113,6 +114,9 @@ pub fn corpus(name: &str) -> Value {
             include_str!("../../src/business_profile/record_join_vectors.json")
         }
         "role_vectors.json" => include_str!("../../src/business_profile/role_vectors.json"),
+        "signer_status_vectors.json" => {
+            include_str!("../../src/business_profile/signer_status_vectors.json")
+        }
         _ => panic!("unknown corpus"),
     };
     checked(MANIFEST, name, bytes)

@@ -12,6 +12,8 @@ pub mod records;
 #[rustfmt::skip]
 pub mod protocol_transitions;
 #[cfg(target_os = "linux")]
+pub mod signer_client;
+#[cfg(target_os = "linux")]
 pub mod signer_peer;
 #[cfg(target_os = "linux")]
 pub mod signer_service;

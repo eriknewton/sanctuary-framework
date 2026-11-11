@@ -329,7 +329,53 @@ fn response(bytes: &[u8]) -> io::Result<Value> {
     }
     canonical(&bytes[LENGTH_BYTES..], RESPONSE_MAX_BYTES)
 }
+pub const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+pub const BOOT_ID_READ_MAX_BYTES: usize = HEX_ID_CHARS + UUID_DASHES + 1; // UUID text plus one newline.
+const UUID_DASHES: usize = 4; // Kernel UUID groups are 8-4-4-4-12 hexadecimal characters.
+pub fn parse_boot_id(bytes: &[u8]) -> io::Result<String> {
+    if bytes.len() > BOOT_ID_READ_MAX_BYTES {
+        return Err(refused());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| refused())?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.len() != HEX_ID_CHARS + UUID_DASHES {
+        return Err(refused());
+    }
+    const DASH_POSITIONS: [usize; UUID_DASHES] = [8, 13, 18, 23]; // Cumulative UUID group widths including prior separators.
+    if text.bytes().enumerate().any(|(index, byte)| {
+        if DASH_POSITIONS.contains(&index) {
+            byte != b'-'
+        } else {
+            !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte)
+        }
+    }) {
+        return Err(refused());
+    }
+    Ok(text.replace('-', ""))
+}
+fn read_boot_id(path: &Path) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    // One extra byte distinguishes an oversized kernel value from a valid prefix without an unbounded read.
+    std::fs::File::open(path)?
+        .take((BOOT_ID_READ_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    parse_boot_id(&bytes)
+}
+fn status_value(grant: &Value, state: State, started: u64, expires: u64, boot_id: &str) -> Value {
+    // Must match signer_status_vectors.json and both runtime parsers: anchor authority is absent until custody binding lands.
+    json!({"op":"STATUS","state":state_name(state),"grant":grant,"started_boottime_ns":started.to_string(),"expires_boottime_ns":expires.to_string(),"boot_id":boot_id,"anchor_revision":null,"anchor_digest":null})
+}
 pub fn run(config: Config, paths: Paths) -> io::Result<()> {
+    run_with_boot_path(config, paths, Path::new(BOOT_ID_PATH))
+}
+#[cfg(feature = "test-isolation")]
+pub fn run_with_test_boot_id(config: Config, paths: Paths, boot_id: &Path) -> io::Result<()> {
+    run_with_boot_path(config, paths, boot_id)
+}
+fn run_with_boot_path(config: Config, paths: Paths, boot_path: &Path) -> io::Result<()> {
+    // Startup reaches readiness only with a valid boot identity; an unknown boot must never bind a grant.
+    let boot_id = read_boot_id(boot_path)?;
+
     unsafe {
         libc::signal(libc::SIGTERM, stop_signal as *const () as usize);
         libc::signal(libc::SIGINT, stop_signal as *const () as usize);
@@ -670,7 +716,13 @@ pub fn run(config: Config, paths: Paths) -> io::Result<()> {
             if packet.bytes == b"{\"op\":\"STATUS\"}" {
                 let _ = reply(
                     c.fd.as_raw_fd(),
-                    json!({"op":"STATUS","state":state_name(lease.state),"grant":grant,"expires_boottime_ns":lease.expires().to_string()}),
+                    status_value(
+                        &grant,
+                        lease.state,
+                        lease.started(),
+                        lease.expires(),
+                        &boot_id,
+                    ),
                 );
                 continue;
             }
@@ -873,79 +925,6 @@ fn notify_ready() -> io::Result<()> {
     }
     Ok(())
 }
-/// Native bridge preserves SOCK_SEQPACKET and kernel authentication for the TS client.
-pub fn bridge(
-    path: &Path,
-    policy: &super::signer_peer::PeerPolicy,
-    parent_policy: &super::signer_peer::PeerPolicy,
-) -> io::Result<()> {
-    const BRIDGE_INPUT: RawFd = 0;
-    signer_peer::require_unix_socket(BRIDGE_INPUT)?;
-    signer_peer::passcred(BRIDGE_INPUT)?;
-    let parent = Peer::capture(BRIDGE_INPUT, parent_policy)?;
-    if parent.pid != unsafe { libc::getppid() } {
-        return Err(refused());
-    }
-    signer_peer::drop_capabilities()?;
-    let socket = signer_peer::connect(path)?;
-    let peer = Peer::capture(socket.as_raw_fd(), policy)?;
-    let mut output = io::stdout().lock();
-    // The ready frame ensures SO_PASSCRED is armed before the parent writes its first byte.
-    let ready = encode(&json!({"op":"BRIDGE_READY"}), &[])?;
-    output.write_all(&(ready.len() as u32).to_be_bytes())?;
-    output.write_all(&ready)?;
-    output.flush()?;
-    loop {
-        let mut bytes = Vec::new();
-        let input_end = signer_watchdog::boottime_ns()? + SIGNER_IDLE_DEADLINE_MS as u64 * MS_TO_NS;
-        loop {
-            if !parent.live() || !peer.live() || signer_watchdog::boottime_ns()? >= input_end {
-                return Err(refused());
-            }
-            if !readable(BRIDGE_INPUT) {
-                std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS as u64));
-                continue;
-            }
-            let packet = signer_peer::receive(BRIDGE_INPUT, SIGNER_FRAME_MAX_BYTES)?;
-            // The bridge authenticates every upstream write so passing its stream cannot launder another process's credentials.
-            if !parent.matches(&packet)
-                || !packet.rights.is_empty()
-                || bytes.len() + packet.bytes.len() > SIGNER_FRAME_MAX_BYTES + LENGTH_BYTES
-            {
-                return Err(refused());
-            }
-            bytes.extend_from_slice(&packet.bytes);
-            if bytes.len() < LENGTH_BYTES {
-                continue;
-            }
-            let length =
-                u32::from_be_bytes(bytes[..LENGTH_BYTES].try_into().map_err(|_| refused())?)
-                    as usize;
-            if length > SIGNER_FRAME_MAX_BYTES || bytes.len() > length + LENGTH_BYTES {
-                return Err(refused());
-            }
-            if bytes.len() == length + LENGTH_BYTES {
-                break;
-            }
-        }
-        signer_peer::send(socket.as_raw_fd(), &bytes[LENGTH_BYTES..], &[])?;
-        let end = signer_watchdog::boottime_ns()? + SIGNER_REQUEST_DEADLINE_MS as u64 * MS_TO_NS;
-        while !readable(socket.as_raw_fd()) {
-            if !peer.live() || !parent.live() || signer_watchdog::boottime_ns()? >= end {
-                return Err(refused());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS as u64));
-        }
-        let packet = signer_peer::receive(socket.as_raw_fd(), RESPONSE_MAX_BYTES + LENGTH_BYTES)?;
-        if !peer.matches(&packet) || !packet.rights.is_empty() {
-            return Err(refused());
-        }
-        output.write_all(&(packet.bytes.len() as u32).to_be_bytes())?;
-        output.write_all(&packet.bytes)?;
-        output.flush()?;
-    }
-}
-
 pub fn verify_worker_signature(value: &Value, grant: &Value, preimage: &[u8]) -> bool {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let Some((_, domain, _)) = ROLE_REGISTRY
@@ -1063,4 +1042,43 @@ pub fn seal_lifecycle_backlog(listener: RawFd, accepted: usize) -> io::Result<bo
         return Err(io::Error::last_os_error());
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    #[test]
+    fn kernel_boot_identity_grammar_is_bounded() {
+        assert_eq!(
+            parse_boot_id(b"01234567-89ab-cdef-0123-456789abcdef\n").unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        for bytes in [
+            b"short".as_slice(),
+            b"01234567-89ab-cdef-0123-456789abcdeg",
+            b"01234567-89ab-cdef-0123-456789abcdef\n\n",
+        ] {
+            assert!(parse_boot_id(bytes).is_err());
+        }
+    }
+    #[test]
+    fn maximal_status_fits_the_response_frame() {
+        let role = ROLE_REGISTRY
+            .iter()
+            .max_by_key(|row| row.0.len())
+            .unwrap()
+            .0;
+        let grant = json!({"role":role,"epoch":SAFE_INTEGER_MAX,"public_key":"WnZPztfFA6lEhWX_RXStdJnqXKQqH9mbl7I9AKKanm0","kid":format!("k1:sha256:{}", "a".repeat(64)),"identity_id":"a".repeat(HEX_ID_CHARS),"machine_id":"a".repeat(HEX_ID_CHARS),"activation_id":"a".repeat(HEX_ID_CHARS),"lease_id":"a".repeat(HEX_ID_CHARS),"generation":SAFE_INTEGER_MAX});
+        let mut value = status_value(
+            &grant,
+            State::RecoveryRequired,
+            u64::MAX,
+            u64::MAX,
+            &"a".repeat(HEX_ID_CHARS),
+        );
+        value["anchor_revision"] = json!(SAFE_INTEGER_MAX);
+        value["anchor_digest"] = json!(format!("sha256:{}", "a".repeat(64)));
+        let encoded = encode(&value, &[]).unwrap();
+        assert!(encoded.len() <= RESPONSE_MAX_BYTES + LENGTH_BYTES);
+    }
 }

@@ -22,6 +22,7 @@ pub const KERNEL_MIN: (u32, u32) = (6, 5);
 #[serde(deny_unknown_fields)]
 pub struct PeerPolicy {
     pub uid: u32,
+    pub gid: u32,
     pub executable_sha256: String,
     pub cgroup: String,
 }
@@ -63,8 +64,8 @@ impl Peer {
             return Err(refused());
         }
         let held = unsafe { OwnedFd::from_raw_fd(pidfd) };
-        // A UID claim cannot authorize a connection because executable, cgroup and retained process identity must also agree.
-        if cred.uid != policy.uid {
+        // The peer's primary group is pinned with its uid; a supplementary group alone never admits a peer.
+        if cred.uid != policy.uid || cred.gid != policy.gid {
             return Err(refused());
         }
         let start = process_start(cred.pid)?;
@@ -500,7 +501,7 @@ fn same_pidfd(a: RawFd, b: RawFd) -> bool {
 pub fn require_unix_socket(fd: RawFd) -> io::Result<()> {
     let mut family = 0i32;
     let mut length = mem::size_of_val(&family) as libc::socklen_t;
-    // Must match SigningServiceClient.connect in server/src/signing/service.ts: child stdio must be AF_UNIX before peer authentication.
+    // Must match the --test-relay entry and server/test/fixtures/k1-relay-client.ts: relay stdin must be AF_UNIX.
     if unsafe {
         libc::getsockopt(
             fd,
@@ -624,6 +625,7 @@ mod identity_tests {
         passcred(a.as_raw_fd()).unwrap();
         let policy = PeerPolicy {
             uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
             executable_sha256: hex::encode(Sha256::digest(fs::read("/proc/self/exe").unwrap())),
             cgroup: fs::read_to_string("/proc/self/cgroup")
                 .unwrap()
