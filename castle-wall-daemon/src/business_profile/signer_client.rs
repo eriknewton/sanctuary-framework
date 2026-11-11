@@ -17,7 +17,7 @@ use std::{
     io,
     os::fd::{AsRawFd, OwnedFd},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 const NS_PER_MS: u64 = 1_000_000; // Nanoseconds in one millisecond.
@@ -175,9 +175,19 @@ pub fn parse_status_packet(packet: &[u8]) -> Result<StatusReply> {
 }
 fn parse_status_value(value: Value) -> Result<StatusReply> {
     // Must match signer_status_vectors.json: both runtime parsers consume its schema, including nested grant fields.
-    let corpus: Value = serde_json::from_str(include_str!("signer_status_vectors.json"))
-        .map_err(|_| Refusal::Schema)?;
-    let schema = &corpus["schema"];
+    static SCHEMA: OnceLock<Result<Value>> = OnceLock::new();
+    let schema = SCHEMA
+        .get_or_init(|| {
+            let mut corpus: Value =
+                serde_json::from_str(include_str!("signer_status_vectors.json"))
+                    .map_err(|_| Refusal::Schema)?;
+            match corpus.get_mut("schema") {
+                Some(schema) if schema.is_object() => Ok(schema.take()),
+                _ => Err(Refusal::Schema),
+            }
+        })
+        .as_ref()
+        .map_err(|error| *error)?;
     let pair = schema["anchor_pair"].as_array().ok_or(Refusal::Schema)?;
     if pair.len() != 2
         || !object_fields(&value, &schema["fields"], schema)
