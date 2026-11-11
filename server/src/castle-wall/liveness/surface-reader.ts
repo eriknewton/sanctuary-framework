@@ -11,7 +11,7 @@ export function project(envelope: LivenessEnvelope, input: LivenessInput, nowMs 
     ...verdicts(envelope), schedule: buildLivenessSchedule(input) };
 }
 
-type Snapshot = { envelope: LivenessEnvelope; input: LivenessInput };
+type Snapshot = { envelope: LivenessEnvelope; input: LivenessInput; projection?: LivenessProjection };
 export class LivenessSurfaceSource {
   private flight: Promise<Snapshot> | undefined;
   private expired: Snapshot | undefined;
@@ -30,7 +30,9 @@ export class LivenessSurfaceSource {
   async readProjection(): Promise<LivenessProjection> {
     // Concurrent requests share one read; an expired read retains admission until all raw operations settle.
     const snapshot = this.expired ?? await (this.flight ?? this.start());
-    return project(snapshot.envelope, snapshot.input, this.now());
+    // Schedule work belongs to the read; only served age varies between callers.
+    snapshot.projection ??= project(snapshot.envelope, snapshot.input, snapshot.input.nowMs);
+    return { ...snapshot.projection, served_age_ms: Math.max(0, this.now() - snapshot.input.nowMs) };
   }
 
   private start(): Promise<Snapshot> {

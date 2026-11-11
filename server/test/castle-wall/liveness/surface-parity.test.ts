@@ -1,5 +1,6 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import * as browserContract from "../../../src/castle-wall/liveness/browser-contract.js";
 import * as readerModule from "../../../src/castle-wall/liveness/read-status.js";
 import { nodeReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
 import { join, basename } from "node:path";
@@ -165,9 +166,12 @@ describe("shared reader snapshot", () => {
   });
   it("shares a thousand concurrent callers and starts a fresh read after settlement", async () => {
     const input = base(), fs = filesystem(input); const source = new LivenessSurfaceSource(options(input, fs.fs));
+    const schedule = vi.spyOn(browserContract, "buildLivenessSchedule");
     const values = await Promise.all(Array.from({ length: 1000 }, () => source.readProjection()));
+    expect(schedule).toHaveBeenCalledTimes(1);
     expect(fs.opens()).toBe(5); expect(new Set(values.map(v => JSON.stringify(v))).size).toBe(1);
     await source.readProjection(); expect(fs.opens()).toBe(10);
+    expect(schedule).toHaveBeenCalledTimes(2);
   });
   it.each(["open", "stat", "read", "close", "host"] as const)("holds admission across a hundred deadline waves with a detached %s", async operation => {
     vi.useFakeTimers(); const input = base(); const backing = filesystem(input);
