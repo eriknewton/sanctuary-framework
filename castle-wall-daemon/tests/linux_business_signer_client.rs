@@ -48,6 +48,10 @@ fn status() -> Value {
     let corpus = checked_corpus::corpus("signer_status_vectors.json");
     let bytes = hex::decode(corpus["cases"][0]["packet_hex"].as_str().unwrap()).unwrap();
     let mut value: Value = serde_json::from_slice(&bytes[signer_service::LENGTH_BYTES..]).unwrap();
+    value["boot_id"] = json!(signer_service::parse_boot_id(
+        &std::fs::read("/proc/sys/kernel/random/boot_id").unwrap()
+    )
+    .unwrap());
     let now = 1; // Controlled fixture clock; the real binary probe covers CLOCK_BOOTTIME.
     value["started_boottime_ns"] = json!(now.to_string());
     value["expires_boottime_ns"] = json!((now + 300 * NS_PER_MS * 1000).to_string()); // Maximum 300-second lease.
@@ -962,9 +966,11 @@ fn signer_eof_never_reconnects_an_old_client() {
 
 #[test]
 fn admission_clock_overflow_refuses_before_sending() {
-    let now = Arc::new(AtomicU64::new(1));
+    let start = u64::MAX - UNLOCK_TTL_MAX_SECONDS as u64 * 1000 * NS_PER_MS;
+    let now = Arc::new(AtomicU64::new(start));
     let mut view = status();
     view["expires_boottime_ns"] = json!(u64::MAX.to_string());
+    view["started_boottime_ns"] = json!(start.to_string());
     let script = Script::start(vec![Action::reply(&view)]);
     let clock = now.clone();
     let mut client = BusinessSignerClient::bootstrap_at_with_clock(
@@ -1046,4 +1052,48 @@ fn signal_during_settlement_keeps_the_slot_until_late_send() {
 #[test]
 fn signal_during_receive_preserves_the_request() {
     interrupted_sign(false);
+}
+
+#[test]
+fn bind_refuses_excessive_lease_lifetime() {
+    let mut view = status();
+    view["expires_boottime_ns"] =
+        json!((2 + UNLOCK_TTL_MAX_SECONDS as u64 * 1000 * NS_PER_MS).to_string());
+    let script = Script::start(vec![Action::reply(&view)]);
+    let mut client = script.client();
+    let grant = client.latest_status().grant.clone();
+    assert_eq!(client.bind(&grant), Err(Refusal::Grant));
+}
+#[test]
+fn bind_refuses_another_kernel_boot() {
+    let mut view = status();
+    let boot = view["boot_id"].as_str().unwrap();
+    view["boot_id"] = json!(format!(
+        "{}{}",
+        if boot.starts_with('0') { "1" } else { "0" },
+        &boot[1..]
+    ));
+    let script = Script::start(vec![Action::reply(&view)]);
+    let mut client = script.client();
+    let grant = client.latest_status().grant.clone();
+    assert_eq!(client.bind(&grant), Err(Refusal::Grant));
+}
+#[test]
+fn bind_refuses_a_stale_status_observation() {
+    let view = status();
+    let script = Script::start(vec![Action::reply(&view)]);
+    let now = Arc::new(AtomicU64::new(1));
+    let clock = now.clone();
+    let mut client = BusinessSignerClient::bootstrap_at_with_clock(
+        &script.path,
+        policy(),
+        Arc::new(move || Ok(clock.load(Ordering::SeqCst))),
+    )
+    .unwrap();
+    now.store(
+        2 + SIGNER_IDLE_DEADLINE_MS as u64 * NS_PER_MS,
+        Ordering::SeqCst,
+    );
+    let grant = client.latest_status().grant.clone();
+    assert_eq!(client.bind(&grant), Err(Refusal::Expired));
 }

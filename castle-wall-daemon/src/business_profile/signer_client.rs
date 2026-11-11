@@ -3,8 +3,9 @@
 use super::{
     custody::CONTROL_ROOT,
     signer_contract::{
-        ROLE_REGISTRY, SIGNER_HANDSHAKE_DEADLINE_MS, SIGNER_PREIMAGE_MAX_BYTES, SIGNER_PROTOCOL,
-        SIGNER_REQUEST_DEADLINE_MS,
+        ROLE_REGISTRY, SIGNER_HANDSHAKE_DEADLINE_MS, SIGNER_IDLE_DEADLINE_MS,
+        SIGNER_PREIMAGE_MAX_BYTES, SIGNER_PROTOCOL, SIGNER_REQUEST_DEADLINE_MS,
+        UNLOCK_TTL_MAX_SECONDS,
     },
     signer_peer::{self, Peer, PeerPolicy},
     signer_service::{self, Header, LENGTH_BYTES, RESPONSE_MAX_BYTES, SIGN_SOCKET},
@@ -14,7 +15,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io,
+    io::{self, Read},
     os::fd::{AsRawFd, OwnedFd},
     path::Path,
     sync::{Arc, OnceLock},
@@ -203,6 +204,8 @@ pub struct BusinessSignerClient {
     peer: Option<Peer>,
     state: SignerClientState,
     latest: StatusReply,
+    latest_at: u64,
+    local_boot_id: String,
     frozen: Option<StatusReply>,
     outstanding: bool,
     settlement_end: Option<Instant>,
@@ -229,6 +232,15 @@ impl BusinessSignerClient {
             .map_err(|_| Refusal::Transport)?
             .checked_add(SIGNER_HANDSHAKE_DEADLINE_MS as u64 * NS_PER_MS)
             .ok_or(Refusal::Deadline)?;
+        let mut boot_bytes = Vec::new();
+        std::fs::File::open("/proc/sys/kernel/random/boot_id")
+            .and_then(|file| {
+                file.take((signer_service::BOOT_ID_READ_MAX_BYTES + 1) as u64)
+                    .read_to_end(&mut boot_bytes)
+            })
+            .map_err(|_| Refusal::Transport)?;
+        let local_boot_id =
+            signer_service::parse_boot_id(&boot_bytes).map_err(|_| Refusal::Schema)?;
         let socket = signer_peer::connect(path).map_err(|_| Refusal::Transport)?;
         signer_peer::passcred(socket.as_raw_fd()).map_err(|_| Refusal::Transport)?;
         let peer = Peer::capture(socket.as_raw_fd(), &policy).map_err(|_| Refusal::Policy)?;
@@ -244,6 +256,7 @@ impl BusinessSignerClient {
             end,
             Instant::now() + Duration::from_millis(SIGNER_HANDSHAKE_DEADLINE_MS as u64),
         )?;
+        let latest_at = clock().map_err(|_| Refusal::Transport)?;
         let latest = parse_status_packet(&bytes)?;
         if clock().map_err(|_| Refusal::Transport)? >= end {
             return Err(Refusal::Deadline);
@@ -256,6 +269,8 @@ impl BusinessSignerClient {
             peer: Some(peer),
             state: SignerClientState::Unbound,
             latest,
+            latest_at,
+            local_boot_id,
             frozen: None,
             outstanding: false,
             settlement_end: None,
@@ -300,6 +315,34 @@ impl BusinessSignerClient {
             return self.fail(Refusal::Grant);
         }
         if !Self::live(&self.latest, now) {
+            return self.fail(Refusal::Expired);
+        }
+        let start = self
+            .latest
+            .started_boottime_ns
+            .parse::<u64>()
+            .map_err(|_| Refusal::Schema)?;
+        let expires = self
+            .latest
+            .expires_boottime_ns
+            .parse::<u64>()
+            .map_err(|_| Refusal::Schema)?;
+        // The relying client caps the authenticated lease at S's own grant limit.
+        if expires
+            .checked_sub(start)
+            .filter(|span| *span <= UNLOCK_TTL_MAX_SECONDS as u64 * 1000 * NS_PER_MS)
+            .is_none()
+        {
+            return self.fail(Refusal::Grant);
+        }
+        if self.latest.boot_id != self.local_boot_id {
+            return self.fail(Refusal::Grant);
+        }
+        if now
+            .checked_sub(self.latest_at)
+            .filter(|age| *age <= SIGNER_IDLE_DEADLINE_MS as u64 * NS_PER_MS)
+            .is_none()
+        {
             return self.fail(Refusal::Expired);
         }
         // First client bind freezes the authenticated observation without I/O or a renewal opportunity.
@@ -435,6 +478,7 @@ impl BusinessSignerClient {
             );
         }
         let value = self.exchange(b"{\"op\":\"STATUS\"}", end)?;
+        let latest_at = self.now()?;
         let view = match parse_status_value(value) {
             Ok(view) => view,
             Err(error) => return self.fail(error),
@@ -451,6 +495,7 @@ impl BusinessSignerClient {
             return self.fail(Refusal::Deadline);
         }
         self.latest = view.clone();
+        self.latest_at = latest_at;
         Ok(view)
     }
     pub fn sign_record(&mut self, header: Header, preimage: &[u8]) -> Result<SignedReply> {
@@ -660,6 +705,8 @@ mod tests {
             peer: Some(peer),
             state: SignerClientState::Bound,
             latest: view.clone(),
+            latest_at: 1,
+            local_boot_id: view.boot_id.clone(),
             frozen: Some(view),
             outstanding: true,
             settlement_end: None,
