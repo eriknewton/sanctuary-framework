@@ -1,10 +1,6 @@
 //! Holds one wall MainPID and authenticates its systemd owner on each exchange.
 mod bus;
-use super::{
-    custody, signer_peer,
-    signer_watchdog::{boottime_ns, WATCHDOG_TICK_MS},
-    writer_protocol,
-};
+use super::{custody, signer_peer, signer_watchdog::WATCHDOG_TICK_MS, writer_protocol};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -265,7 +261,7 @@ impl HeldConfig {
     fn load(path: &Path, owner: u32, production: bool) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
         let m = file.metadata()?;
         if !m.is_file()
@@ -367,7 +363,7 @@ fn process_cgroup(pid: i32) -> Result<String> {
 pub(crate) fn held_artifact(path: &Path, owner: u32, pin: &str) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     let m = file.metadata()?;
     if !m.is_file()
@@ -391,7 +387,7 @@ pub(crate) fn held_artifact(path: &Path, owner: u32, pin: &str) -> Result<File> 
 fn held_socket(path: &Path, owner: u32) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     let m = file.metadata()?;
     if m.mode() & libc::S_IFMT != libc::S_IFSOCK || m.uid() != owner {
@@ -658,6 +654,7 @@ fn validate_unit(unit: &UnitSnapshot, config: &WriterConfig, pid: i32, cgroup: &
 #[cfg(feature = "test-isolation")]
 pub mod test_support {
     use super::*;
+    use crate::business_profile::signer_watchdog::boottime_ns;
     pub fn validate_snapshot(
         unit: &UnitSnapshot,
         config: &WriterConfig,

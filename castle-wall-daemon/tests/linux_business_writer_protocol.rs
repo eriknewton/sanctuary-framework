@@ -371,3 +371,51 @@ fn transport_refuses_rights_and_truncation() {
         );
     }
 }
+
+#[path = "support/writer_state.rs"]
+mod writer_state;
+#[test]
+fn signature_for_another_valid_body_cannot_make_a_verified_envelope() {
+    use castle_wall_daemon::business_profile::writer_service::Error;
+    use std::sync::atomic::Ordering;
+    let f = writer_state::Fixture::new();
+    let mut machine = f.machine();
+    f.grant(&mut machine);
+    let envelope = machine.sign(f.header(), &f.body, |_| Ok(())).unwrap();
+    assert_eq!(
+        decode_envelope(&envelope).unwrap()["body"],
+        serde_json::from_slice::<Value>(&f.body).unwrap()
+    );
+    machine.verified_sent_for_test();
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../src/business_profile/record_join_vectors.json"
+    ))
+    .unwrap();
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    *f.signature.lock().unwrap() = URL_SAFE_NO_PAD
+        .decode(
+            corpus["cases"][2]["records"][1]["outer"]["signature"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        machine.sign(f.header(), &f.body, |_| Ok(())),
+        Err(Error::Signature)
+    );
+    assert_eq!(f.signs.load(Ordering::SeqCst), 2);
+}
+#[test]
+fn noncanonical_body_never_reaches_the_signer() {
+    use std::sync::atomic::Ordering;
+    let f = writer_state::Fixture::new();
+    let mut machine = f.machine();
+    f.grant(&mut machine);
+    let body = [b" ".as_slice(), &f.body].concat();
+    let mut h = f.header();
+    h.preimage_length = body.len();
+    assert!(machine.sign(h, &body, |_| Ok(())).is_err());
+    assert_eq!(f.signs.load(Ordering::SeqCst), 0);
+}

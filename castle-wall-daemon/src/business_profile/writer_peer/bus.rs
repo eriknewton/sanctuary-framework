@@ -241,13 +241,42 @@ fn object_path(text: &str) -> bool {
                 !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
             }))
 }
-fn unique(text: &str) -> bool {
-    text.starts_with(':')
-        && text.len() > 1
-        && text[1..]
+const NAME_MAX_BYTES: usize = u8::MAX as usize; // D-Bus names have the protocol's 255-byte limit.
+fn member(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= NAME_MAX_BYTES
+        && text
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
 }
+fn interface(text: &str) -> bool {
+    text.len() <= NAME_MAX_BYTES && text.contains('.') && text.split('.').all(member)
+}
+fn unique(text: &str) -> bool {
+    text.len() <= NAME_MAX_BYTES
+        && text.starts_with(':')
+        && text[1..].contains('.')
+        && text[1..].split('.').all(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        })
+}
+fn bus_name(text: &str) -> bool {
+    unique(text)
+        || (text.len() <= NAME_MAX_BYTES
+            && text.contains('.')
+            && text.split('.').all(|s| {
+                !s.is_empty()
+                    && s.bytes().enumerate().all(|(i, b)| {
+                        b.is_ascii_alphabetic()
+                            || matches!(b, b'_' | b'-')
+                            || (i > 0 && b.is_ascii_digit())
+                    })
+            }))
+}
+
 #[derive(Debug)]
 pub(super) struct Message {
     pub kind: u8,
@@ -305,7 +334,13 @@ pub(super) fn parse(bytes: &[u8], registry: bool, obs: &mut Observer) -> Result<
         let Item::Variant(sig, item) = item else {
             return Err(Error::Header);
         };
-        if sig != expected || fields.insert(code, *item).is_some() {
+        let valid_name = match code {
+            2 | 4 => item.text().is_ok_and(interface),
+            3 => item.text().is_ok_and(member),
+            6 | 7 => item.text().is_ok_and(bus_name),
+            _ => true,
+        };
+        if !valid_name || sig != expected || fields.insert(code, *item).is_some() {
             return Err(Error::Header);
         }
     }

@@ -596,6 +596,8 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "linux_business_signer_client",
         "linux_business_writer_protocol",
         "linux_business_writer_peer",
+        "linux_business_writer_loss",
+        "linux_business_writer_unit",
         "linux_business_writer_bus_replies",
     ]
     .into_iter()

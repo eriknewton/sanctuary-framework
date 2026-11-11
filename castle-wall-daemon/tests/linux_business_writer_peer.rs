@@ -271,3 +271,56 @@ fn trickled_minimal_reply_cannot_rearm_twenty_fresh_deadlines() {
         assert!(start.elapsed() < std::time::Duration::from_millis(250 + 100));
     }
 }
+
+#[path = "support/writer_state.rs"]
+mod writer_state;
+#[test]
+fn completion_revalidation_refuses_a_new_main_pid_with_the_wall_live() {
+    use castle_wall_daemon::business_profile::writer_service;
+    let f = writer_bus::Fixture::new();
+    let (_a, b) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .unwrap();
+    let owner = unsafe { libc::geteuid() };
+    let expected = ListenerExpectations::isolated(f.root.path().join("record"), owner, unsafe {
+        libc::getegid()
+    });
+    let binding = WallMainBinding::capture(
+        b.as_raw_fd(),
+        &f.config,
+        &f.target,
+        &expected,
+        owner,
+        deadline_ms(250).unwrap(),
+    )
+    .unwrap();
+    let state = writer_state::Fixture::new();
+    let mut signer = state.signer();
+    let mut sign = signer.sign;
+    let changed = f.unit.clone();
+    signer.sign = Box::new(move |header, body| {
+        changed.lock().unwrap().pid += 1;
+        sign(header, body)
+    });
+    let mut machine = writer_service::WriterMachine::isolated(
+        signer,
+        state.reconciler(),
+        "a".repeat(32),
+        state.clock(),
+    )
+    .unwrap();
+    state.grant(&mut machine);
+    binding
+        .revalidate(&f.target, deadline_ms(250).unwrap())
+        .unwrap();
+    let result = machine.sign(state.header(), &state.body, |_| {
+        binding.revalidate(&f.target, deadline_ms(250).unwrap())?;
+        Ok(())
+    });
+    assert_eq!(result, Err(writer_service::Error::Peer(Error::Identity)));
+    assert!(binding.live());
+}

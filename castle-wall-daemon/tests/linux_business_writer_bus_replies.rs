@@ -3,48 +3,60 @@
 mod isolation;
 use castle_wall_daemon::business_profile::writer_peer::{test_support::*, *};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 #[test]
 fn complete_corpus_has_exact_ids_and_refusals() {
     let corpus: Value =
         serde_json::from_str(include_str!("fixtures/writer_bus_replies.json")).unwrap();
     let rows = corpus["cases"].as_array().unwrap();
-    let mut expected: BTreeSet<String> = [
-        "captured-credentials",
-        "captured-unit-id",
-        "valid-response",
-        "unknown-header",
-        "wrong-serial",
-        "wrong-sender",
-        "wrong-destination",
-        "wrong-header-type",
-        "error-reply",
-        "unexpected-message-type",
-        "unix-fds",
-        "descriptor-credential",
-        "ignored-large-groups",
-        "field-count",
-        "registry-array-boundary",
-        "registry-array-overflow",
-        "nesting-overflow",
-        "truncated-body",
-        "trailing-body",
-        "oversize-message",
+    let mut expected: BTreeMap<String, String> = [
+        ("captured-credentials", "ACCEPT"),
+        ("captured-unit-id", "ACCEPT"),
+        ("valid-response", "ACCEPT"),
+        ("unknown-header", "Header"),
+        ("wrong-serial", "Serial"),
+        ("wrong-sender", "Sender"),
+        ("wrong-destination", "Destination"),
+        ("wrong-header-type", "Header"),
+        ("error-reply", "MessageType"),
+        ("unexpected-message-type", "MessageType"),
+        ("unix-fds", "Descriptors"),
+        ("descriptor-credential", "Descriptors"),
+        ("ignored-large-groups", "ACCEPT"),
+        ("field-count", "Cap(\"fields\")"),
+        ("registry-array-boundary", "ACCEPT"),
+        ("registry-array-overflow", "Cap(\"array\")"),
+        ("nesting-overflow", "Cap(\"nesting\")"),
+        ("truncated-body", "Framing"),
+        ("trailing-body", "Framing"),
+        ("oversize-message", "Cap(\"bytes\")"),
     ]
     .into_iter()
-    .map(str::to_owned)
+    .map(|(id, refusal)| (id.to_owned(), refusal.to_owned()))
     .collect();
-    for field in ["serial", "destination", "sender", "signature"] {
-        for kind in ["missing", "duplicate"] {
-            expected.insert(format!("{kind}-{field}"));
-        }
+    for (field, refusal) in [
+        ("serial", "Serial"),
+        ("destination", "Destination"),
+        ("sender", "Sender"),
+        ("signature", "Signature"),
+    ] {
+        expected.insert(format!("missing-{field}"), refusal.into());
+        expected.insert(format!("duplicate-{field}"), "Header".into());
     }
     for p in PROPERTY_REGISTRY {
-        expected.insert(format!("property-{}-signature", p.member));
+        expected.insert(
+            format!("property-{}-signature", p.member),
+            "Signature".into(),
+        );
     }
-    let actual: BTreeSet<String> = rows
+    let actual: BTreeMap<String, String> = rows
         .iter()
-        .map(|r| r["id"].as_str().unwrap().into())
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().into(),
+                r["refusal"].as_str().unwrap().into(),
+            )
+        })
         .collect();
     assert_eq!(rows.len(), actual.len());
     assert_eq!(actual, expected);
