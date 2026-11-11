@@ -245,7 +245,7 @@ impl BusinessSignerClient {
         signer_peer::passcred(socket.as_raw_fd()).map_err(|_| Refusal::Transport)?;
         let peer = Peer::capture(socket.as_raw_fd(), &policy).map_err(|_| Refusal::Policy)?;
         if signer_service::readable(socket.as_raw_fd()) {
-            return Err(Refusal::Unmatched);
+            return Err(Self::pending_refusal(socket.as_raw_fd()));
         }
         signer_peer::send(socket.as_raw_fd(), b"{\"op\":\"STATUS\"}", &[])
             .map_err(|_| Refusal::Transport)?;
@@ -410,6 +410,23 @@ impl BusinessSignerClient {
             return Ok(packet.bytes);
         }
     }
+    fn pending_refusal(fd: i32) -> Refusal {
+        let mut byte = 0u8;
+        // Readability includes EOF; peeking distinguishes transport loss without consuming an unsolicited packet.
+        let count = unsafe {
+            libc::recv(
+                fd,
+                &mut byte as *mut _ as _,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if count <= 0 {
+            Refusal::Transport
+        } else {
+            Refusal::Unmatched
+        }
+    }
     fn exchange(&mut self, bytes: &[u8], end: u64) -> Result<Value> {
         if self.outstanding {
             return self.fail(Refusal::Busy);
@@ -417,7 +434,7 @@ impl BusinessSignerClient {
         let result = (|| {
             let socket = self.socket.as_ref().ok_or(Refusal::State)?;
             if signer_service::readable(socket.as_raw_fd()) {
-                return Err(Refusal::Unmatched);
+                return Err(Self::pending_refusal(socket.as_raw_fd()));
             }
             self.outstanding = true;
             self.settlement_end =

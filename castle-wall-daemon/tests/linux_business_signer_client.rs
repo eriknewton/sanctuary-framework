@@ -740,6 +740,10 @@ fn relay_sender_child() {
         vec![]
     };
     signer_peer::send(socket.as_raw_fd(), &reply, &rights).unwrap();
+    if std::env::var_os("SIGNER_PIDFD_HOLD").is_some() {
+        let holder = signer_peer::connect(&root.join("hold.sock")).unwrap();
+        signer_peer::send(holder.as_raw_fd(), b"hold", &[socket.as_raw_fd()]).unwrap();
+    }
     let end = Instant::now() + Duration::from_millis(WAIT_MS as u64);
     while !root.join("done").exists() && Instant::now() < end {
         thread::sleep(Duration::from_millis(TICK_MS));
@@ -945,7 +949,7 @@ fn signer_eof_never_reconnects_an_old_client() {
     script.thread.take().unwrap().join().unwrap();
     std::fs::remove_file(&script.path).unwrap();
     let listener = signer_peer::listen(&script.path).unwrap();
-    assert_eq!(old.status(), Err(Refusal::Unmatched));
+    assert_eq!(old.status(), Err(Refusal::Transport));
     old.close_and_settle();
     assert_eq!(old.state(), SignerClientState::Closed);
     assert!(!signer_service::readable(listener.as_raw_fd()));
@@ -1096,4 +1100,46 @@ fn bind_refuses_a_stale_status_observation() {
     );
     let grant = client.latest_status().grant.clone();
     assert_eq!(client.bind(&grant), Err(Refusal::Expired));
+}
+
+#[test]
+fn signer_pidfd_death_never_reconnects_even_with_a_live_socket() {
+    use std::os::unix::process::CommandExt;
+    let _guard = SCRIPT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _ = policy();
+    let root = tempfile::tempdir().unwrap();
+    let holder = signer_peer::listen(&root.path().join("hold.sock")).unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "relay_sender_child", "--nocapture"])
+        .env("SIGNER_RELAY_CHILD_ROOT", root.path())
+        .env("SIGNER_PIDFD_HOLD", "1")
+        .stdout(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(signer_peer::drop_capabilities);
+    }
+    let mut sender = ChildGuard(command.spawn().unwrap());
+    let end = Instant::now() + Duration::from_millis(WAIT_MS as u64);
+    while !root.path().join("ready").exists() {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(TICK_MS));
+    }
+    let path = root.path().join("sign.sock");
+    let mut client =
+        BusinessSignerClient::bootstrap_at_with_clock(&path, policy(), Arc::new(|| Ok(1))).unwrap();
+    assert!(readable(holder.as_raw_fd()));
+    let transfer = signer_peer::accept(holder.as_raw_fd()).unwrap();
+    assert!(readable(transfer.as_raw_fd()));
+    let held = signer_peer::receive(transfer.as_raw_fd(), SIGNER_FRAME_MAX_BYTES).unwrap();
+    assert_eq!(held.rights.len(), 1); // Retain S's socket so EOF cannot mask the pidfd guard.
+    sender.0.kill().unwrap();
+    sender.0.wait().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let replacement = signer_peer::listen(&path).unwrap();
+    assert_eq!(client.status(), Err(Refusal::Peer));
+    client.close_and_settle();
+    assert_eq!(client.state(), SignerClientState::Closed);
+    assert!(!signer_service::readable(replacement.as_raw_fd()));
 }
