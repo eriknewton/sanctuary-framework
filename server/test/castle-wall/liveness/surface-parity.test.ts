@@ -286,6 +286,8 @@ function browser(script: string) {
     fetch: () => new Promise(() => {}), setTimeout: () => 0, clearTimeout() {}, clearInterval() {},
     setInterval: (fn: () => void, ms: number) => { intervals.push({ fn, ms }); return 0; },
   });
+  const visibleScript = script.replace("function renderWall(w)", "globalThis.renderWall = function renderWall(w)");
+  script = visibleScript;
   const closure = script.lastIndexOf("})();");
   const mounted = script.trimStart().startsWith("(function")
     ? script.slice(0, closure) + "globalThis.mountedLiveness = livenessDisplay;\n" + script.slice(closure)
@@ -362,6 +364,24 @@ function postureDeps(source: LivenessSurfaceSource): PostureRouteDeps {
     detectInstalledHarnesses: async () => [], readFlightMap: createDashboardReadFlightMap(), panelStore: createPosturePanelStore(), livenessSource: source };
 }
 describe("component surface parity", () => {
+  it("shows a failed audit integrity gate beside a healthy wall badge", async () => {
+    const input = base(), deps = postureDeps(new LivenessSurfaceSource(options(input, filesystem(input).fs)));
+    deps.resolvePinnedProducerKey = () => null;
+    deps.resolveBrokerPinnedProducerKey = () => null;
+    const verdict = vi.spyOn(deps.auditLog!, "getAuditChainVerdict").mockResolvedValue({ status: "findings", findings: [{ kind: "entry_hash_mismatch" }] } as never);
+    const home = await buildHome(deps);
+    expect(verdict).toHaveBeenCalled();
+    expect(home.castle_wall.audit_integrity_ok).toBe(false);
+    expect(home.castle_wall_liveness!.wall.state).toBe("wall_OK_IDLE");
+    const script = shipped[1][1]().replace("function createLivenessDisplay(paint)", "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
+    const page = browser(script);
+    (page.context as any).renderWall(home.castle_wall);
+    page.install(home.castle_wall_liveness!);
+    expect(page.elements.get("wall").innerHTML).toContain("Audit integrity finding present");
+    expect(page.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="wall_OK_IDLE"');
+    expect(page.elements.get("castle-wall-liveness").innerHTML).toContain("Healthy, idle");
+  });
+
   it("reads configured fortress evidence through the dashboard posture routes", async () => {
     const path = mkdtempSync(join(tmpdir(), "posture-liveness-"));
     mkdirSync(join(path, "liveness"), { mode: 0o700 });
