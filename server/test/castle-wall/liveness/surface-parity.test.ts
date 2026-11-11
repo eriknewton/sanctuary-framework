@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as readerModule from "../../../src/castle-wall/liveness/read-status.js";
+import { nodeReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
 import { join, basename } from "node:path";
 import { Writable } from "node:stream";
 import vm from "node:vm";
@@ -307,6 +310,34 @@ function postureDeps(source: LivenessSurfaceSource): PostureRouteDeps {
     detectInstalledHarnesses: async () => [], readFlightMap: createDashboardReadFlightMap(), panelStore: createPosturePanelStore(), livenessSource: source };
 }
 describe("component surface parity", () => {
+  it("reads configured fortress evidence through the dashboard posture routes", async () => {
+    const path = mkdtempSync(join(tmpdir(), "posture-liveness-"));
+    mkdirSync(join(path, "liveness"), { mode: 0o700 });
+    const input = base();
+    input.local.fortress_id = livenessFortressId(path);
+    for (const name of ["daemon", "observer"] as const) record(input, name).subject.fortress_id = input.local.fortress_id;
+    const read = readerModule.readAndEvaluateLivenessWithInput;
+    vi.spyOn(readerModule, "readAndEvaluateLivenessWithInput").mockImplementation(opts => read({ ...opts,
+      platform: "darwin", host: { read: async () => input.host }, nowMs: () => input.nowMs }));
+    for (const name of ["daemon", "observer", "config"] as const) {
+      writeFileSync(join(path, "liveness", name + ".json"), JSON.stringify(record(input, name)), { mode: 0o600 });
+    }
+    const open = vi.spyOn(nodeReaderFs, "open");
+    const rig = await startRig();
+    (rig.dashboard as any)._sanctuaryConfig = { storage_path: path };
+    (rig.dashboard as any).baseline = null;
+    try {
+      for (const route of ["/api/posture/home", "/api/posture/feature-health"]) {
+        open.mockClear();
+        const response = await fetch(rig.baseUrl + route, { headers: { Authorization: `Bearer ${rig.authToken}` } });
+        expect(response.status).toBe(200);
+        const body = await response.json() as any;
+        for (const component of components) expect(body.castle_wall_liveness[component]).toEqual(projection(input)[component]);
+        expect(open.mock.calls.map(call => call[0])).toContain(join(path, "liveness", "observer.json"));
+      }
+    } finally { await rig.stop(); }
+  });
+
   it.each(["healthy", "agent down", "observer stale"])("carries the same independent verdicts through consumers for %s", async kind => {
     let input = base(); if (kind === "agent down") record(input, "observer").raw.gateway.alive = false;
     if (kind === "observer stale") input = advance(input, OBSERVER_WINDOW + 1);

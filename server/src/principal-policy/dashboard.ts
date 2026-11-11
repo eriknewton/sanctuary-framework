@@ -2506,6 +2506,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return handlePostureRoute({ auditLog, originMachine, readFlightMap: this.readFlightMap, panelStore: this.panelStore,
         listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
         streamRegistry: this.postureStreamRegistry, refreshStreamDeps: buildDeps,
+        livenessSource: this.livenessSource(),
       }, req, res, url, method);
     }
     return handlePostureRoute(await withPostureProducerKeys(await buildDeps()), req, res, url, method);
