@@ -1,8 +1,9 @@
 /** Attended LaunchAgent commands use injected host and credential boundaries. Job 996. */
 import * as fs from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isOwnerTrustedExecutable, resolveSignerClientPath } from "../../src/cli/castle-wall-signer-client-path.js";
 import type { StoredPassphraseObservation } from "../../src/wrap/passphrase.js";
 import { CASTLE_WALL_BOOT_LABEL, type ExecFileResult } from "../../src/cli/castle-wall-boot.js";
 import { livenessFortressId } from "../../src/cli/castle-wall-liveness-status.js";
@@ -13,7 +14,7 @@ const api = await import(agentPath).catch(() => null) as typeof import("../../sr
 const state = await import(statePath).catch(() => null) as typeof import("../../src/cli/castle-wall-full-agent-state.js") | null;
 const roots: string[] = [];
 beforeEach(() => { expect(api, "LaunchAgent commands are shipped").not.toBeNull(); expect(state).not.toBeNull(); });
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 // Mode, inode and bytes come from one open descriptor, so every assertion describes the same file even if the path is replaced in between.
 function snapshot(path: string): { stat: fs.Stats; bytes: Buffer } {
   const fd = fs.openSync(path, "r");
@@ -27,6 +28,8 @@ function fixture(fortressName = "fortress") {
   const root = fs.mkdtempSync("/tmp/j996-install-"); roots.push(root);
   const home = join(root, "home"), fortress = join(root, fortressName), cli = join(root, "cli.js");
   fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(fortress, { mode: 0o700 }); fs.writeFileSync(cli, "// fixture entry\n");
+  const signer = join(root, "signer-client");
+  fs.writeFileSync(signer, "#!/bin/sh\nexit 0\n", { mode: 0o700 }); // Owner-only executable fixture.
   let bootLoaded = false;
   let fullLoaded = false;
   let loadedFortress: string | null = fortress;
@@ -49,13 +52,14 @@ function fixture(fortressName = "fortress") {
   const io = { ...fs };
   const write = vi.spyOn(io, "writeFileSync");
   const ctx: import("../../src/cli/castle-wall-full-agent.js").FullAgentCommandContext = {
-    home, env: { HOME: home, SANCTUARY_STORAGE_PATH: fortress }, platform: "darwin", euid: 501,
+    home, signerAccountHome: home, env: { HOME: home, SANCTUARY_STORAGE_PATH: fortress }, platform: "darwin", euid: 501,
     isTTY: true, cliPath: cli, execPath: process.execPath, out, err, fs: io,
     execFileFn: exec, observePassphrase: observe, sleep,
+    signerClientCandidates: [signer],
     // Stable runtime selection has its own suite; this fixture's temp CLI is accepted as the validated lexical path.
     stableRuntime: () => ({ ok: true, node: process.execPath, cli, nodeVersion: process.versions.node }),
   };
-  return { setLoaded: (value: boolean) => { fullLoaded = value; }, io, setLoadedFortress: (value: string | null) => { loadedFortress = value; }, root, home, fortress, cli, out, err, ctx, exec, observe, sleep, write, setBoot: (value: boolean) => { bootLoaded = value; }, setPid: (value: number | null) => { pid = value; } };
+  return { setLoaded: (value: boolean) => { fullLoaded = value; }, io, setLoadedFortress: (value: string | null) => { loadedFortress = value; }, root, home, fortress, cli, signer, out, err, ctx, exec, observe, sleep, write, setBoot: (value: boolean) => { bootLoaded = value; }, setPid: (value: number | null) => { pid = value; } };
 }
 
 describe("full agent attended commands", () => {
@@ -81,6 +85,22 @@ describe("full agent attended commands", () => {
     expect(f.exec).toHaveBeenCalledWith("launchctl", ["bootstrap", "gui/501", plist]);
     expect(f.observe).toHaveBeenCalledWith({ storagePath: f.fortress, home: f.home, readOnly: true, platformOverride: "darwin" });
     expect(f.sleep.mock.calls.reduce((sum, [ms]) => sum + ms, 0)).toBeGreaterThan(api!.FULL_AGENT_THROTTLE_INTERVAL_S * 1000);
+  });
+
+  it("install writes the golden plist shape and reports an owner-trusted signer", async () => {
+    const f = fixture();
+    expect(await api!.runInstallFull([], f.ctx), f.err.text).toBe(0);
+    const installed = fs.readFileSync(join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`), "utf8");
+    const golden = fs.readFileSync(new URL("./fixtures/castle-wall-full-agent.golden.plist", import.meta.url), "utf8")
+      .replaceAll("/usr/local/bin/node", process.execPath)
+      .replaceAll("/opt/sanctuary/cli.js", f.cli)
+      .replaceAll("/Users/operator/Fortress", f.fortress)
+      .replace("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", [...new Set([process.execPath.slice(0, process.execPath.lastIndexOf("/")), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":"));
+    expect(installed).toBe(golden);
+    const environment = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(installed)![1]!;
+    expect([...environment.matchAll(/<key>(.*?)<\/key>/g)].map(match => match[1])).toEqual(["PATH"]);
+    expect(f.out.text).toContain(`install-full checkpoint signer: ${f.signer}`);
+    expect(await isOwnerTrustedExecutable(f.signer, process.getuid?.bind(process), f.ctx.env)).toBe(true);
   });
 
   it("does not certify a restarting pid as stable", async () => {
@@ -493,14 +513,106 @@ describe("install-full stable runtime preflight", () => {
     f.ctx.isTTY = false;
     f.exec.mockClear(); f.write.mockClear(); f.observe.mockClear();
     const before = treeListing(f.root);
+    f.out.text = "";
     expect(await api!.runInstallFull(["--preflight"], f.ctx), f.err.text).toBe(0);
-    expect(f.out.text).toContain(`install-full preflight valid: node=${process.execPath} cli=${f.cli}`);
+    expect(f.out.text).toBe(`install-full preflight valid: node=${process.execPath} cli=${f.cli}\ninstall-full checkpoint signer: ${f.signer}\n`);
     f.ctx.stableRuntime = refusal;
     expect(await api!.runInstallFull(["--preflight"], f.ctx)).toBe(STABLE_RUNTIME_REFUSAL_EXIT_CODE);
     expect(treeListing(f.root)).toEqual(before);
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.write).not.toHaveBeenCalled();
     expect(f.observe).not.toHaveBeenCalled();
+  });
+
+  it.each([{ argv: [] }, { argv: ["--preflight"] }])("missing signer refuses before credentials, launchctl or writes: $argv", async ({ argv }) => {
+    const f = fixture();
+    f.ctx.signerClientCandidates = [join(f.root, "absent-signer")];
+    const before = treeListing(f.root);
+    expect(await api!.runInstallFull(argv, f.ctx)).toBe(STABLE_RUNTIME_REFUSAL_EXIT_CODE);
+    expect(f.err.text).toContain("install-full preflight refused: signer client unavailable");
+    expect(f.err.text).toContain("install or approve the Castle Wall host app");
+    expect(f.observe).not.toHaveBeenCalled();
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(f.write).not.toHaveBeenCalled();
+    expect(treeListing(f.root)).toEqual(before);
+  });
+
+  it("installer-only signer overrides cannot satisfy either discovery preflight", async () => {
+    const observations = [];
+    for (const argv of [[], ["--preflight"]]) {
+      const f = fixture();
+      f.ctx.env!.SANCTUARY_CASTLE_SIGNER_CLIENT = f.signer;
+      f.ctx.signerClientPath = f.signer;
+      f.ctx.signerClientCandidates = [join(f.root, "absent-signer")];
+      expect(fs.existsSync(f.signer)).toBe(true);
+      const before = treeListing(f.root);
+      observations.push({ f, before, code: await api!.runInstallFull(argv, f.ctx) });
+    }
+    expect(observations.map(({ code }) => code)).toEqual([STABLE_RUNTIME_REFUSAL_EXIT_CODE, STABLE_RUNTIME_REFUSAL_EXIT_CODE]);
+    for (const { f, before } of observations) {
+      expect(f.err.text).toContain("install-full preflight refused: signer client unavailable");
+      expect(f.out.text.split("\n")).toContain("install-full: the installed service does not inherit SANCTUARY_CASTLE_SIGNER_CLIENT; the check used discovery.");
+      expect(f.observe).not.toHaveBeenCalled();
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.write).not.toHaveBeenCalled();
+      expect(treeListing(f.root)).toEqual(before);
+    }
+  });
+
+  it("both install paths discover only the account home when installer HOME differs", async () => {
+    const success = 0; // Successful install and preflight share the ordinary CLI success code.
+    const observations = [];
+    for (const argv of [[], ["--preflight"]]) {
+      for (const layout of ["installer-only", "account-only"]) {
+        const f = fixture();
+        const accountHome = join(f.root, "account-home");
+        f.ctx.signerAccountHome = accountHome;
+        delete f.ctx.home;
+        delete f.ctx.signerClientCandidates;
+        vi.stubEnv("HOME", f.home);
+        // Ask the real resolver for each home candidate without reading any host path.
+        const candidateFor = (candidateHome: string) => resolveSignerClientPath({ HOME: candidateHome }, "darwin", {
+          fileExistsFn: async path => path.startsWith(`${candidateHome}/`),
+        });
+        const installerCandidate = (await candidateFor(f.home))!;
+        const accountCandidate = (await candidateFor(accountHome))!;
+        const present = layout === "installer-only" ? installerCandidate : accountCandidate;
+        fs.mkdirSync(dirname(present), { recursive: true });
+        fs.copyFileSync(f.signer, present);
+        const probes: string[] = [];
+        f.ctx.fileExistsFn = async path => {
+          probes.push(path);
+          // Only fixture paths may reach the filesystem, including when discovery proposes the system bundle.
+          return path.startsWith(`${f.root}/`) && isOwnerTrustedExecutable(path, process.getuid?.bind(process), f.ctx.env);
+        };
+        const before = treeListing(f.root);
+        observations.push({ f, argv, layout, before, accountCandidate, installerCandidate, probes,
+          code: await api!.runInstallFull(argv, f.ctx) });
+      }
+    }
+    expect(observations.map(({ code }) => code)).toEqual([
+      STABLE_RUNTIME_REFUSAL_EXIT_CODE, success, STABLE_RUNTIME_REFUSAL_EXIT_CODE, success,
+    ]);
+    for (const { f, argv, layout, before, accountCandidate, installerCandidate, probes } of observations) {
+      expect(probes).toContain(accountCandidate);
+      expect(probes).not.toContain(installerCandidate);
+      if (layout === "installer-only") {
+        expect(f.err.text).toContain("install-full preflight refused: signer client unavailable");
+      } else {
+        expect(f.out.text).toContain(`install-full checkpoint signer: ${accountCandidate}\n`);
+        if (!argv.includes("--preflight")) {
+          expect(f.exec).toHaveBeenCalledWith("launchctl", ["bootstrap", "gui/501",
+            join(f.home, "Library", "LaunchAgents", `${api!.FULL_AGENT_LABEL}.plist`)]);
+          expect(f.observe).toHaveBeenCalledWith({ storagePath: f.fortress, home: f.home, readOnly: true, platformOverride: "darwin" });
+        }
+      }
+      if (layout === "installer-only" || argv.includes("--preflight")) {
+        expect(f.observe).not.toHaveBeenCalled();
+        expect(f.exec).not.toHaveBeenCalled();
+        expect(f.write).not.toHaveBeenCalled();
+        expect(treeListing(f.root)).toEqual(before);
+      }
+    }
   });
 
   it("--preflight keeps the unsupported-host refusal", async () => {

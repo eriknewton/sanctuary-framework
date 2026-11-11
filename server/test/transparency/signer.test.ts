@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
+import { ED25519_PRIVATE_KEY_BYTES } from "../../src/core/crypto-suite-registry.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { randomBytes } from "../../src/core/random.js";
@@ -100,4 +101,29 @@ it("passes a scheduler abort through unchanged before local signer decrypt", asy
     abort.release();
     vi.useRealTimers();
   }
+});
+
+it("an explicit checkpoint signer path takes precedence over the environment", async () => {
+  const privateKey = randomBytes(ED25519_PRIVATE_KEY_BYTES);
+  const publicKey = ed25519.getPublicKey(privateKey);
+  const shim = join(fortressPath, "signer-client");
+  await writeFile(shim, `#!${process.execPath}\nconsole.log(${JSON.stringify(toBase64url(publicKey))});\n`, { mode: 0o700 }); // Owner-only executable fixture.
+  const signer = await resolveTransparencySigner({
+    fortressPath,
+    masterKey: privateKey,
+    env: { SANCTUARY_CASTLE_SIGNER_CLIENT: join(fortressPath, "absent-client") },
+    signerClientPath: shim,
+    globalPinnedPublicKeyPath: join(fortressPath, "absent-pin"),
+    abortState: TRANSPARENCY_NEVER_ABORTED,
+  });
+  expect(signer.publicKey).toEqual(publicKey);
+});
+
+it("missing checkpoint signing inputs retain the unsigned emission refusal", async () => {
+  await expect(resolveTransparencySigner({
+    fortressPath,
+    masterKey: randomBytes(ED25519_PRIVATE_KEY_BYTES),
+    env: {},
+    abortState: TRANSPARENCY_NEVER_ABORTED,
+  })).rejects.toThrow("no checkpoint signer available: set SANCTUARY_CASTLE_SIGNER_CLIENT to the castle-wall-signer-client shim path (helper custody), or pass --local-sign / SANCTUARY_CASTLE_LOCAL_SIGN=1 for the dev local-key path; refusing to emit unsigned");
 });

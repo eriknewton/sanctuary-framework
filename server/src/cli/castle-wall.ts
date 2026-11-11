@@ -1,3 +1,5 @@
+// Resolver precedence must match resolveSignerClientPath in server/src/cli/castle-wall-signer-client-path.ts.
+import { resolveSignerClientPath, isOwnerTrustedExecutable } from "./castle-wall-signer-client-path.js";
 import {requireCliTestRunner} from "./argv.js";
 import {DAEMON_PROFILE_REFUSAL_EXIT_STATUS, appliesLinuxProfileSelection, selectLinuxProfile, defaultSelectorRoots, rawCandidates, profileRefusalText, type SelectorRoots} from "../linux-business/index.js";
 import { FULL_SUPERVISION_COMPLETION_CODES } from "../castle-wall/runtime/full-supervision-exit.js";
@@ -808,8 +810,8 @@ export interface TransparencyDaemonScheduledEmitInput {
   storagePath: string;
   masterKey: Uint8Array;
   env: NodeJS.ProcessEnv;
-  localSign: boolean;
-  signerClientInvoke?: ShimInvoker;
+  // This descriptor must match ResolveTransparencySignerInput in server/src/transparency/signer.ts.
+  signer: { kind: "local" } | { kind: "helper"; clientPath: string; invoke?: ShimInvoker } | { kind: "linux-environment" };
   globalPinnedPublicKeyPath?: string;
   binaryPath: string;
   version: string;
@@ -848,8 +850,12 @@ export function createTransparencyDaemonScheduledEmit(
       fortressPath: input.storagePath,
       masterKey: input.masterKey,
       env: input.env,
-      ...(input.localSign ? { mode: "local" as const } : {}),
-      ...(input.signerClientInvoke ? { signerClientInvoke: input.signerClientInvoke } : {}),
+      ...(input.signer.kind === "local" ? { mode: "local" as const } : {}),
+      ...(input.signer.kind === "helper" ? {
+        mode: "helper" as const,
+        signerClientPath: input.signer.clientPath,
+        ...(input.signer.invoke ? { signerClientInvoke: input.signer.invoke } : {}),
+      } : {}),
       ...(input.globalPinnedPublicKeyPath
         ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
         : {}),
@@ -1813,65 +1819,6 @@ export function buildPinRotationProof(opts: {
     rotated_at: opts.rotatedAt,
     signature: toBase64url(signature),
   };
-}
-
-/** Bundled path of the signer-client shim inside the installed host app. */
-const SIGNER_CLIENT_RELATIVE_BINARY =
-  "Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client";
-
-/**
- * Known on-disk locations of the bundled signer-client shim, in probe order.
- * The shim ships inside the installed host app, so a normally-installed box
- * always has it even when SANCTUARY_CASTLE_SIGNER_CLIENT is unset (the
- * operability gap from the 2026-06-13 Mini1 arming-path drill).
- */
-function defaultSignerClientCandidates(env: NodeJS.ProcessEnv): string[] {
-  const home = env.HOME ?? homedir();
-  return [
-    `/Applications/${SIGNER_CLIENT_RELATIVE_BINARY}`,
-    `${home}/Applications/${SIGNER_CLIENT_RELATIVE_BINARY}`,
-  ];
-}
-
-/**
- * Resolve the signer-client shim path used by `re-pin` and the daemon path.
- * Precedence: explicit `ctx.signerClientPath` → `SANCTUARY_CASTLE_SIGNER_CLIENT`
- * env → (darwin only) auto-discovered bundled shim → `undefined`. Auto-discovery
- * is test-injectable via `ctx.signerClientCandidates` / `ctx.fileExistsFn`,
- * mirroring the host-app `hostAppCandidates` seam, so tests never depend on a
- * real `/Applications` install.
- *
- * The DEFAULT discovery predicate is `isOwnerTrustedExecutable` (the same
- * owner-trust check `resolveHostAppBinary` uses to guard the arming surface):
- * a probed candidate must be a regular file owned by root, the current uid, or
- * (for a root process launched via sudo) SUDO_UID. The sudo case is required
- * for `sudo sanctuary protect --hermes`: privileged account/launchd steps run
- * as root, while the installed and user-consented Castle Wall app can be owned
- * by the operator who invoked sudo.
- * This brings the signer-client surface to PARITY with the host-app surface.
- * NOTE: stronger same-UID hardening (designated-requirement / codesign
- * validation) is a broader follow-up that, if pursued, must apply UNIFORMLY to
- * BOTH the host-app and signer-client surfaces - deliberately out of scope here
- * to stay consistent with the established owner-trust model.
- */
-async function resolveSignerClientPath(
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform,
-  ctx: CastleWallCommandContext,
-): Promise<string | undefined> {
-  if (ctx.signerClientPath) return ctx.signerClientPath;
-  if (env.SANCTUARY_CASTLE_SIGNER_CLIENT) {
-    return env.SANCTUARY_CASTLE_SIGNER_CLIENT;
-  }
-  if (platform !== "darwin") return undefined;
-  const getuid = ctx.getuid ?? process.getuid?.bind(process);
-  const exists =
-    ctx.fileExistsFn ?? ((path: string) => isOwnerTrustedExecutable(path, getuid, env));
-  const candidates = ctx.signerClientCandidates ?? defaultSignerClientCandidates(env);
-  for (const candidate of candidates) {
-    if (await exists(candidate)) return candidate;
-  }
-  return undefined;
 }
 
 /**
@@ -2905,6 +2852,9 @@ export async function runDaemon(
   // from the activation's own evidence rather than from the fact that a start
   // did not throw. `undefined` means the Linux path was not taken at all.
   let linuxActivationCompleteness: CastleWallActivationCompleteness | undefined;
+  let checkpointSigner: TransparencyDaemonScheduledEmitInput["signer"] = localSign
+    ? { kind: "local" }
+    : { kind: "linux-environment" };
 
   if (linuxProducerSigned) {
     // FIX 3: opt-in Linux producer-signed close. Route through the fail-closed
@@ -2969,6 +2919,28 @@ export async function runDaemon(
     const resolvedSignerClient = localSign
       ? undefined
       : await resolveSignerClientPath(env, platform, ctx);
+    if (resolvedSignerClient) {
+      // Both consumers must share one resolution so scheduled signing uses the enforcement signer.
+      checkpointSigner = { kind: "helper", clientPath: resolvedSignerClient };
+    }
+    if (platform === "darwin") {
+      const { parseTransparencyInterval, TRANSPARENCY_INTERVAL_ENV } = await import("../transparency/scheduler.js");
+      let schedulingEnabled: boolean;
+      try {
+        schedulingEnabled = parseTransparencyInterval(env[TRANSPARENCY_INTERVAL_ENV]) !== null;
+      } catch (error) {
+        write(err, `${(error as Error).message}\n`);
+        await releaseDaemonMasterSession();
+        return 1; // Ordinary daemon startup refusal.
+      }
+      // The startup refusal makes a scheduled callback with the environment-deferred kind unreachable on macOS.
+      // Scheduled signing must have a concrete signer before enforcement reaches readiness.
+      if (schedulingEnabled && checkpointSigner.kind === "linux-environment") {
+        write(err, "Refusing to start: scheduled checkpoint signer unavailable; install or approve the Castle Wall host app.\n");
+        await releaseDaemonMasterSession();
+        return 1; // Ordinary daemon startup refusal.
+      }
+    }
 
     // Slice M: resolve the macOS audit-producer public-key path the daemon
     // pins flow verdicts against. ctx (tests) → env override → daemon default
@@ -3008,6 +2980,7 @@ export async function runDaemon(
         livenessHostClock: ctx.liveness?.daemonHostClock ?? productionDaemonLivenessClock,
         ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
         ...(localSign ? { localSign: true } : {}),
+        // Enforcement and scheduled emission must retain the same resolved helper path.
         ...(resolvedSignerClient
           ? { signerClientPath: resolvedSignerClient }
           : {}),
@@ -3115,7 +3088,9 @@ export async function runDaemon(
         storagePath,
         masterKey: derived.key,
         env,
-        localSign,
+        // The required descriptor preserves the signer selected before enforcement startup.
+        signer: checkpointSigner,
+        ...(platform === "darwin" && ctx.globalPinnedPublicKeyPath ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath } : {}),
         binaryPath: realpathSync(process.argv[1] ?? ""),
         version: pkgVersion,
         out,
@@ -3131,6 +3106,11 @@ export async function runDaemon(
           );
         },
       });
+      if (platform === "darwin") {
+        write(out, checkpointSigner.kind === "helper"
+          ? `[transparency] checkpoint signer: helper ${checkpointSigner.clientPath}\n`
+          : "[transparency] checkpoint signer: local key\n");
+      }
       write(
         out,
         `[transparency] periodic enforcement checkpoints every ${Math.round(intervalMs / 60_000)}m (set ${TRANSPARENCY_INTERVAL_ENV}=off to disable).\n`,
@@ -4648,65 +4628,6 @@ function defaultHostAppCandidates(env: NodeJS.ProcessEnv): string[] {
     `/Applications/${HOST_APP_RELATIVE_BINARY}`,
     `${home}/Applications/${HOST_APP_RELATIVE_BINARY}`,
   ];
-}
-
-/**
- * Three-state observation of one candidate binary. "absent" is reserved for
- * the ONE case that actually proves nothing is installed there (ENOENT);
- * every other outcome, including an untrusted owner and an unreadable parent
- * directory, is "undetermined". A caller that turns an observation into a
- * security decision must never read a failed observation as absence
- * (AGENTS.md rule 1: absent, indeterminate and unproven are distinct).
- */
-type OwnerTrustedExecutableObservation = "trusted" | "absent" | "undetermined";
-
-async function observeOwnerTrustedExecutable(
-  path: string,
-  getuid: (() => number) | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<OwnerTrustedExecutableObservation> {
-  let info: Awaited<ReturnType<typeof stat>>;
-  try {
-    info = await stat(path);
-  } catch (error) {
-    // Only "there is nothing at this path" is absence. An EACCES on an
-    // ancestor means the app may well be installed and this account simply
-    // cannot see it.
-    return (error as NodeJS.ErrnoException).code === "ENOENT"
-      ? "absent"
-      : "undetermined";
-  }
-  // Something exists at the app's path. Whether or not we trust its owner, we
-  // cannot claim the machine has no Castle Wall app installed.
-  if (!info.isFile()) return "undetermined";
-  const uid = getuid?.();
-  const trusted = new Set<number>([0]);
-  if (uid !== undefined) {
-    trusted.add(uid);
-    if (uid === 0 && env.SUDO_UID !== undefined && /^\d+$/.test(env.SUDO_UID)) {
-      const sudoUid = Number(env.SUDO_UID);
-      if (Number.isSafeInteger(sudoUid) && sudoUid > 0) {
-        trusted.add(sudoUid);
-      }
-    }
-  }
-  return trusted.has(info.uid) ? "trusted" : "undetermined";
-}
-
-/**
- * True iff `path` is an existing regular file owned by root or the current
- * user (mirrors SanctuaryServerBridge.isOwnerTrustedExecutable on the Swift
- * side): prevents invoking a binary an attacker dropped at a probed path.
- * Invocation sites need a two-state answer ("may I exec this?"), so an
- * undetermined observation collapses to false here; presence questions must
- * use observeOwnerTrustedExecutable instead and keep the third state.
- */
-async function isOwnerTrustedExecutable(
-  path: string,
-  getuid: (() => number) | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<boolean> {
-  return (await observeOwnerTrustedExecutable(path, getuid, env)) === "trusted";
 }
 
 /**

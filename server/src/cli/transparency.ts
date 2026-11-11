@@ -1,3 +1,5 @@
+// Resolver precedence must match resolveSignerClientPath in server/src/cli/castle-wall-signer-client-path.ts.
+import { resolveSignerClientPath, type SignerClientPathContext } from "./castle-wall-signer-client-path.js";
 /**
  * sanctuary transparency — verifiable enforcement-checkpoint commands.
  *
@@ -86,7 +88,9 @@ const PKG_VERSION = getSanctuaryVersion();
  */
 export const EXIT_PARTIAL = 10;
 
-export interface TransparencyCommandArgs {
+export interface TransparencyCommandArgs extends SignerClientPathContext {
+  /** Discovery platform override for isolated command fixtures. */
+  platform?: NodeJS.Platform;
   argv: string[];
   out?: Writable;
   err?: Writable;
@@ -117,7 +121,7 @@ export async function runTransparencyCommand(
       printCheckpointUsage(out);
       return 0;
     }
-    return runCheckpoint(rest, out, err, args.env ?? process.env, args.fetchFn);
+    return runCheckpoint(rest, out, err, args.env ?? process.env, args.fetchFn, args);
   }
   if (sub === "export") {
     if (rest.includes("--help") || rest.includes("-h")) {
@@ -445,7 +449,8 @@ async function runCheckpoint(
   out: Writable,
   err: Writable,
   env: NodeJS.ProcessEnv,
-  fetchFn?: FetchLike
+  fetchFn?: FetchLike,
+  context: SignerClientPathContext & { platform?: NodeJS.Platform } = {},
 ): Promise<number> {
   try {
     // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
@@ -472,7 +477,10 @@ async function runCheckpoint(
       // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call site
       // above for the full rationale.
       await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+      const localSign = opts.flags["--local-sign"] || env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
+      const signerClientPath = localSign ? undefined : await resolveSignerClientPath(env, context.platform ?? process.platform, context);
       const signer = await resolveTransparencySigner({
+        ...(signerClientPath ? { signerClientPath } : {}),
         fortressPath: storagePath,
         masterKey,
         env,

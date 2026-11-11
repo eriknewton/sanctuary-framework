@@ -1,7 +1,9 @@
+// Resolver precedence must match resolveSignerClientPath in server/src/cli/castle-wall-signer-client-path.ts.
+import { resolveSignerClientPath, type SignerClientPathContext } from "./castle-wall-signer-client-path.js";
 /** Attended installation and observation of the operator-user full daemon. */
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { resolveStoragePath } from "../paths.js";
@@ -132,11 +134,13 @@ export interface FullAgentExecResult {
   error?: Error;
 }
 type AgentFs = Pick<typeof fs, "mkdirSync" | "writeFileSync" | "openSync" | "closeSync" | "fchmodSync" | "unlinkSync" | "realpathSync" | "readFileSync">;
-export interface FullAgentCommandContext {
+export interface FullAgentCommandContext extends SignerClientPathContext {
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
   home?: string;
+  /** INTERNAL/TEST: signer discovery's account home; defaults to userInfo().homedir. */
+  signerAccountHome?: string;
   platform?: NodeJS.Platform;
   euid?: number;
   isTTY?: boolean;
@@ -375,6 +379,22 @@ async function stablePid(ctx: AgentContext, sleep: (ms: number) => Promise<void>
   return null;
 }
 
+/** Resolve the installed signing client before credentials or installation side effects. */
+async function state_PREFLIGHT_SIGNER(ctx: AgentContext, input: FullAgentCommandContext): Promise<string | undefined> {
+  if ((input.env ?? process.env).SANCTUARY_CASTLE_SIGNER_CLIENT !== undefined) {
+    ctx.out.write("install-full: the installed service does not inherit SANCTUARY_CASTLE_SIGNER_CLIENT; the check used discovery.\n");
+  }
+  // The plist supplies only PATH and does not copy installer-only overrides, so discovery uses the service account's password-database home.
+  const signer = await resolveSignerClientPath({ HOME: input.signerAccountHome ?? userInfo().homedir }, ctx.platform, {
+    signerClientCandidates: input.signerClientCandidates,
+    fileExistsFn: input.fileExistsFn,
+    getuid: input.getuid,
+  });
+  // An unresolved client cannot support scheduled signing, so refuse before credential access or installation.
+  if (!signer) ctx.err.write("install-full preflight refused: signer client unavailable; install or approve the Castle Wall host app.\n");
+  return signer;
+}
+
 /** Install after an attended credential preflight; a stable positive pid is required for success. */
 export async function runInstallFull(argv: string[] = [], input: FullAgentCommandContext = {}): Promise<number> {
   const err = input.err ?? process.stderr;
@@ -387,13 +407,21 @@ export async function runInstallFull(argv: string[] = [], input: FullAgentComman
     if (argv.includes("--preflight")) {
       const preflight = stableRuntimeFor(ctx, input);
       if (!preflight.ok) { err.write(`install-full preflight refused: ${preflight.reason}\n`); return STABLE_RUNTIME_REFUSAL_EXIT_CODE; }
+      const signer = await state_PREFLIGHT_SIGNER(ctx, input);
+      // A successful preflight must identify the client required for scheduled signing.
+      if (!signer) return STABLE_RUNTIME_REFUSAL_EXIT_CODE;
       ctx.out.write(`install-full preflight valid: node=${preflight.node} cli=${preflight.cli}\n`);
+      ctx.out.write(`install-full checkpoint signer: ${signer}\n`);
       return 0;
     }
     if (!ctx.isTTY) { err.write("install-full requires an attended TTY session.\n"); return 2; }
     // The stable runtime is validated before any job refusal, credential read or write, so a refusal never reaches the credential.
     const runtime = stableRuntimeFor(ctx, input);
     if (!runtime.ok) { err.write(`install-full refused an unstable runtime: ${runtime.reason}\n`); return STABLE_RUNTIME_REFUSAL_EXIT_CODE; }
+    const signer = await state_PREFLIGHT_SIGNER(ctx, input);
+    // Installation must not reach credentials or host mutation without a resolved checkpoint signer.
+    if (!signer) return STABLE_RUNTIME_REFUSAL_EXIT_CODE;
+    ctx.out.write(`install-full checkpoint signer: ${signer}\n`);
     const bootJob = observeJob(ctx.exec, `system/${CASTLE_WALL_BOOT_LABEL}`);
     if (bootJob.state === "state_INDETERMINATE") throw new Error("Safe-mode boot daemon job state is INDETERMINATE.");
     if (bootJob.state === "state_LOADED") {
