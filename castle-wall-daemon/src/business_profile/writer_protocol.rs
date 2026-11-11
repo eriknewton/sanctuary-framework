@@ -21,7 +21,7 @@ pub const WRITER_SIGN_DEADLINE_MAX_MS: u64 = SIGNER_IDLE_DEADLINE_MS as u64 - WR
 pub const WRITER_HANDSHAKE_DEADLINE_MS: u64 = SIGNER_HANDSHAKE_DEADLINE_MS as u64;
 pub const SESSION_ID_BYTES: usize = 16; // Fresh 128-bit identifier.
 pub const SIGNATURE_BYTES: usize = 64; // Ed25519 signature width.
-pub const SIGNATURE_TEXT_BYTES: usize = (SIGNATURE_BYTES * 8 + 5) / 6; // Unpadded base64url, 86 bytes.
+pub const SIGNATURE_TEXT_BYTES: usize = (SIGNATURE_BYTES * 8).div_ceil(6); // Unpadded base64url, 86 bytes.
 const _: () = assert!(WRITER_SIGN_PACKET_MAX_BYTES == SIGNER_FRAME_MAX_BYTES);
 const _: () = assert!(WRITER_STATUS_MAX_BYTES >= signer_service::RESPONSE_MAX_BYTES);
 const _: () = assert!(

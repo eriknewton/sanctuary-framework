@@ -20,6 +20,8 @@ pub mod signer_service;
 #[cfg(target_os = "linux")]
 pub mod signer_watchdog;
 #[cfg(target_os = "linux")]
+pub mod writer_peer;
+#[cfg(target_os = "linux")]
 pub mod writer_protocol;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

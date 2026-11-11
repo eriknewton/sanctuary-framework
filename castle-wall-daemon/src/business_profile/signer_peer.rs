@@ -488,7 +488,7 @@ pub fn kernel_probe() -> io::Result<()> {
     Ok(())
 }
 
-fn same_pidfd(a: RawFd, b: RawFd) -> bool {
+pub(crate) fn same_pidfd(a: RawFd, b: RawFd) -> bool {
     let mut first: libc::stat = unsafe { mem::zeroed() };
     let mut second: libc::stat = unsafe { mem::zeroed() };
     unsafe {
@@ -594,7 +594,7 @@ pub fn drop_capabilities() -> io::Result<()> {
     empty_capabilities(unsafe { libc::getpid() }, !isolation)
 }
 
-fn pidfd_pid(fd: RawFd) -> Option<i32> {
+pub(crate) fn pidfd_pid(fd: RawFd) -> Option<i32> {
     // fdinfo retains the kernel sender identity even on kernels whose pidfds share an anonymous inode.
     bounded_text(&format!("/proc/self/fdinfo/{fd}"))
         .ok()?

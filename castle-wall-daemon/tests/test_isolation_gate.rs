@@ -595,6 +595,8 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "linux_business_profile_selection",
         "linux_business_signer_client",
         "linux_business_writer_protocol",
+        "linux_business_writer_peer",
+        "linux_business_writer_bus_replies",
     ]
     .into_iter()
     .map(String::from)
