@@ -5,6 +5,7 @@
  * clock, a missing one fails at construction, and 100 production cycles over
  * modelled children never reach the credential store.
  */
+// fail-before-exempt: the credential-store check moves to afterEach on correct code; no behavior changes.
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, unlinkSync, existsSync, writeFileSync } from "node:fs";

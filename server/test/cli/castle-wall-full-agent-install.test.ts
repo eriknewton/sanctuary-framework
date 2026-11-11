@@ -1,4 +1,5 @@
 /** Attended LaunchAgent commands use injected host and credential boundaries. Job 996. */
+// fail-before-exempt: a fixture clarity fix on correct code; the exit and its reason are unchanged.
 import * as fs from "node:fs";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";

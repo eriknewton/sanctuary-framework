@@ -1,4 +1,5 @@
 /** Canary and observer property lists, their well-formed checks, and the system-domain print parser. */
+// fail-before-exempt: a test-name correction only; the assertions and the parser are unchanged.
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";

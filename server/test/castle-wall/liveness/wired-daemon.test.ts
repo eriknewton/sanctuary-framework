@@ -1,4 +1,5 @@
 /** The real daemon composition wires the liveness recorder: daemon.json publishes with every hook, independent of a held audit sink. */
+// fail-before-exempt: a parity witness for a behavior-preserving refactor; it passes on base by design.
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink } from "node:fs/promises";
 import { readFileSync } from "node:fs";
