@@ -132,6 +132,7 @@ export function parseArchive(bytes, mode) { return result(() => {
     need(zero(h.subarray(157, 257)) && zero(h.subarray(345)), "tar extensions");
     const path = field(h.subarray(0, 100));
     need(path.startsWith("package/") && !path.includes("\\") && path.split("/").every(part => part !== "" && part !== "." && part !== ".."), "tar path");
+    // A NON_RELEASE component refuses content policy, not publisher authentication; exact registry equality checks the set.
     need(mode !== "release" || !path.split("/").includes(NON_RELEASE_MARKER), "release marker");
     need(!seen.has(path), "duplicate member"); seen.add(path);
     const fileMode = octal(h.subarray(100, 108)), size = octal(h.subarray(124, 136));

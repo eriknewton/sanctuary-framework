@@ -44,7 +44,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
-          # Both event branches have literal policy arguments; no input or receipt chooses policy.
+          # One job is equivalent to separate mode jobs: GitHub supplies the event, both arms fix the mode literally, and the default refuses.
           case "$CANDIDATE_EVENT" in
             pull_request) npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar --artifact-dir /tmp/c13/artifact --artifact-mode fixture ;;
             workflow_dispatch) npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar --artifact-dir /tmp/c13/artifact --artifact-mode release ;;

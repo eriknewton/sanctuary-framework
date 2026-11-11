@@ -1,7 +1,9 @@
 // A1, A18 and A19 fail on a real pre-R1 base build (job 1368 result/base-witness.log).
 // A2-A17 and A20 exercise boundaries absent on that base; their evidence is named mutant kills, not fail-before.
 // C1/C2 are unchanged-input controls; C4 is a new-feature control.
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, symlinkSync, cpSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -33,6 +35,8 @@ function workflowPlan(text: string) {
   expect(build).toMatch(/pull_request\) npm run build:evidence-pack[^\n]+--artifact-mode fixture ;;/);
   expect(build).toMatch(/workflow_dispatch\) npm run build:evidence-pack[^\n]+--artifact-mode release ;;/);
   expect(build).not.toMatch(/--artifact-mode ["'$]/);
+  const prArm = build.match(/pull_request\)([^\n]+);;/)![1]!;
+  expect([...prArm.matchAll(/--artifact-mode\s+(\S+)/g)].map(match => match[1])).toEqual(["fixture"]);
   const check = "node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact";
   for (const position of [positions[1]!, positions[4]!, positions[5]!]) expect(steps[position]!.run).toContain(check);
   expect(steps[positions[2]!]!.run).toContain("node server/scripts/build-evidence-pack.mjs --install-candidate /tmp/c13/artifact");
@@ -138,8 +142,22 @@ describe("packed artifact authority", () => {
   });
   it("A16 later copy refusal preserves foreign files and never writes READY", async () => {
     const root = buildRoot(release), dir = join(scratch(), "artifact"); let faults = 0;
-    await expect(buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision, { afterCopy: (path: string) => { if (path.endsWith("packages/evidence-pack-verifier/dist")) { faults++; writeFileSync(join(path, "foreign"), "keep"); throw new Error("scheduled copy refusal"); } } })).rejects.toThrow("scheduled copy refusal");
-    expect(faults).toBe(1); expect(readFileSync(join(root, "packages/evidence-pack-verifier/dist/foreign"), "utf8")).toBe("keep"); expect(existsSync(join(dir, ARTIFACT_FILES.receipt))).toBe(false); expect(existsSync(join(dir, ARTIFACT_FILES.tarball))).toBe(true); control();
+    const untouched = join(root, "server/evidence-pack-dist/export-evidence-pack.js"), before = { ino: lstatSync(untouched).ino, bytes: readFileSync(untouched) };
+    let copied: { path: string; ino: number; bytes: Buffer } | undefined;
+    const unlink = vi.spyOn(fs, "unlinkSync"); syncBuiltinESMExports();
+    try {
+      await expect(buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision, { afterCopy: (path: string) => { if (path.endsWith("packages/evidence-pack-verifier/dist")) {
+        faults++; writeFileSync(join(path, "foreign"), "keep");
+        const tracked = join(path, "verify-evidence-pack.js"); copied = { path: tracked, ino: lstatSync(tracked).ino, bytes: readFileSync(tracked) };
+        unlink.mockClear(); // Only the refusal path is counted; ordinary pre-copy clearing is authorized.
+        throw new Error("scheduled copy refusal");
+      } } })).rejects.toThrow("scheduled copy refusal");
+      expect(faults).toBe(1); expect(unlink).not.toHaveBeenCalled();
+      expect(lstatSync(untouched).ino).toBe(before.ino); expect(readFileSync(untouched)).toEqual(before.bytes);
+      expect(lstatSync(copied!.path).ino).toBe(copied!.ino); expect(readFileSync(copied!.path)).toEqual(copied!.bytes);
+      expect(readFileSync(join(root, "packages/evidence-pack-verifier/dist/foreign"), "utf8")).toBe("keep"); expect(existsSync(join(dir, ARTIFACT_FILES.receipt))).toBe(false); expect(existsSync(join(dir, ARTIFACT_FILES.tarball))).toBe(true);
+    } finally { unlink.mockRestore(); syncBuiltinESMExports(); }
+    control();
   }, TIMEOUT);
   it("A17 requires explicit policy and an exclusive destination", async () => {
     const root = buildRoot(release), dir = join(scratch(), "artifact"), args = buildArgs(release, dir, "release");
@@ -150,7 +168,18 @@ describe("packed artifact authority", () => {
   it("A18 pins the static workflow and executes its descriptor checker", () => {
     const text = readFileSync(join(ROOT, ".github/workflows/evidence-pack-candidate.yml"), "utf8"); workflowPlan(text);
     for (const mutate of [(s: string) => s.replace("npm run build\n", "npm pack\n"), (s: string) => s.replace("/tmp/c13/artifact/candidate.tgz", "packages/evidence-pack-verifier/*.tgz"), (s: string) => s.replace("      - uses: actions/upload-artifact", "      - if: always()\n        uses: actions/upload-artifact"), (s: string) => s.replace("--check-descriptor /tmp/c13/artifact", "--check-descriptor /tmp/c13/artifact || true")]) expect(() => workflowPlan(mutate(text))).toThrow();
-    for (const fault of ["none", ...Object.values(ARTIFACT_FILES)]) { const dir = scratch(); for (const file of Object.values(ARTIFACT_FILES)) cpSync(join(release.dir, file), join(dir, file)); if (fault !== "none") writeFileSync(join(dir, fault), "changed"); const child = spawnSync(process.execPath, [script, "--check-descriptor", dir], { encoding: "utf8", timeout: 30_000 }); expect(child.status).toBe(fault === "none" ? 0 : 1); expect(existsSync(join(dir, "installed"))).toBe(false); } control();
+    for (const fault of ["none", "archive-only", "metadata-only", ...Object.values(ARTIFACT_FILES), "source.tar", "release-source.json", "source_revision", "source_archive_sha256"]) {
+      const dir = scratch(); for (const file of Object.values(ARTIFACT_FILES)) cpSync(join(release.dir, file), join(dir, file));
+      if (fault !== "metadata-only") cpSync(release.archive, join(dir, "source.tar"));
+      if (fault !== "archive-only") cpSync(release.metadata, join(dir, "release-source.json"));
+      const good = ["none", "archive-only", "metadata-only"].includes(fault);
+      if (["source_revision", "source_archive_sha256"].includes(fault)) { const metadata = JSON.parse(readFileSync(release.metadata, "utf8")); metadata[fault] = "f".repeat(fault === "source_revision" ? 40 : 64); writeFileSync(join(dir, "release-source.json"), JSON.stringify(metadata)); }
+      else if (!good) writeFileSync(join(dir, fault), "changed");
+      const child = spawnSync(process.execPath, [script, "--check-descriptor", dir], { encoding: "utf8", timeout: 30_000 });
+      expect(child.error).toBeUndefined(); expect(child.status, fault).toBe(good ? 0 : 1);
+      if (!good && ["source.tar", "release-source.json", "source_revision", "source_archive_sha256"].includes(fault)) expect(child.stderr).toMatch(/Source archive refused|Source metadata refused|Unexpected token/);
+      expect(existsSync(join(dir, "installed"))).toBe(false);
+    } control();
   });
   it("A19 installed checker reads every actual member independent of checkout reports", async () => {
     const c = await candidateForTests(); // CI supplies the exact candidate selected for upload.

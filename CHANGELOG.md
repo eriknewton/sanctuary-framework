@@ -1,12 +1,12 @@
 # Changelog
 
-- The private evidence-pack candidate build checks packed tarball contents against staging and adds `check-evidence-pack-artifact` for independently pinned content checks.
-
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+- The private evidence-pack candidate build checks packed tarball contents against staging and adds `check-evidence-pack-artifact` for independently pinned content checks.
 
 - Scheduled checkpoints on the installed full service use the signer client the wall already resolved, and the install preflight reports its path.
 

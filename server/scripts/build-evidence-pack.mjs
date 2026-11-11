@@ -7,7 +7,7 @@
 // identities, entries and bytes are checked. Concurrent changes after a relevant check, including changes during verification, can remain undetected
 // and the build can exit zero. It neither prevents redirected operations nor authenticates subsequent checkout contents.
 // Trust bound: the checkout copies are build convenience outputs, not the trust authority; content acceptance uses check-evidence-pack-artifact and the SANCTUARY_EVIDENCE_CANDIDATE_V1 receipt.
-import { ARTIFACT_FORMAT, CANDIDATE_FORMAT, ARTIFACT_FILES, BIN, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, NON_RELEASE_MARKER, NON_RELEASE_TEXT, digest, registry, memberMode, parsePackage, parseCandidate, parseManifest, checkArtifact, requireValid, readBounded, artifactSuccess } from "../src/evidence-pack/artifact-policy.mjs";
+import { ARTIFACT_FORMAT, CANDIDATE_FORMAT, ARTIFACT_FILES, BIN, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, NON_RELEASE_MARKER, NON_RELEASE_TEXT, digest, registry, memberMode, parsePackage, parseCandidate, parseManifest, parseJson, checkArtifact, requireValid, readBounded, artifactSuccess } from "../src/evidence-pack/artifact-policy.mjs";
 export { digest, NON_RELEASE_MARKER, NON_RELEASE_TEXT };
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync, realpathSync, opendirSync, openSync, fstatSync, readSync, closeSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -271,6 +271,16 @@ export function checkDescriptor(artifactDir) {
   artifactDir = realpathSync(artifactDir);
   const receipt = requireValid(parseCandidate(readBounded(join(artifactDir, ARTIFACT_FILES.receipt), MAX_MANIFEST_BYTES)));
   const checked = requireValid(checkArtifact(readBounded(join(artifactDir, receipt.tarball), MAX_ARTIFACT_BYTES), readBounded(join(artifactDir, receipt.manifest), MAX_MANIFEST_BYTES), receipt));
+  // Uploaded source sidecars describe the same input bytes and revision as the accepted artifact.
+  const sourceArchive = join(artifactDir, "source.tar"), sourceMetadata = join(artifactDir, "release-source.json");
+  if (lstatSync(sourceArchive, { throwIfNoEntry: false }) && digest(readBounded(sourceArchive, Number.MAX_SAFE_INTEGER)) !== checked.manifest.source_archive_sha256) throw new Error("Source archive refused");
+  if (lstatSync(sourceMetadata, { throwIfNoEntry: false })) {
+    try {
+      const source = parseJson(readBounded(sourceMetadata, MAX_MANIFEST_BYTES));
+      const keys = ["format", "source_revision", "source_archive_sha256"];
+      if (source === null || typeof source !== "object" || Array.isArray(source) || Object.keys(source).length !== keys.length || !keys.every(key => Object.hasOwn(source, key)) || source.format !== SOURCE_FORMAT || source.source_revision !== checked.manifest.source_revision || source.source_archive_sha256 !== checked.manifest.source_archive_sha256) throw new Error("Source metadata refused");
+    } catch { throw new Error("Source metadata refused"); }
+  }
   return { receipt, ...checked };
 }
 export function checkerArgs(artifactDir, receipt) {
