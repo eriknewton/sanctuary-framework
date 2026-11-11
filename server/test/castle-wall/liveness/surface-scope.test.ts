@@ -43,3 +43,16 @@ it("keeps the status command successful when the authenticated response has wall
     expect(code).toBe(0); expect(JSON.parse(text).castle_wall_liveness.wall.state).toBe("wall_DOWN");
   } finally { spy.mockRestore(); session.mockRestore(); }
 });
+
+it("keeps principal dashboard health and readiness component-free", async () => {
+  const rig = await startRig();
+  try {
+    for (const path of ["/api/health", "/api/readiness"]) {
+      const response = await fetch(rig.baseUrl + path, { headers: { Authorization: `Bearer ${rig.authToken}` } });
+      expect(response.status).toBe(200);
+      const body = await response.json() as Record<string, unknown>;
+      expect(body).not.toHaveProperty("castle_wall_liveness");
+      expect(Object.keys(body).sort()).toEqual(path === "/api/health" ? ["instance", "mode", "ok", "since"] : ["ready", "supervisor"]);
+    }
+  } finally { await rig.stop(); }
+});
