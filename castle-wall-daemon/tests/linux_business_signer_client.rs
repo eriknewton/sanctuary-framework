@@ -114,6 +114,7 @@ struct Counters {
     peak: AtomicU64,
     io: AtomicU64,
     io_peak: AtomicU64,
+    sends: std::sync::Mutex<Vec<bool>>,
 }
 struct Script {
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -127,6 +128,9 @@ impl Script {
         Self::counted(actions, Arc::new(Counters::default()))
     }
     fn counted(actions: Vec<Action>, counters: Arc<Counters>) -> Self {
+        Self::waves(vec![actions], counters)
+    }
+    fn waves(waves: Vec<Vec<Action>>, counters: Arc<Counters>) -> Self {
         let guard = SCRIPT_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -137,111 +141,133 @@ impl Script {
         let stop = Arc::new(AtomicBool::new(false));
         let done = stop.clone();
         let thread = thread::spawn(move || {
-            if !readable(listener.as_raw_fd()) {
-                return;
-            }
-            let Ok(socket) = signer_peer::accept(listener.as_raw_fd()) else {
-                return;
-            };
-            let retained = counters.io.fetch_add(1, Ordering::SeqCst) + 1;
-            counters.io_peak.fetch_max(retained, Ordering::SeqCst);
-            for action in actions {
-                if let Some(gate) = action.gate {
-                    gate.recv_timeout(Duration::from_millis(WAIT_MS as u64))
-                        .unwrap();
+            let multiple = waves.len() > 1;
+            let mut workers = Vec::new();
+            for actions in waves {
+                if !readable(listener.as_raw_fd()) {
+                    return;
                 }
-                if !action.unsolicited {
-                    if done.load(Ordering::SeqCst) || !readable(socket.as_raw_fd()) {
-                        break;
-                    }
-                    let Ok(request) =
-                        signer_peer::receive(socket.as_raw_fd(), SIGNER_FRAME_MAX_BYTES)
-                    else {
-                        break;
-                    };
-                    if request.bytes.is_empty() {
-                        break;
-                    }
-                    if request.bytes != b"{\"op\":\"STATUS\"}" {
-                        // The scripted signer admits the same direct Header-plus-preimage packet as the real service, without an outer transport frame.
-                        let (header, preimage) = signer_service::decode(&request.bytes).unwrap();
-                        assert_eq!(preimage, signed().1);
-                        assert_eq!(header.request_id, "d".repeat(32)); // The fixed 128-bit outstanding request identifier.
-                    }
-                }
-                let active = counters.active.fetch_add(1, Ordering::SeqCst) + 1;
-                counters.peak.fetch_max(active, Ordering::SeqCst);
-                if let Some(delay) = action.delay {
-                    thread::sleep(delay);
-                }
-                if let Some((clock, value)) = action.set_clock {
-                    clock.store(value, Ordering::SeqCst);
-                }
-                let file = std::fs::File::open("/dev/null").unwrap();
-                let rights = if action.rights {
-                    vec![file.as_raw_fd()]
-                } else {
-                    vec![]
+                let Ok(socket) = signer_peer::accept(listener.as_raw_fd()) else {
+                    return;
                 };
-                if action.ancillary_truncation {
-                    const RIGHTS_COUNT: usize = signer_peer::ANCILLARY_WORDS * 2; // More descriptor bytes than the receiver's ancillary buffer can hold.
-                    let rights = vec![file.as_raw_fd(); RIGHTS_COUNT];
-                    let mut iov = libc::iovec {
-                        iov_base: action.bytes.as_ptr() as _,
-                        iov_len: action.bytes.len(),
-                    };
-                    let mut control = vec![0usize; signer_peer::ANCILLARY_WORDS * 4]; // Aligned capacity for the oversized rights header and descriptors.
-                    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                    msg.msg_iov = &mut iov;
-                    msg.msg_iovlen = 1;
-                    msg.msg_control = control.as_mut_ptr() as _;
-                    unsafe {
-                        msg.msg_controllen =
-                            libc::CMSG_SPACE(std::mem::size_of_val(rights.as_slice()) as _) as _;
-                        let c = libc::CMSG_FIRSTHDR(&msg);
-                        (*c).cmsg_level = libc::SOL_SOCKET;
-                        (*c).cmsg_type = libc::SCM_RIGHTS;
-                        (*c).cmsg_len =
-                            libc::CMSG_LEN(std::mem::size_of_val(rights.as_slice()) as _) as _;
-                        std::ptr::copy_nonoverlapping(
-                            rights.as_ptr(),
-                            libc::CMSG_DATA(c) as *mut i32,
-                            rights.len(),
-                        );
-                        assert_eq!(
-                            libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_NOSIGNAL),
-                            action.bytes.len() as isize
-                        );
-                    }
-                } else if action.foreign {
-                    let pid = unsafe { libc::fork() };
-                    assert!(pid >= 0);
-                    if pid == 0 {
-                        let _ = signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
-                        unsafe {
-                            libc::usleep(200_000);
-                            libc::_exit(0)
+                let counters = counters.clone();
+                let done = done.clone();
+                workers.push(thread::spawn(move || {
+                    let retained = counters.io.fetch_add(1, Ordering::SeqCst) + 1;
+                    counters.io_peak.fetch_max(retained, Ordering::SeqCst);
+                    for action in actions {
+                        if let Some(gate) = action.gate {
+                            gate.recv_timeout(Duration::from_millis(WAIT_MS as u64))
+                                .unwrap();
                         }
-                    } // Keep the sender alive through authenticated receipt.
-                    unsafe {
-                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                        if !action.unsolicited {
+                            if done.load(Ordering::SeqCst) || !readable(socket.as_raw_fd()) {
+                                break;
+                            }
+                            let Ok(request) =
+                                signer_peer::receive(socket.as_raw_fd(), SIGNER_FRAME_MAX_BYTES)
+                            else {
+                                break;
+                            };
+                            if request.bytes.is_empty() {
+                                break;
+                            }
+                            if request.bytes != b"{\"op\":\"STATUS\"}" {
+                                // The scripted signer admits the same direct Header-plus-preimage packet as the real service, without an outer transport frame.
+                                let (header, preimage) =
+                                    signer_service::decode(&request.bytes).unwrap();
+                                assert_eq!(preimage, signed().1);
+                                assert_eq!(header.request_id, "d".repeat(32)); // The fixed 128-bit outstanding request identifier.
+                            }
+                        }
+                        let active = counters.active.fetch_add(1, Ordering::SeqCst) + 1;
+                        counters.peak.fetch_max(active, Ordering::SeqCst);
+                        if let Some(delay) = action.delay {
+                            thread::sleep(delay);
+                        }
+                        if let Some((clock, value)) = action.set_clock {
+                            clock.store(value, Ordering::SeqCst);
+                        }
+                        let file = std::fs::File::open("/dev/null").unwrap();
+                        let rights = if action.rights {
+                            vec![file.as_raw_fd()]
+                        } else {
+                            vec![]
+                        };
+                        if action.ancillary_truncation {
+                            const RIGHTS_COUNT: usize = signer_peer::ANCILLARY_WORDS * 2; // More descriptor bytes than the receiver's ancillary buffer can hold.
+                            let rights = vec![file.as_raw_fd(); RIGHTS_COUNT];
+                            let mut iov = libc::iovec {
+                                iov_base: action.bytes.as_ptr() as _,
+                                iov_len: action.bytes.len(),
+                            };
+                            let mut control = vec![0usize; signer_peer::ANCILLARY_WORDS * 4]; // Aligned capacity for the oversized rights header and descriptors.
+                            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                            msg.msg_iov = &mut iov;
+                            msg.msg_iovlen = 1;
+                            msg.msg_control = control.as_mut_ptr() as _;
+                            unsafe {
+                                msg.msg_controllen =
+                                    libc::CMSG_SPACE(std::mem::size_of_val(rights.as_slice()) as _)
+                                        as _;
+                                let c = libc::CMSG_FIRSTHDR(&msg);
+                                (*c).cmsg_level = libc::SOL_SOCKET;
+                                (*c).cmsg_type = libc::SCM_RIGHTS;
+                                (*c).cmsg_len =
+                                    libc::CMSG_LEN(std::mem::size_of_val(rights.as_slice()) as _)
+                                        as _;
+                                std::ptr::copy_nonoverlapping(
+                                    rights.as_ptr(),
+                                    libc::CMSG_DATA(c) as *mut i32,
+                                    rights.len(),
+                                );
+                                assert_eq!(
+                                    libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_NOSIGNAL),
+                                    action.bytes.len() as isize
+                                );
+                            }
+                        } else if action.foreign {
+                            let pid = unsafe { libc::fork() };
+                            assert!(pid >= 0);
+                            if pid == 0 {
+                                let _ =
+                                    signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
+                                unsafe {
+                                    libc::usleep(200_000);
+                                    libc::_exit(0)
+                                }
+                            } // Keep the sender alive through authenticated receipt.
+                            unsafe {
+                                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                            }
+                        } else {
+                            let mut sends = counters.sends.lock().unwrap();
+                            let result =
+                                signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
+                            sends.push(result.is_ok());
+                            if let Some(sent) = &action.sent {
+                                sent.store(result.is_ok(), Ordering::SeqCst);
+                            }
+                            if action.duplicate {
+                                let _ =
+                                    signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
+                            }
+                        }
+                        counters.active.fetch_sub(1, Ordering::SeqCst);
                     }
-                } else {
-                    let _ = signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
-                    if action.duplicate {
-                        let _ = signer_peer::send(socket.as_raw_fd(), &action.bytes, &rights);
+                    // Keep the original peer alive and its socket open until the client has settled.
+                    while !done.load(Ordering::SeqCst) {
+                        if multiple && signer_service::readable(socket.as_raw_fd()) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(TICK_MS));
                     }
-                }
-                if let Some(sent) = action.sent {
-                    sent.store(true, Ordering::SeqCst);
-                }
-                counters.active.fetch_sub(1, Ordering::SeqCst);
+                    counters.io.fetch_sub(1, Ordering::SeqCst);
+                }));
             }
-            // Keep the original peer alive and its socket open until the client has settled.
-            while !done.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(TICK_MS));
+            for worker in workers {
+                worker.join().unwrap();
             }
-            counters.io.fetch_sub(1, Ordering::SeqCst);
         });
         Self {
             _guard: guard,
@@ -633,18 +659,35 @@ fn completion_after_effective_deadline_refuses_with_live_grant() {
 #[test]
 fn repeated_timeout_waves_keep_one_owned_request_and_terminal_clients() {
     let counters = Arc::new(Counters::default());
-    for _ in 0..DEADLINE_WAVES {
-        let view = status();
-        let (reply, body) = signed();
-        let mut action = Action::reply(&reply);
-        action.delay = Some(Duration::from_millis(TICK_MS * 4));
-        let script = Script::counted(vec![Action::reply(&view), action], counters.clone());
+    let view = status();
+    let (reply, body) = signed();
+    let sent: Vec<_> = (0..DEADLINE_WAVES)
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
+    let waves = sent
+        .iter()
+        .map(|sent| {
+            let mut action = Action::reply(&reply);
+            action.delay = Some(Duration::from_millis(TICK_MS * 4));
+            action.sent = Some(sent.clone());
+            vec![Action::reply(&view), action]
+        })
+        .collect();
+    let script = Script::waves(waves, counters.clone());
+    for sent in sent {
         let mut c = script.client();
         bind(&mut c);
-
         let mut h = header(&view, &body, 1);
         h.deadline_boottime_ns = (1 + TICK_MS * NS_PER_MS).to_string();
         assert_eq!(c.sign_record(h, &body), Err(Refusal::Deadline));
+        // Synchronize with the recorded send result before inspecting its completion flag.
+        let sends = counters.sends.lock().unwrap();
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "deadline returned before the late send settled"
+        );
+        assert!(sends.iter().all(|sent| *sent), "scripted late send failed");
+        drop(sends);
         assert_eq!(
             c.sign_record(header(&view, &body, 1), &body),
             Err(Refusal::State)
@@ -652,10 +695,15 @@ fn repeated_timeout_waves_keep_one_owned_request_and_terminal_clients() {
         c.close_and_settle();
         c.close_and_settle();
         assert_eq!(c.state(), SignerClientState::Closed);
-        drop(script);
+        let end = Instant::now() + Duration::from_millis(WAIT_MS as u64);
+        while counters.io.load(Ordering::SeqCst) != 0 {
+            assert!(Instant::now() < end);
+            thread::yield_now();
+        }
         assert_eq!(counters.active.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.io.load(Ordering::SeqCst), 0);
     }
+    drop(script);
+    assert_eq!(counters.sends.lock().unwrap().len(), DEADLINE_WAVES * 2);
     assert_eq!(counters.peak.load(Ordering::SeqCst), 1);
     assert_eq!(counters.io_peak.load(Ordering::SeqCst), 1);
 }
