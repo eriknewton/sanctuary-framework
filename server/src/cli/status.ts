@@ -200,7 +200,8 @@ export function renderTable(status: Record<string, unknown>): string {
   if (liveness) {
     for (const component of ["wall", "agent", "coverage"]) {
       const verdict = asRecord(liveness[component]);
-      lines.push(`  liveness ${component}: ${str(verdict?.state)}`);
+      const reasons = Array.isArray(verdict?.reasons) ? verdict.reasons.filter((reason): reason is string => typeof reason === "string") : [];
+      lines.push(`  liveness ${component}: ${str(verdict?.state)}${reasons.length ? ` (${reasons.join(", ")})` : ""}`);
     }
   }
   return `${lines.join("\n")}\n`;
