@@ -551,6 +551,7 @@ pub struct ClosurePaths {
     self_exe: PathBuf,
     boot_id: PathBuf,
     owner: u32,
+    library_owner: u32,
 }
 impl ClosurePaths {
     pub fn production() -> Self {
@@ -561,6 +562,7 @@ impl ClosurePaths {
             self_exe: "/proc/self/exe".into(),
             boot_id: "/proc/sys/kernel/random/boot_id".into(),
             owner: custody::ROOT_UID,
+            library_owner: custody::ROOT_UID,
         }
     }
     #[cfg(feature = "test-isolation")]
@@ -579,7 +581,13 @@ impl ClosurePaths {
             self_exe,
             boot_id,
             owner,
+            library_owner: owner,
         }
+    }
+    #[cfg(feature = "test-isolation")]
+    pub fn with_library_owner_for_test(mut self, owner: u32) -> Self {
+        self.library_owner = owner;
+        self
     }
 }
 fn trusted_mapping(meta: &fs::Metadata, owner: u32) -> bool {
@@ -644,14 +652,20 @@ fn closure(
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&path)?;
         let meta = file.metadata()?;
-        if !trusted_mapping(&meta, paths.owner)
+        let own_image = (meta.dev(), meta.ino()) == (m.dev(), m.ino());
+        let owner = if own_image {
+            paths.owner
+        } else {
+            paths.library_owner
+        };
+        if !trusted_mapping(&meta, owner)
             || libc::major(meta.dev()) != major
             || libc::minor(meta.dev()) != minor
             || meta.ino() != inode
         {
             return Err(Error::Closure);
         }
-        image_seen |= (meta.dev(), meta.ino()) == (m.dev(), m.ino());
+        image_seen |= own_image;
         held.push(file);
     }
     if !image_seen {
@@ -964,5 +978,143 @@ pub mod test_support {
         environment: &[OsString],
     ) -> Result<()> {
         closure(paths, config, environment).map(|_| ())
+    }
+}
+
+impl Activation {
+    pub fn environment() -> io::Result<Self> {
+        Ok(Self {
+            pid: std::env::var("LISTEN_PID").map_err(|_| custody::refused())?,
+            fds: std::env::var("LISTEN_FDS").map_err(|_| custody::refused())?,
+            names: std::env::var("LISTEN_FDNAMES").map_err(|_| custody::refused())?,
+        })
+    }
+}
+/// Only an explicitly selected isolation entry may retain an unprivileged bounding set.
+pub fn drop_capabilities(isolation: bool) -> io::Result<()> {
+    let isolation = isolation && cfg!(feature = "test-isolation");
+    let last: i32 = writer_peer::read_proc(Path::new("/proc/sys/kernel/cap_last_cap"))
+        .map_err(|_| custody::refused())?
+        .trim()
+        .parse()
+        .map_err(|_| custody::refused())?;
+    if !(0..64).contains(&last) {
+        return Err(custody::refused());
+    } // Linux capability ABI has two 32-bit words.
+    for cap in 0..=last {
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) };
+        if present < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 1 && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0 {
+            let error = io::Error::last_os_error();
+            if !isolation || error.raw_os_error() != Some(libc::EPERM) {
+                return Err(error);
+            }
+        }
+    }
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const CAPABILITY_VERSION_3: u32 = 0x20080522; // linux/capability.h, two 32-bit words.
+    let header = Header {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [Data {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+        || unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0
+        || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    signer_peer::empty_capabilities(unsafe { libc::getpid() }, !isolation)
+}
+
+#[cfg(feature = "test-isolation")]
+pub const WRITER_TEST_SEAM_MARKER: &str = "SANCTUARY_WRITER_TEST_ISOLATION_V1";
+#[cfg(feature = "test-isolation")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestSeam {
+    config: PathBuf,
+    exec: PathBuf,
+    status: PathBuf,
+    maps: PathBuf,
+    self_exe: PathBuf,
+    boot_id: PathBuf,
+    bus: BusTarget,
+    listener: ListenerExpectations,
+    artifact_owner: u32,
+    library_owner: u32,
+    signer_socket: PathBuf,
+}
+#[cfg(feature = "test-isolation")]
+pub fn test_entry(path: &Path) -> io::Result<()> {
+    let setup = (|| {
+        let bytes = custody::read_pinned(
+            path,
+            unsafe { libc::geteuid() },
+            custody::CONFIG_MAX_BYTES,
+            custody::PRIVATE_MODE,
+        )?;
+        let seam: TestSeam = serde_json::from_slice(&bytes).map_err(|_| custody::refused())?;
+        let config = HeldConfig::isolated(&seam.config, seam.artifact_owner)
+            .map_err(|_| custody::refused())?;
+        let signer =
+            ClientSignerPort::bootstrap_at(&seam.signer_socket, config.value.signer.clone())
+                .map_err(|_| custody::refused())?;
+        if unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
+            return Err(custody::refused());
+        }
+        Ok(Dependencies {
+            signer,
+            reconciler: ClosedReconciler::production(),
+            notifier: SystemNotifier,
+            config,
+            bus: seam.bus,
+            listener: unsafe { OwnedFd::from_raw_fd(3) },
+            expectations: seam.listener,
+            activation: Activation::environment()?,
+            clock: std::sync::Arc::new(super::signer_watchdog::boottime_ns),
+            paths: ClosurePaths::isolated(
+                seam.exec,
+                seam.status,
+                seam.maps,
+                seam.self_exe,
+                seam.boot_id,
+                seam.artifact_owner,
+            )
+            .with_library_owner_for_test(seam.library_owner),
+            environment: std::env::vars_os().map(|(k, _)| k).collect(),
+        })
+    })();
+    match setup {
+        Ok(deps) => run(deps).map_err(|_| custody::refused()),
+        Err(e) => {
+            let _ = SystemNotifier.notify("STATUS=writer refused at start");
+            Err(e)
+        }
     }
 }

@@ -23,3 +23,20 @@ it.skipIf(process.platform!=="linux")("controller death reaps an idle worker whi
     expect((await fixture.freshClient()).state).not.toBe("UNLOCKED");
   }finally{if(timer)clearInterval(timer);await heartbeat.catch(()=>undefined);await fixture.close();}
 },30_000);
+
+it.skipIf(process.platform!=="linux")("writer death reaps the worker while the live writer heartbeat preserves it", async () => {
+  const fixture = await serviceFixture("writer fixture ", false, undefined, true);
+  try {
+    expect(fixture.writerNotifications).toContain("READY=1\nSTATUS=writer closed");
+    expect(fixture.writerPid).toBeGreaterThan(0);
+    expect(await fixture.ceremony()).toBe(0);
+    const worker = fixture.workerPid(); expect(worker).toBeGreaterThan(0);
+    await pause(CONTROLLER_DEATH_WINDOW_MS);
+    expect(existsSync(`/proc/${worker}`)).toBe(true);
+    await fixture.killController();
+    expect(existsSync(`/proc/${fixture.writerPid}`)).toBe(false);
+    const deadline = Date.now() + CONTROLLER_DEATH_WINDOW_MS;
+    while (existsSync(`/proc/${worker}`) && Date.now() < deadline) await pause(CONTROLLER_HEARTBEAT_MS / 10);
+    expect(existsSync(`/proc/${worker}`)).toBe(false);
+  } finally { await fixture.close(); }
+}, 30_000);

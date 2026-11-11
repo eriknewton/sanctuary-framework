@@ -28,6 +28,9 @@ fn complete_corpus_has_exact_ids_and_refusals() {
         ("registry-array-overflow", "Cap(\"array\")"),
         ("nesting-overflow", "Cap(\"nesting\")"),
         ("truncated-body", "Framing"),
+        ("string-length-overflow", "Framing"),
+        ("string-terminator", "Framing"),
+        ("registry-element-shape", "Framing"),
         ("trailing-body", "Framing"),
         ("oversize-message", "Cap(\"bytes\")"),
     ]

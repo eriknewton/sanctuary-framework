@@ -418,7 +418,7 @@ pub fn envelope(body: &[u8], signature: &[u8; SIGNATURE_BYTES]) -> Result<Vec<u8
     let bytes = crate::smb::jcs::encode(&wrapped)
         .map_err(|_| Refusal::Canonical)?
         .into_bytes();
-    if bytes.len() > WRITER_ENVELOPE_MAX_BYTES {
+    if !envelope_fits(bytes.len()) {
         return Err(Refusal::Envelope);
     }
     Ok(bytes)
@@ -451,4 +451,12 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<Value> {
         return Err(Refusal::Envelope);
     }
     Ok(value)
+}
+
+fn envelope_fits(length: usize) -> bool {
+    length <= WRITER_ENVELOPE_MAX_BYTES
+}
+#[cfg(feature = "test-isolation")]
+pub fn envelope_size_admitted_for_test(length: usize) -> bool {
+    envelope_fits(length)
 }

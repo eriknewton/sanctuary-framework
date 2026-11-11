@@ -1,0 +1,21 @@
+[Unit]
+Description=Sanctuary business record socket
+Requires=sanctuary-business-barrier.service
+After=sanctuary-business-barrier.service
+BindsTo=sanctuary-business-writer.service
+Before=sanctuary-business-writer.service sanctuary-castle-wall.service
+
+[Socket]
+# Must match RECORD_SOCKET, RECORD_FD_NAME and RECORD_MODE in writer_peer.rs.
+ListenSequentialPacket=/run/sanctuary-business-writer/record.sock
+Service=sanctuary-business-writer.service
+Accept=no
+SocketUser=root
+SocketGroup=sanctuary-business-writer
+SocketMode=0660
+DirectoryMode=0755
+Backlog=1
+PassCredentials=yes
+FlushPending=yes
+RemoveOnStop=yes
+FileDescriptorName=records

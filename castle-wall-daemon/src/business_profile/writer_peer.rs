@@ -25,7 +25,9 @@ pub const BUS_HEADER_FIELDS_MAX: usize = 9; // D-Bus field codes 1 through 9.
 pub const BUS_NESTING_MAX: usize = 4; // Variant, array, ExecStart struct, argv array.
 pub const BUS_ARRAY_ELEMENTS_MAX: usize = 16; // Registry arrays only, above the shipped five-element argv.
 pub const WALL_DROPINS_MAX: usize = BUS_ARRAY_ELEMENTS_MAX;
+// Must match sanctuary-business-writer.socket: path, descriptor name and mode.
 pub const RECORD_SOCKET: &str = "/run/sanctuary-business-writer/record.sock";
+// Must match sanctuary-business-writer.service: wall dependency and argument-free writer executable.
 pub const WALL_UNIT: &str = "sanctuary-castle-wall.service";
 pub const WALL_EXEC: &str = "/usr/local/libexec/sanctuary/castle-wall-daemon";
 pub const WRITER_EXEC: &str = "/usr/libexec/sanctuary-business-writer";
@@ -534,7 +536,7 @@ impl WallMainBinding {
             return Err(Error::Process);
         }
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
-        if signer_peer::pidfd_pid(pidfd.as_raw_fd()) != Some(cred.pid) {
+        if !pidfd_subject(pidfd.as_raw_fd(), cred.pid) {
             return Err(Error::Process);
         }
         let start = process_start(cred.pid)?;
@@ -582,19 +584,15 @@ impl WallMainBinding {
             || packet.cred.uid != self.uid
             || packet.cred.gid != self.gid
             || !self.live()
-            || signer_peer::pidfd_pid(packet.pidfd.as_raw_fd()) != Some(self.pid)
-            || !signer_peer::same_pidfd(self.pidfd.as_raw_fd(), packet.pidfd.as_raw_fd())
+            || !pidfd_subject(packet.pidfd.as_raw_fd(), self.pid)
+            || !same_descriptor(self.pidfd.as_raw_fd(), packet.pidfd.as_raw_fd())
         {
             return Err(Error::Identity);
         }
         Ok(())
     }
     pub fn revalidate(&self, target: &BusTarget, end: Deadline) -> Result<()> {
-        if !self.live()
-            || signer_peer::pidfd_pid(self.pidfd.as_raw_fd()) != Some(self.pid)
-            || process_start(self.pid)? != self.start
-            || process_cgroup(self.pid)? != self.cgroup
-        {
+        if !self.process_identity()? {
             return Err(Error::Process);
         }
         let now = target.exchange(end.clone())?;
@@ -605,18 +603,27 @@ impl WallMainBinding {
         {
             return Err(Error::Identity);
         }
-        if !self.live()
-            || process_start(self.pid)? != self.start
-            || process_cgroup(self.pid)? != self.cgroup
-        {
+        if !self.process_identity()? {
             return Err(Error::Process);
         }
         end.check()?;
         Ok(())
     }
+    fn process_identity(&self) -> Result<bool> {
+        Ok(self.live()
+            && pidfd_subject(self.pidfd.as_raw_fd(), self.pid)
+            && process_start(self.pid)? == self.start
+            && process_cgroup(self.pid)? == self.cgroup)
+    }
     pub fn held_artifacts(&self) -> usize {
         self.artifacts.len()
     }
+}
+fn pidfd_subject(fd: RawFd, pid: i32) -> bool {
+    signer_peer::pidfd_pid(fd) == Some(pid)
+}
+fn same_descriptor(a: RawFd, b: RawFd) -> bool {
+    signer_peer::same_pidfd(a, b)
 }
 fn validate_unit(unit: &UnitSnapshot, config: &WriterConfig, pid: i32, cgroup: &str) -> Result<()> {
     if unit.id != config.wall_unit
@@ -655,6 +662,20 @@ fn validate_unit(unit: &UnitSnapshot, config: &WriterConfig, pid: i32, cgroup: &
 pub mod test_support {
     use super::*;
     use crate::business_profile::signer_watchdog::boottime_ns;
+    pub fn pidfd_subject_matches(fd: RawFd, pid: i32) -> bool {
+        pidfd_subject(fd, pid)
+    }
+    pub fn same_descriptor_matches(a: RawFd, b: RawFd) -> bool {
+        same_descriptor(a, b)
+    }
+    pub fn changed_saved_identity(mut binding: WallMainBinding, field: &str) -> Result<bool> {
+        match field {
+            "start" => binding.start.push('0'),
+            "cgroup" => binding.cgroup.push('x'),
+            _ => return Err(Error::Identity),
+        }
+        binding.process_identity()
+    }
     pub fn validate_snapshot(
         unit: &UnitSnapshot,
         config: &WriterConfig,

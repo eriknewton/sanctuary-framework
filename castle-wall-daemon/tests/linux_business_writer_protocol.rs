@@ -419,3 +419,11 @@ fn noncanonical_body_never_reaches_the_signer() {
     assert!(machine.sign(h, &body, |_| Ok(())).is_err());
     assert_eq!(f.signs.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn encoded_envelope_size_has_an_exact_defensive_bound() {
+    assert!(envelope_size_admitted_for_test(WRITER_ENVELOPE_MAX_BYTES));
+    assert!(!envelope_size_admitted_for_test(
+        WRITER_ENVELOPE_MAX_BYTES + 1
+    ));
+}

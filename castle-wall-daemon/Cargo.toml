@@ -71,6 +71,10 @@ path = "src/bin/sanctuary-business-signer.rs"
 name = "sanctuary-business-unlock"
 path = "src/bin/sanctuary-business-unlock.rs"
 
+[[bin]]
+name = "sanctuary-business-writer"
+path = "src/bin/sanctuary-business-writer.rs"
+
 [features]
 # The raw Ed25519 seed constructor exists only for the legacy v1 cross-language vectors; no shipped build line enables it.
 legacy-raw-producer = []
@@ -84,6 +88,7 @@ smb-test-hooks = []
 # AGENTS.md: "the operator's machine is not a fixture". The seam is structural,
 # not a convention the next test author has to remember.
 test-isolation = []
+user-manager-witness = ["test-isolation"]
 arch-install = []
 
 [dependencies]
@@ -242,3 +247,13 @@ required-features = ["test-isolation"]
 name = "linux_business_writer_unit"
 path = "tests/linux_business_writer_unit.rs"
 required-features = ["test-isolation"]
+
+[[bin]]
+name = "writer-standin"
+path = "tests/helpers/writer-standin.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_business_writer_user_manager"
+path = "tests/linux_business_writer_user_manager.rs"
+required-features = ["test-isolation", "user-manager-witness"]

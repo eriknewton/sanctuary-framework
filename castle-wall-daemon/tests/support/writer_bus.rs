@@ -120,6 +120,8 @@ pub struct Fault {
     pub invalid_signal: bool,
     pub trickle: bool,
     pub change_owner: bool,
+    pub malformed: Option<String>,
+    pub final_capture_change: bool,
 }
 pub struct Fixture {
     pub fault: Arc<Mutex<Fault>>,
@@ -173,9 +175,14 @@ impl Fixture {
         let fault = Arc::new(Mutex::new(Fault::default()));
         let faults = fault.clone();
         let thread = thread::spawn(move || {
+            let mut connections = 0;
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        connections += 1;
+                        if connections == 2 && faults.lock().unwrap().final_capture_change {
+                            shared.lock().unwrap().invocation[0] ^= 1;
+                        }
                         stream
                             .set_read_timeout(Some(Duration::from_millis(100)))
                             .unwrap();
@@ -254,7 +261,7 @@ fn serve(
         let (member, args) = writer_peer::test_support::decode_request(&bytes).unwrap();
         let u = unit.lock().unwrap().clone();
         let fault = faults.lock().unwrap().clone();
-        let response = match member.as_str() {
+        let mut response = match member.as_str() {
             "Hello" => reply(serial, "org.freedesktop.DBus", "s", |v| {
                 string(v, OWN, false)
             }),
@@ -290,6 +297,26 @@ fn serve(
             _ => panic!("unauthorized method {member}"),
         };
         if member == "Hello" {
+            if let Some(case) = &fault.malformed {
+                if case == "signature" {
+                    response = reply(serial, "org.freedesktop.DBus", "u", |v| {
+                        pad(v, 4);
+                        v.extend_from_slice(&0u32.to_le_bytes());
+                    });
+                } else {
+                    // Framing rejects these fields before reply identity or semantic acceptance.
+                    let corpus: serde_json::Value =
+                        serde_json::from_str(include_str!("../fixtures/writer_bus_replies.json"))
+                            .unwrap();
+                    let row = corpus["cases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["id"] == *case)
+                        .unwrap();
+                    response = hex::decode(row["packet_hex"].as_str().unwrap()).unwrap();
+                }
+            }
             for _ in 0..fault.signals {
                 let mut signal = signal();
                 if fault.invalid_signal {

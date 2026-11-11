@@ -20,7 +20,7 @@
 //! Linux, with no error attributable to the test that did it. There is no
 //! after-the-fact symptom to look for, which is why the check must be structural.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // Marker strings must match the suite-list-begin/end comments in the repo-root
@@ -72,36 +72,54 @@ fn repo_root() -> PathBuf {
 /// Parsed from the manifest rather than hard-coded: a hard-coded expected list is
 /// the same hand-mirrored shape this test exists to prohibit, and it would pass
 /// while the manifest said something else.
-fn gated_targets() -> BTreeSet<String> {
+fn target_feature_sets() -> BTreeMap<String, BTreeSet<String>> {
     let manifest =
         std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("read Cargo.toml");
-    let mut gated = BTreeSet::new();
-    let mut name: Option<String> = None;
-    let mut in_test_target = false;
-    for line in manifest.lines() {
-        let line = line.trim();
+    let mut targets = BTreeMap::new();
+    let mut name = None;
+    let mut in_test = false;
+    for line in manifest.lines().map(str::trim) {
         if line.starts_with('[') {
-            // A new table ends the previous one; an ungated `[[test]]` block
-            // therefore drops its name without recording it.
-            in_test_target = line == "[[test]]";
+            in_test = line == "[[test]]";
             name = None;
             continue;
         }
-        if !in_test_target {
+        if !in_test {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("name") {
-            if let Some(value) = rest.split('=').nth(1) {
-                name = Some(value.trim().trim_matches('"').to_string());
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "name" {
+                name = Some(value.trim().trim_matches('"').to_owned());
             }
-        }
-        if line.starts_with("required-features") && line.contains("test-isolation") {
-            if let Some(n) = name.clone() {
-                gated.insert(n);
+            if key.trim() == "required-features" {
+                let features = value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('"').to_owned())
+                    .collect();
+                assert!(targets
+                    .insert(name.clone().expect("named test target"), features)
+                    .is_none());
             }
         }
     }
-    gated
+    targets
+}
+fn gated_targets() -> BTreeSet<String> {
+    target_feature_sets()
+        .into_iter()
+        .filter(|(_, features)| *features == BTreeSet::from(["test-isolation".to_owned()]))
+        .map(|(name, _)| name)
+        .collect()
+}
+fn all_isolation_targets() -> BTreeSet<String> {
+    target_feature_sets()
+        .into_iter()
+        .filter(|(_, features)| features.contains("test-isolation"))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The Linux CI "did it run" loop names every gated target plus this guard
@@ -525,7 +543,7 @@ fn effective_source(path: &Path) -> String {
 
 #[test]
 fn every_target_that_can_reach_host_global_state_is_gated_on_test_isolation() {
-    let gated = gated_targets();
+    let gated = all_isolation_targets();
     let markers = host_global_markers();
     let mut ungated_but_reaching = Vec::new();
     for (name, path) in integration_target_files() {
@@ -553,7 +571,7 @@ fn every_target_that_can_reach_host_global_state_is_gated_on_test_isolation() {
 /// place that installs it, so every gated target must include it.
 #[test]
 fn every_gated_target_installs_the_shared_isolation_module() {
-    let gated = gated_targets();
+    let gated = all_isolation_targets();
     let mut missing_module = Vec::new();
     for (name, path) in integration_target_files() {
         if !gated.contains(&name) {
@@ -851,4 +869,33 @@ fn gated_boot_and_spawn_helpers_supply_selection_roots() {
         .next()
         .unwrap()
         .contains("test_selector_roots"));
+}
+
+// Accounting only; the user-manager target runs separately on a non-root manager.
+#[cfg(not(feature = "user-manager-witness"))]
+#[test]
+fn skipped_linux_business_writer_user_manager_requires_user_manager_witness() {
+    let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
+    let blocks: Vec<_> = manifest
+        .split("[[test]]")
+        .filter(|block| {
+            block
+                .lines()
+                .any(|line| line == r#"name = "linux_business_writer_user_manager""#)
+        })
+        .collect();
+    assert_eq!(blocks.len(), 1);
+    let features: Vec<_> = blocks[0]
+        .lines()
+        .filter(|line| line.starts_with("required-features"))
+        .collect();
+    assert_eq!(
+        features,
+        [r#"required-features = ["test-isolation", "user-manager-witness"]"#]
+    );
+    let source =
+        std::fs::read_to_string(crate_root().join("tests/linux_business_writer_user_manager.rs"))
+            .unwrap();
+    assert!(source.contains("mod isolation;"));
+    assert!(!gated_targets().contains("linux_business_writer_user_manager"));
 }

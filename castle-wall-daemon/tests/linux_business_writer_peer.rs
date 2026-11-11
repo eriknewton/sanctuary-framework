@@ -324,3 +324,190 @@ fn completion_revalidation_refuses_a_new_main_pid_with_the_wall_live() {
     assert_eq!(result, Err(writer_service::Error::Peer(Error::Identity)));
     assert!(binding.live());
 }
+
+#[test]
+fn complete_dropin_order_hash_and_artifact_controls() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    for fault in [
+        "none",
+        "missing",
+        "extra",
+        "duplicate",
+        "reordered",
+        "hash",
+        "mode",
+        "owner",
+    ] {
+        let mut f = writer_bus::Fixture::new();
+        let mut paths = vec![];
+        for name in ["first.conf", "second.conf"] {
+            let path = f.root.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            f.config.wall_dropins.push(DropIn {
+                path: path.clone(),
+                sha256: hex::encode(Sha256::digest(name.as_bytes())),
+            });
+            paths.push(path.to_str().unwrap().to_string());
+        }
+        f.unit.lock().unwrap().dropins = paths.clone();
+        let original = f.unit.lock().unwrap().clone();
+        assert_eq!(
+            validate_snapshot(&original, &f.config, original.pid as i32, &original.cgroup),
+            Ok(())
+        );
+        match fault {
+            "missing" => {
+                f.unit.lock().unwrap().dropins.pop();
+            }
+            "extra" => f.unit.lock().unwrap().dropins.push("/extra".into()),
+            "duplicate" => f.unit.lock().unwrap().dropins[1] = paths[0].clone(),
+            "reordered" => f.unit.lock().unwrap().dropins.reverse(),
+            "hash" => f.config.wall_dropins[0].sha256 = "0".repeat(64),
+            "mode" => {
+                std::fs::set_permissions(&paths[0], std::fs::Permissions::from_mode(0o622)).unwrap()
+            }
+            _ => (),
+        }
+        let (_a, b) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let expect = ListenerExpectations::isolated(f.root.path().join("record"), owner, unsafe {
+            libc::getegid()
+        });
+        let result = WallMainBinding::capture(
+            b.as_raw_fd(),
+            &f.config,
+            &f.target,
+            &expect,
+            owner + u32::from(fault == "owner"),
+            deadline_ms(250).unwrap(),
+        );
+        assert_eq!(result.is_ok(), fault == "none", "{fault}");
+        if fault == "none" {
+            assert_eq!(result.unwrap().held_artifacts(), 4);
+        }
+    }
+}
+
+#[test]
+fn every_packet_identity_component_has_a_control() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let f = writer_bus::Fixture::new();
+    let (a, b) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .unwrap();
+    signer_peer::passcred(b.as_raw_fd()).unwrap();
+    let owner = unsafe { libc::geteuid() };
+    let expect = ListenerExpectations::isolated(f.root.path().join("record"), owner, unsafe {
+        libc::getegid()
+    });
+    let binding = WallMainBinding::capture(
+        b.as_raw_fd(),
+        &f.config,
+        &f.target,
+        &expect,
+        owner,
+        deadline_ms(250).unwrap(),
+    )
+    .unwrap();
+    for fault in ["none", "pid", "uid", "gid", "pidfd", "rights"] {
+        signer_peer::send(a.as_raw_fd(), b"packet", &[]).unwrap();
+        let mut packet = signer_peer::receive(b.as_raw_fd(), 1024).unwrap();
+        assert_eq!(binding.packet(&packet), Ok(()));
+        match fault {
+            "pid" => packet.cred.pid += 1,
+            "uid" => packet.cred.uid += 1,
+            "gid" => packet.cred.gid += 1,
+            "pidfd" => packet.pidfd = std::fs::File::open("/dev/null").unwrap().into(),
+            "rights" => packet
+                .rights
+                .push(unsafe { OwnedFd::from_raw_fd(libc::dup(a.as_raw_fd())) }),
+            _ => (),
+        }
+        assert_eq!(
+            binding.packet(&packet),
+            if fault == "none" {
+                Ok(())
+            } else {
+                Err(Error::Identity)
+            },
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn saved_process_identity_and_descriptor_predicates_are_independent() {
+    let f = writer_bus::Fixture::new();
+    let (_a, b) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .unwrap();
+    let owner = unsafe { libc::geteuid() };
+    let expect = ListenerExpectations::isolated(f.root.path().join("record"), owner, unsafe {
+        libc::getegid()
+    });
+    for field in ["start", "cgroup"] {
+        let binding = WallMainBinding::capture(
+            b.as_raw_fd(),
+            &f.config,
+            &f.target,
+            &expect,
+            owner,
+            deadline_ms(250).unwrap(),
+        )
+        .unwrap();
+        assert!(pidfd_subject_matches(
+            binding.pidfd(),
+            std::process::id() as i32
+        ));
+        assert!(!pidfd_subject_matches(
+            binding.pidfd(),
+            std::process::id() as i32 + 1
+        ));
+        let other = std::fs::File::open("/dev/null").unwrap();
+        assert!(same_descriptor_matches(binding.pidfd(), binding.pidfd()));
+        assert!(!same_descriptor_matches(binding.pidfd(), other.as_raw_fd()));
+        assert_eq!(changed_saved_identity(binding, field), Ok(false), "{field}");
+    }
+}
+#[test]
+fn final_capture_exchange_cannot_adopt_a_replacement_invocation() {
+    let f = writer_bus::Fixture::new();
+    f.fault.lock().unwrap().final_capture_change = true;
+    let (_a, b) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .unwrap();
+    let owner = unsafe { libc::geteuid() };
+    let expect = ListenerExpectations::isolated(f.root.path().join("record"), owner, unsafe {
+        libc::getegid()
+    });
+    assert!(matches!(
+        WallMainBinding::capture(
+            b.as_raw_fd(),
+            &f.config,
+            &f.target,
+            &expect,
+            owner,
+            deadline_ms(250).unwrap()
+        ),
+        Err(Error::Identity)
+    ));
+}

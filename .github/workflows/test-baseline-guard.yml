@@ -66,8 +66,8 @@ jobs:
         run: |
           # Must match test/fixtures/k1-service.ts: both profiles live under this one target root.
           export CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target"
-          CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock
-          cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock
+          CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer
+          cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer
           echo "SANCTUARY_K1_TEST_BINARIES=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
 
       - name: Use Node.js 24

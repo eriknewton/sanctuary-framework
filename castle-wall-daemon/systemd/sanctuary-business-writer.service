@@ -1,0 +1,54 @@
+[Unit]
+Description=Sanctuary closed business writer
+Requires=sanctuary-business-barrier.service sanctuary-business-signer.service sanctuary-business-writer.socket dbus.socket
+After=sanctuary-business-barrier.service sanctuary-business-signer.service sanctuary-business-writer.socket dbus.socket
+BindsTo=sanctuary-business-signer.service sanctuary-castle-wall.service
+PartOf=sanctuary-castle-wall.service
+Before=sanctuary-castle-wall.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=sanctuary
+SupplementaryGroups=
+Slice=system.slice
+Delegate=no
+# Must match WRITER_EXEC and WALL_UNIT in writer_peer.rs.
+ExecStart=/usr/libexec/sanctuary-business-writer
+Restart=no
+TimeoutStartSec=30
+TimeoutStopSec=5
+KillMode=control-group
+SendSIGKILL=yes
+# the socket unit owns this directory; a service RuntimeDirectory= here would re-own the socket's group on start.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateTmp=yes
+PrivateUsers=no
+ProtectProc=default
+ProcSubset=all
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+LimitCORE=0
+MemorySwapMax=0
+MemoryMax=64M
+TasksMax=16
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+# ProtectSystem=strict and no writable path exceptions leave no persistent writable writer state.

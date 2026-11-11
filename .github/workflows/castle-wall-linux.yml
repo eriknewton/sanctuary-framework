@@ -187,6 +187,13 @@ jobs:
         working-directory: castle-wall-daemon
         run: cargo audit --deny warnings
 
+      - name: Build dedicated native writer witness harness
+        working-directory: castle-wall-daemon
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer
+          echo "SANCTUARY_K1_TEST_BINARIES=$RUNNER_TEMP/k1-target" >> "$GITHUB_ENV"
+
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
         # 20 = about 6x the longest observed run of this step (165 to 188 s over
