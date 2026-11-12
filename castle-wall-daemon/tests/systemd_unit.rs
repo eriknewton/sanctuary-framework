@@ -1288,3 +1288,16 @@ mod start_limit_against_real_systemd {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writer_wall_exec_matches_shipped_unit() {
+    // Reverse pin for writer_peer::WALL_EXEC: admission uses the shipped executable.
+    let unit = unit_text();
+    let commands = directive_values(&unit, "ExecStart");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].split_whitespace().next(),
+        Some(castle_wall_daemon::business_profile::writer_peer::WALL_EXEC)
+    );
+}

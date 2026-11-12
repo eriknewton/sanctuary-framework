@@ -20,7 +20,7 @@
 //! Linux, with no error attributable to the test that did it. There is no
 //! after-the-fact symptom to look for, which is why the check must be structural.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // Marker strings must match the suite-list-begin/end comments in the repo-root
@@ -72,36 +72,54 @@ fn repo_root() -> PathBuf {
 /// Parsed from the manifest rather than hard-coded: a hard-coded expected list is
 /// the same hand-mirrored shape this test exists to prohibit, and it would pass
 /// while the manifest said something else.
-fn gated_targets() -> BTreeSet<String> {
+fn target_feature_sets() -> BTreeMap<String, BTreeSet<String>> {
     let manifest =
         std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("read Cargo.toml");
-    let mut gated = BTreeSet::new();
-    let mut name: Option<String> = None;
-    let mut in_test_target = false;
-    for line in manifest.lines() {
-        let line = line.trim();
+    let mut targets = BTreeMap::new();
+    let mut name = None;
+    let mut in_test = false;
+    for line in manifest.lines().map(str::trim) {
         if line.starts_with('[') {
-            // A new table ends the previous one; an ungated `[[test]]` block
-            // therefore drops its name without recording it.
-            in_test_target = line == "[[test]]";
+            in_test = line == "[[test]]";
             name = None;
             continue;
         }
-        if !in_test_target {
+        if !in_test {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("name") {
-            if let Some(value) = rest.split('=').nth(1) {
-                name = Some(value.trim().trim_matches('"').to_string());
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "name" {
+                name = Some(value.trim().trim_matches('"').to_owned());
             }
-        }
-        if line.starts_with("required-features") && line.contains("test-isolation") {
-            if let Some(n) = name.clone() {
-                gated.insert(n);
+            if key.trim() == "required-features" {
+                let features = value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('"').to_owned())
+                    .collect();
+                assert!(targets
+                    .insert(name.clone().expect("named test target"), features)
+                    .is_none());
             }
         }
     }
-    gated
+    targets
+}
+fn gated_targets() -> BTreeSet<String> {
+    target_feature_sets()
+        .into_iter()
+        .filter(|(_, features)| *features == BTreeSet::from(["test-isolation".to_owned()]))
+        .map(|(name, _)| name)
+        .collect()
+}
+fn all_isolation_targets() -> BTreeSet<String> {
+    target_feature_sets()
+        .into_iter()
+        .filter(|(_, features)| features.contains("test-isolation"))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The Linux CI "did it run" loop names every gated target plus this guard
@@ -525,7 +543,7 @@ fn effective_source(path: &Path) -> String {
 
 #[test]
 fn every_target_that_can_reach_host_global_state_is_gated_on_test_isolation() {
-    let gated = gated_targets();
+    let gated = all_isolation_targets();
     let markers = host_global_markers();
     let mut ungated_but_reaching = Vec::new();
     for (name, path) in integration_target_files() {
@@ -553,7 +571,7 @@ fn every_target_that_can_reach_host_global_state_is_gated_on_test_isolation() {
 /// place that installs it, so every gated target must include it.
 #[test]
 fn every_gated_target_installs_the_shared_isolation_module() {
-    let gated = gated_targets();
+    let gated = all_isolation_targets();
     let mut missing_module = Vec::new();
     for (name, path) in integration_target_files() {
         if !gated.contains(&name) {
@@ -594,6 +612,11 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "integration_manifest_and_drain",
         "linux_business_profile_selection",
         "linux_business_signer_client",
+        "linux_business_writer_protocol",
+        "linux_business_writer_peer",
+        "linux_business_writer_loss",
+        "linux_business_writer_unit",
+        "linux_business_writer_bus_replies",
     ]
     .into_iter()
     .map(String::from)
@@ -846,4 +869,178 @@ fn gated_boot_and_spawn_helpers_supply_selection_roots() {
         .next()
         .unwrap()
         .contains("test_selector_roots"));
+}
+
+// Accounting only; the user-manager target runs separately on a non-root manager.
+#[cfg(not(feature = "user-manager-witness"))]
+#[test]
+fn skipped_linux_business_writer_user_manager_requires_user_manager_witness() {
+    let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
+    let blocks: Vec<_> = manifest
+        .split("[[test]]")
+        .filter(|block| {
+            block
+                .lines()
+                .any(|line| line == r#"name = "linux_business_writer_user_manager""#)
+        })
+        .collect();
+    assert_eq!(blocks.len(), 1);
+    let features: Vec<_> = blocks[0]
+        .lines()
+        .filter(|line| line.starts_with("required-features"))
+        .collect();
+    assert_eq!(
+        features,
+        [r#"required-features = ["test-isolation", "user-manager-witness"]"#]
+    );
+    let source =
+        std::fs::read_to_string(crate_root().join("tests/linux_business_writer_user_manager.rs"))
+            .unwrap();
+    assert!(source.contains("mod isolation;"));
+    assert!(!gated_targets().contains("linux_business_writer_user_manager"));
+}
+
+// Source layout is rustfmt-checked; a gated item ends at its own indentation, including inline modules.
+fn writer_production_source(source: &str) -> String {
+    let mut output = String::new();
+    let mut gated = false;
+    let mut item_indent = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[cfg(feature = \"test-isolation\")]" {
+            gated = true;
+            continue;
+        }
+        if gated {
+            if trimmed.starts_with("#[") || trimmed.starts_with("//") || trimmed.is_empty() {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if let Some(start) = item_indent {
+                if indent == start && trimmed.starts_with('}') {
+                    gated = false;
+                    item_indent = None;
+                }
+            } else if trimmed.ends_with(';') {
+                // A complete statement owns no following item, even when it contains braces.
+                gated = false;
+            } else if trimmed.contains('{') && !trimmed.ends_with('}') {
+                item_indent = Some(indent);
+            } else if trimmed.ends_with('}') {
+                gated = false;
+            }
+            continue;
+        }
+        output.push_str(line.split("//").next().unwrap_or_default());
+        output.push('\n');
+    }
+    assert!(!gated, "complete feature-gated source item");
+    output
+}
+
+#[test]
+fn production_reconciler_implementation_set_is_closed() {
+    fn visit(dir: &Path, implementations: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, implementations);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let source = writer_production_source(&std::fs::read_to_string(&path).unwrap());
+                implementations.extend(reconciler_implementations(&source));
+            }
+        }
+    }
+    let mut implementations = Vec::new();
+    visit(&crate_root().join("src"), &mut implementations);
+    // Must match execute in sanctuary-business-writer.rs: only this production implementation may supply reconciliation.
+    assert_eq!(implementations, vec!["ClosedReconciler"]);
+}
+
+#[test]
+fn writer_execute_composes_the_closed_reconciler() {
+    let source =
+        std::fs::read_to_string(crate_root().join("src/bin/sanctuary-business-writer.rs")).unwrap();
+    let production = writer_production_source(&source);
+    let execute = production
+        .split("fn execute()")
+        .nth(1)
+        .unwrap()
+        .split("fn main()")
+        .next()
+        .unwrap();
+    let fields: Vec<_> = execute
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("reconciler:"))
+        .collect();
+    assert_eq!(fields, vec!["reconciler: ClosedReconciler::production(),"]);
+}
+
+// The compiler seals writer_service::Reconciler; this scan also pins its production implementation source.
+fn reconciler_implementations(source: &str) -> Vec<String> {
+    let mut implementations = Vec::new();
+    for item in source.split("impl").skip(1) {
+        let mut rest = item.trim_start();
+        if rest.starts_with('<') {
+            let mut depth = 0;
+            for (index, ch) in rest.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    _ => (),
+                }
+                if depth == 0 {
+                    rest = rest[index + 1..].trim_start();
+                    break;
+                }
+            }
+        }
+        let mut words = rest.split_whitespace();
+        let name = words.next().unwrap_or_default();
+        if name.rsplit("::").next() == Some("Reconciler") && words.next() == Some("for") {
+            let target = words.next().unwrap_or_default().trim_end_matches('{');
+            implementations.push(target.to_owned());
+        }
+    }
+    implementations
+}
+
+fn assert_gated_statement_keeps_implementation(statement: &str, implementation: &str) {
+    let source = format!("#[cfg(feature = \"test-isolation\")]\n{statement}\n{implementation}\n");
+    let production = writer_production_source(&source);
+    assert_eq!(
+        production.trim(),
+        implementation,
+        "following production item retained"
+    );
+    assert_eq!(
+        reconciler_implementations(&production),
+        ["Other"],
+        "implementation spelling recognized"
+    );
+}
+
+#[test]
+fn gated_import_preserves_generic_implementation() {
+    assert_gated_statement_keeps_implementation(
+        "use a::{b, c};",
+        "impl<T> Reconciler for Other {\n}",
+    );
+}
+
+#[test]
+fn gated_constant_preserves_qualified_implementation() {
+    assert_gated_statement_keeps_implementation(
+        "const VALUE: bool = { true };",
+        "impl path::Reconciler for Other {\n}",
+    );
+}
+
+#[test]
+fn gated_static_preserves_combined_implementation() {
+    assert_gated_statement_keeps_implementation(
+        "static VALUE: [u8; 1] = { [0] };",
+        "impl<T: Bound<U>> path::Reconciler for Other {\n}",
+    );
 }

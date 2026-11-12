@@ -58,3 +58,20 @@ it("Linux only: release refuses retired transport and complete relay arguments",
   }
   } finally { rmdirSync(root); }
 });
+
+it("Linux only: writer isolation has a debug scan control and release refuses before reads", () => {
+  const marker = "SANCTUARY_WRITER_TEST_ISOLATION_V1";
+  const debug = readFileSync(nativeBinary("debug", "writer"));
+  const release = readFileSync(nativeBinary("release", "writer"));
+  for (const value of ["--test-writer", marker]) {
+    expect(debug.includes(Buffer.from(value))).toBe(true);
+    expect(release.includes(Buffer.from(value))).toBe(false);
+  }
+  const result = spawnSync(nativeBinary("release", "writer"), ["--test-writer", "/tmp/absent-writer-seam.json"], {env:{VITEST:"true"}, encoding:"utf8", timeout:2000});
+  expect(result.status).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).toBe("K1_REFUSED\n");
+  const source = readFileSync("../castle-wall-daemon/src/bin/sanctuary-business-writer.rs", "utf8");
+  const production = source.slice(source.indexOf("if !args.is_empty()"));
+  expect(production.indexOf("libc::geteuid()")).toBeLessThan(production.indexOf("HeldConfig::production()"));
+  expect(production.indexOf("return Err(refused())")).toBeLessThan(production.indexOf("drop_capabilities_with(CapabilityDrop::Writer { isolation: false })"));
+  expect(production.indexOf("drop_capabilities_with(CapabilityDrop::Writer { isolation: false })")).toBeLessThan(production.indexOf("HeldConfig::production()"));
+});

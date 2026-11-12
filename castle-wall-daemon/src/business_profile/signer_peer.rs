@@ -24,7 +24,17 @@ pub struct PeerPolicy {
     pub uid: u32,
     pub gid: u32,
     pub executable_sha256: String,
+    // Stored as trimmed raw cgroup-v2 proc text (0::/path); capture and writer_peer normalize through normalized_cgroup.
     pub cgroup: String,
+}
+/// Must match writer_peer::normalized_cgroup: one unified proc row becomes the systemd ControlGroup path.
+pub fn normalized_cgroup(text: &str) -> io::Result<String> {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let path = line.strip_prefix("0::").ok_or_else(refused)?;
+    if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
+        return Err(refused());
+    }
+    Ok(path.into())
 }
 pub struct Peer {
     pub pid: i32,
@@ -70,7 +80,8 @@ impl Peer {
         }
         let start = process_start(cred.pid)?;
         let group = bounded_text(&format!("/proc/{}/cgroup", cred.pid))?;
-        if group.trim() != policy.cgroup {
+        // Compare the kernel peer and the stored policy only after the same cgroup-v2 parser used by writer_peer.
+        if normalized_cgroup(&group)? != normalized_cgroup(&policy.cgroup)? {
             return Err(refused());
         }
         let file = fs::File::open(format!("/proc/{}/exe", cred.pid))?;
@@ -488,7 +499,7 @@ pub fn kernel_probe() -> io::Result<()> {
     Ok(())
 }
 
-fn same_pidfd(a: RawFd, b: RawFd) -> bool {
+pub(crate) fn same_pidfd(a: RawFd, b: RawFd) -> bool {
     let mut first: libc::stat = unsafe { mem::zeroed() };
     let mut second: libc::stat = unsafe { mem::zeroed() };
     unsafe {
@@ -548,18 +559,45 @@ pub fn validate_capability_status(status: &str, bounding: bool) -> io::Result<()
     Ok(())
 }
 pub fn drop_capabilities() -> io::Result<()> {
+    drop_capabilities_with(CapabilityDrop::Signer)
+}
+/// The signer keeps its established nonroot isolation behavior; writer isolation tolerates only EPERM.
+pub enum CapabilityDrop {
+    Signer,
+    Writer { isolation: bool },
+}
+fn bounding_drop_result(writer: bool, isolation: bool, error: io::Error) -> io::Result<()> {
+    // Only EPERM can represent the writer's explicitly isolated unprivileged bounding drop.
+    if !isolation || (writer && error.raw_os_error() != Some(libc::EPERM)) {
+        Err(if writer { error } else { refused() })
+    } else {
+        Ok(())
+    }
+}
+/// Shared capability ABI and dropped sets for the signer and sanctuary-business-writer::execute.
+pub fn drop_capabilities_with(policy: CapabilityDrop) -> io::Result<()> {
+    let writer = matches!(policy, CapabilityDrop::Writer { .. });
+    let isolation = cfg!(feature = "test-isolation")
+        && match policy {
+            CapabilityDrop::Signer => (unsafe { libc::geteuid() }) != 0,
+            CapabilityDrop::Writer { isolation } => isolation,
+        };
     let last: i32 = bounded_text("/proc/sys/kernel/cap_last_cap")?
         .trim()
         .parse()
         .map_err(|_| refused())?;
-    // Only the non-root isolation build may retain an inert bounding set that it has no privilege to lower.
-    let isolation = cfg!(feature = "test-isolation") && unsafe { libc::geteuid() } != 0;
+    // The writer admits only the two-word Linux capability ABI before iterating its bounding set.
+    if writer && !(0..64).contains(&last) {
+        return Err(refused());
+    }
     for cap in 0..=last {
-        if unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) } == 1
-            && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0
-            && !isolation
-        {
-            return Err(refused());
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) };
+        if writer && present < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 1 && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0 {
+            let error = io::Error::last_os_error();
+            bounding_drop_result(writer, isolation, error)?;
         }
     }
     #[repr(C)]
@@ -585,16 +623,34 @@ pub fn drop_capabilities() -> io::Result<()> {
         permitted: 0,
         inheritable: 0,
     }; 2];
+    // Both writer_service and the signer use this one ABI set; signer mode preserves its existing operation order.
+    if writer
+        && unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     // Must match sanctuary-business-signer.service: empty peer capabilities allow executable inspection without ptrace privilege.
     if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0
         || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
     {
-        return Err(refused());
+        return Err(if writer {
+            io::Error::last_os_error()
+        } else {
+            refused()
+        });
     }
     empty_capabilities(unsafe { libc::getpid() }, !isolation)
 }
 
-fn pidfd_pid(fd: RawFd) -> Option<i32> {
+pub(crate) fn pidfd_pid(fd: RawFd) -> Option<i32> {
     // fdinfo retains the kernel sender identity even on kernels whose pidfds share an anonymous inode.
     bounded_text(&format!("/proc/self/fdinfo/{fd}"))
         .ok()?
@@ -606,6 +662,29 @@ fn pidfd_pid(fd: RawFd) -> Option<i32> {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    #[test]
+    fn bounding_drop_preserves_mode_and_errno() {
+        for writer in [false, true] {
+            for isolation in [false, true] {
+                for errno in [libc::EPERM, libc::EINVAL, libc::EACCES, libc::ENOSYS] {
+                    let result = bounding_drop_result(
+                        writer,
+                        isolation,
+                        io::Error::from_raw_os_error(errno),
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        isolation && (!writer || errno == libc::EPERM),
+                        "bounding tolerance is mode and errno specific"
+                    );
+                    if let (true, Err(error)) = (writer, result) {
+                        assert_eq!(error.raw_os_error(), Some(errno));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn uid_refusal_is_distinct_from_receive_and_process_faults() {
         let mut fds = [-1; 2];
