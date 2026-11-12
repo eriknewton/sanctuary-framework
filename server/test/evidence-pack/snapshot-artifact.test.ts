@@ -6,7 +6,7 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, symlinkSync, cpSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, symlinkSync, cpSync, mkdirSync, unlinkSync, openSync, fstatSync, closeSync, constants } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -17,6 +17,8 @@ import { samples, scratch, sample, buildArgs, buildRoot, entries, name, setName,
 // @ts-expect-error Node build script deliberately has no TypeScript wrapper.
 import { buildCandidate, checkDescriptor, checkerArgs, candidateForTests } from "../../scripts/build-evidence-pack.mjs";
 let release: Sample, fixture: Sample;
+// One descriptor answers both identity questions, so the inode and the bytes describe the same file; O_NOFOLLOW makes a swapped-in link fail the case.
+function snapshotFile(path: string): { ino: number; bytes: Buffer } { const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); try { return { ino: fstatSync(fd).ino, bytes: readFileSync(fd) }; } finally { closeSync(fd); } }
 const TIMEOUT = 120_000;
 const policy = (s: Sample, tar = s.tar, manifest = s.manifest) => checkArtifact(tar, manifest, pins(s, tar, manifest));
 const error = (r: Parsed<unknown>) => r.ok ? "ACCEPTED" : r.error;
@@ -158,20 +160,20 @@ describe("packed artifact authority", () => {
   });
   it("A16 later copy refusal preserves foreign files and never writes READY", async () => {
     const root = buildRoot(release), dir = join(scratch(), "artifact"); let faults = 0;
-    const untouched = join(root, "server/evidence-pack-dist/export-evidence-pack.js"), before = { ino: lstatSync(untouched).ino, bytes: readFileSync(untouched) };
+    const untouched = join(root, "server/evidence-pack-dist/export-evidence-pack.js"), before = snapshotFile(untouched);
     let copied: { path: string; ino: number; bytes: Buffer } | undefined;
     const unlink = vi.spyOn(fs, "unlinkSync"); syncBuiltinESMExports();
     try {
       await expect(buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision, { afterCopy: (path: string) => { if (path.endsWith("packages/evidence-pack-verifier/dist")) {
         faults++; writeFileSync(join(path, "foreign"), "keep");
-        const tracked = join(path, "verify-evidence-pack.js"); copied = { path: tracked, ino: lstatSync(tracked).ino, bytes: readFileSync(tracked) };
+        const tracked = join(path, "verify-evidence-pack.js"); copied = { path: tracked, ...snapshotFile(tracked) };
         expect(unlink.mock.calls.length).toBeGreaterThan(0); // Clearing must be observed before zero refusal calls can carry evidence.
         unlink.mockClear(); // Only the refusal path is counted; ordinary pre-copy clearing is authorized.
         throw new Error("scheduled copy refusal");
       } } })).rejects.toThrow("scheduled copy refusal");
       expect(faults).toBe(1); expect(unlink).not.toHaveBeenCalled();
-      expect(lstatSync(untouched).ino).toBe(before.ino); expect(readFileSync(untouched)).toEqual(before.bytes);
-      expect(lstatSync(copied!.path).ino).toBe(copied!.ino); expect(readFileSync(copied!.path)).toEqual(copied!.bytes);
+      expect(snapshotFile(untouched)).toEqual(before);
+      expect(snapshotFile(copied!.path)).toEqual({ ino: copied!.ino, bytes: copied!.bytes });
       expect(readFileSync(join(root, "packages/evidence-pack-verifier/dist/foreign"), "utf8")).toBe("keep"); expect(existsSync(join(dir, ARTIFACT_FILES.receipt))).toBe(false); expect(existsSync(join(dir, ARTIFACT_FILES.tarball))).toBe(true);
     } finally { unlink.mockRestore(); syncBuiltinESMExports(); }
     control();
