@@ -6,18 +6,25 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import stat
 import sys
 import time
 
 root, executable, signer_socket, policy_json = sys.argv[1:5]
 fault = sys.argv[5] if len(sys.argv) == 6 else "none"
 root = Path(root)
+# Must match RECORD_MODE in castle-wall-daemon/src/business_profile/writer_peer.rs (0o660): the
+# writer refuses a record listener whose mode differs, so owner and socket group read and write.
+RECORD_MODE = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP
+# The bits the writer's artifact and mapping checks refuse (mode & 0o022 in writer_peer.rs and
+# writer_service.rs); the mode faults below add exactly these to an otherwise trusted file.
+GROUP_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH
 shutil.copyfile(executable, root / "writer.exec")
 os.chmod(root / "writer.exec", 0o700)
 executable = str(root / "writer.exec")
 record = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 record.bind(str(root / 'writer.record'))
-os.chmod(root / 'writer.record', 0o660)
+os.chmod(root / 'writer.record', RECORD_MODE)
 record.listen(1)
 notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 notify.bind(str(root / 'writer.notify'))
@@ -63,11 +70,11 @@ if fault == 'owner':
 if fault == 'library-owner':
     seam['library_owner'] = os.geteuid() + 1
 if fault == 'library-mode':
-    os.chmod(library, 0o622)
+    os.chmod(library, stat.S_IMODE(library.stat().st_mode) | GROUP_OTHER_WRITE)
 if fault == 'config-replace':
     (root / 'replace-config').write_bytes(b'fixture')
 if fault == 'mode':
-    os.chmod(executable, 0o722)
+    os.chmod(executable, stat.S_IMODE(os.stat(executable).st_mode) | GROUP_OTHER_WRITE)
 if fault == 'links':
     os.link(executable, root / 'writer.link')
 if fault == 'identity':
