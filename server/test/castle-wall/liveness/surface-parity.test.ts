@@ -30,6 +30,23 @@ import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { startRig, openDurableSession } from "../../v1/rig.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+// Script blocks of the pages' own rendered markup, located by index rather than by a stripping regex, so a tag's case or attributes never hide a block.
+function scriptBlocks(markup: string): { start: number; end: number; body: string }[] {
+  const lower = markup.toLowerCase(), blocks: { start: number; end: number; body: string }[] = [];
+  for (let start = lower.indexOf("<script"); start !== -1; start = lower.indexOf("<script", start + 1)) {
+    const open = lower.indexOf(">", start), close = lower.indexOf("</script", open);
+    if (open === -1 || close === -1) throw new Error("unterminated script block in rendered markup");
+    const end = lower.indexOf(">", close);
+    if (end === -1) throw new Error("unterminated script close tag in rendered markup");
+    blocks.push({ start, end: end + 1, body: markup.slice(open + 1, close) }); start = end;
+  }
+  return blocks;
+}
+function withoutScripts(markup: string): string {
+  let out = "", from = 0;
+  for (const block of scriptBlocks(markup)) { out += markup.slice(from, block.start); from = block.end; }
+  return out + markup.slice(from);
+}
 
 const fixture = JSON.parse(readFileSync(join(__dirname, "fixtures/states.json"), "utf8"));
 const cases: { name: string; charge_remaining_ms?: number; census_remaining_ms?: number; patches: { path: string; value?: unknown; offset_ms?: number }[] }[] =
@@ -301,7 +318,7 @@ function browser(script: string, html = renderPostureHomeHTML(), route?: "overvi
   const intervals: { fn: () => void; ms: number }[] = []; const listeners: Record<string, () => void> = {};
   const elements = new Map<string, any>();
   function declare(markup: string) {
-    for (const match of markup.replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "").matchAll(/\bid="([^"]+)"/g)) {
+    for (const match of withoutScripts(markup).matchAll(/\bid="([^"]+)"/g)) {
       if (!elements.has(match[1]!)) elements.set(match[1]!, element());
     }
   }
@@ -349,8 +366,8 @@ function browser(script: string, html = renderPostureHomeHTML(), route?: "overvi
 const shipped = [
   ...(["overview", "first run", "enforcement"] as const).map(route =>
     ["dashboard " + route, () => getClientScript(), () => renderDashboardV11Html({ embedClient: false }), route] as const),
-  ["posture home", () => renderPostureHomeHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, ""), renderPostureHomeHTML, undefined],
-  ["posture agent", () => renderPostureAgentHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, ""), renderPostureAgentHTML, undefined],
+  ["posture home", () => scriptBlocks(renderPostureHomeHTML()).map(b => b.body).find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!, renderPostureHomeHTML, undefined],
+  ["posture agent", () => scriptBlocks(renderPostureAgentHTML()).map(b => b.body).find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!, renderPostureAgentHTML, undefined],
 ] as const;
 describe("liveness presentation contract", () => {
   it("matches the documented precedence order", () => {
@@ -376,7 +393,7 @@ describe("liveness presentation contract", () => {
   });
   it.each(shipped)("declares one scheduled badge mount in %s", (_name, source, markup, route) => {
     const page = browser(source(), markup(), route);
-    const html = route ? page.elements.get("main").innerHTML : markup().replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "");
+    const html = route ? page.elements.get("main").innerHTML : withoutScripts(markup());
     expect([...html.matchAll(/\bid="castle-wall-liveness"/g)]).toHaveLength(1);
     page.install(projection());
     expect(page.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="wall_OK_IDLE"');

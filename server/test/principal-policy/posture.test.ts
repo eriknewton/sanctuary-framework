@@ -24,6 +24,12 @@ import {
 } from "../../src/castle-wall/constants.js";
 import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
 import { protectionSubjectFromMacOSAuditToken } from "../../src/castle-wall/subject-binding.js";
+// Visible text of the page's own rendered markup, read by a character scan rather than a tag-stripping regex.
+function textOutsideTags(html: string): string {
+  let out = "", inTag = false;
+  for (const ch of html) { if (ch === "<") inTag = true; else if (ch === ">" && inTag) inTag = false; else if (!inTag) out += ch; }
+  return out;
+}
 
 const FORTRESS = "fortress:test";
 
@@ -1351,7 +1357,7 @@ describe("liveness badges", () => {
     const html = renderLivenessBadges(projection as any);
     expect(html).toContain('data-state="wall_DOWN"');
     expect(html).toContain('title="observer_stale"');
-    const visible = html.replace(/<[^>]*>/g, "");
+    const visible = textOutsideTags(html);
     expect(visible).toBe("Wall: Down Agent: Not monitored Coverage: Unavailable");
     expect(visible).not.toMatch(/wall_DOWN|observer_stale|agent_UNMONITORED|coverage_UNAVAILABLE|\u2014/);
   });
