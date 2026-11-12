@@ -142,6 +142,8 @@ def render(role):
                 del restored[item['directive']]
     for item in manifest['omissions']:
         if item['unit'] == role:
+            # An omission is evidence about emitted text, so it must be absent before inversion.
+            assert item['directive'] not in restored, 'emitted omission absent: ' + item['directive']
             restored[item['directive']] = item['values']
     assert restored == original, 'complete reversed directive equality'
     return output
