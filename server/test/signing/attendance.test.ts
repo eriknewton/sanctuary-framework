@@ -42,9 +42,6 @@ it("Linux only: crashed secret worker is reaped into WIPE_UNCONFIRMED",async()=>
 it.each(["extra","non-tty","foreign"] as const)("Linux only: ceremony refuses %s descriptors before any factor read",async mode=>{
   const f=await serviceFixture();try{expect(await f.ceremony(mode)).toBe(1);expect(f.trace.promptSeen).toBe(false);expect(f.trace.workerBytes).toBe(0);expect((await f.client.status()).state).toBe("LOCKED");}finally{await f.close();}
 },20_000);
-it("Linux only: bridge refuses a stream write from another process",async()=>{
-  const f=await serviceFixture();try{const result=await f.foreignWrite();expect(result.responded).toBe(false);expect(result.bridgeExit).toBe(1);}finally{await f.close();}
-},20_000);
 it("Linux only: recovery factor unlocks only through the attended terminal",async()=>{
   const f=await serviceFixture();try{expect(await f.ceremonyRecovery()).toBe(0);expect(f.trace.echoed).toBe(false);const {g,bytes}=await f.body();expect((await f.client.signRecord({role:g.role,epoch:g.epoch,preimage_bytes:bytes},g,deadline())).kid).toBe(g.kid);expect(await f.ceremony(true)).toBe(0);}finally{await f.close();}
 },20_000);

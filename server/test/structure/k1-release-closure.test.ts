@@ -1,7 +1,9 @@
 // fail-before-exempt: Marker propagation and platform independent source pins preserve existing absence properties; native entrypoint refusal is also checked with the marker present.
 import {it as test,expect} from "vitest";
 const it = process.platform === "linux" ? test : test.skip;
-import {readFileSync} from "node:fs";
+import {readFileSync, mkdtempSync, rmdirSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {execFileSync} from "node:child_process";
 test("worker closure excludes secret observers and credential injection",()=>{
   const worker=readFileSync("dist/k1/signing-worker.cjs","utf8");
@@ -19,7 +21,7 @@ test("frame constants and service installation paths agree on both sides",()=>{
   const worker=readFileSync("src/signing/worker.ts","utf8");
   const tty=worker.match(/const TTY_FD = (\d+);/)?.[1]; expect(tty).toBe("3");
   expect(custody).toContain(`pub const TTY_FD: i32 = ${tty};`);expect(custody).toContain('"/usr/libexec/sanctuary-business-signer"');expect(unit).toContain("ExecStart=/usr/libexec/sanctuary-business-signer");
-  expect(custody).toContain('"/var/lib/sanctuary-business-signer"');expect(unit).toContain("ReadWritePaths=/var/lib/sanctuary-business-signer /run/sanctuary/business-signer");
+  expect(custody).toContain('"/var/lib/sanctuary-business-signer"');expect(unit).toContain("ReadWritePaths=/var/lib/sanctuary-business-signer /run/sanctuary-business-signer");
   for(const pin of ["Type=notify","Restart=no","PrivateDevices=yes","MemorySwapMax=0","KillMode=control-group","RestrictAddressFamilies=AF_UNIX"])expect(unit).toContain(pin);
 });
 
@@ -34,8 +36,25 @@ test.skipIf(process.platform !== "linux")("Linux only: default native release co
   const refused=spawnSync(unlock,["--test-ceremony"],{env:{VITEST:"true"},encoding:"utf8",timeout:2000});
   expect(refused.status).toBe(1);expect(refused.stderr).toBe("K1_REFUSED\n");
   const artifact=readFileSync(path);
-  for(const hook of ["--test-service","--test-bridge","k1-test-frames.bin"])expect(artifact.includes(Buffer.from(hook))).toBe(false);
+  for(const hook of ["--test-service","--test-bridge","--test-relay","--test-client","--test-boot-id","k1-test-frames.bin"])expect(artifact.includes(Buffer.from(hook))).toBe(false);
   const result=spawnSync(path,["--test-service"],{env:{VITEST:"true",K1_FACTOR:"synthetic-unlock-attempt",NODE_OPTIONS:"--inspect"},encoding:"utf8",timeout:2000});
   expect(await releaseIsolationProbe(path)).toBe(false);
   expect(result.status).toBe(1);expect(result.stdout).toBe("");expect(result.stderr).toBe("K1_REFUSED\n");
+});
+
+test("release argument refusal precedes every production path read", () => {
+  const source = readFileSync("../castle-wall-daemon/src/bin/sanctuary-business-signer.rs", "utf8");
+  const production = source.slice(source.indexOf("if !args.is_empty()"));
+  expect(production.indexOf("return Err(refused())")).toBeLessThan(production.indexOf("read_pinned("));
+});
+it("Linux only: release refuses retired transport and complete relay arguments", () => {
+  const root = mkdtempSync(join(tmpdir(), "k1-release-argv-"));
+  const socket = join(root, "sign.sock");
+  try {
+  for (const args of [["--bridge"], ["--test-relay", socket, "{}"], ["--test-client", socket, "{}"],
+    ["--test-service", join(root,"config"), join(root,"control"), join(root,"custody"), join(root,"node"), join(root,"worker"), "--test-boot-id", join(root,"boot-id")]]) {
+    const result = spawnSync(nativeBinary("release", "signer"), args, {env:{VITEST:"true"}, encoding:"utf8", timeout:2000});
+    expect(result.status).toBe(1); expect(result.stdout).toBe(""); expect(result.stderr).toBe("K1_REFUSED\n");
+  }
+  } finally { rmdirSync(root); }
 });

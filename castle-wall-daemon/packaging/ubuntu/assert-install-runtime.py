@@ -20,7 +20,7 @@ SEAMS = {'--isolated-runtime-root': '/nonexistent/package-seam', '--isolated-cas
          '--test-wedge-health-pass-after': '1', '--test-delay-before-ready-ms': '1',
          '--test-trigger-nfqueue-deadline-fail-stop': None,
          '--test-trigger-fatal-control-path': None, '--test-hang-teardown': None,
-         '--test-service': None, '--test-bridge': None, '--test-ceremony': None}
+         '--test-service': None, '--test-boot-id': None, '--test-relay': None, '--test-client': None, '--test-ceremony': None}
 
 
 def classify_refusal(name, flag, status, stderr):

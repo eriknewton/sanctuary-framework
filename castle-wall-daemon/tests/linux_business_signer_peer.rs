@@ -1,3 +1,4 @@
+// fail-before-exempt: the required group policy is new; capability admission already exists.
 #![cfg(target_os = "linux")]
 use castle_wall_daemon::business_profile::signer_peer::*;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,7 @@ fn pair() -> (OwnedFd, OwnedFd) {
 fn policy() -> PeerPolicy {
     PeerPolicy {
         uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
         executable_sha256: hex::encode(Sha256::digest(std::fs::read("/proc/self/exe").unwrap())),
         cgroup: std::fs::read_to_string("/proc/self/cgroup")
             .unwrap()
@@ -255,4 +257,31 @@ fn service_capability_status_requires_every_empty_set_and_no_new_privileges() {
         validate_capability_status(&EMPTY.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"), true)
             .is_err()
     );
+}
+
+#[test]
+fn primary_group_must_match_and_missing_policy_group_refuses() {
+    let (a, _) = pair();
+    let mut p = policy();
+    assert!(Peer::capture(a.as_raw_fd(), &p).is_ok());
+    const OTHER_GROUP_OFFSET: u32 = 1; // A distinct group from this test's own effective group.
+    p.gid += OTHER_GROUP_OFFSET;
+    assert!(
+        Peer::capture(a.as_raw_fd(), &p).is_err(),
+        "wrong primary group admitted"
+    );
+    let mut value = serde_json::to_value(policy()).unwrap();
+    value.as_object_mut().unwrap().remove("gid");
+    assert!(
+        serde_json::from_value::<PeerPolicy>(value).is_err(),
+        "missing primary group admitted"
+    );
+}
+#[test]
+fn bounding_capability_admission_uses_the_root_owner_policy() {
+    let status = "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000001\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n";
+    assert!(validate_capability_status(status, true).is_err());
+    assert!(validate_capability_status(status, false).is_ok());
+    let source = include_str!("../src/business_profile/signer_service.rs");
+    assert!(source.contains("empty_capabilities(peer.pid, paths.owner == ROOT_UID)"));
 }

@@ -10,7 +10,7 @@ import { encrypt, decrypt } from "../../src/core/encryption.js";
 import { encryptBinding } from "../../src/signing/binding-store.js";
 import { prepareRoleIdentity } from "../../src/signing/provision.js";
 import { canonicalBytes, ROLE_REGISTRY, ROLE_SIGNATURE_SCHEME } from "../../src/signing/contract.js";
-import { SigningServiceClient } from "../../src/signing/service.js";
+import { RelayClient } from "./k1-relay-client.js";
 import type { SigningGrant } from "../../src/signing/record-signer.js";
 // Must match the Linux workflow build steps: one target root contains debug and release artifacts.
 export function nativeBinary(profile: "debug" | "release", name: "signer" | "unlock"): string {
@@ -56,12 +56,12 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
   for(const namespace of await storage.listNamespaces()) {const dir=join(custody,namespace);directories.push(dir);mkdirSync(dir,{mode:0o700});for(const entry of await storage.list(namespace)){files.push(join(dir,entry.key+".enc"));writeFileSync(join(dir,entry.key+".enc"),(await storage.read(namespace,entry.key))!,{mode:0o600});}}
   master.masterKey.fill(0);key.fill(0);await master.masterWriteBarrier?.release();
   const uid=process.getuid!(),cgroup=readFileSync("/proc/self/cgroup","utf8").trim();
-  const peer={uid,executable_sha256:digest(binary),cgroup};
+  const peer={uid,gid:process.getegid!(),executable_sha256:digest(binary),cgroup};
   const workerPath=(rootUnit || workerSource !== undefined)?join(root,"signing-worker.cjs"):resolve("dist/k1/signing-worker.cjs");
   if(rootUnit){if(uid!==0)throw new Error("K1_ROOT_UNIT_REQUIRES_ROOT");copyFileSync(resolve("dist/k1/signing-worker.cjs"),workerPath);chmodSync(workerPath,0o600);files.push(workerPath);unitName=`sanctuary-k1-drill-${process.pid}-${randomBytes(4).toString("hex")}.service`;}
-  const servicePeer=rootUnit?{...peer,cgroup:`0::/system.slice/${unitName}`} : peer;
+  const servicePeer=rootUnit?{...peer,gid:Number(execFileSync("getent",["group","sanctuary"],{encoding:"utf8"}).trim().split(":")[2]),cgroup:`0::/system.slice/${unitName}`} : peer;
   if(workerSource !== undefined){writeFileSync(workerPath,workerSource,{mode:0o600});files.push(workerPath);}
-  const config={controller:peer,launcher:{uid,executable_sha256:digest(launcher),cgroup},node_sha256:digest(fixtureNode),worker_sha256:digest(workerPath),grant,fortress_id:fortress,roster_digest:roster,binding_high_water:0,runtime:(JSON.parse(execFileSync(fixtureNode,["-e","process.stdout.write(JSON.stringify(process.report.getReport().sharedObjects.filter(p=>p!=='linux-vdso.so.1').map(p=>require('node:fs').realpathSync(p))))"],{env:{VITEST:"true"},encoding:"utf8"})) as string[]).map(path=>({path,sha256:digest(path)}))};
+  const config={controller:peer,launcher:{uid,gid:process.getegid!(),executable_sha256:digest(launcher),cgroup},node_sha256:digest(fixtureNode),worker_sha256:digest(workerPath),grant,fortress_id:fortress,roster_digest:roster,binding_high_water:0,runtime:(JSON.parse(execFileSync(fixtureNode,["-e","process.stdout.write(JSON.stringify(process.report.getReport().sharedObjects.filter(p=>p!=='linux-vdso.so.1').map(p=>require('node:fs').realpathSync(p))))"],{env:{VITEST:"true"},encoding:"utf8"})) as string[]).map(path=>({path,sha256:digest(path)}))};
   const configPath=join(root,"config.json"),peerPath=join(root,"peer.json");files.push(configPath,peerPath);writeFileSync(configPath,canonicalBytes(config),{mode:0o600});writeFileSync(peerPath,canonicalBytes(servicePeer),{mode:0o644});
   const serviceArgs=["--test-service",configPath,control,custody,fixtureNode,workerPath];
   if(rootUnit){
@@ -75,9 +75,10 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
     execFileSync("systemctl",["link","--runtime",unitPath]);execFileSync("systemctl",["daemon-reload"]);
   }
   const startService=()=>rootUnit?spawn("systemctl",["start",unitName!],{env:{VITEST:"true"},stdio:["ignore","pipe","pipe"]}):spawn(binary,serviceArgs,{env:{VITEST:"true"},stdio:["ignore","pipe","pipe"]});let service=startService();children.push(service);service.stdout.on("data",b=>logs.push(b));service.stderr.on("data",b=>logs.push(b));
-  const clientChild=()=>{const child=spawn(binary,["--test-bridge",join(control,"sign.sock"),JSON.stringify(servicePeer),JSON.stringify({...peer,executable_sha256:digest(process.execPath)})],{env:{VITEST:"true"},stdio:"pipe"});children.push(child);child.stdout.on("data",b=>frames.push(Buffer.from(b)));child.stderr.on("data",b=>logs.push(Buffer.from(b)));const write=child.stdin.write.bind(child.stdin);child.stdin.write=((chunk:Uint8Array,...args:unknown[])=>{frames.push(Buffer.from(chunk));return (write as Function)(chunk,...args);}) as typeof child.stdin.write;return child;};
+  // Must match require_unix_socket in signer_peer.rs and k1-relay-client.ts: the relay stdin must be an AF_UNIX socket.
+  const clientChild=()=>{const child=spawn(binary,["--test-relay",join(control,"sign.sock"),JSON.stringify(servicePeer)],{env:{VITEST:"true"},stdio:"pipe"});children.push(child);child.stdout.on("data",b=>frames.push(Buffer.from(b)));child.stderr.on("data",b=>logs.push(Buffer.from(b)));const write=child.stdin.write.bind(child.stdin);child.stdin.write=((chunk:Uint8Array,...args:unknown[])=>{frames.push(Buffer.from(chunk));return (write as Function)(chunk,...args);}) as typeof child.stdin.write;return child;};
   for(let i=0;i<500;i++){try{readFileSync(configPath);if(readdirSync(control).includes("sign.sock"))break;}catch{} await pause(20);}
-  const child=clientChild(); let client=new SigningServiceClient(child);
+  const child=clientChild(); let client=new RelayClient(child);
   try {await client.status();}catch(e){await client.close();await reap(service);throw new Error("fixture service not ready: "+Buffer.concat(logs).toString(),{cause:e});}
   const trace = {promptSeen:false,workerBytes:0,echoed:false,terminalRestored:false};
   const ceremony=async(lock: boolean | "extra" | "non-tty" | "foreign" = false, factor=passphrase, recovery=false, held=false, settle=true)=>{
@@ -101,16 +102,51 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
   };
   // Must match attendance.test.ts: the marker survives every noncooperative settlement.
   return {trace,markerPresent:()=>existsSync(join(custody,"worker-unclean")),workerPid(){return Number(readFileSync(`/proc/${service.pid}/task/${service.pid}/children`,"utf8").trim());},get client(){return client;},get service(){return service;},grant,
+    async probeClient() {
+      await client.close();
+      return JSON.parse(execFileSync(binary,["--test-client",join(control,"sign.sock"),JSON.stringify(servicePeer)],{env:{VITEST:"true"},encoding:"utf8",timeout:5_000})) as unknown;
+    },
+    async killController() {const relay=children.find(c => c.pid === child.pid)!; relay.kill("SIGKILL");await reap(relay);},
+    async freshClient() {client=new RelayClient(clientChild());return client.status();},
+    async probeBootId(text: string, bootIdPath?: string) {
+      await client.close(); await reap(service);
+      for (const socket of ["sign.sock", "lifecycle.sock"]) {const path=join(control,socket);if(existsSync(path))unlinkSync(path);}
+      const boot=join(root,"boot-id"),notify=join(root,"notify.sock"); files.push(boot,notify);
+      writeFileSync(boot,text,{mode:0o600});
+      // A real datagram observer distinguishes startup refusal from merely refusing later client traffic.
+      const script = `import ctypes,json,os,socket,subprocess,sys,time
+s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)
+s.bind(sys.argv[1])
+s.settimeout(0.05)
+# Linux prctl option 1 is PR_SET_PDEATHSIG; signal 9 is SIGKILL, so observer timeout death also kills S.
+def parent_death_signal():
+ if ctypes.CDLL(None).prctl(1, 9) != 0:
+  raise RuntimeError("parent-death signal setup failed")
+p=subprocess.Popen(sys.argv[2:],preexec_fn=parent_death_signal,env={"NOTIFY_SOCKET":sys.argv[1],"VITEST":"true"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+ready=0
+started=time.monotonic()
+end=started+2
+try:
+ while time.monotonic()<end:
+  try:
+   data=s.recv(1024)
+   ready+=int(b"READY=1" in data)
+  except socket.timeout: pass
+  if ready or p.poll() is not None: break
+finally:
+ if p.poll() is None: p.terminate()
+ try: out,err=p.communicate(timeout=2)
+ except subprocess.TimeoutExpired:
+  p.kill();out,err=p.communicate()
+ s.close()
+print(json.dumps({"ready":ready,"code":p.returncode,"stderr":err.decode(),"elapsedMs":(time.monotonic()-started)*1000}))`;
+      return JSON.parse(execFileSync("python3",["-c",script,notify,binary,...serviceArgs,"--test-boot-id",bootIdPath ?? boot],{encoding:"utf8",timeout:10_000})) as {ready:number;code:number;stderr:string;elapsedMs:number};
+    },
     lockImmediate:()=>ceremony(true,passphrase,false,false,false),
     ceremonyHeld:()=>ceremony(false,passphrase,false,true),
     ceremonyEdited:()=>ceremony(false,passphrase+"x\x7f"),
-    async restart(){await client.close();await reap(service);for(const socket of ["sign.sock","lifecycle.sock"])unlinkSync(join(control,socket));service=startService();children.push(service);service.stdout!.on("data",b=>logs.push(b));service.stderr!.on("data",b=>logs.push(b));for(let i=0;i<500&&!readdirSync(control).includes("sign.sock");i++)await pause(20);client=new SigningServiceClient(clientChild());await client.status();},
-ceremonyRecovery:()=>ceremony(false,master.mintedRecoveryKey!,true),async foreignWrite(){
-    const before=frames.length;
-    const writer=spawn("python3",["-c", "import os; os.write(0, bytes.fromhex('0000000f7b226f70223a22535441545553227d'))"],{env:{VITEST:"true"},stdio:[child.stdin,"ignore","ignore"]});children.push(writer);
-    await new Promise<void>(resolve=>writer.once("exit",()=>resolve()));await pause(100);
-    return {responded:frames.length>before,bridgeExit:child.exitCode};
-  },secrets,frames,logs,ceremony,privateFrames(){return readFileSync(join(control,"k1-test-frames.bin"));},async body(){const status=await client.status();const g=status.grant;return {g,bytes:canonicalBytes({signature_scheme:ROLE_SIGNATURE_SCHEME,...{role:g.role,epoch:g.epoch,kid:g.kid,identity_id:g.identity_id,machine_id:g.machine_id},record_kind:"counter",activation_id:g.activation_id,lease_id:g.lease_id,generation:g.generation,boot_id:"f".repeat(32),sequence:1,prior_commitment:"GENESIS",captured_at_unix_ms:1,captured_at_boottime_ns:"1",policy_digest:roster,runtime_digest:roster,config_digest:roster,payload:{count:1}})};},async close(){await client.close();if(unitName){execFileSync("systemctl",["stop",unitName]);unlinkSync(join("/run/systemd/system",unitName));execFileSync("systemctl",["daemon-reload"]);unitName=undefined;}for(const c of children.reverse())await reap(c);for(const s of secrets)s.fill(0);cleanup(root,files,directories);}};
+    async restart(){await client.close();await reap(service);for(const socket of ["sign.sock","lifecycle.sock"])unlinkSync(join(control,socket));service=startService();children.push(service);service.stdout!.on("data",b=>logs.push(b));service.stderr!.on("data",b=>logs.push(b));for(let i=0;i<500&&!readdirSync(control).includes("sign.sock");i++)await pause(20);client=new RelayClient(clientChild());await client.status();},
+ceremonyRecovery:()=>ceremony(false,master.mintedRecoveryKey!,true),secrets,frames,logs,ceremony,privateFrames(){return readFileSync(join(control,"k1-test-frames.bin"));},async body(){const status=await client.status();const g=status.grant;return {g,bytes:canonicalBytes({signature_scheme:ROLE_SIGNATURE_SCHEME,...{role:g.role,epoch:g.epoch,kid:g.kid,identity_id:g.identity_id,machine_id:g.machine_id},record_kind:"counter",activation_id:g.activation_id,lease_id:g.lease_id,generation:g.generation,boot_id:"f".repeat(32),sequence:1,prior_commitment:"GENESIS",captured_at_unix_ms:1,captured_at_boottime_ns:"1",policy_digest:roster,runtime_digest:roster,config_digest:roster,payload:{count:1}})};},async close(){await client.close();if(unitName){execFileSync("systemctl",["stop",unitName]);unlinkSync(join("/run/systemd/system",unitName));execFileSync("systemctl",["daemon-reload"]);unitName=undefined;}for(const c of children.reverse())await reap(c);for(const s of secrets)s.fill(0);cleanup(root,files,directories);}};
   } catch(error) {if(unitName){try{execFileSync("systemctl",["stop",unitName]);}catch{}try{unlinkSync(join("/run/systemd/system",unitName));execFileSync("systemctl",["daemon-reload"]);}catch{}}await releaseSecrets?.();for(const child of children.reverse())await reap(child);for(const secret of secrets)secret.fill(0);cleanup(root,files,directories);throw error;}
 }
 
@@ -119,7 +155,7 @@ export async function releaseIsolationProbe(executable: string): Promise<boolean
   const root=mkdtempSync(join(tmpdir(),"k1-release-"));chmodSync(root,0o700);
   const control=join(root,"control"),custody=join(root,"custody"),configPath=join(root,"config.json");
   mkdirSync(control,{mode:0o700});mkdirSync(custody,{mode:0o700});
-  const peer={uid:process.getuid!(),executable_sha256:digest(executable),cgroup:readFileSync("/proc/self/cgroup","utf8").trim()};
+  const peer={uid:process.getuid!(),gid:process.getegid!(),executable_sha256:digest(executable),cgroup:readFileSync("/proc/self/cgroup","utf8").trim()};
   const runtime=(JSON.parse(execFileSync(fixtureNode,["-e","process.stdout.write(JSON.stringify(process.report.getReport().sharedObjects.filter(p=>p!=='linux-vdso.so.1').map(p=>require('node:fs').realpathSync(p))))"],{env:{VITEST:"true"},encoding:"utf8"})) as string[]).map(path=>({path,sha256:digest(path)}));
   const worker=resolve("dist/k1/signing-worker.cjs");
   writeFileSync(configPath,canonicalBytes({controller:peer,launcher:peer,node_sha256:digest(fixtureNode),worker_sha256:digest(worker),grant:{},fortress_id:"a".repeat(32),roster_digest:"sha256:"+"b".repeat(64),binding_high_water:0,runtime}),{mode:0o600});

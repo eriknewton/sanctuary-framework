@@ -7,10 +7,16 @@ After=sanctuary-business-closed.service
 [Service]
 Type=notify
 User=root
-Group=root
+Group=sanctuary
+SupplementaryGroups=
+Slice=system.slice
+Delegate=no
+NotifyAccess=main
+TimeoutStartSec=30
+SendSIGKILL=yes
 ExecStart=/usr/libexec/sanctuary-business-signer
 Restart=no
-# Must match signer_peer.rs: launcher and bridge drop capabilities before connecting.
+# Must match signer_peer.rs: launcher and native clients drop capabilities before connecting.
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
@@ -26,8 +32,10 @@ TasksMax=16
 TimeoutStopSec=5
 KillMode=control-group
 UMask=0077
-ReadWritePaths=/var/lib/sanctuary-business-signer /run/sanctuary/business-signer
-RuntimeDirectory=sanctuary/business-signer
+ReadWritePaths=/var/lib/sanctuary-business-signer /run/sanctuary-business-signer
+# Must match custody::CONTROL_ROOT.
+# A stale /run/sanctuary/business-signer from an older install is ignored, never reused; the signer binds only under its own RuntimeDirectory.
+RuntimeDirectory=sanctuary-business-signer
 RuntimeDirectoryMode=0700
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

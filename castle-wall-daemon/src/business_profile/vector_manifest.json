@@ -46,6 +46,12 @@
       "cases": {
         "$root": 8
       }
+    },
+    "signer_status_vectors.json": {
+      "sha256": "f1c69c18bbcf7eb3c75eacd8691350eb86ec9bd0fb7052ca513a2cb8f83b50d4",
+      "cases": {
+        "cases": 100
+      }
     }
   }
 }

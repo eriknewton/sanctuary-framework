@@ -212,3 +212,8 @@ required-features = ["legacy-raw-producer"]
 name = "linux_business_profile_selection"
 path = "tests/linux_business_profile_selection.rs"
 required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_business_signer_client"
+path = "tests/linux_business_signer_client.rs"
+required-features = ["test-isolation"]

@@ -1,4 +1,4 @@
-// fail-before-exempt: the feature boundary is new; predicate removal is mutation evidence.
+// fail-before-exempt: K1c-2b removes the controller-policy literal from both signer binaries; the pinned predicate is Rust source under castle-wall-daemon, which the fail-before harness does not revert, so removal of that literal is the mutation evidence. The K1c-2a feature-boundary pins are unchanged regressions.
 import {expect, it} from "vitest";
 import {readFileSync, readdirSync} from "node:fs";
 import {resolve} from "node:path";
@@ -55,12 +55,14 @@ it("keeps both selection tokens sealed and roots isolated only in test builds", 
 it("pins policy literals and excludes alternate root or token constructors", () => {
   const config = read("castle-wall-daemon/src/config.rs");
   for (const [constant, literal, files] of [
-    ["BUSINESS_SIGNER_PEER_POLICY", "/etc/sanctuary/business-signer-peer.json", ["sanctuary-business-signer.rs", "sanctuary-business-unlock.rs"]],
-    ["BUSINESS_SIGNER_CONTROLLER_POLICY", "/etc/sanctuary/business-signer-controller.json", ["sanctuary-business-signer.rs"]],
+    ["BUSINESS_SIGNER_PEER_POLICY", "/etc/sanctuary/business-signer-peer.json", ["sanctuary-business-unlock.rs"]],
+    ["BUSINESS_SIGNER_CONTROLLER_POLICY", "/etc/sanctuary/business-signer-controller.json", []],
   ] as const) {
     expect(config).toMatch(new RegExp(`${constant}: &str =\\s*"${literal}"`));
     for (const file of files) expect(read(`castle-wall-daemon/src/bin/${file}`)).toContain(`"${literal}"`);
   }
+  for (const file of ["sanctuary-business-signer.rs", "sanctuary-business-unlock.rs"]) expect(read(`castle-wall-daemon/src/bin/${file}`)).not.toContain('"/etc/sanctuary/business-signer-controller.json"');
+  expect(config).toContain('BUSINESS_SIGNER_CONTROLLER_POLICY,');
   for (const name of readdirSync(resolve(root, "castle-wall-daemon/src"), {recursive: true})) {
     if (typeof name !== "string" || !name.endsWith(".rs") || name === "config.rs") continue;
     const source = read(`castle-wall-daemon/src/${name}`);

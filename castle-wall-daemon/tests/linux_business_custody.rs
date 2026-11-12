@@ -149,8 +149,8 @@ fn root_reconstructed_unit_directives_deny_filesystem_write() {
 #[test]
 fn production_store_is_pinned_beneath_role_root() {
     let mut config: Config = serde_json::from_value(serde_json::json!({
-        "controller":{"uid":0,"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
-        "launcher":{"uid":0,"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
+        "controller":{"uid":unsafe {libc::geteuid()},"gid":unsafe {libc::getegid()},"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
+        "launcher":{"uid":unsafe {libc::geteuid()},"gid":unsafe {libc::getegid()},"executable_sha256":"0".repeat(64),"cgroup":"fixture"},
         "node_sha256":"0".repeat(64),"worker_sha256":"0".repeat(64),
         "grant":{"role":"extension:linux-business-producer-v0"},"fortress_id":"fixture-fortress",
         "roster_digest":"public","binding_high_water":0,"runtime":[]
@@ -218,4 +218,32 @@ fn root_shipped_unit_ceremony_and_sign() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+// Fail-before exempt: these existing check_root predicates gain direct runtime-directory coverage.
+#[test]
+fn runtime_root_accepts_owned_private_directory() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+    assert!(check_root(root.path(), unsafe { libc::geteuid() }).is_ok());
+}
+#[test]
+fn runtime_root_refuses_public_mode() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(check_root(root.path(), unsafe { libc::geteuid() }).is_err());
+}
+#[test]
+fn runtime_root_refuses_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(root.path(), &link).unwrap();
+    assert!(check_root(&link, unsafe { libc::geteuid() }).is_err());
+}
+#[test]
+fn runtime_root_refuses_wrong_owner() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+    assert!(check_root(root.path(), unsafe { libc::geteuid() } + 1).is_err());
 }
