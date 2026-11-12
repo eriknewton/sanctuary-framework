@@ -30,7 +30,7 @@ pub const WALL_DROPINS_MAX: usize = BUS_ARRAY_ELEMENTS_MAX;
 pub const RECORD_SOCKET: &str = "/run/sanctuary-business-writer/record.sock";
 // Must match sanctuary-business-writer.service: wall dependency and argument-free writer executable.
 pub const WALL_UNIT: &str = "sanctuary-castle-wall.service";
-// Must match ExecStart in systemd/sanctuary-castle-wall.service.
+// Must match ExecStart in systemd/sanctuary-castle-wall.service; systemd_unit::writer_wall_exec_matches_shipped_unit executes the reverse pin.
 pub const WALL_EXEC: &str = "/usr/local/libexec/sanctuary/castle-wall-daemon";
 pub const WRITER_EXEC: &str = "/usr/libexec/sanctuary-business-writer";
 pub const SYSTEM_BUS_SOCKET: &str = "/run/dbus/system_bus_socket";

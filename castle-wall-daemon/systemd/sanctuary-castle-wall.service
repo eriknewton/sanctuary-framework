@@ -50,7 +50,6 @@ EnvironmentFile=/etc/sanctuary/castle-wall.env
 # Recreate it as root:sanctuary before the daemon's strict path validation;
 # runtime activation itself remains attach-only and never writes `/etc`.
 ExecStartPre=/usr/bin/install -d -m 0750 -o root -g sanctuary /run/sanctuary/${SANCTUARY_FORTRESS_ID}
-# Must match WALL_EXEC in src/business_profile/writer_peer.rs.
 ExecStart=/usr/local/libexec/sanctuary/castle-wall-daemon --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}
 Restart=on-failure
 RestartPreventExitStatus=78
