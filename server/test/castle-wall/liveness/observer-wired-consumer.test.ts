@@ -5,12 +5,13 @@
  * clock, a missing one fails at construction, and 100 production cycles over
  * modelled children never reach the credential store.
  */
+// fail-before-exempt: the credential-store check moves to afterEach on correct code; no behavior changes.
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, unlinkSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OBSERVER_PERIOD } from "../../../src/castle-wall/liveness/constants.js";
 import { CensusSampler, CensusSeries } from "../../../src/castle-wall/liveness/census-sampler.js";
 import { LivenessObserver, type LivenessObserverDeps } from "../../../src/castle-wall/liveness/observer.js";
@@ -34,6 +35,7 @@ const NETSTAT = readFileSync(join(FIX, "census", "netstat-anv-macos26.txt"), "ut
 const goldenArguments = (): string[] => [...(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(GOLDEN)![1]!).matchAll(/<string>([^<]*)<\/string>/g)].map(m => m[1]!);
 
 // The shared in-memory credential store logs every call it serves; no verb may reach it.
+afterEach(() => { expect(inMemoryKeychainCalls()).toEqual([]); });
 
 /** Modelled children for every command a production cycle spawns. */
 function modelledSpawn(argv: string[][]): WatchSpawn {
@@ -224,7 +226,6 @@ describe("production composition", () => {
     expect(publishes.length).toBeGreaterThanOrEqual(100);
     const observer = built!.observer;
     expect(observer.stats().cycles).toBeGreaterThanOrEqual(100);
-    expect(inMemoryKeychainCalls()).toEqual([]);
     const recordPath = join(root, "liveness", "observer.json");
     const record = JSON.parse(readFileSync(recordPath, "utf8"));
     expect(parseObserverRecord(record).ok).toBe(true);

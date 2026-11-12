@@ -1,4 +1,5 @@
 /** Attended LaunchAgent commands use injected host and credential boundaries. Job 996. */
+// fail-before-exempt: a fixture clarity fix on correct code; the exit and its reason are unchanged.
 import * as fs from "node:fs";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
@@ -469,10 +470,12 @@ describe("full-status wall-only exit", () => {
 
   it("pid alive alone is never exit 0: state_RUNNING, bound pid 1234 and no liveness records exits 1", async () => {
     const f = await installedAndRunning();
-    f.ctx.liveness = { getuid: () => LIVENESS_UID, hostClock: { read: async () => ({ ok: false }), uptimeMs: () => LIVENESS_STATES.base.host.uptimeMs } };
+    f.ctx.liveness = { getuid: () => LIVENESS_UID, hostClock: { read: async () => LIVENESS_STATES.base.host, uptimeMs: () => LIVENESS_STATES.base.host.uptimeMs } };
     expect(await api!.runFullStatus([], f.ctx)).toBe(1);
     expect(f.out.text).toMatch(/^Full LaunchAgent state=state_RUNNING charges=\d+ pid=1234\n/);
     expect(f.out.text).not.toMatch(/^Liveness wall: wall_OK_/m);
+    expect(f.out.text).toMatch(/^Liveness wall: wall_DOWN \([^)]*daemon_telemetry_stale/m);
+    expect(f.out.text).not.toContain("time_untrusted");
   });
 
   it("a fresh daemon.json with observer.json absent exits 1", async () => {

@@ -89,6 +89,7 @@ fn main() {
     std::process::exit(1);
 }
 
+// test-isolation only: this relay authenticates the signer but not its parent, so it must never exist in a release artifact; release absence is proven by the release-closure test.
 #[cfg(all(target_os = "linux", feature = "test-isolation"))]
 fn test_relay(
     path: &std::path::Path,
@@ -106,9 +107,9 @@ fn test_relay(
     use std::os::fd::AsRawFd;
     const INPUT: i32 = libc::STDIN_FILENO;
     const OUTPUT: i32 = libc::STDOUT_FILENO;
-    const NS_PER_MS: u64 = 1_000_000; // Nanoseconds per millisecond.
-                                      // test-isolation only: this relay authenticates the signer but not its parent, so it must never exist in a release artifact; release absence is proven by the release-closure test.
-                                      // Must match require_unix_socket in signer_peer.rs and k1-relay-client.ts: stdin is an AF_UNIX socket.
+    // Nanoseconds per millisecond.
+    const NS_PER_MS: u64 = 1_000_000;
+    // Must match require_unix_socket in signer_peer.rs and k1-relay-client.ts: stdin is an AF_UNIX socket.
     signer_peer::require_unix_socket(INPUT)?;
     signer_peer::drop_capabilities()?;
     let socket = signer_peer::connect(path)?;

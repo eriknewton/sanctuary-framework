@@ -94,6 +94,7 @@ pub fn decode(frame: &[u8]) -> io::Result<(Header, &[u8])> {
         .deadline_boottime_ns
         .parse::<u64>()
         .map_err(|_| refused())?;
+    // Must match PROTOCOL_VERSION in signer_client.rs and the version suffix of SIGNER_PROTOCOL.
     if header.v != 1
         || header.protocol != SIGNER_PROTOCOL
         || !id(&header.request_id)
@@ -355,7 +356,7 @@ pub fn parse_boot_id(bytes: &[u8]) -> io::Result<String> {
 }
 fn read_boot_id(path: &Path) -> io::Result<String> {
     let mut bytes = Vec::new();
-    // One extra byte distinguishes an oversized kernel value from a valid prefix without an unbounded read.
+    // Must match bootstrap_inner in signer_client.rs: one extra byte detects overflow without an unbounded read.
     std::fs::File::open(path)?
         .take((BOOT_ID_READ_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;

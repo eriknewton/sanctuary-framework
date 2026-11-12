@@ -3,23 +3,26 @@
 use super::{
     custody::CONTROL_ROOT,
     signer_contract::{
-        ROLE_REGISTRY, SIGNER_HANDSHAKE_DEADLINE_MS, SIGNER_PREIMAGE_MAX_BYTES, SIGNER_PROTOCOL,
-        SIGNER_REQUEST_DEADLINE_MS,
+        ROLE_REGISTRY, SIGNER_HANDSHAKE_DEADLINE_MS, SIGNER_IDLE_DEADLINE_MS,
+        SIGNER_PREIMAGE_MAX_BYTES, SIGNER_PROTOCOL, SIGNER_REQUEST_DEADLINE_MS,
+        UNLOCK_TTL_MAX_SECONDS,
     },
     signer_peer::{self, Peer, PeerPolicy},
     signer_service::{self, Header, LENGTH_BYTES, RESPONSE_MAX_BYTES, SIGN_SOCKET},
-    signer_watchdog::boottime_ns,
+    signer_watchdog::{boottime_ns, NS_PER_SECOND},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io,
+    io::{self, Read},
     os::fd::{AsRawFd, OwnedFd},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
+// Must match decode header.v in signer_service.rs and the version suffix of SIGNER_PROTOCOL.
+const PROTOCOL_VERSION: u8 = 1; // Version suffix of sanctuary.record-signer.v1.
 const NS_PER_MS: u64 = 1_000_000; // Nanoseconds in one millisecond.
 const ID_HEX_CHARS: usize = 16 * 2; // The protocol's 128-bit identifier encoded as hex.
 const DIGEST_HEX_CHARS: usize = 32 * 2; // SHA-256 bytes encoded as hex.
@@ -175,9 +178,19 @@ pub fn parse_status_packet(packet: &[u8]) -> Result<StatusReply> {
 }
 fn parse_status_value(value: Value) -> Result<StatusReply> {
     // Must match signer_status_vectors.json: both runtime parsers consume its schema, including nested grant fields.
-    let corpus: Value = serde_json::from_str(include_str!("signer_status_vectors.json"))
-        .map_err(|_| Refusal::Schema)?;
-    let schema = &corpus["schema"];
+    static SCHEMA: OnceLock<Result<Value>> = OnceLock::new();
+    let schema = SCHEMA
+        .get_or_init(|| {
+            let mut corpus: Value =
+                serde_json::from_str(include_str!("signer_status_vectors.json"))
+                    .map_err(|_| Refusal::Schema)?;
+            match corpus.get_mut("schema") {
+                Some(schema) if schema.is_object() => Ok(schema.take()),
+                _ => Err(Refusal::Schema),
+            }
+        })
+        .as_ref()
+        .map_err(|error| *error)?;
     let pair = schema["anchor_pair"].as_array().ok_or(Refusal::Schema)?;
     if pair.len() != 2
         || !object_fields(&value, &schema["fields"], schema)
@@ -193,6 +206,8 @@ pub struct BusinessSignerClient {
     peer: Option<Peer>,
     state: SignerClientState,
     latest: StatusReply,
+    latest_at: u64,
+    local_boot_id: String,
     frozen: Option<StatusReply>,
     outstanding: bool,
     settlement_end: Option<Instant>,
@@ -219,11 +234,21 @@ impl BusinessSignerClient {
             .map_err(|_| Refusal::Transport)?
             .checked_add(SIGNER_HANDSHAKE_DEADLINE_MS as u64 * NS_PER_MS)
             .ok_or(Refusal::Deadline)?;
+        let mut boot_bytes = Vec::new();
+        // Must match read_boot_id in signer_service.rs: one extra byte detects overflow without an unbounded read.
+        std::fs::File::open(signer_service::BOOT_ID_PATH)
+            .and_then(|file| {
+                file.take((signer_service::BOOT_ID_READ_MAX_BYTES + 1) as u64)
+                    .read_to_end(&mut boot_bytes)
+            })
+            .map_err(|_| Refusal::Transport)?;
+        let local_boot_id =
+            signer_service::parse_boot_id(&boot_bytes).map_err(|_| Refusal::Schema)?;
         let socket = signer_peer::connect(path).map_err(|_| Refusal::Transport)?;
         signer_peer::passcred(socket.as_raw_fd()).map_err(|_| Refusal::Transport)?;
         let peer = Peer::capture(socket.as_raw_fd(), &policy).map_err(|_| Refusal::Policy)?;
         if signer_service::readable(socket.as_raw_fd()) {
-            return Err(Refusal::Unmatched);
+            return Err(Self::pending_refusal(socket.as_raw_fd()));
         }
         signer_peer::send(socket.as_raw_fd(), b"{\"op\":\"STATUS\"}", &[])
             .map_err(|_| Refusal::Transport)?;
@@ -234,6 +259,7 @@ impl BusinessSignerClient {
             end,
             Instant::now() + Duration::from_millis(SIGNER_HANDSHAKE_DEADLINE_MS as u64),
         )?;
+        let latest_at = clock().map_err(|_| Refusal::Transport)?;
         let latest = parse_status_packet(&bytes)?;
         if clock().map_err(|_| Refusal::Transport)? >= end {
             return Err(Refusal::Deadline);
@@ -246,6 +272,8 @@ impl BusinessSignerClient {
             peer: Some(peer),
             state: SignerClientState::Unbound,
             latest,
+            latest_at,
+            local_boot_id,
             frozen: None,
             outstanding: false,
             settlement_end: None,
@@ -292,6 +320,36 @@ impl BusinessSignerClient {
         if !Self::live(&self.latest, now) {
             return self.fail(Refusal::Expired);
         }
+        let start = self
+            .latest
+            .started_boottime_ns
+            .parse::<u64>()
+            .map_err(|_| Refusal::Schema)?;
+        let expires = self
+            .latest
+            .expires_boottime_ns
+            .parse::<u64>()
+            .map_err(|_| Refusal::Schema)?;
+        // Lease::begin in signer_watchdog.rs caps ttl at UNLOCK_TTL_MAX_SECONDS; NS_PER_SECOND converts that cap to nanoseconds.
+        if expires
+            .checked_sub(start)
+            .filter(|span| *span <= UNLOCK_TTL_MAX_SECONDS as u64 * NS_PER_SECOND)
+            .is_none()
+        {
+            return self.fail(Refusal::Grant);
+        }
+        // S and its writer share a kernel, so an observation from another boot cannot bind a grant.
+        if self.latest.boot_id != self.local_boot_id {
+            return self.fail(Refusal::Grant);
+        }
+        // The client dates receipt locally, so an observation older than the idle window cannot freeze authority.
+        if now
+            .checked_sub(self.latest_at)
+            .filter(|age| *age <= SIGNER_IDLE_DEADLINE_MS as u64 * NS_PER_MS)
+            .is_none()
+        {
+            return self.fail(Refusal::Expired);
+        }
         // First client bind freezes the authenticated observation without I/O or a renewal opportunity.
         self.frozen = Some(self.latest.clone());
         self.state = SignerClientState::Bound;
@@ -336,6 +394,9 @@ impl BusinessSignerClient {
                 revents: 0,
             };
             if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 return Err(Refusal::Transport);
             }
             if poll.revents == 0 {
@@ -354,6 +415,36 @@ impl BusinessSignerClient {
             return Ok(packet.bytes);
         }
     }
+    fn pending_refusal(fd: i32) -> Refusal {
+        let mut byte = 0u8;
+        // Readability includes EOF; peeking distinguishes transport loss without consuming an unsolicited packet.
+        Self::pending_refusal_with(|| {
+            let count = unsafe {
+                libc::recv(
+                    fd,
+                    &mut byte as *mut _ as _,
+                    std::mem::size_of_val(&byte),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count)
+            }
+        })
+    }
+    fn pending_refusal_with(mut peek: impl FnMut() -> io::Result<isize>) -> Refusal {
+        loop {
+            match peek() {
+                Ok(0) => return Refusal::Transport,
+                // An interrupted peek supplies no transport evidence; retry without accepting pending traffic.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                // A packet or any other error still refuses the already unsolicited traffic.
+                _ => return Refusal::Unmatched,
+            }
+        }
+    }
     fn exchange(&mut self, bytes: &[u8], end: u64) -> Result<Value> {
         if self.outstanding {
             return self.fail(Refusal::Busy);
@@ -361,7 +452,7 @@ impl BusinessSignerClient {
         let result = (|| {
             let socket = self.socket.as_ref().ok_or(Refusal::State)?;
             if signer_service::readable(socket.as_raw_fd()) {
-                return Err(Refusal::Unmatched);
+                return Err(Self::pending_refusal(socket.as_raw_fd()));
             }
             self.outstanding = true;
             self.settlement_end =
@@ -376,6 +467,7 @@ impl BusinessSignerClient {
             )?;
             self.settlement_end = None;
             let value = packet_value(&packet)?;
+            // An immediately queued duplicate refuses this result. A later duplicate is Unmatched at the next admission; authenticated S cannot renew the settled result.
             if signer_service::readable(socket.as_raw_fd()) {
                 return Err(Refusal::DuplicateReply);
             }
@@ -422,6 +514,7 @@ impl BusinessSignerClient {
             );
         }
         let value = self.exchange(b"{\"op\":\"STATUS\"}", end)?;
+        let latest_at = self.now()?;
         let view = match parse_status_value(value) {
             Ok(view) => view,
             Err(error) => return self.fail(error),
@@ -438,6 +531,7 @@ impl BusinessSignerClient {
             return self.fail(Refusal::Deadline);
         }
         self.latest = view.clone();
+        self.latest_at = latest_at;
         Ok(view)
     }
     pub fn sign_record(&mut self, header: Header, preimage: &[u8]) -> Result<SignedReply> {
@@ -478,7 +572,7 @@ impl BusinessSignerClient {
             Ok(n) if n.to_string() == header.deadline_boottime_ns && n > now && n <= limit => n,
             _ => return self.fail(Refusal::Deadline),
         };
-        if header.v != 1
+        if header.v != PROTOCOL_VERSION
             || header.protocol != SIGNER_PROTOCOL
             || !hex_text(&json!(header.request_id), "", ID_HEX_CHARS)
         {
@@ -557,6 +651,9 @@ impl BusinessSignerClient {
                     revents: 0,
                 };
                 if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
                     break;
                 }
                 if poll.revents != 0 {
@@ -588,6 +685,28 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::os::fd::FromRawFd;
+    #[test]
+    fn pending_peek_retries_interruption_and_refuses_other_outcomes() {
+        for (outcome, expected) in [
+            (Ok(0), Refusal::Transport),
+            (Ok(1), Refusal::Unmatched), // One byte establishes a pending packet.
+            (Err(io::ErrorKind::WouldBlock), Refusal::Unmatched),
+            (Err(io::ErrorKind::PermissionDenied), Refusal::Unmatched),
+        ] {
+            let mut attempts = [Err(io::ErrorKind::Interrupted), outcome].into_iter();
+            assert_eq!(
+                BusinessSignerClient::pending_refusal_with(|| {
+                    attempts
+                        .next()
+                        .expect("peek outcome consumed once")
+                        .map_err(io::Error::from)
+                }),
+                expected,
+                "peek must classify the outcome after interruption"
+            );
+            assert!(attempts.next().is_none(), "peek must retry interruption");
+        }
+    }
     #[test]
     fn retained_slot_refuses_another_sign_before_any_send() {
         // Exclusive mutable access makes this state internal; the guard still refuses retained work before transport effects.
@@ -644,6 +763,8 @@ mod tests {
             peer: Some(peer),
             state: SignerClientState::Bound,
             latest: view.clone(),
+            latest_at: 1,
+            local_boot_id: view.boot_id.clone(),
             frozen: Some(view),
             outstanding: true,
             settlement_end: None,

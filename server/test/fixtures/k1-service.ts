@@ -136,19 +136,24 @@ export async function serviceFixture(passphrasePrefix = "fixture ", rootUnit = f
       } else {child.kill("SIGKILL"); await reap(child);}
     },
     async freshClient() {client=new RelayClient(clientChild());return client.status();},
-    async probeBootId(text: string) {
+    async probeBootId(text: string, bootIdPath?: string) {
       await client.close(); await reap(service);
       for (const socket of ["sign.sock", "lifecycle.sock"]) {const path=join(control,socket);if(existsSync(path))unlinkSync(path);}
       const boot=join(root,"boot-id"),notify=join(root,"notify.sock"); files.push(boot,notify);
       writeFileSync(boot,text,{mode:0o600});
       // A real datagram observer distinguishes startup refusal from merely refusing later client traffic.
-      const script = `import json,os,socket,subprocess,sys,time
+      const script = `import ctypes,json,os,socket,subprocess,sys,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)
 s.bind(sys.argv[1])
 s.settimeout(0.05)
-p=subprocess.Popen(sys.argv[2:],env={"NOTIFY_SOCKET":sys.argv[1],"VITEST":"true"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+# Linux prctl option 1 is PR_SET_PDEATHSIG; signal 9 is SIGKILL, so observer timeout death also kills S.
+def parent_death_signal():
+ if ctypes.CDLL(None).prctl(1, 9) != 0:
+  raise RuntimeError("parent-death signal setup failed")
+p=subprocess.Popen(sys.argv[2:],preexec_fn=parent_death_signal,env={"NOTIFY_SOCKET":sys.argv[1],"VITEST":"true"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 ready=0
-end=time.monotonic()+2
+started=time.monotonic()
+end=started+2
 try:
  while time.monotonic()<end:
   try:
@@ -162,8 +167,8 @@ finally:
  except subprocess.TimeoutExpired:
   p.kill();out,err=p.communicate()
  s.close()
-print(json.dumps({"ready":ready,"code":p.returncode,"stderr":err.decode()}))`;
-      return JSON.parse(execFileSync("python3",["-c",script,notify,binary,...serviceArgs,"--test-boot-id",boot],{encoding:"utf8",timeout:10_000})) as {ready:number;code:number;stderr:string};
+print(json.dumps({"ready":ready,"code":p.returncode,"stderr":err.decode(),"elapsedMs":(time.monotonic()-started)*1000}))`;
+      return JSON.parse(execFileSync("python3",["-c",script,notify,binary,...serviceArgs,"--test-boot-id",bootIdPath ?? boot],{encoding:"utf8",timeout:10_000})) as {ready:number;code:number;stderr:string;elapsedMs:number};
     },
     lockImmediate:()=>ceremony(true,passphrase,false,false,false),
     ceremonyHeld:()=>ceremony(false,passphrase,false,true),

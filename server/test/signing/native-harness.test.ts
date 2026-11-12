@@ -28,7 +28,10 @@ it.skipIf(process.platform !== "linux")("relay readiness is the authenticated re
     const first = fixture.frames[0];
     expect(first.readUInt32BE()).toBe(first.length - LENGTH_BYTES);
     expect(first.subarray(LENGTH_BYTES)).toEqual(Buffer.from(canonicalBytes({op:"STATUS"})));
-    const reply = fixture.frames[1];
+    const chunks = Buffer.concat(fixture.frames.slice(1));
+    const replyLength = chunks.readUInt32BE() + LENGTH_BYTES;
+    expect(chunks.length).toBeGreaterThanOrEqual(replyLength);
+    const reply = chunks.subarray(0, replyLength);
     expect(reply.readUInt32BE()).toBe(reply.length - LENGTH_BYTES);
     expect(parsePublicFrame(reply.subarray(LENGTH_BYTES)).op).toBe("STATUS");
     expect((await fixture.client.status()).state).toBe("LOCKED");
@@ -61,4 +64,14 @@ it.skipIf(process.platform !== "linux")("startup with a valid boot id reaches RE
   const fixture = await serviceFixture();
   try {expect((await fixture.probeBootId("01234567-89ab-cdef-0123-456789abcdef\n")).ready).toBe(1);}
   finally {await fixture.close();}
+});
+
+it.skipIf(process.platform !== "linux")("unending boot-id input refuses within the startup bound before READY", async () => {
+  const fixture = await serviceFixture();
+  try {
+    const observation = await fixture.probeBootId("", "/dev/zero");
+    expect(observation.ready).toBe(0);
+    expect(observation.code).toBe(1);
+    expect(observation.elapsedMs).toBeLessThan(2000);
+  } finally { await fixture.close(); }
 });

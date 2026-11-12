@@ -109,7 +109,7 @@ it("pins full inert dispatch and every direct seam import edge",()=>{
   expect(calls).toEqual(["grant,provider,INERT_SIGNABLE_ADAPTERS[0].schema,INERT_SIGNABLE_ADAPTERS[0].kind"]);
 });
 it("pins native crash settlement bytes and excludes classifier paths from all live roots",()=>{
-  expect(createHash("sha256").update(readFileSync("../castle-wall-daemon/src/business_profile/signer_service.rs")).digest("hex")).toBe("ba5ee75cb9c7ef920b2198a9942b8409ec91b7b97edc9acffcabd76001563d3c");
+  expect(createHash("sha256").update(readFileSync("../castle-wall-daemon/src/business_profile/signer_service.rs")).digest("hex")).toBe("09c50e88dc64c2eca72be46b16d89bd67e03cc16f2aad23e5c7a98b382794448");
   // The original protocol must match its byte pin after removing only the explicitly pinned pure seam.
   const worker = readFileSync("src/signing/worker.ts", "utf8");
   const additions = [

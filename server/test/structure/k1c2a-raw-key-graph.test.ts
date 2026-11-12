@@ -1,4 +1,4 @@
-// fail-before-exempt: the feature boundary is new; predicate removal is mutation evidence.
+// fail-before-exempt: K1c-2b removes the controller-policy literal from both signer binaries; the pinned predicate is Rust source under castle-wall-daemon, which the fail-before harness does not revert, so removal of that literal is the mutation evidence. The K1c-2a feature-boundary pins are unchanged regressions.
 import {expect, it} from "vitest";
 import {readFileSync, readdirSync} from "node:fs";
 import {resolve} from "node:path";
