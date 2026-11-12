@@ -899,3 +899,82 @@ fn skipped_linux_business_writer_user_manager_requires_user_manager_witness() {
     assert!(source.contains("mod isolation;"));
     assert!(!gated_targets().contains("linux_business_writer_user_manager"));
 }
+
+// Source layout is rustfmt-checked; a gated item ends at its own indentation, including inline modules.
+fn writer_production_source(source: &str) -> String {
+    let mut output = String::new();
+    let mut gated = false;
+    let mut item_indent = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[cfg(feature = \"test-isolation\")]" {
+            gated = true;
+            continue;
+        }
+        if gated {
+            if trimmed.starts_with("#[") || trimmed.starts_with("//") || trimmed.is_empty() {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if let Some(start) = item_indent {
+                if indent == start && trimmed.starts_with('}') {
+                    gated = false;
+                    item_indent = None;
+                }
+            } else if trimmed.contains('{') && !trimmed.ends_with('}') {
+                item_indent = Some(indent);
+            } else if trimmed.ends_with(';') || trimmed.ends_with('}') {
+                gated = false;
+            }
+            continue;
+        }
+        output.push_str(line.split("//").next().unwrap_or_default());
+        output.push('\n');
+    }
+    assert!(!gated, "complete feature-gated source item");
+    output
+}
+
+#[test]
+fn production_reconciler_implementation_set_is_closed() {
+    fn visit(dir: &Path, implementations: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, implementations);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let source = writer_production_source(&std::fs::read_to_string(&path).unwrap());
+                let words: Vec<_> = source.split_whitespace().collect();
+                for row in words.windows(4) {
+                    if row[..3] == ["impl", "Reconciler", "for"] {
+                        implementations.push(row[3].to_owned());
+                    }
+                }
+            }
+        }
+    }
+    let mut implementations = Vec::new();
+    visit(&crate_root().join("src"), &mut implementations);
+    // Must match execute in sanctuary-business-writer.rs: only this production implementation may supply reconciliation.
+    assert_eq!(implementations, vec!["ClosedReconciler"]);
+}
+
+#[test]
+fn writer_execute_composes_the_closed_reconciler() {
+    let source =
+        std::fs::read_to_string(crate_root().join("src/bin/sanctuary-business-writer.rs")).unwrap();
+    let production = writer_production_source(&source);
+    let execute = production
+        .split("fn execute()")
+        .nth(1)
+        .unwrap()
+        .split("fn main()")
+        .next()
+        .unwrap();
+    let fields: Vec<_> = execute
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("reconciler:"))
+        .collect();
+    assert_eq!(fields, vec!["reconciler: ClosedReconciler::production(),"]);
+}

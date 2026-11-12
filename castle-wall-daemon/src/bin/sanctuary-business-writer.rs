@@ -36,6 +36,7 @@ fn execute() -> std::io::Result<()> {
         }
         Ok(Dependencies {
             signer,
+            // Must match test_isolation_gate::writer_execute_composes_the_closed_reconciler.
             reconciler: ClosedReconciler::production(),
             notifier: SystemNotifier,
             config,
