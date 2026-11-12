@@ -108,18 +108,6 @@ def render(role):
     if mode == 'two' and role == 'writer.socket':
         rendered['[Socket].ListenSequentialPacket'].append(str(root / 'second.sock'))
         manifest['substitutions'].append(dict(unit=role, directive='extra descriptor', before=[], after=[str(root / 'second.sock')]))
-    restored = {key: list(values) for key, values in rendered.items()}
-    if mode == 'stream' and role == 'writer.socket':
-        restored['[Socket].ListenSequentialPacket'] = restored.pop('[Socket].ListenStream')
-    if mode == 'two' and role == 'writer.socket':
-        restored['[Socket].ListenSequentialPacket'].pop()
-    for item in manifest['substitutions']:
-        if item['unit'] == role and item['directive'] in original:
-            restored[item['directive']] = item['before']
-    for item in manifest['omissions']:
-        if item['unit'] == role:
-            restored[item['directive']] = item['values']
-    assert restored == original, 'complete reversed directive equality'
     output = ''
     previous = None
     for key, values in rendered.items():
@@ -129,6 +117,21 @@ def render(role):
             previous = section
         for value in values:
             output += directive + '=' + value + '\n'
+    restored = parse(output)
+    # Only exact named emitted substitutions may be inverted; a changed recorded value refuses parity.
+    if mode == 'stream' and role == 'writer.socket':
+        restored['[Socket].ListenSequentialPacket'] = restored.pop('[Socket].ListenStream')
+    if mode == 'two' and role == 'writer.socket':
+        assert restored['[Socket].ListenSequentialPacket'][-1] == str(root / 'second.sock')
+        restored['[Socket].ListenSequentialPacket'].pop()
+    for item in manifest['substitutions']:
+        if item['unit'] == role and item['directive'] in original:
+            assert restored[item['directive']] == item['after'], 'emitted substitution equality: ' + item['directive']
+            restored[item['directive']] = item['before']
+    for item in manifest['omissions']:
+        if item['unit'] == role:
+            restored[item['directive']] = item['values']
+    assert restored == original, 'complete reversed directive equality'
     return output
 
 try:
