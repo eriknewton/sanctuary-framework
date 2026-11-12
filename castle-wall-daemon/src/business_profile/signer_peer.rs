@@ -24,7 +24,17 @@ pub struct PeerPolicy {
     pub uid: u32,
     pub gid: u32,
     pub executable_sha256: String,
+    // Stored as trimmed raw cgroup-v2 proc text (0::/path); capture and writer_peer normalize through normalized_cgroup.
     pub cgroup: String,
+}
+/// Must match writer_peer::normalized_cgroup: one unified proc row becomes the systemd ControlGroup path.
+pub fn normalized_cgroup(text: &str) -> io::Result<String> {
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let path = line.strip_prefix("0::").ok_or_else(refused)?;
+    if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
+        return Err(refused());
+    }
+    Ok(path.into())
 }
 pub struct Peer {
     pub pid: i32,
@@ -70,7 +80,8 @@ impl Peer {
         }
         let start = process_start(cred.pid)?;
         let group = bounded_text(&format!("/proc/{}/cgroup", cred.pid))?;
-        if group.trim() != policy.cgroup {
+        // Compare the kernel peer and the stored policy only after the same cgroup-v2 parser used by writer_peer.
+        if normalized_cgroup(&group)? != normalized_cgroup(&policy.cgroup)? {
             return Err(refused());
         }
         let file = fs::File::open(format!("/proc/{}/exe", cred.pid))?;

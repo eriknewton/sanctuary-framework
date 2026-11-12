@@ -351,13 +351,9 @@ fn process_start(pid: i32) -> Result<String> {
     start.parse::<u64>().map_err(|_| Error::Process)?;
     Ok(start.into())
 }
+// PeerPolicy retains raw proc text; signer_peer::Peer::capture uses this same parser on both comparison operands.
 pub fn normalized_cgroup(text: &str) -> Result<String> {
-    let line = text.strip_suffix('\n').unwrap_or(text);
-    let path = line.strip_prefix("0::").ok_or(Error::Group)?;
-    if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
-        return Err(Error::Group);
-    }
-    Ok(path.into())
+    signer_peer::normalized_cgroup(text).map_err(|_| Error::Group)
 }
 fn process_cgroup(pid: i32) -> Result<String> {
     normalized_cgroup(&read_proc(Path::new(&format!("/proc/{pid}/cgroup")))?)

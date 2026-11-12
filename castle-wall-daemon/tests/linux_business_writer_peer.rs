@@ -512,3 +512,33 @@ fn final_capture_exchange_cannot_adopt_a_replacement_invocation() {
         Err(Error::Identity)
     ));
 }
+
+#[test]
+fn stored_peer_cgroup_and_wall_path_share_normalization() {
+    use sha2::{Digest, Sha256};
+    let (_a, b) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .unwrap();
+    let raw = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let mut policy = signer_peer::PeerPolicy {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        executable_sha256: hex::encode(Sha256::digest(std::fs::read("/proc/self/exe").unwrap())),
+        cgroup: raw.trim().into(),
+    };
+    assert!(policy.cgroup.starts_with("0::/"));
+    assert_eq!(
+        normalized_cgroup(&raw).unwrap(),
+        signer_peer::normalized_cgroup(&policy.cgroup).unwrap()
+    );
+    assert!(
+        signer_peer::Peer::capture(b.as_raw_fd(), &policy).is_ok(),
+        "stored raw policy admits the same kernel cgroup"
+    );
+    policy.cgroup.push('x');
+    assert!(signer_peer::Peer::capture(b.as_raw_fd(), &policy).is_err());
+}
