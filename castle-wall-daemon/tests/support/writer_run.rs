@@ -851,6 +851,97 @@ pub fn scenario(case: &str) {
             assert_eq!(state.closes.load(Ordering::SeqCst), 1);
             return;
         }
+        if case.starts_with("aged-") {
+            use castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS;
+            use writer_protocol::{WRITER_HEARTBEAT_MS, WRITER_SIGN_DEADLINE_MAX_MS};
+            let tick = WATCHDOG_TICK_MS as u64;
+            let age_ms = WRITER_HEARTBEAT_MS - tick;
+            let last = *state.status_times.lock().unwrap().last().unwrap();
+            state
+                .now
+                .store(last + age_ms * writer_state::NS_PER_MS, Ordering::SeqCst);
+            let late = case.ends_with("late");
+            // Leave one watchdog tick for a successful bus exchange; the late reply crosses the local window.
+            let delay_ms = if late {
+                WRITER_SIGN_DEADLINE_MAX_MS - tick
+            } else {
+                WRITER_SIGN_DEADLINE_MAX_MS - age_ms - tick
+            };
+            let advance_ms = if late {
+                WRITER_SIGN_DEADLINE_MAX_MS + tick
+            } else {
+                delay_ms
+            };
+            bus.fault.lock().unwrap().hello_delay = Some((
+                delay_ms,
+                advance_ms * writer_state::NS_PER_MS,
+                state.now.clone(),
+            ));
+            let operation = if case.starts_with("aged-sign") {
+                Operation::Sign(state.header())
+            } else {
+                Operation::Status {
+                    request_id: "e".repeat(32),
+                }
+            };
+            send(
+                wall.as_raw_fd(),
+                &hello.session_id,
+                &operation,
+                if case.starts_with("aged-sign") {
+                    &state.body
+                } else {
+                    &[]
+                },
+            );
+            if late {
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
+                        .unwrap(),
+                    STOP_STATUS
+                );
+                let settled = state.now.load(Ordering::SeqCst);
+                assert!(
+                    settled - last
+                        < signer_contract::SIGNER_IDLE_DEADLINE_MS as u64 * writer_state::NS_PER_MS,
+                    "settlement stays inside the signer idle window"
+                );
+                assert_eq!(state.signs.load(Ordering::SeqCst), 0);
+            } else {
+                let reply = receive(wall.as_raw_fd());
+                assert!(matches!(
+                    reply.operation,
+                    Operation::StatusReply { .. } | Operation::Verified { .. }
+                ));
+                bus.fault.lock().unwrap().hello_delay = None;
+                let start = std::time::Instant::now();
+                while *state.status_times.lock().unwrap().last().unwrap() == last {
+                    assert!(start.elapsed() < Duration::from_millis(WAIT_MS as u64));
+                    thread::yield_now();
+                }
+                let times = state.status_times.lock().unwrap();
+                assert!(
+                    times.windows(2).all(|pair| pair[1] - pair[0]
+                        < signer_contract::SIGNER_IDLE_DEADLINE_MS as u64
+                            * writer_state::NS_PER_MS),
+                    "every status gap stays inside the signer idle window"
+                );
+                drop(times);
+                drop(wall);
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
+                        .unwrap(),
+                    STOP_STATUS
+                );
+            }
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
+                    .unwrap(),
+                "STOPPING=1"
+            );
+            assert!(runner.join().unwrap().is_err());
+            return;
+        }
         let mut h = state.header();
         let mut body = state.body.clone();
         if case == "short-sign" {

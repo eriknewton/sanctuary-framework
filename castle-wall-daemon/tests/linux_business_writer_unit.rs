@@ -657,3 +657,17 @@ fn composed_short_sign_uses_local_revalidation_window() {
         || writer_run::scenario("short-sign"),
     );
 }
+
+#[test]
+fn composed_aged_status_keeps_the_signer_window() {
+    for case in [
+        "aged-status",
+        "aged-sign",
+        "aged-status-late",
+        "aged-sign-late",
+    ] {
+        writer_run::child_case("composed_aged_status_keeps_the_signer_window", case, || {
+            writer_run::scenario(case)
+        });
+    }
+}

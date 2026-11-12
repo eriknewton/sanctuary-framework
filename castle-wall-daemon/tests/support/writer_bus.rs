@@ -120,6 +120,8 @@ pub struct Fault {
     pub invalid_signal: bool,
     pub trickle: bool,
     pub reply_delay_ms: u64,
+    // Hello dates one complete exchange; the composed clock advances with its scripted reply.
+    pub hello_delay: Option<(u64, u64, Arc<std::sync::atomic::AtomicU64>)>,
     pub change_owner: bool,
     pub malformed: Option<String>,
     pub final_capture_change: bool,
@@ -261,7 +263,14 @@ fn serve(
         stream.read_exact(&mut bytes[16..])?;
         let (member, args) = writer_peer::test_support::decode_request(&bytes).unwrap();
         let u = unit.lock().unwrap().clone();
-        let fault = faults.lock().unwrap().clone();
+        let fault = {
+            let mut current = faults.lock().unwrap();
+            let snapshot = current.clone();
+            if member == "Hello" {
+                current.hello_delay = None;
+            }
+            snapshot
+        };
         let mut response = match member.as_str() {
             "Hello" => reply(serial, "org.freedesktop.DBus", "s", |v| {
                 string(v, OWN, false)
@@ -331,6 +340,12 @@ fn serve(
                     thread::sleep(Duration::from_millis(10));
                 }
                 continue;
+            }
+        }
+        if member == "Hello" {
+            if let Some((delay_ms, advance_ns, clock)) = &fault.hello_delay {
+                thread::sleep(Duration::from_millis(*delay_ms));
+                clock.fetch_add(*advance_ns, Ordering::SeqCst);
             }
         }
         thread::sleep(Duration::from_millis(fault.reply_delay_ms));

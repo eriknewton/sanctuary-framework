@@ -937,10 +937,19 @@ fn serve<P: SignerPort, R: Reconciler>(
                         return Err(e);
                     }
                 }
-                // Wall identity work consumes a locally bounded window, never caller-selected freshness.
+                // Packet admission follows a heartbeat check: now - last_status < WRITER_HEARTBEAT_MS.
+                // Anchoring to both clocks retains at least WRITER_SIGN_DEADLINE_MAX_MS - WRITER_HEARTBEAT_MS
+                // of bus budget; the next heartbeat leaves inside SIGNER_IDLE_DEADLINE_MS of the last exchange.
+                // The caller deadline never selects this local identity window.
                 let end = now
                     .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
                     .ok_or(Error::Deadline)?
+                    .min(
+                        machine
+                            .last_status
+                            .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
+                            .ok_or(Error::Deadline)?,
+                    )
                     .min(machine.expiry()?);
                 w.binding
                     .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
