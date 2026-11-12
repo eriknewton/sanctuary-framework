@@ -19,8 +19,8 @@
  * `renderPostureHomeHTML()` string (matching the v1.1 sse-reconnect test
  * pattern) so the honesty contract is pinned without a browser.
  */
-
-import { describe, expect, it, afterEach } from "vitest";
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js"; import { describe, expect, it, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -140,7 +140,7 @@ function baseDeps(
   const detected: DetectedHarness[] = [
     { platform: "cursor", harness: "cursor", config_path: "/home/u/.cursor/mcp.json" },
   ];
-  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
+  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => agents,

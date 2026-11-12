@@ -1,4 +1,6 @@
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 /** Posture panels preserve independent freshness, bounded admission, and honest historical values. */
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -27,7 +29,7 @@ function pending<T>() {
 async function fixture() {
   const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
   const deps = { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, auditLog, originMachine: "panels", listAgents: () => [],
-    detectInstalledHarnesses: async () => [], panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap() };
+    detectInstalledHarnesses: async () => [], panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap() };
   return { deps, home: await buildHome(deps) };
 }
 
