@@ -76,6 +76,7 @@ import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import { protectionSubjectForUid, protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import { hostname as osHostname, uptime as osUptime } from "node:os";
 import { LivenessRecorder, type CanaryOriginSubjects, type PendingEvidenceCounts } from "../liveness/recorder.js";
+import { observerHostId } from "../liveness/observer.js";
 import { SECOND as LIVENESS_SECOND, COUNTER_MAX as LIVENESS_COUNTER_MAX } from "../liveness/constants.js";
 import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
@@ -3158,8 +3159,6 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-/** Hex digits of the opaque host id; it names the host without publishing its hostname. */
-const LIVENESS_HOST_ID_HEX_DIGITS = 16;
 /** 8 random bytes (64 bits) name one daemon instance and its one publication temp file. */
 const LIVENESS_INSTANCE_BYTES = 8;
 
@@ -3208,7 +3207,8 @@ async function createLivenessRecorder(
     fortressPath: input.fortressPath,
     subject: {
       fortress_id: input.fortressId,
-      host_id: `host-${createHash("sha256").update(osHostname()).digest("hex").slice(0, LIVENESS_HOST_ID_HEX_DIGITS)}`,
+      // Must match observerHostId in server/src/castle-wall/liveness/observer.ts so daemon and observer name the same host.
+      host_id: observerHostId(osHostname()),
       platform: input.platform ?? process.platform,
       operator_uid: process.getuid?.() ?? -1,
     },
