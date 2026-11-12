@@ -11,7 +11,7 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=3072
       VITEST_MAX_WORKERS: 2
       TMPDIR: /tmp/c13
-      EVIDENCE_PACK_TEST_CANDIDATE: /tmp/c13/candidate.json
+      EVIDENCE_PACK_TEST_CANDIDATE: /tmp/c13/artifact/test-candidate.json
     steps:
       # Must match promise-hygiene/run.mjs and promise-hygiene-workflows.test.ts: merge plus two parents, no ref.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,52 +38,66 @@ jobs:
           echo "SANCTUARY_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           node --input-type=module -e 'import fs from "node:fs"; import crypto from "node:crypto"; import cp from "node:child_process"; fs.writeFileSync("/tmp/c13/release-source.json", JSON.stringify({format:"SANCTUARY_RELEASE_SOURCE_V1",source_revision:cp.execFileSync("git",["rev-parse","HEAD"],{encoding:"utf8"}).trim(),source_archive_sha256:crypto.createHash("sha256").update(fs.readFileSync("/tmp/c13/source.tar")).digest("hex")}));'
       - name: Build candidate
+        env:
+          CANDIDATE_EVENT: ${{ github.event_name }}
         working-directory: server
         run: |
           npm ci --no-audit --no-fund
           npm run build
-          npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar
+          # A pull request runs its own YAML even in separate jobs; GitHub supplies the event, both arms fix the mode literally, and the default refuses.
+          case "$CANDIDATE_EVENT" in
+            pull_request) npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar --artifact-dir /tmp/c13/artifact --artifact-mode fixture ;;
+            workflow_dispatch) npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar --artifact-dir /tmp/c13/artifact --artifact-mode release ;;
+            *) exit 1 ;;
+          esac
           npm run typecheck
           npm run lint
           npx tsx scripts/check-no-raw-console.ts
           npm run check-import-cycles
-      - name: Pack candidate once
-        working-directory: packages/evidence-pack-verifier
-        run: |
-          npm pack --json --ignore-scripts --offline > /tmp/c13/pack.json
-          sha256sum ./*.tgz > /tmp/c13/tarball.sha256
-      # Must match candidateForTests in server/scripts/build-evidence-pack.mjs: both runtimes consume this packed descriptor.
+      # This same shared-schema entry is used before install, on Node 24 and immediately before upload.
+      - name: Check artifact descriptor
+        run: node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
       - name: Install packed candidate and record descriptor
         run: |
-          npm install --prefix /tmp/c13/installed --ignore-scripts --no-audit --no-fund --offline ./packages/evidence-pack-verifier/*.tgz
-          node --input-type=module <<'JS'
-          import fs from "node:fs";
-          import path from "node:path";
-          const packed = JSON.parse(fs.readFileSync("/tmp/c13/pack.json", "utf8"))[0];
-          const ref = JSON.parse(fs.readFileSync("/tmp/c13/source-ref.json", "utf8"));
-          fs.writeFileSync(process.env.EVIDENCE_PACK_TEST_CANDIDATE, JSON.stringify({ ...ref, root: "/tmp/c13", tree: process.cwd(), command: "/tmp/c13/installed/node_modules/.bin/verify-evidence-pack", packed, archive: "/tmp/c13/source.tar", metadata: "/tmp/c13/release-source.json", tarball: path.resolve("packages/evidence-pack-verifier", packed.filename) }));
-          JS
+          node server/scripts/build-evidence-pack.mjs --install-candidate /tmp/c13/artifact
+          cp /tmp/c13/source.tar /tmp/c13/artifact/source.tar
+          cp /tmp/c13/release-source.json /tmp/c13/artifact/release-source.json
       - name: Test packed candidate on Node 22
         working-directory: server
         run: |
-          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-cli.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-provenance.test.ts test/evidence-pack/snapshot-acceptance.test.ts test/evidence-pack/snapshot-mutations.test.ts test/structure/snapshot-verifier-import-graph.test.ts test/structure/publish-workflow-signing-gate.test.ts
+          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-cli.test.ts test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-provenance.test.ts test/evidence-pack/snapshot-acceptance.test.ts test/evidence-pack/snapshot-mutations.test.ts test/structure/snapshot-verifier-import-graph.test.ts test/structure/publish-workflow-signing-gate.test.ts
           node ../scripts/check-release-action-pins.mjs
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - name: Check identical candidate on Node 24
         run: |
-          /tmp/c13/installed/node_modules/.bin/verify-evidence-pack --version
+          node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
+          /tmp/c13/artifact/installed/node_modules/.bin/verify-evidence-pack --version
           cd server
-          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
+          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
+      - name: Recheck artifact before upload
+        run: |
+          node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
+          # Must match the upload path list below and workflowPlan in snapshot-artifact.test.ts.
+          # Each file is required because the upload action only rejects an empty aggregate selection.
+          test -f /tmp/c13/artifact/candidate.tgz || exit 1
+          test -f /tmp/c13/artifact/artifact-manifest.json || exit 1
+          test -f /tmp/c13/artifact/candidate.json || exit 1
+          test -f /tmp/c13/artifact/release-source.json || exit 1
+          test -f /tmp/c13/artifact/source.tar || exit 1
+          test -f /tmp/c13/artifact/test-candidate.json || exit 1
+          test -f /tmp/c13/source-ref.json || exit 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          if-no-files-found: error
           name: ${{ github.event_name == 'pull_request' && format('evidence-pack-nonrelease-{0}', github.run_id) || 'evidence-pack-candidate' }}
+          # Must match every test -f in the final recheck and workflowPlan in snapshot-artifact.test.ts.
           path: |
-            packages/evidence-pack-verifier/*.tgz
-            /tmp/c13/release-source.json
-            /tmp/c13/source.tar
-            /tmp/c13/pack.json
-            /tmp/c13/candidate.json
+            /tmp/c13/artifact/candidate.tgz
+            /tmp/c13/artifact/artifact-manifest.json
+            /tmp/c13/artifact/candidate.json
+            /tmp/c13/artifact/release-source.json
+            /tmp/c13/artifact/source.tar
+            /tmp/c13/artifact/test-candidate.json
             /tmp/c13/source-ref.json
-            /tmp/c13/tarball.sha256

@@ -152,3 +152,22 @@ to the frozen surfaces above or to existing callers:
 No receipt, pin or seal API or persisted audit format is added. Existing encrypted
 bytes, namespace encoding, modes, cryptographic labels and legacy API signatures
 remain unchanged. The new methods are not added to package exports or boot paths.
+
+### Evidence artifact candidate contract
+
+`artifact-policy.mjs` owns `SANCTUARY_EVIDENCE_ARTIFACT_V1`, `SANCTUARY_EVIDENCE_CANDIDATE_V1`, the member registry and marker constants. Must match `snapshot-artifact-cli.ts`, `tsup.evidence-pack.config.ts`, `build-evidence-pack.mjs` and `packages/evidence-pack-verifier/package.json`. Bins: `verify-evidence-pack: dist/verify-evidence-pack.js` and `check-evidence-pack-artifact: dist/check-evidence-pack-artifact.js`.
+
+The checker requires each pair exactly once. Its standalone help is:
+
+```text
+Usage: check-evidence-pack-artifact --tarball <file> --manifest <file> --expect-tarball-sha256 <64hex> --expect-manifest-sha256 <64hex> --expect-source-revision <40hex> --expect-mode <release|fixture>
+```
+
+Every result below has exactly one trailing LF. Successful checks exit 0; help exits 0 without checking content. Output failure exits 1.
+
+- `ARTIFACT_OK: release-policy contents matched; this does not authenticate the publisher.`
+- `ARTIFACT_OK: fixture-policy contents matched; non-release.`
+- `ARTIFACT_REFUSED: artifact contents could not be verified.` (stderr, exit 1)
+- `ARTIFACT_USAGE_ERROR: invalid command arguments.` (stderr, exit 2)
+
+The verifier's existing help, version, evidence results and exits remain unchanged. `NON_RELEASE` and `Synthetic archive metadata is not release authentication.\n` retain their exact bytes.
