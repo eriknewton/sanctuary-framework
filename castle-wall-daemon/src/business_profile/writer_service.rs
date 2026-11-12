@@ -472,10 +472,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         let frozen = self.frozen.clone().ok_or(Error::Grant)?;
         let now = self.now()?;
         let g = &frozen.grant;
-        let deadline = header
-            .deadline_boottime_ns
-            .parse::<u64>()
-            .map_err(|_| Error::Deadline)?;
+        let deadline = canonical_deadline(&header.deadline_boottime_ns).ok_or(Error::Deadline)?;
         if header.v != 1
             || header.protocol != SIGNER_PROTOCOL
             || header.activation_id != g.activation_id
@@ -918,10 +915,8 @@ fn serve<P: SignerPort, R: Reconciler>(
                 w.binding.packet(&packet)?;
                 let now = clock()?;
                 if let Operation::Sign(h) = &frame.operation {
-                    let admission = h
-                        .deadline_boottime_ns
-                        .parse::<u64>()
-                        .map_err(|_| Error::Deadline)
+                    let admission = canonical_deadline(&h.deadline_boottime_ns)
+                        .ok_or(Error::Deadline)
                         .and_then(|deadline| {
                             WriterMachine::<P, R>::admit_deadline(deadline, now, machine.expiry()?)
                         });

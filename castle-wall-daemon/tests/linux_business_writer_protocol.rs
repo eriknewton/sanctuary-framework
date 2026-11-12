@@ -243,7 +243,6 @@ fn sign_fields_share_the_native_signer_schema() {
         ("epoch", json!(0)),
         ("generation", json!(-1)),
         ("role", json!("unknown")),
-        ("deadline_boottime_ns", json!("01")),
         ("preimage_length", json!(1)),
     ] {
         let mut value = source.clone();
@@ -253,16 +252,23 @@ fn sign_fields_share_the_native_signer_schema() {
             "{field}"
         );
     }
-    // The writer retains an unparseable string for writer_service's correlated admission reply.
-    for deadline in ["invalid", "", "18446744073709551616"] {
+    // The writer retains deadline text for writer_service's correlated admission reply.
+    for deadline in ["invalid", "", "18446744073709551616", "01", "05", "+1"] {
         let mut value = source.clone();
         value["deadline_boottime_ns"] = json!(deadline);
         let packet = raw(&value, &[]);
-        let frame = decode(&packet, Direction::ToWriter, SESSION).unwrap();
-        let Operation::Sign(header) = frame.operation else {
-            panic!("SIGN header retained")
+        let retained = match decode(&packet, Direction::ToWriter, SESSION) {
+            Ok(Frame {
+                operation: Operation::Sign(header),
+                ..
+            }) => Some(header.deadline_boottime_ns),
+            _ => None,
         };
-        assert_eq!(header.deadline_boottime_ns, deadline);
+        assert_eq!(
+            retained.as_deref(),
+            Some(deadline),
+            "deadline text retained"
+        );
     }
 }
 fn first_record() -> Value {

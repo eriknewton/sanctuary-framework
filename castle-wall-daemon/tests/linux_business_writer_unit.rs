@@ -622,6 +622,7 @@ fn composed_ack_packets_and_frozen_grant_admission() {
         "admission-deadline",
         "admission-expired",
         "admission-text",
+        "admission-noncanonical",
     ] {
         writer_run::child_case(
             "composed_ack_packets_and_frozen_grant_admission",

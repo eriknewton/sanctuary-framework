@@ -964,6 +964,7 @@ pub fn scenario(case: &str) {
                         .to_string()
                 }
                 "admission-text" => h.deadline_boottime_ns = "invalid".into(),
+                "admission-noncanonical" => h.deadline_boottime_ns.insert(0, '0'),
                 "admission-expired" => {
                     h.deadline_boottime_ns = state.now.load(Ordering::SeqCst).to_string()
                 }

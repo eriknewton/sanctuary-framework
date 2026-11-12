@@ -4,6 +4,11 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+// Native signer_service::decode uses the same decimal round trip; every writer stage consumes this predicate.
+pub fn canonical_deadline(text: &str) -> Option<u64> {
+    let value = text.parse::<u64>().ok()?;
+    (value.to_string() == text).then_some(value)
+}
 pub const WRITER_PROTOCOL: &str = "sanctuary.business-writer.v1";
 pub const LENGTH_BYTES: usize = 4; // u32be header length.
 pub const WRITER_HEADER_MAX_BYTES: usize = SIGNER_HEADER_MAX_BYTES;
@@ -181,7 +186,7 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
                 .and_then(Value::as_str)
                 .ok_or(Refusal::Schema)?
                 .to_owned();
-            if deadline.parse::<u64>().is_err() {
+            if canonical_deadline(&deadline).is_none() {
                 map.insert("deadline_boottime_ns".into(), json!("1"));
             }
             let encoded =
