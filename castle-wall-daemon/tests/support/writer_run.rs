@@ -3,7 +3,7 @@ use super::{writer_bus, writer_state};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use castle_wall_daemon::business_profile::{
     signer_client::{self, CurrentGrantView, SignedReply, StatusReply},
-    signer_peer,
+    signer_contract, signer_peer,
     signer_service::{self, Header},
     writer_peer::{HeldConfig, ListenerExpectations},
     writer_protocol::{self, Direction, Operation, StatusPayload},
@@ -203,6 +203,29 @@ pub fn scenario(case: &str) {
     )
     .unwrap();
     fs::write(&boot, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n").unwrap();
+    let closure_writer = if case == "slow-closure" {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(cap.as_os_str().as_bytes()).unwrap();
+        fs::remove_file(&cap).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let fifo = cap.clone();
+        let now = state.now.clone();
+        Some(thread::spawn(move || {
+            use std::io::Write;
+            let mut writer = fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            // Opening the FIFO synchronizes with closure's read; elapsed work exceeds a whole signer idle window.
+            now.fetch_add(
+                (signer_contract::SIGNER_IDLE_DEADLINE_MS as u64 + 1) * writer_state::NS_PER_MS,
+                Ordering::SeqCst,
+            );
+            writer.write_all(CAPS.as_bytes()).unwrap();
+        }))
+    } else {
+        None
+    };
+    if case == "closure-refusal" {
+        fs::write(&cap, CAPS.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0")).unwrap();
+    }
     let paths = ClosurePaths::isolated(
         bus.config.wall_exec.clone(),
         cap,
@@ -264,7 +287,7 @@ pub fn scenario(case: &str) {
         });
     }
     let mut native_thread = None;
-    let port = if case.starts_with("native-") {
+    let bootstrap: Box<dyn FnOnce() -> Result<Port> + Send> = if case.starts_with("native-") {
         let path = root.join("sign.sock");
         let listener = signer_peer::listen(&path).unwrap();
         let view = state.view.clone();
@@ -326,17 +349,28 @@ pub fn scenario(case: &str) {
                 .trim()
                 .into(),
         };
-        Port::Native(
-            Box::new(
-                ClientSignerPort::bootstrap_at_with_clock(&path, policy, state.clock()).unwrap(),
-            ),
-            state.binds.clone(),
-        )
+        let clock = state.clock();
+        let binds = state.binds.clone();
+        Box::new(move || {
+            Ok(Port::Native(
+                Box::new(ClientSignerPort::bootstrap_at_with_clock(
+                    &path, policy, clock,
+                )?),
+                binds,
+            ))
+        })
     } else {
-        Port::Script(Box::new(script))
+        Box::new(move || Ok(Port::Script(Box::new(script))))
     };
+    let bootstrapped_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bootstrap_time = bootstrapped_at.clone();
+    let bootstrap_clock = state.now.clone();
+    let bootstrap = Box::new(move || {
+        bootstrap_time.store(bootstrap_clock.load(Ordering::SeqCst), Ordering::SeqCst);
+        bootstrap()
+    });
     let deps = Dependencies {
-        signer: port,
+        bootstrap,
         reconciler: Reconcile {
             closed: case == "inert",
             calls: state.reconciles.clone(),
@@ -359,9 +393,51 @@ pub fn scenario(case: &str) {
     let first = rx
         .recv_timeout(Duration::from_millis(WAIT_MS as u64))
         .unwrap();
+    if let Some(writer) = closure_writer {
+        writer.join().unwrap();
+    }
+    if case == "closure-refusal" {
+        assert_eq!(first, "STATUS=writer refused at start");
+        assert!(runner.join().unwrap().is_err());
+        assert_eq!(
+            bootstrapped_at.load(Ordering::SeqCst),
+            0,
+            "closure precedes bootstrap"
+        );
+        return;
+    }
+    if case == "slow-closure" {
+        assert_eq!(first, "READY=1\nSTATUS=writer closed");
+        state.now.fetch_add(
+            writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
+        let start = std::time::Instant::now();
+        while state.statuses.load(Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_millis(WAIT_MS as u64));
+            thread::yield_now();
+        }
+        let gap = state.now.load(Ordering::SeqCst) - bootstrapped_at.load(Ordering::SeqCst);
+        assert!(
+            gap < signer_contract::SIGNER_IDLE_DEADLINE_MS as u64 * writer_state::NS_PER_MS,
+            "bootstrap to first heartbeat stays within idle window"
+        );
+        stop.store(true, Ordering::SeqCst);
+        state.now.fetch_add(
+            writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
+        assert!(runner.join().unwrap().is_err());
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        return;
+    }
     if case.starts_with("start-refuse-") || case == "activation-two" {
         assert_eq!(first, "STATUS=writer refused at start");
         assert!(runner.join().unwrap().is_err());
+        assert_eq!(
+            state.closes.load(Ordering::SeqCst),
+            usize::from(case != "activation-two")
+        );
         return;
     }
     assert_eq!(

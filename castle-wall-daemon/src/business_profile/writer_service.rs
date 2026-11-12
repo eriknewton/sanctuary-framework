@@ -686,7 +686,7 @@ pub struct Activation {
     pub names: String,
 }
 pub struct Dependencies<P: SignerPort, R: Reconciler, N: Notifier> {
-    pub signer: P,
+    pub bootstrap: Box<dyn FnOnce() -> Result<P> + Send>,
     pub reconciler: R,
     pub notifier: N,
     pub config: HeldConfig,
@@ -721,12 +721,19 @@ pub fn run<P: SignerPort, R: Reconciler, N: Notifier>(
         Ok(v) => v,
         Err(e) => {
             let _ = deps.notifier.notify("STATUS=writer refused at start");
-            deps.signer.close_and_settle();
+            return Err(e);
+        }
+    };
+    // Closure, activation and config admission precede any signer session; execute supplies this required bootstrap.
+    let signer = match (deps.bootstrap)() {
+        Ok(signer) => signer,
+        Err(e) => {
+            let _ = deps.notifier.notify("STATUS=writer refused at start");
             return Err(e);
         }
     };
     let mut machine = WriterMachine::new(
-        deps.signer,
+        signer,
         deps.reconciler,
         boot,
         deps.clock.clone(),
@@ -1043,14 +1050,14 @@ pub fn test_entry(path: &Path) -> io::Result<()> {
         let seam: TestSeam = serde_json::from_slice(&bytes).map_err(|_| custody::refused())?;
         let config = HeldConfig::isolated(&seam.config, seam.artifact_owner)
             .map_err(|_| custody::refused())?;
-        let signer =
-            ClientSignerPort::bootstrap_at(&seam.signer_socket, config.value.signer.clone())
-                .map_err(|_| custody::refused())?;
+        let policy = config.value.signer.clone();
         if unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
             return Err(custody::refused());
         }
         Ok(Dependencies {
-            signer,
+            bootstrap: Box::new(move || {
+                Ok(ClientSignerPort::bootstrap_at(&seam.signer_socket, policy)?)
+            }),
             reconciler: ClosedReconciler::production(),
             notifier: SystemNotifier,
             config,

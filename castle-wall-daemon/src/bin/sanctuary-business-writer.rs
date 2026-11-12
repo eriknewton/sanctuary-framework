@@ -29,14 +29,14 @@ fn execute() -> std::io::Result<()> {
     let setup = (|| {
         let config = HeldConfig::production().map_err(|_| refused())?;
         let expectations = ListenerExpectations::production(config.value.writer_socket_gid);
-        let signer =
-            ClientSignerPort::bootstrap(config.value.signer.clone()).map_err(|_| refused())?;
+        let policy = config.value.signer.clone();
         // fd 3 is systemd's first inherited descriptor; run validates its complete identity before READY.
         if unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
             return Err(refused());
         }
         Ok(Dependencies {
-            signer,
+            // run invokes this only after closure and activation admission, immediately before start.
+            bootstrap: Box::new(move || Ok(ClientSignerPort::bootstrap(policy)?)),
             // Must match test_isolation_gate::writer_execute_composes_the_closed_reconciler.
             reconciler: ClosedReconciler::production(),
             notifier: SystemNotifier,

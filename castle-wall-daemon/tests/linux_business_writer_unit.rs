@@ -639,3 +639,12 @@ fn composed_wall_death_during_sign_emits_no_verified() {
         || writer_run::scenario("death-during-sign"),
     );
 }
+
+#[test]
+fn closure_work_precedes_the_signer_idle_window() {
+    for case in ["slow-closure", "closure-refusal"] {
+        writer_run::child_case("closure_work_precedes_the_signer_idle_window", case, || {
+            writer_run::scenario(case)
+        });
+    }
+}
