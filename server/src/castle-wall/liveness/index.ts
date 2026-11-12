@@ -13,3 +13,5 @@ export * from "./canary-integrity.js";
 export * from "./process-census.js";
 export * from "./census-sampler.js";
 export * from "./observer.js";
+export * from "./surface-reader.js";
+export * from "./browser-contract.js";

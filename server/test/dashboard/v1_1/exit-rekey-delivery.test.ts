@@ -1,3 +1,5 @@
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
+import { createFixtureLivenessSource } from "../../helpers/fixture-liveness-source.js";
 import { buildV11Bindings } from "../construction-work-fixture.js";
 // fail-before-exempt: Export fault assertions preserve existing scrubbing on both base and fix; lift disclosure is witnessed in the controller, route and shipped-client tests.
 /** The approving dashboard alone receives an export key; reusable views remain metadata only. IC-07. */
@@ -208,7 +210,7 @@ describe("response-only export delivery", () => {
     const raw = await f.auditLog.query({ limit: 100 });
     secretFree(raw);
     const evidenceReply = new Reply();
-    await handlePostureRoute({ auditLog: f.auditLog, originMachine: "fixture", listAgents: () => [], panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap() }, request("/api/posture/evidence", "GET"), evidenceReply as unknown as ServerResponse, new URL("http://localhost/api/posture/evidence"), "GET");
+    await handlePostureRoute({ auditLog: f.auditLog, originMachine: "fixture", listAgents: () => [], panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap() }, request("/api/posture/evidence", "GET"), evidenceReply as unknown as ServerResponse, new URL("http://localhost/api/posture/evidence"), "GET");
     expect(evidenceReply.statusCode).toBe(200); secretFree(evidenceReply.json());
     const rawChannel = new DashboardApprovalChannel({ port: 0, host: "127.0.0.1", timeout_seconds: 30, auto_open: false });
     (rawChannel as any).auditLog = f.auditLog;

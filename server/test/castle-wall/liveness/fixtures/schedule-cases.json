@@ -1,0 +1,76 @@
+{
+  "provenance": "Modelled record sets derived from states.json base; times are offsets in milliseconds relative to the fixture evaluation. Commissioning values remain fixture values.",
+  "cases": [
+    {
+      "name": "healthy",
+      "patches": []
+    },
+    {
+      "name": "wall degraded with agent expiry",
+      "charge_remaining_ms": 10000,
+      "census_remaining_ms": 3000,
+      "patches": []
+    },
+    {
+      "name": "restart ages out",
+      "charge_remaining_ms": 1000,
+      "patches": []
+    },
+    {
+      "name": "mixed step",
+      "charge_remaining_ms": 1000,
+      "census_remaining_ms": 1000,
+      "patches": []
+    },
+    {
+      "name": "adjacent collision",
+      "charge_remaining_ms": 1000,
+      "census_remaining_ms": 3000,
+      "patches": [
+        {
+          "path": "observer.value.raw.mcp",
+          "value": {
+            "stale_child": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "equal severity collision",
+      "patches": [
+        {
+          "path": "daemon.value.raw.hooks.emission_tick",
+          "value": false
+        },
+        {
+          "path": "observer.value.raw.canary_integrity.checked_at_ms",
+          "offset_ms": -29000
+        },
+        {
+          "path": "observer.value.raw.availability.resolved_at_ms",
+          "offset_ms": -27000
+        }
+      ]
+    },
+    {
+      "name": "TTL warning collision",
+      "charge_remaining_ms": 10000,
+      "patches": [
+        {
+          "path": "daemon.value.raw.lease.deadline_ms",
+          "offset_ms": 299000
+        }
+      ]
+    },
+    {
+      "name": "coverage collision",
+      "charge_remaining_ms": 1000,
+      "patches": [
+        {
+          "path": "observer.value.raw.canary_integrity.checked_at_ms",
+          "offset_ms": -27000
+        }
+      ]
+    }
+  ]
+}
