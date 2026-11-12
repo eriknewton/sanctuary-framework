@@ -119,6 +119,7 @@ pub struct Fault {
     pub signals: usize,
     pub invalid_signal: bool,
     pub trickle: bool,
+    pub reply_delay_ms: u64,
     pub change_owner: bool,
     pub malformed: Option<String>,
     pub final_capture_change: bool,
@@ -332,6 +333,7 @@ fn serve(
                 continue;
             }
         }
+        thread::sleep(Duration::from_millis(fault.reply_delay_ms));
         stream.write_all(&response)?;
     }
 }

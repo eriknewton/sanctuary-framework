@@ -105,7 +105,7 @@ def render(role):
                 value = str(root / 'record.sock')
             changed.append(value)
         if values != changed:
-            manifest['substitutions'].append(dict(unit=role, directive=key, before=values, after=changed))
+            manifest['substitutions'].append(dict(unit=role, directive=key, before=list(values), after=list(changed)))
         rendered[key] = changed
     if mode == 'stream' and role == 'writer.socket':
         rendered['[Socket].ListenStream'] = rendered.pop('[Socket].ListenSequentialPacket')
@@ -113,6 +113,10 @@ def render(role):
     if mode == 'two' and role == 'writer.socket':
         rendered['[Socket].ListenSequentialPacket'].append(str(root / 'second.sock'))
         manifest['substitutions'].append(dict(unit=role, directive='extra descriptor', before=[], after=[str(root / 'second.sock')]))
+    if role == 'writer.service':
+        gate = [f'{root}/actor before-writer {root} main']
+        rendered['[Service].ExecStartPre'] = gate
+        manifest['substitutions'].append(dict(unit=role, directive='[Service].ExecStartPre', before=[], after=gate, reason='hold before writer exec until socket ownership is observed'))
     output = ''
     previous = None
     for key, values in rendered.items():
@@ -130,9 +134,12 @@ def render(role):
         assert restored['[Socket].ListenSequentialPacket'][-1] == str(root / 'second.sock')
         restored['[Socket].ListenSequentialPacket'].pop()
     for item in manifest['substitutions']:
-        if item['unit'] == role and item['directive'] in original:
+        if item['unit'] == role and item['directive'].startswith('['):
             assert restored[item['directive']] == item['after'], 'emitted substitution equality: ' + item['directive']
-            restored[item['directive']] = item['before']
+            if item['directive'] in original:
+                restored[item['directive']] = item['before']
+            else:
+                del restored[item['directive']]
     for item in manifest['omissions']:
         if item['unit'] == role:
             restored[item['directive']] = item['values']
@@ -179,12 +186,17 @@ try:
         holder.listen(1)
         holder.settimeout(4)
     ctl('start', names['writer.socket'], '--no-block')
+    wait(lambda: (root / 'before-writer').exists(), 'writer pre-start hold')
     wait(lambda: (root / 'record.sock').exists() or (root / 'signer-closed').exists(), 'socket creation')
     before = (root / 'record.sock').stat() if (root / 'record.sock').exists() else None
     if before:
         assert (before.st_uid, before.st_gid, before.st_mode & 0o7777) == (uid, gid, 0o660)
+    assert show('writer.service', 'SubState') == 'start-pre', 'socket observed before writer exec'
+    assert not (root / 'signer-connected').exists(), 'pre-start hold precedes bootstrap'
+    (root / 'start-writer').touch()
     if mode not in ['stream', 'two']:
         wait(lambda: show('writer.service', 'ActiveState') == 'active', 'writer READY')
+        assert (root / 'signer-connected').exists(), 'ready writer has bootstrapped signer'
     if mode in ['death', 'held']:
         ctl('start', names['wall.service'])
     if mode == 'outside':
@@ -193,7 +205,11 @@ try:
     else:
         (root / 'go').touch()
     if mode in ['child', 'outside', 'stream', 'two']:
-        wait(lambda: (root / 'signer-closed').exists(), 'terminal refusal closes signer')
+        if mode in ['stream', 'two']:
+            wait(lambda: show('writer.service', 'ActiveState') in ['failed', 'inactive'], 'activation refused before bootstrap')
+            assert not (root / 'signer-connected').exists(), 'activation precedes signer session'
+        else:
+            wait(lambda: (root / 'signer-closed').exists(), 'terminal refusal closes signer')
         assert not (root / 'wall-bound').exists()
         assert show('writer.service', 'ActiveState') in ['failed', 'inactive']
     else:

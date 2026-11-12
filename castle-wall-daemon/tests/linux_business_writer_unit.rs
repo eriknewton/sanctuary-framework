@@ -648,3 +648,12 @@ fn closure_work_precedes_the_signer_idle_window() {
         });
     }
 }
+
+#[test]
+fn composed_short_sign_uses_local_revalidation_window() {
+    writer_run::child_case(
+        "composed_short_sign_uses_local_revalidation_window",
+        "short-sign",
+        || writer_run::scenario("short-sign"),
+    );
+}

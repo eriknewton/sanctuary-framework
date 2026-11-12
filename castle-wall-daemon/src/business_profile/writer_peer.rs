@@ -1,6 +1,6 @@
 //! Holds one wall MainPID and authenticates its systemd owner on each exchange.
 mod bus;
-use super::{custody, signer_peer, signer_watchdog::WATCHDOG_TICK_MS, writer_protocol};
+use super::{custody, signer_peer, signer_watchdog::WATCHDOG_TICK_MS};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,11 +24,13 @@ pub const BUS_UNSOLICITED_MAX: usize = 8; // NameAcquired plus bounded signal he
 pub const BUS_HEADER_FIELDS_MAX: usize = 9; // D-Bus field codes 1 through 9.
 pub const BUS_NESTING_MAX: usize = 4; // Variant, array, ExecStart struct, argv array.
 pub const BUS_ARRAY_ELEMENTS_MAX: usize = 16; // Registry arrays only, above the shipped five-element argv.
+pub const INVOCATION_ID_HEX_LEN: usize = 32; // systemd 128-bit InvocationID encoded as two hex digits per byte.
 pub const WALL_DROPINS_MAX: usize = BUS_ARRAY_ELEMENTS_MAX;
 // Must match sanctuary-business-writer.socket: path, descriptor name and mode.
 pub const RECORD_SOCKET: &str = "/run/sanctuary-business-writer/record.sock";
 // Must match sanctuary-business-writer.service: wall dependency and argument-free writer executable.
 pub const WALL_UNIT: &str = "sanctuary-castle-wall.service";
+// Must match ExecStart in systemd/sanctuary-castle-wall.service.
 pub const WALL_EXEC: &str = "/usr/local/libexec/sanctuary/castle-wall-daemon";
 pub const WRITER_EXEC: &str = "/usr/libexec/sanctuary-business-writer";
 pub const SYSTEM_BUS_SOCKET: &str = "/run/dbus/system_bus_socket";
@@ -628,7 +630,7 @@ fn validate_unit(unit: &UnitSnapshot, config: &WriterConfig, pid: i32, cgroup: &
             (unit.active.as_str(), unit.sub.as_str()),
             ("active", "running") | ("activating", "start")
         )
-        || unit.invocation.len() != writer_protocol::SESSION_ID_BYTES
+        || unit.invocation.len() != INVOCATION_ID_HEX_LEN / 2
         || !Path::new(&unit.fragment).is_absolute()
     {
         return Err(Error::Unit);

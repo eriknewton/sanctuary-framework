@@ -117,6 +117,7 @@ fn signer(root: &Path, bounded: bool) {
         }
         thread::sleep(Duration::from_millis(1));
     };
+    fs::write(root.join("signer-connected"), b"connected").unwrap();
     let mut replies = 0;
     loop {
         let mut poll = libc::pollfd {
@@ -167,6 +168,17 @@ fn main() {
     match args[1].as_str() {
         "signer" => signer(root, args[3] == "bounded"),
         "wall" => wall(root, &args[3]),
+        "before-writer" => {
+            // Four signer idle windows bound the fixture-only ownership observation before ExecStart.
+            let end = std::time::Instant::now() + Duration::from_millis(4 * castle_wall_daemon::business_profile::signer_contract::SIGNER_IDLE_DEADLINE_MS as u64);
+            fs::write(root.join("before-writer"), b"held").unwrap();
+            while !root.join("start-writer").exists() {
+                assert!(std::time::Instant::now() < end, "pre-start hold completed");
+                thread::sleep(Duration::from_millis(
+                    castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS as u64,
+                ));
+            }
+        }
         _ => panic!("unknown actor"),
     }
 }

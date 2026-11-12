@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const FIXED_HEADER: usize = 16; // D-Bus fixed header, before the a(yv) field body.
 const ALIGNMENT: usize = 8; // D-Bus struct and message-body alignment.
+const SASL_GUID_HEX_LEN: usize = 16 * 2; // The 16-byte server GUID as hex; either hex case is accepted.
 const BUS_DAEMON: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
 const MANAGER: &str = "org.freedesktop.systemd1";
@@ -79,7 +80,18 @@ fn nesting(depth: usize, obs: &mut Observer) -> Result<()> {
     obs.depth = obs.depth.max(depth);
     Ok(())
 }
-fn signature(bytes: &[u8], offset: &mut usize, depth: usize, obs: &mut Observer) -> Result<Kind> {
+#[derive(Clone, Copy)]
+enum SignatureContext {
+    Value,
+    ArrayElement,
+}
+fn signature(
+    bytes: &[u8],
+    offset: &mut usize,
+    depth: usize,
+    obs: &mut Observer,
+    context: SignatureContext,
+) -> Result<Kind> {
     let code = *bytes.get(*offset).ok_or(Error::Signature)?;
     *offset += 1;
     match code {
@@ -95,14 +107,25 @@ fn signature(bytes: &[u8], offset: &mut usize, depth: usize, obs: &mut Observer)
                 offset,
                 depth + 1,
                 obs,
+                SignatureContext::ArrayElement,
             )?)))
         }
         b'(' | b'{' => {
+            // A dict entry has meaning only as the immediate element of an array, including inside variants.
+            if code == b'{' && !matches!(context, SignatureContext::ArrayElement) {
+                return Err(Error::Signature);
+            }
             nesting(depth + 1, obs)?;
             let end = if code == b'(' { b')' } else { b'}' };
             let mut kinds = Vec::new();
             while bytes.get(*offset) != Some(&end) {
-                kinds.push(signature(bytes, offset, depth + 1, obs)?);
+                kinds.push(signature(
+                    bytes,
+                    offset,
+                    depth + 1,
+                    obs,
+                    SignatureContext::Value,
+                )?);
             }
             *offset += 1;
             if kinds.is_empty()
@@ -221,7 +244,13 @@ impl<'a> Reader<'a> {
                 nesting(depth + 1, obs)?;
                 let text = self.text(true)?;
                 let mut at = 0;
-                let kind = signature(text.as_bytes(), &mut at, depth + 1, obs)?;
+                let kind = signature(
+                    text.as_bytes(),
+                    &mut at,
+                    depth + 1,
+                    obs,
+                    SignatureContext::Value,
+                )?;
                 if at != text.len() {
                     return Err(Error::Signature);
                 }
@@ -358,7 +387,7 @@ pub(super) fn parse(bytes: &[u8], registry: bool, obs: &mut Observer) -> Result<
     let mut at = 0;
     let mut body = Vec::new();
     while at < sig.len() {
-        let kind = signature(sig.as_bytes(), &mut at, 0, obs)?;
+        let kind = signature(sig.as_bytes(), &mut at, 0, obs, SignatureContext::Value)?;
         body.push(reader.item(&kind, 0, registry, obs)?);
     }
     if reader.at != reader.end {
@@ -507,7 +536,7 @@ impl Connection {
             .strip_prefix("OK ")
             .and_then(|s| s.strip_suffix("\r\n"))
             .ok_or(Error::Sasl)?;
-        if guid.len() != 32 || !guid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if guid.len() != SASL_GUID_HEX_LEN || !guid.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Sasl);
         }
         connection.write(b"BEGIN\r\n")?;
@@ -794,4 +823,28 @@ pub(super) fn exchange(target: &BusTarget, end: Deadline) -> Result<UnitSnapshot
         exec: entry[0].text()?.to_owned(),
         argv,
     })
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    #[test]
+    fn dictionary_entries_are_array_elements() {
+        for (text, accepted) in [
+            ("a{sv}", true),
+            ("{sv}", false),
+            ("({sv})", false),
+            ("a({sv})", false),
+        ] {
+            let mut offset = 0;
+            let result = signature(
+                text.as_bytes(),
+                &mut offset,
+                0,
+                &mut Observer::default(),
+                SignatureContext::Value,
+            );
+            assert_eq!(result.is_ok(), accepted, "dictionary context: {text}");
+        }
+    }
 }

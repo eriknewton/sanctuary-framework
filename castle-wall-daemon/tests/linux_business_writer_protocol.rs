@@ -253,6 +253,17 @@ fn sign_fields_share_the_native_signer_schema() {
             "{field}"
         );
     }
+    // The writer retains an unparseable string for writer_service's correlated admission reply.
+    for deadline in ["invalid", "", "18446744073709551616"] {
+        let mut value = source.clone();
+        value["deadline_boottime_ns"] = json!(deadline);
+        let packet = raw(&value, &[]);
+        let frame = decode(&packet, Direction::ToWriter, SESSION).unwrap();
+        let Operation::Sign(header) = frame.operation else {
+            panic!("SIGN header retained")
+        };
+        assert_eq!(header.deadline_boottime_ns, deadline);
+    }
 }
 fn first_record() -> Value {
     let corpus: Value = serde_json::from_str(include_str!(

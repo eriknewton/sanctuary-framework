@@ -204,6 +204,7 @@ fn maximum_budget_sign_heartbeats_before_completion_exchange() {
     let mut m = f.machine();
     f.grant(&mut m);
     f.events.lock().unwrap().clear();
+    let previous_status = *f.status_times.lock().unwrap().last().unwrap();
     f.delay
         .store(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS, Ordering::SeqCst);
     let events = f.events.clone();
@@ -219,6 +220,11 @@ fn maximum_budget_sign_heartbeats_before_completion_exchange() {
         })
         .unwrap();
     assert!(!body.is_empty());
+    let heartbeat_at = *f.status_times.lock().unwrap().last().unwrap();
+    assert!(
+        heartbeat_at - previous_status < SIGNER_IDLE_DEADLINE_MS as u64 * NS_PER_MS,
+        "signer observed idle gap"
+    );
     assert_eq!(
         *f.events.lock().unwrap(),
         vec!["sign", "status", "post-wait"]
@@ -259,4 +265,22 @@ fn sign_deadline_admission_at_clock_and_above_cap() {
         assert_eq!(m.sign(header, &f.body, |_| Ok(())), Err(Error::Deadline));
         assert_eq!(f.signs.load(Ordering::SeqCst), 0);
     }
+}
+
+#[test]
+fn bootstrap_admission_seeds_the_first_heartbeat() {
+    use std::sync::{atomic::AtomicUsize, Arc};
+    let f = Fixture::new();
+    let reads = AtomicUsize::new(0);
+    let clock = Arc::new(move || {
+        Ok(NOW
+            + u64::from(reads.fetch_add(1, Ordering::SeqCst) != 0)
+                * WRITER_HEARTBEAT_MS
+                * NS_PER_MS)
+    });
+    let m = WriterMachine::isolated(f.signer(), f.reconciler(), "a".repeat(32), clock).unwrap();
+    assert!(
+        m.heartbeat_due().unwrap(),
+        "bootstrap admission remains the heartbeat origin"
+    );
 }

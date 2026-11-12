@@ -16,6 +16,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand_core::{OsRng, RngCore};
 #[cfg(feature = "test-isolation")]
 use serde::Deserialize;
+#[cfg(feature = "test-isolation")]
+use std::path::Path;
 use std::{
     collections::BTreeSet,
     ffi::OsString,
@@ -25,7 +27,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 pub const WRITER_MAPPINGS_MAX: usize = custody::RUNTIME_FILES_MAX;
 pub const STOP_STATUS:&str="STATUS=writer stopped; the wall stays closed and nothing restarts the writer until the wall unit is restarted";
@@ -229,6 +231,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         clock: Clock,
         fortress: String,
         revision: u64,
+        bootstrapped_at: u64,
     ) -> Self {
         let latest = signer.initial_status();
         Self {
@@ -242,7 +245,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
             wall: false,
             boot,
             clock,
-            last_status: 0,
+            last_status: bootstrapped_at,
             fortress,
             revision,
         }
@@ -254,7 +257,6 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         Ok((self.clock)()?)
     }
     fn start(&mut self) -> Result<&'static str> {
-        self.last_status = self.now()?;
         match self.latest.state.as_str() {
             "LOCKED" => {
                 self.state = WriterState::ClosedLocked;
@@ -533,7 +535,16 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
     }
     #[cfg(feature = "test-isolation")]
     pub fn isolated(signer: P, reconciler: R, boot: String, clock: Clock) -> Result<Self> {
-        let mut m = Self::new(signer, reconciler, boot, clock, "fixture".into(), 1);
+        let bootstrapped_at = clock()?;
+        let mut m = Self::new(
+            signer,
+            reconciler,
+            boot,
+            clock,
+            "fixture".into(),
+            1,
+            bootstrapped_at,
+        );
         m.start()?;
         Ok(m)
     }
@@ -725,10 +736,24 @@ pub fn run<P: SignerPort, R: Reconciler, N: Notifier>(
         }
     };
     // Closure, activation and config admission precede any signer session; execute supplies this required bootstrap.
-    let signer = match (deps.bootstrap)() {
+    let mut signer = match (deps.bootstrap)() {
         Ok(signer) => signer,
         Err(e) => {
             let _ = deps.notifier.notify("STATUS=writer refused at start");
+            return Err(e);
+        }
+    };
+    // Bootstrap is an external wait; preserve its admission time through the final held-config check and settle any setup refusal.
+    let admission = (|| -> Result<u64> {
+        let bootstrapped_at = (deps.clock)()?;
+        deps.config.recheck()?;
+        Ok(bootstrapped_at)
+    })();
+    let bootstrapped_at = match admission {
+        Ok(time) => time,
+        Err(e) => {
+            let _ = deps.notifier.notify("STATUS=writer refused at start");
+            signer.close_and_settle();
             return Err(e);
         }
     };
@@ -739,6 +764,7 @@ pub fn run<P: SignerPort, R: Reconciler, N: Notifier>(
         deps.clock.clone(),
         deps.config.value.fortress_id.clone(),
         deps.config.value.enrollment_revision,
+        bootstrapped_at,
     );
     let ready = match machine.start() {
         Ok(text) => text,

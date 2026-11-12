@@ -17,6 +17,7 @@ pub const WRITER_CONNECTIONS_MAX: usize = 2; // Bound wall and terminal second a
 pub const WRITER_WORK_MAX: usize = 1; // One synchronous signer slot.
 pub const WRITER_QUEUE_MAX: usize = 0; // No queued signing authority.
 pub const WRITER_HEARTBEAT_MS: u64 = SIGNER_IDLE_DEADLINE_MS as u64 / 4;
+// Must match the K1c-2e consumer: a SIGN wait plus one heartbeat fits the signer idle deadline.
 pub const WRITER_SIGN_DEADLINE_MAX_MS: u64 = SIGNER_IDLE_DEADLINE_MS as u64 - WRITER_HEARTBEAT_MS;
 pub const WRITER_HANDSHAKE_DEADLINE_MS: u64 = SIGNER_HANDSHAKE_DEADLINE_MS as u64;
 pub const SESSION_ID_BYTES: usize = 16; // Fresh 128-bit identifier.
@@ -180,7 +181,9 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
                 .and_then(Value::as_str)
                 .ok_or(Refusal::Schema)?
                 .to_owned();
-            map.insert("deadline_boottime_ns".into(), json!("1"));
+            if deadline.parse::<u64>().is_err() {
+                map.insert("deadline_boottime_ns".into(), json!("1"));
+            }
             let encoded =
                 signer_service::encode(&signer, &packet[end..]).map_err(|_| Refusal::Length)?;
             let (mut header, _) = signer_service::decode(&encoded).map_err(|_| Refusal::Schema)?;

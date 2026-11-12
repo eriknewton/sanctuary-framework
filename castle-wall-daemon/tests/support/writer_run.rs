@@ -203,6 +203,13 @@ pub fn scenario(case: &str) {
     )
     .unwrap();
     fs::write(&boot, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n").unwrap();
+    if case.starts_with("native-") {
+        // BusinessSignerClient::bind verifies the actual kernel boot, so both native peers consume that same source.
+        let kernel = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        state.view.lock().unwrap().boot_id =
+            signer_service::parse_boot_id(kernel.as_bytes()).unwrap();
+        fs::write(&boot, kernel).unwrap();
+    }
     let closure_writer = if case == "slow-closure" {
         use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(cap.as_os_str().as_bytes()).unwrap();
@@ -846,6 +853,13 @@ pub fn scenario(case: &str) {
         }
         let mut h = state.header();
         let mut body = state.body.clone();
+        if case == "short-sign" {
+            // One caller millisecond is shorter than one watchdog tick of bus work; the injected signer clock stays fixed.
+            h.deadline_boottime_ns =
+                (state.now.load(Ordering::SeqCst) + writer_state::NS_PER_MS).to_string();
+            bus.fault.lock().unwrap().reply_delay_ms =
+                castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS as u64;
+        }
         if case.starts_with("admission-") {
             match case {
                 "admission-activation" => h.activation_id = "b".repeat(32),

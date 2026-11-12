@@ -26,6 +26,7 @@ pub struct Fixture {
     pub binds: Arc<AtomicUsize>,
     pub reconciles: Arc<AtomicUsize>,
     pub statuses: Arc<AtomicUsize>,
+    pub status_times: Arc<Mutex<Vec<u64>>>,
     pub closes: Arc<AtomicUsize>,
     pub body: Vec<u8>,
     pub signature: Arc<Mutex<[u8; 64]>>,
@@ -58,6 +59,7 @@ impl Fixture {
             binds: Arc::default(),
             reconciles: Arc::default(),
             statuses: Arc::default(),
+            status_times: Arc::default(),
             closes: Arc::default(),
             body: serde_json::to_vec(b).unwrap(),
             signature: Arc::new(Mutex::new(signature)),
@@ -73,6 +75,7 @@ impl Fixture {
     pub fn signer(&self) -> ScriptedSigner {
         let view = self.view.clone();
         let statuses = self.statuses.clone();
+        let status_times = self.status_times.clone();
         let now = self.now.clone();
         let status_delay = self.status_delay.clone();
         let events = self.events.clone();
@@ -87,6 +90,10 @@ impl Fixture {
             initial: self.view.lock().unwrap().clone(),
             status: Box::new(move || {
                 statuses.fetch_add(1, Ordering::SeqCst);
+                status_times
+                    .lock()
+                    .unwrap()
+                    .push(now.load(Ordering::SeqCst));
                 events.lock().unwrap().push("status".into());
                 now.fetch_add(status_delay.load(Ordering::SeqCst), Ordering::SeqCst);
                 Ok(view.lock().unwrap().clone())
