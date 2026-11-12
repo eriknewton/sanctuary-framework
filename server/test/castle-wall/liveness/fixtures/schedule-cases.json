@@ -44,11 +44,11 @@
         },
         {
           "path": "observer.value.raw.canary_integrity.checked_at_ms",
-          "value": 1794225571000
+          "offset_ms": -29000
         },
         {
           "path": "observer.value.raw.availability.resolved_at_ms",
-          "value": 1794225573000
+          "offset_ms": -27000
         }
       ]
     },
@@ -58,7 +58,7 @@
       "patches": [
         {
           "path": "daemon.value.raw.lease.deadline_ms",
-          "value": 1794225899000
+          "offset_ms": 299000
         }
       ]
     },
@@ -68,7 +68,7 @@
       "patches": [
         {
           "path": "observer.value.raw.canary_integrity.checked_at_ms",
-          "value": 1794225573000
+          "offset_ms": -27000
         }
       ]
     }

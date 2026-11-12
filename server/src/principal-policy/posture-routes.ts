@@ -46,7 +46,6 @@
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  *   GET /posture/evidence        - the Phase 2 Evidence View HTML shell.
  */
-import { buildLivenessHealthRows } from "./feature-health.js";
 import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
 
 
@@ -561,7 +560,8 @@ export async function handlePostureRoute(
     }
     await handlePostureStream(res, {
       // SSE admits and registers cleanup before refreshing each frame; it never joins the HTTP flight.
-      buildHome: async () => buildHome(deps.refreshStreamDeps ? await deps.refreshStreamDeps() : deps),
+      // The admitted stream owns its liveness source; refreshing panel dependencies cannot replace it.
+      buildHome: async () => buildHome({ ...(deps.refreshStreamDeps ? await deps.refreshStreamDeps() : deps), livenessSource: deps.livenessSource }),
       registry: deps.streamRegistry,
       ...(deps.streamIntervalMs !== undefined
         ? { intervalMs: deps.streamIntervalMs }
@@ -598,7 +598,7 @@ export async function handlePostureRoute(
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/feature-health`) {
       const panel = await buildFeatureHealth(deps);
       const castle_wall_liveness = await deps.livenessSource.readProjection();
-      writeJSON(res, 200, { ...panel, castle_wall_liveness, liveness_rows: buildLivenessHealthRows(castle_wall_liveness) });
+      writeJSON(res, 200, { ...panel, castle_wall_liveness });
       return true;
     }
 
@@ -1375,7 +1375,8 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
       feature_health: health.status, custody_exit: custody.status, federation: federation.status, query_privacy: query.status },
     audit_verification: deps.auditLog!.verificationCacheStats(),
     castle_wall: castleWall, digest: keysRestricted ? fallback.digest : value("digest", digest),
-    unwrapped: unwrappedValue, feature_health: { ...featureHealth, liveness_rows: buildLivenessHealthRows(liveness) }, custody_exit: value("custody_exit", custody),
+    // Scheduled liveness stays beside cached panels; no schedule-less healthy text belongs inside feature_health.
+    unwrapped: unwrappedValue, feature_health: featureHealth, custody_exit: value("custody_exit", custody),
     federation: value("federation", federation), query_privacy: queryPrivacy, agents,
     protection_requested_count: agents.filter(a => a.policy_protected).length,
     protection_detected_count: records.length + unwrappedValue.unwrapped.length,

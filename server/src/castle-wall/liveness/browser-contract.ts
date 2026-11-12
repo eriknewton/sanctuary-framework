@@ -1,7 +1,6 @@
 /** Evaluator projections and a bounded, conservative browser expiry schedule. */
-import { buildLivenessBadges, renderLivenessBadges } from "../../principal-policy/posture.js";
 import { evaluateLiveness, type LivenessEnvelope, type LivenessInput } from "./evaluate.js";
-import { DISPLAY_PERIOD, LOCAL_JITTER, SCHEDULE_STEPS, LIVENESS_SEVERITY_ORDER, type LivenessVerdicts } from "./constants.js";
+import { LIVENESS_STATES, DISPLAY_PERIOD, LOCAL_JITTER, SCHEDULE_STEPS, LIVENESS_SEVERITY_ORDER, type LivenessVerdicts } from "./constants.js";
 
 export type { LivenessVerdicts } from "./constants.js";
 export interface LivenessScheduleEntry { after_ms: number; projection: LivenessVerdicts }
@@ -64,7 +63,7 @@ export function buildLivenessSchedule(input: LivenessInput): LivenessScheduleEnt
       else { worsened = true; replace(early, next, component); }
     }
     if (worsened) emit((k - 1) * LOCAL_JITTER, early);
-    // The terminal evaluation is always emitted strictly beyond observer freshness, even without a change.
+    // Must match createLivenessDisplay terminal validation below: beyond observer freshness, neither component is OK and coverage is UNAVAILABLE.
     if (improved || k === SCHEDULE_STEPS) emit(k * LOCAL_JITTER, next);
     previous = next;
   }
@@ -73,10 +72,9 @@ export function buildLivenessSchedule(input: LivenessInput): LivenessScheduleEnt
 
 /** Must match the interpolation sites in posture-home-html.ts, posture-agent-html.ts and dashboard/v1_1/client.ts, via posture-html-shared.ts. */
 export const LIVENESS_SCHEDULE_FN_SOURCE = String.raw`
-${buildLivenessBadges.toString()}
-${renderLivenessBadges.toString()}
 function createLivenessDisplay(paint) {
   var invalid = false;
+  // observation_invalid is a browser-only refusal reason, not an evaluator registry reason.
   var fallback = { wall: { state: "wall_DOWN", alarm: true, reasons: ["observation_invalid"], cause: null },
     agent: { state: "agent_DOWN", alarm: true, reasons: ["observation_invalid"], cause: null },
     coverage: { state: "coverage_UNAVAILABLE", alarm: true, reasons: ["observation_invalid"], cause: null }, exit_code: 1 };
@@ -95,10 +93,12 @@ function createLivenessDisplay(paint) {
     }
     paint(selected.projection);
   }
+  // Must match LIVENESS_STATES in constants.ts; only closed component states can reach a paint.
+  var states = ${JSON.stringify(LIVENESS_STATES)};
   function validVerdicts(value) {
     return value && Number.isInteger(value.exit_code) && ['wall', 'agent', 'coverage'].every(function(component) {
       var verdict = value[component];
-      return verdict && typeof verdict.state === 'string' && verdict.state.indexOf(component + '_') === 0 &&
+      return verdict && typeof verdict.state === 'string' && states[component].includes(verdict.state) &&
         typeof verdict.alarm === 'boolean' && Array.isArray(verdict.reasons) &&
         verdict.reasons.every(function(reason) { return typeof reason === 'string'; }) &&
         (verdict.cause === null || typeof verdict.cause === 'string');
@@ -106,7 +106,8 @@ function createLivenessDisplay(paint) {
   }
   function refuse() { invalid = true; render(); }
   function install(projection) {
-    // Invalid age or shape must never leave a healthy first entry painted indefinitely.
+    // Must match buildLivenessSchedule terminal emission above: neither component is OK and coverage is UNAVAILABLE.
+    // Invalid age, shape or unknown state must never leave a healthy first entry painted indefinitely.
     var origin = projection && parseEvidenceTimestamp(projection.evaluated_at);
     if (!projection || !Number.isFinite(projection.served_age_ms) || projection.served_age_ms < 0 ||
         origin === undefined || !validVerdicts(projection) || !Array.isArray(projection.schedule) ||

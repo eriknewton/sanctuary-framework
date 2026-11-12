@@ -317,6 +317,16 @@ describe("renderTable castle-wall line", () => {
     const line = table.split("\n").find((l) => l.includes("castle wall:"));
     expect(line).toContain("castle wall:  unknown");
   });
+  it("prints each liveness state and its supplied reasons together", () => {
+    const text = renderTable({ castle_wall_liveness: {
+      wall: { state: "wall_DOWN", reasons: ["observer_stale", "canary_failed"] },
+      agent: { state: "agent_UNMONITORED", reasons: ["agent_not_configured"] },
+      coverage: { state: "coverage_UNAVAILABLE", reasons: ["observer_stale"] },
+    } });
+    expect(text).toContain("liveness wall: wall_DOWN (observer_stale, canary_failed)");
+    expect(text).toContain("liveness agent: agent_UNMONITORED (agent_not_configured)");
+    expect(text).toContain("liveness coverage: coverage_UNAVAILABLE (observer_stale)");
+  });
 });
 
 describe("toYaml", () => {
@@ -336,15 +346,4 @@ describe("toYaml", () => {
     expect(text).toContain('"needs: quoting"');
     expect(text).toContain("a: null");
   });
-});
-
- it("prints each liveness state and its supplied reasons together", () => {
-  const text = renderTable({ castle_wall_liveness: {
-    wall: { state: "wall_DOWN", reasons: ["observer_stale", "canary_failed"] },
-    agent: { state: "agent_UNMONITORED", reasons: ["agent_not_configured"] },
-    coverage: { state: "coverage_UNAVAILABLE", reasons: ["observer_stale"] },
-  } });
-  expect(text).toContain("liveness wall: wall_DOWN (observer_stale, canary_failed)");
-  expect(text).toContain("liveness agent: agent_UNMONITORED (agent_not_configured)");
-  expect(text).toContain("liveness coverage: coverage_UNAVAILABLE (observer_stale)");
 });

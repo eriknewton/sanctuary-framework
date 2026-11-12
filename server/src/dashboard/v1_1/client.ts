@@ -26,6 +26,7 @@
  * commas, colons, or parentheses.
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
+import { LIVENESS_BADGE_FN_SOURCE } from "../../principal-policy/posture.js";
 import { LIVENESS_SCHEDULE_FN_SOURCE } from "../../principal-policy/posture-html-shared.js";
 
 
@@ -82,6 +83,8 @@ const EVIDENCE_CHAIN_VERDICTS = {
 const CLIENT_SCRIPT = String.raw`
 "use strict";
 // Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+// Must match LIVENESS_BADGE_FN_SOURCE in principal-policy/posture.ts.
+${LIVENESS_BADGE_FN_SOURCE}
 ${LIVENESS_SCHEDULE_FN_SOURCE}
 const livenessDisplay = mountLivenessDisplay();
 

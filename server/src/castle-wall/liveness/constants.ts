@@ -280,32 +280,15 @@ export const STABLE_RUNTIME_REFUSAL_EXIT_CODE = 78;
 // ---------------------------------------------------------------------------
 // Closed reason registry.
 // ---------------------------------------------------------------------------
-export type WallState =
-  | "wall_INITIALIZING"
-  | "wall_OK_ACTIVE"
-  | "wall_OK_IDLE"
-  | "wall_OK_AGED_HISTORY"
-  | "wall_OK_TTL_COUNTDOWN"
-  | "wall_TTL_WARNING"
-  | "wall_DEGRADED"
-  | "wall_DOWN"
-  | "wall_RECOVERING"
-  | "wall_SAFE_MODE"
-  | "wall_REBOOT_NO_LOGIN"
-  | "wall_LOGGED_OUT";
-export type AgentState =
-  | "agent_UNMONITORED"
-  | "agent_INITIALIZING"
-  | "agent_OK_PASSIVE"
-  | "agent_OK_OPTIONAL_REPLY"
-  | "agent_DEGRADED_STALE_MCP"
-  | "agent_DOWN"
-  | "agent_RECOVERING";
-export type CoverageState =
-  | "coverage_COMPLETE"
-  | "coverage_WALL_ONLY"
-  | "coverage_LEGACY_PARTIAL"
-  | "coverage_UNAVAILABLE";
+/** Must match the closed-state validation in browser-contract.ts and the exhaustive badge words in principal-policy/posture.ts. */
+export const LIVENESS_STATES = {
+  wall: ["wall_INITIALIZING", "wall_OK_ACTIVE", "wall_OK_IDLE", "wall_OK_AGED_HISTORY", "wall_OK_TTL_COUNTDOWN", "wall_TTL_WARNING", "wall_DEGRADED", "wall_DOWN", "wall_RECOVERING", "wall_SAFE_MODE", "wall_REBOOT_NO_LOGIN", "wall_LOGGED_OUT"],
+  agent: ["agent_UNMONITORED", "agent_INITIALIZING", "agent_OK_PASSIVE", "agent_OK_OPTIONAL_REPLY", "agent_DEGRADED_STALE_MCP", "agent_DOWN", "agent_RECOVERING"],
+  coverage: ["coverage_COMPLETE", "coverage_WALL_ONLY", "coverage_LEGACY_PARTIAL", "coverage_UNAVAILABLE"],
+} as const;
+export type WallState = typeof LIVENESS_STATES.wall[number];
+export type AgentState = typeof LIVENESS_STATES.agent[number];
+export type CoverageState = typeof LIVENESS_STATES.coverage[number];
 
 /** The state class a reason gives the wall, or `n/a` when the wall cannot carry it. */
 export type WallClass =

@@ -28,6 +28,7 @@
  * Returns a string so the dashboard can serve it directly (mirrors
  * `renderPostureHomeHTML`).
  */
+import { LIVENESS_BADGE_FN_SOURCE } from "./posture.js";
 import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
 
 
@@ -132,7 +133,9 @@ export function renderPostureAgentHTML(): string {
   "use strict";
   ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
   // Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
-  ${LIVENESS_SCHEDULE_FN_SOURCE}
+  // Must match LIVENESS_BADGE_FN_SOURCE in principal-policy/posture.ts.
+${LIVENESS_BADGE_FN_SOURCE}
+${LIVENESS_SCHEDULE_FN_SOURCE}
   var livenessDisplay = mountLivenessDisplay();
   // Same auth model as the rest of the dashboard: loopback auto-auth or a
   // bearer token the operator pasted. We send credentials: same-origin so the

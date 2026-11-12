@@ -68,8 +68,6 @@
  * without a live HTTP server or a running daemon.
  */
 
-import type { LivenessVerdicts } from "../castle-wall/liveness/browser-contract.js";
-import { buildLivenessBadges } from "./posture.js";
 import type {
   AuditEntry,
   AuditIntegrityFinding,
@@ -1620,7 +1618,6 @@ export function evaluateFeatureHealth(args: {
 }
 
 export interface FeatureHealthPanel {
-  liveness_rows?: ReturnType<typeof buildLivenessHealthRows>;
   origin_machine: string;
   window_start: string;
   window_end: string;
@@ -2110,8 +2107,3 @@ export const FEATURE_FAULT_CLASS_RULES: ReadonlyArray<FeatureFaultClassRule> =
       dormant: false,
     },
   ]);
-
-/** Fresh component rows are attached after the cached feature panel has been read. */
-export function buildLivenessHealthRows(projection: LivenessVerdicts) {
-  return buildLivenessBadges(projection);
-}

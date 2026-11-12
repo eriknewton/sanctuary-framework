@@ -14,6 +14,18 @@ export function project(envelope: LivenessEnvelope, input: LivenessInput, nowMs 
     ...verdicts(envelope), schedule: buildLivenessSchedule(input) };
 }
 
+function freezeProjection(projection: LivenessProjection): LivenessProjection {
+  // Callers share nested schedule verdicts, so no caller may rewrite another caller's evidence.
+  const pending: unknown[] = [projection];
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (next === null || typeof next !== "object" || Object.isFrozen(next)) continue;
+    Object.freeze(next);
+    pending.push(...Object.values(next));
+  }
+  return projection;
+}
+
 type Snapshot = { envelope: LivenessEnvelope; input: LivenessInput; projection?: LivenessProjection };
 export class LivenessSurfaceSource {
   private flight: Promise<Snapshot> | undefined;
@@ -34,7 +46,7 @@ export class LivenessSurfaceSource {
     // Concurrent requests share one read; an expired read retains admission until all raw operations settle.
     const snapshot = this.expired ?? await (this.flight ?? this.start());
     // Schedule work belongs to the read; only served age varies between callers.
-    snapshot.projection ??= project(snapshot.envelope, snapshot.input, snapshot.input.nowMs);
+    snapshot.projection ??= freezeProjection(project(snapshot.envelope, snapshot.input, snapshot.input.nowMs));
     return { ...snapshot.projection, served_age_ms: Math.max(0, this.now() - snapshot.input.nowMs) };
   }
 
@@ -76,6 +88,7 @@ export class LivenessSurfaceSource {
         const result = this.expired ?? snapshot;
         release(); finish(result);
       } else {
+        // Until every raw operation settles, later callers get the deadline envelope rather than a read-time snapshot.
         this.expired ??= this.deadlineSnapshot();
         finish(snapshot);
       }

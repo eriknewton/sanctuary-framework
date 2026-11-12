@@ -11,7 +11,11 @@ import { evaluateLiveness, type LivenessInput } from "../../../src/castle-wall/l
 import { readAndEvaluateLiveness, readAndEvaluateLivenessWithInput, type ReaderFs } from "../../../src/castle-wall/liveness/read-status.js";
 import { LivenessSurfaceSource, project } from "../../../src/castle-wall/liveness/surface-reader.js";
 import { buildLivenessSchedule, LIVENESS_SCHEDULE_FN_SOURCE, verdicts, type LivenessProjection, type LivenessVerdicts } from "../../../src/castle-wall/liveness/browser-contract.js";
-import { HTTP_BODY_BYTES, STATUS_BYTES, LIVENESS_SEVERITY_ORDER, AGENT_WINDOW_BASE, HISTORY_WINDOW, OBSERVER_WINDOW, LOCAL_JITTER, SCHEDULE_STEPS, DISPLAY_PERIOD, SECOND, STATUS_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
+import { LIVENESS_STATES, HTTP_BODY_BYTES, STATUS_BYTES, LIVENESS_SEVERITY_ORDER, AGENT_WINDOW_BASE, HISTORY_WINDOW, OBSERVER_WINDOW, LOCAL_JITTER, SCHEDULE_STEPS, DISPLAY_PERIOD, SECOND, STATUS_READ_DEADLINE } from "../../../src/castle-wall/liveness/constants.js";
+import { buildLivenessBadges, renderLivenessBadges, LIVENESS_BADGE_FN_SOURCE } from "../../../src/principal-policy/posture.js";
+import { renderDashboardV11Html } from "../../../src/dashboard/v1_1/html.js";
+import { defaultConfig } from "../../../src/config.js";
+import { createFixtureLivenessSource } from "../../helpers/fixture-liveness-source.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { renderPostureHomeHTML } from "../../../src/principal-policy/posture-home-html.js";
 import { renderPostureAgentHTML } from "../../../src/principal-policy/posture-agent-html.js";
@@ -28,7 +32,7 @@ import { startRig, openDurableSession } from "../../v1/rig.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 const fixture = JSON.parse(readFileSync(join(__dirname, "fixtures/states.json"), "utf8"));
-const cases: { name: string; charge_remaining_ms?: number; census_remaining_ms?: number; patches: { path: string; value: unknown }[] }[] =
+const cases: { name: string; charge_remaining_ms?: number; census_remaining_ms?: number; patches: { path: string; value?: unknown; offset_ms?: number }[] }[] =
   JSON.parse(readFileSync(join(__dirname, "fixtures/schedule-cases.json"), "utf8")).cases;
 const fortressPath = "/fixture/fortress";
 function base(): LivenessInput {
@@ -58,7 +62,7 @@ function caseInput(row: typeof cases[number]): LivenessInput {
   }
   for (const patch of row.patches) {
     const keys = patch.path.split("."); const last = keys.pop()!;
-    let target: any = input; for (const key of keys) target = target[key]; target[last] = patch.value;
+    let target: any = input; for (const key of keys) target = target[key]; target[last] = patch.offset_ms === undefined ? patch.value : input.nowMs + patch.offset_ms;
   }
   return input;
 }
@@ -87,14 +91,26 @@ function options(input: LivenessInput, fs: ReaderFs) {
 function projection(input = base()) { return project(evaluateLiveness(input), input, input.nowMs); }
 const select = (p: LivenessProjection, age: number) => p.schedule.filter(entry => entry.after_ms <= age).at(-1)!.projection;
 const components = ["wall", "agent", "coverage"] as const;
+// Deliberately hand-written rather than imported: the sweep must remain independent of production precedence.
+const oracleOrder = {
+  wall: ["OK", "RECOVERING", "DEGRADED", "TTL_WARNING"],
+  agent: ["OK", "RECOVERING", "DEGRADED_STALE_MCP", "INITIALIZING", "DOWN", "UNMONITORED"],
+  coverage: ["COMPLETE", "WALL_ONLY", "LEGACY_PARTIAL", "UNAVAILABLE"],
+};
 function rank(component: typeof components[number], state: string): number {
-  const order = LIVENESS_SEVERITY_ORDER[component];
+  const order = oracleOrder[component];
   const name = state.slice(component.length + 1); const i = order.indexOf(name.startsWith("OK_") ? "OK" : name);
   return i < 0 ? order.length : i;
 }
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("shared reader snapshot", () => {
+  it("keeps fixture host evidence unavailable", async () => {
+    const evaluate = vi.spyOn(await import("../../../src/castle-wall/liveness/evaluate.js"), "evaluateLiveness");
+    const result = await createFixtureLivenessSource().readProjection();
+    expect(evaluate.mock.calls[0]![0].host.ok).toBe(false);
+    expect(result.wall.alarm).toBe(true);
+  });
   it("shares a deadline verdict after a returning reader leaves a close pending", async () => {
     vi.useFakeTimers();
     const input = base(), backing = filesystem(input);
@@ -169,6 +185,16 @@ describe("shared reader snapshot", () => {
     const schedule = vi.spyOn(browserContract, "buildLivenessSchedule");
     const values = await Promise.all(Array.from({ length: 1000 }, () => source.readProjection()));
     expect(schedule).toHaveBeenCalledTimes(1);
+    for (const value of values) {
+      const pending: unknown[] = [value.wall, value.agent, value.coverage, value.schedule];
+      while (pending.length > 0) {
+        const next = pending.pop();
+        if (next === null || typeof next !== "object") continue;
+        expect(Object.isFrozen(next)).toBe(true);
+        pending.push(...Object.values(next));
+      }
+    }
+    expect(() => { values[0]!.schedule[0]!.projection.wall.reasons.push("changed"); }).toThrow();
     expect(fs.opens()).toBe(5); expect(new Set(values.map(v => JSON.stringify(v))).size).toBe(1);
     await source.readProjection(); expect(fs.opens()).toBe(10);
     expect(schedule).toHaveBeenCalledTimes(2);
@@ -270,13 +296,20 @@ describe("conservative evaluator schedule", () => {
   });
 });
 
-function browser(script: string) {
+function browser(script: string, html = renderPostureHomeHTML(), route?: "overview" | "first run" | "enforcement") {
   let now = 0, perf = 0, painted: LivenessVerdicts | undefined;
   const intervals: { fn: () => void; ms: number }[] = []; const listeners: Record<string, () => void> = {};
   const elements = new Map<string, any>();
-  const element = () => ({ textContent: "", innerHTML: "", style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {} }, setAttribute() {}, addEventListener() {}, appendChild() {}, querySelectorAll: () => [], querySelector: () => null });
+  function declare(markup: string) {
+    for (const match of markup.replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "").matchAll(/\bid="([^"]+)"/g)) {
+      if (!elements.has(match[1]!)) elements.set(match[1]!, element());
+    }
+  }
+  const element = () => ({ textContent: "", _html: "",
+    get innerHTML() { return this._html; }, set innerHTML(value: string) { this._html = value; declare(value); }, style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {} }, setAttribute() {}, addEventListener() {}, appendChild() {}, querySelectorAll: () => [], querySelector: () => null });
+  declare(html);
   const document = { body: { appendChild(e: any) { elements.set(e.id, e); } }, documentElement: element(),
-    getElementById: (id: string) => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
+    getElementById: (id: string) => elements.get(id) ?? null,
     createElement: element, querySelectorAll: () => [], querySelector: () => element(),
     addEventListener: (event: string, fn: () => void) => { listeners[event] = fn; } };
   const context = vm.createContext({ Date: class extends Date { static override now() { return now; } }, performance: { now: () => perf },
@@ -287,6 +320,7 @@ function browser(script: string) {
     fetch: () => new Promise(() => {}), setTimeout: () => 0, clearTimeout() {}, clearInterval() {},
     setInterval: (fn: () => void, ms: number) => { intervals.push({ fn, ms }); return 0; },
   });
+  script = script.replace(/(?<!globalThis.createLivenessDisplay = )function createLivenessDisplay\(paint\)/, "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
   const visibleScript = script.replace("function renderWall(w)", "globalThis.renderWall = function renderWall(w)");
   script = visibleScript;
   const closure = script.lastIndexOf("})();");
@@ -294,6 +328,16 @@ function browser(script: string) {
     ? script.slice(0, closure) + "globalThis.mountedLiveness = livenessDisplay;\n" + script.slice(closure)
     : script + "\nglobalThis.mountedLiveness = livenessDisplay;";
   vm.runInContext(mounted, context);
+  if (route) {
+    (context as any).routeName = route === "enforcement" ? "enforcement" : "posture";
+    (context as any).firstRun = route === "first run";
+    vm.runInContext(`
+      sourceReads.forEach(function(read) { read.state = "state_LOADED"; });
+      state.posture.home = { agents: firstRun ? [] : [{ agent_id: "fixture", harness: "fixture" }], castle_wall: {}, unwrapped: [] };
+      state.route = routeName;
+      renderMain();
+    `, context);
+  }
   // Exercise the exact embedded factory as well as the actual mount's timer and visibility hook.
   (context as any).capture = (v: LivenessVerdicts) => { painted = v; };
   vm.runInContext("globalThis.testDisplay = createLivenessDisplay(capture)", context);
@@ -303,12 +347,43 @@ function browser(script: string) {
     shown: () => painted!, intervals, listeners, context, elements };
 }
 const shipped = [
-  ["dashboard", () => getClientScript()],
-  ["posture home", () => renderPostureHomeHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, "")],
-  ["posture agent", () => renderPostureAgentHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, "")],
+  ...(["overview", "first run", "enforcement"] as const).map(route =>
+    ["dashboard " + route, () => getClientScript(), () => renderDashboardV11Html({ embedClient: false }), route] as const),
+  ["posture home", () => renderPostureHomeHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, ""), renderPostureHomeHTML, undefined],
+  ["posture agent", () => renderPostureAgentHTML().match(/<script>[\s\S]*?<\/script>/g)!.find(s => s.includes(LIVENESS_SCHEDULE_FN_SOURCE))!.replace(/^<script>|<\/script>$/g, ""), renderPostureAgentHTML, undefined],
 ] as const;
+describe("liveness presentation contract", () => {
+  it("matches the documented precedence order", () => {
+    expect(oracleOrder).toEqual(LIVENESS_SEVERITY_ORDER);
+  });
+  it("ships browser badge source with only browser globals", () => {
+    expect(LIVENESS_BADGE_FN_SOURCE).not.toMatch(/\b__\w+\b/);
+    const contract = readFileSync(join(__dirname, "../../../src/castle-wall/liveness/browser-contract.ts"), "utf8");
+    expect(contract).not.toContain("principal-policy/posture");
+    const shell = renderDashboardV11Html({ embedClient: false });
+    expect(shell).toContain(".pill.tone-verified { background: var(--sage-bg); color: var(--sage)");
+    expect(shell).toContain(".pill.tone-unverified { background: var(--rust-bg); color: var(--rust)");
+    const context = vm.createContext({});
+    vm.runInContext(LIVENESS_BADGE_FN_SOURCE, context);
+    for (const component of components) for (const state of [...LIVENESS_STATES[component], component + "_FUTURE", component + "_OK_FUTURE", component === "wall" ? "agent_OK_PASSIVE" : "wall_OK_IDLE"]) {
+      for (const alarm of [false, true]) {
+        const value = structuredClone(projection());
+        Object.assign(value[component], { state, alarm, reasons: ['<reason & "detail">'] });
+        expect((context as any).buildLivenessBadges(value)).toEqual(buildLivenessBadges(value));
+        expect((context as any).renderLivenessBadges(value)).toBe(renderLivenessBadges(value));
+      }
+    }
+  });
+  it.each(shipped)("declares one scheduled badge mount in %s", (_name, source, markup, route) => {
+    const page = browser(source(), markup(), route);
+    const html = route ? page.elements.get("main").innerHTML : markup().replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, "");
+    expect([...html.matchAll(/\bid="castle-wall-liveness"/g)]).toHaveLength(1);
+    page.install(projection());
+    expect(page.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="wall_OK_IDLE"');
+  });
+});
 describe("shipped browser clocks", () => {
-  it.each(shipped)("refuses malformed liveness projections in %s", (_name, source) => {
+  it.each(shipped)("refuses malformed liveness projections in %s", (_name, source, markup, route) => {
     const script = source().replace("function createLivenessDisplay(paint)", "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
     const malformed = [
       (p: any) => { delete p.served_age_ms; }, (p: any) => { p.served_age_ms = NaN; },
@@ -318,9 +393,15 @@ describe("shipped browser clocks", () => {
       (p: any) => { p.schedule[0].after_ms = 1; }, (p: any) => { delete p.wall.reasons; },
       (p: any) => { delete p.schedule[0].projection.wall.reasons; },
       (p: any) => { p.schedule[0].projection = null; },
+      ...components.flatMap(component => [
+        (p: any) => { p[component].state = component + "_FUTURE"; p[component].alarm = false; },
+        (p: any) => { p.schedule[0].projection[component].state = component + "_FUTURE"; p.schedule[0].projection[component].alarm = false; },
+        (p: any) => { p[component].state = component === "wall" ? "agent_OK_PASSIVE" : "wall_OK_IDLE"; p[component].alarm = false; },
+        (p: any) => { p.schedule[0].projection[component].state = component === "wall" ? "agent_OK_PASSIVE" : "wall_OK_IDLE"; p.schedule[0].projection[component].alarm = false; },
+      ]),
     ];
     for (const damage of malformed) {
-      const page = browser(script), valid = projection(), invalid = structuredClone(valid);
+      const page = browser(script, markup(), route), valid = projection(), invalid = structuredClone(valid);
       page.install(valid); damage(invalid);
       expect(() => page.install(invalid)).not.toThrow();
       page.tick(SECOND, SECOND);
@@ -331,25 +412,31 @@ describe("shipped browser clocks", () => {
     }
   });
 
-  it.each(shipped)("expires and accepts only newer evaluation lifetimes in %s", (_name, source) => {
+  it.each(shipped)("expires and accepts only newer evaluation lifetimes in %s", (_name, source, markup, route) => {
     const script = source(); expect(script).toContain(LIVENESS_SCHEDULE_FN_SOURCE);
     // Keep the embedded functions visible after the page IIFE exits.
     const exposed = script.replace("function createLivenessDisplay(paint)", "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
     for (const row of cases) {
-      const scheduled = projection(caseInput(row)), page = browser(exposed);
+      const scheduled = projection(caseInput(row)), page = browser(exposed, markup(), route);
       page.install(scheduled);
       const instants = [...new Set([...scheduled.schedule.map(entry => entry.after_ms),
         ...Array.from({ length: 1000 }, (_, i) => (i * 7919) % (SCHEDULE_STEPS * LOCAL_JITTER + 1))])].sort((a, b) => a - b);
       for (const t of instants) {
         page.tick(t, 0);
         expect(page.shown()).toEqual(select(scheduled, t));
-        for (const component of components) expect(page.elements.get("castle-wall-liveness").innerHTML).toContain('data-state="' + select(scheduled, t)[component].state + '"');
+        for (const component of components) {
+          const verdict = select(scheduled, t)[component];
+          const healthy = !verdict.alarm && (verdict.state.includes("_OK_") || verdict.state === "coverage_COMPLETE");
+          expect(page.elements.get("castle-wall-liveness").innerHTML).toContain(
+            '<span class="pill ' + (healthy ? 'green tone-verified' : 'amber tone-unverified') +
+            '" data-liveness-component="' + component + '" data-state="' + verdict.state + '"');
+        }
       }
     }
-    const performancePage = browser(exposed); performancePage.install(projection());
+    const performancePage = browser(exposed, markup(), route); performancePage.install(projection());
     performancePage.tick(0, SCHEDULE_STEPS * LOCAL_JITTER);
     expect(performancePage.shown().wall.state).toBe("wall_DOWN");
-    const b = browser(exposed), p = projection();
+    const b = browser(exposed, markup(), route), p = projection();
     const intervalsBeforeEvidence = b.intervals.length;
     b.install(p);
     expect(b.intervals.length).toBe(intervalsBeforeEvidence + 1);
@@ -383,6 +470,10 @@ describe("shipped browser clocks", () => {
   });
 });
 
+function getHomeScript() {
+  return shipped.find(([name]) => name === "posture home")![1]();
+}
+
 function response() {
   let body = "", status = 0;
   return { res: { writeHead(code: number) { status = code; }, end(value: string) { body = value; }, on() {}, once() {}, off() {} } as unknown as ServerResponse,
@@ -403,7 +494,7 @@ describe("component surface parity", () => {
     expect(verdict).toHaveBeenCalled();
     expect(home.castle_wall.audit_integrity_ok).toBe(false);
     expect(home.castle_wall_liveness!.wall.state).toBe("wall_OK_IDLE");
-    const script = shipped[1][1]().replace("function createLivenessDisplay(paint)", "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
+    const script = getHomeScript().replace("function createLivenessDisplay(paint)", "globalThis.createLivenessDisplay = function createLivenessDisplay(paint)");
     const page = browser(script);
     (page.context as any).renderWall(home.castle_wall);
     page.install(home.castle_wall_liveness!);
@@ -426,8 +517,8 @@ describe("component surface parity", () => {
     }
     const open = vi.spyOn(nodeReaderFs, "open");
     const rig = await startRig();
-    (rig.dashboard as any)._sanctuaryConfig = { storage_path: path };
-    (rig.dashboard as any).baseline = null;
+    rig.dashboard.setDependencies({ policy: { version: 1, tier1_always_approve: [], tier3_auto_allow: [] } as never,
+      baseline: null as never, auditLog: rig.auditLog, sanctuaryConfig: { ...defaultConfig(), storage_path: path } });
     try {
       for (const route of ["/api/posture/home", "/api/posture/feature-health"]) {
         open.mockClear();
@@ -437,6 +528,25 @@ describe("component surface parity", () => {
         for (const component of components) expect(body.castle_wall_liveness[component]).toEqual(projection(input)[component]);
         expect(open.mock.calls.map(call => call[0])).toContain(join(path, "liveness", "observer.json"));
       }
+      const controller = new AbortController();
+      const stream = await fetch(rig.baseUrl + "/api/posture/stream", {
+        headers: { Authorization: `Bearer ${rig.authToken}` }, signal: controller.signal,
+      });
+      expect(stream.status).toBe(200);
+      const reader = stream.body!.getReader();
+      try {
+        let frame = "";
+        while (!frame.includes("\n\n")) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          frame += new TextDecoder().decode(chunk.value);
+        }
+        const data = frame.split("\n").find(line => line.startsWith("data: "));
+        const body = data ? JSON.parse(data.slice("data: ".length)) : {};
+        expect(body.castle_wall_liveness).toEqual({ ...projection(input), served_age_ms: expect.any(Number) });
+        expect(body.castle_wall_liveness.served_age_ms).toBeGreaterThanOrEqual(0);
+        expect(frame).toContain("event: home");
+      } finally { await reader.cancel(); controller.abort(); }
     } finally { await rig.stop(); }
   });
 
@@ -479,7 +589,8 @@ describe("component surface parity", () => {
     const res = response(); await handleRequest(apiDeps, request("/api/status"), res.res); same(res.json().castle_wall_liveness);
     const health = response(); await handlePostureRoute(deps, request("/api/posture/feature-health"), health.res, new URL("http://fixture/api/posture/feature-health"), "GET");
     same(health.json().castle_wall_liveness);
-    expect(health.json().liveness_rows.map((row: any) => row.state)).toEqual(components.map(c => expected[c].state));
+    expect(health.json()).not.toHaveProperty("liveness_rows");
+    expect(home.feature_health).not.toHaveProperty("liveness_rows");
     const rig = await startRig({ withOperatorIdentity: true });
     (rig.dashboard as any).baseline = null;
     vi.spyOn(LivenessSurfaceSource.prototype, "readProjection").mockImplementation(() => Promise.resolve(expected));
