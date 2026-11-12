@@ -821,6 +821,11 @@ fn serve<P: SignerPort, R: Reconciler>(
     owner: u32,
     clock: &Clock,
 ) -> Result<()> {
+    // One bound wall plus a terminal second accept implements the connection cap in writer_protocol.
+    const _: () = assert!(writer_protocol::WRITER_CONNECTIONS_MAX == 2);
+    // Synchronous SIGN owns the only work slot; serve retains no queue between iterations.
+    const _: () = assert!(writer_protocol::WRITER_WORK_MAX == 1);
+    const _: () = assert!(writer_protocol::WRITER_QUEUE_MAX == 0);
     let mut wall: Option<Wall> = None;
     loop {
         machine.tick()?;

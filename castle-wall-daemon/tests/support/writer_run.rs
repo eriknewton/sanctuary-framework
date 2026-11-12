@@ -270,9 +270,10 @@ pub fn scenario(case: &str) {
         });
     }
     if case == "maximum-sign" {
-        state
-            .delay
-            .store(750 * writer_state::NS_PER_MS, Ordering::SeqCst);
+        state.delay.store(
+            writer_protocol::WRITER_SIGN_DEADLINE_MAX_MS * writer_state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
     }
     let remote_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
     if case == "death-during-sign" {
@@ -853,7 +854,8 @@ pub fn scenario(case: &str) {
                 "admission-epoch" => h.epoch += 1,
                 "admission-deadline" => {
                     h.deadline_boottime_ns = (state.now.load(Ordering::SeqCst)
-                        + 751 * writer_state::NS_PER_MS)
+                        + (writer_protocol::WRITER_SIGN_DEADLINE_MAX_MS + 1)
+                            * writer_state::NS_PER_MS)
                         .to_string()
                 }
                 "admission-text" => h.deadline_boottime_ns = "invalid".into(),

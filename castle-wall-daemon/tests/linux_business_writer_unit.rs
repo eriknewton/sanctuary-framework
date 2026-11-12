@@ -569,7 +569,7 @@ fn composed_capture_predicates_close_after_ready() {
 
 #[test]
 fn composed_heartbeat_timeout_waves_and_bound_loss() {
-    for wave in 0..20 {
+    for wave in 0..writer_state::HEARTBEAT_WAVES {
         let case = format!("heartbeat-timeout-{wave}");
         writer_run::child_case(
             "composed_heartbeat_timeout_waves_and_bound_loss",

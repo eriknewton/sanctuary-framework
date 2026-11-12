@@ -259,8 +259,7 @@ fn bounded_signals_are_discarded_without_satisfying_a_response() {
 }
 #[test]
 fn trickled_minimal_reply_cannot_rearm_twenty_fresh_deadlines() {
-    const WAVES: usize = 20; // Independent admissions required by the fault schedule.
-    for _ in 0..WAVES {
+    for _ in 0..writer_state::HEARTBEAT_WAVES {
         let f = writer_bus::Fixture::new();
         f.fault.lock().unwrap().trickle = true;
         let start = std::time::Instant::now();
@@ -268,7 +267,9 @@ fn trickled_minimal_reply_cannot_rearm_twenty_fresh_deadlines() {
             f.target.exchange(deadline_ms(250).unwrap()),
             Err(Error::Deadline)
         );
-        assert!(start.elapsed() < std::time::Duration::from_millis(250 + 100));
+        assert!(start.elapsed() < std::time::Duration::from_millis(
+            castle_wall_daemon::business_profile::writer_protocol::WRITER_HANDSHAKE_DEADLINE_MS + writer_state::BUS_SCHEDULING_SLACK_MS
+        ));
     }
 }
 

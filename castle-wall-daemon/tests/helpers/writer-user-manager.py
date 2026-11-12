@@ -3,6 +3,7 @@ import array
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -12,6 +13,10 @@ import sys
 import tempfile
 import time
 
+# One signer idle period gives the poll-driven wall-loss observer its required scheduling margin.
+SIGNER_IDLE_DEADLINE_MS = int(re.search(r'pub const SIGNER_IDLE_DEADLINE_MS: usize = (\d+);', Path('src/business_profile/signer_contract.rs').read_text()).group(1))
+WALL_LOSS_WINDOW_MS = SIGNER_IDLE_DEADLINE_MS
+MILLISECONDS_PER_SECOND = 1000
 helper, writer, mode = sys.argv[1:]
 uid, gid = os.geteuid(), os.getegid()
 runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{uid}'))
@@ -212,7 +217,7 @@ try:
                 poll.register(held, select.POLLHUP)
                 assert not poll.poll(0), 'holder preserves peer fd before writer loss dispatch'
             os.kill(int(show('wall.service', 'MainPID')), 9)
-            wait(lambda: show('writer.service', 'ActiveState') in ['failed', 'inactive'], 'pidfd death closes writer', 0.5)
+            wait(lambda: show('writer.service', 'ActiveState') in ['failed', 'inactive'], 'pidfd death closes writer', WALL_LOSS_WINDOW_MS / MILLISECONDS_PER_SECOND)
             assert (root / 'signer-closed').exists()
         elif mode == 'edges':
             ctl('stop', names['wall.service'])

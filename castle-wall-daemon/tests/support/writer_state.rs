@@ -14,6 +14,11 @@ use std::sync::{
 };
 pub const NOW: u64 = 1_000_000_000; // One second on the injected boottime clock.
 pub const NS_PER_MS: u64 = 1_000_000;
+// Twenty independently settled writers are the required repeated-admission policy sample.
+pub const HEARTBEAT_WAVES: usize = 20;
+// Ten watchdog ticks leave scheduling margin around the fixed bus handshake deadline.
+pub const BUS_SCHEDULING_SLACK_MS: u64 =
+    10 * castle_wall_daemon::business_profile::signer_watchdog::WATCHDOG_TICK_MS as u64;
 pub struct Fixture {
     pub now: Arc<AtomicU64>,
     pub view: Arc<Mutex<StatusReply>>,
@@ -160,7 +165,10 @@ impl Fixture {
             generation: v.grant.generation,
             epoch: v.grant.epoch,
             role: v.grant.role.clone(),
-            deadline_boottime_ns: (self.now.load(Ordering::SeqCst) + 750 * NS_PER_MS).to_string(),
+            deadline_boottime_ns: (self.now.load(Ordering::SeqCst)
+                + castle_wall_daemon::business_profile::writer_protocol::WRITER_SIGN_DEADLINE_MAX_MS
+                    * NS_PER_MS)
+                .to_string(),
             preimage_length: self.body.len(),
         }
     }

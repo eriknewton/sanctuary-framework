@@ -4,6 +4,9 @@ mod isolation;
 #[path = "support/writer_state.rs"]
 mod writer_state;
 use castle_wall_daemon::business_profile::writer_service::*;
+use castle_wall_daemon::business_profile::{
+    signer_contract::SIGNER_IDLE_DEADLINE_MS, writer_protocol::*,
+};
 use std::sync::atomic::Ordering;
 use writer_state::*;
 #[test]
@@ -171,19 +174,24 @@ fn bound_view_changes_and_frozen_expiry_settle() {
 }
 #[test]
 fn closed_states_keep_heartbeats_and_timeout_waves_do_not_overlap() {
-    for _ in 0..20 {
+    for _ in 0..HEARTBEAT_WAVES {
         let f = Fixture::new();
         let mut m = f.machine();
         assert!(!m.heartbeat_due().unwrap());
-        f.now.fetch_add(250 * NS_PER_MS, Ordering::SeqCst);
+        f.now
+            .fetch_add(WRITER_HEARTBEAT_MS * NS_PER_MS, Ordering::SeqCst);
         assert!(m.heartbeat_due().unwrap());
         m.heartbeat().unwrap();
         assert_eq!(m.state(), WriterState::ClosedLocked);
         m.captured_wall_for_test().unwrap();
-        f.now.fetch_add(250 * NS_PER_MS, Ordering::SeqCst);
+        f.now
+            .fetch_add(WRITER_HEARTBEAT_MS * NS_PER_MS, Ordering::SeqCst);
         m.heartbeat().unwrap();
         assert_eq!(m.state(), WriterState::WallBound);
-        f.status_delay.store(1001 * NS_PER_MS, Ordering::SeqCst);
+        f.status_delay.store(
+            (SIGNER_IDLE_DEADLINE_MS as u64 + 1) * NS_PER_MS,
+            Ordering::SeqCst,
+        );
         assert_eq!(m.heartbeat(), Err(Error::Deadline));
         m.settle();
         assert_eq!(m.state(), WriterState::Stopped);
@@ -196,13 +204,17 @@ fn maximum_budget_sign_heartbeats_before_completion_exchange() {
     let mut m = f.machine();
     f.grant(&mut m);
     f.events.lock().unwrap().clear();
-    f.delay.store(750 * NS_PER_MS, Ordering::SeqCst);
+    f.delay
+        .store(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS, Ordering::SeqCst);
     let events = f.events.clone();
     let now = f.now.clone();
     let body = m
         .sign(f.header(), &f.body, move |end| {
             events.lock().unwrap().push("post-wait".into());
-            assert_eq!(end, now.load(Ordering::SeqCst) + 250 * NS_PER_MS);
+            assert_eq!(
+                end,
+                now.load(Ordering::SeqCst) + WRITER_HEARTBEAT_MS * NS_PER_MS
+            );
             Ok(())
         })
         .unwrap();
@@ -215,7 +227,8 @@ fn maximum_budget_sign_heartbeats_before_completion_exchange() {
     m.verified_sent_for_test();
     assert_eq!(m.state(), WriterState::Granted);
     let mut h = f.header();
-    h.deadline_boottime_ns = (f.now.load(Ordering::SeqCst) + 751 * NS_PER_MS).to_string();
+    h.deadline_boottime_ns =
+        (f.now.load(Ordering::SeqCst) + (WRITER_SIGN_DEADLINE_MAX_MS + 1) * NS_PER_MS).to_string();
     assert_eq!(m.sign(h, &f.body, |_| Ok(())), Err(Error::Deadline));
     assert_eq!(f.signs.load(Ordering::SeqCst), 1);
 }
