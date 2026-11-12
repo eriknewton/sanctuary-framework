@@ -46,6 +46,8 @@
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  *   GET /posture/evidence        - the Phase 2 Evidence View HTML shell.
  */
+import type { LivenessSurfaceSource } from "../castle-wall/liveness/surface-reader.js";
+
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { composeProtectionLayers } from "../agent-native/protection-layers.js";
@@ -164,6 +166,7 @@ export const POSTURE_EVIDENCE_PATH = "/posture/evidence";
  * mirrors the `buildV1AgentsDeps` pattern.
  */
 export interface PostureRouteDeps {
+  livenessSource: Pick<LivenessSurfaceSource, "readProjection">;
   /** Must match ProtectionRuntimeProvider in protection-observations.ts; reads current session and consumers. */
   protectionRuntime?: ProtectionRuntimeProvider;
   /** Encrypted audit log (already unlocked). */
@@ -557,7 +560,8 @@ export async function handlePostureRoute(
     }
     await handlePostureStream(res, {
       // SSE admits and registers cleanup before refreshing each frame; it never joins the HTTP flight.
-      buildHome: async () => buildHome(deps.refreshStreamDeps ? await deps.refreshStreamDeps() : deps),
+      // The admitted stream owns its liveness source; refreshing panel dependencies cannot replace it.
+      buildHome: async () => buildHome({ ...(deps.refreshStreamDeps ? await deps.refreshStreamDeps() : deps), livenessSource: deps.livenessSource }),
       registry: deps.streamRegistry,
       ...(deps.streamIntervalMs !== undefined
         ? { intervalMs: deps.streamIntervalMs }
@@ -581,7 +585,7 @@ export async function handlePostureRoute(
   try {
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/castle-wall`) {
       const posture = await buildWallPosture(deps);
-      writeJSON(res, 200, posture);
+      writeJSON(res, 200, { ...posture, castle_wall_liveness: await deps.livenessSource.readProjection() });
       return true;
     }
 
@@ -593,7 +597,8 @@ export async function handlePostureRoute(
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/feature-health`) {
       const panel = await buildFeatureHealth(deps);
-      writeJSON(res, 200, panel);
+      const castle_wall_liveness = await deps.livenessSource.readProjection();
+      writeJSON(res, 200, { ...panel, castle_wall_liveness });
       return true;
     }
 
@@ -1353,7 +1358,10 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
   // Must match custodyObservation in protectionEvidenceSchema (protection-layers.ts): use the producer status, including fallback and stale reads.
   const snapshot = observeProtections(runtime(), { featureHealth, custodyExit: value("custody_exit", custody),
     custodyObservation: custody.status, now: now(), auditChain: undefined });
+  const liveness = await deps.livenessSource.readProjection();
   const home: PostureHome = {
+    // Liveness is read for this response, outside every cached panel value.
+    castle_wall_liveness: liveness,
     origin_machine: deps.originMachine, stream_available: deps.streamRegistry !== undefined,
     protection_layers: composeProtectionLayers(snapshot),
     producer_keys: { producer: deps.producerKeyObservation!, broker: deps.brokerProducerKeyObservation!,
@@ -1367,6 +1375,7 @@ export async function buildHome(initialDeps: PostureRouteDeps): Promise<PostureH
       feature_health: health.status, custody_exit: custody.status, federation: federation.status, query_privacy: query.status },
     audit_verification: deps.auditLog!.verificationCacheStats(),
     castle_wall: castleWall, digest: keysRestricted ? fallback.digest : value("digest", digest),
+    // Scheduled liveness stays beside cached panels; no schedule-less healthy text belongs inside feature_health.
     unwrapped: unwrappedValue, feature_health: featureHealth, custody_exit: value("custody_exit", custody),
     federation: value("federation", federation), query_privacy: queryPrivacy, agents,
     protection_requested_count: agents.filter(a => a.policy_protected).length,

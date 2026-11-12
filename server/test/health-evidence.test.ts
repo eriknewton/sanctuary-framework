@@ -467,3 +467,58 @@ describe("health/evidence : the mandatory audit-ACK confirmation gate", () => {
     ).toBe(true);
   });
 });
+
+it("keeps detector and layer evidence unchanged beside a component projection", async () => {
+  const { project } = await import("../src/castle-wall/liveness/surface-reader.js");
+  const { evaluateLiveness } = await import("../src/castle-wall/liveness/evaluate.js");
+  const { readFileSync } = await import("node:fs");
+  const input = JSON.parse(readFileSync(new URL("./castle-wall/liveness/fixtures/states.json", import.meta.url), "utf8")).base;
+  const config = defaultConfig();
+  const options = { config, identityCount: 0, storageBackendName: "MemoryStorage", castleWall: { platform: "linux", configured: false } };
+  const before = buildHealthEvidenceReport(options);
+  const projection = project(evaluateLiveness(input), input, input.nowMs);
+  const after = buildHealthEvidenceReport({ ...options, castleWallLiveness: projection });
+  expect(after.castle_wall_liveness).toEqual(projection);
+  expect(JSON.stringify(after.castle_wall)).toBe(JSON.stringify(before.castle_wall));
+  expect(JSON.stringify(after.layers)).toBe(JSON.stringify(before.layers));
+  expect(before).not.toHaveProperty("castle_wall_liveness");
+});
+
+it("supplies the component projection through both registered health tool handlers", async () => {
+  const { vi } = await import("vitest");
+  const { createTempHome } = await import("./helpers/temp-fortress.js");
+  const { createSanctuaryServer } = await import("../src/index.js");
+  const { MemoryStorage } = await import("../src/storage/memory.js");
+  const { LivenessSurfaceSource, project } = await import("../src/castle-wall/liveness/surface-reader.js");
+  const { evaluateLiveness } = await import("../src/castle-wall/liveness/evaluate.js");
+  const { readFileSync } = await import("node:fs");
+  const input = JSON.parse(readFileSync(new URL("./castle-wall/liveness/fixtures/states.json", import.meta.url), "utf8")).base;
+  const { OBSERVER_WINDOW } = await import("../src/castle-wall/liveness/constants.js");
+  const home = await createTempHome("health-components");
+  const spy = vi.spyOn(LivenessSurfaceSource.prototype, "readProjection");
+  let runtime: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
+  try {
+    runtime = await createSanctuaryServer({ storage: new MemoryStorage(), passphrase: "fixture-health-passphrase" });
+    const handler = (runtime.server as unknown as { _requestHandlers: Map<string, (request: unknown, extra: unknown) => Promise<any>> })._requestHandlers.get("tools/call")!;
+    const { castleWallSnapshotForHealthReport } = await import("../src/health/index.js");
+    const expected = buildHealthEvidenceReport({ config: runtime.config, identityCount: runtime.identityManager.list().length,
+      storageBackendName: "MemoryStorage", castleWall: await castleWallSnapshotForHealthReport({ config: runtime.config, masterKey: runtime.masterKey }) });
+    for (const state of ["healthy", "agent down", "observer stale"]) {
+      const current = structuredClone(input);
+      if (state === "agent down") current.observer.value.raw.gateway.alive = false;
+      if (state === "observer stale") { current.nowMs += OBSERVER_WINDOW + 1; current.host.uptimeMs += OBSERVER_WINDOW + 1; }
+      const projection = project(evaluateLiveness(current), current, current.nowMs);
+      spy.mockResolvedValue(projection);
+      for (const name of ["monitor_health", "exec_attest"]) {
+        const result = await handler({ method: "tools/call", params: { name, arguments: {} } }, {});
+        const body = JSON.parse(result.content[0].text);
+        expect(body.castle_wall_liveness).toEqual(projection);
+        expect(JSON.stringify(body.castle_wall)).toBe(JSON.stringify(expected.castle_wall));
+        expect(body.layers).toEqual(expected.layers);
+      }
+    }
+    expect(spy).toHaveBeenCalledTimes(6);
+  } finally {
+    spy.mockRestore(); await runtime?.cleanup(); await runtime?.server.close(); await home.cleanup();
+  }
+});

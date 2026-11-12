@@ -1,4 +1,6 @@
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 /** Shared real-shape scenarios for the wired client and the lane's capture script. */
+import { createFixtureLivenessSource } from "../../../helpers/fixture-liveness-source.js";
 import type { PostureHome } from "../../../../src/principal-policy/posture-home-types.js";
 import type { SovereigntyRoutePayload } from "../../../../src/principal-policy/dashboard.js";
 import type { LocalAgentRecord } from "../../../../src/contracts/v1.1/local-agent-records.js";
@@ -34,7 +36,7 @@ export async function overviewScenarios(now: number) {
   const deps = { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, auditLog, originMachine: ORIGIN, listAgents: () => records,
     detectInstalledHarnesses: async () => [{ harness: "cursor" as const, platform: "cursor" as const, config_path: "/fixture/cursor.json" }],
     resolveProtectionClaimSubject: () => SUBJECT, platform: "linux" as const, now: () => now,
-    panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
+    panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(),
   };
   const base = await buildHome(deps);
   const healthy = { ...base } satisfies PostureHome;

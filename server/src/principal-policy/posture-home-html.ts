@@ -28,6 +28,9 @@
  * Returns a string so the dashboard can serve it directly (mirrors
  * `generateDashboardHTML`).
  */
+import { LIVENESS_BADGE_FN_SOURCE } from "./posture.js";
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
+
 
 import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "./posture-home-types.js";
 import type { FeatureHealthStatus } from "./feature-health.js";
@@ -355,6 +358,7 @@ export function renderPostureHomeHTML(): string {
   <section>
     <h2>Castle Wall</h2>
     <div class="panel" id="wall"><span class="empty">Loading…</span></div>
+    <div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>
   </section>
 
   <section>
@@ -396,6 +400,12 @@ export function renderPostureHomeHTML(): string {
 <script>
 (function () {
   "use strict";
+  ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
+  // Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+  // Must match LIVENESS_BADGE_FN_SOURCE in principal-policy/posture.ts.
+${LIVENESS_BADGE_FN_SOURCE}
+${LIVENESS_SCHEDULE_FN_SOURCE}
+  var livenessDisplay = mountLivenessDisplay();
   // Same auth model as the rest of the dashboard: loopback auto-auth or a
   // bearer token the operator pasted. We send credentials: same-origin so the
   // login session cookie rides along; if a token is in the URL hash we use it.
@@ -1825,6 +1835,9 @@ export function renderPostureHomeHTML(): string {
   }
 
   function renderPanelStatus(home) {
+    if (home.castle_wall_liveness) {
+      try { livenessDisplay.install(home.castle_wall_liveness); } catch { livenessDisplay.refuse(); }
+    }
     // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.
     var reasons = { budget_exceeded: "Time budget exceeded", producer_failed: "Observation failed", never_completed: "No completed observation", upstream_unavailable: "Required evidence unavailable", observation_superseded: "Newer evidence is available" };
     var MILLISECONDS_PER_SECOND = 1000; // One second contains one thousand milliseconds.

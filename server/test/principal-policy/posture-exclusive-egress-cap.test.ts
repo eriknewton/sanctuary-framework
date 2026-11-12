@@ -12,8 +12,8 @@
  * status table, the posture-home page source, the v1.1 console source, the
  * fortress-view source).
  */
-
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js"; import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -620,7 +620,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
     };
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-      const handled = await handlePostureRoute({ resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
+      const handled = await handlePostureRoute({ resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
       if (!handled) res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -661,7 +661,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
     };
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-      const handled = await handlePostureRoute({ resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
+      const handled = await handlePostureRoute({ resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
       if (!handled) res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -721,7 +721,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
     };
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-      const handled = await handlePostureRoute({ resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
+      const handled = await handlePostureRoute({ resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
       if (!handled) res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

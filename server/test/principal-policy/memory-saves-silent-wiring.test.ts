@@ -1,4 +1,6 @@
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 /** Own-scope saves run silently and name their caller through the production server. */
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -80,7 +82,7 @@ async function evidence(booted: Awaited<ReturnType<typeof createSanctuaryServer>
   const server: Server = createServer(async (req, res) => {
     await handlePostureRoute({
       // The route requires its per-instance panel store (fails closed at the type level); same rig as posture-evidence.test.ts.
-      panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(), auditLog: booted.auditLog,
+      panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(), auditLog: booted.auditLog,
       originMachine: "fortress:memory-saves", listAgents: () => [], detectInstalledHarnesses: async () => [],
     }, req, res, new URL(req.url ?? "/", `http://${req.headers.host}`), req.method ?? "GET");
   });

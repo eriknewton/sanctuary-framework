@@ -280,32 +280,15 @@ export const STABLE_RUNTIME_REFUSAL_EXIT_CODE = 78;
 // ---------------------------------------------------------------------------
 // Closed reason registry.
 // ---------------------------------------------------------------------------
-export type WallState =
-  | "wall_INITIALIZING"
-  | "wall_OK_ACTIVE"
-  | "wall_OK_IDLE"
-  | "wall_OK_AGED_HISTORY"
-  | "wall_OK_TTL_COUNTDOWN"
-  | "wall_TTL_WARNING"
-  | "wall_DEGRADED"
-  | "wall_DOWN"
-  | "wall_RECOVERING"
-  | "wall_SAFE_MODE"
-  | "wall_REBOOT_NO_LOGIN"
-  | "wall_LOGGED_OUT";
-export type AgentState =
-  | "agent_UNMONITORED"
-  | "agent_INITIALIZING"
-  | "agent_OK_PASSIVE"
-  | "agent_OK_OPTIONAL_REPLY"
-  | "agent_DEGRADED_STALE_MCP"
-  | "agent_DOWN"
-  | "agent_RECOVERING";
-export type CoverageState =
-  | "coverage_COMPLETE"
-  | "coverage_WALL_ONLY"
-  | "coverage_LEGACY_PARTIAL"
-  | "coverage_UNAVAILABLE";
+/** Must match the closed-state validation in browser-contract.ts and the exhaustive badge words in principal-policy/posture.ts. */
+export const LIVENESS_STATES = {
+  wall: ["wall_INITIALIZING", "wall_OK_ACTIVE", "wall_OK_IDLE", "wall_OK_AGED_HISTORY", "wall_OK_TTL_COUNTDOWN", "wall_TTL_WARNING", "wall_DEGRADED", "wall_DOWN", "wall_RECOVERING", "wall_SAFE_MODE", "wall_REBOOT_NO_LOGIN", "wall_LOGGED_OUT"],
+  agent: ["agent_UNMONITORED", "agent_INITIALIZING", "agent_OK_PASSIVE", "agent_OK_OPTIONAL_REPLY", "agent_DEGRADED_STALE_MCP", "agent_DOWN", "agent_RECOVERING"],
+  coverage: ["coverage_COMPLETE", "coverage_WALL_ONLY", "coverage_LEGACY_PARTIAL", "coverage_UNAVAILABLE"],
+} as const;
+export type WallState = typeof LIVENESS_STATES.wall[number];
+export type AgentState = typeof LIVENESS_STATES.agent[number];
+export type CoverageState = typeof LIVENESS_STATES.coverage[number];
 
 /** The state class a reason gives the wall, or `n/a` when the wall cannot carry it. */
 export type WallClass =
@@ -445,3 +428,24 @@ export const LIVENESS_DIRECTORY = "liveness";
 export const DAEMON_RECORD_FILE = "daemon.json";
 export const OBSERVER_RECORD_FILE = "observer.json";
 export const CONFIG_RECORD_FILE = "config.json";
+
+/** Display refresh cadence, in milliseconds. */
+export const DISPLAY_PERIOD = SECOND;
+/** One step strictly beyond the inclusive observer freshness window. */
+export const SCHEDULE_STEPS = Math.floor(OBSERVER_WINDOW / LOCAL_JITTER) + 1;
+
+/** Component severity shared by schedule construction and its consumers. */
+export const LIVENESS_SEVERITY_ORDER: Record<"wall" | "agent" | "coverage", readonly string[]> = {
+    wall: ["OK", "RECOVERING", "DEGRADED", "TTL_WARNING"],
+    agent: ["OK", "RECOVERING", "DEGRADED_STALE_MCP", "INITIALIZING", "DOWN", "UNMONITORED"],
+    coverage: ["COMPLETE", "WALL_ONLY", "LEGACY_PARTIAL", "UNAVAILABLE"],
+};
+
+/** Component verdict shape shared by schedule and presentation consumers. */
+type Verdict<S extends string> = { state: S; alarm: boolean; reasons: string[]; cause: string | null };
+export interface LivenessVerdicts {
+  wall: Verdict<WallState>;
+  agent: Verdict<AgentState>;
+  coverage: Verdict<CoverageState>;
+  exit_code: number;
+}

@@ -1,3 +1,4 @@
+import type { LivenessProjection } from "../castle-wall/liveness/browser-contract.js";
 import type { SafetyNetAuditState, StatusResponse } from "../castle-wall/ipc/messages.js";
 import type { CastleWallProvisionState } from "../castle-wall/provision-state.js";
 import {
@@ -148,6 +149,7 @@ export interface LayerEvidence {
 }
 
 export interface HealthEvidenceReport {
+  castle_wall_liveness?: LivenessProjection;
   sanctuary_version: string;
   mcp_sdk_version: string;
   castle_wall: CastleWallEvidence;
@@ -181,6 +183,7 @@ export interface BuildHealthEvidenceInput {
   identityCount: number;
   storageBackendName: string;
   castleWall?: CastleWallRuntimeSnapshot;
+  castleWallLiveness?: LivenessProjection;
 }
 
 export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): HealthEvidenceReport {
@@ -195,6 +198,7 @@ export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): Heal
     sanctuary_version: getSanctuaryVersion(),
     mcp_sdk_version: getMcpSdkVersion(),
     castle_wall: castleWall,
+    ...(input.castleWallLiveness ? { castle_wall_liveness: input.castleWallLiveness } : {}),
     audit: {
       writes_persistent: auditWritesPersistent,
       chain_verified: "unknown",

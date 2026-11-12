@@ -318,6 +318,8 @@ import {
   type UnifiedInboxRetentionPolicyStore,
 } from "./unified-inbox-retention-policy.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+import { surfaceSourceFor } from "../castle-wall/liveness/surface-reader.js";
+import { productionHostClock, livenessFortressId } from "../cli/castle-wall-liveness-status.js";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -2388,6 +2390,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         originMachine,
         readFlightMap: this.readFlightMap,
         panelStore: this.panelStore,
+        livenessSource: this.livenessSource(),
         prepareProducerKeys: async () => {
           // This frame already observed the bounded current pair; do not start another reload while shaping it.
           await keyLoad;
@@ -2503,6 +2506,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return handlePostureRoute({ auditLog, originMachine, readFlightMap: this.readFlightMap, panelStore: this.panelStore,
         listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
         streamRegistry: this.postureStreamRegistry, refreshStreamDeps: buildDeps,
+        livenessSource: this.livenessSource(),
       }, req, res, url, method);
     }
     return handlePostureRoute(await withPostureProducerKeys(await buildDeps()), req, res, url, method);
@@ -2947,6 +2951,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
   }
 
+  private livenessSource() {
+    const path = this._sanctuaryConfig?.storage_path ?? "";
+    return surfaceSourceFor(this._sanctuaryConfig ?? this, path, livenessFortressId(path), productionHostClock);
+  }
+
   /**
    * Federation PR-A1: full `/v1/status` document, served only to a valid
    * SESSION_TOKEN holder with the status-read capability. Catalog shape:
@@ -3003,6 +3012,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           }
         : null,
       castle_wall: castleWall,
+      castle_wall_liveness: await this.livenessSource().readProjection(),
     };
   }
 
@@ -7187,7 +7197,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       } else if (method === "GET" && url.pathname === "/events") {
         this.handleSSE(req, res, authAdmission);
       } else if (method === "GET" && url.pathname === "/api/status") {
-        this.handleStatus(res);
+        void this.handleStatus(res).catch(error => {
+          logCaughtError(error, { route: "/api/status", operation: "get_status" });
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
       } else if (method === "GET" && url.pathname === "/api/snapshot") {
         // v1.3.3 fix (F-1.3.2-N-002): the standalone dashboard served its
         // HTTP surface through this legacy route table, which never
@@ -8557,8 +8573,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       });
   }
 
-  private handleStatus(res: ServerResponse): void {
+  private async handleStatus(res: ServerResponse): Promise<void> {
     const status: Record<string, unknown> = {
+      castle_wall_liveness: await this.livenessSource().readProjection(),
       pending_count: this.pending.size,
       connected_clients: this.clientCount,
       standalone_mode: this._standaloneMode,

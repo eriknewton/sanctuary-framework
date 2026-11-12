@@ -38,6 +38,7 @@
  * without a live HTTP server or a running daemon.
  */
 
+import type { LivenessVerdicts, WallState, AgentState, CoverageState } from "../castle-wall/liveness/constants.js";
 import { parseIsoInstantWithOffset } from "../core/index.js";
 import {
   auditChainVerdictClaimsClean,
@@ -2487,3 +2488,64 @@ function describeDestinations(rule: ReachRule): DestinationPredicate[] {
   }
   return out;
 }
+
+// Must match LIVENESS_STATES in castle-wall/liveness/constants.ts; every known state has operator wording.
+const LIVENESS_BADGE_WORDS: Record<WallState | AgentState | CoverageState, string> = {
+  wall_OK_TTL_COUNTDOWN: "Healthy, lease counting down", wall_OK_AGED_HISTORY: "Healthy, past faults expired",
+  wall_OK_ACTIVE: "Healthy, active", wall_OK_IDLE: "Healthy, idle",
+  wall_RECOVERING: "Recovering", wall_DEGRADED: "Degraded", wall_TTL_WARNING: "Lease expires soon",
+  wall_DOWN: "Down", wall_INITIALIZING: "Starting", wall_SAFE_MODE: "Safe mode",
+  wall_REBOOT_NO_LOGIN: "Rebooted, login required", wall_LOGGED_OUT: "Logged out",
+  agent_OK_OPTIONAL_REPLY: "Healthy, reply received", agent_OK_PASSIVE: "Healthy, passive",
+  agent_RECOVERING: "Recovering", agent_DEGRADED_STALE_MCP: "Stale child process",
+  agent_INITIALIZING: "Starting", agent_DOWN: "Down", agent_UNMONITORED: "Not monitored",
+  coverage_COMPLETE: "Complete", coverage_WALL_ONLY: "Wall only",
+  coverage_LEGACY_PARTIAL: "Partial legacy coverage", coverage_UNAVAILABLE: "Unavailable",
+};
+/** Must match LIVENESS_BADGE_FN_SOURCE below; known verdicts retain their wording and unknown states read Down. */
+export function buildLivenessBadges(projection: LivenessVerdicts) {
+  const labels = { wall: "Wall", agent: "Agent", coverage: "Coverage" };
+  return (["wall", "agent", "coverage"] as const).map(component => {
+    const verdict = projection[component];
+    const known = Object.hasOwn(LIVENESS_BADGE_WORDS, verdict.state) && verdict.state.startsWith(component + "_");
+    // Only known healthy states earn the healthy tone, regardless of an untrusted alarm flag.
+    const healthy = known && (verdict.state.includes("_OK_") || verdict.state === "coverage_COMPLETE");
+    return { component, label: labels[component], state: verdict.state, alarm: verdict.alarm || !healthy,
+      text: known ? LIVENESS_BADGE_WORDS[verdict.state] : "Down", detail: verdict.reasons.join(", ") };
+  });
+}
+
+// Tone classes must match .pill.tone-verified/.pill.tone-unverified in dashboard/v1_1/html.ts.
+export function renderLivenessBadges(projection: LivenessVerdicts): string {
+  const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return buildLivenessBadges(projection).map(badge =>
+    '<span class="pill ' + (badge.alarm ? 'amber tone-unverified' : 'green tone-verified') + '" data-liveness-component="' + badge.component +
+    '" data-state="' + escape(badge.state) + '" title="' + escape(badge.detail) + '"><strong>' +
+    badge.label + ':</strong> ' + escape(badge.text) + '</span>').join(' ');
+}
+
+/** Must match buildLivenessBadges/renderLivenessBadges above and the interpolation sites in posture-home-html.ts, posture-agent-html.ts and dashboard/v1_1/client.ts. */
+export const LIVENESS_BADGE_FN_SOURCE = String.raw`
+var livenessBadgeWords = ${JSON.stringify(LIVENESS_BADGE_WORDS)};
+function buildLivenessBadges(projection) {
+  var labels = { wall: "Wall", agent: "Agent", coverage: "Coverage" };
+  return ["wall", "agent", "coverage"].map(function(component) {
+    var verdict = projection[component];
+    var known = Object.hasOwn(livenessBadgeWords, verdict.state) && verdict.state.startsWith(component + "_");
+    // Must match buildLivenessBadges above: only known healthy states earn the healthy tone.
+    var healthy = known && (verdict.state.includes("_OK_") || verdict.state === "coverage_COMPLETE");
+    return { component: component, label: labels[component], state: verdict.state, alarm: verdict.alarm || !healthy,
+      text: known ? livenessBadgeWords[verdict.state] : "Down", detail: verdict.reasons.join(", ") };
+  });
+}
+function renderLivenessBadges(projection) {
+  function escape(value) { return value.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  return buildLivenessBadges(projection).map(function(badge) {
+    return '<span class="pill ' + (badge.alarm ? 'amber tone-unverified' : 'green tone-verified') + '" data-liveness-component="' + badge.component +
+      '" data-state="' + escape(badge.state) + '" title="' + escape(badge.detail) + '"><strong>' +
+      badge.label + ':</strong> ' + escape(badge.text) + '</span>';
+  }).join(' ');
+}
+`;

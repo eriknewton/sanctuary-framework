@@ -1,4 +1,6 @@
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 // fail-before-exempt: this change only reorders a clock freeze in an existing test so its audit entry is never timestamped after the frozen now; the source under test is unchanged, so the test passes against pre-change source by construction.
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -144,7 +146,7 @@ describe("protection layers", () => {
     const home = await buildHome({ auditLog, originMachine: "test", listAgents: () => [],
       detectInstalledHarnesses: async () => [], resolvePinnedProducerKey: () => null,
       resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(),
-      readFlightMap: createDashboardReadFlightMap(),
+      livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(),
       protectionRuntime: () => ({ identityManager: primitives.identityManager, stateStore, currentSessionBinding: () => binding }) });
     expect(home.protection_layers?.find(r => r.id === "identity")?.status, "Identity status").toBe("on");
     expect(home.protection_layers?.find(r => r.id === "encrypted_vault")?.status, "Encrypted vault status").toBe("on");
@@ -531,7 +533,7 @@ describe("evidence consumer boundaries", () => {
         : read(id, sequence, produce, key));
       const home = await buildHome({ auditLog, originMachine: "test", listAgents: () => [], now: () => observedAt,
         detectInstalledHarnesses: async () => [], resolvePinnedProducerKey: () => null,
-        resolveBrokerPinnedProducerKey: () => null, panelStore, readFlightMap: createDashboardReadFlightMap() });
+        resolveBrokerPinnedProducerKey: () => null, panelStore, livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap() });
       expect(home.custody_exit.exit_state).toBe("export_available");
       expect(home.protection_layers?.find(row => row.id === "exit"))
         .toMatchObject({ status: "unknown", basis: expect.stringContaining(failure) });

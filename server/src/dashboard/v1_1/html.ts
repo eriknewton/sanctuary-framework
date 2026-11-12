@@ -340,6 +340,7 @@ body {
   font-family: var(--mono); border: 1px solid var(--rule);
   background: var(--surface-2); color: var(--ink-2);
 }
+/* Must match renderLivenessBadges in principal-policy/posture.ts: healthy and alarm tones remain distinct. */
 .pill.tone-verified { background: var(--sage-bg); color: var(--sage); border-color: var(--sage); }
 .pill.tone-degraded { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .pill.tone-unverified { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
