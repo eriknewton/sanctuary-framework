@@ -1,12 +1,13 @@
 // fail-before-exempt: These rows exercise the candidate build script under server/scripts, which this gate does not revert; script mutation checks and unchanged-input controls cover the defended boundaries.
 import { describe, it, expect, beforeAll, vi } from "vitest";
+import fs from "node:fs";
 import { readFileSync, writeFileSync, mkdtempSync, realpathSync, readdirSync, lstatSync } from "node:fs";
 import { join, dirname } from "node:path";
 import os, { tmpdir } from "node:os";
 import { syncBuiltinESMExports } from "node:module";
 import { spawnSync, execFileSync } from "node:child_process";
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
-import { validateSource, digest, candidateForTests, NON_RELEASE_MARKER, NON_RELEASE_TEXT } from "../../scripts/build-evidence-pack.mjs";
+import { validateSource, parseSourceMetadata, hashSourceArchive, MAX_SOURCE_ARCHIVE_BYTES, SOURCE_HASH_CHUNK_BYTES, digest, candidateForTests, NON_RELEASE_MARKER, NON_RELEASE_TEXT } from "../../scripts/build-evidence-pack.mjs";
 const SOURCE = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const tempParent = mkdtempSync(join(tmpdir(), "provenance-witness-"));
 const scratch = (prefix: string) => mkdtempSync(join(tempParent, prefix));
@@ -17,11 +18,55 @@ const archive = Buffer.from("synthetic source archive");
 const metadata = { format: "SANCTUARY_RELEASE_SOURCE_V1", source_revision: SOURCE, source_archive_sha256: digest(archive) };
 describe("candidate provenance input boundary", () => {
   it("accepts full matching git and archive provenance", () => { expect(validateSource(metadata, archive, SOURCE, SOURCE)).toEqual(metadata); });
-  it.each(["short", "uppercase", "head", "env", "archive", "extra", "missing"])("refuses %s provenance", kind => {
+  it.each(["short", "uppercase", "head", "env", "archive", "extra", "missing", "alias"])("refuses %s provenance", kind => {
     const m = { ...metadata }; if (kind === "short") m.source_revision = SOURCE.slice(0, 8); if (kind === "uppercase") m.source_revision = SOURCE.toUpperCase(); if (kind === "extra") Object.assign(m, { extra: true }); if (kind === "missing") delete (m as Partial<typeof m>).source_archive_sha256;
+    if (kind === "alias") { delete (m as Partial<typeof m>).format; delete (m as Partial<typeof m>).source_archive_sha256; Object.assign(m, { "format,source_archive_sha256": true }); }
     expect(() => validateSource(m, kind === "archive" ? Buffer.from("other") : archive, kind === "short" ? m.source_revision : kind === "env" ? "a".repeat(40) : SOURCE, kind === "short" ? m.source_revision : kind === "head" ? "b".repeat(40) : SOURCE)).toThrow("Source provenance refused");
   });
-  it("build command refuses an eight-hex input before bundling", () => { const root = scratch("provenance-"); const m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive); const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], { encoding: "utf8" }); expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); });
+  it("build command refuses an eight-hex input before bundling", () => {
+    const root = scratch("provenance-"), alias = join(root, "alias"); symlinkSync(root, alias, "dir");
+    const m = join(root, "source.json"), a = join(root, "archive");
+    writeFileSync(m, JSON.stringify({ ...metadata, source_revision: SOURCE.slice(0, 8) })); writeFileSync(a, archive);
+    const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a, "--artifact-dir", join(alias, "artifact"), "--artifact-mode", "release"], { encoding: "utf8" });
+    expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); expect(existsSync(join(root, "artifact"))).toBe(false);
+  });
+  // Must match parseSourceMetadata shared by buildCandidate and checkDescriptor in scripts/build-evidence-pack.mjs.
+  it("source metadata uses one exact schema and rejects duplicate decoded keys", () => {
+    const bytes = Buffer.from(JSON.stringify(metadata)); expect(parseSourceMetadata(bytes)).toEqual(metadata);
+    for (const value of [null, [], "record"]) expect(() => parseSourceMetadata(Buffer.from(JSON.stringify(value)))).toThrow("Source metadata shape refused");
+    const { format, source_archive_sha256, ...revision } = metadata;
+    for (const value of [{}, { ...metadata, extra: true }, revision, { ...revision, "format,source_archive_sha256": format }]) expect(() => parseSourceMetadata(Buffer.from(JSON.stringify(value)))).toThrow("Source metadata keys refused");
+    for (const value of [{ ...metadata, format: "other" }, { ...metadata, source_revision: "short" }, { ...metadata, source_archive_sha256: "short" }]) expect(() => parseSourceMetadata(Buffer.from(JSON.stringify(value)))).toThrow("Source metadata fields refused");
+    const duplicate = bytes.toString().replace('"format":', '"format":"other","format":');
+    expect(() => parseSourceMetadata(Buffer.from(duplicate))).toThrow("duplicate key");
+    const root = scratch("source-record-"), m = join(root, "source.json"), a = join(root, "archive"); writeFileSync(m, duplicate); writeFileSync(a, archive);
+    const r = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", a, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], { encoding: "utf8", env: { ...process.env, SANCTUARY_SOURCE_SHA: SOURCE } });
+    expect(r.status).toBe(1); expect(r.stderr).toContain("Source provenance refused"); expect(existsSync(join(root, "artifact"))).toBe(false);
+  });
+  // Must match hashSourceArchive's ceiling and chunk size in scripts/build-evidence-pack.mjs.
+  it("source archive hashing bounds reads and detects changed lengths", () => {
+    const root = scratch("source-hash-"), path = join(root, "source.tar");
+    const bytes = Buffer.alloc(SOURCE_HASH_CHUNK_BYTES + 1, "a"); writeFileSync(path, bytes);
+    const read = vi.spyOn(fs, "readSync"), open = vi.spyOn(fs, "openSync"); syncBuiltinESMExports();
+    try {
+      expect(hashSourceArchive(path)).toBe(digest(bytes));
+      expect(read.mock.calls.length).toBeGreaterThan(1);
+      for (const call of read.mock.calls) expect((call[1] as Buffer).length).toBe(SOURCE_HASH_CHUNK_BYTES);
+      expect(open).toHaveBeenCalledWith(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } finally { read.mockRestore(); open.mockRestore(); syncBuiltinESMExports(); }
+    const stat = fs.statSync(path);
+    for (const [size, regular, message] of [[MAX_SOURCE_ARCHIVE_BYTES + 1, true, "Source archive size/type refused"], [stat.size, false, "Source archive size/type refused"], [stat.size - 1, true, "Source archive changed"], [stat.size + 1, true, "Source archive changed"]] as const) {
+      const observed = vi.spyOn(fs, "fstatSync").mockReturnValue({ ...stat, size, isFile: () => regular }); syncBuiltinESMExports();
+      try { expect(() => hashSourceArchive(path)).toThrow(message); }
+      finally { observed.mockRestore(); syncBuiltinESMExports(); }
+    }
+    // A sparse file reaches the shared source ceiling without allocating the archive in the test process.
+    fs.truncateSync(path, MAX_SOURCE_ARCHIVE_BYTES + 1);
+    expect(() => hashSourceArchive(path)).toThrow("Source archive size/type refused");
+    const m = join(root, "source.json"); writeFileSync(m, JSON.stringify(metadata));
+    const child = spawnSync(process.execPath, ["scripts/build-evidence-pack.mjs", "--source-metadata", m, "--source-archive", path, "--artifact-dir", join(root, "artifact"), "--artifact-mode", "release"], { encoding: "utf8" });
+    expect(child.status).toBe(1); expect(child.stderr).toContain("read size/type"); expect(existsSync(join(root, "artifact"))).toBe(false);
+  });
 });
 describe("installed immutable version", () => {
   let c: Awaited<ReturnType<typeof candidateForTests>>;

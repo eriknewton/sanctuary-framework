@@ -10,6 +10,7 @@
 import { ARTIFACT_FORMAT, CANDIDATE_FORMAT, ARTIFACT_FILES, BIN, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, NON_RELEASE_MARKER, NON_RELEASE_TEXT, digest, registry, memberMode, parsePackage, parseCandidate, parseManifest, parseJson, checkArtifact, requireValid, readBounded, artifactSuccess } from "../src/evidence-pack/artifact-policy.mjs";
 export { digest, NON_RELEASE_MARKER, NON_RELEASE_TEXT };
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, mkdtempSync, cpSync, symlinkSync, readdirSync, unlinkSync, lstatSync, realpathSync, opendirSync, openSync, fstatSync, readSync, closeSync, constants } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve, isAbsolute, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,10 +25,51 @@ const BUILD_FORMAT = "SANCTUARY_VERIFIER_BUILD_V1";
 // Must match the installed non-release marker consumer in snapshot-provenance.test.ts and the packed file list in snapshot-packed.test.ts.
 const SHA = /^[0-9a-f]{40}$/;
 const HASH = /^[0-9a-f]{64}$/;
-export function validateSource(metadata, archive, revision, head) {
-  // Exact metadata and full revisions prevent a basename or short hash from becoming build provenance.
-  if (Object.keys(metadata).sort().join() !== "format,source_archive_sha256,source_revision" || metadata.format !== SOURCE_FORMAT || !SHA.test(metadata.source_revision) || !HASH.test(metadata.source_archive_sha256) || revision !== metadata.source_revision || (head !== undefined && head !== revision) || digest(archive) !== metadata.source_archive_sha256) throw new Error("Source provenance refused");
+// Source archives include the checkout rather than just the verifier; allow up to 512 MiB.
+export const MAX_SOURCE_ARCHIVE_BYTES = 512 * 1024 * 1024;
+// Hashing holds at most 64 KiB regardless of archive size.
+export const SOURCE_HASH_CHUNK_BYTES = 64 * 1024;
+// Must match the source metadata schema witnesses in snapshot-provenance.test.ts.
+/** Parse the source record shared by build provenance and optional upload sidecars. */
+export function parseSourceMetadata(bytes) {
+  const metadata = parseJson(bytes);
+  // One exact schema prevents build and descriptor consumers from accepting different source records.
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("Source metadata shape refused");
+  // Whole-set equality rejects omitted fields and comma-containing names before any field is consumed.
+  if (!sameNames(Object.keys(metadata), ["format", "source_archive_sha256", "source_revision"])) throw new Error("Source metadata keys refused");
+  // Full lowercase source identities keep abbreviated or unrelated records out of both consumers.
+  if (metadata.format !== SOURCE_FORMAT || !SHA.test(metadata.source_revision) || !HASH.test(metadata.source_archive_sha256)) throw new Error("Source metadata fields refused");
   return metadata;
+}
+export function validateSource(metadata, archive, revision, head) {
+  try {
+    metadata = parseSourceMetadata(Buffer.from(JSON.stringify(metadata)));
+    // Exact metadata and full revisions bind the requested source to both the checkout and the archive bytes.
+    if (revision !== metadata.source_revision || (head !== undefined && head !== revision) || digest(archive) !== metadata.source_archive_sha256) throw new Error("Source provenance refused");
+    return metadata;
+  } catch { throw new Error("Source provenance refused"); }
+}
+// Must match the source archive hashing witnesses in snapshot-provenance.test.ts.
+/** Hash a regular source archive with bounded memory and a fixed byte ceiling. */
+export function hashSourceArchive(path) {
+  // No-follow and nonblocking opens keep a source sidecar from redirecting or stalling the recheck.
+  if (constants.O_NOFOLLOW === undefined || constants.O_NONBLOCK === undefined) throw new Error("Source archive flags refused");
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    // The file kind and ceiling bound both the input authority and the work before any chunk is read.
+    if (!stat.isFile() || stat.size > MAX_SOURCE_ARCHIVE_BYTES) throw new Error("Source archive size/type refused");
+    const hash = createHash("sha256"), chunk = Buffer.alloc(SOURCE_HASH_CHUNK_BYTES); let length = 0;
+    // One byte past the initial size detects growth without reading an unbounded stream.
+    while (length <= stat.size) {
+      const count = readSync(fd, chunk, 0, Math.min(chunk.length, stat.size + 1 - length), null);
+      if (!count) break;
+      length += count; hash.update(chunk.subarray(0, count));
+    }
+    // A changed length cannot describe the archive observed by the initial file check.
+    if (length !== stat.size) throw new Error("Source archive changed");
+    return hash.digest("hex");
+  } finally { closeSync(fd); }
 }
 export function extractSourceArchive(archive, staged) {
   // Validation and extraction share one archive handle so only checked members reach the empty staging tree.
@@ -53,15 +95,22 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   // INPUTS_VALIDATED: artifact policy is required in the core entry, never defaulted from an option.
   if (args.length !== 8 || args[0] !== "--source-metadata" || args[2] !== "--source-archive" || args[4] !== "--artifact-dir" || args[6] !== "--artifact-mode" || !["release", "fixture"].includes(args[7])) throw new Error("Expected source metadata, source archive, artifact directory and explicit mode");
   const mode = args[7], nonRelease = mode === "fixture";
-  const metadata = JSON.parse(readFileSync(args[1], "utf8"));
+  let metadata;
+  try { metadata = parseSourceMetadata(readBounded(args[1], MAX_MANIFEST_BYTES)); }
+  catch { throw new Error("Source provenance refused"); }
   const head = existsSync(join(root, ".git")) ? execFileSync("/usr/bin/git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined;
-  const archiveBytes = readFileSync(args[3]);
+  // Extraction retains validated bytes, so its source allocation shares the sidecar hash ceiling.
+  const archiveBytes = readBounded(args[3], MAX_SOURCE_ARCHIVE_BYTES);
   validateSource(metadata, archiveBytes, revision, head);
   const destination = args[5], component = destination.split("/").at(-1);
   if (!isAbsolute(destination) || resolve(destination) !== destination || !component || component === "." || component === "..") throw new Error("Artifact destination refused");
-  // Ancestors may relocate the whole artifact; anchor the parent once and create only a plain final component.
+  // Path-based artifact writes are observations, not a held directory handle; an ancestor replaced after anchoring can redirect them.
   const parent = realpathSync(dirname(destination)), artifactDir = join(parent, basename(destination));
-  if (OUTPUT_DIRECTORIES.some(path => artifactDir === join(realpathSync(root), path) || artifactDir.startsWith(join(realpathSync(root), path) + "/"))) throw new Error("Artifact destination refused");
+  // The exclusion and later output checks must use the same repository anchor.
+  const base = realpathSync(root);
+  // Must match the direct and aliased output-destination witnesses in snapshot-artifact.test.ts.
+  // An artifact inside either convenience output would be affected by the later clear and copy.
+  if (OUTPUT_DIRECTORIES.some(path => artifactDir === join(base, path) || artifactDir.startsWith(join(base, path) + "/"))) throw new Error("Artifact destination refused");
   mkdirSync(artifactDir, { mode: 0o700 }); // Exclusive creation refuses existing files, directories and links.
   // Hash validation precedes extraction, and only the validated archive supplies compiled source bytes.
   const staged = mkdtempSync(join(tmpdir(), "pack-source-"));
@@ -108,8 +157,6 @@ export async function buildCandidate(args, root = resolve(dirname(fileURLToPath(
   writeFileSync(join(artifactDir, receipt.tarball), tarballBytes, { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
   writeFileSync(join(artifactDir, receipt.manifest), manifestBytes, { flag: "wx", mode: PRIVATE_ARCHIVE_MODE });
   artifactWritten?.(artifactDir);
-  // The repository root is resolved once, so every output component below it is judged against one real anchor.
-  const base = realpathSync(root);
   const outputs = OUTPUT_DIRECTORIES.map(relative => checkOutput(base, relative));
   // Test-only seam: it runs after both outputs pass validation and before any removal, so a hardening test can change an output in that window.
   outputsChecked?.(outputs.map(output => output.destination));
@@ -269,18 +316,20 @@ export async function prepareFixtureCandidate(sourceRoot = resolve(dirname(fileU
 /** Fixed-path descriptor consumer used before install and upload; a receipt supplies data, never a command. */
 // The trusted runner recheck is self-pinned by design; recipients require independent authenticated pins.
 export function checkDescriptor(artifactDir) {
+  // Canonical spelling keeps lstat from following a final link hidden by a slash or dot suffix; ancestors may still be links.
+  // These path observations hold no directory handle, so replacement between lstat and realpath can redirect later reads.
   if (!isAbsolute(artifactDir) || resolve(artifactDir) !== artifactDir || !lstatSync(artifactDir).isDirectory()) throw new Error("Artifact directory refused");
   artifactDir = realpathSync(artifactDir);
   const receipt = requireValid(parseCandidate(readBounded(join(artifactDir, ARTIFACT_FILES.receipt), MAX_MANIFEST_BYTES)));
   const checked = requireValid(checkArtifact(readBounded(join(artifactDir, receipt.tarball), MAX_ARTIFACT_BYTES), readBounded(join(artifactDir, receipt.manifest), MAX_MANIFEST_BYTES), receipt));
   // Uploaded source sidecars describe the same input bytes and revision as the accepted artifact.
   const sourceArchive = join(artifactDir, "source.tar"), sourceMetadata = join(artifactDir, "release-source.json");
-  if (lstatSync(sourceArchive, { throwIfNoEntry: false }) && digest(readBounded(sourceArchive, Number.MAX_SAFE_INTEGER)) !== checked.manifest.source_archive_sha256) throw new Error("Source archive refused");
+  if (lstatSync(sourceArchive, { throwIfNoEntry: false }) && hashSourceArchive(sourceArchive) !== checked.manifest.source_archive_sha256) throw new Error("Source archive refused");
   if (lstatSync(sourceMetadata, { throwIfNoEntry: false })) {
     try {
-      const source = parseJson(readBounded(sourceMetadata, MAX_MANIFEST_BYTES));
-      const keys = ["format", "source_revision", "source_archive_sha256"];
-      if (source === null || typeof source !== "object" || Array.isArray(source) || Object.keys(source).length !== keys.length || !keys.every(key => Object.hasOwn(source, key)) || source.format !== SOURCE_FORMAT || source.source_revision !== checked.manifest.source_revision || source.source_archive_sha256 !== checked.manifest.source_archive_sha256) throw new Error("Source metadata refused");
+      const source = parseSourceMetadata(readBounded(sourceMetadata, MAX_MANIFEST_BYTES));
+      // Present sidecars must describe the source committed by the accepted manifest.
+      if (source.source_revision !== checked.manifest.source_revision || source.source_archive_sha256 !== checked.manifest.source_archive_sha256) throw new Error("Source metadata refused");
     } catch { throw new Error("Source metadata refused"); }
   }
   return { receipt, ...checked };

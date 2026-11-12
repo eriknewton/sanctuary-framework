@@ -1,10 +1,12 @@
 // A1, A18 and A19 fail on a real pre-R1 base build (job 1368 result/base-witness.log).
 // A2-A17 and A20 exercise boundaries absent on that base; their evidence is named mutant kills, not fail-before.
+// A21 fails on the R1 build; A22's bare link already refused there, while its slash and dot rows are new.
+// A23 exercises a new predicate and relies on its named mutant kill. A24 covers output destinations with named mutants.
 // C1/C2 are unchanged-input controls; C4 is a new-feature control.
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, symlinkSync, cpSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, symlinkSync, cpSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -43,7 +45,13 @@ function workflowPlan(text: string) {
   for (const position of [positions[3]!, positions[4]!]) expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-artifact.test.ts");
   const upload = steps.findIndex(s => s.uses?.startsWith("actions/upload-artifact@")); expect(upload).toBeGreaterThan(positions[5]!);
   expect(steps[upload]!.with!["if-no-files-found"]).toBe("error");
-  expect(steps[upload]!.with!.path!.trim().split(/\s+/).sort()).toEqual(["/tmp/c13/artifact/candidate.tgz", "/tmp/c13/artifact/artifact-manifest.json", "/tmp/c13/artifact/candidate.json", "/tmp/c13/artifact/release-source.json", "/tmp/c13/artifact/source.tar", "/tmp/c13/artifact/test-candidate.json", "/tmp/c13/source-ref.json"].sort());
+  const uploadPaths = steps[upload]!.with!.path!.trim().split(/\s+/).sort();
+  // Must match the final recheck and upload path list in .github/workflows/evidence-pack-candidate.yml.
+  const recheck = steps[positions[5]!]!.run!;
+  const presenceChecks = recheck.split("\n").filter(line => line.startsWith("test -f "));
+  expect(presenceChecks.sort()).toEqual(uploadPaths.map(path => `test -f ${path} || exit 1`).sort());
+  expect(uploadPaths).toEqual(["/tmp/c13/artifact/candidate.tgz", "/tmp/c13/artifact/artifact-manifest.json", "/tmp/c13/artifact/candidate.json", "/tmp/c13/artifact/release-source.json", "/tmp/c13/artifact/source.tar", "/tmp/c13/artifact/test-candidate.json", "/tmp/c13/source-ref.json"].sort());
+  return { recheck, uploadPaths };
 }
 describe("packed artifact authority", () => {
   // Memoize two real compiled builds; byte-level faults reuse them. Build schedules compile separately.
@@ -157,6 +165,7 @@ describe("packed artifact authority", () => {
       await expect(buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision, { afterCopy: (path: string) => { if (path.endsWith("packages/evidence-pack-verifier/dist")) {
         faults++; writeFileSync(join(path, "foreign"), "keep");
         const tracked = join(path, "verify-evidence-pack.js"); copied = { path: tracked, ino: lstatSync(tracked).ino, bytes: readFileSync(tracked) };
+        expect(unlink.mock.calls.length).toBeGreaterThan(0); // Clearing must be observed before zero refusal calls can carry evidence.
         unlink.mockClear(); // Only the refusal path is counted; ordinary pre-copy clearing is authorized.
         throw new Error("scheduled copy refusal");
       } } })).rejects.toThrow("scheduled copy refusal");
@@ -174,7 +183,21 @@ describe("packed artifact authority", () => {
     expect(readFileSync(join(dir, "foreign"), "utf8")).toBe("keep"); expect(existsSync(join(dir, ARTIFACT_FILES.receipt))).toBe(false); control();
   });
   it("A18 pins the static workflow and executes its descriptor checker", () => {
-    const text = readFileSync(join(ROOT, ".github/workflows/evidence-pack-candidate.yml"), "utf8"); workflowPlan(text);
+    const text = readFileSync(join(ROOT, ".github/workflows/evidence-pack-candidate.yml"), "utf8"), { recheck, uploadPaths } = workflowPlan(text);
+    for (const path of uploadPaths) {
+      expect(() => workflowPlan(text.replace(`          test -f ${path} || exit 1\n`, ""))).toThrow();
+      expect(() => workflowPlan(text.replace(`test -f ${path} || exit 1`, `test -f ${path}`))).toThrow();
+    }
+    for (const missing of [undefined, ...uploadPaths]) {
+      const parent = scratch(), artifact = join(parent, "artifact"); mkdirSync(artifact);
+      for (const file of Object.values(ARTIFACT_FILES)) cpSync(join(release.dir, file), join(artifact, file));
+      cpSync(release.archive, join(artifact, "source.tar")); cpSync(release.metadata, join(artifact, "release-source.json"));
+      writeFileSync(join(artifact, "test-candidate.json"), JSON.stringify(release.receipt)); writeFileSync(join(parent, "source-ref.json"), "{}");
+      if (missing) unlinkSync(missing.replace("/tmp/c13", parent));
+      // Execute the literal final step, changing only its owned temporary parent.
+      const child = spawnSync("bash", ["-e", "-c", recheck.replaceAll("/tmp/c13", parent)], { cwd: ROOT, encoding: "utf8" });
+      expect(child.error).toBeUndefined(); expect(child.status, missing ?? "complete upload").toBe(missing ? 1 : 0);
+    }
     for (const mutate of [(s: string) => s.replace("npm run build\n", "npm pack\n"), (s: string) => s.replace("/tmp/c13/artifact/candidate.tgz", "packages/evidence-pack-verifier/*.tgz"), (s: string) => s.replace("      - uses: actions/upload-artifact", "      - if: always()\n        uses: actions/upload-artifact"), (s: string) => s.replace("--check-descriptor /tmp/c13/artifact", "--check-descriptor /tmp/c13/artifact || true")]) expect(() => workflowPlan(mutate(text))).toThrow();
     for (const fault of ["none", "archive-only", "metadata-only", ...Object.values(ARTIFACT_FILES), "source.tar", "release-source.json", "source_revision", "source_archive_sha256"]) {
       const dir = scratch(); for (const file of Object.values(ARTIFACT_FILES)) cpSync(join(release.dir, file), join(dir, file));
@@ -185,7 +208,7 @@ describe("packed artifact authority", () => {
       else if (!good) writeFileSync(join(dir, fault), "changed");
       const child = spawnSync(process.execPath, [script, "--check-descriptor", dir], { encoding: "utf8", timeout: 30_000 });
       expect(child.error).toBeUndefined(); expect(child.status, fault).toBe(good ? 0 : 1);
-      if (!good && ["source.tar", "release-source.json", "source_revision", "source_archive_sha256"].includes(fault)) expect(child.stderr).toMatch(/Source archive refused|Source metadata refused|Unexpected token/);
+      if (!good && ["source.tar", "release-source.json", "source_revision", "source_archive_sha256"].includes(fault)) expect(child.stderr).toBe(`Error: ${fault === "source.tar" ? "Source archive refused" : "Source metadata refused"}\n`);
       expect(existsSync(join(dir, "installed"))).toBe(false);
     } control();
   });
@@ -240,6 +263,18 @@ describe("packed artifact authority", () => {
       try { await expect(buildCandidate(buildArgs(release, dir, "release"), root, release.receipt.source_revision)).rejects.toThrow("Unexpected verifier artifact"); }
       finally { listing.mockRestore(); syncBuiltinESMExports(); }
       expect(faults).toBe(1); expect(existsSync(join(dir, ARTIFACT_FILES.receipt))).toBe(false);
+    } control();
+  }, TIMEOUT);
+  // Must match the anchored OUTPUT_DIRECTORIES exclusion in scripts/build-evidence-pack.mjs.
+  it.each(["direct", "alias"])("A24 refuses %s destinations inside either checkout output", async kind => {
+    const root = buildRoot(release), alias = join(scratch(), "checkout"); symlinkSync(root, alias, "dir");
+    for (const output of ["packages/evidence-pack-verifier/dist", "server/evidence-pack-dist"]) {
+      const anchored = join(root, output, "artifact"), destination = join(kind === "alias" ? alias : root, output, "artifact");
+      const before = readdirSync(join(root, output)).sort();
+      const outcome = await buildCandidate(buildArgs(release, destination, "release"), root, release.receipt.source_revision).then(() => "READY", (error: Error) => error.message);
+      expect(existsSync(anchored)).toBe(false);
+      expect(readdirSync(join(root, output)).sort()).toEqual(before);
+      expect(outcome).toBe("Artifact destination refused");
     } control();
   }, TIMEOUT);
   it("C1 release control with stable existing copies reaches the complete receipt", () => { control(); expect(checkDescriptor(release.dir).receipt.mode).toBe("release"); expect(readdirSync(join(release.tree, "packages/evidence-pack-verifier/dist")).sort()).toEqual(registry("release").filter(p => p.startsWith("package/dist/")).map(p => p.slice("package/dist/".length)).sort()); });

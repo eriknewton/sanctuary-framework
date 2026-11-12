@@ -44,7 +44,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
-          # One job is equivalent to separate mode jobs: GitHub supplies the event, both arms fix the mode literally, and the default refuses.
+          # A pull request runs its own YAML even in separate jobs; GitHub supplies the event, both arms fix the mode literally, and the default refuses.
           case "$CANDIDATE_EVENT" in
             pull_request) npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar --artifact-dir /tmp/c13/artifact --artifact-mode fixture ;;
             workflow_dispatch) npm run build:evidence-pack -- --source-metadata /tmp/c13/release-source.json --source-archive /tmp/c13/source.tar --artifact-dir /tmp/c13/artifact --artifact-mode release ;;
@@ -77,11 +77,22 @@ jobs:
           cd server
           env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
       - name: Recheck artifact before upload
-        run: node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
+        run: |
+          node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
+          # Must match the upload path list below and workflowPlan in snapshot-artifact.test.ts.
+          # Each file is required because the upload action only rejects an empty aggregate selection.
+          test -f /tmp/c13/artifact/candidate.tgz || exit 1
+          test -f /tmp/c13/artifact/artifact-manifest.json || exit 1
+          test -f /tmp/c13/artifact/candidate.json || exit 1
+          test -f /tmp/c13/artifact/release-source.json || exit 1
+          test -f /tmp/c13/artifact/source.tar || exit 1
+          test -f /tmp/c13/artifact/test-candidate.json || exit 1
+          test -f /tmp/c13/source-ref.json || exit 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           if-no-files-found: error
           name: ${{ github.event_name == 'pull_request' && format('evidence-pack-nonrelease-{0}', github.run_id) || 'evidence-pack-candidate' }}
+          # Must match every test -f in the final recheck and workflowPlan in snapshot-artifact.test.ts.
           path: |
             /tmp/c13/artifact/candidate.tgz
             /tmp/c13/artifact/artifact-manifest.json
