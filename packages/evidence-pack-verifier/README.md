@@ -29,3 +29,17 @@ Supported hosts are macOS with `/usr/bin/xattr` and Linux with `/usr/bin/python3
 Metadata enumeration uses paths and checks the held inode after each subprocess. A path changed and restored during the subprocess cannot be excluded by those observations. This bounds observation of names only; metadata values are never evidence.
 
 Build provenance includes the SHA-256 of the dependency lockfile used by the build tree. Installed dependency bytes still require a trusted build environment; the lockfile record alone does not establish reproducibility.
+
+## Check the delivered artifact
+
+Evidence-pack verifier artifacts remain private candidates. The builder checks the packed tarball's exact contents and emits `candidate.tgz`, `artifact-manifest.json` and the final `candidate.json` receipt. Checkout copies are convenience outputs: verification is a sequence of observations, not an atomic snapshot, and does not authenticate later contents. A refused build can leave a tarball without a receipt; do not use it.
+
+Obtain a trusted checker independently, or authenticate both delivered files with an independent trusted SHA-256 tool before installing that exact tarball with scripts disabled. Obtain both hashes and the full source revision through a separately authenticated channel. Installing an unauthenticated checker and trusting its own result does not authenticate it.
+
+```sh
+check-evidence-pack-artifact --tarball candidate.tgz --manifest artifact-manifest.json --expect-tarball-sha256 "$TRUSTED_TARBALL_SHA256" --expect-manifest-sha256 "$TRUSTED_MANIFEST_SHA256" --expect-source-revision "$TRUSTED_SOURCE_REVISION" --expect-mode release
+```
+
+Success establishes byte equality, member policy and internal provenance consistency. It does not authenticate the publisher, prove source correctness or establish dependency reproducibility. A fixture-built checker only permits fixture-policy success; use `--expect-mode fixture` for synthetic artifacts. Snapshot signature verification is separate. Installed-package marker classification remains pending.
+
+The build creates no signature, attestation or distribution notice. Authenticated digest publication remains an owner-controlled process outside this workflow. PR artifacts are non-release test material even if PR-controlled source or YAML labels them otherwise. Only dispatches from the workflow's permitted main or version-tag refs are eligible for subsequent external authentication. Rechecking before upload and installation is a point-in-time observation, not protection against concurrent writers.

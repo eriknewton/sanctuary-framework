@@ -81,9 +81,9 @@ describe("packed recipient consumer", () => {
   it("package contains exactly its allowlisted bundle provenance and notices", () => {
     const files = c.packed.files.map((f: { path: string }) => f.path).sort();
     // Must match NON_RELEASE_MARKER written by buildCandidate in scripts/build-evidence-pack.mjs: only a fixture build packs the marker.
-    expect(files).toEqual(["LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "dist/provenance.json", "dist/verify-evidence-pack.js", "package.json", ...(c.fixture ? ["dist/NON_RELEASE"] : [])].sort());
+    expect(files).toEqual(["LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "dist/check-evidence-pack-artifact.js", "dist/provenance.json", "dist/verify-evidence-pack.js", "package.json", ...(c.fixture ? ["dist/NON_RELEASE"] : [])].sort());
     const pkg = JSON.parse(readFileSync(join(dirname(realpathSync(c.command)), "../package.json"), "utf8"));
-    expect(pkg).toMatchObject({ private: true, author: "Erik Newton", license: "Apache-2.0", engines: { node: ">=22.0.0" }, bin: { "verify-evidence-pack": "dist/verify-evidence-pack.js" } }); expect(pkg.dependencies).toBeUndefined(); expect(pkg.scripts).toBeUndefined();
+    expect(pkg).toMatchObject({ private: true, author: "Erik Newton", license: "Apache-2.0", engines: { node: ">=22.0.0" }, bin: { "verify-evidence-pack": "dist/verify-evidence-pack.js", "check-evidence-pack-artifact": "dist/check-evidence-pack-artifact.js" } }); expect(pkg.dependencies).toBeUndefined(); expect(pkg.scripts).toBeUndefined();
     const bundle = readFileSync(c.command, "utf8"); expect(bundle).not.toMatch(FORBIDDEN_BUNDLE);
   });
   it("candidate workflow has read-only authority and immutable actions", () => {
@@ -140,7 +140,7 @@ it.each(["job-authority", "npm-alias", "release-upload"])("workflow policy rejec
 });
 it("both workflow runtimes use the packed descriptor and dispatch restricts refs", () => {
   const source = readFileSync(resolve("../.github/workflows/evidence-pack-candidate.yml"), "utf8");
-  expect(source).toContain("EVIDENCE_PACK_TEST_CANDIDATE: /tmp/c13/candidate.json");
+  expect(source).toContain("EVIDENCE_PACK_TEST_CANDIDATE: /tmp/c13/artifact/test-candidate.json");
   expect(source.indexOf("Install packed candidate and record descriptor")).toBeLessThan(source.indexOf("Test packed candidate on Node 22"));
   expect(source).toContain("refs/heads/main|refs/tags/v*"); expect(source).toContain('*) exit 1');
   expect(source).toContain('non_release:process.env.CANDIDATE_EVENT === "pull_request"'); expect(source).toContain("evidence-pack-nonrelease-");

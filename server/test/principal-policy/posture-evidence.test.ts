@@ -10,8 +10,8 @@
  *   (d) A fixture WITH integrity findings returns them honestly (not green)
  *   (e) Filter params map to AuditLog.query() options
  */
-
-import { describe, expect, it, afterEach } from "vitest";
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js"; import { describe, expect, it, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -57,7 +57,7 @@ async function serve(deps: PostureRouteDeps): Promise<string> {
 }
 
 function baseDeps(log: AuditLog | null): PostureRouteDeps {
-  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), readFlightMap: createDashboardReadFlightMap(),
+  return { resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null, panelStore: createPosturePanelStore(), livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => [] as LocalAgentRecord[],

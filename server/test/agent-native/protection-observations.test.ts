@@ -1,4 +1,6 @@
+// fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
 /** Shared protection observations. */
+import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js";
 import { afterEach, expect, it, vi } from "vitest";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
@@ -62,7 +64,7 @@ async function fixture() {
     resolvePinnedProducerKey: () => null, resolveBrokerPinnedProducerKey: () => null,
     resolveEnforcementAvailability: async () => ({ status: "undetermined" as const, reason: "unavailable",
       observed_at: null, freshness_window_ms: custodySource.DEFAULT_ENFORCEMENT_FRESHNESS_MS, active_connection_count: 0 }), // No observed enforcement connections.
-    panelStore, readFlightMap: createDashboardReadFlightMap(), now: () => observedAt,
+    panelStore, livenessSource: createFixtureLivenessSource(), readFlightMap: createDashboardReadFlightMap(), now: () => observedAt,
     protectionRuntime: () => runtime };
   return { storage, masterKey, runtime, auditLog, health, custody, healthRead, custodyRead, chainRead, chain,
     makeTool, readTool, deps, setBinding: (value: SessionBinding | undefined) => { binding = value; } };

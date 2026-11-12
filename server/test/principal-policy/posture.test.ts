@@ -24,6 +24,12 @@ import {
 } from "../../src/castle-wall/constants.js";
 import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
 import { protectionSubjectFromMacOSAuditToken } from "../../src/castle-wall/subject-binding.js";
+// Visible text of the page's own rendered markup, read by a character scan rather than a tag-stripping regex.
+function textOutsideTags(html: string): string {
+  let out = "", inTag = false;
+  for (const ch of html) { if (ch === "<") inTag = true; else if (ch === ">" && inTag) inTag = false; else if (!inTag) out += ch; }
+  return out;
+}
 
 const FORTRESS = "fortress:test";
 
@@ -1334,5 +1340,45 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
     });
     expect(panel.receipts.receipts_capped).toBe(false);
     expect(panel.receipts.attested).toBe(1);
+  });
+});
+
+describe("liveness badges", () => {
+  it("presents labelled liveness badges from unchanged component verdicts", async () => {
+    const projection = {
+      wall: { state: "wall_DOWN", alarm: true, reasons: ["observer_stale"], cause: null },
+      agent: { state: "agent_UNMONITORED", alarm: true, reasons: ["agent_not_configured"], cause: null },
+      coverage: { state: "coverage_UNAVAILABLE", alarm: true, reasons: ["observer_stale"], cause: null },
+      exit_code: 1,
+    } as const;
+    const { buildLivenessBadges, renderLivenessBadges } = await import("../../src/principal-policy/posture.js");
+    const badges = buildLivenessBadges(projection as any);
+    expect(badges.map(b => [b.label, b.text])).toEqual([["Wall", "Down"], ["Agent", "Not monitored"], ["Coverage", "Unavailable"]]);
+    const html = renderLivenessBadges(projection as any);
+    expect(html).toContain('data-state="wall_DOWN"');
+    expect(html).toContain('title="observer_stale"');
+    const visible = textOutsideTags(html);
+    expect(visible).toBe("Wall: Down Agent: Not monitored Coverage: Unavailable");
+    expect(visible).not.toMatch(/wall_DOWN|observer_stale|agent_UNMONITORED|coverage_UNAVAILABLE|\u2014/);
+  });
+  it("uses the alarm tone unless a known healthy state earns green", async () => {
+    const { LIVENESS_STATES } = await import("../../src/castle-wall/liveness/constants.js");
+    const { buildLivenessBadges, renderLivenessBadges } = await import("../../src/principal-policy/posture.js");
+    for (const component of ["wall", "agent", "coverage"] as const) {
+      for (const state of [...LIVENESS_STATES[component], component + "_FUTURE", component + "_OK_FUTURE", "toString", component === "wall" ? "agent_OK_PASSIVE" : "wall_OK_IDLE"]) {
+        for (const alarm of [false, true]) {
+          const value: any = { wall: { state: "wall_OK_IDLE", alarm: false, reasons: [] },
+            agent: { state: "agent_OK_PASSIVE", alarm: false, reasons: [] },
+            coverage: { state: "coverage_COMPLETE", alarm: false, reasons: [] } };
+          value[component] = { state, alarm, reasons: [] };
+          const known = (LIVENESS_STATES[component] as readonly string[]).includes(state);
+          const healthy = known && !alarm && (state.includes("_OK_") || state === "coverage_COMPLETE");
+          if (!known) expect(buildLivenessBadges(value).find(b => b.component === component)!.text).toBe("Down");
+          const html = renderLivenessBadges(value);
+          expect(html).toContain('<span class="pill ' + (healthy ? 'green tone-verified' : 'amber tone-unverified') +
+            '" data-liveness-component="' + component + '" data-state="' + state + '"');
+        }
+      }
+    }
   });
 });

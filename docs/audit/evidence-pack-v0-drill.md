@@ -142,3 +142,11 @@ Retain tarball SHA-256 and npm integrity, package provenance, tree hashes, authe
 No second-Mac results have been recorded.
 
 <!-- Fixture root and checkpoint prefix contract: server/scripts/evidence-pack-drill-fixture.ts and evidence-pack-drill-tamper.py. -->
+
+## Artifact handoff
+
+Supply explicit `--artifact-dir` and `--artifact-mode` arguments to the candidate builder. The destination must have a plain final component in an absolute path. The builder resolves and anchors its parent once, then creates the final directory exclusively; a symlinked ancestor is allowed, but an existing final entry is refused. Pass the path without a trailing slash or `.` suffix; those spellings, and a final component that is a link, are refused. Shell completion can add a trailing slash and cause an otherwise valid path to be refused. The receipt is written last. On refusal, leave partial outputs for inspection and rebuild in a clean destination; a complete-looking convenience copy is not a release authority.
+
+Before installation or upload, run `node server/scripts/build-evidence-pack.mjs --check-descriptor <artifact-directory>`. Install only its fixed `candidate.tgz`, offline with scripts disabled. The shipped `check-evidence-pack-artifact` checks the same pair against independently supplied digest and revision pins. Fixture-policy success is non-release evidence. Neither the process nor its receipt authenticates a publisher.
+
+The artifact path still needs native Darwin and Node 24 drills. No native Darwin result is asserted here; existing snapshot and isolation bounds remain unchanged.

@@ -29,6 +29,17 @@ const SENDER_HOLD_US: u32 = SIGNER_HANDSHAKE_DEADLINE_MS as u32 * 1000; // Keep 
 const TICK_MS: u64 = 5; // Test polling cadence, below the handshake budget.
 const DEADLINE_WAVES: usize = 50; // Required repeated-admission fault schedule policy bound.
 static SCRIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// A child that drops every capability before exec can no longer traverse a checkout under another user's home
+// (root CI runs from the runner's home), so the scripted children exec a copy in a temp directory the test owns.
+fn capability_dropped_exe() -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("signer-client-child");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (dir, exe)
+}
+
 fn policy() -> PeerPolicy {
     static POLICY: std::sync::OnceLock<PeerPolicy> = std::sync::OnceLock::new();
     POLICY
@@ -759,7 +770,8 @@ fn relay_rights(rights: bool) {
     use std::os::unix::{net::UnixStream, process::CommandExt};
     use std::process::{Command, Stdio};
     let root = tempfile::tempdir().unwrap();
-    let mut command = Command::new(std::env::current_exe().unwrap());
+    let (_exe_dir, exe) = capability_dropped_exe();
+    let mut command = Command::new(&exe);
     command
         .args(["--exact", "child_relay_sender", "--nocapture"])
         .env("SIGNER_RELAY_CHILD_ROOT", root.path())
@@ -767,7 +779,8 @@ fn relay_rights(rights: bool) {
     if rights {
         command.env("SIGNER_RELAY_RIGHTS", "1");
     }
-    // The scripted signer drops capabilities before exec, so this witness is identical in root CI and on the box.
+    // The scripted signer drops capabilities before exec, so this witness is identical in root CI and on the box;
+    // it execs the temp copy for the same reason.
     unsafe {
         command.pre_exec(signer_peer::drop_capabilities);
     }
@@ -1117,7 +1130,8 @@ fn signer_pidfd_death_never_reconnects_even_with_a_live_socket() {
     let _ = policy();
     let root = tempfile::tempdir().unwrap();
     let holder = signer_peer::listen(&root.path().join("hold.sock")).unwrap();
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let (_exe_dir, exe) = capability_dropped_exe();
+    let mut command = std::process::Command::new(&exe);
     command
         .args(["--exact", "child_relay_sender", "--nocapture"])
         .env("SIGNER_RELAY_CHILD_ROOT", root.path())

@@ -28,6 +28,9 @@
  * Returns a string so the dashboard can serve it directly (mirrors
  * `renderPostureHomeHTML`).
  */
+import { LIVENESS_BADGE_FN_SOURCE } from "./posture.js";
+import { LIVENESS_SCHEDULE_FN_SOURCE } from "./posture-html-shared.js";
+
 
 import { AUDIT_CHAIN_VERIFIED_MAX_AGE_MS, POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE } from "./posture-home-types.js";
 import {
@@ -102,6 +105,7 @@ export function renderPostureAgentHTML(): string {
   <section>
     <h2>Standing</h2>
     <div class="panel" id="standing"><span class="empty">Loading...</span></div>
+    <div id="castle-wall-liveness" aria-label="Castle Wall liveness"></div>
   </section>
 
   <section>
@@ -127,6 +131,12 @@ export function renderPostureAgentHTML(): string {
 <script>
 (function () {
   "use strict";
+  ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
+  // Must match LIVENESS_SCHEDULE_FN_SOURCE in castle-wall/liveness/browser-contract.ts.
+  // Must match LIVENESS_BADGE_FN_SOURCE in principal-policy/posture.ts.
+${LIVENESS_BADGE_FN_SOURCE}
+${LIVENESS_SCHEDULE_FN_SOURCE}
+  var livenessDisplay = mountLivenessDisplay();
   // Same auth model as the rest of the dashboard: loopback auto-auth or a
   // bearer token the operator pasted. We send credentials: same-origin so the
   // session cookie rides along; if a token is in the URL hash we use it.
@@ -213,6 +223,9 @@ export function renderPostureAgentHTML(): string {
   ${REL_TIME_FN_SOURCE}
 
   function renderPanelStatus(home) {
+    if (home.castle_wall_liveness) {
+      try { livenessDisplay.install(home.castle_wall_liveness); } catch { livenessDisplay.refuse(); }
+    }
     // Freshness accepts the same strict instant as the SPA, never a browser-local date.
     ${POSTURE_AUDIT_TIMESTAMP_PARSER_SOURCE}
     // Must match PosturePanelReason in panel-producer.ts and the other consumer copy tables.

@@ -196,6 +196,14 @@ export function renderTable(status: Record<string, unknown>): string {
         (reasons.length > 0 ? ` - ${reasons.join("; ")}` : ""),
     );
   }
+  const liveness = asRecord(status.castle_wall_liveness);
+  if (liveness) {
+    for (const component of ["wall", "agent", "coverage"]) {
+      const verdict = asRecord(liveness[component]);
+      const reasons = Array.isArray(verdict?.reasons) ? verdict.reasons.filter((reason): reason is string => typeof reason === "string") : [];
+      lines.push(`  liveness ${component}: ${str(verdict?.state)}${reasons.length ? ` (${reasons.join(", ")})` : ""}`);
+    }
+  }
   return `${lines.join("\n")}\n`;
 }
 

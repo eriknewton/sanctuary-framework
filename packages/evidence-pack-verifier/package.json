@@ -7,6 +7,6 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": { "node": ">=22.0.0" },
-  "bin": { "verify-evidence-pack": "dist/verify-evidence-pack.js" },
+  "bin": { "verify-evidence-pack": "dist/verify-evidence-pack.js", "check-evidence-pack-artifact": "dist/check-evidence-pack-artifact.js" },
   "files": ["dist", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 }
