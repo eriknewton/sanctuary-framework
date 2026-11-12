@@ -6,6 +6,7 @@ mod writer_bus;
 use castle_wall_daemon::business_profile::{
     signer_peer,
     writer_peer::{test_support::*, *},
+    writer_protocol::WRITER_HANDSHAKE_DEADLINE_MS,
 };
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use std::os::fd::AsRawFd;
@@ -35,7 +36,10 @@ fn cgroup_is_one_unified_absolute_path() {
 #[test]
 fn authenticated_exchange_and_capture_hold_the_live_main_process() {
     let f = writer_bus::Fixture::new();
-    let u = f.target.exchange(deadline_ms(250).unwrap()).unwrap();
+    let u = f
+        .target
+        .exchange(deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap())
+        .unwrap();
     assert_eq!(u, *f.unit.lock().unwrap());
     let (a, b) = socketpair(
         AddressFamily::Unix,
@@ -56,7 +60,7 @@ fn authenticated_exchange_and_capture_hold_the_live_main_process() {
         &f.target,
         &expected,
         unsafe { libc::geteuid() },
-        deadline_ms(250).unwrap(),
+        deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
     )
     .unwrap();
     assert_eq!(binding.pid, std::process::id() as i32);
@@ -66,11 +70,17 @@ fn authenticated_exchange_and_capture_hold_the_live_main_process() {
     let packet = signer_peer::receive(b.as_raw_fd(), 1024).unwrap();
     binding.packet(&packet).unwrap();
     binding
-        .revalidate(&f.target, deadline_ms(250).unwrap())
+        .revalidate(
+            &f.target,
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
+        )
         .unwrap();
     f.unit.lock().unwrap().invocation[0] ^= 1;
     assert_eq!(
-        binding.revalidate(&f.target, deadline_ms(250).unwrap()),
+        binding.revalidate(
+            &f.target,
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
+        ),
         Err(Error::Identity)
     );
     assert!(binding.live());
@@ -147,7 +157,7 @@ fn capture_refuses_primary_identity_and_artifact_mismatches() {
             &f.target,
             &expected,
             owner,
-            deadline_ms(250).unwrap()
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
         Err(Error::Peer)
     ));
@@ -162,7 +172,7 @@ fn capture_refuses_primary_identity_and_artifact_mismatches() {
             &f.target,
             &expected_wrong,
             owner,
-            deadline_ms(250).unwrap()
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
         Err(Error::Peer)
     ));
@@ -175,7 +185,7 @@ fn capture_refuses_primary_identity_and_artifact_mismatches() {
             &f.target,
             &expected,
             owner,
-            deadline_ms(250).unwrap()
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
         Err(Error::Artifact)
     ));
@@ -216,7 +226,8 @@ fn owner_change_is_terminal_without_rebinding() {
     let f = writer_bus::Fixture::new();
     f.unit.lock().unwrap().owner = ":1.89".into();
     assert_eq!(
-        f.target.exchange(deadline_ms(250).unwrap()),
+        f.target
+            .exchange(deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()),
         Err(Error::Sender)
     );
 }
@@ -232,7 +243,8 @@ fn manager_credentials_and_final_ownership_are_pinned() {
             ..Default::default()
         };
         assert_eq!(
-            f.target.exchange(deadline_ms(250).unwrap()),
+            f.target
+                .exchange(deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()),
             Err(Error::Owner)
         );
     }
@@ -250,7 +262,9 @@ fn bounded_signals_are_discarded_without_satisfying_a_response() {
             invalid_signal: invalid,
             ..Default::default()
         };
-        let result = f.target.exchange(deadline_ms(250).unwrap());
+        let result = f
+            .target
+            .exchange(deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap());
         match expected {
             Some(error) => assert_eq!(result, Err(error)),
             None => assert!(result.is_ok()),
@@ -264,7 +278,8 @@ fn trickled_minimal_reply_cannot_rearm_twenty_fresh_deadlines() {
         f.fault.lock().unwrap().trickle = true;
         let start = std::time::Instant::now();
         assert_eq!(
-            f.target.exchange(deadline_ms(250).unwrap()),
+            f.target
+                .exchange(deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()),
             Err(Error::Deadline)
         );
         assert!(start.elapsed() < std::time::Duration::from_millis(
@@ -296,7 +311,7 @@ fn completion_revalidation_refuses_a_new_main_pid_with_the_wall_live() {
         &f.target,
         &expected,
         owner,
-        deadline_ms(250).unwrap(),
+        deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
     )
     .unwrap();
     let state = writer_state::Fixture::new();
@@ -316,10 +331,16 @@ fn completion_revalidation_refuses_a_new_main_pid_with_the_wall_live() {
     .unwrap();
     state.grant(&mut machine);
     binding
-        .revalidate(&f.target, deadline_ms(250).unwrap())
+        .revalidate(
+            &f.target,
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
+        )
         .unwrap();
     let result = machine.sign(state.header(), &state.body, |_| {
-        binding.revalidate(&f.target, deadline_ms(250).unwrap())?;
+        binding.revalidate(
+            &f.target,
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
+        )?;
         Ok(())
     });
     assert_eq!(result, Err(writer_service::Error::Peer(Error::Identity)));
@@ -387,7 +408,7 @@ fn complete_dropin_order_hash_and_artifact_controls() {
             &f.target,
             &expect,
             owner + u32::from(fault == "owner"),
-            deadline_ms(250).unwrap(),
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
         );
         assert_eq!(result.is_ok(), fault == "none", "{fault}");
         if fault == "none" {
@@ -418,7 +439,7 @@ fn every_packet_identity_component_has_a_control() {
         &f.target,
         &expect,
         owner,
-        deadline_ms(250).unwrap(),
+        deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
     )
     .unwrap();
     for fault in ["none", "pid", "uid", "gid", "pidfd", "rights"] {
@@ -468,7 +489,7 @@ fn saved_process_identity_and_descriptor_predicates_are_independent() {
             &f.target,
             &expect,
             owner,
-            deadline_ms(250).unwrap(),
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
         )
         .unwrap();
         assert!(pidfd_subject_matches(
@@ -507,7 +528,7 @@ fn final_capture_exchange_cannot_adopt_a_replacement_invocation() {
             &f.target,
             &expect,
             owner,
-            deadline_ms(250).unwrap()
+            deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
         Err(Error::Identity)
     ));

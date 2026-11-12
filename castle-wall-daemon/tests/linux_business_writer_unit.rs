@@ -672,3 +672,12 @@ fn composed_aged_status_keeps_the_signer_window() {
         });
     }
 }
+
+#[test]
+fn writer_capability_syscalls_preserve_errno() {
+    for case in ["capset", "no-new-privs"] {
+        writer_run::child_case("writer_capability_syscalls_preserve_errno", case, || {
+            writer_run::capability_errno(case)
+        });
+    }
+}

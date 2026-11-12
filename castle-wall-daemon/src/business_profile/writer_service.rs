@@ -928,6 +928,7 @@ fn serve<P: SignerPort, R: Reconciler>(
                             WriterMachine::<P, R>::admit_deadline(deadline, now, machine.expiry()?)
                         });
                     if let Err(e) = admission {
+                        // REFUSED goes out after packet-credential binding and before that packet's bus revalidation, and carries only the caller's own id.
                         let _ = send(
                             w.fd.as_raw_fd(),
                             &w.session,

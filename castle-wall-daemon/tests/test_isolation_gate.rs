@@ -1014,7 +1014,11 @@ fn assert_gated_statement_keeps_implementation(statement: &str, implementation: 
         implementation,
         "following production item retained"
     );
-    assert_eq!(reconciler_implementations(&production), ["Other"], "implementation spelling recognized");
+    assert_eq!(
+        reconciler_implementations(&production),
+        ["Other"],
+        "implementation spelling recognized"
+    );
 }
 
 #[test]

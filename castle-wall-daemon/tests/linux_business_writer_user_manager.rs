@@ -14,6 +14,11 @@ fn witness(mode: &str) {
             ),
             mode,
         ])
+        // Must match writer-user-manager.py's final argument: one shared signer idle window.
+        .arg(
+            castle_wall_daemon::business_profile::signer_contract::SIGNER_IDLE_DEADLINE_MS
+                .to_string(),
+        )
         .output()
         .unwrap();
     assert!(

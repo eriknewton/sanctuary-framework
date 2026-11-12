@@ -4,6 +4,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+// A canonical positive decimal lets the native decoder check other fields; overwritten with the caller's text and never admitted.
+const DEADLINE_DECODE_PLACEHOLDER: &str = "1";
 // Native signer_service::decode uses the same decimal round trip; every writer stage consumes this predicate.
 pub fn canonical_deadline(text: &str) -> Option<u64> {
     let value = text.parse::<u64>().ok()?;
@@ -187,7 +189,10 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
                 .ok_or(Refusal::Schema)?
                 .to_owned();
             if canonical_deadline(&deadline).is_none() {
-                map.insert("deadline_boottime_ns".into(), json!("1"));
+                map.insert(
+                    "deadline_boottime_ns".into(),
+                    json!(DEADLINE_DECODE_PLACEHOLDER),
+                );
             }
             let encoded =
                 signer_service::encode(&signer, &packet[end..]).map_err(|_| Refusal::Length)?;

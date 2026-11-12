@@ -3,7 +3,6 @@ import array
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 import select
 import shutil
@@ -13,11 +12,12 @@ import sys
 import tempfile
 import time
 
-# One signer idle period gives the poll-driven wall-loss observer its required scheduling margin.
-SIGNER_IDLE_DEADLINE_MS = int(re.search(r'pub const SIGNER_IDLE_DEADLINE_MS: usize = (\d+);', Path('src/business_profile/signer_contract.rs').read_text()).group(1))
+# Must match linux_business_writer_user_manager::witness: Rust supplies the shared idle bound.
+helper, writer, mode, signer_idle_ms = sys.argv[1:]
+SIGNER_IDLE_DEADLINE_MS = int(signer_idle_ms)
+# One signer idle period gives the poll-driven wall-loss observer its scheduling margin.
 WALL_LOSS_WINDOW_MS = SIGNER_IDLE_DEADLINE_MS
 MILLISECONDS_PER_SECOND = 1000
-helper, writer, mode = sys.argv[1:]
 uid, gid = os.geteuid(), os.getegid()
 runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{uid}'))
 unit_dir = runtime / 'systemd/user'
@@ -81,6 +81,14 @@ def parse(text):
 hardening = '''CapabilityBoundingSet AmbientCapabilities NoNewPrivileges UMask ProtectSystem ProtectHome PrivateDevices PrivateIPC PrivateTmp PrivateUsers ProtectProc ProcSubset ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictAddressFamilies RestrictNamespaces RestrictRealtime RestrictSUIDSGID LockPersonality SystemCallArchitectures LimitCORE MemorySwapMax MemoryMax TasksMax StandardInput StandardOutput StandardError'''.split()
 omit = set(hardening + ['User', 'Group', 'SupplementaryGroups', 'SocketUser', 'SocketGroup'])
 
+# Only these reviewed unit-name, path, lifetime-edge and activation substitutions may be inverted.
+ALLOWED_SUBSTITUTIONS = {
+    'writer.service': frozenset(['[Unit].Requires', '[Unit].After', '[Unit].BindsTo', '[Unit].PartOf',
+                                '[Unit].Before', '[Service].Slice', '[Service].ExecStart', '[Service].ExecStartPre']),
+    'writer.socket': frozenset(['[Unit].Requires', '[Unit].After', '[Unit].BindsTo', '[Unit].Before',
+                               '[Socket].Service', '[Socket].ListenSequentialPacket', 'socket type']),
+}
+
 def render(role):
     production = Path('systemd/sanctuary-business-' + role).read_text()
     original = parse(production)
@@ -104,15 +112,14 @@ def render(role):
             if directive == 'ListenSequentialPacket':
                 value = str(root / 'record.sock')
             changed.append(value)
+        if mode == 'two' and role == 'writer.socket' and directive == 'ListenSequentialPacket':
+            changed.append(str(root / 'second.sock'))
         if values != changed:
             manifest['substitutions'].append(dict(unit=role, directive=key, before=list(values), after=list(changed)))
         rendered[key] = changed
     if mode == 'stream' and role == 'writer.socket':
         rendered['[Socket].ListenStream'] = rendered.pop('[Socket].ListenSequentialPacket')
         manifest['substitutions'].append(dict(unit=role, directive='socket type', before='ListenSequentialPacket', after='ListenStream'))
-    if mode == 'two' and role == 'writer.socket':
-        rendered['[Socket].ListenSequentialPacket'].append(str(root / 'second.sock'))
-        manifest['substitutions'].append(dict(unit=role, directive='extra descriptor', before=[], after=[str(root / 'second.sock')]))
     if role == 'writer.service':
         gate = [f'{root}/actor before-writer {root} main']
         rendered['[Service].ExecStartPre'] = gate
@@ -130,10 +137,11 @@ def render(role):
     # Only exact named emitted substitutions may be inverted; a changed recorded value refuses parity.
     if mode == 'stream' and role == 'writer.socket':
         restored['[Socket].ListenSequentialPacket'] = restored.pop('[Socket].ListenStream')
-    if mode == 'two' and role == 'writer.socket':
-        assert restored['[Socket].ListenSequentialPacket'][-1] == str(root / 'second.sock')
-        restored['[Socket].ListenSequentialPacket'].pop()
     for item in manifest['substitutions']:
+        # The allowlist is independent of the manifest, so recording a new directive cannot authorize it.
+        assert item['directive'] in ALLOWED_SUBSTITUTIONS[item['unit']], 'reviewed substitution directive: ' + item['directive']
+        if item['directive'] == 'socket type':
+            assert item == dict(unit='writer.socket', directive='socket type', before='ListenSequentialPacket', after='ListenStream')
         if item['unit'] == role and item['directive'].startswith('['):
             assert restored[item['directive']] == item['after'], 'emitted substitution equality: ' + item['directive']
             if item['directive'] in original:

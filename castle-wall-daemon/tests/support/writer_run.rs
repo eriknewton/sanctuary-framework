@@ -481,9 +481,10 @@ pub fn scenario(case: &str) {
         assert_eq!(state.binds.load(Ordering::SeqCst), 0);
         state.unlock();
         for _ in 0..2 {
-            state
-                .now
-                .fetch_add(250 * writer_state::NS_PER_MS, Ordering::SeqCst);
+            state.now.fetch_add(
+                writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+                Ordering::SeqCst,
+            );
             thread::sleep(Duration::from_millis(30));
         }
         assert_eq!(state.binds.load(Ordering::SeqCst), 1);
@@ -529,12 +530,14 @@ pub fn scenario(case: &str) {
         return;
     }
     if case.starts_with("heartbeat-timeout-") {
-        state
-            .status_delay
-            .store(1000 * writer_state::NS_PER_MS, Ordering::SeqCst);
-        state
-            .now
-            .fetch_add(250 * writer_state::NS_PER_MS, Ordering::SeqCst);
+        state.status_delay.store(
+            signer_contract::SIGNER_IDLE_DEADLINE_MS as u64 * writer_state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
+        state.now.fetch_add(
+            writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
         assert_eq!(
             rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
                 .unwrap(),
@@ -738,16 +741,18 @@ pub fn scenario(case: &str) {
     } else {
         if case.starts_with("recovery-") {
             state.state("RECOVERY_REQUIRED");
-            state
-                .now
-                .fetch_add(250 * writer_state::NS_PER_MS, Ordering::SeqCst);
+            state.now.fetch_add(
+                writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+                Ordering::SeqCst,
+            );
             thread::sleep(Duration::from_millis(30));
             assert!(status(wall.as_raw_fd(), &hello.session_id).grant.is_none());
             if case != "recovery-no-lock" {
                 state.state("LOCKED");
-                state
-                    .now
-                    .fetch_add(250 * writer_state::NS_PER_MS, Ordering::SeqCst);
+                state.now.fetch_add(
+                    writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+                    Ordering::SeqCst,
+                );
                 thread::sleep(Duration::from_millis(30));
                 assert_eq!(status(wall.as_raw_fd(), &hello.session_id).state, "LOCKED");
                 if case == "recovery-fresh" {
@@ -766,9 +771,10 @@ pub fn scenario(case: &str) {
         }
         for _ in 0..2 {
             let count = state.statuses.load(Ordering::SeqCst);
-            state
-                .now
-                .fetch_add(250 * writer_state::NS_PER_MS, Ordering::SeqCst);
+            state.now.fetch_add(
+                writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+                Ordering::SeqCst,
+            );
             for _ in 0..100 {
                 if state.statuses.load(Ordering::SeqCst) > count {
                     break;
@@ -827,9 +833,10 @@ pub fn scenario(case: &str) {
                     "bound-change-boot" => view.boot_id = "b".repeat(32),
                     _ => panic!("unknown bound fault"),
                 }
-                state
-                    .now
-                    .fetch_add(250 * writer_state::NS_PER_MS, Ordering::SeqCst);
+                state.now.fetch_add(
+                    writer_protocol::WRITER_HEARTBEAT_MS * writer_state::NS_PER_MS,
+                    Ordering::SeqCst,
+                );
             }
             assert_eq!(
                 rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
@@ -1043,4 +1050,88 @@ pub fn scenario(case: &str) {
     if let Some(thread) = native_thread {
         thread.join().unwrap();
     }
+}
+
+pub fn capability_errno(case: &str) {
+    fn instruction(code: u32, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        }
+    }
+    // Linux seccomp_data begins with nr, arch and instruction_pointer, then its u64 syscall arguments.
+    const SYSCALL_NUMBER_OFFSET: u32 = 0;
+    const FIRST_ARGUMENT_OFFSET: u32 =
+        (2 * std::mem::size_of::<u32>() + std::mem::size_of::<u64>()) as u32;
+    let mut filter = vec![instruction(
+        libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+        0,
+        0,
+        SYSCALL_NUMBER_OFFSET,
+    )];
+    if case == "capset" {
+        // One comparison skips the errno return for every other syscall.
+        filter.push(instruction(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            0,
+            1,
+            libc::SYS_capset as u32,
+        ));
+    } else {
+        assert_eq!(case, "no-new-privs");
+        // Three instructions inspect only prctl's option before the shared allow return.
+        filter.push(instruction(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            0,
+            3,
+            libc::SYS_prctl as u32,
+        ));
+        filter.push(instruction(
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            0,
+            0,
+            FIRST_ARGUMENT_OFFSET,
+        ));
+        filter.push(instruction(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            0,
+            1,
+            libc::PR_SET_NO_NEW_PRIVS as u32,
+        ));
+    }
+    filter.push(instruction(
+        libc::BPF_RET | libc::BPF_K,
+        0,
+        0,
+        libc::SECCOMP_RET_ERRNO | libc::EIO as u32,
+    ));
+    filter.push(instruction(
+        libc::BPF_RET | libc::BPF_K,
+        0,
+        0,
+        libc::SECCOMP_RET_ALLOW,
+    ));
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    // The child installs its filter after NNP; only the shared routine's subsequent call receives EIO.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+        0
+    );
+    let result = signer_peer::drop_capabilities_with(signer_peer::CapabilityDrop::Writer {
+        isolation: true,
+    });
+    assert_eq!(
+        result.err().and_then(|error| error.raw_os_error()),
+        Some(libc::EIO),
+        "writer preserves syscall errno"
+    );
 }

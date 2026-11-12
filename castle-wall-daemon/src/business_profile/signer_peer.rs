@@ -566,6 +566,14 @@ pub enum CapabilityDrop {
     Signer,
     Writer { isolation: bool },
 }
+fn bounding_drop_result(writer: bool, isolation: bool, error: io::Error) -> io::Result<()> {
+    // Only EPERM can represent the writer's explicitly isolated unprivileged bounding drop.
+    if !isolation || (writer && error.raw_os_error() != Some(libc::EPERM)) {
+        Err(if writer { error } else { refused() })
+    } else {
+        Ok(())
+    }
+}
 /// Shared capability ABI and dropped sets for the signer and sanctuary-business-writer::execute.
 pub fn drop_capabilities_with(policy: CapabilityDrop) -> io::Result<()> {
     let writer = matches!(policy, CapabilityDrop::Writer { .. });
@@ -589,9 +597,7 @@ pub fn drop_capabilities_with(policy: CapabilityDrop) -> io::Result<()> {
         }
         if present == 1 && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0 {
             let error = io::Error::last_os_error();
-            if !isolation || (writer && error.raw_os_error() != Some(libc::EPERM)) {
-                return Err(if writer { error } else { refused() });
-            }
+            bounding_drop_result(writer, isolation, error)?;
         }
     }
     #[repr(C)]
@@ -635,7 +641,11 @@ pub fn drop_capabilities_with(policy: CapabilityDrop) -> io::Result<()> {
     if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0
         || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
     {
-        return Err(refused());
+        return Err(if writer {
+            io::Error::last_os_error()
+        } else {
+            refused()
+        });
     }
     empty_capabilities(unsafe { libc::getpid() }, !isolation)
 }
@@ -652,6 +662,29 @@ pub(crate) fn pidfd_pid(fd: RawFd) -> Option<i32> {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    #[test]
+    fn bounding_drop_preserves_mode_and_errno() {
+        for writer in [false, true] {
+            for isolation in [false, true] {
+                for errno in [libc::EPERM, libc::EINVAL, libc::EACCES, libc::ENOSYS] {
+                    let result = bounding_drop_result(
+                        writer,
+                        isolation,
+                        io::Error::from_raw_os_error(errno),
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        isolation && (!writer || errno == libc::EPERM),
+                        "bounding tolerance is mode and errno specific"
+                    );
+                    if let (true, Err(error)) = (writer, result) {
+                        assert_eq!(error.raw_os_error(), Some(errno));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn uid_refusal_is_distinct_from_receive_and_process_faults() {
         let mut fds = [-1; 2];
