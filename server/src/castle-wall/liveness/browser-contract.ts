@@ -74,7 +74,7 @@ export function buildLivenessSchedule(input: LivenessInput): LivenessScheduleEnt
 export const LIVENESS_SCHEDULE_FN_SOURCE = String.raw`
 function createLivenessDisplay(paint) {
   var invalid = false;
-  // observation_invalid is a browser-only refusal reason, not an evaluator registry reason.
+  // This observation_invalid reason describes browser-only projection refusal; it does not replace an evaluator observation.
   var fallback = { wall: { state: "wall_DOWN", alarm: true, reasons: ["observation_invalid"], cause: null },
     agent: { state: "agent_DOWN", alarm: true, reasons: ["observation_invalid"], cause: null },
     coverage: { state: "coverage_UNAVAILABLE", alarm: true, reasons: ["observation_invalid"], cause: null }, exit_code: 1 };
