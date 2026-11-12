@@ -50,11 +50,8 @@ fn execute() -> std::io::Result<()> {
             let packet = signer_service::encode(&value, &[])?;
             let line = std::str::from_utf8(&packet[signer_service::LENGTH_BYTES..])
                 .map_err(|_| refused())?;
-            // The test-only probe emits only the public canonical STATUS observation as its stdout contract.
-            use std::io::Write;
-            let mut output = std::io::stdout().lock();
-            output.write_all(line.as_bytes())?;
-            output.write_all(b"\n")?;
+            // SAFETY: The test-only probe emits only the public canonical STATUS observation as its stdout contract.
+            println!("{line}");
             client.close_and_settle();
             return Ok(());
         }
@@ -92,6 +89,7 @@ fn main() {
     std::process::exit(1);
 }
 
+// test-isolation only: this relay authenticates the signer but not its parent, so it must never exist in a release artifact; release absence is proven by the release-closure test.
 #[cfg(all(target_os = "linux", feature = "test-isolation"))]
 fn test_relay(
     path: &std::path::Path,
@@ -111,7 +109,6 @@ fn test_relay(
     const OUTPUT: i32 = libc::STDOUT_FILENO;
     // Nanoseconds per millisecond.
     const NS_PER_MS: u64 = 1_000_000;
-    // test-isolation only: this relay authenticates the signer but not its parent, so it must never exist in a release artifact; release absence is proven by the release-closure test.
     // Must match require_unix_socket in signer_peer.rs and k1-relay-client.ts: stdin is an AF_UNIX socket.
     signer_peer::require_unix_socket(INPUT)?;
     signer_peer::drop_capabilities()?;

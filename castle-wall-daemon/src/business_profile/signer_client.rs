@@ -9,7 +9,7 @@ use super::{
     },
     signer_peer::{self, Peer, PeerPolicy},
     signer_service::{self, Header, LENGTH_BYTES, RESPONSE_MAX_BYTES, SIGN_SOCKET},
-    signer_watchdog::boottime_ns,
+    signer_watchdog::{boottime_ns, NS_PER_SECOND},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
+// Must match decode header.v in signer_service.rs and the version suffix of SIGNER_PROTOCOL.
 const PROTOCOL_VERSION: u8 = 1; // Version suffix of sanctuary.record-signer.v1.
 const NS_PER_MS: u64 = 1_000_000; // Nanoseconds in one millisecond.
 const ID_HEX_CHARS: usize = 16 * 2; // The protocol's 128-bit identifier encoded as hex.
@@ -234,7 +235,8 @@ impl BusinessSignerClient {
             .checked_add(SIGNER_HANDSHAKE_DEADLINE_MS as u64 * NS_PER_MS)
             .ok_or(Refusal::Deadline)?;
         let mut boot_bytes = Vec::new();
-        std::fs::File::open("/proc/sys/kernel/random/boot_id")
+        // Must match read_boot_id in signer_service.rs: one extra byte detects overflow without an unbounded read.
+        std::fs::File::open(signer_service::BOOT_ID_PATH)
             .and_then(|file| {
                 file.take((signer_service::BOOT_ID_READ_MAX_BYTES + 1) as u64)
                     .read_to_end(&mut boot_bytes)
@@ -328,17 +330,19 @@ impl BusinessSignerClient {
             .expires_boottime_ns
             .parse::<u64>()
             .map_err(|_| Refusal::Schema)?;
-        // The relying client caps the authenticated lease at S's own grant limit.
+        // Lease::begin in signer_watchdog.rs caps ttl at UNLOCK_TTL_MAX_SECONDS; NS_PER_SECOND converts that cap to nanoseconds.
         if expires
             .checked_sub(start)
-            .filter(|span| *span <= UNLOCK_TTL_MAX_SECONDS as u64 * 1000 * NS_PER_MS)
+            .filter(|span| *span <= UNLOCK_TTL_MAX_SECONDS as u64 * NS_PER_SECOND)
             .is_none()
         {
             return self.fail(Refusal::Grant);
         }
+        // S and its writer share a kernel, so an observation from another boot cannot bind a grant.
         if self.latest.boot_id != self.local_boot_id {
             return self.fail(Refusal::Grant);
         }
+        // The client dates receipt locally, so an observation older than the idle window cannot freeze authority.
         if now
             .checked_sub(self.latest_at)
             .filter(|age| *age <= SIGNER_IDLE_DEADLINE_MS as u64 * NS_PER_MS)
@@ -414,18 +418,31 @@ impl BusinessSignerClient {
     fn pending_refusal(fd: i32) -> Refusal {
         let mut byte = 0u8;
         // Readability includes EOF; peeking distinguishes transport loss without consuming an unsolicited packet.
-        let count = unsafe {
-            libc::recv(
-                fd,
-                &mut byte as *mut _ as _,
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if count <= 0 {
-            Refusal::Transport
-        } else {
-            Refusal::Unmatched
+        Self::pending_refusal_with(|| {
+            let count = unsafe {
+                libc::recv(
+                    fd,
+                    &mut byte as *mut _ as _,
+                    std::mem::size_of_val(&byte),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count)
+            }
+        })
+    }
+    fn pending_refusal_with(mut peek: impl FnMut() -> io::Result<isize>) -> Refusal {
+        loop {
+            match peek() {
+                Ok(0) => return Refusal::Transport,
+                // An interrupted peek supplies no transport evidence; retry without accepting pending traffic.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                // A packet or any other error still refuses the already unsolicited traffic.
+                _ => return Refusal::Unmatched,
+            }
         }
     }
     fn exchange(&mut self, bytes: &[u8], end: u64) -> Result<Value> {
@@ -668,6 +685,28 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::os::fd::FromRawFd;
+    #[test]
+    fn pending_peek_retries_interruption_and_refuses_other_outcomes() {
+        for (outcome, expected) in [
+            (Ok(0), Refusal::Transport),
+            (Ok(1), Refusal::Unmatched), // One byte establishes a pending packet.
+            (Err(io::ErrorKind::WouldBlock), Refusal::Unmatched),
+            (Err(io::ErrorKind::PermissionDenied), Refusal::Unmatched),
+        ] {
+            let mut attempts = [Err(io::ErrorKind::Interrupted), outcome].into_iter();
+            assert_eq!(
+                BusinessSignerClient::pending_refusal_with(|| {
+                    attempts
+                        .next()
+                        .expect("peek outcome consumed once")
+                        .map_err(io::Error::from)
+                }),
+                expected,
+                "peek must classify the outcome after interruption"
+            );
+            assert!(attempts.next().is_none(), "peek must retry interruption");
+        }
+    }
     #[test]
     fn retained_slot_refuses_another_sign_before_any_send() {
         // Exclusive mutable access makes this state internal; the guard still refuses retained work before transport effects.
