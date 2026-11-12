@@ -86,11 +86,12 @@ export interface LivenessObserverDeps {
 
 /** Bytes of randomness in an instance label: 16 bytes is 32 hex characters, inside LABEL_BYTES with the prefix. */
 const INSTANCE_RANDOM_BYTES = 16;
-/** Hex digits of the host id digest. One-sided copy of LIVENESS_HOST_ID_HEX_DIGITS in server/src/castle-wall/runtime/macos-daemon.ts, which this job may not edit. */
+/** 16 hex digits retain 64 digest bits for an informational host label without publishing the hostname. */
 const HOST_ID_HEX_DIGITS = 16;
 
 /** The informational host id, derived the way the daemon writes it. */
 export function observerHostId(hostname: string): string {
+  // Must match host_id in createLivenessRecorder in server/src/castle-wall/runtime/macos-daemon.ts; both consumers use this derivation.
   return `host-${createHash("sha256").update(hostname).digest("hex").slice(0, HOST_ID_HEX_DIGITS)}`;
 }
 
