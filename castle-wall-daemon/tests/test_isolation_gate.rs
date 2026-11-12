@@ -921,9 +921,12 @@ fn writer_production_source(source: &str) -> String {
                     gated = false;
                     item_indent = None;
                 }
+            } else if trimmed.ends_with(';') {
+                // A complete statement owns no following item, even when it contains braces.
+                gated = false;
             } else if trimmed.contains('{') && !trimmed.ends_with('}') {
                 item_indent = Some(indent);
-            } else if trimmed.ends_with(';') || trimmed.ends_with('}') {
+            } else if trimmed.ends_with('}') {
                 gated = false;
             }
             continue;
@@ -944,12 +947,7 @@ fn production_reconciler_implementation_set_is_closed() {
                 visit(&path, implementations);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 let source = writer_production_source(&std::fs::read_to_string(&path).unwrap());
-                let words: Vec<_> = source.split_whitespace().collect();
-                for row in words.windows(4) {
-                    if row[..3] == ["impl", "Reconciler", "for"] {
-                        implementations.push(row[3].to_owned());
-                    }
-                }
+                implementations.extend(reconciler_implementations(&source));
             }
         }
     }
@@ -977,4 +975,68 @@ fn writer_execute_composes_the_closed_reconciler() {
         .filter(|line| line.starts_with("reconciler:"))
         .collect();
     assert_eq!(fields, vec!["reconciler: ClosedReconciler::production(),"]);
+}
+
+// The compiler seals writer_service::Reconciler; this scan also pins its production implementation source.
+fn reconciler_implementations(source: &str) -> Vec<String> {
+    let mut implementations = Vec::new();
+    for item in source.split("impl").skip(1) {
+        let mut rest = item.trim_start();
+        if rest.starts_with('<') {
+            let mut depth = 0;
+            for (index, ch) in rest.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    _ => (),
+                }
+                if depth == 0 {
+                    rest = rest[index + 1..].trim_start();
+                    break;
+                }
+            }
+        }
+        let mut words = rest.split_whitespace();
+        let name = words.next().unwrap_or_default();
+        if name.rsplit("::").next() == Some("Reconciler") && words.next() == Some("for") {
+            let target = words.next().unwrap_or_default().trim_end_matches('{');
+            implementations.push(target.to_owned());
+        }
+    }
+    implementations
+}
+
+fn assert_gated_statement_keeps_implementation(statement: &str, implementation: &str) {
+    let source = format!("#[cfg(feature = \"test-isolation\")]\n{statement}\n{implementation}\n");
+    let production = writer_production_source(&source);
+    assert_eq!(
+        production.trim(),
+        implementation,
+        "following production item retained"
+    );
+    assert_eq!(reconciler_implementations(&production), ["Other"], "implementation spelling recognized");
+}
+
+#[test]
+fn gated_import_preserves_generic_implementation() {
+    assert_gated_statement_keeps_implementation(
+        "use a::{b, c};",
+        "impl<T> Reconciler for Other {\n}",
+    );
+}
+
+#[test]
+fn gated_constant_preserves_qualified_implementation() {
+    assert_gated_statement_keeps_implementation(
+        "const VALUE: bool = { true };",
+        "impl path::Reconciler for Other {\n}",
+    );
+}
+
+#[test]
+fn gated_static_preserves_combined_implementation() {
+    assert_gated_statement_keeps_implementation(
+        "static VALUE: [u8; 1] = { [0] };",
+        "impl<T: Bound<U>> path::Reconciler for Other {\n}",
+    );
 }

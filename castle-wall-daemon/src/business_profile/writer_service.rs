@@ -129,7 +129,14 @@ pub enum Reconciliation {
     NotReconciled,
     Reconciled(Box<StatusReply>),
 }
-pub trait Reconciler {
+// Only the closed production reconciler and the gated script can supply reconciliation evidence.
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::ClosedReconciler {}
+    #[cfg(feature = "test-isolation")]
+    impl Sealed for super::test_support::TestReconciler {}
+}
+pub trait Reconciler: sealed::Sealed {
     fn reconcile(&mut self, evidence: ReconcileEvidence<'_>) -> Reconciliation;
 }
 pub struct ClosedReconciler;

@@ -106,20 +106,6 @@ impl SignerPort for Port {
         }
     }
 }
-struct Reconcile {
-    closed: bool,
-    calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-impl Reconciler for Reconcile {
-    fn reconcile(&mut self, e: ReconcileEvidence<'_>) -> Reconciliation {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.closed {
-            ClosedReconciler::production().reconcile(e)
-        } else {
-            Reconciliation::Reconciled(Box::new(e.observation.clone()))
-        }
-    }
-}
 struct Received {
     operation: Operation,
     payload: Vec<u8>,
@@ -377,11 +363,19 @@ pub fn scenario(case: &str) {
         bootstrap_time.store(bootstrap_clock.load(Ordering::SeqCst), Ordering::SeqCst);
         bootstrap()
     });
+    let closed_reconciliation = case == "inert";
+    let reconciliation_calls = state.reconciles.clone();
     let deps = Dependencies {
         bootstrap,
-        reconciler: Reconcile {
-            closed: case == "inert",
-            calls: state.reconciles.clone(),
+        reconciler: test_support::TestReconciler {
+            reconcile: Box::new(move |e| {
+                reconciliation_calls.fetch_add(1, Ordering::SeqCst);
+                if closed_reconciliation {
+                    ClosedReconciler::production().reconcile(e)
+                } else {
+                    Reconciliation::Reconciled(Box::new(e.observation.clone()))
+                }
+            }),
         },
         notifier: Notify(tx),
         config,
