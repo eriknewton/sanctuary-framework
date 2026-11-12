@@ -1012,67 +1012,6 @@ impl Activation {
         })
     }
 }
-/// Only an explicitly selected isolation entry may retain an unprivileged bounding set.
-pub fn drop_capabilities(isolation: bool) -> io::Result<()> {
-    let isolation = isolation && cfg!(feature = "test-isolation");
-    let last: i32 = writer_peer::read_proc(Path::new("/proc/sys/kernel/cap_last_cap"))
-        .map_err(|_| custody::refused())?
-        .trim()
-        .parse()
-        .map_err(|_| custody::refused())?;
-    if !(0..64).contains(&last) {
-        return Err(custody::refused());
-    } // Linux capability ABI has two 32-bit words.
-    for cap in 0..=last {
-        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) };
-        if present < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if present == 1 && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0 {
-            let error = io::Error::last_os_error();
-            if !isolation || error.raw_os_error() != Some(libc::EPERM) {
-                return Err(error);
-            }
-        }
-    }
-    #[repr(C)]
-    struct Header {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Data {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-    const CAPABILITY_VERSION_3: u32 = 0x20080522; // linux/capability.h, two 32-bit words.
-    let header = Header {
-        version: CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let data = [Data {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    }; 2];
-    if unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        )
-    } != 0
-        || unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0
-        || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    signer_peer::empty_capabilities(unsafe { libc::getpid() }, !isolation)
-}
 
 #[cfg(feature = "test-isolation")]
 pub const WRITER_TEST_SEAM_MARKER: &str = "SANCTUARY_WRITER_TEST_ISOLATION_V1";

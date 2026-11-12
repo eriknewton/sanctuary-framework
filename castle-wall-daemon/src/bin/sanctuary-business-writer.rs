@@ -3,6 +3,7 @@
 fn execute() -> std::io::Result<()> {
     use castle_wall_daemon::business_profile::{
         custody::{refused, ROOT_UID},
+        signer_peer::{drop_capabilities_with, CapabilityDrop},
         signer_watchdog::boottime_ns,
         writer_peer::{BusTarget, HeldConfig, ListenerExpectations},
         writer_service::{
@@ -18,13 +19,13 @@ fn execute() -> std::io::Result<()> {
     #[cfg(feature = "test-isolation")]
     if args.len() == 2 && args[0] == std::hint::black_box("--test-writer") {
         std::hint::black_box(writer_service::WRITER_TEST_SEAM_MARKER);
-        writer_service::drop_capabilities(true)?;
+        drop_capabilities_with(CapabilityDrop::Writer { isolation: true })?;
         return writer_service::test_entry(std::path::Path::new(&args[1]));
     }
     if !args.is_empty() || unsafe { libc::geteuid() } != ROOT_UID {
         return Err(refused());
     }
-    writer_service::drop_capabilities(false)?;
+    drop_capabilities_with(CapabilityDrop::Writer { isolation: false })?;
     let setup = (|| {
         let config = HeldConfig::production().map_err(|_| refused())?;
         let expectations = ListenerExpectations::production(config.value.writer_socket_gid);

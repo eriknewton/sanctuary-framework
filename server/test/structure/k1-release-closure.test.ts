@@ -72,6 +72,6 @@ it("Linux only: writer isolation has a debug scan control and release refuses be
   const source = readFileSync("../castle-wall-daemon/src/bin/sanctuary-business-writer.rs", "utf8");
   const production = source.slice(source.indexOf("if !args.is_empty()"));
   expect(production.indexOf("libc::geteuid()")).toBeLessThan(production.indexOf("HeldConfig::production()"));
-  expect(production.indexOf("return Err(refused())")).toBeLessThan(production.indexOf("drop_capabilities(false)"));
-  expect(production.indexOf("drop_capabilities(false)")).toBeLessThan(production.indexOf("HeldConfig::production()"));
+  expect(production.indexOf("return Err(refused())")).toBeLessThan(production.indexOf("drop_capabilities_with(CapabilityDrop::Writer { isolation: false })"));
+  expect(production.indexOf("drop_capabilities_with(CapabilityDrop::Writer { isolation: false })")).toBeLessThan(production.indexOf("HeldConfig::production()"));
 });

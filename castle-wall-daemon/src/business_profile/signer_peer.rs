@@ -548,18 +548,39 @@ pub fn validate_capability_status(status: &str, bounding: bool) -> io::Result<()
     Ok(())
 }
 pub fn drop_capabilities() -> io::Result<()> {
+    drop_capabilities_with(CapabilityDrop::Signer)
+}
+/// The signer keeps its established nonroot isolation behavior; writer isolation tolerates only EPERM.
+pub enum CapabilityDrop {
+    Signer,
+    Writer { isolation: bool },
+}
+/// Shared capability ABI and dropped sets for the signer and sanctuary-business-writer::execute.
+pub fn drop_capabilities_with(policy: CapabilityDrop) -> io::Result<()> {
+    let writer = matches!(policy, CapabilityDrop::Writer { .. });
+    let isolation = cfg!(feature = "test-isolation")
+        && match policy {
+            CapabilityDrop::Signer => (unsafe { libc::geteuid() }) != 0,
+            CapabilityDrop::Writer { isolation } => isolation,
+        };
     let last: i32 = bounded_text("/proc/sys/kernel/cap_last_cap")?
         .trim()
         .parse()
         .map_err(|_| refused())?;
-    // Only the non-root isolation build may retain an inert bounding set that it has no privilege to lower.
-    let isolation = cfg!(feature = "test-isolation") && unsafe { libc::geteuid() } != 0;
+    // The writer admits only the two-word Linux capability ABI before iterating its bounding set.
+    if writer && !(0..64).contains(&last) {
+        return Err(refused());
+    }
     for cap in 0..=last {
-        if unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) } == 1
-            && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0
-            && !isolation
-        {
-            return Err(refused());
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) };
+        if writer && present < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 1 && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0 {
+            let error = io::Error::last_os_error();
+            if !isolation || (writer && error.raw_os_error() != Some(libc::EPERM)) {
+                return Err(if writer { error } else { refused() });
+            }
         }
     }
     #[repr(C)]
@@ -585,6 +606,20 @@ pub fn drop_capabilities() -> io::Result<()> {
         permitted: 0,
         inheritable: 0,
     }; 2];
+    // Both writer_service and the signer use this one ABI set; signer mode preserves its existing operation order.
+    if writer
+        && unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     // Must match sanctuary-business-signer.service: empty peer capabilities allow executable inspection without ptrace privilege.
     if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0
         || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
