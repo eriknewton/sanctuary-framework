@@ -780,6 +780,7 @@ pub fn scenario(case: &str) {
                         + 751 * writer_state::NS_PER_MS)
                         .to_string()
                 }
+                "admission-text" => h.deadline_boottime_ns = "invalid".into(),
                 "admission-expired" => {
                     h.deadline_boottime_ns = state.now.load(Ordering::SeqCst).to_string()
                 }
@@ -820,21 +821,6 @@ pub fn scenario(case: &str) {
             &Operation::Sign(h),
             &body,
         );
-        if case == "admission-expired" {
-            assert_eq!(
-                rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
-                    .unwrap(),
-                STOP_STATUS
-            );
-            assert_eq!(
-                rx.recv_timeout(Duration::from_millis(WAIT_MS as u64))
-                    .unwrap(),
-                "STOPPING=1"
-            );
-            assert!(runner.join().unwrap().is_err());
-            assert_eq!(state.signs.load(Ordering::SeqCst), 0);
-            return;
-        }
         let reply = receive(wall.as_raw_fd());
         if matches!(
             case,
@@ -849,7 +835,9 @@ pub fn scenario(case: &str) {
         ) || case.starts_with("postwait-")
             || case.starts_with("admission-")
         {
-            assert!(matches!(reply.operation, Operation::Refused { .. }));
+            assert!(
+                matches!(reply.operation, Operation::Refused { ref request_id } if *request_id == state.header().request_id)
+            );
             assert_eq!(
                 state.signs.load(Ordering::SeqCst),
                 usize::from(case == "wrong-signature" || case.starts_with("postwait-"))

@@ -432,6 +432,19 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
             })
             .unwrap_or(Ok(u64::MAX))
     }
+    // Caller freshness is admitted before bus work; serve uses this same predicate before REFUSED.
+    fn admit_deadline(deadline: u64, now: u64, expiry: u64) -> Result<()> {
+        if deadline <= now
+            || deadline
+                > now
+                    .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
+                    .ok_or(Error::Deadline)?
+            || deadline >= expiry
+        {
+            return Err(Error::Deadline);
+        }
+        Ok(())
+    }
     pub fn sign(
         &mut self,
         header: Header,
@@ -472,15 +485,7 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         {
             return Err(Error::Grant);
         }
-        if deadline <= now
-            || deadline
-                > now
-                    .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
-                    .ok_or(Error::Deadline)?
-            || deadline >= self.expiry()?
-        {
-            return Err(Error::Deadline);
-        }
+        Self::admit_deadline(deadline, now, self.expiry()?)?;
         writer_protocol::measured_envelope(body)?;
         let request_id = header.request_id.clone();
         self.state = WriterState::SignInFlight;
@@ -873,17 +878,34 @@ fn serve<P: SignerPort, R: Reconciler>(
                 let packet = writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?;
                 let frame = w.handshake.receive(&packet.bytes)?;
                 w.binding.packet(&packet)?;
-                let request_limit = match &frame.operation {
-                    Operation::Sign(h) => h
+                let now = clock()?;
+                if let Operation::Sign(h) = &frame.operation {
+                    let admission = h
                         .deadline_boottime_ns
                         .parse::<u64>()
-                        .map_err(|_| Error::Deadline)?,
-                    _ => u64::MAX,
-                };
-                w.binding.revalidate(
-                    bus,
-                    exchange_deadline(clock, request_limit.min(machine.expiry()?))?,
-                )?;
+                        .map_err(|_| Error::Deadline)
+                        .and_then(|deadline| {
+                            WriterMachine::<P, R>::admit_deadline(deadline, now, machine.expiry()?)
+                        });
+                    if let Err(e) = admission {
+                        let _ = send(
+                            w.fd.as_raw_fd(),
+                            &w.session,
+                            &Operation::Refused {
+                                request_id: h.request_id.clone(),
+                            },
+                            &[],
+                        );
+                        return Err(e);
+                    }
+                }
+                // Wall identity work consumes a locally bounded window, never caller-selected freshness.
+                let end = now
+                    .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
+                    .ok_or(Error::Deadline)?
+                    .min(machine.expiry()?);
+                w.binding
+                    .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
                 match frame.operation {
                     Operation::Status { request_id } => send(
                         w.fd.as_raw_fd(),

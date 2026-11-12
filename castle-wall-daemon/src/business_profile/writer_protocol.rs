@@ -174,9 +174,17 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
             map.remove("op");
             map.remove("session_id");
             map.insert("protocol".into(), json!(SIGNER_PROTOCOL));
+            // Native decode still owns every other header field; writer_service admits caller deadlines with a REFUSED reply.
+            let deadline = map
+                .get("deadline_boottime_ns")
+                .and_then(Value::as_str)
+                .ok_or(Refusal::Schema)?
+                .to_owned();
+            map.insert("deadline_boottime_ns".into(), json!("1"));
             let encoded =
                 signer_service::encode(&signer, &packet[end..]).map_err(|_| Refusal::Length)?;
-            let (header, _) = signer_service::decode(&encoded).map_err(|_| Refusal::Schema)?;
+            let (mut header, _) = signer_service::decode(&encoded).map_err(|_| Refusal::Schema)?;
+            header.deadline_boottime_ns = deadline;
             let size = header.preimage_length;
             (Operation::Sign(header), size, fields)
         }

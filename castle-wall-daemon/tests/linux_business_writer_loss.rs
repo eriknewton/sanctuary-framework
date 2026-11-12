@@ -233,3 +233,17 @@ fn recovery_without_an_observed_lock_never_forwards_sign() {
     let _ = m.sign(f.header(), &f.body, |_| Ok(()));
     assert_eq!(f.signs.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn sign_deadline_admission_at_clock_and_above_cap() {
+    use castle_wall_daemon::business_profile::writer_protocol::WRITER_SIGN_DEADLINE_MAX_MS;
+    for offset in [0, (WRITER_SIGN_DEADLINE_MAX_MS + 1) * NS_PER_MS] {
+        let f = Fixture::new();
+        let mut m = f.machine();
+        f.grant(&mut m);
+        let mut header = f.header();
+        header.deadline_boottime_ns = (f.now.load(Ordering::SeqCst) + offset).to_string();
+        assert_eq!(m.sign(header, &f.body, |_| Ok(())), Err(Error::Deadline));
+        assert_eq!(f.signs.load(Ordering::SeqCst), 0);
+    }
+}
