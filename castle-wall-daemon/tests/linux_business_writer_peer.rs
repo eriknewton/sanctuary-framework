@@ -539,6 +539,19 @@ fn stored_peer_cgroup_and_wall_path_share_normalization() {
         signer_peer::Peer::capture(b.as_raw_fd(), &policy).is_ok(),
         "stored raw policy admits the same kernel cgroup"
     );
+    let unified = policy.cgroup.clone();
+    for text in [
+        format!("{unified}\n1:name=systemd:/fixture"),
+        format!("{unified} "),
+        format!("{unified}\t"),
+    ] {
+        policy.cgroup = text;
+        assert!(
+            signer_peer::Peer::capture(b.as_raw_fd(), &policy).is_err(),
+            "capture requires one exact unified row"
+        );
+    }
+    policy.cgroup = unified;
     policy.cgroup.push('x');
     assert!(signer_peer::Peer::capture(b.as_raw_fd(), &policy).is_err());
 }
