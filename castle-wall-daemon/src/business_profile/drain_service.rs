@@ -459,6 +459,8 @@ impl DescriptorReader {
         let pin = old["descriptor_digest"]
             .as_str()
             .ok_or(Refusal::DESCRIPTOR)?;
+        // D_DESCRIPTOR_MAX_BYTES caps raw input; parsing transiently overlaps it with one parsed descriptor.
+        // The previous cache entry is already dropped and raw bytes are dropped after parse; only one parsed descriptor survives, with no combined 65536-byte bound.
         let descriptor = anchor::parse_descriptor(&bytes, pin).map_err(|_| Refusal::DESCRIPTOR)?;
         // Raw bytes have no cache lifetime; one parsed descriptor is the only retained public evidence.
         drop(bytes);
