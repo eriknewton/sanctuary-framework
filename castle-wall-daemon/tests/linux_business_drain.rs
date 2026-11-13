@@ -307,7 +307,7 @@ fn held_readback_never_acknowledges_original_early() {
 #[test]
 fn every_commit_evidence_stage_refuses_before_publication() {
     let _guard = isolation::guard();
-    for stage in [
+    let stages = [
         "ENVELOPE",
         "ENVELOPE_INDEX",
         "ENVELOPE_FOREIGN_ROLE",
@@ -325,7 +325,15 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         "GRANT_BOOT",
         "SIGNATURE",
         "COMMITMENT",
-    ] {
+    ];
+    // A misspelled targeted selection must not skip every case and pass with nothing checked.
+    if let Ok(selected) = std::env::var("DRAIN_VERIFY_CASE") {
+        assert!(
+            stages.contains(&selected.as_str()),
+            "DRAIN_VERIFY_CASE names no evidence case"
+        );
+    }
+    for stage in stages {
         // A targeted mutation run selects one evidence predicate; ordinary suites run every case.
         if std::env::var("DRAIN_VERIFY_CASE").is_ok_and(|selected| selected != stage) {
             continue;
