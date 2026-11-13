@@ -377,7 +377,9 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         body["sequence"] = json!(1);
         body["prior_commitment"] = json!("GENESIS");
         match stage {
-            "DESCRIPTOR_BODY_MACHINE" => body["machine_id"] = json!("f".repeat(32)),
+            "DESCRIPTOR_BODY_MACHINE" | "DESCRIPTOR_MACHINE" => {
+                body["machine_id"] = json!("f".repeat(32))
+            }
             "KID_ABSENT_EPOCH" => body["epoch"] = json!(2),
             "GRANT_ACTIVATION" => body["activation_id"] = json!("f".repeat(32)),
             "GRANT_BOOT" => body["boot_id"] = json!("f".repeat(32)),
@@ -526,7 +528,6 @@ fn three_originals_require_each_exact_ledger_entry() {
         bad_signature["outer"]["signature"] = json!(URL_SAFE_NO_PAD.encode(bytes));
     }
     for (case, sequence, envelope, stage) in [
-        ("above committed", 4, envelopes[2].clone(), "CHAIN"),
         ("header body sequence", 1, envelopes[1].clone(), "CHAIN"),
         ("gap", 2, envelopes[1].clone(), "CHAIN"),
         (
@@ -581,6 +582,27 @@ fn three_originals_require_each_exact_ledger_entry() {
             "ORIGINAL_ACK"
         );
     }
+    let mut beyond: Value = serde_json::from_slice::<Value>(&envelopes[2]).unwrap()["body"].clone();
+    beyond["sequence"] = json!(4);
+    beyond["prior_commitment"] = f.anchor["committed_digest"].clone();
+    let envelope = f.signed(&beyond);
+    let before = f.read(true)["anchor_digest"].clone();
+    let reply = f.request(false, &original_packet(&"e".repeat(32), 4, &envelope));
+    assert_eq!(
+        reply.as_ref().and_then(|r| r["op"].as_str()),
+        Some("REFUSED"),
+        "above committed original refuses"
+    );
+    assert_eq!(
+        f.stages().last().map(String::as_str),
+        Some("CHAIN"),
+        "above committed original stage"
+    );
+    assert_eq!(
+        f.read(true)["anchor_digest"],
+        before,
+        "above committed unchanged anchor"
+    );
     let before = f.read(true)["anchor_digest"].clone();
     let reply = f.request(false, &original_packet(&"e".repeat(32), 1, &envelopes[0]));
     assert_eq!(
@@ -1622,7 +1644,7 @@ fn schema_role_set_requires_a_role_stage_witness_when_expanded() {
     .unwrap();
     let mut body = corpus["cases"][0]["records"][0]["body"].clone();
     assert!(records_schema::valid(&body), "producer schema control");
-    for (role, _) in ROLE_REGISTRY {
+    for (role, _, _) in ROLE_REGISTRY {
         if *role == ROLE {
             continue;
         }

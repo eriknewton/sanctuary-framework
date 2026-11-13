@@ -1482,3 +1482,42 @@ pub fn production() -> Result<Dependencies> {
 
 #[cfg(feature = "test-isolation")]
 use std::io::Write;
+
+#[cfg(test)]
+mod publication_order_tests {
+    // fail-before-exempt: Source ordering guards are also run against the pre-fix service.
+    #[test]
+    fn reply_encoding_precedes_every_mutating_publication() {
+        let source = include_str!("drain_service.rs");
+        let process = source
+            .split("    fn process(")
+            .nth(1)
+            .unwrap()
+            .split("    fn request(")
+            .next()
+            .unwrap();
+        for (start, end) in [
+            ("let record = DrainRecord", "Operation::Original"),
+            (
+                "if *sequence == drained {",
+                "let commitment = verify_original",
+            ),
+            (
+                "let commitment = verify_original",
+                "_ => Err(Refusal::AUTHORITY)",
+            ),
+        ] {
+            let arm = process
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(
+                arm.find("response(").unwrap() < arm.find("self.store.publish_").unwrap(),
+                "encode ACK before any publication: {start}"
+            );
+        }
+    }
+}
