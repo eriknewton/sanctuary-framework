@@ -9,11 +9,11 @@ const ALLOWED = [
   "audit/chain.ts", "audit/checkpoint-shape.ts", "cli/argv.ts", "cli/audit-chain-verify.ts",
   "core/encoding.ts", "core/encryption.ts", "core/hashing.ts", "core/identity.ts", "core/random.ts", "core/signing-domains.ts", "core/rotation-chain.ts",
   "errors/config-error.ts", "errors/index.ts", "errors/profile-error.ts", "errors/untrusted-diagnostic.ts",
-  "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-metadata.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
+  "evidence-pack/artifact-policy.mjs", "evidence-pack/snapshot-installed-cli.ts", "evidence-pack/snapshot-package-marker.ts", "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-metadata.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
   "hermes-memory-bridge/constants.ts", "hermes-memory-bridge/strict-json.ts", "lockdown/status.ts", "transparency/checkpoint.ts", "transparency/verify.ts",
 ];
 // Existing audit CLI imports filesystem helpers; the pure entry never calls its I/O functions.
-const EXTERNAL = new Set(["@noble/curves/ed25519", "@noble/hashes/sha256", "@noble/hashes/hmac", "@noble/hashes/sha512", "@noble/hashes/hkdf", "@noble/ciphers/aes.js", "node:crypto", "crypto", "node:fs", "node:fs/promises", "node:path"]);
+const EXTERNAL = new Set(["@noble/curves/ed25519", "@noble/hashes/sha256", "@noble/hashes/hmac", "@noble/hashes/sha512", "@noble/hashes/hkdf", "@noble/ciphers/aes.js", "node:crypto", "crypto", "node:fs", "node:fs/promises", "node:path", "node:url", "node:zlib"]);
 function imports(source: string): string[] {
   const tree = ts.createSourceFile("fixture.ts", source, ts.ScriptTarget.Latest, true); const specs: string[] = [];
   function visit(node: ts.Node) {
@@ -32,7 +32,7 @@ function imports(source: string): string[] {
 }
 function crawl(injected: Record<string, string> = {}): { files: string[]; external: string[] } {
   const seen = new Set<string>(); const external = new Set<string>();
-  const queue = ["evidence-pack/snapshot-verify.ts", "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-nested.ts"];
+  const queue = ["evidence-pack/snapshot-installed-cli.ts", "evidence-pack/snapshot-verify.ts", "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-nested.ts"];
   while (queue.length) {
     const file = queue.shift()!; if (seen.has(file)) continue; seen.add(file);
     for (const spec of imports(readFileSync(resolve(ROOT, file), "utf8") + (injected[file] ?? ""))) {
@@ -47,7 +47,7 @@ function crawl(injected: Record<string, string> = {}): { files: string[]; extern
   return { files: [...seen].sort(), external: [...external].sort() };
 }
 describe("snapshot verifier import graph", () => {
-  it("matches the complete runtime allowlist and cannot reach exporter or server startup", () => { const graph = crawl(); expect(graph.files).toEqual([...ALLOWED].sort()); expect(graph.external.filter(s => !EXTERNAL.has(s))).toEqual([]); });
+  it("matches the complete runtime allowlist and cannot reach exporter or server startup", () => { for (const name of ["snapshot-installed-cli", "snapshot-package-marker"]) expect(() => crawl({ [`evidence-pack/${name}.ts`]: '\nimport "node:child_process";' })).toThrow(); const graph = crawl(); expect(graph.files).toEqual([...ALLOWED].sort()); expect(graph.external.filter(s => !EXTERNAL.has(s))).toEqual([]); });
   it("parser sees side effects, reexports, dynamic imports and require but excludes type-only edges", () => { expect(imports('import "./a.js"; export { b } from "./b.js"; import("./c.js"); require("./d.js"); import type { E } from "./e.js";')).toEqual(["./a.js", "./b.js", "./c.js", "./d.js"]); });
 });
 

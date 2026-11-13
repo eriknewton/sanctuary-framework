@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 - Doctor and `sanctuary status` report wall, agent and coverage readings from the same evaluator. Dashboard and posture pages show English badges whose readings expire when evidence stops.
-- The private evidence-pack candidate build checks packed tarball contents against staging and adds `check-evidence-pack-artifact` for independently pinned content checks.
+- The evidence-pack verifier candidate build now checks the packed tarball's exact contents, adds a check-evidence-pack-artifact command, and the installed verifier refuses to run from a package marked non-release.
 
 - Scheduled checkpoints on the installed full service use the signer client the wall already resolved, and the install preflight reports its path.
 

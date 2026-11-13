@@ -21,7 +21,7 @@ printf 'VERIFIER_EXIT=%s\n' "$rc"
 cat result.json
 ```
 
-Compare the reported version and full revision with the authenticated notice. Accept only exit 0, `status:"PASS"`, `accepted:true` and the expected export id together. Exit 10, `status:"PARTIAL"` and `accepted:false` mean checks are incomplete; retain the explicit reasons and ask the sender to resolve them. Exit 1 and FAIL reject the delivery. Exit 2 requests corrected arguments and a fresh run. Only lone `--help` or `--version` exits 0 without a verdict.
+Compare the reported version and full revision with the authenticated notice. Accept only exit 0, `status:"PASS"`, `accepted:true` and the expected export id together. Exit 10, `status:"PARTIAL"` and `accepted:false` mean checks are incomplete; retain the explicit reasons and ask the sender to resolve them. Exit 1 and FAIL reject the delivery. Exit 2 requests corrected arguments and a fresh run. On admitted installations, only lone `--help` or `--version` exits 0 without a verdict.
 
 The command checks the exact signed manifest digest, the manifest signature, the complete file set, every file's bytes, independent descriptor equality and the included supported audit and transparency records. It requires all four value flags once each. There are no environment pins, embedded trust options or downgrade flags. Output failure is a failed command.
 
@@ -49,6 +49,26 @@ Obtain a trusted checker independently, or authenticate both delivered files wit
 check-evidence-pack-artifact --tarball candidate.tgz --manifest artifact-manifest.json --expect-tarball-sha256 "$TRUSTED_TARBALL_SHA256" --expect-manifest-sha256 "$TRUSTED_MANIFEST_SHA256" --expect-source-revision "$TRUSTED_SOURCE_REVISION" --expect-mode release
 ```
 
-Success establishes byte equality, member policy and internal provenance consistency. It does not authenticate the publisher, prove source correctness or establish dependency reproducibility. A fixture-built checker only permits fixture-policy success; use `--expect-mode fixture` for synthetic artifacts. Snapshot signature verification is separate. Installed-package marker classification remains pending.
+Success establishes byte equality, member policy and internal provenance consistency. It does not authenticate the publisher, prove source correctness or establish dependency reproducibility. A fixture-built checker only permits fixture-policy success; use `--expect-mode fixture` for synthetic artifacts. Snapshot signature verification is separate.
 
 The build creates no signature, attestation or distribution notice. Authenticated digest publication remains an owner-controlled process outside this workflow. PR artifacts are non-release test material even if PR-controlled source or YAML labels them otherwise. Only dispatches from the workflow's permitted main or version-tag refs are eligible for subsequent external authentication. Rechecking before upload and installation is a point-in-time observation, not protection against concurrent writers.
+
+## Installed package classification
+
+The installed verifier classifies its own package before help, version, argument parsing or evidence reads. There is no environment or flag override. A regular `dist/NON_RELEASE` entry refuses with exit 1, empty stdout and exactly:
+
+```text
+NON_RELEASE: this verifier package is not a release artifact.
+```
+
+An unexpected package layout, a non-regular marker entry or an observation failure refuses with exit 1, empty stdout and exactly:
+
+```text
+PACKAGE_MARKER_UNAVAILABLE: verifier package classification could not be established.
+```
+
+`PACKAGE_MARKER_UNAVAILABLE` refuses use when absence is unproved, including a symlink at the package root or an unexpected parent. This refusal is not a finding that the package is a release. Treat a nonzero exit or missing result as refusal, even when no snapshot JSON is produced. Restore a trusted, intact installation before retrying; do not remove a marker to make a candidate usable.
+
+The observation is in-process and adds no host prerequisite. Marker contents and link targets are never opened. Ancestors above the package root are not inspected. Classification is a point-in-time observation that requires a trusted installation with no concurrent package writers. Marker absence does not authenticate a release; authenticate the exact tarball independently.
+
+The companion artifact checker applies the same classification before release-policy checks. Fixture-policy checks and standalone checker help remain available. A fixture-built checker still cannot report release-policy success. Marker-free verifier help, version and snapshot result bytes retain their existing meanings.

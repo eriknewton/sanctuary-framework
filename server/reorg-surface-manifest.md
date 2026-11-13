@@ -170,4 +170,13 @@ Every result below has exactly one trailing LF. Successful checks exit 0; help e
 - `ARTIFACT_REFUSED: artifact contents could not be verified.` (stderr, exit 1)
 - `ARTIFACT_USAGE_ERROR: invalid command arguments.` (stderr, exit 2)
 
-The verifier's existing help, version, evidence results and exits remain unchanged. `NON_RELEASE` and `Synthetic archive metadata is not release authentication.\n` retain their exact bytes.
+The verifier's existing help, version, evidence results and exits remain unchanged on admitted installations. `NON_RELEASE` and `Synthetic archive metadata is not release authentication.\n` retain their exact bytes.
+
+### Installed verifier refusal contract
+
+Must match `snapshot-package-marker.ts`, `snapshot-installed-cli.ts`, the installed checker wrapper in `snapshot-artifact-cli.ts` and `tsup.evidence-pack.config.ts`. Classification precedes every verifier branch, including help, version and usage. Only observed absence admits the existing command. Both refusals use stderr with one final LF, empty stdout and exit 1; no V0 evidence result is created:
+
+- `NON_RELEASE: this verifier package is not a release artifact.`
+- `PACKAGE_MARKER_UNAVAILABLE: verifier package classification could not be established.`
+
+The checker applies these refusals to release-policy requests; fixture-policy checking and standalone checker help remain available. Its compiled fixture restriction remains in force. The marker name and text above are unchanged. Absence grants no release authenticity and makes no atomic installed-tree claim.

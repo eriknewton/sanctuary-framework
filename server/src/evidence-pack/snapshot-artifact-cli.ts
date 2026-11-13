@@ -1,3 +1,5 @@
+import { lstatSync } from "node:fs";
+import { observeArtifactPackageMarker, markerRefusal } from "./snapshot-package-marker.js";
 import { ARTIFACT_HELP, ARTIFACT_REFUSED, ARTIFACT_USAGE, CHECK_FLAGS, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, artifactSuccess, checkArtifact, readBounded } from "./artifact-policy.mjs";
 import type { ArtifactMode } from "./artifact-policy.mjs";
 interface Output { write(text: string): Promise<void> }
@@ -27,4 +29,16 @@ export async function runArtifactCommand(args: string[], buildMode: ArtifactMode
     if (!checked.ok) return emit(stderr, ARTIFACT_REFUSED, 1);
     return emit(stdout, artifactSuccess(mode), 0);
   } catch { return emit(stderr, ARTIFACT_REFUSED, 1); }
+}
+
+/** Installed checker: fixture inspection and help remain available; release checks require observed absence. */
+export async function runInstalledArtifactCommand(args: string[], buildMode: ArtifactMode, moduleUrl: string, stdout: Output = output(process.stdout), stderr: Output = output(process.stderr)): Promise<number> {
+  try {
+    // Must match the loader URL supplied by tsup.evidence-pack.config.ts; fixture policy never grants release authority.
+    if (args.some((arg, index) => arg === "--expect-mode" && args[index + 1] === "release")) {
+      const refusal = markerRefusal(observeArtifactPackageMarker(moduleUrl, { lstatSync }));
+      if (refusal !== undefined) { await stderr.write(refusal); return 1; }
+    }
+    return await runArtifactCommand(args, buildMode, stdout, stderr);
+  } catch { return 1; }
 }

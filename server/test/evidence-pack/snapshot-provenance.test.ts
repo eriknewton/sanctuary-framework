@@ -1,4 +1,4 @@
-// fail-before-exempt: These rows exercise the candidate build script under server/scripts, which this gate does not revert; script mutation checks and unchanged-input controls cover the defended boundaries.
+/** Candidate provenance binds source bytes and preserves fixture carriage. R1 */
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import fs from "node:fs";
 import { readFileSync, writeFileSync, mkdtempSync, realpathSync, readdirSync, lstatSync } from "node:fs";
@@ -8,6 +8,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { spawnSync, execFileSync } from "node:child_process";
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { validateSource, parseSourceMetadata, hashSourceArchive, MAX_SOURCE_ARCHIVE_BYTES, SOURCE_HASH_CHUNK_BYTES, digest, candidateForTests, NON_RELEASE_MARKER, NON_RELEASE_TEXT } from "../../scripts/build-evidence-pack.mjs";
+import { functionalCandidateForTests } from "./snapshot-artifact-fixtures.js";
 const SOURCE = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const tempParent = mkdtempSync(join(tmpdir(), "provenance-witness-"));
 const scratch = (prefix: string) => mkdtempSync(join(tempParent, prefix));
@@ -71,7 +72,7 @@ describe("candidate provenance input boundary", () => {
 describe("installed immutable version", () => {
   let c: Awaited<ReturnType<typeof candidateForTests>>;
   beforeAll(async () => { c = await candidateForTests(); }, 120_000);
-  it("runtime environment cannot replace the baked revision", () => { const r = spawnSync(process.execPath, [c.command, "--version"], { env: { ...process.env, SANCTUARY_SOURCE_SHA: "e".repeat(40) }, encoding: "utf8" }); expect(r.status).toBe(0); expect(r.stdout).toBe(`verify-evidence-pack 0.1.0 source_revision=${SOURCE}\n`); });
+  it("runtime environment cannot replace the baked revision", async () => { const c = await functionalCandidateForTests(); const r = spawnSync(process.execPath, [c.command, "--version"], { env: { ...process.env, SANCTUARY_SOURCE_SHA: "e".repeat(40) }, encoding: "utf8" }); expect(r.status).toBe(0); expect(r.stdout).toBe(`verify-evidence-pack 0.1.0 source_revision=${SOURCE}\n`); });
   it("provenance hashes the final bundle and marks fixture builds non-release", () => { const p = JSON.parse(readFileSync(join(dirname(realpathSync(c.command)), "provenance.json"), "utf8")); expect(Object.keys(p).sort()).toEqual(["format", "package_version", "source_revision", "source_archive_sha256", "verifier_sha256", "dependency_lock_sha256"].sort()); expect(p).toMatchObject({ format: "SANCTUARY_VERIFIER_BUILD_V1", package_version: "0.1.0", source_revision: SOURCE, source_archive_sha256: digest(readFileSync(c.archive)), verifier_sha256: digest(readFileSync(c.command)), dependency_lock_sha256: digest(readFileSync(join(c.tree, "server/package-lock.json"))) }); if (c.fixture) { expect(c.non_release).toBe(true); expect(readFileSync(join(c.root, "NON_RELEASE_FIXTURE"), "utf8")).toContain("not release authentication"); } });
   // Must match NON_RELEASE_MARKER written by buildCandidate in scripts/build-evidence-pack.mjs.
   it("fixture tarball carries its non-release marker into the installed package", () => {

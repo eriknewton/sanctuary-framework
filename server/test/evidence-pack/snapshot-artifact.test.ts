@@ -1,8 +1,4 @@
-// A1, A18 and A19 fail on a real pre-R1 base build (job 1368 result/base-witness.log).
-// A2-A17 and A20 exercise boundaries absent on that base; their evidence is named mutant kills, not fail-before.
-// A21 fails on the R1 build; A22's bare link already refused there, while its slash and dot rows are new.
-// A23 exercises a new predicate and relies on its named mutant kill. A24 covers output destinations with named mutants.
-// C1/C2 are unchanged-input controls; C4 is a new-feature control.
+/** Packed artifact acceptance checks every member and the fixed handoff. R1 */
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -44,7 +40,7 @@ function workflowPlan(text: string) {
   const check = "node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact";
   for (const position of [positions[1]!, positions[4]!, positions[5]!]) expect(steps[position]!.run).toContain(check);
   expect(steps[positions[2]!]!.run).toContain("node server/scripts/build-evidence-pack.mjs --install-candidate /tmp/c13/artifact");
-  for (const position of [positions[3]!, positions[4]!]) expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-artifact.test.ts");
+  for (const position of [positions[3]!, positions[4]!]) { expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-artifact.test.ts"); expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-installed-marker.test.ts"); }
   const upload = steps.findIndex(s => s.uses?.startsWith("actions/upload-artifact@")); expect(upload).toBeGreaterThan(positions[5]!);
   expect(steps[upload]!.with!["if-no-files-found"]).toBe("error");
   const uploadPaths = steps[upload]!.with!.path!.trim().split(/\s+/).sort();
