@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { spawnSync, execFileSync } from "node:child_process";
 import { observePackageMarker, parseMarkerState, markerRefusal, NON_RELEASE_REFUSAL, PACKAGE_MARKER_UNAVAILABLE, MAX_PACKAGE_COMPONENTS, MAX_PACKAGE_PATH_BYTES, type MarkerFS } from "../../src/evidence-pack/snapshot-package-marker.js";
 import { runInstalledOfflineCommand } from "../../src/evidence-pack/snapshot-installed-cli.js";
-import { ARTIFACT_HELP, NON_RELEASE_MARKER, NON_RELEASE_TEXT, digest, parseArchive, requireValid } from "../../src/evidence-pack/artifact-policy.mjs";
+import { ARTIFACT_HELP, artifactSuccess, NON_RELEASE_MARKER, NON_RELEASE_TEXT, digest, parseArchive, requireValid } from "../../src/evidence-pack/artifact-policy.mjs";
 import { scratch, functionalCandidateForTests } from "./snapshot-artifact-fixtures.js";
 import { fixture, syncAudit } from "./snapshot-fixtures.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
@@ -67,6 +67,15 @@ describe("installed package classification", () => {
     const args = checkerArgs(control.artifactDir, control.receipt);
     refused(run(marked.checker, args)); expect(run(marked.checker, checkerArgs(marked.artifactDir, marked.receipt)).status).toBe(0); expect(run(marked.checker, ["--help"]).stdout).toBe(ARTIFACT_HELP);
   });
+  it("refuses a planted marker in the release-built checker M1-release", () => {
+    const c = copyPackage(control), args = checkerArgs(control.artifactDir, control.receipt);
+    const clean = run(c.checker, args); expect(clean.status).toBe(0); expect(clean.stdout).toBe(artifactSuccess("release")); expect(clean.stderr).toBe("");
+    writeFileSync(c.marker, NON_RELEASE_TEXT);
+    refused(run(c.checker, args));
+    const fixtureCheck = run(c.checker, checkerArgs(marked.artifactDir, marked.receipt));
+    expect(fixtureCheck.status).toBe(0); expect(fixtureCheck.stdout).toBe(artifactSuccess("fixture")); expect(fixtureCheck.stderr).toBe("");
+    const help = run(c.checker, ["--help"]); expect(help.status).toBe(0); expect(help.stdout).toBe(ARTIFACT_HELP); expect(help.stderr).toBe("");
+  });
   it("classifies help and version on the actual candidate M2", () => {
     paired(); for (const arg of ["--help", "--version"]) {
       refused(run(marked.command, [arg]));
@@ -108,6 +117,16 @@ describe("installed package classification", () => {
     const noDist = join(parent, "no-dist"); mkdirSync(noDist); expect(observePackageMarker(pathToFileURL(join(noDist, "dist/verify-evidence-pack.js")).href, { lstatSync })).toEqual({ kind: "absent" });
     const regularDist = join(parent, "regular-dist"); mkdirSync(regularDist); writeFileSync(join(regularDist, "dist"), "regular"); expect(observePackageMarker(pathToFileURL(join(regularDist, "dist/verify-evidence-pack.js")).href, { lstatSync })).toEqual({ kind: "unknown" });
     const linkedDist = join(parent, "linked-dist"); mkdirSync(linkedDist); symlinkSync(dirname(c.command), join(linkedDist, "dist")); expect(observePackageMarker(pathToFileURL(join(linkedDist, "dist/verify-evidence-pack.js")).href, { lstatSync })).toEqual({ kind: "absent" });
+  });
+  it("refuses root types before observing the marker M7-first-root", () => {
+    const c = copyPackage(control), parent = scratch(), alias = join(parent, "alias"), file = join(parent, "file");
+    symlinkSync(c.root, alias); writeFileSync(file, "regular");
+    for (const root of [alias, file]) {
+      const calls: string[] = [];
+      const fs: MarkerFS = { lstatSync(path, options) { calls.push(path); return lstatSync(path, options); } };
+      expect(observePackageMarker(pathToFileURL(join(root, "dist/verify-evidence-pack.js")).href, fs)).toEqual({ kind: "unknown" });
+      expect(calls).toEqual([root]);
+    }
   });
   it("rechecks package identity after the marker observation M8", () => {
     paired(); expect(observePackageMarker(url, schedule().fs)).toEqual({ kind: "absent" }); for (const field of ["dev", "ino"]) {
