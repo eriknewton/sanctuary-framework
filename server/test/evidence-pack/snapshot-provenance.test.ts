@@ -1,4 +1,4 @@
-/** Candidate provenance binds source bytes and preserves fixture carriage. R1 */
+// fail-before-exempt: These rows exercise the candidate build script under server/scripts, which this gate does not revert; script mutation checks and unchanged-input controls cover the defended boundaries.
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import fs from "node:fs";
 import { readFileSync, writeFileSync, mkdtempSync, realpathSync, readdirSync, lstatSync } from "node:fs";

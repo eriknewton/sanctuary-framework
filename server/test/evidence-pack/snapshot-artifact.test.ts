@@ -1,4 +1,8 @@
-/** Packed artifact acceptance checks every member and the fixed handoff. R1 */
+// A1, A18 and A19 fail on a real pre-R1 base build (job 1368 result/base-witness.log).
+// A2-A17 and A20 exercise boundaries absent on that base; their evidence is named mutant kills, not fail-before.
+// A21 fails on the R1 build; A22's bare link already refused there, while its slash and dot rows are new.
+// A23 exercises a new predicate and relies on its named mutant kill. A24 covers output destinations with named mutants.
+// C1/C2 are unchanged-input controls; C4 is a new-feature control.
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";

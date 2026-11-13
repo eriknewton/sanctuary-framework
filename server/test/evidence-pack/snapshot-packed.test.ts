@@ -1,3 +1,4 @@
+// fail-before-exempt: The rows this change adds witness the isolation preload and the candidate build script under server/scripts, which this gate does not revert, so they pass on the reverted source by design; each is killed instead by a recorded single-predicate mutant of that script.
 /** Installed consumers preserve snapshot semantics within the isolation boundary. R3 */
 import { beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, symlinkSync, chmodSync, lstatSync } from "node:fs";
