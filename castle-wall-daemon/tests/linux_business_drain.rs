@@ -14,6 +14,14 @@ use std::{
     fs,
     time::{Duration, Instant},
 };
+// Scheduling grace beyond the request deadline, separate from negative observation windows.
+const DEADLINE_GRACE_MS: u64 = 20;
+// A short receive window samples absence while the executor is held.
+const NO_REPLY_WINDOW_MS: u64 = 10;
+// Readback holds use a longer observation window to expose an early ACK.
+const READBACK_OBSERVATION_MS: u64 = 20;
+// Child-liveness polling cadence, independent of protocol deadlines.
+const CHILD_POLL_MS: i32 = 10;
 #[test]
 fn genesis_phase_retry_restart_and_conflict() {
     let _guard = isolation::guard();
@@ -267,7 +275,7 @@ fn held_readback_never_acknowledges_original_early() {
         assert!(Instant::now() < end);
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(f.w.receive(20).is_none());
+    assert!(f.w.receive(READBACK_OBSERVATION_MS).is_none());
     write_private(&f.root.join("release-copy"), b"");
     let reply = f.w.receive(WAIT_MS).unwrap();
     let (h, _) = castle_wall_daemon::business_profile::frame::split(
@@ -528,7 +536,7 @@ fn disconnected_timeout_waves_keep_one_request_until_settlement() {
             std::thread::sleep(Duration::from_millis(1));
         }
         std::thread::sleep(Duration::from_millis(
-            protocol::D_REQUEST_DEADLINE_MS as u64 + 20,
+            protocol::D_REQUEST_DEADLINE_MS as u64 + DEADLINE_GRACE_MS,
         ));
         f.s.command(json!({"op":"close"}));
         f.w.connect(&path);
@@ -539,7 +547,7 @@ fn disconnected_timeout_waves_keep_one_request_until_settlement() {
         )
         .unwrap();
         f.w.send(&read);
-        assert!(f.w.receive(10).is_none());
+        assert!(f.w.receive(NO_REPLY_WINDOW_MS).is_none());
         assert!(f.events()[start..]
             .iter()
             .all(|v| v["event"] != "RequestAdmitted" || v["request_id"] == id));
@@ -1037,7 +1045,7 @@ fn custody_record_and_original_waves_settle_before_another_admission() {
                 std::thread::sleep(Duration::from_millis(1));
             }
             std::thread::sleep(Duration::from_millis(
-                protocol::D_REQUEST_DEADLINE_MS as u64 + 20,
+                protocol::D_REQUEST_DEADLINE_MS as u64 + DEADLINE_GRACE_MS,
             ));
             let actor = if signer { &mut f.s } else { &mut f.w };
             actor.command(json!({"op":"close"}));
@@ -1050,7 +1058,7 @@ fn custody_record_and_original_waves_settle_before_another_admission() {
             let other = if signer { &mut f.w } else { &mut f.s };
             other.connect(&path);
             other.send(&read);
-            assert!(other.receive(10).is_none());
+            assert!(other.receive(NO_REPLY_WINDOW_MS).is_none());
             assert!(f.events()[before..]
                 .iter()
                 .all(|v| v["event"] != "RequestAdmitted" || v["request_id"] == id));
@@ -1163,7 +1171,7 @@ fn drain_transport_child_driver() {
             events: libc::POLLIN,
             revents: 0,
         };
-        if unsafe { libc::poll(&mut poll, 1, 10) } == 0 {
+        if unsafe { libc::poll(&mut poll, 1, CHILD_POLL_MS) } == 0 {
             continue;
         }
         match signer_peer::receive(socket.as_raw_fd(), protocol::D_REPLY_MAX_BYTES) {
@@ -1239,7 +1247,7 @@ fn drain_transport_child_driver() {
             events: libc::POLLIN,
             revents: 0,
         };
-        if unsafe { libc::poll(&mut poll, 1, 10) } == 0 {
+        if unsafe { libc::poll(&mut poll, 1, CHILD_POLL_MS) } == 0 {
             continue;
         }
         match signer_peer::receive(socket.as_raw_fd(), protocol::D_REPLY_MAX_BYTES) {

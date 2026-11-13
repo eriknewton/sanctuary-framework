@@ -101,7 +101,7 @@ fn length(h: &Value, name: &str, cap: usize) -> Result<usize, Refusal> {
 fn sequence(h: &Value) -> Result<u64, Refusal> {
     h["sequence"]
         .as_u64()
-        .filter(|n| *n > 0 && *n <= anchor::D_EPOCH_MAX)
+        .filter(|n| *n > 0 && *n <= anchor::SAFE_INTEGER) // Sequence shares the anchor exact-JSON-integer domain.
         .ok_or(Refusal::Schema)
 }
 pub fn decode(packet: &[u8], direction: Direction) -> Result<Frame<'_>, Refusal> {
@@ -260,7 +260,11 @@ pub fn decode(packet: &[u8], direction: Direction) -> Result<Frame<'_>, Refusal>
 /// Encoders use the receiving decoder, so the two directions have one schema.
 pub fn encode(header: &Value, payload: &[u8], direction: Direction) -> Result<Vec<u8>, Refusal> {
     let bytes = crate::smb::jcs::encode(header).map_err(|_| Refusal::Canonical)?;
-    if bytes.len() > D_HEADER_MAX_BYTES || payload.len() > D_REQUEST_MAX_BYTES {
+    let cap = match direction {
+        Direction::ToDrain => D_REQUEST_MAX_BYTES,
+        Direction::FromDrain => D_REPLY_MAX_BYTES,
+    };
+    if bytes.len() > D_HEADER_MAX_BYTES || payload.len() > cap {
         return Err(Refusal::Length);
     }
     let packet = [

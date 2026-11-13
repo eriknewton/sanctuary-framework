@@ -329,6 +329,8 @@ use std::{
 };
 
 /// Holds the trusted public-evidence root or the independent runtime directory.
+// Group and other write bits would let another principal replace trusted evidence.
+const UNTRUSTED_WRITE_MASK: u32 = 0o022;
 pub struct Directory {
     file: File,
     owner: u32,
@@ -375,7 +377,7 @@ impl Directory {
         // Every evidence ancestor is owner-controlled; the runtime root is additionally private.
         if !m.is_dir()
             || m.uid() != owner
-            || m.mode() & 0o022 != 0
+            || m.mode() & UNTRUSTED_WRITE_MASK != 0
             || (private && m.mode() & 0o7777 != custody::DIRECTORY_MODE)
         {
             return Err(Refusal::ROOT);
