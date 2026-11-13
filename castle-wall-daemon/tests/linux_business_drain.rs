@@ -1465,3 +1465,41 @@ fn schema_role_set_requires_a_role_stage_witness_when_expanded() {
         assert!(!records_schema::valid(&body), "schema admits {role}: add the W-COMMIT-VERIFY ROLE-stage witness");
     }
 }
+
+#[test]
+fn drained_original_lost_retry_ack_reconciles_and_conflict_closes_writer() {
+    let _guard = isolation::guard();
+    let mut f = Fixture::new();
+    f.start();
+    f.prepare();
+    let (_, envelope) = f.reserve_commit(&"d".repeat(32));
+    let packet = original_packet(&"e".repeat(32), 1, &envelope);
+    assert_eq!(f.request(false, &packet).unwrap()["op"], "ORIGINAL_ACK");
+    let before = f.read(true)["anchor_digest"].clone();
+    let events = f.events().len();
+    f.fault("copy", "Readback", "hold", json!("retry"), 1);
+    f.w.connect(&f.socket());
+    f.w.send(&packet);
+    let end = Instant::now() + Duration::from_millis(WAIT_MS);
+    while !f.events()[events..].iter().any(|e| e["publication"] == "copy" && e["step"] == "DirSync") {
+        assert!(Instant::now() < end, "drained retry reaches copy durability barrier");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    f.w.command(json!({"op":"close"}));
+    write_private(&f.root.join("release-retry"), b"");
+    let read = f.read(true);
+    assert_eq!(read["uncertain"], true, "lost drained retry ACK marks uncertainty");
+    assert_eq!(read["anchor_digest"], before, "lost retry preserves anchor");
+    f.clear();
+    let reply = f.request(false, &packet);
+    assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("ORIGINAL_ACK"), "next mutation reconciles the drained retry");
+    let read = f.read(true);
+    assert_eq!(read["uncertain"], false, "reconciled retry clears uncertainty");
+    assert_eq!(read["anchor_digest"], before, "reconciled retry preserves anchor");
+    let mut different = envelope.clone();
+    different.push(b' ');
+    assert!(f.request(false, &original_packet(&"f".repeat(32), 1, &different)).is_none(), "different drained bytes close W");
+    assert!(f.request(false, &packet).is_none(), "W remains closed after conflicting drained bytes");
+    assert_eq!(f.read(true)["anchor_digest"], before, "S remains served without changing anchor");
+    assert_eq!(fs::read_to_string(f.root.join("diagnostics.log")).unwrap(), "drain authority closed\n", "one content-free diagnostic for W closure");
+}
