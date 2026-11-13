@@ -567,7 +567,7 @@ pub fn verify_original(
         return Err(Refusal::CHAIN);
     }
     let commitment = records::join_commitment(&e).ok_or(Refusal::COMMITMENT)?;
-    // A drained original is the exact signed record this drain verified at commit; equality with the commit ledger is the whole check, and no signature is made.
+    // Store::publish_original's check_copy against ledger.first() in drain_store.rs is the binding guard; this comparison is uncredited defense in depth.
     if record.ledger.first() != Some(&commitment) {
         return Err(Refusal::COMMITMENT);
     }
