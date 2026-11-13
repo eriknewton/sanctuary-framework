@@ -152,19 +152,31 @@ impl HeldConfig {
 pub struct Classifier {
     #[cfg(feature = "test-isolation")]
     signer_pid: Option<i32>,
+    #[cfg(feature = "test-isolation")]
+    signer_group: Option<String>,
 }
 impl Classifier {
     pub fn production() -> Self {
         Self {
             #[cfg(feature = "test-isolation")]
             signer_pid: None,
+            #[cfg(feature = "test-isolation")]
+            signer_group: None,
         }
     }
     #[cfg(feature = "test-isolation")]
-    pub fn isolated(signer_pid: i32) -> Self {
+    pub fn isolated(signer_pid: i32, signer_group: String) -> Self {
         Self {
             signer_pid: Some(signer_pid),
+            signer_group: Some(signer_group),
         }
+    }
+    fn partition_group<'a>(&'a self, configured: &'a str) -> &'a str {
+        #[cfg(feature = "test-isolation")]
+        if let Some(group) = &self.signer_group {
+            return group;
+        }
+        configured
     }
     fn signer(&self, pid: i32, actual: &str, configured: &str) -> bool {
         #[cfg(feature = "test-isolation")]
@@ -177,7 +189,7 @@ impl Classifier {
 }
 pub enum Binding {
     S(signer_peer::Peer),
-    W(WallMainBinding),
+    W(Box<WallMainBinding>),
 }
 impl Binding {
     pub fn authority(&self) -> Authority {
@@ -222,18 +234,20 @@ impl Binding {
             Self::S(signer_peer::Peer::capture(fd, &config.signer).map_err(|_| Refusal::CLASSIFY)?)
         } else {
             // The supplementary group narrows who can connect, but it is not a bound against a uid 0 peer; the MainPID equality is that bound.
-            // Shared capture binds ControlGroup to this actual peer cgroup; the production partition excludes signer overlap.
-            Self::W(
-                WallMainBinding::capture(
-                    fd,
-                    &config.wall_policy(),
-                    bus,
-                    peer_uid,
-                    owner,
-                    end.clone(),
-                )
-                .map_err(|_| Refusal::CLASSIFY)?,
+            let wall = WallMainBinding::capture(
+                fd,
+                &config.wall_policy(),
+                bus,
+                peer_uid,
+                owner,
+                end.clone(),
             )
+            .map_err(|_| Refusal::CLASSIFY)?;
+            // Snapshot evidence cannot confer wall authority inside the signer partition, even if the process moved during capture.
+            if wall.cgroup() == classifier.partition_group(&configured) {
+                return Err(Refusal::CLASSIFY);
+            }
+            Self::W(Box::new(wall))
         };
         end.check().map_err(|_| Refusal::DEADLINE)?;
         Ok(binding)
@@ -738,3 +752,713 @@ mod verification_tests {
         );
     }
 }
+
+use drain_store::{
+    DrainRecord, EventSink, HeldRoot, LastOp, Phase, PublishOutcome, StateLock, Store, StoreFaults,
+};
+use protocol::{Direction, Operation};
+use std::{io, os::fd::OwnedFd, sync::Arc};
+const SLOT: &str = drain_store::DRAIN_SLOTS[0].0;
+const WIRE_ROLE: &str = drain_store::DRAIN_SLOTS[0].1;
+const SOCKET_NAME: &str = "drain.sock"; // Must match DRAIN_SOCKET in drain_protocol.rs.
+const POLL_MS: i32 = super::signer_watchdog::WATCHDOG_TICK_MS;
+#[derive(Debug, Clone, Copy)]
+pub enum StartState {
+    LoadConfig,
+    Lock,
+    ValidateState,
+    PrepareSocket,
+    Listen,
+    Ready,
+}
+#[derive(Debug, Clone, Copy)]
+pub enum RequestState {
+    Bind,
+    Decode,
+    Role,
+    Reconcile,
+    Authority,
+    Retry,
+    Propose,
+    Verify,
+    Capacity,
+    Store,
+    Revalidate,
+    Reply,
+}
+/// The required sink has an explicit production no-op; test logs never contain candidate record bytes.
+pub struct Diagnostics {
+    events: EventSink,
+    #[cfg(feature = "test-isolation")]
+    seam: Option<PathBuf>,
+}
+impl Diagnostics {
+    pub fn production() -> Self {
+        Self {
+            events: EventSink::none(),
+            #[cfg(feature = "test-isolation")]
+            seam: None,
+        }
+    }
+    #[cfg(feature = "test-isolation")]
+    pub fn isolated(root: &Path) -> Result<Self> {
+        Ok(Self {
+            events: EventSink::from_seam_root(root).map_err(|_| Refusal::ROOT)?,
+            seam: Some(root.to_owned()),
+        })
+    }
+    fn event(&self, name: &str, id: Option<&str>, settlement: Option<&str>) -> Result<()> {
+        self.events
+            .emit(name, id, None, None, settlement)
+            .map_err(|_| Refusal::STORE)
+    }
+    fn refuse(&self, stage: Refusal, id: Option<&str>) -> Result<()> {
+        #[cfg(feature = "test-isolation")]
+        if let Some(root) = &self.seam {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .mode(custody::PRIVATE_MODE)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root.join("refusals.jsonl"))
+                .map_err(|_| Refusal::STORE)?;
+            let v = serde_json::json!({"stage":format!("{stage:?}"),"slot":SLOT,"request_id":id});
+            writeln!(
+                f,
+                "{}",
+                crate::smb::jcs::encode(&v).map_err(|_| Refusal::STORE)?
+            )
+            .map_err(|_| Refusal::STORE)?;
+        }
+        let _ = (stage, id);
+        Ok(())
+    }
+}
+pub struct Dependencies {
+    pub config: HeldConfig,
+    pub state: HeldRoot,
+    pub runtime: Directory,
+    pub descriptor: DescriptorReader,
+    pub bus: BusTarget,
+    pub peer_uid: u32,
+    pub owner: u32,
+    pub classifier: Classifier,
+    pub faults: StoreFaults,
+    pub store_events: EventSink,
+    pub diagnostics: Diagnostics,
+    pub notifier: Box<dyn super::writer_service::Notifier>,
+    pub clock: writer_peer::Clock,
+}
+struct SocketGuard<'a> {
+    runtime: &'a Directory,
+    listener: OwnedFd,
+    dev: u64,
+    ino: u64,
+}
+fn socket_stat(runtime: &Directory) -> Result<Option<libc::stat>> {
+    let name = CString::new(SOCKET_NAME).map_err(|_| Refusal::SOCKET)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            runtime.file.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        if io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(Refusal::SOCKET);
+    }
+    Ok(Some(st))
+}
+fn unlink_socket(runtime: &Directory) -> Result<()> {
+    let name = CString::new(SOCKET_NAME).map_err(|_| Refusal::SOCKET)?;
+    if unsafe { libc::unlinkat(runtime.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        Err(Refusal::SOCKET)
+    } else {
+        Ok(())
+    }
+}
+fn prepare_socket<'a>(runtime: &'a Directory, _lock: &StateLock) -> Result<SocketGuard<'a>> {
+    // Only the singleton state-lock holder may remove the fixed stale socket; no arbitrary runtime entry is cleaned.
+    if let Some(st) = socket_stat(runtime)? {
+        if st.st_mode & libc::S_IFMT != libc::S_IFSOCK || st.st_uid != runtime.owner {
+            return Err(Refusal::SOCKET);
+        }
+        unlink_socket(runtime)?;
+    }
+    signer_peer::drop_capabilities_with(signer_peer::CapabilityDrop::Signer)
+        .map_err(|_| Refusal::ROOT)?;
+    let path = PathBuf::from(format!(
+        "/proc/self/fd/{}/{SOCKET_NAME}",
+        runtime.file.as_raw_fd()
+    ));
+    let listener = signer_peer::listen(&path).map_err(|_| Refusal::SOCKET)?;
+    let st = socket_stat(runtime)?.ok_or(Refusal::SOCKET)?;
+    Ok(SocketGuard {
+        runtime,
+        listener,
+        dev: st.st_dev,
+        ino: st.st_ino,
+    })
+}
+impl Drop for SocketGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(Some(st)) = socket_stat(self.runtime) {
+            if st.st_dev == self.dev && st.st_ino == self.ino {
+                let _ = unlink_socket(self.runtime);
+            }
+        }
+    }
+}
+fn deadline(clock: &writer_peer::Clock, ms: usize) -> Result<Deadline> {
+    let now = clock().map_err(|_| Refusal::DEADLINE)?;
+    let end = now
+        .checked_add(
+            (ms as u64)
+                .checked_mul(writer_peer::NS_PER_MS)
+                .ok_or(Refusal::DEADLINE)?,
+        )
+        .ok_or(Refusal::DEADLINE)?;
+    Deadline::new(clock.clone(), end).map_err(|_| Refusal::DEADLINE)
+}
+fn send_before(fd: RawFd, bytes: &[u8], end: &Deadline) -> Result<()> {
+    loop {
+        end.check().map_err(|_| Refusal::DEADLINE)?;
+        match signer_peer::send(fd, bytes, &[]) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return Err(Refusal::REPLY),
+        }
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut p, 1, POLL_MS) } < 0 {
+            return Err(Refusal::REPLY);
+        }
+    }
+}
+fn response(
+    op: &str,
+    id: &str,
+    anchor: Option<&Value>,
+    sequence: Option<u64>,
+    uncertain: bool,
+) -> Result<Vec<u8>> {
+    let mut h = protocol::header(op, id, WIRE_ROLE);
+    let mut payload = Vec::new();
+    if matches!(op, "ANCHOR_ACK" | "READ_REPLY") {
+        if let Some(a) = anchor {
+            payload = crate::smb::jcs::encode(a)
+                .map_err(|_| Refusal::REPLY)?
+                .into_bytes();
+        }
+        h["payload_length"] = serde_json::json!(payload.len());
+        h["anchor_digest"] = serde_json::json!(anchor.and_then(anchor::anchor_digest));
+        if op == "READ_REPLY" {
+            h["state"] = serde_json::json!(if anchor.is_some() {
+                "PRESENT"
+            } else {
+                "ABSENT"
+            });
+            h["latched"] =
+                serde_json::json!(anchor.is_some_and(|a| a["recovery_required"] == true));
+            h["uncertain"] = serde_json::json!(uncertain);
+        }
+    } else if op == "ORIGINAL_ACK" {
+        h["sequence"] = serde_json::json!(sequence.ok_or(Refusal::REPLY)?);
+        h["drained_digest"] = anchor.ok_or(Refusal::REPLY)?["drained_digest"].clone();
+    }
+    protocol::encode(&h, &payload, Direction::FromDrain).map_err(|_| Refusal::REPLY)
+}
+struct PreparedReply {
+    bytes: Vec<u8>,
+    published: bool,
+}
+struct Executor<'a, 'b> {
+    store: Store<'a>,
+    reader: &'b mut DescriptorReader,
+    diagnostics: &'b Diagnostics,
+    fortress: &'b str,
+    closed: [bool; 2],
+    copy_cap_refusals: usize,
+}
+fn authority_index(a: Authority) -> usize {
+    match a {
+        Authority::W => 0,
+        Authority::S => 1,
+    }
+}
+impl Executor<'_, '_> {
+    fn close_authority(&mut self, a: Authority, id: &str) -> Result<()> {
+        let index = authority_index(a);
+        if !self.closed[index] {
+            self.closed[index] = true;
+            self.diagnostics.refuse(Refusal::RETRY, Some(id))?;
+        }
+        Ok(())
+    }
+    fn publish(&mut self, outcome: PublishOutcome) -> Result<()> {
+        match outcome {
+            PublishOutcome::Durable => Ok(()),
+            PublishOutcome::PrePublication(drain_store::StoreRefusal::CAP) => {
+                // A saturated fixed counter reports copy backpressure without retaining per-request history.
+                self.copy_cap_refusals = self.copy_cap_refusals.saturating_add(1);
+                Err(Refusal::STORE)
+            }
+            PublishOutcome::PrePublication(_) | PublishOutcome::Uncertain(_) => Err(Refusal::STORE),
+        }
+    }
+    fn process(
+        &mut self,
+        authority: Authority,
+        frame: &protocol::Frame<'_>,
+        packet: &[u8],
+    ) -> Result<PreparedReply> {
+        let _state = RequestState::Role;
+        if frame.role != WIRE_ROLE {
+            return Err(Refusal::ROLE);
+        }
+        if self.closed[authority_index(authority)] {
+            return Err(Refusal::AUTHORITY);
+        }
+        if matches!(frame.operation, Operation::Read) {
+            let observation = self.store.observe(SLOT);
+            return Ok(PreparedReply {
+                bytes: response(
+                    "READ_REPLY",
+                    &frame.request_id,
+                    observation.anchor.as_ref(),
+                    None,
+                    observation.uncertain,
+                )?,
+                published: false,
+            });
+        }
+        let _state = RequestState::Reconcile;
+        // Unknown slots observe as uncertain absence; only the fixed producer slot can ever reach this mutation gate.
+        self.store.reconcile(SLOT).map_err(|_| Refusal::RECONCILE)?;
+        if self.store.observe(SLOT).uncertain {
+            return Err(Refusal::RECONCILE);
+        }
+        let phase = match &frame.operation {
+            Operation::Anchor { message, .. } => {
+                Phase::of_message(message).ok_or(Refusal::AUTHORITY)?
+            }
+            Operation::Original { .. } => Phase::DRAIN,
+            _ => return Err(Refusal::AUTHORITY),
+        };
+        let _state = RequestState::Authority;
+        if !authorized(authority, phase) {
+            return Err(Refusal::AUTHORITY);
+        }
+        let old = self.store.record(SLOT).cloned();
+        let digest = packet_digest(packet);
+        let last = LastOp {
+            authority,
+            phase,
+            request_id: frame.request_id.clone(),
+            request_sha256: digest,
+        };
+        match &frame.operation {
+            Operation::Anchor { message, envelope } => {
+                let _state = RequestState::Retry;
+                if let Some(record) = &old {
+                    if record.last.authority == authority
+                        && record.last.phase == phase
+                        && record.last.request_id == frame.request_id
+                    {
+                        if record.last.request_sha256 != last.request_sha256 {
+                            self.close_authority(authority, &frame.request_id)?;
+                            return Err(Refusal::RETRY);
+                        }
+                        return Ok(PreparedReply {
+                            bytes: response(
+                                "ANCHOR_ACK",
+                                &frame.request_id,
+                                Some(&record.anchor),
+                                None,
+                                false,
+                            )?,
+                            published: false,
+                        });
+                    }
+                }
+                let _state = RequestState::Propose;
+                let prior = old
+                    .as_ref()
+                    .map_or(anchor::Prior::Absent, |r| anchor::Prior::Present(&r.anchor));
+                let next = anchor::propose(prior, message).ok_or(Refusal::PROPOSE)?;
+                if next["fortress_id"] != self.fortress || next["role"] != WIRE_ROLE {
+                    return Err(Refusal::ROLE);
+                }
+                let mut ledger = old.as_ref().map_or_else(Vec::new, |r| r.ledger.clone());
+                if phase == Phase::RECORD_COMMIT {
+                    let _state = RequestState::Verify;
+                    let commitment = verify_commit(
+                        self.reader,
+                        &frame.role,
+                        &old.as_ref().ok_or(Refusal::PROPOSE)?.anchor,
+                        message,
+                        envelope,
+                    )?;
+                    let _state = RequestState::Capacity;
+                    // A missing head original, copy cap or latch can stop DRAIN and then COMMIT; refusal never evicts and no finalization headroom is promised.
+                    if ledger.len() >= drain_store::D_UNDRAINED_MAX {
+                        return Err(Refusal::CAPACITY);
+                    }
+                    ledger.push(commitment);
+                }
+                let record = DrainRecord {
+                    anchor: next,
+                    last,
+                    ledger,
+                };
+                let _state = RequestState::Store;
+                let outcome = self.store.publish_record(SLOT, &record);
+                self.publish(outcome)?;
+                self.reader.invalidate();
+                // Custody and record COMMIT ACKs require the store's fsync plus exact readback, followed by peer revalidation.
+                Ok(PreparedReply {
+                    bytes: response(
+                        "ANCHOR_ACK",
+                        &frame.request_id,
+                        Some(&record.anchor),
+                        None,
+                        false,
+                    )?,
+                    published: true,
+                })
+            }
+            Operation::Original { sequence, envelope } => {
+                let mut record = old.ok_or(Refusal::PROPOSE)?;
+                let drained = record.anchor["drained_sequence"]
+                    .as_u64()
+                    .ok_or(Refusal::PROPOSE)?;
+                if *sequence == drained || drained.checked_add(1) == Some(*sequence) {
+                    if let Some(copy) = self.store.copy(SLOT, *sequence) {
+                        if copy != *envelope {
+                            self.close_authority(authority, &frame.request_id)?;
+                            return Err(Refusal::RETRY);
+                        }
+                    }
+                }
+                if *sequence == drained {
+                    if self.store.copy(SLOT, *sequence).is_none() {
+                        return Err(Refusal::PROPOSE);
+                    }
+                    let outcome = self.store.publish_original(SLOT, *sequence, envelope);
+                    self.publish(outcome)?;
+                    return Ok(PreparedReply {
+                        bytes: response(
+                            "ORIGINAL_ACK",
+                            &frame.request_id,
+                            Some(&record.anchor),
+                            Some(*sequence),
+                            false,
+                        )?,
+                        published: true,
+                    });
+                }
+                let commitment = verify_original(&frame.role, *sequence, &record, envelope)?;
+                let mut next = record.anchor.clone();
+                next["drained_sequence"] = serde_json::json!(sequence);
+                next["drained_digest"] = serde_json::json!(commitment);
+                let proposal = serde_json::json!({"version":1,"op":"DRAIN","request_id":frame.request_id,"expected":record.anchor,"next":next});
+                let outcome = self.store.publish_original(SLOT, *sequence, envelope);
+                self.publish(outcome)?;
+                // Only a durable original permits the reducer to advance the drain watermark.
+                let next = anchor::propose(anchor::Prior::Present(&record.anchor), &proposal)
+                    .ok_or(Refusal::PROPOSE)?;
+                record.anchor = next;
+                record.last = last;
+                record.ledger.remove(0);
+                let outcome = self.store.publish_record(SLOT, &record);
+                self.publish(outcome)?;
+                self.reader.invalidate();
+                // Only this acknowledgment authorizes the wall to release log space; REFUSED, a disconnect, a durable copy alone or an uncertain outcome never does.
+                Ok(PreparedReply {
+                    bytes: response(
+                        "ORIGINAL_ACK",
+                        &frame.request_id,
+                        Some(&record.anchor),
+                        Some(*sequence),
+                        false,
+                    )?,
+                    published: true,
+                })
+            }
+            _ => Err(Refusal::AUTHORITY),
+        }
+    }
+    fn request(
+        &mut self,
+        fd: RawFd,
+        binding: &Binding,
+        bus: &BusTarget,
+        end: Deadline,
+    ) -> Result<()> {
+        let _state = RequestState::Bind;
+        let packet =
+            signer_peer::receive(fd, protocol::D_REQUEST_MAX_BYTES).map_err(|_| Refusal::BIND)?;
+        binding.packet(&packet)?;
+        let _state = RequestState::Decode;
+        let frame =
+            protocol::decode(&packet.bytes, Direction::ToDrain).map_err(|_| Refusal::ENVELOPE)?;
+        self.diagnostics
+            .event("RequestAdmitted", Some(&frame.request_id), None)?;
+        let prepared = self.process(binding.authority(), &frame, &packet.bytes);
+        let mut published = false;
+        let result = match prepared {
+            Ok(reply) => {
+                published = reply.published;
+                let _state = RequestState::Revalidate;
+                binding.revalidate(bus, end.clone()).and_then(|()| {
+                    let _state = RequestState::Reply;
+                    send_before(fd, &reply.bytes, &end)?;
+                    self.diagnostics
+                        .event("ReplySent", Some(&frame.request_id), None)
+                })
+            }
+            Err(stage) => {
+                self.diagnostics.refuse(stage, Some(&frame.request_id))?;
+                if stage != Refusal::STORE && stage != Refusal::RETRY {
+                    let bytes = response("REFUSED", &frame.request_id, None, None, false)?;
+                    let _ = send_before(fd, &bytes, &end);
+                }
+                Err(stage)
+            }
+        };
+        // A failed completion after Durable keeps the attempted image for independent reconciliation; a no-store retry cannot invent clearing evidence.
+        if result.is_err() && published {
+            self.store.mark_uncertain(SLOT);
+        }
+        let settlement = if self.store.observe(SLOT).uncertain {
+            "uncertain"
+        } else if published {
+            "durable"
+        } else {
+            "pre_publication"
+        };
+        self.diagnostics
+            .event("RequestSettled", Some(&frame.request_id), Some(settlement))?;
+        result
+    }
+}
+pub fn run(mut deps: Dependencies) -> Result<()> {
+    let setup = (|| {
+        let _state = StartState::Lock;
+        let lock = StateLock::acquire(&deps.state).map_err(|_| Refusal::ROOT)?;
+        Ok(lock)
+    })();
+    let lock = match setup {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = deps.notifier.notify("STATUS=drain refused at start");
+            return Err(e);
+        }
+    };
+    let _state = StartState::ValidateState;
+    let store = match Store::open(
+        &deps.state,
+        &deps.config.value.fortress_id,
+        &lock,
+        deps.owner,
+        deps.faults,
+        deps.store_events,
+    ) {
+        Ok(store) => store,
+        Err(_) => {
+            let _ = deps.notifier.notify("STATUS=drain refused at start");
+            return Err(Refusal::STORE);
+        }
+    };
+    let _state = StartState::PrepareSocket;
+    let socket = match prepare_socket(&deps.runtime, &lock) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = deps.notifier.notify("STATUS=drain refused at start");
+            return Err(e);
+        }
+    };
+    let observation = store.observe(SLOT);
+    let _state = StartState::Ready;
+    deps.notifier
+        .notify(&format!(
+            "READY=1\nSTATUS=drain ready; {} roles; latched={}; uncertain={}",
+            drain_store::DRAIN_SLOTS.len(),
+            observation.latched,
+            observation.uncertain
+        ))
+        .map_err(|_| Refusal::REPLY)?;
+    let mut executor = Executor {
+        store,
+        reader: &mut deps.descriptor,
+        diagnostics: &deps.diagnostics,
+        fortress: &deps.config.value.fortress_id,
+        closed: [false; 2],
+        copy_cap_refusals: 0,
+    };
+    let mut reported_caps = 0;
+    let mut peers: Vec<(OwnedFd, Binding)> = Vec::new();
+    // A stalled store step stalls every peer, including the signer's recovery read; no request is admitted while one is unsettled.
+    loop {
+        let mut polls: Vec<_> = std::iter::once(libc::pollfd {
+            fd: socket.listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .chain(peers.iter().map(|(fd, _)| libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }))
+        .collect();
+        let result =
+            unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, POLL_MS) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Refusal::BIND);
+        }
+        for index in (0..peers.len()).rev() {
+            let events = polls[index + 1].revents;
+            if events == 0 {
+                continue;
+            }
+            let (fd, binding) = &peers[index];
+            if events & libc::POLLIN == 0 || executor.closed[authority_index(binding.authority())] {
+                peers.remove(index);
+                continue;
+            }
+            let end = deadline(&deps.clock, protocol::D_REQUEST_DEADLINE_MS)?;
+            if let Err(stage) = executor.request(fd.as_raw_fd(), binding, &deps.bus, end) {
+                deps.diagnostics.refuse(stage, None)?;
+                peers.remove(index);
+            }
+            if reported_caps != executor.copy_cap_refusals {
+                let observation = executor.store.observe(SLOT);
+                deps.notifier
+                    .notify(&format!(
+                    "STATUS=drain ready; {} roles; latched={}; uncertain={}; copy_cap_refusals={}",
+                    drain_store::DRAIN_SLOTS.len(), observation.latched, observation.uncertain,
+                    executor.copy_cap_refusals,
+                ))
+                    .map_err(|_| Refusal::REPLY)?;
+                reported_caps = executor.copy_cap_refusals;
+            }
+        }
+        if polls[0].revents & libc::POLLIN != 0 {
+            let fd =
+                signer_peer::accept(socket.listener.as_raw_fd()).map_err(|_| Refusal::CLASSIFY)?;
+            let end = deadline(&deps.clock, protocol::D_CLASSIFY_DEADLINE_MS)?;
+            // The two admitted authority slots plus this synchronous classifier are the complete connection bound.
+            if peers.len() + 1 > protocol::D_CONNECTIONS_MAX {
+                continue;
+            }
+            match Binding::capture(
+                fd.as_raw_fd(),
+                &deps.config.value,
+                &deps.bus,
+                deps.peer_uid,
+                deps.owner,
+                &deps.classifier,
+                end,
+            ) {
+                Ok(binding) => {
+                    if executor.closed[authority_index(binding.authority())]
+                        || peers
+                            .iter()
+                            .any(|(_, b)| b.authority() == binding.authority())
+                    {
+                        continue;
+                    }
+                    signer_peer::passcred(fd.as_raw_fd()).map_err(|_| Refusal::BIND)?;
+                    peers.push((fd, binding));
+                }
+                Err(stage) => deps.diagnostics.refuse(stage, None)?,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-isolation")]
+pub const DRAIN_TEST_SEAM_MARKER: &str = "sanctuary-drain-test-seam-v1";
+#[cfg(feature = "test-isolation")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeamConfig {
+    owner: u32,
+    peer_uid: u32,
+    signer_pid: i32,
+    signer_group: String,
+    bus: BusTarget,
+}
+#[cfg(feature = "test-isolation")]
+pub fn test_entry(root: &Path) -> Result<()> {
+    let bytes = custody::read_pinned(
+        &root.join("seam.json"),
+        unsafe { libc::geteuid() },
+        custody::CONFIG_MAX_BYTES,
+        custody::PRIVATE_MODE,
+    )
+    .map_err(|_| Refusal::CONFIG)?;
+    let seam: SeamConfig = serde_json::from_value(
+        protocol::canonical(&bytes, custody::CONFIG_MAX_BYTES).map_err(|_| Refusal::CONFIG)?,
+    )
+    .map_err(|_| Refusal::CONFIG)?;
+    run(Dependencies {
+        config: HeldConfig::isolated(&root.join("config.json"), seam.owner)?,
+        state: HeldRoot::isolated_under(&root.join("state"), seam.owner)
+            .map_err(|_| Refusal::ROOT)?,
+        runtime: Directory::isolated(&root.join("runtime"), seam.owner, true)?,
+        descriptor: DescriptorReader::new(Directory::isolated(
+            &root.join("custody"),
+            seam.owner,
+            true,
+        )?),
+        bus: seam.bus,
+        peer_uid: seam.peer_uid,
+        owner: seam.owner,
+        classifier: Classifier::isolated(seam.signer_pid, seam.signer_group),
+        faults: StoreFaults::from_seam_root(root).map_err(|_| Refusal::ROOT)?,
+        store_events: EventSink::from_seam_root(root).map_err(|_| Refusal::ROOT)?,
+        diagnostics: Diagnostics::isolated(root)?,
+        notifier: Box::new(super::writer_service::SystemNotifier),
+        clock: Arc::new(super::signer_watchdog::boottime_ns),
+    })
+}
+pub fn production() -> Result<()> {
+    run(Dependencies {
+        config: HeldConfig::production()?,
+        state: HeldRoot::production().map_err(|_| Refusal::ROOT)?,
+        runtime: Directory::production(
+            Path::new(protocol::DRAIN_SOCKET)
+                .parent()
+                .ok_or(Refusal::ROOT)?,
+            true,
+        )?,
+        descriptor: DescriptorReader::new(Directory::production(
+            Path::new(custody::CUSTODY_ROOT),
+            true,
+        )?),
+        bus: BusTarget::production(),
+        peer_uid: custody::ROOT_UID,
+        owner: custody::ROOT_UID,
+        classifier: Classifier::production(),
+        faults: StoreFaults::none(),
+        store_events: EventSink::none(),
+        diagnostics: Diagnostics::production(),
+        notifier: Box::new(super::writer_service::SystemNotifier),
+        clock: Arc::new(super::signer_watchdog::boottime_ns),
+    })
+}
+
+#[cfg(feature = "test-isolation")]
+use std::io::Write;

@@ -637,6 +637,10 @@ impl WallMainBinding {
             && process_start(self.pid)? == self.start
             && process_cgroup(self.pid)? == self.cgroup)
     }
+    /// The snapshot ControlGroup was checked against the captured process by validate_unit.
+    pub fn cgroup(&self) -> &str {
+        &self.cgroup
+    }
     pub fn held_artifacts(&self) -> usize {
         self.artifacts.len()
     }
