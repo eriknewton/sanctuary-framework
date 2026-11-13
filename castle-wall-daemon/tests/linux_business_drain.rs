@@ -289,8 +289,15 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         "BODY_DIGEST",
         "CHAIN",
         "DESCRIPTOR",
+        "DESCRIPTOR_FORTRESS",
+        "DESCRIPTOR_MACHINE",
+        "DESCRIPTOR_IDENTITY",
+        "DESCRIPTOR_BODY_MACHINE",
         "KID",
+        "KID_ABSENT_EPOCH",
         "GRANT",
+        "GRANT_ACTIVATION",
+        "GRANT_BOOT",
         "SIGNATURE",
         "COMMITMENT",
     ] {
@@ -307,11 +314,27 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             f.anchor["descriptor_digest"] = json!(packet_digest(&bytes));
             fs::write(path, bytes).unwrap();
         }
+        if matches!(stage, "DESCRIPTOR_FORTRESS" | "DESCRIPTOR_MACHINE" | "DESCRIPTOR_IDENTITY") {
+            let path = f.root.join("custody").join(FORTRESS).join(SLOT).join("public/epochs.json");
+            let mut descriptor: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let field = match stage { "DESCRIPTOR_FORTRESS" => "fortress_id", "DESCRIPTOR_MACHINE" => "machine_id", _ => "identity_id" };
+            descriptor[field] = json!("f".repeat(32));
+            let bytes = canonical(&descriptor);
+            f.anchor["descriptor_digest"] = json!(packet_digest(&bytes));
+            fs::write(path, bytes).unwrap();
+        }
         f.start();
         f.prepare();
         let mut body = f.body.clone();
         body["sequence"] = json!(1);
         body["prior_commitment"] = json!("GENESIS");
+        match stage {
+            "DESCRIPTOR_BODY_MACHINE" => body["machine_id"] = json!("f".repeat(32)),
+            "KID_ABSENT_EPOCH" => body["epoch"] = json!(2),
+            "GRANT_ACTIVATION" => body["activation_id"] = json!("f".repeat(32)),
+            "GRANT_BOOT" => body["boot_id"] = json!("f".repeat(32)),
+            _ => {}
+        }
         if stage == "CHAIN" {
             body["prior_commitment"] = json!(format!("sha256:{}", "f".repeat(64)));
         }
@@ -399,26 +422,20 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             .filter(|v| v["event"] == "StoreEntered")
             .count();
         assert_eq!(
-            f.request(false, &anchor_packet(&m, &envelope)).unwrap()["op"],
-            "REFUSED",
+            f.request(false, &anchor_packet(&m, &envelope)).as_ref().and_then(|r| r["op"].as_str()),
+            Some("REFUSED"),
             "{stage}"
         );
         assert!(
-            f.stages().contains(&if stage.starts_with("ENVELOPE_") {
-                "ENVELOPE".into()
-            } else {
-                stage.to_owned()
-            }),
+            f.stages().contains(&stage.split('_').next().unwrap().to_owned()),
             "{stage}: {:?}",
             f.stages()
         );
         assert_eq!(
-            f.events()
-                .iter()
-                .filter(|v| v["event"] == "StoreEntered")
-                .count(),
-            before
+            f.events().iter().filter(|v| v["event"] == "StoreEntered").count(), before,
+            "{stage}: refusal must not publish"
         );
+        assert_eq!(f.read(true)["anchor_digest"], json!(castle_wall_daemon::business_profile::activation_anchor::anchor_digest(&old)), "{stage}: unchanged anchor");
     }
 }
 #[test]
@@ -431,6 +448,25 @@ fn three_originals_require_each_exact_ledger_entry() {
     for i in 1..=3 {
         let (_, e) = f.reserve_commit(&format!("{i:032x}"));
         envelopes.push(e);
+    }
+    let mut bad_signature: Value = serde_json::from_slice(&envelopes[0]).unwrap();
+    {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let mut bytes = URL_SAFE_NO_PAD.decode(bad_signature["outer"]["signature"].as_str().unwrap()).unwrap();
+        bytes[0] ^= 1;
+        bad_signature["outer"]["signature"] = json!(URL_SAFE_NO_PAD.encode(bytes));
+    }
+    for (case, sequence, envelope, stage) in [
+        ("above committed", 4, envelopes[2].clone(), "CHAIN"),
+        ("header body sequence", 1, envelopes[1].clone(), "CHAIN"),
+        ("gap", 2, envelopes[1].clone(), "CHAIN"),
+        ("changed signature", 1, canonical(&bad_signature), "COMMITMENT"),
+    ] {
+        let before = f.read(true)["anchor_digest"].clone();
+        let reply = f.request(false, &original_packet(&"e".repeat(32), sequence, &envelope));
+        assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("REFUSED"), "{case}: original refusal");
+        assert_eq!(f.stages().last().map(String::as_str), Some(stage), "{case}: named refusal stage");
+        assert_eq!(f.read(true)["anchor_digest"], before, "{case}: unchanged anchor");
     }
     assert_eq!(
         f.request(false, &original_packet(&"e".repeat(32), 1, &envelopes[0]))
@@ -456,6 +492,12 @@ fn three_originals_require_each_exact_ledger_entry() {
             "ORIGINAL_ACK"
         );
     }
+    let before = f.read(true)["anchor_digest"].clone();
+    let reply = f.request(false, &original_packet(&"e".repeat(32), 1, &envelopes[0]));
+    assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("REFUSED"), "stale original refusal");
+    assert_eq!(f.stages().last().map(String::as_str), Some("CHAIN"), "stale original named stage");
+    assert_eq!(f.read(true)["anchor_digest"], before, "stale original unchanged anchor");
+
 }
 #[test]
 fn disconnected_timeout_waves_keep_one_request_until_settlement() {
@@ -727,6 +769,12 @@ fn authority_cells_and_direct_operations_are_closed() {
         "REFUSED"
     );
     assert_eq!(f.read(true)["state"], "ABSENT");
+    let mut foreign = m.clone();
+    foreign["next"]["role"] = json!("extension:linux-business-retrospective-v0");
+    let reply = f.request(true, &anchor_packet(&foreign, &[]));
+    assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("REFUSED"), "foreign genesis role refuses");
+    assert_eq!(f.stages().last().map(String::as_str), Some("ROLE"), "foreign genesis role stage");
+    assert_eq!(f.read(true)["state"], "ABSENT", "foreign genesis preserves absence");
     f.prepare();
     let mut next = f.anchor.clone();
     let digest = packet_digest(&canonical(&f.body));
