@@ -907,15 +907,20 @@ fn authority_cells_and_direct_operations_are_closed() {
     assert_eq!(f.read(true)["state"], "ABSENT");
     let mut foreign = m.clone();
     foreign["next"]["role"] = json!("extension:linux-business-retrospective-v0");
-    let reply = f.request(true, &anchor_packet(&foreign, &[]));
-    assert_eq!(
-        reply.as_ref().and_then(|r| r["op"].as_str()),
-        Some("REFUSED"),
-        "foreign genesis role refuses"
+    // The frozen anchor schema rejects this before a reply identity exists; decode refusal is a silent close.
+    let message = canonical(&foreign);
+    let mut header = protocol::header("ANCHOR", &"c".repeat(32), ROLE);
+    header["message_length"] = json!(message.len());
+    header["envelope_length"] = json!(0);
+    let bytes = canonical(&header);
+    let packet = [&(bytes.len() as u32).to_be_bytes()[..], &bytes, &message].concat();
+    assert!(
+        f.request(true, &packet).is_none(),
+        "foreign genesis role silently refuses at decode"
     );
     assert_eq!(
         f.stages().last().map(String::as_str),
-        Some("ROLE"),
+        Some("ENVELOPE"),
         "foreign genesis role stage"
     );
     assert_eq!(
