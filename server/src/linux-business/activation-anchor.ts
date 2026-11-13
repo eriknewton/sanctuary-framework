@@ -10,6 +10,12 @@ export const ANCHOR_MAX_BYTES = 65536;
 // DRAIN_SCHEMA_BEGIN
 // must match `drain_schema.json` via `scripts/generate-drain-contract.mjs`
 export const DRAIN_SCHEMA_DIGEST = "sha256:a9ce79996945b09990ea8ab538bbe3288a19be4051db013238d14431bfc4254d";
+export const ID_HEX_LENGTH = 32;
+export const DIGEST_HEX_LENGTH = 64;
+export const KEY_HEX_LENGTH = 64;
+export const SAFE_INTEGER = 9007199254740991;
+// The schema bounds every drain integer even when the shared signing validator is imported.
+const drainSafeInteger = safeInteger.max(SAFE_INTEGER);
 export const ANCHOR_FIELDS = ["version","fortress_id","machine_id","role","enrollment_revision","descriptor_digest","roster_digest","custody_envelope_digest","retired","activation_id","boot_id","generation_high_water","reserved_sequence","committed_sequence","committed_digest","drained_sequence","drained_digest","transaction_id","recovery_required","recovery_reason","recovery_revision","reserved_body_digest"] as const;
 const id = z.string().regex(/^[a-f0-9]{32}$/);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
@@ -19,23 +25,23 @@ const anchorShape = z.object({
   fortress_id: id,
   machine_id: id,
   role: z.literal("extension:linux-business-producer-v0"),
-  enrollment_revision: safeInteger.min(1),
+  enrollment_revision: drainSafeInteger.min(1),
   descriptor_digest: digest,
   roster_digest: digest,
   custody_envelope_digest: digest,
   retired: z.boolean(),
   activation_id: id,
   boot_id: id,
-  generation_high_water: safeInteger,
-  reserved_sequence: safeInteger,
-  committed_sequence: safeInteger,
+  generation_high_water: drainSafeInteger,
+  reserved_sequence: drainSafeInteger,
+  committed_sequence: drainSafeInteger,
   committed_digest: z.union([z.literal("GENESIS"), digest]),
-  drained_sequence: safeInteger,
+  drained_sequence: drainSafeInteger,
   drained_digest: z.union([z.literal("GENESIS"), digest]),
   transaction_id: id.nullable(),
   recovery_required: z.boolean(),
   recovery_reason: reason.nullable(),
-  recovery_revision: safeInteger,
+  recovery_revision: drainSafeInteger,
   reserved_body_digest: digest.nullable(),
 }).strict();
 const MESSAGE_KEYS = ["version","op","request_id","expected","next"] as const;
@@ -221,8 +227,9 @@ function descriptorDomain(value: unknown, domain: string): boolean {
     case "epochs": return Array.isArray(value);
     case "registeredRole": return ROLE_REGISTRY.some(r => r.role === value);
     case "positiveInteger": return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= D_EPOCH_MAX;
-    case "key": return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-    case "kid": return typeof value === "string" && /^k1:sha256:[a-f0-9]{64}$/.test(value);
+    // Schema widths bind each public key and kid to the shared primitive encoding.
+    case "key": return typeof value === "string" && new RegExp(`^[a-f0-9]{${KEY_HEX_LENGTH}}$`).test(value);
+    case "kid": return typeof value === "string" && new RegExp(`^k1:sha256:[a-f0-9]{${DIGEST_HEX_LENGTH}}$`).test(value);
     default: return false;
   }
 }

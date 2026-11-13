@@ -1156,3 +1156,41 @@ fn drained_tail_retry_and_certain_reconcile_have_explicit_io_bounds() {
     );
     assert!(store.observe(SLOT).uncertain);
 }
+
+#[test]
+fn unknown_slot_is_uncertain_without_changing_the_producer_observation() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::Durable
+    );
+    let before = store.observe(SLOT);
+    let events = fixture.events();
+    let unknown = store.observe("unknown");
+    assert_eq!(unknown.state, ObservationState::Absent);
+    assert!(unknown.uncertain);
+    assert_eq!(unknown.anchor, None);
+    assert_eq!(store.observe(SLOT), before);
+    assert_eq!(fixture.events(), events);
+}
+#[test]
+fn copy_staging_without_record_refuses_start_and_is_preserved() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::Durable
+    );
+    drop(store);
+    fs::remove_file(fixture.record_path()).unwrap();
+    let stage = fixture
+        .copies_path()
+        .join(format!(".{:020}.env.staging", 1));
+    fs::write(&stage, b"partial").unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(matches!(fixture.try_store(), Err(StoreRefusal::STAGING)));
+    assert_eq!(fs::read(stage).unwrap(), b"partial");
+}

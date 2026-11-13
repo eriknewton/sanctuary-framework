@@ -21,7 +21,7 @@ pub use anchor::{D_DESCRIPTOR_EPOCHS_MAX, D_DESCRIPTOR_MAX_BYTES, D_EPOCH_MAX};
 pub const D_ANCHOR_MAX_BYTES: usize = 1172; // 22 keys, six 16-digit counters, four 32-hex ids, six 71-byte digests, nullable transaction id, role and maximal reason; measured by maximal_record_bounds.
 pub const D_ANCHOR_MESSAGE_MAX_BYTES: usize = 2539; // Two maximal anchors plus longest operation, request id and body digest; measured by maximal_record_bounds.
 pub const D_LAST_MAX_BYTES: usize = 185; // Authority, longest phase, 32-hex request id and 71-byte digest; measured by maximal_record_bounds.
-pub const D_LEDGER_ENTRY_BYTES: usize = 71 + 2 + 1; // Digest plus quotes and comma.
+pub const D_LEDGER_ENTRY_BYTES: usize = "sha256:".len() + anchor::DIGEST_HEX_LENGTH + 2 + 1; // Two JSON quotes and one comma delimit each digest.
 pub const D_RECORD_FIXED_BYTES: usize = 1400; // Maximal anchor and last with empty ledger and record keys; measured by maximal_record_bounds.
 pub const D_UNDRAINED_MAX: usize = 512; // Largest power of two fitting the strict JSON parse cap; no eviction.
 pub const D_RECORD_MAX_BYTES: usize =
@@ -45,6 +45,8 @@ const _: () =
     assert!(D_ANCHOR_PAYLOAD_MAX_BYTES <= D_REQUEST_MAX_BYTES - LENGTH_BYTES - D_HEADER_MAX_BYTES);
 const _: () = assert!(D_REPLY_MAX_BYTES == SIGNER_FRAME_MAX_BYTES);
 pub const DRAIN_SLOTS: &[(&str, &str)] = &[(custody::PRODUCER_ROLE_SLOT, anchor::PRODUCER_ROLE)];
+const MODE_BITS: u32 = 0o7777; // POSIX permissions plus setuid, setgid and sticky bits.
+const ACTIVE_STORE_OPERATIONS: usize = 1; // Store methods serialize one operation at a time.
 const SLOT: &str = DRAIN_SLOTS[0].0;
 const WIRE_ROLE: &str = DRAIN_SLOTS[0].1;
 
@@ -293,7 +295,7 @@ fn meta(file: &File) -> Result<Metadata> {
 }
 fn trusted(m: &Metadata, owner: u32, directory: bool) -> bool {
     m.uid() == owner
-        && m.mode() & 0o7777
+        && m.mode() & MODE_BITS
             == if directory {
                 custody::DIRECTORY_MODE
             } else {
@@ -510,7 +512,8 @@ impl HeldRoot {
         }
         const PARENT_MODE: u32 = 0o755; // Public search ancestors of the private production state root.
         let root_metadata = meta(&file)?;
-        if root_metadata.uid() != custody::ROOT_UID || root_metadata.mode() & 0o7777 != PARENT_MODE
+        if root_metadata.uid() != custody::ROOT_UID
+            || root_metadata.mode() & MODE_BITS != PARENT_MODE
         {
             return Err(StoreRefusal::ROOT);
         }
@@ -531,7 +534,7 @@ impl HeldRoot {
                 if !trusted(&m, owner, true) {
                     return Err(StoreRefusal::ROOT);
                 }
-            } else if m.uid() != custody::ROOT_UID || m.mode() & 0o7777 != PARENT_MODE {
+            } else if m.uid() != custody::ROOT_UID || m.mode() & MODE_BITS != PARENT_MODE {
                 return Err(StoreRefusal::ROOT);
             }
         }
@@ -719,7 +722,7 @@ impl EventSink {
         step: Option<StoreStep>,
         settlement: Option<&str>,
     ) -> Result<()> {
-        let value = json!({"event":event,"slot":SLOT,"request_id":request_id,"publication":publication,"step":step.map(|s|format!("{s:?}")),"settlement":settlement,"active":1});
+        let value = json!({"event":event,"slot":SLOT,"request_id":request_id,"publication":publication,"step":step.map(|s|format!("{s:?}")),"settlement":settlement,"active":ACTIVE_STORE_OPERATIONS});
         self.append("events.jsonl", &value)
     }
     fn refusal(&self, stage: StoreRefusal, request_id: Option<&str>) -> Result<()> {
@@ -860,12 +863,16 @@ fn validate_layout(root: &HeldRoot, fortress: &str, cleanup: bool) -> Result<Rol
             let mut copy_staging = None;
             let mut staging_bytes = 0;
             // One serialized publication permits one staging copy in addition to the capped retained set.
-            for leaf in enumerate(&copies, D_COPY_ENTRIES_MAX + 1)? {
+            for leaf in enumerate(&copies, D_COPY_ENTRIES_MAX + D_DIRECTORY_SENTINEL)? {
                 if let Some(target) = leaf
                     .strip_prefix('.')
                     .and_then(|s| s.strip_suffix(".staging"))
                 {
-                    if copy_staging.is_some() || parse_sequence(target) != drained.checked_add(1) {
+                    // Without a record there is no authorized next copy, so staging must not turn stray evidence into absence.
+                    if state.record.is_none()
+                        || copy_staging.is_some()
+                        || parse_sequence(target) != drained.checked_add(1)
+                    {
                         return Err(StoreRefusal::STAGING);
                     }
                     let f = open_at(
@@ -1055,6 +1062,7 @@ impl<'a> Store<'a> {
             anchor: record.map(|r| r.anchor.clone()),
             anchor_digest: record.and_then(|r| anchor::anchor_digest(&r.anchor)),
             latched: record.is_some_and(|r| r.anchor["recovery_required"] == true),
+            // Unknown slots observe as uncertain absence without IO or changing the producer flag; d2 admits only the producer slot and refuses every mutation while uncertain.
             uncertain: self.uncertain || slot != SLOT,
         }
     }

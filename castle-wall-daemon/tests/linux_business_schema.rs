@@ -738,6 +738,33 @@ fn complete_descriptor_vectors() {
             .map(String::as_str)
             .collect()
     );
+    // Runtime primitive bounds must match the shared schema, not just its field names and digest.
+    for (actual, expected) in [
+        (
+            anchor::ID_HEX_LENGTH as u64,
+            &schema["domains"]["id_hex_length"],
+        ),
+        (
+            anchor::DIGEST_HEX_LENGTH as u64,
+            &schema["domains"]["digest_hex_length"],
+        ),
+        (
+            anchor::KEY_HEX_LENGTH as u64,
+            &schema["domains"]["key_hex_length"],
+        ),
+        (anchor::SAFE_INTEGER, &schema["domains"]["safe_integer_max"]),
+        (anchor::D_EPOCH_MAX, &schema["descriptor"]["epoch_max"]),
+        (
+            anchor::D_DESCRIPTOR_EPOCHS_MAX as u64,
+            &schema["descriptor"]["epochs_max"],
+        ),
+        (
+            anchor::D_DESCRIPTOR_MAX_BYTES as u64,
+            &schema["descriptor"]["max_bytes"],
+        ),
+    ] {
+        assert_eq!(json!(actual), *expected);
+    }
     let c = corpus("drain_vectors.json");
     assert_eq!(c["schema_sha256"], anchor::DRAIN_SCHEMA_DIGEST);
     let rows = c["descriptor"].as_array().unwrap();

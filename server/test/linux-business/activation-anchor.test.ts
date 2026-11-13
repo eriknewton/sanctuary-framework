@@ -104,6 +104,9 @@ const drainSchema = JSON.parse(drainSchemaBytes.toString());
 it("generated anchor and descriptor schema identity agrees with the complete shared contract", () => {
   expect(anchorModule.DRAIN_SCHEMA_DIGEST).toBe("sha256:" + createHash("sha256").update(drainSchemaBytes).digest("hex"));
   expect([...anchorModule.ANCHOR_FIELDS]).toEqual(Object.keys(drainSchema.anchor));
+  expect([anchorModule.ID_HEX_LENGTH, anchorModule.DIGEST_HEX_LENGTH, anchorModule.KEY_HEX_LENGTH, anchorModule.SAFE_INTEGER, anchorModule.D_EPOCH_MAX, anchorModule.D_DESCRIPTOR_EPOCHS_MAX, anchorModule.D_DESCRIPTOR_MAX_BYTES]).toEqual([drainSchema.domains.id_hex_length, drainSchema.domains.digest_hex_length, drainSchema.domains.key_hex_length, drainSchema.domains.safe_integer_max, drainSchema.descriptor.epoch_max, drainSchema.descriptor.epochs_max, drainSchema.descriptor.max_bytes]);
+  expect(anchorSchema.safeParse({...anchor, generation_high_water: drainSchema.domains.safe_integer_max}).success).toBe(true);
+  expect(anchorSchema.safeParse({...anchor, generation_high_water: drainSchema.domains.safe_integer_max + 1}).success).toBe(false);
 });
 function executeProposal(c: any) {
   try { decodeAnchorMessage(canonicalBytes(c.message)); } catch { return [c.id, false, "DECODE", null]; }
