@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 // Must match checkCorpus in server/test/fixtures/business-corpus.ts.
 pub const REQUIRED_CORPORA: &[&str] = &[
     "closure_vectors.json",
+    "drain_vectors.json",
     "generator_vectors.json",
     "profile_selector_vectors.json",
     "public_vectors.json",
@@ -102,6 +103,7 @@ pub fn checked(manifest: &str, name: &str, bytes: &str) -> Value {
 }
 pub fn corpus(name: &str) -> Value {
     let bytes = match name {
+        "drain_vectors.json" => include_str!("../../src/business_profile/drain_vectors.json"),
         "closure_vectors.json" => include_str!("../../src/business_profile/closure_vectors.json"),
         "generator_vectors.json" => {
             include_str!("../../src/business_profile/generator_vectors.json")

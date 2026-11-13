@@ -1,0 +1,30 @@
+import {readFileSync, writeFileSync} from "node:fs";
+import {createHash} from "node:crypto";
+const root = new URL("../", import.meta.url);
+const source = readFileSync(new URL("castle-wall-daemon/src/business_profile/drain_schema.json", root), "utf8");
+const schema = JSON.parse(source);
+const q = JSON.stringify;
+const pin = '// must match `drain_schema.json` via `scripts/generate-drain-contract.mjs`';
+const digest = 'sha256:' + createHash('sha256').update(source).digest('hex');
+function emit(path, name, body) {
+  const target = new URL(path, root), old = readFileSync(target, 'utf8');
+  const begin = `// ${name}_BEGIN\n`, end = `// ${name}_END`;
+  if (old.split(begin).length !== 2 || old.split(end).length !== 2) throw new Error('DRAIN_GENERATED_REGION');
+  const value = old.slice(0, old.indexOf(begin)) + begin + pin + '\n' + body + '\n' + old.slice(old.indexOf(end));
+  if (process.argv.includes('--check')) { if (value !== old) throw new Error('DRAIN_GENERATED_DIFFERENCE ' + path); }
+  else writeFileSync(target, value);
+}
+const domains = {literal1:'z.literal(1)', producer:`z.literal(${q(schema.domains.producer)})`, id:'id', digest:'digest', commitment:'z.union([z.literal("GENESIS"), digest])', boolean:'z.boolean()', nullableId:'id.nullable()', nullableDigest:'digest.nullable()', nullableReason:'reason.nullable()', safeInteger:'safeInteger', positiveInteger:'safeInteger.min(1)'};
+if (Object.values(schema.anchor).some(d => !Object.hasOwn(domains,d))) throw new Error('DRAIN_DOMAIN');
+const ts = `export const DRAIN_SCHEMA_DIGEST = ${q(digest)};\nexport const ANCHOR_FIELDS = ${q(Object.keys(schema.anchor))} as const;\nconst id = z.string().regex(/^[a-f0-9]{${schema.domains.id_hex_length}}$/);\nconst digest = z.string().regex(/^sha256:[a-f0-9]{${schema.domains.digest_hex_length}}$/);\nconst reason = z.enum(${q(schema.domains.reasons)});\nconst anchorShape = z.object({\n${Object.entries(schema.anchor).map(([k,v])=>`  ${k}: ${domains[v]},`).join('\n')}\n}).strict();\nconst MESSAGE_KEYS = ${q(schema.message.keys)} as const;\nconst BODY_DIGEST_RULE = ${q(schema.message.body_digest)} as const;\nconst DESCRIPTOR_ROOT = ${q(schema.descriptor.root)} as const;\nconst DESCRIPTOR_ENTRY = ${q(schema.descriptor.entry)} as const;\nexport const D_DESCRIPTOR_EPOCHS_MAX = ${schema.descriptor.epochs_max};\nexport const D_DESCRIPTOR_MAX_BYTES = ${schema.descriptor.max_bytes};\nexport const D_EPOCH_MAX = ${schema.descriptor.epoch_max};`;
+let rs = `pub const DRAIN_SCHEMA_DIGEST: &str =\n    ${q(digest)};\npub const ID_HEX_LENGTH: usize = ${schema.domains.id_hex_length};\npub const DIGEST_HEX_LENGTH: usize = ${schema.domains.digest_hex_length};\npub const KEY_HEX_LENGTH: usize = ${schema.domains.key_hex_length};\npub const PRODUCER_ROLE: &str = ${q(schema.domains.producer)};\n#[rustfmt::skip]\npub const REASONS: &[&str] = &[${schema.domains.reasons.map(q).join(", ")}];\npub const SAFE_INTEGER: u64 = ${schema.descriptor.epoch_max}; // Largest exact JSON integer.\n#[rustfmt::skip]\npub const FIELDS: &[&str] = &[${Object.keys(schema.anchor).map(q).join(', ')}];\n`;
+for (const [name,fields] of [['ANCHOR_DOMAINS',schema.anchor],['DESCRIPTOR_ROOT',schema.descriptor.root],['DESCRIPTOR_ENTRY',schema.descriptor.entry]]) rs+=`#[rustfmt::skip]\npub const ${name}: &[(&str, &str)] = &[\n${Object.entries(fields).map(([k,v])=>`    (${q(k)}, ${q(v)}),`).join('\n')}\n];\n`;
+rs+=`#[rustfmt::skip]\nconst MESSAGE_KEYS: &[&str] = &[${schema.message.keys.map(q).join(', ')}];\n#[rustfmt::skip]\nconst BODY_DIGEST_OPS: &[&str] = &[${schema.message.body_digest.ops.map(q).join(', ')}];\nconst BODY_DIGEST_CONDITIONAL_OP: &str = ${q(schema.message.body_digest.conditional_op)};\nconst BODY_DIGEST_EXPECTED_FIELD: &str = ${q(schema.message.body_digest.expected_null_field)};\npub const D_DESCRIPTOR_EPOCHS_MAX: usize = super::signer_contract::SIGNER_EPOCHS_MAX;\npub const D_DESCRIPTOR_MAX_BYTES: usize = super::custody::CONFIG_MAX_BYTES;\npub const D_EPOCH_MAX: u64 = SAFE_INTEGER;`;
+emit('castle-wall-daemon/src/business_profile/activation_anchor.rs','DRAIN_SCHEMA',rs);
+emit('server/src/linux-business/activation-anchor.ts','DRAIN_SCHEMA',ts);
+emit('server/src/linux-business/profile-selection.ts','DRAIN_INVENTORY',schema.inventory.map(e=>`export const ${e.name} = ${q(e.path)};`).join('\n')+`\nexport const BUSINESS_EVIDENCE = Object.freeze([\n${schema.inventory.map(e=>'  '+e.name+',').join('\n')}\n]);`);
+const aliases={BUSINESS_SIGNER_CONFIG:'CONFIG_PATH',BUSINESS_CUSTODY_ROOT:'CUSTODY_ROOT'};
+emit('castle-wall-daemon/src/config.rs','DRAIN_INVENTORY',schema.inventory.map(e=>(aliases[e.name]?'#[cfg(target_os = "linux")]\n':'')+`#[rustfmt::skip]\npub const ${e.name}: &str = ${aliases[e.name]?'crate::business_profile::custody::'+aliases[e.name]:q(e.path)};`).join('\n')+`\n#[cfg(target_os = "linux")]\npub const BUSINESS_EVIDENCE: &[&str] = &[\n${schema.inventory.map(e=>'    '+e.name+',').join('\n')}\n];\n#[cfg(all(test, target_os = "linux"))]\n#[test]\n#[rustfmt::skip]\nfn drain_inventory_aliases_match_schema() {\n${schema.inventory.filter(e=>aliases[e.name]).map(e=>`    assert_eq!(${e.name}, ${q(e.path)});`).join('\n')}\n}`);
+
+const messageDomains = {version:'z.literal(ANCHOR_VERSION)', op:'z.enum(ANCHOR_OPS)', request_id:'id', expected:'anchorSchema.nullable()', next:'anchorSchema.nullable()'};
+emit('server/src/linux-business/activation-anchor.ts', 'DRAIN_MESSAGE', `const messageSchema = z.object({\n${schema.message.keys.map(k=>`  ${k}: ${messageDomains[k]},`).join('\n')}\n  body_digest: digest.optional(),\n}).strict();`);

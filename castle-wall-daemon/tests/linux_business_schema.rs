@@ -1,3 +1,4 @@
+// fail-before-exempt: existing cases are format migrations; new entrypoints use predicate-removal evidence.
 use castle_wall_daemon::business_profile::{
     activation_anchor as anchor, protocol_transitions, records, records_schema,
 };
@@ -142,28 +143,40 @@ fn anchor_proposals_and_outside_receipt() {
     assert!(!anchor::reconcile(&old, &old, Some(&receipt), None));
     let mut reserved = old.clone();
     reserved["reserved_sequence"] = json!(1);
-    let m = json!({"version":1,"op":"RESERVE","request_id":"c".repeat(32),"expected":old,"next":reserved});
-    assert_eq!(anchor::propose(&old, &m), Some(reserved.clone()));
+    reserved["reserved_body_digest"] = json!(format!("sha256:{}", "d".repeat(64)));
+    let m = json!({"version":1,"op":"RESERVE","body_digest":reserved["reserved_body_digest"],"request_id":"c".repeat(32),"expected":old,"next":reserved});
+    assert_eq!(
+        anchor::propose(anchor::Prior::Present(&old), &m),
+        Some(reserved.clone())
+    );
     let mut stale = old.clone();
     stale["generation_high_water"] = json!(1);
     let mut stale_message = m.clone();
     stale_message["next"]["generation_high_water"] = json!(1);
-    assert!(anchor::propose(&stale, &stale_message).is_none());
+    assert!(anchor::propose(anchor::Prior::Present(&stale), &stale_message).is_none());
     let mut committed = reserved.clone();
     committed["committed_sequence"] = json!(1);
+    committed["reserved_body_digest"] = Value::Null;
     committed["committed_digest"] = json!(format!("sha256:{}", "d".repeat(64)));
     let mut m = m;
     m["expected"] = reserved.clone();
     m["next"] = committed.clone();
     m["op"] = json!("COMMIT");
-    assert_eq!(anchor::propose(&reserved, &m), Some(committed.clone()));
+    assert_eq!(
+        anchor::propose(anchor::Prior::Present(&reserved), &m),
+        Some(committed.clone())
+    );
     let mut drained = committed.clone();
     drained["drained_sequence"] = json!(1);
     drained["drained_digest"] = committed["committed_digest"].clone();
     m["expected"] = committed.clone();
     m["next"] = drained.clone();
     m["op"] = json!("DRAIN");
-    assert_eq!(anchor::propose(&committed, &m), Some(drained));
+    m.as_object_mut().unwrap().remove("body_digest");
+    assert_eq!(
+        anchor::propose(anchor::Prior::Present(&committed), &m),
+        Some(drained)
+    );
     let mut latched = old.clone();
     latched["recovery_required"] = json!(true);
     latched["recovery_reason"] = json!("integrity");
@@ -171,11 +184,14 @@ fn anchor_proposals_and_outside_receipt() {
     m["expected"] = old.clone();
     m["next"] = latched.clone();
     m["op"] = json!("LATCH");
-    assert_eq!(anchor::propose(&old, &m), Some(latched.clone()));
+    assert_eq!(
+        anchor::propose(anchor::Prior::Present(&old), &m),
+        Some(latched.clone())
+    );
     m["expected"] = latched.clone();
     m["next"] = old.clone();
     m["op"] = json!("RECOVERY_COMMIT");
-    assert!(anchor::propose(&latched, &m).is_none());
+    assert!(anchor::propose(anchor::Prior::Present(&latched), &m).is_none());
     for key in old.as_object().unwrap().keys() {
         let mut bad = old.clone();
         bad.as_object_mut().unwrap().remove(key);
@@ -265,8 +281,8 @@ fn closure_anchor_vectors() {
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for c in corpus["anchors"].as_array().unwrap() {
-        let m = json!({"version":1,"op":c["op"],"request_id":c["request_id"],"expected":c["old"],"next":c["next"]});
-        let result = anchor::propose(&c["old"], &m);
+        let m = c["message"].clone();
+        let result = anchor::propose(anchor::Prior::Present(&c["old"]), &m);
         // The whole returned tuple is compared, so a wrong accepted proposal cannot pass on its accept bit.
         let want = if c["accept"] == true {
             if c["next"].is_null() {
@@ -277,8 +293,21 @@ fn closure_anchor_vectors() {
         } else {
             Value::Null
         };
-        actual.push(json!([c["id"], result.unwrap_or(Value::Null)]));
-        expected.push(json!([c["id"], want]));
+        let bytes = castle_wall_daemon::smb::jcs::encode(&m).unwrap();
+        let stage = if anchor::decode_message(bytes.as_bytes()).is_none() {
+            json!("DECODE")
+        } else if result.is_none() {
+            json!("PROPOSE")
+        } else {
+            Value::Null
+        };
+        actual.push(json!([
+            c["id"],
+            result.is_some(),
+            stage,
+            result.unwrap_or(Value::Null)
+        ]));
+        expected.push(json!([c["id"], c["accept"], c["stage"], want]));
     }
     eprintln!("CLOSURE_RESULTS {}", json!(actual));
     assert_eq!(actual, expected);
@@ -506,12 +535,12 @@ fn closure_reserve_latch_commit_sequence() {
     let mut state = case("reserve")["old"].clone();
     for id in ["reserve", "latch"] {
         let c = case(id);
-        let message = json!({"version":1,"op":c["op"],"request_id":c["request_id"],"expected":state,"next":c["next"]});
-        state = anchor::propose(&state, &message).unwrap();
+        let message = c["message"].clone();
+        state = anchor::propose(anchor::Prior::Present(&state), &message).unwrap();
     }
     let c = case("latched-commit");
-    let message = json!({"version":1,"op":c["op"],"request_id":c["request_id"],"expected":state,"next":c["next"]});
-    let accepted = anchor::propose(&state, &message).is_some();
+    let message = c["message"].clone();
+    let accepted = anchor::propose(anchor::Prior::Present(&state), &message).is_some();
     eprintln!(
         "CLOSURE_RESULTS {}",
         json!([["closure reserve-latch-commit sequence", accepted]])
@@ -528,6 +557,7 @@ fn shared_manifest_pins_every_k1c_corpus() {
         names,
         [
             "closure_vectors.json",
+            "drain_vectors.json",
             "generator_vectors.json",
             "profile_selector_vectors.json",
             "public_vectors.json",
@@ -546,19 +576,23 @@ fn closure_activation_return_sequence() {
     let corpus = corpus("closure_vectors.json");
     let cases = corpus["anchors"].as_array().unwrap();
     let case = |id: &str| cases.iter().find(|c| c["id"] == id).unwrap();
-    let message = |c: &Value, expected: &Value| json!({"version":1,"op":c["op"],"request_id":c["request_id"],"expected":expected,"next":c["next"]});
+    let message = |c: &Value, _expected: &Value| c["message"].clone();
     let forward = case("advance_activation");
-    let state = anchor::propose(&forward["old"], &message(forward, &forward["old"])).unwrap();
+    let state = anchor::propose(
+        anchor::Prior::Present(&forward["old"]),
+        &message(forward, &forward["old"]),
+    )
+    .unwrap();
     let back = case("advance-activation-return");
     assert_eq!(state, back["old"]);
     assert_eq!(
         back["next"]["activation_id"],
         forward["old"]["activation_id"]
     );
-    assert!(anchor::propose(&state, &message(back, &state)).is_none());
+    assert!(anchor::propose(anchor::Prior::Present(&state), &message(back, &state)).is_none());
     let onward = case("advance-activation-forward");
     assert_eq!(
-        anchor::propose(&state, &message(onward, &state)),
+        anchor::propose(anchor::Prior::Present(&state), &message(onward, &state)),
         Some(onward["next"].clone())
     );
 }
@@ -615,7 +649,7 @@ fn closure_recover_vectors() {
             None => json!("RECONCILE"),
             Some(base) => {
                 let m = json!({"version":1,"op":"PREPARE","request_id":c["transaction"]["transaction_id"],"expected":base,"next":c["ack"]});
-                if anchor::propose(base, &m).as_ref() == Some(&c["ack"]) {
+                if anchor::propose(anchor::Prior::Present(base), &m).as_ref() == Some(&c["ack"]) {
                     Value::Null
                 } else {
                     json!("D_ACK")
@@ -632,4 +666,113 @@ fn closure_recover_vectors() {
     }
     eprintln!("CLOSURE_RESULTS {}", json!(actual));
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn complete_absent_and_reserved_digest_vectors() {
+    let c = corpus("closure_vectors.json");
+    for group in ["absent", "reserved_digest"] {
+        let cases = c[group].as_array().unwrap();
+        let actual: Vec<_> = cases
+            .iter()
+            .map(|c| {
+                let prior = if c["prior"].is_null() {
+                    anchor::Prior::Absent
+                } else {
+                    anchor::Prior::Present(&c["prior"])
+                };
+                let bytes = castle_wall_daemon::smb::jcs::encode(&c["message"]).unwrap();
+                if anchor::decode_message(bytes.as_bytes()).is_none() {
+                    return json!([c["id"], false, "DECODE", null]);
+                }
+                match anchor::propose(prior, &c["message"]) {
+                    Some(v) => json!([c["id"], true, null, v]),
+                    None => json!([c["id"], false, "PROPOSE", null]),
+                }
+            })
+            .collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|c| json!([c["id"], c["accept"], c["stage"], c["value"]]))
+            .collect();
+        assert_eq!(actual, expected, "{group}");
+        assert_eq!(
+            cases
+                .iter()
+                .map(|c| c["id"].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            cases.len()
+        );
+    }
+    for c in c["observation"].as_array().unwrap() {
+        let prior = if c["prior"].is_null() {
+            anchor::Prior::Absent
+        } else {
+            anchor::Prior::Present(&c["prior"])
+        };
+        assert_eq!(
+            anchor::observe(prior),
+            json!({"state":c["expect"],"latched":c["latched"]})
+        );
+    }
+}
+#[test]
+fn complete_descriptor_vectors() {
+    use sha2::{Digest, Sha256};
+    let schema = include_str!("../src/business_profile/drain_schema.json");
+    assert_eq!(
+        anchor::DRAIN_SCHEMA_DIGEST,
+        format!("sha256:{}", hex::encode(Sha256::digest(schema.as_bytes())))
+    );
+    let schema: Value = serde_json::from_str(schema).unwrap();
+    assert_eq!(
+        anchor::FIELDS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        schema["anchor"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    );
+    let c = corpus("drain_vectors.json");
+    assert_eq!(c["schema_sha256"], anchor::DRAIN_SCHEMA_DIGEST);
+    let rows = c["descriptor"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        rows.len()
+    );
+    let actual: Vec<_> = rows.iter().map(|c| match anchor::parse_descriptor(c["bytes"].as_str().unwrap().as_bytes(),c["pin"].as_str().unwrap()) {
+        Err(stage) => json!([c["id"],false,format!("{stage:?}"),null]),
+        Ok(v) => json!([c["id"],true,null,{"fortress_id":v.fortress_id,"machine_id":v.machine_id,"identity_id":v.identity_id,"epochs":v.epochs.iter().map(|e|json!({"role":e.role,"epoch":e.epoch,"kid":e.kid,"public_key_hex":hex::encode(e.public_key)})).collect::<Vec<_>>()}]),
+    }).collect();
+    let expected: Vec<_> = rows
+        .iter()
+        .map(|c| json!([c["id"], c["accept"], c["stage"], c["value"]]))
+        .collect();
+    assert_eq!(actual, expected);
+}
+#[test]
+fn maximal_descriptor_fits() {
+    use sha2::{Digest, Sha256};
+    let role = "extension:linux-business-retrospective-v0";
+    let epochs: Vec<_> = (0..anchor::D_DESCRIPTOR_EPOCHS_MAX).map(|i| {
+        let epoch=anchor::D_EPOCH_MAX-anchor::D_DESCRIPTOR_EPOCHS_MAX as u64+i as u64+1;
+        json!({"role":role,"epoch":epoch,"kid":castle_wall_daemon::business_profile::role_kid(role,epoch,&[255;32]).unwrap(),"public_key":hex::encode([255;32])})
+    }).collect();
+    let v = json!({"version":1,"fortress_id":"f".repeat(32),"machine_id":"f".repeat(32),"identity_id":"f".repeat(32),"epochs":epochs});
+    let bytes = castle_wall_daemon::smb::jcs::encode(&v).unwrap();
+    eprintln!("DESCRIPTOR_MAX_MEASURED {}", bytes.len());
+    assert!(bytes.len() <= anchor::D_DESCRIPTOR_MAX_BYTES);
+    assert!(anchor::parse_descriptor(
+        bytes.as_bytes(),
+        &format!("sha256:{}", hex::encode(Sha256::digest(bytes.as_bytes())))
+    )
+    .is_ok());
 }

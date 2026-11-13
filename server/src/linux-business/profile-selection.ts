@@ -7,17 +7,27 @@ export const DAEMON_PROFILE_REFUSAL_EXIT_STATUS = 1;
 // Existing wrap refusal convention; pinned by linux-profile-selection-callers.test.ts.
 export const WRAP_PROFILE_REFUSAL_EXIT_STATUS = 2;
 
-// Must match config.rs and the complete inventory in profile_selector_vectors.json.
+// DRAIN_INVENTORY_BEGIN
+// must match `drain_schema.json` via `scripts/generate-drain-contract.mjs`
 export const BUSINESS_PROFILE_SELECTOR = "/etc/sanctuary/business-profile.json";
 export const BUSINESS_SIGNER_CONFIG = "/etc/sanctuary/business-signer.json";
 export const BUSINESS_SIGNER_PEER_POLICY = "/etc/sanctuary/business-signer-peer.json";
 export const BUSINESS_SIGNER_CONTROLLER_POLICY = "/etc/sanctuary/business-signer-controller.json";
 export const BUSINESS_WRITER_CONFIG = "/etc/sanctuary/business-writer.json";
+export const BUSINESS_DRAIN_CONFIG = "/etc/sanctuary/business-drain.json";
 export const BUSINESS_CUSTODY_ROOT = "/var/lib/sanctuary-business-signer";
 export const BUSINESS_DRAIN_ROOT = "/var/lib/sanctuary-business-drain";
-export const BUSINESS_EVIDENCE = Object.freeze([BUSINESS_PROFILE_SELECTOR, BUSINESS_SIGNER_CONFIG,
-  BUSINESS_SIGNER_PEER_POLICY, BUSINESS_SIGNER_CONTROLLER_POLICY, BUSINESS_WRITER_CONFIG,
-  BUSINESS_CUSTODY_ROOT, BUSINESS_DRAIN_ROOT]);
+export const BUSINESS_EVIDENCE = Object.freeze([
+  BUSINESS_PROFILE_SELECTOR,
+  BUSINESS_SIGNER_CONFIG,
+  BUSINESS_SIGNER_PEER_POLICY,
+  BUSINESS_SIGNER_CONTROLLER_POLICY,
+  BUSINESS_WRITER_CONFIG,
+  BUSINESS_DRAIN_CONFIG,
+  BUSINESS_CUSTODY_ROOT,
+  BUSINESS_DRAIN_ROOT,
+]);
+// DRAIN_INVENTORY_END
 export const RAW_STATE_ROOT = "/var/lib/sanctuary";
 export const RAW_RUNTIME_ROOT = "/run/sanctuary";
 export const RAW_STATE_RELATIVE = "policy/egress/audit-producer.key";

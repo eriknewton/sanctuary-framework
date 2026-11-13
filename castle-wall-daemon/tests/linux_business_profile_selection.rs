@@ -459,3 +459,32 @@ fn candidate_caps_and_descriptor_lifetime_are_bounded() {
     );
     assert_eq!(fs::read_dir("/proc/self/fd").unwrap().count(), before);
 }
+
+#[test]
+fn drain_inventory_matches_shared_schema() {
+    let schema: Value =
+        serde_json::from_str(include_str!("../src/business_profile/drain_schema.json")).unwrap();
+    let paths: Vec<_> = schema["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(BUSINESS_EVIDENCE, paths);
+    assert_eq!(BUSINESS_EVIDENCE[0], BUSINESS_PROFILE_SELECTOR);
+}
+
+#[test]
+fn drain_config_only_selects_business() {
+    let _guard = isolation::guard();
+    let corpus = checked_corpus::corpus("profile_selector_vectors.json");
+    let case = corpus["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "drain-config-only")
+        .unwrap();
+    let root = TempDir::new().unwrap();
+    let roots = fixture(root.path(), case);
+    assert_eq!(project(select_profile(&roots, &[])), case["expect"]);
+}
