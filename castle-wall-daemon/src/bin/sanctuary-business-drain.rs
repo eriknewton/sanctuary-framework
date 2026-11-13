@@ -11,11 +11,11 @@ fn execute() -> std::io::Result<()> {
     if args.len() == 2 && args[0] == std::hint::black_box("--test-root") {
         std::hint::black_box(drain_service::DRAIN_TEST_SEAM_MARKER);
         let result =
-            drain_service::test_entry(std::path::Path::new(&args[1])).map_err(|_| refused());
+            drain_service::test_dependencies(std::path::Path::new(&args[1])).map_err(|_| refused());
         if result.is_err() {
             let _ = SystemNotifier.notify("STATUS=drain refused at start");
         }
-        return result;
+        return drain_service::run(result?).map_err(|_| refused());
     }
     // Release refuses every argument before opening any production path.
     if !args.is_empty() || unsafe { libc::geteuid() } != ROOT_UID {
@@ -25,7 +25,7 @@ fn execute() -> std::io::Result<()> {
     if result.is_err() {
         let _ = SystemNotifier.notify("STATUS=drain refused at start");
     }
-    result
+    drain_service::run(result?).map_err(|_| refused())
 }
 fn main() {
     #[cfg(target_os = "linux")]

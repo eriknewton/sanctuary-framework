@@ -14,7 +14,10 @@ fn start_without_wall_or_bus_and_restart_stale_socket() {
     fs::remove_file(f.bus.root.path().join("bus")).unwrap();
     f.child = Some(f.spawn());
     let ready = f.try_notification();
-    assert!(ready.as_ref().is_some_and(|s| s.contains("READY=1")), "READY=1 before any W connection");
+    assert!(
+        ready.as_ref().is_some_and(|s| s.contains("READY=1")),
+        "READY=1 before any W connection"
+    );
     assert_eq!(f.read(true)["state"], "ABSENT");
     f.prepare();
     f.stop();

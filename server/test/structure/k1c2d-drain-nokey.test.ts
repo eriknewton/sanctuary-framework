@@ -18,7 +18,9 @@ function closing(source: string, start: number): number {
   throw new Error("unresolved item boundary");
 }
 function production(source: string): string {
-  source = source.replace(/\/\/[^\n]*/g, "");
+  // Match strings before comments, so a URL or raw string cannot hide reached code.
+  source = source.replace(/r(#+)"[\s\S]*?"\1|"(?:\\.|[^"\\])*"|b?'(?:\\.|[^'\\])'|\/\/[^\n]*|\/\*[\s\S]*?\*\//g,
+    value => value.startsWith("//") || value.startsWith("/*") ? value.replace(/[^\n]/g, " ") : value);
   for (;;) {
     const match = /#\[cfg\((?:test|feature\s*=\s*"test-isolation")\)\]/.exec(source);
     if (!match) break;
@@ -102,6 +104,9 @@ it("reachability follows local helpers and aliases without promoting unrelated i
   for (const imported of ["use ed25519_dalek::SigningKey as Hidden;", "use ed25519_dalek::{SigningKey as Hidden};", "type Hidden = ed25519_dalek::SigningKey;"]) {
     expect(() => reachable(`${imported} fn entry() { helper(); } fn helper() { Hidden::from_bytes(); }`, ["entry"])).toThrow("forbidden production item");
   }
+  for (const literal of ['"https://local"', 'r#"https://local"#']) {
+    expect(() => reachable(production(`fn entry() { let url = ${literal}; SigningKey::from_bytes(); }`), ["entry"])).toThrow("forbidden production item");
+  }
   expect(() => reachable("fn unrelated() {}", ["entry"])).toThrow("unresolved");
   expect(() => reachable("fn entry() { unknown_module::helper(); }", ["entry"])).toThrow("unresolved");
   expect(() => reachable("fn entry() { missing_helper(); }", ["entry"])).toThrow("unresolved");
@@ -115,6 +120,7 @@ it("drain production items have no key constructor, signer client or worker laun
   let failure = "";
   try { graph = reachable(source, ["production", "run", "request", "process", "verify_commit", "verify_original"]); }
   catch (error) { failure = (error as Error).message; }
+  expect(failure).not.toMatch(/forbidden production item/);
   expect(failure, "production traversal must succeed; forbidden production item identifies a key-construction kill").toBe("");
   for (const item of ["descriptor", "capture", "revalidate", "prepare_socket", "publish"]) expect(graph).toContain(item);
   const writer = production(readFileSync("../castle-wall-daemon/src/business_profile/writer_protocol.rs", "utf8"));

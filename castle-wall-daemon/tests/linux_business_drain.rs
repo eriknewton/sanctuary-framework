@@ -31,12 +31,25 @@ fn genesis_phase_retry_restart_and_conflict() {
     let id = "c".repeat(32);
     let mut next = f.anchor.clone();
     next["transaction_id"] = json!(id);
-    let prepare = anchor_packet(&json!({"version":1,"op":"PREPARE","request_id":id,"expected":null,"next":next}), &[]);
-    let commit = anchor_packet(&json!({"version":1,"op":"COMMIT","request_id":id,"expected":next,"next":f.anchor}), &[]);
+    let prepare = anchor_packet(
+        &json!({"version":1,"op":"PREPARE","request_id":id,"expected":null,"next":next}),
+        &[],
+    );
+    let commit = anchor_packet(
+        &json!({"version":1,"op":"COMMIT","request_id":id,"expected":next,"next":f.anchor}),
+        &[],
+    );
     for packet in [&prepare, &commit] {
         let reply = f.request(true, packet);
-        assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("ANCHOR_ACK"), "PREPARE then custody COMMIT share one id");
-        assert!(!f.stages().contains(&"RETRY".into()), "PREPARE then custody COMMIT must not conflict");
+        assert_eq!(
+            reply.as_ref().and_then(|r| r["op"].as_str()),
+            Some("ANCHOR_ACK"),
+            "PREPARE then custody COMMIT share one id"
+        );
+        assert!(
+            !f.stages().contains(&"RETRY".into()),
+            "PREPARE then custody COMMIT must not conflict"
+        );
     }
     assert_eq!(f.request(true, &prepare).unwrap()["op"], "REFUSED");
     let count = f
@@ -78,7 +91,11 @@ fn genesis_phase_retry_restart_and_conflict() {
         json!(f.anchor["generation_high_water"].as_u64().unwrap() + 1);
     assert!(f.request(true, &anchor_packet(&m, &[])).is_none());
     assert_eq!(f.read(false)["state"], "PRESENT");
-    assert_eq!(fs::read_to_string(f.root.join("diagnostics.log")).unwrap(), "drain authority closed\n", "one content-free diagnostic per authority closure");
+    assert_eq!(
+        fs::read_to_string(f.root.join("diagnostics.log")).unwrap(),
+        "drain authority closed\n",
+        "one content-free diagnostic per authority closure"
+    );
 }
 #[test]
 fn signed_commits_originals_and_ledger_conflict() {
@@ -311,21 +328,44 @@ fn every_commit_evidence_stage_refuses_before_publication() {
     ] {
         let mut f = Fixture::new();
         let foreign = castle_wall_daemon::business_profile::signer_contract::ROLE_REGISTRY
-            .iter().find(|r| r.0 != ROLE).unwrap();
+            .iter()
+            .find(|r| r.0 != ROLE)
+            .unwrap();
         let foreign_kid = castle_wall_daemon::business_profile::role_kid(
-            foreign.0, f.body["epoch"].as_u64().unwrap(), &f.key.verifying_key().to_bytes()).unwrap();
+            foreign.0,
+            f.body["epoch"].as_u64().unwrap(),
+            &f.key.verifying_key().to_bytes(),
+        )
+        .unwrap();
         if stage == "ENVELOPE_FOREIGN_ROLE" {
-            let path = f.root.join("custody").join(FORTRESS).join(SLOT).join("public/epochs.json");
+            let path = f
+                .root
+                .join("custody")
+                .join(FORTRESS)
+                .join(SLOT)
+                .join("public/epochs.json");
             let mut descriptor: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             descriptor["epochs"].as_array_mut().unwrap().push(json!({"role":foreign.0,"epoch":f.body["epoch"],"kid":foreign_kid,"public_key":hex::encode(f.key.verifying_key().to_bytes())}));
             let bytes = canonical(&descriptor);
             f.anchor["descriptor_digest"] = json!(packet_digest(&bytes));
             fs::write(path, bytes).unwrap();
         }
-        if matches!(stage, "DESCRIPTOR_FORTRESS" | "DESCRIPTOR_MACHINE" | "DESCRIPTOR_IDENTITY") {
-            let path = f.root.join("custody").join(FORTRESS).join(SLOT).join("public/epochs.json");
+        if matches!(
+            stage,
+            "DESCRIPTOR_FORTRESS" | "DESCRIPTOR_MACHINE" | "DESCRIPTOR_IDENTITY"
+        ) {
+            let path = f
+                .root
+                .join("custody")
+                .join(FORTRESS)
+                .join(SLOT)
+                .join("public/epochs.json");
             let mut descriptor: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            let field = match stage { "DESCRIPTOR_FORTRESS" => "fortress_id", "DESCRIPTOR_MACHINE" => "machine_id", _ => "identity_id" };
+            let field = match stage {
+                "DESCRIPTOR_FORTRESS" => "fortress_id",
+                "DESCRIPTOR_MACHINE" => "machine_id",
+                _ => "identity_id",
+            };
             descriptor[field] = json!("f".repeat(32));
             let bytes = canonical(&descriptor);
             f.anchor["descriptor_digest"] = json!(packet_digest(&bytes));
@@ -373,14 +413,22 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
             use ed25519_dalek::Signer;
             // Build hostile bytes directly: the fixture encoder correctly rejects foreign roles.
-            let signature = f.key.sign(&[foreign.1.as_bytes(), &canonical(&body)].concat());
+            let signature = f
+                .key
+                .sign(&[foreign.1.as_bytes(), &canonical(&body)].concat());
             let mut outer = serde_json::Map::new();
             for key in castle_wall_daemon::business_profile::signer_contract::LINUX_FIELDS
-                .iter().copied().filter(|key| !key.ends_with("_digest"))
-                .chain(std::iter::once("machine_id")) {
+                .iter()
+                .copied()
+                .filter(|key| !key.ends_with("_digest"))
+                .chain(std::iter::once("machine_id"))
+            {
                 outer.insert(key.into(), body[key].clone());
             }
-            outer.insert("signature".into(), json!(URL_SAFE_NO_PAD.encode(signature.to_bytes())));
+            outer.insert(
+                "signature".into(),
+                json!(URL_SAFE_NO_PAD.encode(signature.to_bytes())),
+            );
             canonical(&json!({"body":body,"outer":outer}))
         } else {
             f.signed(&body)
@@ -430,20 +478,31 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             .filter(|v| v["event"] == "StoreEntered")
             .count();
         assert_eq!(
-            f.request(false, &anchor_packet(&m, &envelope)).as_ref().and_then(|r| r["op"].as_str()),
+            f.request(false, &anchor_packet(&m, &envelope))
+                .as_ref()
+                .and_then(|r| r["op"].as_str()),
             Some("REFUSED"),
             "{stage}"
         );
         assert!(
-            f.stages().contains(&stage.split('_').next().unwrap().to_owned()),
+            f.stages()
+                .contains(&stage.split('_').next().unwrap().to_owned()),
             "{stage}: {:?}",
             f.stages()
         );
         assert_eq!(
-            f.events().iter().filter(|v| v["event"] == "StoreEntered").count(), before,
+            f.events()
+                .iter()
+                .filter(|v| v["event"] == "StoreEntered")
+                .count(),
+            before,
             "{stage}: refusal must not publish"
         );
-        assert_eq!(f.read(true)["anchor_digest"], json!(castle_wall_daemon::business_profile::activation_anchor::anchor_digest(&old)), "{stage}: unchanged anchor");
+        assert_eq!(
+            f.read(true)["anchor_digest"],
+            json!(castle_wall_daemon::business_profile::activation_anchor::anchor_digest(&old)),
+            "{stage}: unchanged anchor"
+        );
     }
 }
 #[test]
@@ -460,7 +519,9 @@ fn three_originals_require_each_exact_ledger_entry() {
     let mut bad_signature: Value = serde_json::from_slice(&envelopes[0]).unwrap();
     {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        let mut bytes = URL_SAFE_NO_PAD.decode(bad_signature["outer"]["signature"].as_str().unwrap()).unwrap();
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(bad_signature["outer"]["signature"].as_str().unwrap())
+            .unwrap();
         bytes[0] ^= 1;
         bad_signature["outer"]["signature"] = json!(URL_SAFE_NO_PAD.encode(bytes));
     }
@@ -468,13 +529,33 @@ fn three_originals_require_each_exact_ledger_entry() {
         ("above committed", 4, envelopes[2].clone(), "CHAIN"),
         ("header body sequence", 1, envelopes[1].clone(), "CHAIN"),
         ("gap", 2, envelopes[1].clone(), "CHAIN"),
-        ("changed signature", 1, canonical(&bad_signature), "COMMITMENT"),
+        (
+            "changed signature",
+            1,
+            canonical(&bad_signature),
+            "COMMITMENT",
+        ),
     ] {
         let before = f.read(true)["anchor_digest"].clone();
-        let reply = f.request(false, &original_packet(&"e".repeat(32), sequence, &envelope));
-        assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("REFUSED"), "{case}: original refusal");
-        assert_eq!(f.stages().last().map(String::as_str), Some(stage), "{case}: named refusal stage");
-        assert_eq!(f.read(true)["anchor_digest"], before, "{case}: unchanged anchor");
+        let reply = f.request(
+            false,
+            &original_packet(&"e".repeat(32), sequence, &envelope),
+        );
+        assert_eq!(
+            reply.as_ref().and_then(|r| r["op"].as_str()),
+            Some("REFUSED"),
+            "{case}: original refusal"
+        );
+        assert_eq!(
+            f.stages().last().map(String::as_str),
+            Some(stage),
+            "{case}: named refusal stage"
+        );
+        assert_eq!(
+            f.read(true)["anchor_digest"],
+            before,
+            "{case}: unchanged anchor"
+        );
     }
     assert_eq!(
         f.request(false, &original_packet(&"e".repeat(32), 1, &envelopes[0]))
@@ -502,10 +583,21 @@ fn three_originals_require_each_exact_ledger_entry() {
     }
     let before = f.read(true)["anchor_digest"].clone();
     let reply = f.request(false, &original_packet(&"e".repeat(32), 1, &envelopes[0]));
-    assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("REFUSED"), "stale original refusal");
-    assert_eq!(f.stages().last().map(String::as_str), Some("CHAIN"), "stale original named stage");
-    assert_eq!(f.read(true)["anchor_digest"], before, "stale original unchanged anchor");
-
+    assert_eq!(
+        reply.as_ref().and_then(|r| r["op"].as_str()),
+        Some("REFUSED"),
+        "stale original refusal"
+    );
+    assert_eq!(
+        f.stages().last().map(String::as_str),
+        Some("CHAIN"),
+        "stale original named stage"
+    );
+    assert_eq!(
+        f.read(true)["anchor_digest"],
+        before,
+        "stale original unchanged anchor"
+    );
 }
 #[test]
 fn disconnected_timeout_waves_keep_one_request_until_settlement() {
@@ -780,9 +872,21 @@ fn authority_cells_and_direct_operations_are_closed() {
     let mut foreign = m.clone();
     foreign["next"]["role"] = json!("extension:linux-business-retrospective-v0");
     let reply = f.request(true, &anchor_packet(&foreign, &[]));
-    assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("REFUSED"), "foreign genesis role refuses");
-    assert_eq!(f.stages().last().map(String::as_str), Some("ROLE"), "foreign genesis role stage");
-    assert_eq!(f.read(true)["state"], "ABSENT", "foreign genesis preserves absence");
+    assert_eq!(
+        reply.as_ref().and_then(|r| r["op"].as_str()),
+        Some("REFUSED"),
+        "foreign genesis role refuses"
+    );
+    assert_eq!(
+        f.stages().last().map(String::as_str),
+        Some("ROLE"),
+        "foreign genesis role stage"
+    );
+    assert_eq!(
+        f.read(true)["state"],
+        "ABSENT",
+        "foreign genesis preserves absence"
+    );
     f.prepare();
     let mut next = f.anchor.clone();
     let digest = packet_digest(&canonical(&f.body));
@@ -1512,13 +1616,21 @@ fn competing_reserve_and_advance_share_one_cas_prior() {
 #[test]
 fn schema_role_set_requires_a_role_stage_witness_when_expanded() {
     use castle_wall_daemon::business_profile::{records_schema, signer_contract::ROLE_REGISTRY};
-    let corpus: Value = serde_json::from_str(include_str!("../src/business_profile/record_join_vectors.json")).unwrap();
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../src/business_profile/record_join_vectors.json"
+    ))
+    .unwrap();
     let mut body = corpus["cases"][0]["records"][0]["body"].clone();
     assert!(records_schema::valid(&body), "producer schema control");
     for (role, _) in ROLE_REGISTRY {
-        if *role == ROLE { continue; }
+        if *role == ROLE {
+            continue;
+        }
         body["role"] = json!(role);
-        assert!(!records_schema::valid(&body), "schema admits {role}: add the W-COMMIT-VERIFY ROLE-stage witness");
+        assert!(
+            !records_schema::valid(&body),
+            "schema admits {role}: add the W-COMMIT-VERIFY ROLE-stage witness"
+        );
     }
 }
 
@@ -1537,25 +1649,59 @@ fn drained_original_lost_retry_ack_reconciles_and_conflict_closes_writer() {
     f.w.connect(&f.socket());
     f.w.send(&packet);
     let end = Instant::now() + Duration::from_millis(WAIT_MS);
-    while !f.events()[events..].iter().any(|e| e["publication"] == "copy" && e["step"] == "DirSync") {
-        assert!(Instant::now() < end, "drained retry reaches copy durability barrier");
+    while !f.events()[events..]
+        .iter()
+        .any(|e| e["publication"] == "copy" && e["step"] == "DirSync")
+    {
+        assert!(
+            Instant::now() < end,
+            "drained retry reaches copy durability barrier"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     f.w.command(json!({"op":"close"}));
     write_private(&f.root.join("release-retry"), b"");
     let read = f.read(true);
-    assert_eq!(read["uncertain"], true, "lost drained retry ACK marks uncertainty");
+    assert_eq!(
+        read["uncertain"], true,
+        "lost drained retry ACK marks uncertainty"
+    );
     assert_eq!(read["anchor_digest"], before, "lost retry preserves anchor");
     f.clear();
     let reply = f.request(false, &packet);
-    assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("ORIGINAL_ACK"), "next mutation reconciles the drained retry");
+    assert_eq!(
+        reply.as_ref().and_then(|r| r["op"].as_str()),
+        Some("ORIGINAL_ACK"),
+        "next mutation reconciles the drained retry"
+    );
     let read = f.read(true);
-    assert_eq!(read["uncertain"], false, "reconciled retry clears uncertainty");
-    assert_eq!(read["anchor_digest"], before, "reconciled retry preserves anchor");
+    assert_eq!(
+        read["uncertain"], false,
+        "reconciled retry clears uncertainty"
+    );
+    assert_eq!(
+        read["anchor_digest"], before,
+        "reconciled retry preserves anchor"
+    );
     let mut different = envelope.clone();
     different.push(b' ');
-    assert!(f.request(false, &original_packet(&"f".repeat(32), 1, &different)).is_none(), "different drained bytes close W");
-    assert!(f.request(false, &packet).is_none(), "W remains closed after conflicting drained bytes");
-    assert_eq!(f.read(true)["anchor_digest"], before, "S remains served without changing anchor");
-    assert_eq!(fs::read_to_string(f.root.join("diagnostics.log")).unwrap(), "drain authority closed\n", "one content-free diagnostic for W closure");
+    assert!(
+        f.request(false, &original_packet(&"f".repeat(32), 1, &different))
+            .is_none(),
+        "different drained bytes close W"
+    );
+    assert!(
+        f.request(false, &packet).is_none(),
+        "W remains closed after conflicting drained bytes"
+    );
+    assert_eq!(
+        f.read(true)["anchor_digest"],
+        before,
+        "S remains served without changing anchor"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("diagnostics.log")).unwrap(),
+        "drain authority closed\n",
+        "one content-free diagnostic for W closure"
+    );
 }
