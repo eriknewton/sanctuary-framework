@@ -532,13 +532,45 @@ mod tests {
     }
 }
 
-// Must match inventory and limits in profile_selector_vectors.json and profile-selection.ts.
+// DRAIN_INVENTORY_BEGIN
+// must match `drain_schema.json` via `scripts/generate-drain-contract.mjs`
+#[rustfmt::skip]
 pub const BUSINESS_PROFILE_SELECTOR: &str = "/etc/sanctuary/business-profile.json";
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+pub const BUSINESS_SIGNER_CONFIG: &str = crate::business_profile::custody::CONFIG_PATH;
+#[rustfmt::skip]
 pub const BUSINESS_SIGNER_PEER_POLICY: &str = "/etc/sanctuary/business-signer-peer.json";
-pub const BUSINESS_SIGNER_CONTROLLER_POLICY: &str =
-    "/etc/sanctuary/business-signer-controller.json";
+#[rustfmt::skip]
+pub const BUSINESS_SIGNER_CONTROLLER_POLICY: &str = "/etc/sanctuary/business-signer-controller.json";
+#[rustfmt::skip]
 pub const BUSINESS_WRITER_CONFIG: &str = "/etc/sanctuary/business-writer.json";
+#[rustfmt::skip]
+pub const BUSINESS_DRAIN_CONFIG: &str = "/etc/sanctuary/business-drain.json";
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+pub const BUSINESS_CUSTODY_ROOT: &str = crate::business_profile::custody::CUSTODY_ROOT;
+#[rustfmt::skip]
 pub const BUSINESS_DRAIN_ROOT: &str = "/var/lib/sanctuary-business-drain";
+#[cfg(target_os = "linux")]
+pub const BUSINESS_EVIDENCE: &[&str] = &[
+    BUSINESS_PROFILE_SELECTOR,
+    BUSINESS_SIGNER_CONFIG,
+    BUSINESS_SIGNER_PEER_POLICY,
+    BUSINESS_SIGNER_CONTROLLER_POLICY,
+    BUSINESS_WRITER_CONFIG,
+    BUSINESS_DRAIN_CONFIG,
+    BUSINESS_CUSTODY_ROOT,
+    BUSINESS_DRAIN_ROOT,
+];
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+#[rustfmt::skip]
+fn drain_inventory_aliases_match_schema() {
+    assert_eq!(BUSINESS_SIGNER_CONFIG, "/etc/sanctuary/business-signer.json");
+    assert_eq!(BUSINESS_CUSTODY_ROOT, "/var/lib/sanctuary-business-signer");
+}
+// DRAIN_INVENTORY_END
 pub const RAW_STATE_ROOT: &str = "/var/lib/sanctuary";
 pub const RAW_RUNTIME_ROOT: &str = "/run/sanctuary";
 pub const RAW_STATE_RELATIVE: &str = "policy/egress/audit-producer.key";
@@ -552,28 +584,15 @@ pub const SELECTOR_MODE: u32 = 0o600; // Enrollment selection is owner-readable 
 pub const CANDIDATE_MAX_BYTES: usize = 4096 - 1; // Linux PATH_MAX includes the terminating NUL.
 pub const CANDIDATE_MAX_COMPONENTS: usize = CANDIDATE_MAX_BYTES.div_ceil(2); // One-byte names separated by slashes.
 
-// Work ceiling: 20 fixed directory opens, 64 * (6 + 3) raw parent opens,
+// Work ceiling: 22 fixed directory opens: one root, six /etc/sanctuary
+// walks of two parents, two /var/lib walks of two parents, and raw roots
+// of three and two parents; plus 64 * (6 + 3) raw parent opens,
 // and at most 2 * 2048 candidate parent opens. Each has one fstat; each
 // leaf has one no-follow probe. At most two extra descriptors hold the
 // selector and enumeration stream. All held descriptors close on return.
 // readdir observes at most 65 non-dot names per root, never a full listing;
 // the selector reads at most 513 bytes. Resource exhaustion refuses closed.
 pub const MAX_RAW_CANDIDATES: usize = 2; // The private and public producer paths are the only caller candidates.
-#[cfg(target_os = "linux")]
-pub const BUSINESS_SIGNER_CONFIG: &str = crate::business_profile::custody::CONFIG_PATH;
-#[cfg(target_os = "linux")]
-pub const BUSINESS_CUSTODY_ROOT: &str = crate::business_profile::custody::CUSTODY_ROOT;
-#[cfg(target_os = "linux")]
-pub const BUSINESS_EVIDENCE: &[&str] = &[
-    BUSINESS_PROFILE_SELECTOR,
-    BUSINESS_SIGNER_CONFIG,
-    BUSINESS_SIGNER_PEER_POLICY,
-    BUSINESS_SIGNER_CONTROLLER_POLICY,
-    BUSINESS_WRITER_CONFIG,
-    BUSINESS_CUSTODY_ROOT,
-    BUSINESS_DRAIN_ROOT,
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyReason {
     Explicit,
@@ -969,7 +988,7 @@ mod selection_walk {
         let mut walk = Walk::new(roots)?;
         let selector = walk.selector()?;
         let mut evidence = false;
-        // All six entries must be unambiguous before either profile can continue.
+        // All seven entries must be unambiguous before either profile can continue.
         for path in &BUSINESS_EVIDENCE[1..] {
             match walk.present(Path::new(&path[1..])) {
                 Ok(_) => evidence = true,

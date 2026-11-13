@@ -11,6 +11,7 @@ const root=resolve(fileURLToPath(import.meta.url),"../../../..");
 describe("isolated K1 boundaries",()=>{
   it("generated Rust matches the full TS role, schema and constant sets",()=>{
     expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-record-signer-contract.mjs"),"--check"])).not.toThrow();
+    expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-drain-contract.mjs"),"--check"])).not.toThrow();
     const rust=readFileSync(join(root,"castle-wall-daemon/src/business_profile/signer_contract.rs"),"utf8");
     const rows=[...rust.matchAll(/\("([^"]+)", "([^"]+)", (\d+)\)/g)].map(match=>({role:match[1],domain:JSON.parse('"'+match[2]+'"'),envelope_max_bytes:Number(match[3])}));
     expect(ROLE_REGISTRY.every(row => Object.isFrozen(row.record_kinds))).toBe(true);

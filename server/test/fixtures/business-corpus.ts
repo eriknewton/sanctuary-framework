@@ -4,7 +4,7 @@ import {resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
 // Must match checked in castle-wall-daemon/tests/support/checked_corpus.rs.
-export const REQUIRED_CORPORA = ["closure_vectors.json", "generator_vectors.json", "profile_selector_vectors.json", "public_vectors.json", "record_join_vectors.json", "role_vectors.json", "signer_status_vectors.json"] as const;
+export const REQUIRED_CORPORA = ["closure_vectors.json", "drain_vectors.json", "generator_vectors.json", "profile_selector_vectors.json", "public_vectors.json", "record_join_vectors.json", "role_vectors.json", "signer_status_vectors.json"] as const;
 const DEFAULT_ROOT = resolve(fileURLToPath(import.meta.url), "../../../../castle-wall-daemon/src/business_profile");
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const equalKeys = (value: Record<string, unknown>, keys: readonly string[]): boolean => JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());

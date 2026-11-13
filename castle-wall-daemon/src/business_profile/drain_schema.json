@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "contract": "must match generated regions in activation_anchor.rs, activation-anchor.ts, config.rs and profile-selection.ts via scripts/generate-drain-contract.mjs",
+  "anchor": {
+    "version": "literal1",
+    "fortress_id": "id",
+    "machine_id": "id",
+    "role": "producer",
+    "enrollment_revision": "positiveInteger",
+    "descriptor_digest": "digest",
+    "roster_digest": "digest",
+    "custody_envelope_digest": "digest",
+    "retired": "boolean",
+    "activation_id": "id",
+    "boot_id": "id",
+    "generation_high_water": "safeInteger",
+    "reserved_sequence": "safeInteger",
+    "committed_sequence": "safeInteger",
+    "committed_digest": "commitment",
+    "drained_sequence": "safeInteger",
+    "drained_digest": "commitment",
+    "transaction_id": "nullableId",
+    "recovery_required": "boolean",
+    "recovery_reason": "nullableReason",
+    "recovery_revision": "safeInteger",
+    "reserved_body_digest": "nullableDigest"
+  },
+  "message": {
+    "keys": [
+      "version",
+      "op",
+      "request_id",
+      "expected",
+      "next"
+    ],
+    "body_digest": {
+      "ops": [
+        "RESERVE"
+      ],
+      "conditional_op": "COMMIT",
+      "expected_null_field": "transaction_id"
+    }
+  },
+  "descriptor": {
+    "root": {
+      "version": "literal1",
+      "fortress_id": "id",
+      "machine_id": "id",
+      "identity_id": "id",
+      "epochs": "epochs"
+    },
+    "entry": {
+      "role": "registeredRole",
+      "epoch": "positiveInteger",
+      "kid": "kid",
+      "public_key": "key"
+    },
+    "epochs_max": 256,
+    "max_bytes": 65536,
+    "epoch_max": 9007199254740991
+  },
+  "inventory": [
+    {
+      "name": "BUSINESS_PROFILE_SELECTOR",
+      "path": "/etc/sanctuary/business-profile.json"
+    },
+    {
+      "name": "BUSINESS_SIGNER_CONFIG",
+      "path": "/etc/sanctuary/business-signer.json"
+    },
+    {
+      "name": "BUSINESS_SIGNER_PEER_POLICY",
+      "path": "/etc/sanctuary/business-signer-peer.json"
+    },
+    {
+      "name": "BUSINESS_SIGNER_CONTROLLER_POLICY",
+      "path": "/etc/sanctuary/business-signer-controller.json"
+    },
+    {
+      "name": "BUSINESS_WRITER_CONFIG",
+      "path": "/etc/sanctuary/business-writer.json"
+    },
+    {
+      "name": "BUSINESS_DRAIN_CONFIG",
+      "path": "/etc/sanctuary/business-drain.json"
+    },
+    {
+      "name": "BUSINESS_CUSTODY_ROOT",
+      "path": "/var/lib/sanctuary-business-signer"
+    },
+    {
+      "name": "BUSINESS_DRAIN_ROOT",
+      "path": "/var/lib/sanctuary-business-drain"
+    }
+  ],
+  "domains": {
+    "id_hex_length": 32,
+    "digest_hex_length": 64,
+    "key_hex_length": 64,
+    "producer": "extension:linux-business-producer-v0",
+    "reasons": [
+      "integrity",
+      "restart",
+      "storage_fault",
+      "counter_lost"
+    ],
+    "safe_integer_max": 9007199254740991
+  }
+}

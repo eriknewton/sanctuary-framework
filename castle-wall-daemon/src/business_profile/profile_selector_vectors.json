@@ -32,10 +32,14 @@
       },
       {
         "id": "6",
-        "path": "/var/lib/sanctuary-business-signer"
+        "path": "/etc/sanctuary/business-drain.json"
       },
       {
         "id": "7",
+        "path": "/var/lib/sanctuary-business-signer"
+      },
+      {
+        "id": "8",
         "path": "/var/lib/sanctuary-business-drain"
       }
     ],
@@ -3751,6 +3755,28 @@
       "expect": {
         "kind": "Refused",
         "reason": "RawInventoryPresent"
+      }
+    },
+    {
+      "id": "drain-config-only",
+      "caller": "owner",
+      "layout": [
+        {
+          "type": "file",
+          "path": "etc/sanctuary/business-drain.json",
+          "mode": 384,
+          "content": "{}"
+        }
+      ],
+      "owners": {},
+      "deny": {
+        "lookup": [],
+        "open": []
+      },
+      "candidates": [],
+      "expect": {
+        "kind": "Business",
+        "reason": null
       }
     }
   ]

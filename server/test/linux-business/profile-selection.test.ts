@@ -108,6 +108,9 @@ describe.skipIf(process.platform !== "linux")("shared selector corpus", () => {
   });
   it("executes the complete sorted result set and pins all inventory constants", () => {
     expect(actual.sort()).toEqual(corpus.cases.map((c: Obj) => [c.id, c.expect]).sort());
+    const schema = JSON.parse(fs.readFileSync(new URL("../../../castle-wall-daemon/src/business_profile/drain_schema.json", import.meta.url), "utf8"));
+    expect(selection.BUSINESS_EVIDENCE).toEqual(schema.inventory.map((e: {path: string}) => e.path));
+    expect(selection.BUSINESS_EVIDENCE[0]).toBe(selection.BUSINESS_PROFILE_SELECTOR);
     expect(corpus.inventory).toEqual({evidence: selection.BUSINESS_EVIDENCE.map((path, i) => ({id: String(i + 1), path})),
       raw_roots: [selection.RAW_STATE_ROOT, selection.RAW_RUNTIME_ROOT], raw_relative: {state: selection.RAW_STATE_RELATIVE, runtime: selection.RAW_RUNTIME_RELATIVE}});
   });
