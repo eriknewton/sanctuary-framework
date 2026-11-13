@@ -1,3 +1,4 @@
+// fail-before-exempt: Mechanical adaptation to the borrowed wall policy; every peer assertion is retained.
 // fail-before-exempt: wall binding and the private bus parser are new.
 #![cfg(target_os = "linux")]
 mod isolation;
@@ -56,9 +57,9 @@ fn authenticated_exchange_and_capture_hold_the_live_main_process() {
     );
     let binding = WallMainBinding::capture(
         b.as_raw_fd(),
-        &f.config,
+        &f.config.wall_policy(),
         &f.target,
-        &expected,
+        expected.peer_uid,
         unsafe { libc::geteuid() },
         deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
     )
@@ -153,9 +154,9 @@ fn capture_refuses_primary_identity_and_artifact_mismatches() {
     assert!(matches!(
         WallMainBinding::capture(
             b.as_raw_fd(),
-            &config,
+            &config.wall_policy(),
             &f.target,
-            &expected,
+            expected.peer_uid,
             owner,
             deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
@@ -168,9 +169,9 @@ fn capture_refuses_primary_identity_and_artifact_mismatches() {
     assert!(matches!(
         WallMainBinding::capture(
             b.as_raw_fd(),
-            &f.config,
+            &f.config.wall_policy(),
             &f.target,
-            &expected_wrong,
+            expected_wrong.peer_uid,
             owner,
             deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
@@ -181,9 +182,9 @@ fn capture_refuses_primary_identity_and_artifact_mismatches() {
     assert!(matches!(
         WallMainBinding::capture(
             b.as_raw_fd(),
-            &config,
+            &config.wall_policy(),
             &f.target,
-            &expected,
+            expected.peer_uid,
             owner,
             deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),
@@ -307,9 +308,9 @@ fn completion_revalidation_refuses_a_new_main_pid_with_the_wall_live() {
     });
     let binding = WallMainBinding::capture(
         b.as_raw_fd(),
-        &f.config,
+        &f.config.wall_policy(),
         &f.target,
-        &expected,
+        expected.peer_uid,
         owner,
         deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
     )
@@ -404,9 +405,9 @@ fn complete_dropin_order_hash_and_artifact_controls() {
         });
         let result = WallMainBinding::capture(
             b.as_raw_fd(),
-            &f.config,
+            &f.config.wall_policy(),
             &f.target,
-            &expect,
+            expect.peer_uid,
             owner + u32::from(fault == "owner"),
             deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
         );
@@ -435,9 +436,9 @@ fn every_packet_identity_component_has_a_control() {
     });
     let binding = WallMainBinding::capture(
         b.as_raw_fd(),
-        &f.config,
+        &f.config.wall_policy(),
         &f.target,
-        &expect,
+        expect.peer_uid,
         owner,
         deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
     )
@@ -485,9 +486,9 @@ fn saved_process_identity_and_descriptor_predicates_are_independent() {
     for field in ["start", "cgroup"] {
         let binding = WallMainBinding::capture(
             b.as_raw_fd(),
-            &f.config,
+            &f.config.wall_policy(),
             &f.target,
-            &expect,
+            expect.peer_uid,
             owner,
             deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap(),
         )
@@ -524,9 +525,9 @@ fn final_capture_exchange_cannot_adopt_a_replacement_invocation() {
     assert!(matches!(
         WallMainBinding::capture(
             b.as_raw_fd(),
-            &f.config,
+            &f.config.wall_policy(),
             &f.target,
-            &expect,
+            expect.peer_uid,
             owner,
             deadline_ms(WRITER_HANDSHAKE_DEADLINE_MS).unwrap()
         ),

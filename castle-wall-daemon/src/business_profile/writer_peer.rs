@@ -239,6 +239,30 @@ pub struct WriterConfig {
     pub enrollment_revision: u64,
     pub signer: signer_peer::PeerPolicy,
 }
+/// Borrowed pins describe the wall process and its installed systemd artifacts.
+/// Both consumers use the same capture verifier without changing writer config serialization.
+pub struct WallPolicy<'a> {
+    pub wall_unit: &'a str,
+    pub wall_exec: &'a Path,
+    pub wall_sha256: &'a str,
+    pub wall_argv_sha256: &'a str,
+    pub wall_unit_sha256: &'a str,
+    pub wall_dropins: &'a [DropIn],
+    pub wall_gid: u32,
+}
+impl WriterConfig {
+    pub fn wall_policy(&self) -> WallPolicy<'_> {
+        WallPolicy {
+            wall_unit: &self.wall_unit,
+            wall_exec: &self.wall_exec,
+            wall_sha256: &self.wall_sha256,
+            wall_argv_sha256: &self.wall_argv_sha256,
+            wall_unit_sha256: &self.wall_unit_sha256,
+            wall_dropins: &self.wall_dropins,
+            wall_gid: self.wall_gid,
+        }
+    }
+}
 fn digest_shape(s: &str) -> bool {
     s.len() == 32 * 2
         && s.bytes()
@@ -402,7 +426,7 @@ pub struct ListenerExpectations {
     path: PathBuf,
     owner: u32,
     group: u32,
-    peer_uid: u32,
+    pub peer_uid: u32,
 }
 impl ListenerExpectations {
     pub fn production(group: u32) -> Self {
@@ -500,9 +524,9 @@ pub struct WallMainBinding {
 impl WallMainBinding {
     pub fn capture(
         fd: RawFd,
-        config: &WriterConfig,
+        config: &WallPolicy<'_>,
         target: &BusTarget,
-        expect: &ListenerExpectations,
+        peer_uid: u32,
         artifact_owner: u32,
         end: Deadline,
     ) -> Result<Self> {
@@ -521,7 +545,7 @@ impl WallMainBinding {
         } != 0
             || len as usize != std::mem::size_of_val(&cred)
             || cred.pid <= 0
-            || cred.uid != expect.peer_uid
+            || cred.uid != peer_uid
         {
             return Err(Error::Peer);
         }
@@ -542,14 +566,14 @@ impl WallMainBinding {
         let unit = target.exchange(end.clone())?;
         validate_unit(&unit, config, cred.pid, &cgroup)?;
         let mut artifacts = vec![
-            held_artifact(&config.wall_exec, artifact_owner, &config.wall_sha256)?,
+            held_artifact(config.wall_exec, artifact_owner, config.wall_sha256)?,
             held_artifact(
                 Path::new(&unit.fragment),
                 artifact_owner,
-                &config.wall_unit_sha256,
+                config.wall_unit_sha256,
             )?,
         ];
-        for dropin in &config.wall_dropins {
+        for dropin in config.wall_dropins {
             artifacts.push(held_artifact(&dropin.path, artifact_owner, &dropin.sha256)?);
         }
         let binding = Self {
@@ -623,7 +647,12 @@ fn pidfd_subject(fd: RawFd, pid: i32) -> bool {
 fn same_descriptor(a: RawFd, b: RawFd) -> bool {
     signer_peer::same_pidfd(a, b)
 }
-fn validate_unit(unit: &UnitSnapshot, config: &WriterConfig, pid: i32, cgroup: &str) -> Result<()> {
+fn validate_unit(
+    unit: &UnitSnapshot,
+    config: &WallPolicy<'_>,
+    pid: i32,
+    cgroup: &str,
+) -> Result<()> {
     if unit.id != config.wall_unit
         || unit.load != "loaded"
         || !matches!(
@@ -649,7 +678,7 @@ fn validate_unit(unit: &UnitSnapshot, config: &WriterConfig, pid: i32, cgroup: &
         || unit
             .dropins
             .iter()
-            .zip(&config.wall_dropins)
+            .zip(config.wall_dropins)
             .any(|(a, b)| Path::new(a) != b.path)
     {
         return Err(Error::Artifact);
@@ -680,7 +709,7 @@ pub mod test_support {
         pid: i32,
         cgroup: &str,
     ) -> Result<()> {
-        validate_unit(unit, config, pid, cgroup)
+        validate_unit(unit, &config.wall_policy(), pid, cgroup)
     }
     #[derive(Debug)]
     pub struct ParseObservation {
