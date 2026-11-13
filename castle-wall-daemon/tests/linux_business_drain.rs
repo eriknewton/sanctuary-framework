@@ -1181,7 +1181,7 @@ fn transport_rights_truncation_and_passed_socket_refuse_before_decode() {
         write_private(&f.root.join("config.json"), &canonical(&config));
         let mut child = Reaped(
             // Must match the --transport-child exec path in helpers/drain-actor.rs.
-            std::process::Command::new(std::env::var_os("DRAIN_TEST_ACTOR").unwrap())
+            std::process::Command::new(actor_path())
                 .arg("--transport-child")
                 .arg(executable)
                 .env("DRAIN_TRANSPORT_FIXTURE", &f.root)

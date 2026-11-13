@@ -40,6 +40,11 @@ pub fn native(name: &str) -> PathBuf {
     );
     path
 }
+pub fn actor_path() -> PathBuf {
+    std::env::var_os("DRAIN_TEST_ACTOR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_drain-actor")))
+}
 pub struct Actor {
     pub child: Child,
     input: ChildStdin,
@@ -47,7 +52,7 @@ pub struct Actor {
 }
 impl Actor {
     pub fn new() -> Self {
-        let path = std::env::var_os("DRAIN_TEST_ACTOR").expect("DRAIN_TEST_ACTOR required");
+        let path = actor_path();
         let mut child = Command::new(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -136,7 +141,7 @@ impl Fixture {
         bus.unit.lock().unwrap().pid = w.child.id();
         let owner = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
-        let actor = std::env::var_os("DRAIN_TEST_ACTOR").unwrap();
+        let actor = actor_path();
         let config = json!({"version":1,"fortress_id":FORTRESS,"signer":{"uid":owner,"gid":gid,"executable_sha256":hex::encode(Sha256::digest(fs::read(actor).unwrap())),"cgroup":fs::read_to_string("/proc/self/cgroup").unwrap()},"wall":{"unit":bus.config.wall_unit,"exec":bus.config.wall_exec,"sha256":bus.config.wall_sha256,"argv_sha256":bus.config.wall_argv_sha256,"unit_sha256":bus.config.wall_unit_sha256,"dropins":[],"gid":gid}});
         write_private(&root.join("config.json"), &canonical(&config));
         write_private(
