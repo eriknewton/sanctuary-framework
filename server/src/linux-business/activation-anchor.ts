@@ -50,7 +50,7 @@ const DESCRIPTOR_ROOT = {"version":"literal1","fortress_id":"id","machine_id":"i
 const DESCRIPTOR_ENTRY = {"role":"registeredRole","epoch":"positiveInteger","kid":"kid","public_key":"key"} as const;
 export const D_DESCRIPTOR_EPOCHS_MAX = 256;
 export const D_DESCRIPTOR_MAX_BYTES = 65536;
-export const D_EPOCH_MAX = 9007199254740991;
+export const D_EPOCH_MAX = 9007199254740991; // 2^53 - 1 is the largest shared safe integer epoch.
 // DRAIN_SCHEMA_END
 export const anchorSchema = anchorShape.superRefine((a, ctx) => {
   // High-water and latch consistency prevent a well-shaped proposal from erasing uncertainty.

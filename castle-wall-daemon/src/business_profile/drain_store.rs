@@ -15,6 +15,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+// These bounds must match "D interface contract v2" section 4 I5 in BRIEF_K1C2d1.md and BRIEF_K1C2d2.md.
 // These bounds must match maximal_record_bounds_are_measured_from_canonical_images in tests/linux_business_drain_store.rs.
 pub const LENGTH_BYTES: usize = writer_protocol::LENGTH_BYTES;
 pub const SEQUENCE_FILENAME_DIGITS: usize = 20; // Decimal width of u64::MAX.
@@ -29,7 +30,8 @@ pub const D_RECORD_MAX_BYTES: usize =
     D_RECORD_FIXED_BYTES + D_UNDRAINED_MAX * D_LEDGER_ENTRY_BYTES - 1;
 pub const D_COPY_MAX_BYTES: u64 = 64 * 1024 * 1024; // Ordinary WAL64MiB bound, with no finalization headroom.
 pub const D_COPY_ENTRIES_MAX: usize = 65536; // Policy: 64 MiB at an average of at least 1 KiB per copy.
-pub const D_DIRECTORY_SENTINEL: usize = 1;
+pub const D_DIRECTORY_SENTINEL: usize = 1; // One extra entry detects a directory beyond its admission cap.
+pub const D_COPY_STAGING_ALLOWANCE: usize = 1; // One serialized copy publication can leave one staging leaf beside retained copies.
 pub const DESCRIPTOR_MODE: u32 = 0o644; // Historical descriptors are public.
 pub const D_HEADER_MAX_BYTES: usize = SIGNER_HEADER_MAX_BYTES;
 pub const D_REQUEST_MAX_BYTES: usize = SIGNER_FRAME_MAX_BYTES;
@@ -620,6 +622,8 @@ impl StoreFaults {
             use std::time::{Duration, Instant};
             const SEAM_BYTES_MAX: u64 = 65536; // One bounded test schedule, independent of production packets.
             const SEAM_RULES_MAX: usize = 128; // Two positions for six steps across the bounded publication matrix.
+
+            // This bound must match DRIVER_TIMEOUT_MS in tests/linux_business_drain_store.rs: the driver uses half this hold budget.
             const SEAM_WAIT_MAX_MS: u64 = (D_REQUEST_DEADLINE_MS * 10) as u64; // Ten request budgets bound a test driver hold, never a production request.
             let dir = match &self.seam {
                 Some(dir) => dir,
@@ -866,7 +870,7 @@ fn validate_layout(root: &HeldRoot, fortress: &str, cleanup: bool) -> Result<Rol
             let mut copy_staging = None;
             let mut staging_bytes = 0;
             // One serialized publication permits one staging copy in addition to the capped retained set.
-            for leaf in enumerate(&copies, D_COPY_ENTRIES_MAX + D_DIRECTORY_SENTINEL)? {
+            for leaf in enumerate(&copies, D_COPY_ENTRIES_MAX + D_COPY_STAGING_ALLOWANCE)? {
                 if let Some(target) = leaf
                     .strip_prefix('.')
                     .and_then(|s| s.strip_suffix(".staging"))
@@ -1284,11 +1288,11 @@ impl<'a> Store<'a> {
         outcome
     }
     // Continuing effect | Evidence | Refusal
-    // Reverify drained tail | identical bytes, DirSync and Readback, no Stage | conflicting bytes refuse with the slot certain
+    // Reverify drained tail | identical bytes, DirSync and Readback, no Stage | conflicting request bytes refuse with the slot certain; leaf DirSync or Readback failure: Uncertain
     // Changed or missing held copy before Stage | verified bytes restored, DirSync succeeds and whole layout validates | Uncertain(READBACK), no Stage or extra charge
     // Unexpected copy at the target | verified absence restored, DirSync succeeds and whole layout validates | Uncertain(ORPHAN), no Stage
-    // Reuse orphan | identical bytes, DirSync and Readback, no new charge | conflicting bytes refuse with the slot certain
-    // These arms must match drained_tail_retry_and_certain_reconcile in tests/linux_business_drain_store.rs.
+    // Reuse orphan | identical bytes, DirSync and Readback, no new charge | conflicting request bytes refuse with the slot certain; leaf DirSync or Readback failure: Uncertain
+    // These arms must match drained_tail_retry_and_certain_reconcile_have_explicit_io_bounds in tests/linux_business_drain_store.rs.
     pub fn publish_original(&mut self, slot: &str, sequence: u64, bytes: &[u8]) -> PublishOutcome {
         if self.uncertain {
             return self.refuse(StoreRefusal::UNCERTAIN);
@@ -1399,7 +1403,7 @@ impl<'a> Store<'a> {
         outcome
     }
     // Continuing effect | Evidence | Refusal
-    // Durable | synced file, rename, synced directory, exact readback and held path | uncertain after rename
+    // Durable | every chain child and parent synced before Stage; synced file, rename, synced directory, exact readback and held path | uncertain after rename
     // Keep old and open | no rename, or failed rename with verified old inode and bytes or absence; cleanup verified | uncertain cleanup
     // Publish record after copy | verified charged orphan survives pre-publication record refusal | uncertain copy blocks record
     // These arms must match every_record_image_cut and every_copy_cut witnesses in tests/linux_business_drain_store.rs.

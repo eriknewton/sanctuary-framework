@@ -90,7 +90,7 @@ pub const D_DESCRIPTOR_MAX_BYTES: usize = super::custody::CONFIG_MAX_BYTES;
 #[cfg(not(target_os = "linux"))]
 pub const D_DESCRIPTOR_MAX_BYTES: usize = 65536;
 const _: () = assert!(D_DESCRIPTOR_MAX_BYTES == 65536);
-pub const D_EPOCH_MAX: u64 = 9007199254740991;
+pub const D_EPOCH_MAX: u64 = 9007199254740991; // 2^53 - 1 is the largest shared safe integer epoch.
 const _: () = assert!(D_EPOCH_MAX == SAFE_INTEGER);
 // DRAIN_SCHEMA_END
 fn exact(v: &Value, fields: &[&str]) -> bool {

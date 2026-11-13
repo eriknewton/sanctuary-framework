@@ -12,6 +12,10 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
+// The driver deadline must expire before the seam's hold limit so failed rendezvous still release the worker.
+// This bound must match SEAM_WAIT_MAX_MS in ../src/business_profile/drain_store.rs.
+const DRIVER_TIMEOUT_MS: u64 = (D_REQUEST_DEADLINE_MS * 5) as u64; // Five request budgets, below the seam's ten.
+const DRIVER_POLL_MS: u64 = 1; // One millisecond observes filesystem rendezvous without a busy loop.
 const SLOT: &str = DRAIN_SLOTS[0].0;
 const FORTRESS: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static SERIAL: AtomicUsize = AtomicUsize::new(0);
@@ -448,7 +452,11 @@ fn startup_rejects_bad_ledger_orphan_strays_and_lock_contention() {
     );
     drop(store);
     assert_eq!(fixture.store().usage().entries, 1);
-    let copy = fixture.copies_path().join(format!("{:020}.env", 1));
+    let copy = fixture.copies_path().join(format!(
+        "{:0width$}.env",
+        1,
+        width = SEQUENCE_FILENAME_DIGITS
+    ));
     fs::write(&copy, envelope(2)).unwrap();
     assert!(matches!(
         validate_role_state(&fixture.held, FORTRESS),
@@ -503,7 +511,11 @@ fn absent_means_no_copies_and_directory_sentinels_bound_startup() {
         fixture.store().observe(SLOT).state,
         ObservationState::Absent
     );
-    let leaf = fixture.copies_path().join(format!("{:020}.env", 1));
+    let leaf = fixture.copies_path().join(format!(
+        "{:0width$}.env",
+        1,
+        width = SEQUENCE_FILENAME_DIGITS
+    ));
     fs::write(&leaf, envelope(1)).unwrap();
     fs::set_permissions(&leaf, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(matches!(
@@ -615,12 +627,9 @@ fn seams_are_feature_gated_and_no_service_calls_the_store() {
             .count(),
         2
     ); // Both fault and event constructors must be gated.
-    assert_eq!(
-        source
-            .matches("#[cfg(feature = \"test-isolation\")]\n    pub fn from_seam_root")
-            .count(),
-        2
-    ); // Fault and event constructors both require the feature.
+
+    // Bounding the total as well as the gated count rejects any additional ungated constructor.
+    assert_eq!(source.matches("pub fn from_seam_root").count(), 2); // One fault and one event constructor.
     assert!(source.contains("#[cfg(feature = \"test-isolation\")]\n    pub fn isolated_under"));
     assert!(!include_str!("../src/business_profile/writer_service.rs").contains("drain_store"));
     assert!(!include_str!("../src/business_profile/signer_service.rs").contains("drain_store"));
@@ -642,11 +651,11 @@ fn rename_syscall_error_with_same_verified_inode_stays_open() {
     let release = fixture.seam.join("release-rename");
     std::thread::scope(|scope| {
         let driver = scope.spawn(|| {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis((D_REQUEST_DEADLINE_MS * 5) as u64);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(DRIVER_TIMEOUT_MS);
             while !staged.exists() {
                 assert!(std::time::Instant::now() < deadline);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(DRIVER_POLL_MS));
             }
             // Removing only the staged name forces renameat itself to fail while the old target inode remains intact.
             fs::remove_file(&staged).unwrap();
@@ -691,7 +700,11 @@ fn copy_caps_refuse_without_eviction_and_oversize_records_do_no_io() {
         };
         let mut remaining = desired - tail.len() as u64;
         for seq in 1..count {
-            let f = fs::File::create(fixture.copies_path().join(format!("{seq:020}.env"))).unwrap();
+            let f = fs::File::create(fixture.copies_path().join(format!(
+                "{seq:0width$}.env",
+                width = SEQUENCE_FILENAME_DIGITS
+            )))
+            .unwrap();
             f.set_permissions(fs::Permissions::from_mode(0o600))
                 .unwrap();
             let len = remaining.min(writer_protocol::WRITER_ENVELOPE_MAX_BYTES as u64);
@@ -699,7 +712,10 @@ fn copy_caps_refuse_without_eviction_and_oversize_records_do_no_io() {
             remaining -= len;
         }
         assert_eq!(remaining, 0);
-        let tail_path = fixture.copies_path().join(format!("{count:020}.env"));
+        let tail_path = fixture.copies_path().join(format!(
+            "{count:0width$}.env",
+            width = SEQUENCE_FILENAME_DIGITS
+        ));
         fs::write(&tail_path, &tail).unwrap();
         fs::set_permissions(&tail_path, fs::Permissions::from_mode(0o600)).unwrap();
         let tail_digest =
@@ -730,9 +746,11 @@ fn copy_caps_refuse_without_eviction_and_oversize_records_do_no_io() {
         );
         assert_eq!(fs::read(tail_path).unwrap(), tail);
         drop(store);
-        let stage = fixture
-            .copies_path()
-            .join(format!(".{:020}.env.staging", count + 1));
+        let stage = fixture.copies_path().join(format!(
+            ".{:0width$}.env.staging",
+            count + 1,
+            width = SEQUENCE_FILENAME_DIGITS
+        ));
         fs::write(&stage, &next).unwrap();
         fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(fixture.try_store(), Err(StoreRefusal::CAP)));
@@ -810,11 +828,11 @@ fn failed_staging_cleanup_blocks_until_verified_reconciliation() {
     let release = fixture.seam.join("release-cleanup");
     std::thread::scope(|scope| {
         let driver = scope.spawn(|| {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis((D_REQUEST_DEADLINE_MS * 5) as u64);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(DRIVER_TIMEOUT_MS);
             while !staged.exists() {
                 assert!(std::time::Instant::now() < deadline);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(DRIVER_POLL_MS));
             }
             // An unexpected directory at the staging leaf makes unlinkat refuse without deleting any directory.
             fs::remove_file(&staged).unwrap();
@@ -856,11 +874,11 @@ fn rename_error_with_changed_or_untrusted_target_is_uncertain() {
         let release = fixture.seam.join("release-target");
         std::thread::scope(|scope| {
             let driver = scope.spawn(|| {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis((D_REQUEST_DEADLINE_MS * 5) as u64);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(DRIVER_TIMEOUT_MS);
                 while !staged.exists() {
                     assert!(std::time::Instant::now() < deadline);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    std::thread::sleep(std::time::Duration::from_millis(DRIVER_POLL_MS));
                 }
                 fs::remove_file(&staged).unwrap();
                 if change_bytes {
@@ -1038,11 +1056,11 @@ fn remove_staging_at_rename(
     let release = fixture.seam.join("release-absent");
     std::thread::scope(|scope| {
         let driver = scope.spawn(|| {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis((D_REQUEST_DEADLINE_MS * 5) as u64);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(DRIVER_TIMEOUT_MS);
             while !staging.exists() {
                 assert!(std::time::Instant::now() < deadline);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(DRIVER_POLL_MS));
             }
             // Removing the staged leaf makes the real rename syscall fail without changing the target.
             fs::remove_file(&staging).unwrap();
@@ -1070,7 +1088,14 @@ fn first_record_and_copy_rename_errors_preserve_verified_absence() {
             assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
         }
         let (publication, target) = if copy {
-            ("copy", fixture.copies_path().join(format!("{:020}.env", 1)))
+            (
+                "copy",
+                fixture.copies_path().join(format!(
+                    "{:0width$}.env",
+                    1,
+                    width = SEQUENCE_FILENAME_DIGITS
+                )),
+            )
         } else {
             ("record", fixture.record_path())
         };
@@ -1211,9 +1236,11 @@ fn copy_staging_without_record_refuses_start_and_is_preserved() {
     );
     drop(store);
     fs::remove_file(fixture.record_path()).unwrap();
-    let stage = fixture
-        .copies_path()
-        .join(format!(".{:020}.env.staging", 1));
+    let stage = fixture.copies_path().join(format!(
+        ".{:0width$}.env.staging",
+        1,
+        width = SEQUENCE_FILENAME_DIGITS
+    ));
     fs::write(&stage, b"partial").unwrap();
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(matches!(fixture.try_store(), Err(StoreRefusal::STAGING)));
@@ -1388,9 +1415,10 @@ fn startup_partial_copy_cleanup_requires_the_record_next_sequence() {
             PublishOutcome::Durable
         );
         drop(store);
-        let stage = fixture
-            .copies_path()
-            .join(format!(".{sequence:020}.env.staging"));
+        let stage = fixture.copies_path().join(format!(
+            ".{sequence:0width$}.env.staging",
+            width = SEQUENCE_FILENAME_DIGITS
+        ));
         fs::write(&stage, b"partial").unwrap();
         fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
         if sequence == 1 {
