@@ -485,6 +485,7 @@ pub fn verify_commit(
     let e = writer_protocol::decode_envelope(envelope).map_err(|_| Refusal::ENVELOPE)?;
     let body = &e["body"];
     let bytes = crate::smb::jcs::encode(body).map_err(|_| Refusal::ENVELOPE)?;
+    // activation_anchor.rs binds body_digest to reserved_body_digest in the reducer before this envelope comparison.
     if message["body_digest"] != packet_digest(bytes.as_bytes()) {
         return Err(Refusal::BODY_DIGEST);
     }
