@@ -61,6 +61,7 @@ fn genesis_phase_retry_restart_and_conflict() {
         json!(f.anchor["generation_high_water"].as_u64().unwrap() + 1);
     assert!(f.request(true, &anchor_packet(&m, &[])).is_none());
     assert_eq!(f.read(false)["state"], "PRESENT");
+    assert_eq!(fs::read_to_string(f.root.join("diagnostics.log")).unwrap(), "drain authority closed\n", "one content-free diagnostic per authority closure");
 }
 #[test]
 fn signed_commits_originals_and_ledger_conflict() {

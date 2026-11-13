@@ -219,7 +219,7 @@ impl Fixture {
             .env("NOTIFY_SOCKET", self.root.join("notify"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::OpenOptions::new().create(true).append(true).open(self.root.join("diagnostics.log")).unwrap())
             .spawn()
             .unwrap()
     }

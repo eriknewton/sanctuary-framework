@@ -1004,6 +1004,8 @@ impl Executor<'_, '_> {
         let index = authority_index(a);
         if !self.closed[index] {
             self.closed[index] = true;
+            // A fixed production line records each authority closure once without request or record content.
+            eprintln!("drain authority closed");
             self.diagnostics.refuse(Refusal::RETRY, Some(id))?;
         }
         Ok(())
