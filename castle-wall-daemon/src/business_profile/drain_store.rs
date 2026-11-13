@@ -1158,7 +1158,8 @@ impl<'a> Store<'a> {
     }
     fn refuse(&mut self, stage: StoreRefusal) -> PublishOutcome {
         let _ = self.events.refusal(stage, None);
-        if self.uncertain || self.copy_pending {
+        // A verified orphan is charged evidence, not an uncertain record publication.
+        if self.uncertain {
             self.uncertain = true;
             PublishOutcome::Uncertain(stage)
         } else {
@@ -1207,6 +1208,10 @@ impl<'a> Store<'a> {
         }
         outcome
     }
+    // Continuing effect | Evidence | Refusal
+    // Reverify drained tail | identical bytes, DirSync and Readback, no Stage | conflicting bytes refuse with the slot certain
+    // Reuse orphan | identical bytes, DirSync and Readback, no new charge | conflicting bytes refuse with the slot certain
+    // These arms must match drained_tail_retry_and_certain_reconcile in tests/linux_business_drain_store.rs.
     pub fn publish_original(&mut self, slot: &str, sequence: u64, bytes: &[u8]) -> PublishOutcome {
         if self.uncertain {
             return self.refuse(StoreRefusal::UNCERTAIN);
@@ -1371,7 +1376,8 @@ impl<'a> Store<'a> {
                     Ok(Some(now)) => a.old.as_ref().is_some_and(|old| {
                         now.dev == old.dev && now.ino == old.ino && now.bytes == old.bytes
                     }),
-                    Ok(None) => false,
+                    // Verified absence is the unchanged image for a first publication.
+                    Ok(None) => a.old.is_none(),
                     Err(_) => false,
                 };
             let renamed = matches!(
@@ -1393,6 +1399,9 @@ impl<'a> Store<'a> {
                     self.uncertain = true;
                 } else if !self.copy_pending {
                     self.attempts.clear();
+                } else {
+                    // A cleaned record attempt contributes no uncertainty; retain only the verified copy for an identical retry.
+                    self.attempts.pop();
                 }
             } else {
                 self.uncertain = true;

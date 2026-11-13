@@ -357,30 +357,54 @@ fn readback_mismatch_and_directory_sync_are_independent_predicates() {
     assert_eq!(store.observe(SLOT).anchor, Some(old.anchor));
 }
 #[test]
-fn original_record_failure_retains_whole_request_uncertainty() {
+fn original_record_prepublication_failure_keeps_a_verified_charged_orphan() {
     let _guard = isolation::guard();
-    let fixture = Fixture::new();
-    let mut store = fixture.store();
-    let bytes = envelope(1);
-    let r = committed(&bytes);
-    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
-    assert_eq!(
-        store.publish_original(SLOT, 1, &bytes),
-        PublishOutcome::Durable
-    );
-    fixture.fault("record", StoreStep::Stage, "before", "fail", 1);
-    assert_eq!(
-        store.publish_record(SLOT, &drained(r.clone())),
-        PublishOutcome::Uncertain(StoreRefusal::STAGE)
-    );
-    assert!(store.observe(SLOT).uncertain);
-    fixture.fault("copy", StoreStep::DirSync, "before", "fail", 1);
-    assert!(store.reconcile(SLOT).is_err());
-    assert!(store.observe(SLOT).uncertain);
-    fixture.clear();
-    store.reconcile(SLOT).unwrap();
-    assert_eq!(store.observe(SLOT).anchor, Some(r.anchor));
-    assert_eq!(store.copy(SLOT, 1), Some(bytes.as_slice()));
+    for step in [
+        StoreStep::Stage,
+        StoreStep::Write,
+        StoreStep::FileSync,
+        StoreStep::Rename,
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        let bytes = envelope(1);
+        let r = committed(&bytes);
+        assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+        assert_eq!(
+            store.publish_original(SLOT, 1, &bytes),
+            PublishOutcome::Durable
+        );
+        let usage = store.usage();
+        fixture.fault("record", step, "before", "fail", 1);
+        assert!(matches!(
+            store.publish_record(SLOT, &drained(r.clone())),
+            PublishOutcome::PrePublication(_)
+        ));
+        assert!(!store.observe(SLOT).uncertain);
+        assert_eq!(store.record(SLOT), Some(&r));
+        assert_eq!(store.copy(SLOT, 1), Some(bytes.as_slice()));
+        assert_eq!(store.usage(), usage);
+        assert!(!fixture
+            .record_path()
+            .with_file_name(format!(".{SLOT}.json.staging"))
+            .exists());
+        let mut conflict = bytes.clone();
+        conflict[0] ^= 1;
+        assert_eq!(
+            store.publish_original(SLOT, 1, &conflict),
+            PublishOutcome::PrePublication(StoreRefusal::ORPHAN)
+        );
+        fixture.clear();
+        assert_eq!(
+            store.publish_original(SLOT, 1, &bytes),
+            PublishOutcome::Durable
+        );
+        assert_eq!(
+            store.publish_record(SLOT, &drained(r)),
+            PublishOutcome::Durable
+        );
+        assert_eq!(store.usage(), usage);
+    }
 }
 
 #[test]
@@ -971,4 +995,164 @@ fn precreated_empty_directories_are_synced_before_staging() {
         PublishOutcome::Durable
     );
     assert_chain_before_stage(&fixture.events()[before..]);
+}
+
+fn remove_staging_at_rename(
+    fixture: &Fixture,
+    publication: &str,
+    target: PathBuf,
+    publish: impl FnOnce() -> PublishOutcome,
+) -> PublishOutcome {
+    fs::write(fixture.seam.join("store-faults.json"), serde_json::to_vec(&json!([
+        {"slot":SLOT,"publication":publication,"step":"FileSync","position":"after","action":"hold","value":"absent","times":1}
+    ])).unwrap()).unwrap();
+    let staging = target.with_file_name(format!(
+        ".{}.staging",
+        target.file_name().unwrap().to_str().unwrap()
+    ));
+    let release = fixture.seam.join("release-absent");
+    std::thread::scope(|scope| {
+        let driver = scope.spawn(|| {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis((D_REQUEST_DEADLINE_MS * 5) as u64);
+            while !staging.exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Removing the staged leaf makes the real rename syscall fail without changing the target.
+            fs::remove_file(&staging).unwrap();
+            fs::write(release, b"release").unwrap();
+        });
+        let result = publish();
+        driver.join().unwrap();
+        assert!(!staging.exists());
+        assert!(fixture
+            .events()
+            .iter()
+            .any(|e| e["event"] == "StoreResumed" && e["step"] == "FileSync"));
+        result
+    })
+}
+#[test]
+fn first_record_and_copy_rename_errors_preserve_verified_absence() {
+    let _guard = isolation::guard();
+    for copy in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        let bytes = envelope(1);
+        let r = committed(&bytes);
+        if copy {
+            assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+        }
+        let (publication, target) = if copy {
+            ("copy", fixture.copies_path().join(format!("{:020}.env", 1)))
+        } else {
+            ("record", fixture.record_path())
+        };
+        let outcome = remove_staging_at_rename(&fixture, publication, target.clone(), || {
+            if copy {
+                store.publish_original(SLOT, 1, &bytes)
+            } else {
+                store.publish_record(SLOT, &r)
+            }
+        });
+        assert_eq!(
+            outcome,
+            PublishOutcome::PrePublication(StoreRefusal::RENAME)
+        );
+        assert!(!target.exists());
+        assert!(!store.observe(SLOT).uncertain);
+        assert_eq!(store.usage(), CopyUsage::default());
+        fixture.clear();
+        assert_eq!(
+            if copy {
+                store.publish_original(SLOT, 1, &bytes)
+            } else {
+                store.publish_record(SLOT, &r)
+            },
+            PublishOutcome::Durable
+        );
+    }
+}
+#[test]
+fn record_rename_error_after_durable_copy_preserves_the_orphan() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let bytes = envelope(1);
+    let r = committed(&bytes);
+    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    let usage = store.usage();
+    assert_eq!(
+        remove_staging_at_rename(&fixture, "record", fixture.record_path(), || store
+            .publish_record(SLOT, &drained(r.clone()))),
+        PublishOutcome::PrePublication(StoreRefusal::RENAME)
+    );
+    assert!(!store.observe(SLOT).uncertain);
+    assert_eq!(store.record(SLOT), Some(&r));
+    assert_eq!(store.copy(SLOT, 1), Some(bytes.as_slice()));
+    assert_eq!(store.usage(), usage);
+    fixture.clear();
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    assert_eq!(
+        store.publish_record(SLOT, &drained(r)),
+        PublishOutcome::Durable
+    );
+}
+#[test]
+fn drained_tail_retry_and_certain_reconcile_have_explicit_io_bounds() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let bytes = envelope(1);
+    let r = committed(&bytes);
+    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    assert_eq!(
+        store.publish_record(SLOT, &drained(r)),
+        PublishOutcome::Durable
+    );
+    let usage = store.usage();
+    let before = fixture.events().len();
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    let events = fixture.events();
+    assert!(!events[before..].iter().any(|e| e["step"] == "Stage"));
+    assert!(events[before..]
+        .iter()
+        .any(|e| e["publication"] == "copy" && e["step"] == "Readback"));
+    assert_eq!(store.usage(), usage);
+    let mut conflict = bytes.clone();
+    conflict[0] ^= 1;
+    assert_eq!(
+        store.publish_original(SLOT, 1, &conflict),
+        PublishOutcome::PrePublication(StoreRefusal::ORPHAN)
+    );
+    assert!(!store.observe(SLOT).uncertain);
+    fixture.fault("copy", StoreStep::DirSync, "before", "fail", 1);
+    let before = fixture.events();
+    let refusals = fs::read(fixture.seam.join("refusals.jsonl")).unwrap();
+    store.reconcile(SLOT).unwrap();
+    assert_eq!(fixture.events(), before);
+    assert_eq!(
+        fs::read(fixture.seam.join("refusals.jsonl")).unwrap(),
+        refusals
+    );
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Uncertain(StoreRefusal::DIR_SYNC)
+    );
+    assert!(store.observe(SLOT).uncertain);
 }
