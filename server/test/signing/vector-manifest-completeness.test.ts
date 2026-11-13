@@ -1,4 +1,4 @@
-// fail-before-exempt: K1c-2b adds the signer status corpus to the Rust corpus manifest, which sits outside the server source that the base comparison restores; the manifest hash and case pins are the regression evidence.
+// fail-before-exempt: K1c-2d1 adds the drain corpus to the Rust corpus manifest, which sits outside the server source that the base comparison restores; the exact eight-name set, manifest hash and case pins are the regression evidence.
 import {expect, it} from "vitest";
 import {readFileSync} from "node:fs";
 import {createHash} from "node:crypto";
