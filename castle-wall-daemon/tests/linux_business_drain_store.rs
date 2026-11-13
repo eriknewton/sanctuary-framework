@@ -1547,3 +1547,171 @@ fn assert_restart_copy_cut(record: &DrainRecord, bytes: &[u8], step: StoreStep, 
         }
     );
 }
+
+#[test]
+fn changed_or_missing_held_copy_requires_verified_bytes_to_clear() {
+    let _guard = isolation::guard();
+    // Admission reads have no Readback fault hook; invalid permissions exercise their read-error arm through isolated files.
+    for damage in ["changed", "missing", "unreadable"] {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        let bytes = envelope(1);
+        let r = drained(committed(&bytes));
+        assert_eq!(
+            store.publish_record(SLOT, &committed(&bytes)),
+            PublishOutcome::Durable
+        );
+        assert_eq!(
+            store.publish_original(SLOT, 1, &bytes),
+            PublishOutcome::Durable
+        );
+        assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+        let path = fixture.copies_path().join(format!(
+            "{:0width$}.env",
+            1,
+            width = SEQUENCE_FILENAME_DIGITS
+        ));
+        match damage {
+            "changed" => {
+                let mut changed = bytes.clone();
+                changed[0] ^= 1;
+                fs::write(&path, changed).unwrap();
+            }
+            "missing" => fs::remove_file(&path).unwrap(),
+            _ => fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap(),
+        }
+        let usage = store.usage();
+        let before = fixture.events().len();
+        assert_eq!(
+            store.publish_original(SLOT, 1, &bytes),
+            PublishOutcome::Uncertain(StoreRefusal::READBACK),
+            "{damage}"
+        );
+        assert!(!fixture.events()[before..]
+            .iter()
+            .any(|e| e["step"] == "Stage"));
+        assert_eq!(store.usage(), usage);
+        assert_eq!(
+            store.publish_record(SLOT, &r),
+            PublishOutcome::Uncertain(StoreRefusal::UNCERTAIN)
+        );
+        assert!(store.observe(SLOT).uncertain);
+        assert!(store.reconcile(SLOT).is_err());
+        assert!(store.observe(SLOT).uncertain);
+        if damage == "unreadable" {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::write(&path, &bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture.fault("copy", StoreStep::DirSync, "before", "fail", 1);
+        assert_eq!(store.reconcile(SLOT), Err(StoreRefusal::DIR_SYNC));
+        assert!(store.observe(SLOT).uncertain);
+        fixture.clear();
+        let stray = fixture.copies_path().join("unexpected");
+        fs::write(&stray, b"invalid layout").unwrap();
+        assert!(store.reconcile(SLOT).is_err());
+        assert!(store.observe(SLOT).uncertain);
+        fs::remove_file(stray).unwrap();
+        store.reconcile(SLOT).unwrap();
+        assert!(!store.observe(SLOT).uncertain);
+        assert_eq!(store.record(SLOT), Some(&r));
+        assert_eq!(store.usage(), usage);
+    }
+}
+
+#[test]
+fn unexpected_copy_target_requires_verified_absence_to_clear() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let bytes = envelope(1);
+    let r = committed(&bytes);
+    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+    fs::create_dir_all(fixture.copies_path()).unwrap();
+    fs::set_permissions(
+        fixture.root.join(FORTRESS).join("originals"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(fixture.copies_path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = fixture.copies_path().join(format!(
+        "{:0width$}.env",
+        1,
+        width = SEQUENCE_FILENAME_DIGITS
+    ));
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fixture.events().len();
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Uncertain(StoreRefusal::ORPHAN)
+    );
+    assert!(!fixture.events()[before..]
+        .iter()
+        .any(|e| e["step"] == "Stage"));
+    assert_eq!(
+        store.publish_record(SLOT, &r),
+        PublishOutcome::Uncertain(StoreRefusal::UNCERTAIN)
+    );
+    assert!(store.observe(SLOT).uncertain);
+    assert!(store.reconcile(SLOT).is_err());
+    assert!(store.observe(SLOT).uncertain);
+    fs::remove_file(path).unwrap();
+    fixture.fault("copy", StoreStep::DirSync, "before", "fail", 1);
+    assert_eq!(store.reconcile(SLOT), Err(StoreRefusal::DIR_SYNC));
+    fixture.clear();
+    let stray = fixture.copies_path().join("unexpected");
+    fs::write(&stray, b"invalid layout").unwrap();
+    assert!(store.reconcile(SLOT).is_err());
+    assert!(store.observe(SLOT).uncertain);
+    fs::remove_file(stray).unwrap();
+    store.reconcile(SLOT).unwrap();
+    assert!(!store.observe(SLOT).uncertain);
+    assert_eq!(store.record(SLOT), Some(&r));
+    assert_eq!(store.copy(SLOT, 1), None);
+    assert_eq!(store.usage().entries, 0);
+}
+
+#[test]
+fn cleaned_record_attempts_stay_bounded_and_do_not_block_a_later_candidate() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let bytes = envelope(1);
+    let r = committed(&bytes);
+    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    let a = drained(r);
+    let mut b = a.clone();
+    b.last.request_id = "b".repeat(anchor::ID_HEX_LENGTH);
+    const MAX_RETAINED_ATTEMPTS: usize = 2; // One durable copy and at most one record candidate.
+    const FAILED_RETRIES: usize = MAX_RETAINED_ATTEMPTS + 1; // More failures than the retained bound reveal accumulation.
+    fixture.fault(
+        "record",
+        StoreStep::Write,
+        "before",
+        "fail",
+        FAILED_RETRIES as u64,
+    );
+    for _ in 0..FAILED_RETRIES {
+        assert_eq!(
+            store.publish_record(SLOT, &a),
+            PublishOutcome::PrePublication(StoreRefusal::WRITE)
+        );
+        assert!(!store.observe(SLOT).uncertain);
+        assert!(store.retained_attempt_count() <= MAX_RETAINED_ATTEMPTS);
+    }
+    fixture.fault("record", StoreStep::DirSync, "before", "fail", 1);
+    assert_eq!(
+        store.publish_record(SLOT, &b),
+        PublishOutcome::Uncertain(StoreRefusal::DIR_SYNC)
+    );
+    assert!(store.retained_attempt_count() <= MAX_RETAINED_ATTEMPTS);
+    fixture.clear();
+    store.reconcile(SLOT).unwrap();
+    assert_eq!(store.record(SLOT), Some(&b));
+    assert!(!store.observe(SLOT).uncertain);
+}

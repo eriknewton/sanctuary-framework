@@ -997,11 +997,17 @@ impl Drop for StoreLease<'_> {
     }
 }
 
+enum ClearingImages {
+    Published,
+    VerifiedOnly(Option<Vec<u8>>),
+}
+
 struct Attempt {
     directory: File,
     target: String,
     publication: &'static str,
     old: Option<Image>,
+    clearing_images: ClearingImages,
     bytes: Vec<u8>,
     state: PublicationState,
     request_id: Option<String>,
@@ -1279,6 +1285,8 @@ impl<'a> Store<'a> {
     }
     // Continuing effect | Evidence | Refusal
     // Reverify drained tail | identical bytes, DirSync and Readback, no Stage | conflicting bytes refuse with the slot certain
+    // Changed or missing held copy before Stage | verified bytes restored, DirSync succeeds and whole layout validates | Uncertain(READBACK), no Stage or extra charge
+    // Unexpected copy at the target | verified absence restored, DirSync succeeds and whole layout validates | Uncertain(ORPHAN), no Stage
     // Reuse orphan | identical bytes, DirSync and Readback, no new charge | conflicting bytes refuse with the slot certain
     // These arms must match drained_tail_retry_and_certain_reconcile in tests/linux_business_drain_store.rs.
     pub fn publish_original(&mut self, slot: &str, sequence: u64, bytes: &[u8]) -> PublishOutcome {
@@ -1329,8 +1337,6 @@ impl<'a> Store<'a> {
         {
             return self.refuse(StoreRefusal::CAP);
         }
-        self.attempts.clear();
-        self.copy_pending = false;
         let dir = match self.destination(true) {
             Ok(d) => d,
             Err(e) => return self.refuse(e),
@@ -1344,13 +1350,19 @@ impl<'a> Store<'a> {
                 writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
             ) {
                 Ok(Some(i)) if i.bytes == bytes => i,
-                _ => return self.refuse(StoreRefusal::READBACK),
+                _ => {
+                    // A held copy discrepancy may clear only to cached verified bytes, never to the observed replacement or absence.
+                    self.retain_verified_copy(dir, target, Some(bytes.into()));
+                    return self.refuse(StoreRefusal::READBACK);
+                }
             };
+            self.attempts.clear();
             self.attempts.push(Attempt {
                 directory: dir,
                 target,
                 publication: "copy",
                 old: Some(old),
+                clearing_images: ClearingImages::Published,
                 bytes: bytes.into(),
                 state: PublicationState::RenameAttempted,
                 request_id: None,
@@ -1367,6 +1379,8 @@ impl<'a> Store<'a> {
                 }
             };
         }
+        self.attempts.clear();
+        self.copy_pending = false;
         // Prospective copies remain charged through uncertain publication and are released only after verified cleanup or reconciliation.
         self.state.usage.bytes += bytes.len() as u64;
         self.state.usage.entries += 1;
@@ -1412,6 +1426,8 @@ impl<'a> Store<'a> {
             }
         };
         if publication == "copy" && old.is_some() {
+            // An unverified target cannot become an old image; only verified absence may clear this discrepancy.
+            self.retain_verified_copy(dir, target, None);
             return self.refuse(StoreRefusal::ORPHAN);
         }
         if publication == "record" {
@@ -1436,6 +1452,7 @@ impl<'a> Store<'a> {
             target,
             publication,
             old,
+            clearing_images: ClearingImages::Published,
             bytes,
             state: PublicationState::Planned,
             request_id,
@@ -1486,6 +1503,25 @@ impl<'a> Store<'a> {
         }
         PublishOutcome::Durable
     }
+    fn retain_verified_copy(&mut self, directory: File, target: String, verified: Option<Vec<u8>>) {
+        // Retain the sole clearing image without discarding evidence from other affected files.
+        self.uncertain = true;
+        self.attempts.push(Attempt {
+            directory,
+            target,
+            publication: "copy",
+            old: None,
+            clearing_images: ClearingImages::VerifiedOnly(verified),
+            bytes: Vec::new(),
+            state: PublicationState::Planned,
+            request_id: None,
+        });
+    }
+    /// Exposes retained evidence size only to isolated bounded-retry witnesses.
+    #[cfg(feature = "test-isolation")]
+    pub fn retained_attempt_count(&self) -> usize {
+        self.attempts.len()
+    }
     fn retain_verified_record(
         &mut self,
         directory: File,
@@ -1499,6 +1535,7 @@ impl<'a> Store<'a> {
             target,
             publication: "record",
             old: self.state.record_image.clone(),
+            clearing_images: ClearingImages::Published,
             bytes: self
                 .state
                 .record_image
@@ -1710,12 +1747,18 @@ impl<'a> Store<'a> {
                     &self.events,
                     a.request_id.as_deref(),
                 )?;
-            let matches = match current {
-                Some(ref image) => {
-                    image.bytes == a.bytes
-                        || a.old.as_ref().is_some_and(|old| old.bytes == image.bytes)
+            // A discrepancy observed before publication has no attempted image that could authorize clearing.
+            let matches = match &a.clearing_images {
+                ClearingImages::VerifiedOnly(verified) => {
+                    current.as_ref().map(|image| &image.bytes) == verified.as_ref()
                 }
-                None => a.old.is_none(),
+                ClearingImages::Published => match current {
+                    Some(ref image) => {
+                        image.bytes == a.bytes
+                            || a.old.as_ref().is_some_and(|old| old.bytes == image.bytes)
+                    }
+                    None => a.old.is_none(),
+                },
             };
             if alter || !matches {
                 return Err(StoreRefusal::UNCERTAIN);
