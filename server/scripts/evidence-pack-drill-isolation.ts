@@ -48,7 +48,7 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
   const home = process.env.HOME ? resolved(resolve(process.env.HOME)) : undefined;
   let denied = 0, enumerations = 0, markerObservations = 0;
   // Must match snapshot-package-marker.ts: only exact no-follow observations, never marker content or ancestors.
-  const markerPaths = new Set([dirname(bundle), dirname(dirname(bundle)), join(dirname(bundle), NON_RELEASE_MARKER)]);
+  const markerPaths = new Set([dirname(dirname(bundle)), join(dirname(bundle), NON_RELEASE_MARKER)]);
   const deny = (): never => { denied++; throw new Error("Evidence drill isolation denied I/O"); };
   const inside = (path: string) => path === root || path.startsWith(root + sep);
   const pathOf = (value: unknown) => value instanceof URL ? fileURLToPath(value) : Buffer.isBuffer(value) ? value.toString() : typeof value === "string" ? value : undefined;
@@ -85,7 +85,7 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
       if (!options || typeof options !== "object" || Object.getPrototypeOf(options) !== Object.prototype || Object.keys(options).length !== 1 || !Object.hasOwn(options, "bigint") || !("bigint" in options) || options.bigint !== true) return deny();
       markerObservations++; return original(...args);
     }
-    if (path !== undefined && markerPaths.has(path)) return deny();
+    if (path !== undefined && markerPaths.has(resolved(resolve(path)))) return deny();
     check(args[0]); if (key === "open" && !writable) { const flags = args[1]; if (typeof flags === "string" ? flags !== "r" : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC)) !== 0) deny(); } return original(...args); });
   // Glob lists options.cwd or the process directory and accepts pattern arrays, so no single-path check can bound it; the verifier never globs, so every form is refused.
   for (const object of [fs, fsp]) for (const suffix of ["", "Sync"]) wrap(object, "glob" + suffix, () => deny());

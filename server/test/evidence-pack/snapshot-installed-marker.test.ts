@@ -178,15 +178,18 @@ describe("installed package classification", () => {
     const isolation = join(control.tree, "server/evidence-pack-dist/evidence-pack-drill-isolation.js");
     for (const writable of [false, true]) {
       const hook = preload(`import {installIsolation} from ${JSON.stringify(isolation)}; installIsolation(${JSON.stringify(root)}, ${JSON.stringify(bundle)}, ${writable});`);
-      for (const path of [packageRoot, dirname(bundle), join(dirname(bundle), NON_RELEASE_MARKER)]) {
+      for (const path of [packageRoot, join(dirname(bundle), NON_RELEASE_MARKER)]) {
         const script = join(root, "allow.mjs"); writeFileSync(script, `import fs from 'node:fs';try{fs.lstatSync(${JSON.stringify(path)},{bigint:true});}catch(e){if(e.code!=='ENOENT')throw e;}`);
         const r = run(script, [], { preload: hook }); expect(r.status, r.stderr).toBe(0); expect(JSON.parse(r.stderr)).toMatchObject({ denied: 0, enumerations: 0, markerObservations: 1 });
       }
       const nested = copyPackage(control), nestedRoot = dirname(nested.root);
       const nestedHook = preload(`import {installIsolation} from ${JSON.stringify(isolation)}; installIsolation(${JSON.stringify(nestedRoot)}, ${JSON.stringify(nested.command)}, ${writable});`);
-      const nestedScript = join(nestedRoot, "deny-marker.mjs"); writeFileSync(nestedScript, `import fs from 'node:fs';fs.readFileSync(${JSON.stringify(nested.marker)});`);
-      const nestedRun = run(nestedScript, [], { preload: nestedHook }); expect(nestedRun.status).toBe(1); expect(nestedRun.stderr).toContain('"denied":1');
-      for (const expression of [`fs.readFileSync(${JSON.stringify(join(dirname(bundle), NON_RELEASE_MARKER))})`, `fs.lstatSync(${JSON.stringify(dirname(packageRoot))},{bigint:true})`, `fs.realpathSync(${JSON.stringify(packageRoot)})`, `fs.lstatSync(${JSON.stringify(packageRoot)},{bigint:true,throwIfNoEntry:false})`, `fs.lstatSync(${JSON.stringify(packageRoot)},Object.assign(Object.create({bigint:true}),{throwIfNoEntry:false}))`, `fs.lstatSync(${JSON.stringify(packageRoot)},Object.assign(Object.create({throwIfNoEntry:false}),{bigint:true}))`]) {
+      writeFileSync(nested.marker, NON_RELEASE_TEXT);
+      for (const spelling of [nested.marker, dirname(nested.marker) + "/./" + NON_RELEASE_MARKER, dirname(nested.marker) + "/../dist/" + NON_RELEASE_MARKER]) {
+        const nestedScript = join(nestedRoot, "deny-marker.mjs"); writeFileSync(nestedScript, `import fs from 'node:fs';fs.readFileSync(${JSON.stringify(spelling)});`);
+        const nestedRun = run(nestedScript, [], { preload: nestedHook }); expect(nestedRun.status).toBe(1); expect(nestedRun.stderr).toContain('"denied":1');
+      }
+      for (const expression of [`fs.lstatSync(${JSON.stringify(dirname(bundle))},{bigint:true})`, `fs.readFileSync(${JSON.stringify(join(dirname(bundle), NON_RELEASE_MARKER))})`, `fs.lstatSync(${JSON.stringify(dirname(packageRoot))},{bigint:true})`, `fs.realpathSync(${JSON.stringify(packageRoot)})`, `fs.lstatSync(${JSON.stringify(packageRoot)},{bigint:true,throwIfNoEntry:false})`, `fs.lstatSync(${JSON.stringify(packageRoot)},Object.assign(Object.create({bigint:true}),{throwIfNoEntry:false}))`, `fs.lstatSync(${JSON.stringify(packageRoot)},Object.assign(Object.create({throwIfNoEntry:false}),{bigint:true}))`]) {
         const script = join(root, "deny.mjs"); writeFileSync(script, `import fs from 'node:fs';${expression};`); const r = run(script, [], { preload: hook }); expect(r.status).toBe(1); expect(r.stderr).toContain('"denied":1');
       }
     }

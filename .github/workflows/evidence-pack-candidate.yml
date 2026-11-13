@@ -73,7 +73,7 @@ jobs:
       - name: Check identical candidate on Node 24
         run: |
           node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
-          # M2 reads the validated descriptor: fixture version refuses; release version retains its exact bytes.
+          # M2 uses candidateForTests / functionalCandidateForTests: fixture version refuses; the separate control retains exact version bytes.
           cd server
           env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-installed-marker.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
       - name: Recheck artifact before upload

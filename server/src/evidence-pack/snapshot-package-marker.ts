@@ -2,7 +2,7 @@ import type { BigIntStats } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BIN, NON_RELEASE_MARKER } from "./artifact-policy.mjs";
 
-// Installation-layout budgets, independent of the length of any evidence input.
+// Installation-layout budgets: 4096 is Linux PATH_MAX; 256 is the design descriptor budget, independent of evidence input size.
 export const MAX_PACKAGE_PATH_BYTES = 4096, MAX_PACKAGE_COMPONENTS = 256;
 // Must match the refusal inventory in server/reorg-surface-manifest.md and the recipient instructions.
 export const NON_RELEASE_REFUSAL = "NON_RELEASE: this verifier package is not a release artifact.\n";
@@ -24,12 +24,15 @@ function observe(moduleUrl: string, fsOps: MarkerFS, bin: string): MarkerState {
     // Validate the unnormalized URL spelling too: URL parsing otherwise erases dot components.
     if (/[\\?#]/.test(moduleUrl) || /%5c/i.test(moduleUrl)) return { kind: "unknown" };
     const raw = decodeURIComponent(moduleUrl);
+    // The first three slash-separated fields are file: and the two empty fields in file:///.
     if (!raw.startsWith("file:///") || raw.split("/").slice(3).some(part => part === "." || part === ".." || part === "")) return { kind: "unknown" };
     const path = fileURLToPath(moduleUrl);
     const components = path.slice(1).split("/");
+    // At least three components are required: a package root, dist and the entry filename.
     if (!path.startsWith("/") || Buffer.byteLength(path) > MAX_PACKAGE_PATH_BYTES || components.length > MAX_PACKAGE_COMPONENTS || components.some(part => !part || part === "." || part === "..") || components.at(-2) !== dist || components.at(-1) !== entry || components.length < 3) return { kind: "unknown" };
     const root = "/" + components.slice(0, -2).join("/");
     // Ancestors above the package root are not inspected: a symlinked ancestor relocates the whole package, so it cannot substitute a marker. These point-in-time checks require a trusted installation with no concurrent package writers; they do not authenticate a release.
+    // With --preserve-symlinks-main, a symlinked bundle observes the link directory; entry links are outside this trusted-installation check.
     // Must match markerPaths and the exact { bigint: true } option check in server/scripts/evidence-pack-drill-isolation.ts.
     const before = fsOps.lstatSync(root, { bigint: true });
     if (!before.isDirectory() || before.isSymbolicLink()) return { kind: "unknown" };
