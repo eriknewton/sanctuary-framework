@@ -1,4 +1,4 @@
-// fail-before-exempt: New drain binary witnesses; component entrypoints are absent at the supplied base.
+// fail-before-exempt: New drain authority, durability and peer witnesses read isolated native artifacts and files; capability setup uses the inherited actor helper.
 #![cfg(target_os = "linux")]
 #[path = "support/drain_run.rs"]
 mod drain_run;
@@ -74,6 +74,15 @@ fn signed_commits_originals_and_ledger_conflict() {
     assert!(f.events()[n..]
         .iter()
         .all(|v| v["event"] != "StepCompleted"));
+    let before = f.events().len();
+    f.bus.unit.lock().unwrap().pid = std::process::id();
+    f.w.send(&commit);
+    assert!(f.w.receive(WAIT_MS).is_none());
+    assert!(f.events()[before..]
+        .iter()
+        .all(|v| v["event"] != "StoreEntered" && v["event"] != "StepCompleted"));
+    assert_eq!(f.read(true)["uncertain"], false);
+    f.bus.unit.lock().unwrap().pid = f.w.child.id();
     let p = original_packet(&"f".repeat(32), 1, &envelope);
     assert_eq!(f.request(false, &p).unwrap()["op"], "ORIGINAL_ACK");
     assert_eq!(f.request(false, &p).unwrap()["op"], "ORIGINAL_ACK");
@@ -750,37 +759,58 @@ fn durable_orphan_retries_and_conflicts_keep_signer_available() {
 #[test]
 fn post_store_identity_loss_has_no_success_reply() {
     let _guard = isolation::guard();
-    let mut f = Fixture::new();
-    f.start();
-    f.prepare();
-    let digest = packet_digest(&canonical(&f.body));
-    let mut next = f.anchor.clone();
-    next["reserved_sequence"] = json!(1);
-    next["reserved_body_digest"] = json!(digest);
-    let m = json!({"version":1,"op":"RESERVE","request_id":"d".repeat(32),"expected":f.anchor,"next":next,"body_digest":digest});
-    let p = anchor_packet(&m, &[]);
-    f.fault("record", "FileSync", "hold", json!("identity"), 1);
-    let path = f.socket();
-    f.w.connect(&path);
-    f.w.send(&p);
-    let end = Instant::now() + Duration::from_millis(WAIT_MS);
-    while !f.events().iter().any(|v| {
-        v["request_id"] == "d".repeat(32) && v["event"] == "StepCompleted" && v["step"] == "Write"
-    }) {
-        assert!(Instant::now() < end);
-        std::thread::sleep(Duration::from_millis(1));
+    for death in [false, true] {
+        let mut f = Fixture::new();
+        f.start();
+        f.prepare();
+        let digest = packet_digest(&canonical(&f.body));
+        let mut next = f.anchor.clone();
+        next["reserved_sequence"] = json!(1);
+        next["reserved_body_digest"] = json!(digest);
+        let m = json!({"version":1,"op":"RESERVE","request_id":"d".repeat(32),"expected":f.anchor,"next":next,"body_digest":digest});
+        let p = anchor_packet(&m, &[]);
+        f.fault("record", "FileSync", "hold", json!("identity"), 1);
+        let path = f.socket();
+        f.w.connect(&path);
+        f.w.send(&p);
+        let end = Instant::now() + Duration::from_millis(WAIT_MS);
+        while !f.events().iter().any(|v| {
+            v["request_id"] == "d".repeat(32)
+                && v["event"] == "StepCompleted"
+                && v["step"] == "Write"
+        }) {
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if death {
+            f.w.child.kill().unwrap();
+            f.w.child.wait().unwrap();
+            f.w = Actor::new();
+        } else {
+            f.bus.unit.lock().unwrap().pid = std::process::id();
+        }
+        write_private(&f.root.join("release-identity"), b"");
+        if death {
+            while !f
+                .events()
+                .iter()
+                .any(|v| v["request_id"] == "d".repeat(32) && v["event"] == "RequestSettled")
+            {
+                assert!(Instant::now() < end);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        } else {
+            assert!(f.w.receive(WAIT_MS).is_none());
+        }
+        assert_eq!(f.read(true)["uncertain"], true);
+        assert!(f
+            .events()
+            .iter()
+            .all(|v| v["request_id"] != "d".repeat(32) || v["event"] != "ReplySent"));
+        f.bus.unit.lock().unwrap().pid = f.w.child.id();
+        f.clear();
+        assert_eq!(f.request(false, &p).unwrap()["op"], "ANCHOR_ACK");
     }
-    f.bus.unit.lock().unwrap().pid = std::process::id();
-    write_private(&f.root.join("release-identity"), b"");
-    assert!(f.w.receive(WAIT_MS).is_none());
-    assert_eq!(f.read(true)["uncertain"], true);
-    assert!(f
-        .events()
-        .iter()
-        .all(|v| v["request_id"] != "d".repeat(32) || v["event"] != "ReplySent"));
-    f.bus.unit.lock().unwrap().pid = f.w.child.id();
-    f.clear();
-    assert_eq!(f.request(false, &p).unwrap()["op"], "ANCHOR_ACK");
 }
 
 fn pending_operation(f: &mut Fixture, op: &str, id: &str) -> (bool, Vec<u8>, &'static str) {
@@ -1018,6 +1048,7 @@ fn lost_custody_and_record_ack_restart_retry_has_no_store_steps() {
 fn drain_transport_child_driver() {
     use castle_wall_daemon::business_profile::signer_peer;
     use std::os::fd::AsRawFd;
+    // The drain-actor launcher drops capabilities before exec, so every harness thread inherits the same empty principal.
     let root = std::path::PathBuf::from(
         std::env::var_os("DRAIN_TRANSPORT_FIXTURE").expect("explicit fixture root"),
     );
@@ -1149,13 +1180,10 @@ fn transport_rights_truncation_and_passed_socket_refuse_before_decode() {
         }
         write_private(&f.root.join("config.json"), &canonical(&config));
         let mut child = Reaped(
-            std::process::Command::new(executable)
-                .args([
-                    "drain_transport_child_driver",
-                    "--ignored",
-                    "--exact",
-                    "--nocapture",
-                ])
+            // Must match the --transport-child exec path in helpers/drain-actor.rs.
+            std::process::Command::new(std::env::var_os("DRAIN_TEST_ACTOR").unwrap())
+                .arg("--transport-child")
+                .arg(executable)
                 .env("DRAIN_TRANSPORT_FIXTURE", &f.root)
                 .env("DRAIN_TRANSPORT_MODE", mode)
                 .stdout(std::process::Stdio::inherit())

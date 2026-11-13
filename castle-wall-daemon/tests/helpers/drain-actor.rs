@@ -1,3 +1,4 @@
+// fail-before-exempt: New isolated native actor and capability-drop launcher; the drain entrypoint is absent at the base.
 //! Test-only real socket principal; stdin commands never exist in a shipped service.
 #[cfg(target_os = "linux")]
 fn execute() -> std::io::Result<()> {
@@ -12,6 +13,24 @@ fn execute() -> std::io::Result<()> {
     };
     // The driver permits five service deadlines for classification, a reply and scheduling overhead.
     const DRIVER_WAIT_MS: u64 = D_REQUEST_DEADLINE_MS as u64 * 5;
+    // Match the writer stand-in: empty peer capabilities permit the service's unprivileged executable inspection in root CI.
+    signer_peer::drop_capabilities()?;
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.len() == 3 && args[1] == "--transport-child" {
+        use std::os::unix::process::CommandExt;
+        // Must match drain_transport_child_driver in linux_business_drain.rs; exec preserves this dropped principal and PID.
+        return Err(std::process::Command::new(&args[2])
+            .args([
+                "drain_transport_child_driver",
+                "--ignored",
+                "--exact",
+                "--nocapture",
+            ])
+            .exec());
+    }
+    if args.len() != 1 {
+        return Err(refused());
+    }
     let mut socket: Option<OwnedFd> = None;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();

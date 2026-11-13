@@ -1059,8 +1059,9 @@ impl Executor<'_, '_> {
         }
         let old = self.store.record(SLOT).cloned();
         let digest = packet_digest(packet);
+        // Request identity uses the phase's authority only after the captured peer passed the equality check above.
         let last = LastOp {
-            authority,
+            authority: Authority::for_phase(phase),
             phase,
             request_id: frame.request_id.clone(),
             request_sha256: digest,
