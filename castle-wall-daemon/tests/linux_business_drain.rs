@@ -275,6 +275,7 @@ fn every_commit_evidence_stage_refuses_before_publication() {
     for stage in [
         "ENVELOPE",
         "ENVELOPE_INDEX",
+        "ENVELOPE_FOREIGN_ROLE",
         "BODY_DIGEST",
         "CHAIN",
         "DESCRIPTOR",
@@ -284,6 +285,18 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         "COMMITMENT",
     ] {
         let mut f = Fixture::new();
+        let foreign = castle_wall_daemon::business_profile::signer_contract::ROLE_REGISTRY
+            .iter().find(|r| r.0 != ROLE).unwrap();
+        let foreign_kid = castle_wall_daemon::business_profile::role_kid(
+            foreign.0, f.body["epoch"].as_u64().unwrap(), &f.key.verifying_key().to_bytes()).unwrap();
+        if stage == "ENVELOPE_FOREIGN_ROLE" {
+            let path = f.root.join("custody").join(FORTRESS).join(SLOT).join("public/epochs.json");
+            let mut descriptor: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            descriptor["epochs"].as_array_mut().unwrap().push(json!({"role":foreign.0,"epoch":f.body["epoch"],"kid":foreign_kid,"public_key":hex::encode(f.key.verifying_key().to_bytes())}));
+            let bytes = canonical(&descriptor);
+            f.anchor["descriptor_digest"] = json!(packet_digest(&bytes));
+            fs::write(path, bytes).unwrap();
+        }
         f.start();
         f.prepare();
         let mut body = f.body.clone();
@@ -298,6 +311,10 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         if stage == "GRANT" {
             body["generation"] = json!(body["generation"].as_u64().unwrap() + 1);
         }
+        if stage == "ENVELOPE_FOREIGN_ROLE" {
+            body["role"] = json!(foreign.0);
+            body["kid"] = json!(foreign_kid);
+        }
         let reserved = packet_digest(&canonical(&body));
         let mut next = f.anchor.clone();
         next["reserved_sequence"] = json!(1);
@@ -311,7 +328,22 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         if stage == "BODY_DIGEST" {
             body["captured_at_unix_ms"] = json!(body["captured_at_unix_ms"].as_u64().unwrap() + 1);
         }
-        let mut envelope = f.signed(&body);
+        let mut envelope = if stage == "ENVELOPE_FOREIGN_ROLE" {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+            use ed25519_dalek::Signer;
+            // Build hostile bytes directly: the fixture encoder correctly rejects foreign roles.
+            let signature = f.key.sign(&[foreign.1.as_bytes(), &canonical(&body)].concat());
+            let mut outer = serde_json::Map::new();
+            for key in castle_wall_daemon::business_profile::signer_contract::LINUX_FIELDS
+                .iter().copied().filter(|key| !key.ends_with("_digest"))
+                .chain(std::iter::once("machine_id")) {
+                outer.insert(key.into(), body[key].clone());
+            }
+            outer.insert("signature".into(), json!(URL_SAFE_NO_PAD.encode(signature.to_bytes())));
+            canonical(&json!({"body":body,"outer":outer}))
+        } else {
+            f.signed(&body)
+        };
         if stage == "SIGNATURE" {
             let e: Value = serde_json::from_slice(&envelope).unwrap();
             envelope = castle_wall_daemon::business_profile::writer_protocol::envelope(
@@ -362,7 +394,7 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             "{stage}"
         );
         assert!(
-            f.stages().contains(&if stage == "ENVELOPE_INDEX" {
+            f.stages().contains(&if stage.starts_with("ENVELOPE_") {
                 "ENVELOPE".into()
             } else {
                 stage.to_owned()
@@ -1409,4 +1441,17 @@ fn competing_reserve_and_advance_share_one_cas_prior() {
     assert_eq!(ops.iter().filter(|s| *s == "ANCHOR_ACK").count(), 1);
     assert_eq!(ops.iter().filter(|s| *s == "REFUSED").count(), 1);
     assert!(f.stages().contains(&"PROPOSE".into()));
+}
+
+#[test]
+fn schema_role_set_requires_a_role_stage_witness_when_expanded() {
+    use castle_wall_daemon::business_profile::{records_schema, signer_contract::ROLE_REGISTRY};
+    let corpus: Value = serde_json::from_str(include_str!("../src/business_profile/record_join_vectors.json")).unwrap();
+    let mut body = corpus["cases"][0]["records"][0]["body"].clone();
+    assert!(records_schema::valid(&body), "producer schema control");
+    for (role, _) in ROLE_REGISTRY {
+        if *role == ROLE { continue; }
+        body["role"] = json!(role);
+        assert!(!records_schema::valid(&body), "schema admits {role}: add the W-COMMIT-VERIFY ROLE-stage witness");
+    }
 }

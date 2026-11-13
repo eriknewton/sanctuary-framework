@@ -489,6 +489,8 @@ pub fn verify_commit(
     if message["body_digest"] != packet_digest(bytes.as_bytes()) {
         return Err(Refusal::BODY_DIGEST);
     }
+    // Foreign bodies currently refuse at ENVELOPE because records_schema admits only the producer role.
+    // This is defense in depth; the ROLE-stage witness is owed when the schema admits a second role.
     if role != drain_store::DRAIN_SLOTS[0].1 || body["role"] != role {
         return Err(Refusal::ROLE);
     }
