@@ -21,8 +21,8 @@ export function parseMarkerState(value: unknown): MarkerState {
 function observe(moduleUrl: string, fsOps: MarkerFS, bin: string): MarkerState {
   try {
     const [dist, entry] = bin.split("/");
-    // Validate the unnormalized URL spelling too: URL parsing otherwise erases dot components.
-    if (/[\\?#]/.test(moduleUrl) || /%5c/i.test(moduleUrl)) return { kind: "unknown" };
+    // Validate the unnormalized URL spelling too: URL parsing otherwise erases dot components, and it strips raw tab, newline and carriage return before resolving them.
+    if (/[\\?#]/.test(moduleUrl) || /%5c/i.test(moduleUrl) || Array.from(moduleUrl, ch => ch.charCodeAt(0)).some(code => code <= 0x20 || code === 0x7f)) return { kind: "unknown" };
     const raw = decodeURIComponent(moduleUrl);
     // The first three slash-separated fields are file: and the two empty fields in file:///.
     if (!raw.startsWith("file:///") || raw.split("/").slice(3).some(part => part === "." || part === ".." || part === "")) return { kind: "unknown" };
