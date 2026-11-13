@@ -129,12 +129,13 @@ pub fn valid(a: &Value) -> bool {
     {
         return false;
     }
+    // Sequence commitments use the schema digest width so cross-field validation cannot drift from primitive parsing.
     for (seq, digest) in [
         ("committed_sequence", "committed_digest"),
         ("drained_sequence", "drained_digest"),
     ] {
         if (n(a, seq) == 0) != (a[digest] == "GENESIS")
-            || !(a[digest] == "GENESIS" || hex(&a[digest], "sha256:", 64))
+            || !(a[digest] == "GENESIS" || hex(&a[digest], "sha256:", DIGEST_HEX_LENGTH))
         {
             return false;
         }
@@ -172,7 +173,8 @@ pub fn decode_message(bytes: &[u8]) -> Option<Value> {
     if !exact(&m, &keys)
         || (needs_body && !domain_valid(&m["body_digest"], "digest"))
         || m["version"] != 1
-        || !hex(&m["request_id"], "", 32)
+        // Request identity uses the schema width just like anchor identities.
+        || !hex(&m["request_id"], "", ID_HEX_LENGTH)
         || !OPS.contains(&m["op"].as_str()?)
         || !(valid(&m["expected"]) || (m["expected"].is_null() && m["op"] == "PREPARE"))
         || ((m["op"] == "READ") != m["next"].is_null())

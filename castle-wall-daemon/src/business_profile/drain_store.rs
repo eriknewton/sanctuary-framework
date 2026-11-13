@@ -12,9 +12,10 @@ use std::{
         unix::fs::MetadataExt,
     },
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
-// Must match D interface contract v1 in both drain briefs; d2 consumes these caps unchanged.
+// These bounds must match maximal_record_bounds_are_measured_from_canonical_images in tests/linux_business_drain_store.rs.
 pub const LENGTH_BYTES: usize = writer_protocol::LENGTH_BYTES;
 pub const SEQUENCE_FILENAME_DIGITS: usize = 20; // Decimal width of u64::MAX.
 pub use anchor::{D_DESCRIPTOR_EPOCHS_MAX, D_DESCRIPTOR_MAX_BYTES, D_EPOCH_MAX};
@@ -422,7 +423,7 @@ fn enumerate(parent: &File, cap: usize) -> Result<Vec<String>> {
             continue;
         }
         // Read at most cap plus one sentinel; never sort or collect an unbounded directory.
-        if entries.len() >= cap {
+        if entries.len() + D_DIRECTORY_SENTINEL > cap {
             return Err(StoreRefusal::CAP);
         }
         entries.push(
@@ -549,6 +550,7 @@ pub struct StateLock {
     file: File,
     root_dev: u64,
     root_ino: u64,
+    opened: AtomicBool,
 }
 impl StateLock {
     pub fn acquire(root: &HeldRoot) -> Result<Self> {
@@ -574,6 +576,7 @@ impl StateLock {
             file,
             root_dev: m.dev(),
             root_ino: m.ino(),
+            opened: AtomicBool::new(false),
         })
     }
 }
@@ -617,7 +620,7 @@ impl StoreFaults {
             use std::time::{Duration, Instant};
             const SEAM_BYTES_MAX: u64 = 65536; // One bounded test schedule, independent of production packets.
             const SEAM_RULES_MAX: usize = 128; // Two positions for six steps across the bounded publication matrix.
-            const SEAM_WAIT_MAX_MS: u64 = (D_REQUEST_DEADLINE_MS * 10) as u64;
+            const SEAM_WAIT_MAX_MS: u64 = (D_REQUEST_DEADLINE_MS * 10) as u64; // Ten request budgets bound a test driver hold, never a production request.
             let dir = match &self.seam {
                 Some(dir) => dir,
                 None => return Ok(false),
@@ -810,7 +813,7 @@ pub fn validate_role_state(root: &HeldRoot, fortress: &str) -> Result<RoleState>
     validate_layout(root, fortress, false)
 }
 // Continuing effect | Evidence | Refusal
-// Open PRESENT | trusted locked layout, canonical record, ledger and copy checks | any invalid entry or bound
+// Open PRESENT | synced directory chain, trusted locked layout, canonical record, ledger and copy checks | any failed sync, invalid entry or bound
 // Open ABSENT | no record and no originals | any retained original
 // Remove known staging | complete layout validated first | unknown leaf, metadata or cleanup failure
 // Keep orphan | sequence and role join ledger head | conflicting orphan
@@ -986,6 +989,14 @@ fn validate_layout(root: &HeldRoot, fortress: &str, cleanup: bool) -> Result<Rol
     Ok(state)
 }
 
+// A lease releases in-process ownership on failed startup or Store drop while retaining the process lock.
+struct StoreLease<'a>(&'a StateLock);
+impl Drop for StoreLease<'_> {
+    fn drop(&mut self) {
+        self.0.opened.store(false, Ordering::Release);
+    }
+}
+
 struct Attempt {
     directory: File,
     target: String,
@@ -998,7 +1009,7 @@ struct Attempt {
 pub struct Store<'a> {
     root: &'a HeldRoot,
     fortress: String,
-    _lock: &'a StateLock,
+    _lock: StoreLease<'a>,
     state: RoleState,
     uncertain: bool,
     attempts: Vec<Attempt>,
@@ -1025,6 +1036,15 @@ impl<'a> Store<'a> {
         {
             return Err(StoreRefusal::LOCK);
         }
+        // One held flock permits only one live in-process store, so independent caches cannot authorize competing publications.
+        if lock
+            .opened
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StoreRefusal::LOCK);
+        }
+        let lease = StoreLease(lock);
         // A restart cannot infer persistence from visible bytes; sync all present paths before bounded readback and validation.
         let state = match sync_existing_chain(root, fortress, &mut faults, &events)
             .and_then(|()| validate_layout(root, fortress, true))
@@ -1038,7 +1058,7 @@ impl<'a> Store<'a> {
         Ok(Self {
             root,
             fortress: fortress.into(),
-            _lock: lock,
+            _lock: lease,
             state,
             uncertain: false,
             attempts: Vec::new(),
@@ -1174,6 +1194,44 @@ impl<'a> Store<'a> {
             PublishOutcome::PrePublication(stage)
         }
     }
+    fn check_record_copies(&self, record: &DrainRecord) -> Result<()> {
+        let drained = record.anchor["drained_sequence"]
+            .as_u64()
+            .ok_or(StoreRefusal::COPY_SET)?;
+        let old_drained = self
+            .state
+            .record
+            .as_ref()
+            .and_then(|r| r.anchor["drained_sequence"].as_u64())
+            .unwrap_or(0);
+        // A prospective anchor may preserve the tail or consume exactly one verified original; it cannot invent, discard or skip copy history.
+        if drained != old_drained && Some(drained) != old_drained.checked_add(1) {
+            return Err(StoreRefusal::COPY_SET);
+        }
+        if drained > 0 {
+            check_copy(
+                self.state
+                    .copies
+                    .get(&drained)
+                    .ok_or(StoreRefusal::COPY_SET)?,
+                drained,
+                record.anchor["drained_digest"]
+                    .as_str()
+                    .ok_or(StoreRefusal::COPY_SET)?,
+                StoreRefusal::COPY_SET,
+            )?;
+        }
+        if let Some(bytes) = self.state.copies.get(&drained.saturating_add(1)) {
+            // A retained orphan must still join the prospective ledger head before that record can replace the verified image.
+            check_copy(
+                bytes,
+                drained + 1,
+                record.ledger.first().ok_or(StoreRefusal::COPY_SET)?,
+                StoreRefusal::COPY_SET,
+            )?;
+        }
+        Ok(())
+    }
     pub fn publish_record(&mut self, slot: &str, record: &DrainRecord) -> PublishOutcome {
         if self.uncertain {
             return self.refuse(StoreRefusal::UNCERTAIN);
@@ -1188,6 +1246,9 @@ impl<'a> Store<'a> {
             Ok(b) => b,
             Err(e) => return self.refuse(e),
         };
+        if let Err(stage) = self.check_record_copies(record) {
+            return self.refuse(stage);
+        }
         if !self.copy_pending {
             self.attempts.clear();
         }
@@ -1325,8 +1386,8 @@ impl<'a> Store<'a> {
     }
     // Continuing effect | Evidence | Refusal
     // Durable | synced file, rename, synced directory, exact readback and held path | uncertain after rename
-    // Keep old and open | no rename, or failed rename with verified old inode and bytes; cleanup verified | uncertain cleanup
-    // Publish record after copy | verified copy retained in this request | uncertain copy blocks record
+    // Keep old and open | no rename, or failed rename with verified old inode and bytes or absence; cleanup verified | uncertain cleanup
+    // Publish record after copy | verified charged orphan survives pre-publication record refusal | uncertain copy blocks record
     // These arms must match every_record_image_cut and every_copy_cut witnesses in tests/linux_business_drain_store.rs.
     fn publish(
         &mut self,
@@ -1343,7 +1404,12 @@ impl<'a> Store<'a> {
         };
         let old = match read_image(&dir, &target, self.root.owner, cap) {
             Ok(v) => v,
-            Err(e) => return self.refuse(e),
+            Err(e) => {
+                if publication == "record" {
+                    self.retain_verified_record(dir, target, request_id);
+                }
+                return self.refuse(e);
+            }
         };
         if publication == "copy" && old.is_some() {
             return self.refuse(StoreRefusal::ORPHAN);
@@ -1360,6 +1426,8 @@ impl<'a> Store<'a> {
                 _ => false,
             };
             if !matches {
+                // A changed disk image invalidates certainty even before staging; reconciliation may only restore the last verified bytes.
+                self.retain_verified_record(dir, target, request_id);
                 return self.refuse(StoreRefusal::READBACK);
             }
         }
@@ -1417,6 +1485,29 @@ impl<'a> Store<'a> {
             return self.refuse(stage);
         }
         PublishOutcome::Durable
+    }
+    fn retain_verified_record(
+        &mut self,
+        directory: File,
+        target: String,
+        request_id: Option<String>,
+    ) {
+        // No write was attempted, so only the last verified image can clear this observed disk discrepancy.
+        self.uncertain = true;
+        self.attempts.push(Attempt {
+            directory,
+            target,
+            publication: "record",
+            old: self.state.record_image.clone(),
+            bytes: self
+                .state
+                .record_image
+                .as_ref()
+                .map(|i| i.bytes.clone())
+                .unwrap_or_default(),
+            state: PublicationState::Planned,
+            request_id,
+        });
     }
     fn write_last(&mut self) -> Result<()> {
         let a = self.attempts.last_mut().ok_or(StoreRefusal::STAGE)?;
@@ -1572,7 +1663,7 @@ impl<'a> Store<'a> {
     // Clear durable | every affected directory synced and every target equals an attempted or verified old image, layout valid | any mismatch stays uncertain
     // Clear lost | same independent sync and layout proof with old bytes or verified absence | unknown bytes stay uncertain
     // Keep open | already certain, no IO | unknown slot refuses
-    // These arms must match readback_mismatch_and_directory_sync and original_record_failure witnesses in tests/linux_business_drain_store.rs.
+    // These arms must match readback_mismatch_and_directory_sync_are_independent_predicates and postrename_record_failure_reconciles_copy_and_record_independently in tests/linux_business_drain_store.rs.
     fn reconcile_inner(&mut self, slot: &str) -> Result<()> {
         if slot != SLOT {
             return Err(StoreRefusal::RECORD_ANCHOR);
@@ -1580,6 +1671,7 @@ impl<'a> Store<'a> {
         if !self.uncertain {
             return Ok(());
         }
+        // With no retained attempt there is no clearing image; callers must not mark a no-store-step retry uncertain.
         if self.attempts.is_empty() {
             return Err(StoreRefusal::UNCERTAIN);
         }

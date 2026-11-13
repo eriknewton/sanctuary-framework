@@ -1,4 +1,5 @@
-// fail-before-exempt: the durable store is new; isolated predicate mutations supply evidence.
+// Continuing-path and bound witnesses must match drain_store.rs in ../src/business_profile/drain_store.rs.
+// Existing correct behavior is regression coverage; fix witnesses also run against the supplied branch head.
 #![cfg(target_os = "linux")]
 mod isolation;
 use castle_wall_daemon::business_profile::{
@@ -194,6 +195,7 @@ fn every_record_image_cut_preserves_observation_and_recovers() {
                 let before = fixture.events().len();
                 fixture.fault("record", step, position, "fail", 1);
                 let outcome = store.publish_record(SLOT, &next);
+                assert_fault_boundary(&fixture, before, "record", step, position, &outcome);
                 assert_eq!(
                     matches!(outcome, PublishOutcome::Uncertain(_)),
                     post_rename(step, position),
@@ -248,6 +250,7 @@ fn every_record_image_cut_preserves_observation_and_recovers() {
                 fixture.clear();
                 let restarted = fixture.store();
                 assert_eq!(restarted.observe(SLOT), observation);
+                assert_restart_record_cut(&old, &next, step, position);
                 assert!(fs::read_dir(fixture.record_path().parent().unwrap())
                     .unwrap()
                     .all(|e| !e
@@ -270,7 +273,9 @@ fn every_copy_cut_and_orphan_reuse_preserves_the_anchor() {
             let mut store = fixture.store();
             assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
             fixture.fault("copy", step, position, "fail", 1);
+            let before = fixture.events().len();
             let outcome = store.publish_original(SLOT, 1, &bytes);
+            assert_fault_boundary(&fixture, before, "copy", step, position, &outcome);
             assert_eq!(store.observe(SLOT).anchor, Some(r.anchor.clone()));
             if post_rename(step, position) {
                 assert!(matches!(outcome, PublishOutcome::Uncertain(_)));
@@ -321,6 +326,7 @@ fn every_copy_cut_and_orphan_reuse_preserves_the_anchor() {
             drop(store);
             let store = fixture.store();
             assert_eq!(store.copy(SLOT, 1), Some(bytes.as_slice()));
+            assert_restart_copy_cut(&r, &bytes, step, position);
         }
     }
 }
@@ -603,10 +609,19 @@ fn maximal_record_bounds_are_measured_from_canonical_images() {
 #[test]
 fn seams_are_feature_gated_and_no_service_calls_the_store() {
     let source = include_str!("../src/business_profile/drain_store.rs");
-    assert!(
-        source.contains("#[cfg(feature=\"test-isolation\")]\n    pub fn from_seam_root")
-            || source.contains("#[cfg(feature = \"test-isolation\")]\n    pub fn from_seam_root")
-    );
+    assert_eq!(
+        source
+            .matches("#[cfg(feature = \"test-isolation\")]\n    pub fn from_seam_root")
+            .count(),
+        2
+    ); // Both fault and event constructors must be gated.
+    assert_eq!(
+        source
+            .matches("#[cfg(feature = \"test-isolation\")]\n    pub fn from_seam_root")
+            .count(),
+        2
+    ); // Fault and event constructors both require the feature.
+    assert!(source.contains("#[cfg(feature = \"test-isolation\")]\n    pub fn isolated_under"));
     assert!(!include_str!("../src/business_profile/writer_service.rs").contains("drain_store"));
     assert!(!include_str!("../src/business_profile/signer_service.rs").contains("drain_store"));
 }
@@ -714,6 +729,14 @@ fn copy_caps_refuse_without_eviction_and_oversize_records_do_no_io() {
             }
         );
         assert_eq!(fs::read(tail_path).unwrap(), tail);
+        drop(store);
+        let stage = fixture
+            .copies_path()
+            .join(format!(".{:020}.env.staging", count + 1));
+        fs::write(&stage, &next).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(fixture.try_store(), Err(StoreRefusal::CAP)));
+        assert!(stage.exists());
     }
     let fixture = Fixture::new();
     let mut store = fixture.store();
@@ -738,7 +761,9 @@ fn genesis_cuts_reopen_without_inventing_a_proposal() {
             let fixture = Fixture::new();
             let mut store = fixture.store();
             fixture.fault("record", step, position, "fail", 1);
+            let before = fixture.events().len();
             let outcome = store.publish_record(SLOT, &genesis());
+            assert_fault_boundary(&fixture, before, "record", step, position, &outcome);
             assert_eq!(store.observe(SLOT).state, ObservationState::Absent);
             assert_eq!(store.observe(SLOT).uncertain, post_rename(step, position));
             assert_eq!(
@@ -1193,4 +1218,332 @@ fn copy_staging_without_record_refuses_start_and_is_preserved() {
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(matches!(fixture.try_store(), Err(StoreRefusal::STAGING)));
     assert_eq!(fs::read(stage).unwrap(), b"partial");
+}
+
+fn assert_fault_boundary(
+    fixture: &Fixture,
+    before: usize,
+    publication: &str,
+    step: StoreStep,
+    position: &str,
+    outcome: &PublishOutcome,
+) {
+    let stage = match step {
+        StoreStep::HoldDirectory => StoreRefusal::ROOT,
+        StoreStep::Stage => StoreRefusal::STAGE,
+        StoreStep::Write => StoreRefusal::WRITE,
+        StoreStep::FileSync => StoreRefusal::FILE_SYNC,
+        StoreStep::Rename => StoreRefusal::RENAME,
+        StoreStep::DirSync => StoreRefusal::DIR_SYNC,
+        StoreStep::Readback => StoreRefusal::READBACK,
+    };
+    assert_eq!(
+        *outcome,
+        if post_rename(step, position) {
+            PublishOutcome::Uncertain(stage)
+        } else {
+            PublishOutcome::PrePublication(stage)
+        }
+    );
+    let index = STEPS.iter().position(|s| *s == step).unwrap();
+    // Readback completion requires comparison after both hooks; other steps complete before their after hook.
+    let count = index + usize::from(position == "after" && step != StoreStep::Readback);
+    let events = fixture.events();
+    let completed: Vec<_> = events[before..]
+        .iter()
+        .filter(|e| e["publication"] == publication && e["event"] == "StepCompleted")
+        .map(|e| e["step"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        completed,
+        STEPS[..count]
+            .iter()
+            .map(|s| format!("{s:?}"))
+            .collect::<Vec<_>>()
+    );
+    let refusals = fs::read_to_string(fixture.seam.join("refusals.jsonl")).unwrap();
+    let refusal: Value = serde_json::from_str(refusals.lines().last().unwrap()).unwrap();
+    assert_eq!(refusal["stage"], format!("{stage:?}"));
+}
+
+#[test]
+fn one_lock_cannot_back_two_live_stores() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::Durable
+    );
+    let stage = fixture
+        .record_path()
+        .with_file_name(format!(".{SLOT}.json.staging"));
+    fs::write(&stage, b"partial").unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fixture.events();
+    assert!(matches!(fixture.try_store(), Err(StoreRefusal::LOCK)));
+    assert!(stage.exists());
+    assert_eq!(fixture.events(), before);
+    drop(store);
+    drop(fixture.store());
+    assert!(!stage.exists());
+}
+
+#[test]
+fn prospective_records_must_match_verified_copies_before_staging() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let bytes = envelope(1);
+    let r = committed(&bytes);
+    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+    let before = fixture.events();
+    assert_eq!(
+        store.publish_record(SLOT, &drained(r.clone())),
+        PublishOutcome::PrePublication(StoreRefusal::COPY_SET)
+    );
+    assert_eq!(fixture.events(), before);
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    let mut bad_orphan = r.clone();
+    let wrong = format!("sha256:{}", "f".repeat(anchor::DIGEST_HEX_LENGTH));
+    bad_orphan.anchor["committed_digest"] = json!(wrong);
+    bad_orphan.ledger[0] = wrong.clone();
+    let mut bad_tail = drained(r.clone());
+    bad_tail.anchor["committed_digest"] = json!(wrong);
+    bad_tail.anchor["drained_digest"] = json!(wrong);
+    let mut skipped = drained(r.clone());
+    for field in [
+        "drained_sequence",
+        "committed_sequence",
+        "reserved_sequence",
+    ] {
+        skipped.anchor[field] = json!(2);
+    } // Skips the first verified tail.
+    for candidate in [bad_orphan, bad_tail, skipped] {
+        let before = fixture.events();
+        assert_eq!(
+            store.publish_record(SLOT, &candidate),
+            PublishOutcome::PrePublication(StoreRefusal::COPY_SET)
+        );
+        assert_eq!(fixture.events(), before);
+        assert!(!store.observe(SLOT).uncertain);
+    }
+    assert_eq!(
+        store.publish_record(SLOT, &drained(r)),
+        PublishOutcome::Durable
+    );
+    let before = fixture.events();
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::PrePublication(StoreRefusal::COPY_SET)
+    );
+    assert_eq!(fixture.events(), before);
+}
+
+#[test]
+fn changed_disk_record_stays_uncertain_until_verified_bytes_return() {
+    let _guard = isolation::guard();
+    for absent in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        let old = genesis();
+        assert_eq!(store.publish_record(SLOT, &old), PublishOutcome::Durable);
+        let mut next = old.clone();
+        next.anchor["generation_high_water"] = json!(1);
+        if absent {
+            fs::remove_file(fixture.record_path()).unwrap();
+        } else {
+            fs::write(fixture.record_path(), encode_record(&next).unwrap()).unwrap();
+        }
+        let before = fixture.events();
+        assert_eq!(
+            store.publish_record(SLOT, &next),
+            PublishOutcome::Uncertain(StoreRefusal::READBACK)
+        );
+        assert!(store.observe(SLOT).uncertain);
+        assert!(!fixture.events()[before.len()..]
+            .iter()
+            .any(|e| e["step"] == "Stage"));
+        assert!(store.reconcile(SLOT).is_err());
+        fs::write(fixture.record_path(), encode_record(&old).unwrap()).unwrap();
+        fs::set_permissions(fixture.record_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        store.reconcile(SLOT).unwrap();
+        assert!(!store.observe(SLOT).uncertain);
+        assert_eq!(store.record(SLOT), Some(&old));
+    }
+}
+
+#[test]
+fn startup_partial_copy_cleanup_requires_the_record_next_sequence() {
+    let _guard = isolation::guard();
+    for sequence in [1, 2] {
+        // Only the first sequence follows a genesis record.
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        assert_eq!(
+            store.publish_record(SLOT, &genesis()),
+            PublishOutcome::Durable
+        );
+        drop(store);
+        let stage = fixture
+            .copies_path()
+            .join(format!(".{sequence:020}.env.staging"));
+        fs::write(&stage, b"partial").unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+        if sequence == 1 {
+            assert!(!fixture.store().observe(SLOT).uncertain);
+            assert!(!stage.exists());
+        } else {
+            assert!(matches!(fixture.try_store(), Err(StoreRefusal::STAGING)));
+            assert!(stage.exists());
+        }
+    }
+}
+
+#[test]
+fn each_held_directory_enforces_its_entry_limit_at_start() {
+    let _guard = isolation::guard();
+    for directory in ["root", "fortress", "anchors", "originals", "copies"] {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        assert_eq!(
+            store.publish_record(SLOT, &genesis()),
+            PublishOutcome::Durable
+        );
+        drop(store);
+        let (dir, extras) = match directory {
+            "root" => (fixture.root.clone(), 1), // Lock and fortress already occupy both allowed names.
+            "fortress" => (fixture.root.join(FORTRESS), 1), // Anchors and originals already occupy both names.
+            "anchors" => (fixture.record_path().parent().unwrap().to_owned(), 2), // One record plus two extra names exceeds record and staging.
+            "originals" => (fixture.copies_path().parent().unwrap().to_owned(), 1), // Only the producer slot is permitted.
+            _ => (
+                fixture.copies_path(),
+                D_COPY_ENTRIES_MAX + D_DIRECTORY_SENTINEL + 1,
+            ), // Retained copies, one staging allowance, and one refusal sentinel.
+        };
+        for i in 0..extras {
+            fs::write(dir.join(format!("extra-{i}")), b"").unwrap();
+        }
+        assert!(
+            matches!(fixture.try_store(), Err(StoreRefusal::CAP)),
+            "{directory}"
+        );
+    }
+}
+
+#[test]
+fn restart_after_parent_sync_failure_requires_fresh_chain_sync() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    fixture.fault(
+        "chain:fortress:parent",
+        StoreStep::DirSync,
+        "before",
+        "fail",
+        1,
+    );
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::PrePublication(StoreRefusal::DIR_SYNC)
+    );
+    drop(store);
+    fixture.fault("root", StoreStep::DirSync, "before", "fail", 1);
+    assert!(matches!(fixture.try_store(), Err(StoreRefusal::DIR_SYNC)));
+    fixture.clear();
+    let mut store = fixture.store();
+    let before = fixture.events().len();
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::Durable
+    );
+    assert_chain_before_stage(&fixture.events()[before..]);
+}
+
+#[test]
+fn postrename_record_failure_reconciles_copy_and_record_independently() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let bytes = envelope(1);
+    let r = committed(&bytes);
+    assert_eq!(store.publish_record(SLOT, &r), PublishOutcome::Durable);
+    assert_eq!(
+        store.publish_original(SLOT, 1, &bytes),
+        PublishOutcome::Durable
+    );
+    fixture.fault("record", StoreStep::DirSync, "before", "fail", 1);
+    assert_eq!(
+        store.publish_record(SLOT, &drained(r.clone())),
+        PublishOutcome::Uncertain(StoreRefusal::DIR_SYNC)
+    );
+    for publication in ["copy", "record"] {
+        fixture.fault(publication, StoreStep::DirSync, "before", "fail", 1);
+        assert_eq!(store.reconcile(SLOT), Err(StoreRefusal::DIR_SYNC));
+        assert!(store.observe(SLOT).uncertain);
+        assert_eq!(store.record(SLOT), Some(&r));
+    }
+    fixture.clear();
+    store.reconcile(SLOT).unwrap();
+    assert_eq!(store.record(SLOT), Some(&drained(r)));
+    assert!(!store.observe(SLOT).uncertain);
+}
+
+// Separate fixtures preserve both immediate restart evidence and the original store's in-process reconciliation evidence.
+fn assert_restart_record_cut(
+    old: &DrainRecord,
+    next: &DrainRecord,
+    step: StoreStep,
+    position: &str,
+) {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    assert_eq!(store.publish_record(SLOT, old), PublishOutcome::Durable);
+    fixture.fault("record", step, position, "fail", 1);
+    let before = fixture.events().len();
+    let outcome = store.publish_record(SLOT, next);
+    assert_fault_boundary(&fixture, before, "record", step, position, &outcome);
+    drop(store);
+    if step == StoreStep::DirSync {
+        assert!(matches!(fixture.try_store(), Err(StoreRefusal::DIR_SYNC)));
+    }
+    fixture.clear();
+    let restarted = fixture.store();
+    assert!(!restarted.observe(SLOT).uncertain);
+    assert_eq!(
+        restarted.record(SLOT),
+        Some(if post_rename(step, position) {
+            next
+        } else {
+            old
+        })
+    );
+}
+fn assert_restart_copy_cut(record: &DrainRecord, bytes: &[u8], step: StoreStep, position: &str) {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    assert_eq!(store.publish_record(SLOT, record), PublishOutcome::Durable);
+    fixture.fault("copy", step, position, "fail", 1);
+    let before = fixture.events().len();
+    let outcome = store.publish_original(SLOT, 1, bytes);
+    assert_fault_boundary(&fixture, before, "copy", step, position, &outcome);
+    drop(store);
+    if step == StoreStep::DirSync {
+        assert!(matches!(fixture.try_store(), Err(StoreRefusal::DIR_SYNC)));
+    }
+    fixture.clear();
+    let restarted = fixture.store();
+    assert!(!restarted.observe(SLOT).uncertain);
+    assert_eq!(restarted.record(SLOT), Some(record));
+    assert_eq!(
+        restarted.copy(SLOT, 1),
+        if post_rename(step, position) {
+            Some(bytes)
+        } else {
+            None
+        }
+    );
 }
