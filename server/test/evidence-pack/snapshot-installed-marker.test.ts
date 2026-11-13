@@ -147,6 +147,12 @@ describe("installed package classification", () => {
       expect(await runInstalledOfflineCommand(["--help"], pathToFileURL(realpathSync(marked.command)).href, { stdout: good, stderr: broken })).toBe(1); expect(calls).toBe(1); calls = 0;
       expect(await runInstalledOfflineCommand(["--help"], pathToFileURL(realpathSync(control.command)).href, { stdout: broken, stderr: good })).toBe(1); expect(calls).toBe(1);
     }
+    // Emit during a successful command's write, before its returned zero reaches the built footer.
+    for (const [command, output] of [[control.command, HELP], [control.checker, ARTIFACT_HELP]]) for (const stream of ["stdout", "stderr"]) {
+      const hook = preload(`const native=process.stdout.write.bind(process.stdout);let faults=0;process.stdout.write=(...args)=>{const callback=args.at(-1);if(typeof callback!=='function')throw Error('write callback required');args[args.length-1]=(...result)=>{callback(...result);if(!faults){faults++;process[${JSON.stringify(stream)}].emit('error',Error('scheduled stream failure'));}};return native(...args);};process.on('exit',()=>process.stderr.write('STREAM_ERRORS '+faults+'\\n'));`);
+      const r = run(command!, ["--help"], { preload: hook });
+      expect(r.error).toBeUndefined(); expect(r.status, r.stderr).toBe(1); expect(r.stdout).toBe(output); expect(r.stderr).toBe("STREAM_ERRORS 1\n");
+    }
   });
   it("limits isolation observations to exact package paths M14", () => {
     paired(); const root = scratch(), bundle = realpathSync(control.command), packageRoot = dirname(dirname(bundle));
