@@ -326,6 +326,10 @@ fn every_commit_evidence_stage_refuses_before_publication() {
         "SIGNATURE",
         "COMMITMENT",
     ] {
+        // A targeted mutation run selects one evidence predicate; ordinary suites run every case.
+        if std::env::var("DRAIN_VERIFY_CASE").is_ok_and(|selected| selected != stage) {
+            continue;
+        }
         let mut f = Fixture::new();
         let foreign = castle_wall_daemon::business_profile::signer_contract::ROLE_REGISTRY
             .iter()
@@ -346,6 +350,10 @@ fn every_commit_evidence_stage_refuses_before_publication() {
                 .join("public/epochs.json");
             let mut descriptor: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             descriptor["epochs"].as_array_mut().unwrap().push(json!({"role":foreign.0,"epoch":f.body["epoch"],"kid":foreign_kid,"public_key":hex::encode(f.key.verifying_key().to_bytes())}));
+            descriptor["epochs"]
+                .as_array_mut()
+                .unwrap()
+                .sort_by(|a, b| a["role"].as_str().cmp(&b["role"].as_str()));
             let bytes = canonical(&descriptor);
             f.anchor["descriptor_digest"] = json!(packet_digest(&bytes));
             fs::write(path, bytes).unwrap();
@@ -384,6 +392,9 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             "GRANT_ACTIVATION" => body["activation_id"] = json!("f".repeat(32)),
             "GRANT_BOOT" => body["boot_id"] = json!("f".repeat(32)),
             _ => {}
+        }
+        for field in ["machine_id", "activation_id", "boot_id"] {
+            body["payload"]["context"]["flow"][field] = body[field].clone();
         }
         if stage == "CHAIN" {
             body["prior_commitment"] = json!(format!("sha256:{}", "f".repeat(64)));
@@ -487,8 +498,11 @@ fn every_commit_evidence_stage_refuses_before_publication() {
             "{stage}"
         );
         assert!(
-            f.stages()
-                .contains(&stage.split('_').next().unwrap().to_owned()),
+            f.stages().contains(&if stage == "BODY_DIGEST" {
+                stage.to_owned()
+            } else {
+                stage.split('_').next().unwrap().to_owned()
+            }),
             "{stage}: {:?}",
             f.stages()
         );
