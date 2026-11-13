@@ -105,7 +105,7 @@ it("reachability follows local helpers and aliases without promoting unrelated i
     expect(() => reachable(`${imported} fn entry() { helper(); } fn helper() { Hidden::from_bytes(); }`, ["entry"])).toThrow("forbidden production item");
   }
   for (const literal of ['"https://local"', 'r#"https://local"#']) {
-    expect(() => reachable(production(`fn entry() { let url = ${literal}; SigningKey::from_bytes(); }`), ["entry"])).toThrow("forbidden production item");
+    expect(() => reachable(production(`fn entry() {\n let url = ${literal}; SigningKey::from_bytes();\n }`), ["entry"])).toThrow("forbidden production item");
   }
   expect(() => reachable("fn unrelated() {}", ["entry"])).toThrow("unresolved");
   expect(() => reachable("fn entry() { unknown_module::helper(); }", ["entry"])).toThrow("unresolved");
