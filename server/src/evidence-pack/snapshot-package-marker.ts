@@ -21,6 +21,7 @@ export function parseMarkerState(value: unknown): MarkerState {
 function observe(moduleUrl: string, fsOps: MarkerFS, entry: string): MarkerState {
   try {
     // Validate the unnormalized URL spelling too: URL parsing otherwise erases dot components.
+    if (/[\\?#]/.test(moduleUrl) || /%5c/i.test(moduleUrl)) return { kind: "unknown" };
     const raw = decodeURIComponent(moduleUrl);
     if (!raw.startsWith("file:///") || raw.split("/").slice(3).some(part => part === "." || part === ".." || part === "")) return { kind: "unknown" };
     const path = fileURLToPath(moduleUrl);
