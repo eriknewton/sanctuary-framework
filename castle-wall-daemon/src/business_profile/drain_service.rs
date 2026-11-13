@@ -886,7 +886,7 @@ fn unlink_socket(runtime: &Directory) -> Result<()> {
     }
 }
 fn prepare_socket<'a>(runtime: &'a Directory, _lock: &StateLock) -> Result<SocketGuard<'a>> {
-    // Only the singleton state-lock holder may remove the fixed stale socket; no arbitrary runtime entry is cleaned.
+    // Stale unlink relies on the owner-controlled 0700 runtime root and singleton StateLock: no other process admitted by the contract can bind drain.sock.
     if let Some(st) = socket_stat(runtime)? {
         if st.st_mode & libc::S_IFMT != libc::S_IFSOCK || st.st_uid != runtime.owner {
             return Err(Refusal::SOCKET);
