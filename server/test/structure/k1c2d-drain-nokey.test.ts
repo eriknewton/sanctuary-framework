@@ -100,7 +100,7 @@ function reachable(source: string, roots: string[]): string[] {
 it("reachability follows local helpers and aliases without promoting unrelated items", () => {
   expect(reachable("fn entry() { envelope(); } fn envelope() {} fn unrelated() { SigningKey::from_bytes(); }", ["entry"])).toEqual(["entry", "envelope"]);
   for (const imported of ["use ed25519_dalek::SigningKey as Hidden;", "use ed25519_dalek::{SigningKey as Hidden};", "type Hidden = ed25519_dalek::SigningKey;"]) {
-    expect(() => reachable(`${imported} fn entry() { helper(); } fn helper() { Hidden::from_bytes(); }`, ["entry"])).toThrow("forbidden");
+    expect(() => reachable(`${imported} fn entry() { helper(); } fn helper() { Hidden::from_bytes(); }`, ["entry"])).toThrow("forbidden production item");
   }
   expect(() => reachable("fn unrelated() {}", ["entry"])).toThrow("unresolved");
   expect(() => reachable("fn entry() { unknown_module::helper(); }", ["entry"])).toThrow("unresolved");
@@ -111,7 +111,11 @@ it("drain production items have no key constructor, signer client or worker laun
   const binary = production(readFileSync("../castle-wall-daemon/src/bin/sanctuary-business-drain.rs", "utf8"));
   expect(reachable(binary, ["main"])).toEqual(["execute", "main"]);
   const source = production(readFileSync("../castle-wall-daemon/src/business_profile/drain_service.rs", "utf8"));
-  const graph = reachable(source, ["production", "run", "request", "process", "verify_commit", "verify_original"]);
+  let graph: string[] = [];
+  let failure = "";
+  try { graph = reachable(source, ["production", "run", "request", "process", "verify_commit", "verify_original"]); }
+  catch (error) { failure = (error as Error).message; }
+  expect(failure, "production traversal must succeed; forbidden production item identifies a key-construction kill").toBe("");
   for (const item of ["descriptor", "capture", "revalidate", "prepare_socket", "publish"]) expect(graph).toContain(item);
   const writer = production(readFileSync("../castle-wall-daemon/src/business_profile/writer_protocol.rs", "utf8"));
   const pure = reachable(writer, ["decode_envelope", "envelope", "envelope_fits"]);

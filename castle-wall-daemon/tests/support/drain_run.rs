@@ -233,9 +233,12 @@ impl Fixture {
         );
     }
     pub fn notification(&self) -> String {
+        self.try_notification().expect("drain notify deadline")
+    }
+    pub fn try_notification(&self) -> Option<String> {
         let mut bytes = [0; 1024];
-        let n = self.notify.recv(&mut bytes).expect("drain notify deadline");
-        String::from_utf8(bytes[..n].to_vec()).unwrap()
+        let n = self.notify.recv(&mut bytes).ok()?;
+        String::from_utf8(bytes[..n].to_vec()).ok()
     }
     pub fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {

@@ -20,7 +20,16 @@ fn genesis_phase_retry_restart_and_conflict() {
     let mut f = Fixture::new();
     f.start();
     assert_eq!(f.read(true)["state"], "ABSENT");
-    let (prepare, commit) = f.prepare();
+    let id = "c".repeat(32);
+    let mut next = f.anchor.clone();
+    next["transaction_id"] = json!(id);
+    let prepare = anchor_packet(&json!({"version":1,"op":"PREPARE","request_id":id,"expected":null,"next":next}), &[]);
+    let commit = anchor_packet(&json!({"version":1,"op":"COMMIT","request_id":id,"expected":next,"next":f.anchor}), &[]);
+    for packet in [&prepare, &commit] {
+        let reply = f.request(true, packet);
+        assert_eq!(reply.as_ref().and_then(|r| r["op"].as_str()), Some("ANCHOR_ACK"), "PREPARE then custody COMMIT share one id");
+        assert!(!f.stages().contains(&"RETRY".into()), "PREPARE then custody COMMIT must not conflict");
+    }
     assert_eq!(f.request(true, &prepare).unwrap()["op"], "REFUSED");
     let count = f
         .events()
