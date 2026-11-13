@@ -1231,6 +1231,7 @@ impl Executor<'_, '_> {
             }
             Err(stage) => {
                 self.diagnostics.refuse(stage, Some(&frame.request_id))?;
+                // Decode, STORE (including CAP) and RETRY conflicts close silently; W must treat disconnect exactly as REFUSED, never as proof of failure.
                 if stage != Refusal::STORE && stage != Refusal::RETRY {
                     let bytes = response("REFUSED", &frame.request_id, None, None, false)?;
                     let _ = send_before(fd, &bytes, &end);
