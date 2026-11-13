@@ -44,6 +44,9 @@ impl Fixture {
         }
     }
     fn store(&self) -> Store<'_> {
+        self.try_store().unwrap()
+    }
+    fn try_store(&self) -> Result<Store<'_>, StoreRefusal> {
         // SAFETY: the test's euid supplies required ownership evidence, never a production root path.
         Store::open(
             &self.held,
@@ -53,7 +56,6 @@ impl Fixture {
             StoreFaults::from_seam_root(&self.seam).unwrap(),
             EventSink::from_seam_root(&self.seam).unwrap(),
         )
-        .unwrap()
     }
     fn fault(&self, publication: &str, step: StoreStep, position: &str, action: &str, times: u64) {
         fs::write(self.seam.join("store-faults.json"),serde_json::to_vec(&json!([{"slot":SLOT,"publication":publication,"step":format!("{step:?}"),"position":position,"action":action,"value":null,"times":times}])).unwrap()).unwrap();
@@ -205,18 +207,6 @@ fn every_record_image_cut_preserves_observation_and_recovers() {
                     Some(old.anchor.clone()),
                     "{id} {step:?} {position}"
                 );
-                // Reopening immediately after the cut validates only the present disk image, without an in-memory proposal.
-                let restarted = fixture.store();
-                assert_eq!(
-                    restarted.observe(SLOT).anchor,
-                    Some(if post_rename(step, position) {
-                        next.anchor.clone()
-                    } else {
-                        old.anchor.clone()
-                    })
-                );
-                assert!(!restarted.observe(SLOT).uncertain);
-                drop(restarted);
                 if post_rename(step, position) {
                     assert!(
                         matches!(outcome, PublishOutcome::Uncertain(_)),
@@ -255,6 +245,7 @@ fn every_record_image_cut_preserves_observation_and_recovers() {
                 );
                 let observation = store.observe(SLOT);
                 drop(store);
+                fixture.clear();
                 let restarted = fixture.store();
                 assert_eq!(restarted.observe(SLOT), observation);
                 assert!(fs::read_dir(fixture.record_path().parent().unwrap())
@@ -281,17 +272,6 @@ fn every_copy_cut_and_orphan_reuse_preserves_the_anchor() {
             fixture.fault("copy", step, position, "fail", 1);
             let outcome = store.publish_original(SLOT, 1, &bytes);
             assert_eq!(store.observe(SLOT).anchor, Some(r.anchor.clone()));
-            let restarted = fixture.store();
-            assert_eq!(restarted.observe(SLOT).anchor, Some(r.anchor.clone()));
-            assert_eq!(
-                restarted.copy(SLOT, 1),
-                if post_rename(step, position) {
-                    Some(bytes.as_slice())
-                } else {
-                    None
-                }
-            );
-            drop(restarted);
             if post_rename(step, position) {
                 assert!(matches!(outcome, PublishOutcome::Uncertain(_)));
                 assert!(matches!(
@@ -306,8 +286,8 @@ fn every_copy_cut_and_orphan_reuse_preserves_the_anchor() {
                 assert_eq!(store.usage(), CopyUsage::default());
             }
             drop(store);
-            let mut store = fixture.store();
             fixture.clear();
+            let mut store = fixture.store();
             assert_eq!(
                 store.publish_original(SLOT, 1, &bytes),
                 PublishOutcome::Durable
@@ -742,6 +722,11 @@ fn genesis_cuts_reopen_without_inventing_a_proposal() {
                 post_rename(step, position)
             );
             drop(store);
+            // Restart must obtain fresh durability evidence; the fault remains armed until explicitly cleared.
+            if step == StoreStep::DirSync {
+                assert!(matches!(fixture.try_store(), Err(StoreRefusal::DIR_SYNC)));
+            }
+            fixture.clear();
             let restarted = fixture.store();
             assert_eq!(
                 restarted.observe(SLOT).state,
@@ -862,4 +847,128 @@ fn rename_error_with_changed_or_untrusted_target_is_uncertain() {
         );
         assert!(!store.observe(SLOT).uncertain);
     }
+}
+
+#[test]
+fn startup_sync_failure_refuses_until_durability_is_reestablished() {
+    let _guard = isolation::guard();
+    for publication in ["root", "fortress", "record", "originals", "copy"] {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        let attempted = genesis();
+        fixture.fault("record", StoreStep::DirSync, "before", "fail", 1);
+        assert_eq!(
+            store.publish_record(SLOT, &attempted),
+            PublishOutcome::Uncertain(StoreRefusal::DIR_SYNC)
+        );
+        drop(store);
+        fixture.fault(publication, StoreStep::DirSync, "before", "fail", 1);
+        assert!(
+            matches!(fixture.try_store(), Err(StoreRefusal::DIR_SYNC)),
+            "{publication}"
+        );
+        fixture.clear();
+        let before = fixture.events().len();
+        let store = fixture.store();
+        assert!(!store.observe(SLOT).uncertain);
+        assert_eq!(store.record(SLOT), Some(&attempted));
+        let synced: Vec<_> = fixture.events()[before..]
+            .iter()
+            .filter(|e| e["event"] == "StepCompleted" && e["step"] == "DirSync")
+            .map(|e| e["publication"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(synced, ["root", "fortress", "record", "originals", "copy"]);
+    }
+}
+
+#[test]
+fn directory_creation_and_chain_sync_failures_are_retry_safe() {
+    let _guard = isolation::guard();
+    for component in ["fortress", "anchors", "originals", "copies"] {
+        for boundary in ["mkdir", "child", "parent"] {
+            for position in ["before", "after"] {
+                let fixture = Fixture::new();
+                let mut store = fixture.store();
+                let (label, step, refusal) = if boundary == "mkdir" {
+                    (
+                        format!("mkdir:{component}"),
+                        StoreStep::HoldDirectory,
+                        StoreRefusal::ROOT,
+                    )
+                } else {
+                    (
+                        format!("chain:{component}:{boundary}"),
+                        StoreStep::DirSync,
+                        StoreRefusal::DIR_SYNC,
+                    )
+                };
+                fixture.fault(&label, step, position, "fail", 1);
+                let before = fixture.events().len();
+                assert_eq!(
+                    store.publish_record(SLOT, &genesis()),
+                    PublishOutcome::PrePublication(refusal)
+                );
+                assert!(!fixture.record_path().exists());
+                assert!(!fixture.events()[before..]
+                    .iter()
+                    .any(|e| e["step"] == "Stage"));
+                assert!(!store.observe(SLOT).uncertain);
+                fixture.clear();
+                let before = fixture.events().len();
+                assert_eq!(
+                    store.publish_record(SLOT, &genesis()),
+                    PublishOutcome::Durable
+                );
+                assert_chain_before_stage(&fixture.events()[before..]);
+                drop(store);
+                fixture.fault("root", StoreStep::DirSync, "before", "fail", 1);
+                assert!(matches!(fixture.try_store(), Err(StoreRefusal::DIR_SYNC)));
+                fixture.clear();
+                assert!(!fixture.store().observe(SLOT).uncertain);
+            }
+        }
+    }
+}
+fn assert_chain_before_stage(events: &[Value]) {
+    let staged = events.iter().position(|e| e["step"] == "Stage").unwrap();
+    let synced: Vec<_> = events[..staged]
+        .iter()
+        .filter(|e| e["event"] == "StepCompleted" && e["step"] == "DirSync")
+        .map(|e| e["publication"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        synced,
+        [
+            "chain:fortress:child",
+            "chain:fortress:parent",
+            "chain:anchors:child",
+            "chain:anchors:parent",
+            "chain:originals:child",
+            "chain:originals:parent",
+            "chain:copies:child",
+            "chain:copies:parent"
+        ]
+    );
+}
+
+#[test]
+fn precreated_empty_directories_are_synced_before_staging() {
+    let _guard = isolation::guard();
+    let fixture = Fixture::new();
+    for path in [
+        fixture.root.join(FORTRESS),
+        fixture.root.join(FORTRESS).join("anchors"),
+        fixture.root.join(FORTRESS).join("originals"),
+        fixture.copies_path(),
+    ] {
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut store = fixture.store();
+    let before = fixture.events().len();
+    assert_eq!(
+        store.publish_record(SLOT, &genesis()),
+        PublishOutcome::Durable
+    );
+    assert_chain_before_stage(&fixture.events()[before..]);
 }

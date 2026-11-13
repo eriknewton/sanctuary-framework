@@ -337,18 +337,31 @@ fn exists(parent: &File, leaf: &str) -> Result<bool> {
         Err(StoreRefusal::ENTRY)
     }
 }
-fn mkdir(parent: &File, leaf: &str, owner: u32) -> Result<File> {
+fn mkdir(
+    parent: &File,
+    leaf: &str,
+    owner: u32,
+    label: &str,
+    faults: &mut StoreFaults,
+    events: &EventSink,
+) -> Result<File> {
     if !exists(parent, leaf)? {
+        faults.hit(label, StoreStep::HoldDirectory, "before", events, None)?;
         let n = name(leaf)?;
         // SAFETY: the held parent and fixed leaf remain valid for this descriptor-relative creation.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), n.as_ptr(), custody::DIRECTORY_MODE) } != 0 {
             return Err(StoreRefusal::ROOT);
         }
-        let child = directory(parent, leaf, owner)?;
-        // A genesis directory and its parent are durable before any record can depend on that path.
-        child.sync_all().map_err(|_| StoreRefusal::DIR_SYNC)?;
-        parent.sync_all().map_err(|_| StoreRefusal::DIR_SYNC)?;
-        Ok(child)
+        events.emit(
+            "StepCompleted",
+            None,
+            Some(label),
+            Some(StoreStep::HoldDirectory),
+            None,
+        )?;
+        faults.hit(label, StoreStep::HoldDirectory, "after", events, None)?;
+        // Creation alone proves no durability; destination syncs every child and parent on every publication, including retries.
+        directory(parent, leaf, owner)
     } else {
         directory(parent, leaf, owner)
     }
@@ -992,7 +1005,7 @@ impl<'a> Store<'a> {
         fortress: &str,
         lock: &'a StateLock,
         owner: u32,
-        faults: StoreFaults,
+        mut faults: StoreFaults,
         events: EventSink,
     ) -> std::result::Result<Self, StartRefusal> {
         let m = meta(&root.file)?;
@@ -1005,7 +1018,10 @@ impl<'a> Store<'a> {
         {
             return Err(StoreRefusal::LOCK);
         }
-        let state = match validate_layout(root, fortress, true) {
+        // A restart cannot infer persistence from visible bytes; sync all present paths before bounded readback and validation.
+        let state = match sync_existing_chain(root, fortress, &mut faults, &events)
+            .and_then(|()| validate_layout(root, fortress, true))
+        {
             Ok(state) => state,
             Err(stage) => {
                 events.refusal(stage, None)?;
@@ -1056,14 +1072,72 @@ impl<'a> Store<'a> {
     pub fn usage(&self) -> CopyUsage {
         self.state.usage
     }
-    fn destination(&self, copy: bool) -> Result<File> {
+    fn destination(&mut self, copy: bool) -> Result<File> {
         if !trusted(&meta(&self.root.file)?, self.root.owner, true) {
             return Err(StoreRefusal::ROOT);
         }
-        let fort = mkdir(&self.root.file, &self.fortress, self.root.owner)?;
-        let anchors = mkdir(&fort, "anchors", self.root.owner)?;
-        let originals = mkdir(&fort, "originals", self.root.owner)?;
-        let copies = mkdir(&originals, SLOT, self.root.owner)?;
+        let fort = mkdir(
+            &self.root.file,
+            &self.fortress,
+            self.root.owner,
+            "mkdir:fortress",
+            &mut self.faults,
+            &self.events,
+        )?;
+        let anchors = mkdir(
+            &fort,
+            "anchors",
+            self.root.owner,
+            "mkdir:anchors",
+            &mut self.faults,
+            &self.events,
+        )?;
+        let originals = mkdir(
+            &fort,
+            "originals",
+            self.root.owner,
+            "mkdir:originals",
+            &mut self.faults,
+            &self.events,
+        )?;
+        let copies = mkdir(
+            &originals,
+            SLOT,
+            self.root.owner,
+            "mkdir:copies",
+            &mut self.faults,
+            &self.events,
+        )?;
+        // Existence is not persistence: each child and its parent must sync successfully before anything is staged, even after a failed prior attempt.
+        for (child, parent, child_label, parent_label) in [
+            (
+                &fort,
+                &self.root.file,
+                "chain:fortress:child",
+                "chain:fortress:parent",
+            ),
+            (
+                &anchors,
+                &fort,
+                "chain:anchors:child",
+                "chain:anchors:parent",
+            ),
+            (
+                &originals,
+                &fort,
+                "chain:originals:child",
+                "chain:originals:parent",
+            ),
+            (
+                &copies,
+                &originals,
+                "chain:copies:child",
+                "chain:copies:parent",
+            ),
+        ] {
+            sync_directory(child, child_label, None, &mut self.faults, &self.events)?;
+            sync_directory(parent, parent_label, None, &mut self.faults, &self.events)?;
+        }
         Ok(if copy { copies } else { anchors })
     }
     fn same_destination(&self, attempt: &Attempt) -> Result<()> {
@@ -1571,5 +1645,35 @@ fn sync_directory(
         None,
     )?;
     faults.hit(publication, StoreStep::DirSync, "after", events, request_id)?;
+    Ok(())
+}
+
+// Only fixed, validated path components are visited, so startup sync work is bounded independently of directory contents.
+fn sync_existing_chain(
+    root: &HeldRoot,
+    fortress: &str,
+    faults: &mut StoreFaults,
+    events: &EventSink,
+) -> Result<()> {
+    if !hex_shape(fortress, "", anchor::ID_HEX_LENGTH) {
+        return Err(StoreRefusal::ROOT);
+    }
+    sync_directory(&root.file, "root", None, faults, events)?;
+    if exists(&root.file, fortress)? {
+        let fort = directory(&root.file, fortress, root.owner)?;
+        sync_directory(&fort, "fortress", None, faults, events)?;
+        if exists(&fort, "anchors")? {
+            let anchors = directory(&fort, "anchors", root.owner)?;
+            sync_directory(&anchors, "record", None, faults, events)?;
+        }
+        if exists(&fort, "originals")? {
+            let originals = directory(&fort, "originals", root.owner)?;
+            sync_directory(&originals, "originals", None, faults, events)?;
+            if exists(&originals, SLOT)? {
+                let copies = directory(&originals, SLOT, root.owner)?;
+                sync_directory(&copies, "copy", None, faults, events)?;
+            }
+        }
+    }
     Ok(())
 }
