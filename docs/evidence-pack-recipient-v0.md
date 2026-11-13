@@ -67,7 +67,7 @@ An unexpected package layout, a non-regular marker entry or an observation failu
 PACKAGE_MARKER_UNAVAILABLE: verifier package classification could not be established.
 ```
 
-`PACKAGE_MARKER_UNAVAILABLE` refuses use when absence is unproved, including a symlink at the package root or an unexpected parent. This refusal is not a finding that the package is a release. Treat a nonzero exit or missing result as refusal, even when no snapshot JSON is produced. Restore a trusted, intact installation before retrying; do not remove a marker to make a candidate usable.
+`PACKAGE_MARKER_UNAVAILABLE` refuses use when absence is unproved, including a loader path that does not end in `dist/verify-evidence-pack.js` (such as an unresolved bin link) or a package root that is not a real directory. This refusal is not a finding that the package is a release. Treat a nonzero exit or missing result as refusal, even when no snapshot JSON is produced. Restore a trusted, intact installation before retrying; do not remove a marker to make a candidate usable.
 
 The observation is in-process and adds no host prerequisite. Marker contents and link targets are never opened. Ancestors above the package root are not inspected. Classification is a point-in-time observation that requires a trusted installation with no concurrent package writers. Marker absence does not authenticate a release; authenticate the exact tarball independently.
 
