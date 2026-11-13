@@ -82,7 +82,12 @@ const BODY_DIGEST_OPS: &[&str] = &["RESERVE"];
 const BODY_DIGEST_CONDITIONAL_OP: &str = "COMMIT";
 const BODY_DIGEST_EXPECTED_FIELD: &str = "transaction_id";
 pub const D_DESCRIPTOR_EPOCHS_MAX: usize = super::signer_contract::SIGNER_EPOCHS_MAX;
+#[cfg(target_os = "linux")]
 pub const D_DESCRIPTOR_MAX_BYTES: usize = super::custody::CONFIG_MAX_BYTES;
+// The pure parser remains available where Linux custody is not compiled.
+#[cfg(not(target_os = "linux"))]
+pub const D_DESCRIPTOR_MAX_BYTES: usize = 65536;
+const _: () = assert!(D_DESCRIPTOR_MAX_BYTES == 65536);
 pub const D_EPOCH_MAX: u64 = SAFE_INTEGER;
 // DRAIN_SCHEMA_END
 fn exact(v: &Value, fields: &[&str]) -> bool {
