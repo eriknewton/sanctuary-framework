@@ -1,4 +1,3 @@
-// fail-before-exempt: lifecycle, immutable contract, projection and boundary assertions consume shared native corpus and contract vectors.
 // W-PROVENANCE
 // W-ENVELOPE-CAP
 // W-JOIN-LIFECYCLE

@@ -1,4 +1,3 @@
-// fail-before-exempt: same-anchor recovery, serialized input and exact-refusal assertions read the manifest-checked native corpus, outside server/src.
 // W-TS-SCHEMA
 // W-ENVELOPE-CAP
 import {it, expect, vi} from "vitest";
