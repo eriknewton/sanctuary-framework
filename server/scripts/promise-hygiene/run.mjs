@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ESLint } from 'eslint';
@@ -26,7 +26,8 @@ function readMetadata(root, name) {
   try {
     // O_NOFOLLOW refuses a link at open, so the checks below and the read share one descriptor
     // and a file swapped in after the check cannot be the one that is read.
-    descriptor = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // O_NONBLOCK lets a FIFO reach the type refusal without waiting for a writer.
+    descriptor = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     // ELOOP is what open reports for a final-component link under O_NOFOLLOW (Linux and macOS).
     insist(error?.code !== 'ELOOP', `linked metadata: ${name}`);
@@ -37,10 +38,18 @@ function readMetadata(root, name) {
     // Metadata must not follow a link around the shared size cap, including lockfile digest reads.
     insist(stat.isFile(), `metadata type refused: ${name}`);
     insist(stat.size <= MAX_METADATA_BYTES, 'metadata size refused');
-    const bytes = readFileSync(descriptor);
-    // The read runs to end of file, so a file that grew after fstat is capped on what was read.
-    insist(bytes.length <= MAX_METADATA_BYTES, 'metadata size refused');
-    return bytes;
+    // Read at most the cap plus one refusal byte, even if the file grows after fstat.
+    const chunks = [];
+    let length = 0;
+    while (length <= MAX_METADATA_BYTES) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_METADATA_BYTES + 1 - length));
+      const count = readSync(descriptor, chunk, 0, chunk.length, null);
+      if (count === 0) break;
+      length += count;
+      insist(length <= MAX_METADATA_BYTES, 'metadata size refused');
+      chunks.push(chunk.subarray(0, count));
+    }
+    return Buffer.concat(chunks, length);
   } finally {
     closeSync(descriptor);
   }

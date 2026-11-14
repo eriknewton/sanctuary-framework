@@ -133,6 +133,221 @@ def check_partition(constants, expected):
         fail(f"guard path constants outside the declared partition: {sorted(guard_paths ^ declared)}")
 
 
+def rust_tokens(text):
+    """Strip comments and tokenize active Rust, retaining each literal as one token."""
+    tokens = []
+    i = 0
+    while i < len(text):
+        if not text[i].isascii():
+            fail("non-ASCII Rust outside comments or literals")
+        if text[i].isspace():
+            i += 1
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        if text.startswith("/*", i):
+            depth = 1
+            i += 2
+            while depth and i < len(text):
+                if text.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                fail("unterminated Rust comment")
+            continue
+        raw = re.match(r'(?:br|cr|r)(#*)"', text[i:])
+        if raw:
+            end = text.find('"' + raw[1], i + raw.end())
+            if end < 0:
+                fail("unterminated Rust raw string")
+            end += 1 + len(raw[1])
+            tokens.append(text[i:end])
+            i = end
+            continue
+        # A char has a closing quote; a lifetime such as 'a does not.
+        literal = re.match(r"""(?:b|c)?"(?:\\[\s\S]|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|[\s\S])|[^'\\\n])'""", text[i:])
+        if literal:
+            tokens.append(literal[0])
+            i += literal.end()
+            continue
+        if re.match(r'(?:b|c)?"|b\x27', text[i:]):
+            fail("unterminated Rust literal")
+        if text[i] == "'":
+            lifetime = re.match(r"'[A-Za-z_][A-Za-z_0-9]*", text[i:])
+            previous = tokens[-1] if tokens else ""
+            if not lifetime or (previous not in ("&", "<", ",", ":", "+", "break", "continue") and
+                                not text[i + lifetime.end():].lstrip().startswith(":")):
+                fail("unterminated Rust char literal")
+            tokens.append(lifetime[0])
+            i += lifetime.end()
+            continue
+        identifier = re.match(r"(?:r#)?[A-Za-z_][A-Za-z_0-9]*", text[i:])
+        if identifier:
+            tokens.append(identifier[0].removeprefix("r#"))
+            i += identifier.end()
+            continue
+        tokens.append(text[i])
+        i += 1
+    return tokens
+
+
+def rust_delimiters(tokens):
+    """Pair token groups so patterns and function boundaries cannot bleed together."""
+    pairs, parents, stack = {}, {}, []
+    for i, token in enumerate(tokens):
+        parents[i] = stack[-1] if stack else None
+        if token in ("(", "[", "{"):
+            stack.append(i)
+        elif token in (")", "]", "}"):
+            if not stack or tokens[stack[-1]] != {")": "(", "]": "[", "}": "{"}[token]:
+                fail("unbalanced Rust delimiters")
+            opening = stack.pop()
+            pairs[opening], pairs[i] = i, opening
+    if stack:
+        fail("unterminated Rust group")
+    return pairs, parents
+
+
+def rust_bindings(tokens):
+    """Return lexical declaration/pattern positions and named function extents."""
+    pairs, parents = rust_delimiters(tokens)
+    bindings, functions, closure_ends, arm_arrows = set(), [], set(), {}
+
+    def until(start, stops):
+        i = start
+        while i < len(tokens):
+            path_colon = tokens[i] == ":" and (tokens[i - 1:i] == [":"] or tokens[i + 1:i + 2] == [":"])
+            if tokens[i] in stops and not path_colon:
+                break
+            i = pairs[i] + 1 if tokens[i] in ("(", "[", "{") else i + 1
+        return i
+
+    def parameters(start, end):
+        # Types and return expressions are uses, not parameter patterns.
+        while start < end:
+            stop = min(until(start, {",", ":"}), end)
+            bindings.update(range(start, stop))
+            start = min(until(stop, {","}), end) + 1
+
+    for i, token in enumerate(tokens):
+        if token in ("const", "static", "struct", "enum", "union", "type", "fn", "mod", "trait"):
+            name = i + 1
+            if tokens[name:name + 1] == ["mut"]:
+                name += 1
+            bindings.add(name)
+        elif token == "macro_rules" and tokens[i + 1:i + 2] == ["!"]:
+            bindings.add(i + 2)
+        elif token == "use":
+            end = until(i + 1, {";"})
+            bindings.update(j + 1 for j in range(i + 1, end) if tokens[j] == "as")
+        elif token == "let":
+            end = until(i + 1, {"=", ";"})
+            bindings.update(range(i + 1, end))
+        if token == "fn" and i + 2 < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", tokens[i + 1]):
+            opening = i + 2
+            # Generic bounds can themselves contain Fn(...) parameter groups.
+            depth = 0
+            while opening < len(tokens):
+                current = tokens[opening]
+                if depth == 0 and current in ("(", ";", "{"):
+                    break
+                depth += (current == "<") - (current == ">")
+                opening += 1
+            if opening >= len(tokens) or tokens[opening] != "(":
+                fail("unsupported Rust function signature")
+            closing = pairs[opening]
+            parameters(opening + 1, closing)
+            body = until(closing + 1, {"{", ";"})
+            if body < len(tokens) and tokens[body] == "{":
+                # The function's name binds in its enclosing scope; its parameters do not.
+                functions.append((opening, body, pairs[body], tokens[i + 1]))
+        if token == "|" and i not in closure_ends:
+            previous = tokens[i - 1] if i else ""
+            if (previous in ("=", "(", "[", ",", "{", ";", ":", "&", "!", "*", "return", "break", "move", "async") or
+                    i - 1 in closure_ends or tokens[i - 2:i] == ["=", ">"]):
+                end = until(i + 1, {"|", ";"})
+                if end < len(tokens) and tokens[end] == "|":
+                    closure_ends.add(end)
+                    parameters(i + 1, end)
+        if token == "=" and tokens[i + 1:i + 2] == [">"]:
+            group = parents[i]
+            if group is None or tokens[group] != "{":
+                continue
+            previous = arm_arrows.get(group)
+            arm_arrows[group] = i
+            start = group + 1 if previous is None else previous + 2
+            if previous is not None:
+                cursor = start
+                while cursor < i:
+                    if tokens[cursor] == ",":
+                        start = cursor + 1
+                    cursor = pairs[cursor] + 1 if tokens[cursor] in ("(", "[", "{") else cursor + 1
+                if start == previous + 2:
+                    # Block-valued arms can omit a comma. Skip their body and else branches.
+                    cursor = until(start, {"{"})
+                    while cursor < i and tokens[cursor] == "{":
+                        cursor = pairs[cursor] + 1
+                        if tokens[cursor:cursor + 1] == ["else"]:
+                            cursor = until(cursor + 1, {"{"})
+                    start = cursor
+            # Names in the arm's guard or result expression are ordinary uses.
+            end = min(until(start, {"if", "="}), i)
+            bindings.update(range(start, end))
+    return bindings, functions
+
+
+def fortress_root(tokens, name, prefix):
+    bindings, _ = rust_bindings(tokens)
+    declarations = [i for i in sorted(bindings) if tokens[i:i + 1] == [name]]
+    if len(declarations) != 1:
+        fail(f"expected one {name} declaration of any kind; found {len(declarations)}")
+    i = declarations[0]
+    if tokens[max(0, i - 2):i + 5] != ["pub", "const", name, ":", "&", "str", "="]:
+        fail(f"unexpected fortress root declaration: {name}")
+    value = re.fullmatch('"(' + re.escape(prefix) + r'/[^"\n]+)"', "".join(tokens[i + 5:i + 6]))
+    if not value or tokens[i + 6:i + 7] != [";"]:
+        fail(f"unexpected fortress root value: {name}")
+    return value[1]
+
+
+def fortress_directory(tokens, name, root):
+    derivation = ["let", name, "=", "PathBuf", ":", ":", "from", "(", root, ")",
+                  ".", "join", "(", "&", "fortress_id", ")", ";"]
+    bindings, functions = rust_bindings(tokens)
+    pairs, _ = rust_delimiters(tokens)
+
+    def owner(position):
+        enclosing = [scope for scope in functions if scope[0] <= position <= scope[2]]
+        return min(enclosing, key=lambda scope: scope[2] - scope[0]) if enclosing else None
+
+    # Pin the shipping derivation's function; helpers may use the same local names.
+    scopes = [scope for scope in functions if scope[3] == "defaults_for_fortress"]
+    if len(scopes) != 1:
+        fail("expected one defaults_for_fortress function")
+    scope = scopes[0]
+    derivations = []
+    for i in range(len(tokens)):
+        if owner(i) != scope or tokens[i:i + len(derivation)] != derivation:
+            continue
+        before = i - 1
+        while before >= 0 and tokens[before] == "]" and tokens[pairs[before] - 1:pairs[before]] == ["#"]:
+            before = pairs[before] - 2
+        if before >= 0 and tokens[before] in (";", "{", "}"):
+            derivations.append(i + 1)
+    if len(derivations) != 1:
+        fail(f"expected one fortress directory derivation: {name}; found {len(derivations)}")
+
+    if [i for i in sorted(bindings) if tokens[i:i + 1] == [name] and owner(i) == scope] != derivations:
+        fail(f"second fortress directory binding in derivation function: {name}")
+
+
 def main():
     here = Path(__file__).resolve().parent
     crate = here.parent.parent
@@ -161,19 +376,29 @@ def main():
     state_dir = one(r"^StateDirectory=(\S+)$", unit, "StateDirectory")
     if one(r"^WantedBy=(\S+)$", unit, "WantedBy") != "multi-user.target" or unit.count("[Install]") != 1:
         fail("pinned unit is not installable under its expected target")
-    # The fortress roots are named constants in config.rs and the per-fortress directories are derived from them. This is a
-    # textual drift tripwire, not name resolution: it requires one declaration of each root name of any kind (so no shadow
-    # and no second cfg arm), one binding of each directory, and that binding to be the constant-derived line. The compiled
-    # value is pinned separately by the resolved-path unit tests in config.rs.
+    # Contract: this is a tripwire for accidental drift, not a defense against deliberately
+    # disguised Rust. It catches an honest edit that changes a root literal, adds a second
+    # root declaration or directory binding, moves or comments out the derivation, or leaves
+    # a literal or comment unterminated. To do that it strips line and nested block comments
+    # outside Rust literals, treats raw identifiers as ordinary identifiers, refuses non-ASCII
+    # outside comments and literals, and counts only active declarations: each root has one
+    # pub const, each directory one plain constant-derived let and no second binding in its
+    # function. Ordinary uses and bindings in other functions are allowed.
+    # Not guaranteed, because a text scan cannot model them (some are refused today, none is
+    # promised): macro expansion (macro_rules! bodies, rebind!(state_dir.join(""))), include!,
+    # any rebinding of PathBuf or fortress_id, shadows of the root names through imports, enum
+    # variants, for loops, match arms, cfg attributes or keyword-spelled raw identifiers, a
+    # shebang or bare carriage return that hides text, and absolute .join(...) arguments.
+    # The pinned lines keep their exact form: a type annotation on a derivation or a
+    # &'static str root refuses even when the value is unchanged. Any refusal fails closed
+    # and the remedy is to extend this guard. Compiled values are pinned separately by the
+    # resolved-path tests in config.rs.
     # Must match RAW_RUNTIME_ROOT and RAW_STATE_ROOT in castle-wall-daemon/src/config.rs.
-    runtime_root = one(r'^pub const RAW_RUNTIME_ROOT: &str = "(/run/[^"]+)";$', config, "fortress runtime root")
-    state_root = one(r'^pub const RAW_STATE_ROOT: &str = "(/var/lib/[^"]+)";$', config, "fortress state root")
-    for name in ("RAW_RUNTIME_ROOT", "RAW_STATE_ROOT"):
-        one(r'\b(?:const|static|let)\s+(?:mut\s+)?' + name + r'\b', config, name + " declaration of any kind")
-    one(r'\blet\s+(?:mut\s+)?runtime_dir\b', config, "fortress runtime directory binding")
-    one(r'\blet\s+(?:mut\s+)?state_dir\b', config, "fortress state directory binding")
-    one(r'^\s*let runtime_dir = PathBuf::from\(RAW_RUNTIME_ROOT\)\.join\(&fortress_id\);$', config, "fortress runtime directory derivation")
-    one(r'^\s*let state_dir = PathBuf::from\(RAW_STATE_ROOT\)\.join\(&fortress_id\);$', config, "fortress state directory derivation")
+    tokens = rust_tokens(config)
+    runtime_root = fortress_root(tokens, "RAW_RUNTIME_ROOT", "/run")
+    state_root = fortress_root(tokens, "RAW_STATE_ROOT", "/var/lib")
+    fortress_directory(tokens, "runtime_dir", "RAW_RUNTIME_ROOT")
+    fortress_directory(tokens, "state_dir", "RAW_STATE_ROOT")
     expected = {
         "ENV_PATH": env,
         "DAEMON_PATH": start.split()[0],

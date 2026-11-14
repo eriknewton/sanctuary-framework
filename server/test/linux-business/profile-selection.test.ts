@@ -1,4 +1,4 @@
-// fail-before-exempt: the selector and its corpus are new; predicate removal supplies evidence.
+// fail-before-exempt: fixture snapshot mutation witnesses read FIFO metadata outside server/src.
 import {describe, expect, it} from "vitest";
 import * as fs from "node:fs";
 import {join, dirname} from "node:path";
@@ -69,12 +69,12 @@ function snapshot(root: string): unknown[] {
     // then reopened: a link swapped in between could otherwise be followed out of the fixture.
     for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
       const path = join(dir, entry.name), label = path.slice(root.length);
-      if (entry.isSymbolicLink()) rows.push([label, "link", fs.readlinkSync(path)]);
+      if (entry.isSymbolicLink()) rows.push([label, fs.lstatSync(path).mode, fs.readlinkSync(path)]);
       else if (entry.isFile()) {
         const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
         try { rows.push([label, fs.fstatSync(fd).mode, fs.readFileSync(fd).toString("hex")]); } finally { fs.closeSync(fd); }
       } else {
-        rows.push([label, entry.isDirectory() ? fs.lstatSync(path).mode : "other", null]);
+        rows.push([label, fs.lstatSync(path).mode, null]);
         if (entry.isDirectory()) visit(path);
       }
     }
@@ -180,3 +180,17 @@ for (const [rawRoot, suffix] of [[selection.RAW_STATE_ROOT, selection.RAW_STATE_
     }
   });
 }
+
+it.skipIf(process.platform !== "linux")("snapshot detects a FIFO mode mutation without opening it", () => {
+  const root = fs.mkdtempSync(join(tmpdir(), "k1-selector-snapshot-"));
+  const fifo = join(root, "entry");
+  try {
+    execFileSync("mkfifo", [fifo]);
+    fs.chmodSync(fifo, 0o600);
+    const before = snapshot(root);
+    fs.chmodSync(fifo, 0o666);
+    expect(snapshot(root)).not.toEqual(before);
+    expect(before).toEqual([["/entry", fs.constants.S_IFIFO | 0o600, null]]);
+    expect(snapshot(root)).toEqual([["/entry", fs.constants.S_IFIFO | 0o666, null]]);
+  } finally { cleanup(root); }
+});
