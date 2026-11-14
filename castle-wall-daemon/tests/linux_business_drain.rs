@@ -1440,7 +1440,8 @@ fn transport_rights_truncation_and_passed_socket_refuse_before_decode() {
                 .arg(executable)
                 .env("DRAIN_TRANSPORT_FIXTURE", &f.root)
                 .env("DRAIN_TRANSPORT_MODE", mode)
-                .stdout(std::process::Stdio::inherit())
+                // The driver's own libtest summary must not reach this suite's stdout: CI counts "test result: ok." lines against started suites (castle-wall-linux.yml), so it is discarded; panics still arrive on stderr.
+                .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
                 .unwrap(),

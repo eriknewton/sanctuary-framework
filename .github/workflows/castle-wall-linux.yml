@@ -255,7 +255,10 @@ jobs:
           # Every suite that ran must also have REPORTED a result line. A binary
           # that aborted (SIGSEGV, a panic in a harness thread, an OOM kill) prints
           # `Running tests/<suite>.rs` and then dies without `test result:`, which
-          # the presence-grep alone would accept.
+          # the presence-grep alone would accept. A test that runs another libtest
+          # binary as a child must discard that child's stdout, or its summary adds
+          # an extra result line here (must match the transport driver spawn in
+          # castle-wall-daemon/tests/linux_business_drain.rs).
           started=$(grep -cE "^[[:space:]]*Running " cargo-test.plain.log || true)
           finished=$(grep -cE "^test result: ok\." cargo-test.plain.log || true)
           if [ "$started" != "$finished" ]; then
