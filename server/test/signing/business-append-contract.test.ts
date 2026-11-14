@@ -1,13 +1,14 @@
-// fail-before-exempt: shared native corpus and append shape parity exercise new pure foundations.
+// fail-before-exempt: round-one lifecycle, projection and boundary assertions consume shared native corpus and contract vectors.
 // W-PROVENANCE
 // W-ENVELOPE-CAP
 // W-JOIN-LIFECYCLE
-import {it, expect} from "vitest";
+import {it, expect, vi} from "vitest";
 import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
-import {APPEND_CONTRACT, appendShape, envelopeSizeAdmitted, parseBusinessEnvelope, parseBusinessEvent, parseBusinessEventBytes, deliveryIdentity} from "../../src/signing/business-append-contract.js";
+import {APPEND_CONTRACT, appendShape, envelopeSizeAdmitted, parseBusinessEnvelope, parseBusinessEvent, parseBusinessEventBytes, deliveryIdentity, projectBusinessRecord} from "../../src/signing/business-append-contract.js";
 import {initialLifecycle, lifecycleStep} from "../../src/signing/business-join-lifecycle.js";
+import * as signingContract from "../../src/signing/contract.js";
 import {canonicalBytes} from "../../src/signing/contract.js";
-import {validateBusinessRecord} from "../../src/signing/linux-business-records.js";
+import {BUSINESS_KINDS, validateBusinessRecord} from "../../src/signing/linux-business-records.js";
 import type {JoinRecord} from "../../src/signing/record-joins.js";
 const corpus = loadCheckedCorpus("record_join_vectors.json") as {cases: Array<{id:string;records:JoinRecord[]}>};
 const record = corpus.cases[0].records[0];
@@ -63,4 +64,43 @@ it("serialized business events reject duplicate wrapper keys before normalizatio
 
 it("checkpoint shapes share complete bounded nested tables without granting authority", () => {
   for(const row of APPEND_CONTRACT.checkpoint_vectors) expect(appendShape("checkpoint",row.value),row.id).toBe(row.accepted);
+});
+
+it.each(["constructor","__proto__","toString"])("lifecycle refuses inherited event name %s",type=>{
+  const state=initialLifecycle();expect(lifecycleStep(state,{type})).toEqual({accepted:false,state});
+});
+it("lifecycle refuses a table entry with no implemented transition",()=>{
+  const table=APPEND_CONTRACT.lifecycle as Record<string,string[]>;table.Future=[];
+  try {const state=initialLifecycle();expect(lifecycleStep(state,{type:"Future"})).toEqual({accepted:false,state});}
+  finally {delete table.Future;}
+});
+
+it("real envelope parser checks 4097 before decode and admits 4096 to decoding",()=>{
+  const decode=vi.spyOn(signingContract,"decodeCanonical");
+  try {
+    for(const length of [4096,4097]) {
+      const shaped=structuredClone(record);
+      const payload=shaped.body.payload as Record<string,unknown>;
+      payload.reason="a".repeat(length-bytes.length+String(payload.reason).length);
+      const candidate=canonicalBytes(shaped);
+      expect(candidate.length).toBe(length);
+      decode.mockClear();
+      let failure: unknown;
+      try {parseBusinessEnvelope(Buffer.from(candidate).toString("base64url"));} catch(error) {failure=error;}
+      expect(decode).toHaveBeenCalledTimes(length===4096?1:0);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe("BUSINESS_ENVELOPE");
+    }
+  } finally {decode.mockRestore();}
+});
+
+it.each(APPEND_CONTRACT.projection_vectors)("shared projection $id",row=>{
+  const candidate=row.record as unknown as JoinRecord;
+  expect(validateBusinessRecord(candidate.body)).toBe(true);
+  expect(projectBusinessRecord(candidate)).toEqual(row.expected);
+});
+it("projection vectors cover the entire schema kind set and permit unknown",()=>{
+  expect([...new Set(APPEND_CONTRACT.projection_vectors.map(row=>row.record.body.record_kind))].sort()).toEqual([...BUSINESS_KINDS].sort());
+  const unknown=APPEND_CONTRACT.projection_vectors.find(row=>row.id==="permit-unknown")!;
+  expect(unknown.record.body.payload).toMatchObject({type:"permit",outcome:"unknown",effect:"EFFECT_UNKNOWN"});
 });

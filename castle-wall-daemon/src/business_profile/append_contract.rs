@@ -1,9 +1,12 @@
+//! Must match server/src/signing/business-append-contract.ts; shared data owns shapes.
 //! Shared append shapes, exact envelope identity and projection. No authentication is conferred here.
 use super::{records, writer_protocol};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 include!("append_contract_constants.rs");
+// Must match BUSINESS_SAFE_INTEGER in server/src/signing/business-append-contract.ts.
+const SAFE_INTEGER: u64 = super::activation_anchor::SAFE_INTEGER;
 pub const CONTRACT: &str =
     include_str!("../../../server/src/signing/business-append-contract.json");
 pub fn contract() -> Option<Value> {
@@ -30,7 +33,7 @@ fn shape_with(name: &str, value: &Value, contract: &Value) -> bool {
             match token.as_str() {
                 Some("safe" | "positive") => v
                     .as_u64()
-                    .map(|n| n <= 9_007_199_254_740_991 && (token != "positive" || n > 0))
+                    .map(|n| n <= SAFE_INTEGER && (token != "positive" || n > 0))
                     .unwrap_or(false),
                 Some("digest") => v
                     .as_str()
@@ -40,7 +43,7 @@ fn shape_with(name: &str, value: &Value, contract: &Value) -> bool {
                 Some("hex" | "nullable_hex") => v
                     .as_str()
                     .map(|s| {
-                        s.len() == 64
+                        s.len() == super::activation_anchor::DIGEST_HEX_LENGTH
                             && s.bytes()
                                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                     })
@@ -138,6 +141,7 @@ pub fn projection(record: &Value) -> Option<Value> {
     }
     Some(Value::Object(out))
 }
+/// Already-parsed values cannot retain duplicate keys; event_bytes detects them at ingress.
 pub fn event(value: &Value) -> Option<(Vec<u8>, Value)> {
     if !shape("event", value) {
         return None;

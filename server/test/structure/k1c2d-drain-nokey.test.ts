@@ -1,3 +1,4 @@
+// fail-before-exempt: round-one parser reachability adds the exact canonical-frame edge; the complete frame source remains audited below.
 // fail-before-exempt: New drain production reachability and debug/release artifact witnesses read native sources and harness binaries.
 import { expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -76,7 +77,7 @@ function reachable(source: string, roots: string[]): string[] {
       const known = new Set(["Self", "std", "io", "libc", "hex", "serde_json", "Arc", "Vec", "String", "Box", "BTreeSet", "CString", "File", "OpenOptions", "Path", "PathBuf", "Sha256", "Authority", "Phase", "PublishOutcome", "Binding", "BusTarget", "Classifier", "Deadline", "DescriptorReader", "Diagnostics", "Directory", "EventSink", "HeldConfig", "HeldRoot", "StateLock", "Store", "StoreFaults", "WallMainBinding", "Refusal", "Operation", "Value", "signer_peer", "writer_peer", "drain_store", "anchor", "protocol", "activation_anchor", "drain_protocol", "drain_service"]);
       for (const edge of mask(body).matchAll(/\b((?:\w+::)+\w+)\s*(?:\(|\{)/g)) {
         const path = edge[1];
-        const narrow = ["crate::smb::jcs::encode", "super::verify_role", "records::decode", "records::join_commitment", "writer_protocol::decode_envelope", "signer_service::canonical"].includes(path);
+        const narrow = ["crate::smb::jcs::encode", "super::verify_role", "records::decode", "records::join_commitment", "writer_protocol::decode_envelope", "signer_service::canonical", "super::frame::canonical"].includes(path);
         if (!narrow && !known.has(path.split("::")[0])) throw new Error(`unresolved qualified edge: ${path}`);
       }
 
@@ -107,6 +108,8 @@ it("reachability follows local helpers and aliases without promoting unrelated i
   for (const literal of ['"https://local"', 'r#"https://local"#']) {
     expect(() => reachable(production(`fn entry() {\n let url = ${literal}; SigningKey::from_bytes();\n }`), ["entry"])).toThrow("forbidden production item");
   }
+  // The exact frame edge is covered by the complete helper-module audit below.
+  expect(reachable("fn entry() { super::frame::canonical(); }", ["entry"])).toEqual(["entry"]);
   expect(() => reachable("fn unrelated() {}", ["entry"])).toThrow("unresolved");
   expect(() => reachable("fn entry() { unknown_module::helper(); }", ["entry"])).toThrow("unresolved");
   expect(() => reachable("fn entry() { missing_helper(); }", ["entry"])).toThrow("unresolved");

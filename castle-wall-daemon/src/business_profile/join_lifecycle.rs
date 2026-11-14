@@ -1,3 +1,4 @@
+//! Must match server/src/signing/business-join-lifecycle.ts and its shared vectors.
 //! Pure event model, not the worker state holder. Caller authenticates checkpoint and commit events.
 use super::{append_contract, records};
 use serde_json::{json, Value};

@@ -28,7 +28,9 @@ pub const WRITER_HEARTBEAT_MS: u64 = SIGNER_IDLE_DEADLINE_MS as u64 / 4;
 // Must match the K1c-2e consumer: a SIGN wait plus one heartbeat fits the signer idle deadline.
 pub const WRITER_SIGN_DEADLINE_MAX_MS: u64 = SIGNER_IDLE_DEADLINE_MS as u64 - WRITER_HEARTBEAT_MS;
 pub const WRITER_HANDSHAKE_DEADLINE_MS: u64 = SIGNER_HANDSHAKE_DEADLINE_MS as u64;
-pub const SESSION_ID_BYTES: usize = 16; // Fresh 128-bit identifier.
+// Fresh 128-bit identifier.
+pub const SESSION_ID_BYTES: usize = 16;
+// Must match ED25519_SIGNATURE_BYTES used by business-append-contract.ts.
 pub const SIGNATURE_BYTES: usize = 64; // Ed25519 signature width.
 pub const SIGNATURE_TEXT_BYTES: usize = (SIGNATURE_BYTES * 8).div_ceil(6); // Unpadded base64url, 86 bytes.
 const _: () = assert!(WRITER_SIGN_PACKET_MAX_BYTES == SIGNER_FRAME_MAX_BYTES);
@@ -402,7 +404,10 @@ pub fn measured_envelope(body: &[u8]) -> Result<usize> {
 }
 /// Insert only the signature; the body must re-encode to the frozen input bytes.
 pub fn envelope(body: &[u8], signature: &[u8; SIGNATURE_BYTES]) -> Result<Vec<u8>> {
-    let value = records::decode(body).ok_or(Refusal::Canonical)?;
+    // Measure the canonical envelope before schema rejection so the byte ceiling
+    // applies even to a schema-shaped candidate whose string field is too wide.
+    let value = super::frame::canonical(body, super::records_schema::MAX_BYTES)
+        .map_err(|_| Refusal::Canonical)?;
     // Must match the outer-index rule in records::advance.
     let mut outer = serde_json::Map::new();
     for key in LINUX_FIELDS
@@ -435,6 +440,7 @@ pub fn envelope(body: &[u8], signature: &[u8; SIGNATURE_BYTES]) -> Result<Vec<u8
     if !envelope_fits(bytes.len()) {
         return Err(Refusal::Envelope);
     }
+    records::decode(body).ok_or(Refusal::Canonical)?;
     Ok(bytes)
 }
 

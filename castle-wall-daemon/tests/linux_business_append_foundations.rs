@@ -1,4 +1,4 @@
-// fail-before-exempt: shared append contracts and native budget boundaries are new isolated entrypoints.
+// fail-before-exempt: round-one shared vectors, checked corpus and ownership witnesses read native and shared contract inputs.
 // W-PROVENANCE
 // W-LEASE-ADMISSION
 // W-ENVELOPE-CAP
@@ -9,12 +9,12 @@ use castle_wall_daemon::business_profile::{
     append_budget::*, append_contract as contract, join_lifecycle, records_schema, writer_protocol,
 };
 use serde_json::{json, Value};
+#[path = "support/checked_corpus.rs"]
+mod checked_corpus;
 fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../src/business_profile/record_join_vectors.json"
-    ))
-    .unwrap()
+    checked_corpus::corpus("record_join_vectors.json")
 }
+
 #[test]
 fn shared_identity_and_lifecycle_vectors() {
     let data = contract::contract().unwrap();
@@ -84,7 +84,12 @@ fn shared_identity_and_lifecycle_vectors() {
 }
 #[test]
 fn envelope_caps_and_provenance_boundary() {
-    assert_eq!(contract::PRODUCER_ENVELOPE_MAX_BYTES, 4096);
+    assert_eq!(
+        contract::contract().unwrap()["envelope_max_bytes"]
+            .as_u64()
+            .unwrap() as usize,
+        contract::PRODUCER_ENVELOPE_MAX_BYTES
+    );
     assert!(contract::ENVELOPE_BRANCH_BOUNDS
         .iter()
         .all(|bound| *bound <= contract::PRODUCER_ENVELOPE_MAX_BYTES));
@@ -112,14 +117,15 @@ fn envelope_caps_and_provenance_boundary() {
     }
 }
 fn input(p: u64, h: u64) -> RecheckInputs {
-    RecheckInputs {
-        observed_ms: 0,
-        producer: ProducerExpiry {
-            grant: [1; 16],
-            at_ms: p,
-        },
-        h: HExpiry { at_ms: h },
-    }
+    observed_input(0, [1; 16], p, h)
+}
+fn observed_input(now: u64, grant: [u8; 16], p: u64, h: u64) -> RecheckInputs {
+    RecheckInputs::checked(
+        now,
+        ProducerExpiry::checked(grant, p, now).unwrap(),
+        HExpiry::checked(h, now).unwrap(),
+    )
+    .unwrap()
 }
 #[test]
 fn three_admission_predicates_and_absolute_completion() {
@@ -135,22 +141,92 @@ fn three_admission_predicates_and_absolute_completion() {
     // Isolate the cap with all remaining budget predicates satisfied.
     assert!(admit(input(304000, 240000), 14).is_none());
     let snap = admit(input(300000, 240000), 13).unwrap();
-    assert_eq!(snap.append_deadline(179000, 240000), Some(180000));
-    let mut late = input(300000, 240000);
-    late.observed_ms = 179001;
+    let late = observed_input(179001, [1; 16], 300000, 240000);
     let window = snap.begin_append(179000, 240000).unwrap();
     assert_eq!(window.deadline_ms(), 180000);
     assert!(window.recheck(late, 999));
-    let mut expired = late;
-    expired.observed_ms = 180000;
+    let expired = observed_input(180000, [1; 16], 300000, 240000);
     assert!(!window.recheck(expired, 0));
-    late.producer.grant = [2; 16];
-    assert!(!window.recheck(late, 999));
-    assert_eq!(snap.append_deadline(0, 4000), Some(4000));
+    assert!(!window.recheck(observed_input(179001, [2; 16], 300000, 240000), 999));
+    assert_eq!(
+        admit(input(300000, 240000), 13)
+            .unwrap()
+            .begin_append(0, 4000)
+            .unwrap()
+            .deadline_ms(),
+        4000
+    );
+    assert!(ProducerExpiry::checked([1; 16], 1, 1).is_none());
+    assert!(HExpiry::checked(1, 1).is_none());
+    assert!(RecheckInputs::checked(
+        240000,
+        ProducerExpiry::checked([1; 16], 300000, 0).unwrap(),
+        HExpiry::checked(240000, 0).unwrap()
+    )
+    .is_none());
     let mut cuts = CutObligation::default();
     assert!(cuts.retain([1; 16], 1));
     assert!(cuts.retain([1; 16], 2));
     assert!(!cuts.retain([2; 16], 1));
     assert!(!cuts.retain([1; 16], u64::MAX));
     assert_eq!(cuts.pending(), Some(([1; 16], 3)));
+}
+
+#[test]
+fn real_envelope_boundary_precedes_schema_rejection() {
+    let data = contract::contract().unwrap();
+    for length in [4096, 4097] {
+        let mut record = data["lifecycle_events"]["admit"]["record"].clone();
+        let original = crate_bytes(&record).len();
+        let reason = record["body"]["payload"]["reason"].as_str().unwrap().len();
+        record["body"]["payload"]["reason"] = json!("a".repeat(length - original + reason));
+        assert_eq!(crate_bytes(&record).len(), length);
+        let body = crate_bytes(&record["body"]);
+        assert_eq!(
+            writer_protocol::envelope(&body, &[0; writer_protocol::SIGNATURE_BYTES]),
+            Err(if length == 4097 {
+                writer_protocol::Refusal::Envelope
+            } else {
+                writer_protocol::Refusal::Canonical
+            })
+        );
+    }
+}
+fn crate_bytes(value: &Value) -> Vec<u8> {
+    castle_wall_daemon::smb::jcs::encode(value)
+        .unwrap()
+        .into_bytes()
+}
+
+#[test]
+fn shared_projections_cover_schema_kinds() {
+    use std::collections::BTreeSet;
+    let data = contract::contract().unwrap();
+    let rows = data["projection_vectors"].as_array().unwrap();
+    for row in rows {
+        assert!(
+            records_schema::valid(&row["record"]["body"]),
+            "{}",
+            row["id"]
+        );
+        assert_eq!(
+            contract::projection(&row["record"]),
+            Some(row["expected"].clone()),
+            "{}",
+            row["id"]
+        );
+    }
+    let kinds: BTreeSet<_> = rows
+        .iter()
+        .map(|row| row["record"]["body"]["record_kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        records_schema::BUSINESS_KINDS.iter().copied().collect()
+    );
+    let unknown = rows
+        .iter()
+        .find(|row| row["id"] == "permit-unknown")
+        .unwrap();
+    assert_eq!(unknown["record"]["body"]["payload"]["outcome"], "unknown");
 }

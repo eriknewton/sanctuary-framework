@@ -1,5 +1,6 @@
+// Must match business_profile/join_lifecycle.rs; shared vectors pin every transition.
 import {advance, joinStateValid, type JoinRecord, type JoinState} from "./record-joins.js";
-import {APPEND_CONTRACT, deliveryIdentity, type BusinessDeliveryIdentity} from "./business-append-contract.js";
+import {APPEND_CONTRACT, deliveryIdentity, parseBusinessEnvelope, type BusinessDeliveryIdentity} from "./business-append-contract.js";
 import {canonicalBytes} from "./contract.js";
 export interface JoinLifecycleState {committed: JoinState | null; provisional: {state: JoinState; identity: BusinessDeliveryIdentity; signed: boolean} | null; tombstone: BusinessDeliveryIdentity | null; needs_checkpoint: boolean;}
 export const initialLifecycle = (): JoinLifecycleState => ({committed: null, provisional: null, tombstone: null, needs_checkpoint: true});
@@ -8,6 +9,7 @@ const equal = (a: unknown,b: unknown) => Buffer.from(canonicalBytes(a)).equals(B
 export function lifecycleStep(state: JoinLifecycleState, event: Record<string, unknown>): {accepted: boolean; state: JoinLifecycleState} {
   const fail = () => ({accepted:false, state});
   const type = event.type as keyof typeof APPEND_CONTRACT.lifecycle;
+  if (!Object.hasOwn(APPEND_CONTRACT.lifecycle,type)) return fail();
   const fields = APPEND_CONTRACT.lifecycle[type];
   if (!fields || !equal(Object.keys(event).sort(), ["type",...fields].sort())) return fail();
   const next = structuredClone(state);
@@ -21,7 +23,10 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
     }
     case "SignAdmitted": {
       if (!state.committed || state.needs_checkpoint || state.provisional || state.tombstone) return fail();
-      const record = event.record as JoinRecord;
+      let record: JoinRecord;
+      // Admission uses the same bounded envelope shape as the native identity path.
+      try { record = parseBusinessEnvelope(Buffer.from(canonicalBytes(event.record)).toString("base64url")).record; }
+      catch { return fail(); }
       const result = advance(state.committed, record);
       if (result.refusal_code) return fail();
       const identity = deliveryIdentity(canonicalBytes(record), record);
@@ -35,6 +40,7 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
       next.committed=next.provisional!.state;next.provisional=null;next.tombstone=null;break;
     case "LostOrUnmatched":next.provisional=null;next.needs_checkpoint=true;break;
     case "NextGrant":next.provisional=null;next.needs_checkpoint=true;break;
+    default: return fail();
   }
   return {accepted:true,state:next};
 }

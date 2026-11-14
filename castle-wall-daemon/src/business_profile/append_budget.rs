@@ -72,8 +72,11 @@ impl HExpiry {
 impl RecheckInputs {
     /// Refuse expired observations before they can enter admission or completion.
     pub fn checked(observed_ms: u64, producer: ProducerExpiry, h: HExpiry) -> Option<Self> {
-        (observed_ms < producer.at_ms && observed_ms < h.at_ms)
-            .then_some(Self { observed_ms, producer, h })
+        (observed_ms < producer.at_ms && observed_ms < h.at_ms).then_some(Self {
+            observed_ms,
+            producer,
+            h,
+        })
     }
 }
 pub fn admit(input: RecheckInputs, flows: u64) -> Option<BudgetSnapshot> {
