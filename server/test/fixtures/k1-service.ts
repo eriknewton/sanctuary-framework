@@ -1,3 +1,4 @@
+// fail-before-exempt: native harness mapping now includes the isolated wall executable.
 import { copyFileSync, accessSync, constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, unlinkSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,10 +14,11 @@ import { canonicalBytes, ROLE_REGISTRY, ROLE_SIGNATURE_SCHEME } from "../../src/
 import { RelayClient } from "./k1-relay-client.js";
 import type { SigningGrant } from "../../src/signing/record-signer.js";
 // Must match the Linux workflow build steps: one target root contains debug and release artifacts.
-export function nativeBinary(profile: "debug" | "release", name: "signer" | "unlock" | "writer" | "drain"): string {
+export function nativeBinary(profile: "debug" | "release", name: "signer" | "unlock" | "writer" | "drain" | "wall"): string {
   const root = process.env.SANCTUARY_K1_TEST_BINARIES;
   if (!root) throw new Error("K1_NATIVE_BINARIES_REQUIRED: set SANCTUARY_K1_TEST_BINARIES to the harness target directory");
-  const path = join(root, profile, `sanctuary-business-${name}`);
+  const binaries = {signer: "sanctuary-business-signer", unlock: "sanctuary-business-unlock", writer: "sanctuary-business-writer", drain: "sanctuary-business-drain", wall: "castle-wall-daemon"} as const;
+  const path = join(root, profile, binaries[name]);
   try { accessSync(path, constants.X_OK); } catch { throw new Error(`K1_NATIVE_BINARY_UNBUILT: ${profile}/${name}`); }
   return path;
 }

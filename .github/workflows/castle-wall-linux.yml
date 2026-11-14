@@ -190,8 +190,8 @@ jobs:
       - name: Build dedicated native writer witness harness
         working-directory: castle-wall-daemon
         run: |
-          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain
-          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain --bin castle-wall-daemon
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain --bin castle-wall-daemon
           echo "SANCTUARY_K1_TEST_BINARIES=$RUNNER_TEMP/k1-target" >> "$GITHUB_ENV"
 
       - name: cargo test (lib + integration, as root for kernel access)
