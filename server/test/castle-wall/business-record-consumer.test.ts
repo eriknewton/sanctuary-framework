@@ -218,7 +218,7 @@ it.each([null,undefined,1,true,[],new Date(0),Object.create({legacy:true})])("le
   await expect(consumer.accept(input)).rejects.toThrow(/^BUSINESS_IN_LEGACY$/);
   expect(consume).not.toHaveBeenCalled();
 });
-it("legacy refuses built-in objects whatever their prototype",async()=>{
+it("legacy refuses non-event objects of every built-in kind",async()=>{
   const consume=vi.fn(async()=>{}),consumer=await createBusinessRecordConsumer({kind:"Legacy",consume});
   const make=()=>[new Map(),new Set(),new WeakMap(),new WeakSet(),Promise.resolve(),new ArrayBuffer(4),new SharedArrayBuffer(4),new Uint8Array(4),Buffer.alloc(4),new DataView(new ArrayBuffer(4)),new Date(0),/x/,new Error("x"),new String("x"),[]];
   const inputs=[...make(),...make().map(v=>Object.setPrototypeOf(v,Object.prototype)),...make().map(v=>Object.setPrototypeOf(v,null)),new Proxy({seq:1},{})];
