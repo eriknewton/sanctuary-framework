@@ -45,9 +45,9 @@
       }
     },
     "record_join_vectors.json": {
-      "sha256": "f2dd9855e598c5ccb80a0fb68bdc7689e373aabc13ed8f2313803b8f807a8d81",
+      "sha256": "1f7919b3781340c6b1fff6f80f10b29337dfb8746cb059593e0068579a8c17ae",
       "cases": {
-        "cases": 158
+        "cases": 180
       }
     },
     "role_vectors.json": {

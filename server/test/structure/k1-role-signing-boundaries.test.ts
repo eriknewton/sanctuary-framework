@@ -1,6 +1,8 @@
+// fail-before-exempt: append generator freshness and ownership CI assertions read native output, the Linux workflow and repository generators;
 // fail-before-exempt: the changed assertions read server/tsup.config.ts and castle-wall-daemon sources, which verify-fail-before does not revert (it reverts server/src only); the full suite at head checks them.
 import {describe,it,expect} from "vitest";
-import {readFileSync,readdirSync} from "node:fs";
+import {readFileSync,readdirSync,mkdtempSync,writeFileSync,unlinkSync,rmdirSync} from "node:fs";
+import {tmpdir} from "node:os";
 import {resolve,join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {execFileSync} from "node:child_process";
@@ -12,6 +14,7 @@ describe("isolated K1 boundaries",()=>{
   it("generated Rust matches the full TS role, schema and constant sets",()=>{
     expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-record-signer-contract.mjs"),"--check"])).not.toThrow();
     expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-drain-contract.mjs"),"--check"])).not.toThrow();
+    expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check"])).not.toThrow();
     const rust=readFileSync(join(root,"castle-wall-daemon/src/business_profile/signer_contract.rs"),"utf8");
     const rows=[...rust.matchAll(/\("([^"]+)", "([^"]+)", (\d+)\)/g)].map(match=>({role:match[1],domain:JSON.parse('"'+match[2]+'"'),envelope_max_bytes:Number(match[3])}));
     expect(ROLE_REGISTRY.every(row => Object.isFrozen(row.record_kinds))).toBe(true);
@@ -92,4 +95,30 @@ it("documents the message bound and scalar and signature derivations", () => {
   expect(contract).toContain("SIGNER_PREIMAGE_MAX_BYTES + SIGNER_DOMAIN_MAX_BYTES");
   expect(contract).toContain("ceil(64 * 8 / 6) = 86");
   expect(readFileSync(join(root, "server/src/signing/strict-verifier.ts"), "utf8")).toContain("2^252 + 27742317777372353535851937790883648493");
+});
+
+it("append generator refuses a stale derived bound table",()=>{
+  const directory=mkdtempSync(join(tmpdir(),"append-freshness-")),candidate=join(directory,"constants.rs");
+  try {
+    const generated=readFileSync(join(root,"castle-wall-daemon/src/business_profile/append_contract_constants.rs"),"utf8");
+    writeFileSync(candidate,generated);
+    const check=()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check","--check-file",candidate],{stdio:"pipe"});
+    expect(check).not.toThrow();
+    writeFileSync(candidate,generated.replace(/(CONSERVATIVE_ENVELOPE_MAX_BYTES: usize = )(\d+)/,(_all,prefix,n)=>prefix+(Number(n)+1)));
+    expect(check).toThrow("append contract differs");
+  } finally {unlinkSync(candidate);rmdirSync(directory);}
+});
+
+it("Linux CI runs only the append budget ownership doctests",()=>{
+  const workflow=readFileSync(join(root,".github/workflows/castle-wall-linux.yml"),"utf8");
+  // The whole step is pinned through the next step's name, so a dropped count check or an added skip fails here.
+  expect(workflow).toContain([
+    "      - name: Check append budget ownership doctests",
+    "        working-directory: castle-wall-daemon",
+    "        # The grep refuses a run that selected or compiled fewer than both doctests: a filter that matches nothing,",
+    "        # or a fence changed to ignore, would otherwise pass with the ownership proof never checked.",
+    "        run: cargo test --locked --doc --features test-isolation business_profile::append_budget 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 2 passed; 0 failed; 0 ignored;'",
+    "",
+    "      - name: cargo clippy (warnings as errors)",
+  ].join("\n"));
 });

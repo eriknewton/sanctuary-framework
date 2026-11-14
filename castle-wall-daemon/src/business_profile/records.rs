@@ -205,8 +205,14 @@ pub fn join_commitment(record: &Value) -> Option<String> {
         ))
     ))
 }
+#[cfg(test)]
+thread_local! {
+    pub(super) static ADVANCE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Pure history validation only; callers authenticate the checkpoint and verify signatures separately.
 pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
+    #[cfg(test)]
+    ADVANCE_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Malformed relying-party state refuses before any record field is read, so INPUT precedes SCHEMA in both executors.
     if !join_state_valid(state) {
         return Err("INPUT");

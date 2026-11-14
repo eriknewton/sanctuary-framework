@@ -976,6 +976,48 @@
               "payload.context.flow.activation_id",
               "activation_id"
             ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.machine_id",
+              "payload.context.flow.machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.boot_id",
+              "payload.context.flow.boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.activation_id",
+              "payload.context.flow.activation_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.ct_zone",
+              "payload.context.flow.ct_zone"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.ct_id",
+              "payload.context.flow.ct_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.open_sequence",
+              "payload.context.flow.open_sequence"
+            ]
           }
         ]
       },
@@ -1117,6 +1159,48 @@
             "paths": [
               "payload.context.flow.activation_id",
               "activation_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.machine_id",
+              "payload.context.flow.machine_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.boot_id",
+              "payload.context.flow.boot_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.activation_id",
+              "payload.context.flow.activation_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.ct_zone",
+              "payload.context.flow.ct_zone"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.ct_id",
+              "payload.context.flow.ct_id"
+            ]
+          },
+          {
+            "op": "eq",
+            "paths": [
+              "payload.link.agent_flow.open_sequence",
+              "payload.context.flow.open_sequence"
             ]
           }
         ]

@@ -281,3 +281,8 @@ required-features = ["test-isolation"]
 name = "linux_business_reconciliation"
 path = "tests/linux_business_reconciliation.rs"
 required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_business_append_foundations"
+path = "tests/linux_business_append_foundations.rs"
+required-features = ["test-isolation"]
