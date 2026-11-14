@@ -26,16 +26,26 @@ const equal = (a: unknown,b: unknown) => Buffer.from(canonicalBytes(a)).equals(B
 const sameEnvelope = (a: Uint8Array,b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
 const copy = (value: DurableBusinessAcceptance): DurableBusinessAcceptance => structuredClone(value);
 const equalAcceptance = (a: DurableBusinessAcceptance,b: DurableBusinessAcceptance) => equal(a.pin,b.pin) && sameEnvelope(a.envelope,b.envelope) && equal(a.identity,b.identity) && equal(a.projection,b.projection) && equal(a.checkpoint,b.checkpoint);
-const parseInput = (event: unknown) => event instanceof Uint8Array ? parseBusinessEventBytes(event) : typeof event === "string" ? parseBusinessEventBytes(Buffer.from(event,"utf8")) : parseBusinessEvent(event);
+const parseInput = (event: unknown) => {
+  if (event instanceof Uint8Array) return parseBusinessEventBytes(event);
+  if (typeof event !== "string") return parseBusinessEvent(event);
+  // Validate UTF-16 before conversion can replace an unpaired surrogate.
+  for (let i=0;i<event.length;i++) {
+    const unit=event.charCodeAt(i);
+    if (unit>=0xd800 && unit<=0xdbff) {
+      const low=event.charCodeAt(++i);
+      if (!(low>=0xdc00 && low<=0xdfff)) throw Error("BUSINESS_EVENT");
+    } else if (unit>=0xdc00 && unit<=0xdfff) throw Error("BUSINESS_EVENT");
+  }
+  return parseBusinessEventBytes(Buffer.from(event,"utf8"));
+};
 /** Mode and pins are supplied by trusted composition, never selected by event fields. */
 export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<{accept(event: unknown): Promise<BusinessDeliveryAck | void>; committedState(): JoinState | null; pendingDelivery(): BusinessDeliveryIdentity | null}> {
   if (mode.kind === "Legacy") {
     return {committedState:()=>null,pendingDelivery:()=>null,async accept(event) {
-      if (event !== null && typeof event === "object" && "business_envelope" in event && event.business_envelope !== null && event.business_envelope !== undefined) throw Error("BUSINESS_IN_LEGACY");
-      // Serialized inputs use the same strict boundary before any legacy effect.
-      let business=false;
-      try { parseInput(event); business=true; } catch { /* Not a strict Business event. */ }
-      if(business) throw Error("BUSINESS_IN_LEGACY");
+      // Legacy drain callers supply plain objects, never serialized input.
+      if (event === null || typeof event !== "object" || (Object.getPrototypeOf(event) !== Object.prototype && Object.getPrototypeOf(event) !== null)) throw Error("BUSINESS_IN_LEGACY");
+      if ("business_envelope" in event && event.business_envelope !== null && event.business_envelope !== undefined) throw Error("BUSINESS_IN_LEGACY");
       await mode.consume(event);
     }};
   }
