@@ -72,7 +72,7 @@ const _: fn() = || {
     }
     impl<T: ?Sized> AmbiguousIfClone<()> for T {}
     struct Cloned;
-    impl<T: ?Sized + Clone> AmbiguousIfClone<Cloned> for T {}
+    impl<T: Clone> AmbiguousIfClone<Cloned> for T {}
     let _ = <BudgetSnapshot as AmbiguousIfClone<_>>::check;
 
     trait AmbiguousIfCopy<A> {
@@ -80,7 +80,7 @@ const _: fn() = || {
     }
     impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
     struct Copied;
-    impl<T: ?Sized + Copy> AmbiguousIfCopy<Copied> for T {}
+    impl<T: Copy> AmbiguousIfCopy<Copied> for T {}
     let _ = <BudgetSnapshot as AmbiguousIfCopy<_>>::check;
 };
 impl ProducerExpiry {
