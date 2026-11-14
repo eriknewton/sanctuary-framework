@@ -196,11 +196,14 @@ jobs:
 
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
-        # 20 = about 6x the longest observed run of this step (165 to 188 s over
-        # the last seven runs, 2026-09-27), leaving room for a cold-cache rebuild.
+        # 35 = this step's 13.4 min on main (run 43545385001, 2026-11-14) plus the
+        # 5.5 min K1c-2d2 drain suite, about 1.8x that 19 min for a cold-cache
+        # rebuild. The earlier 20 (6x the 165 to 188 s observed 2026-09-27) was
+        # outgrown as the business-profile suites landed: a run that times out
+        # here reads as a failure with no failing test in the log.
         # Without a bound a hung or OOM-thrashing suite holds the job to the
         # 360-minute default and the leftover-state refusal below never runs.
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: |
           # Run all tests including Linux-gated integration tests.
           # NFQUEUE and nftables tests need root.
