@@ -1,4 +1,5 @@
 // fail-before-exempt: The rows this change adds witness the isolation preload and the candidate build script under server/scripts, which this gate does not revert, so they pass on the reverted source by design; each is killed instead by a recorded single-predicate mutant of that script.
+/** Installed consumers preserve snapshot semantics within the isolation boundary. R3 */
 import { beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, symlinkSync, chmodSync, lstatSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -7,6 +8,7 @@ import { tmpdir } from "node:os";
 import { spawnSync, execFileSync } from "node:child_process";
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { candidateForTests } from "../../scripts/build-evidence-pack.mjs";
+import { functionalCandidateForTests } from "./snapshot-artifact-fixtures.js";
 import { fixture, syncAudit } from "./snapshot-fixtures.js";
 import { verifyAuditChainContent } from "../../src/cli/audit-chain-verify.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
@@ -36,13 +38,13 @@ function isolated(attack?: string, status = "PASS", alias = false, writable = fa
   return { ...result, expectedEnumerations };
 }
 describe("packed recipient consumer", () => {
-  beforeAll(async () => { c = await candidateForTests(); }, 120_000);
+  beforeAll(async () => { c = await functionalCandidateForTests(); }, 120_000);
   it.each(["PASS", "PARTIAL", "FAIL"])("installed bundle isolates every verdict %s with an exact enumeration count", status => {
     const r = isolated(undefined, status); expect(r.error).toBeUndefined(); expect(r.status, r.stderr + r.stdout).toBe(status === "PASS" ? C.EXIT_PASS : status === "PARTIAL" ? C.EXIT_PARTIAL : C.EXIT_FAIL);
     expect(JSON.parse(r.stdout)).toMatchObject({ status, accepted: status === "PASS" });
-    expect(JSON.parse(r.stderr)).toEqual({ isolation: true, denied: 0, enumerations: r.expectedEnumerations });
+    expect(JSON.parse(r.stderr)).toEqual({ isolation: true, denied: 0, enumerations: r.expectedEnumerations, markerObservations: 3 });
   });
-  it("installed bundle accepts a canonical root reached through a symlinked temp parent", () => { const r = isolated(undefined, "PASS", true); expect(r.status, r.stderr + r.stdout).toBe(C.EXIT_PASS); expect(JSON.parse(r.stderr)).toEqual({ isolation: true, denied: 0, enumerations: r.expectedEnumerations }); });
+  it("installed bundle accepts a canonical root reached through a symlinked temp parent", () => { const r = isolated(undefined, "PASS", true); expect(r.status, r.stderr + r.stdout).toBe(C.EXIT_PASS); expect(JSON.parse(r.stderr)).toEqual({ isolation: true, denied: 0, enumerations: r.expectedEnumerations, markerObservations: 3 }); });
   it.each([
     'import fs from "node:fs"; fs.readFileSync(process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/link");',
     'import fs from "node:fs"; fs.readFileSync(process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/inside-link");',
@@ -78,7 +80,8 @@ describe("packed recipient consumer", () => {
     'import { createRequire } from "node:module"; createRequire(import.meta.url)("node:net").connect(80, "127.0.0.1");',
     'import { createRequire } from "node:module"; createRequire(import.meta.url)("node:child_process").execFileSync("/usr/bin/env", ["true"]);',
   ])("isolation detects forbidden reach %s", attack => { const r = isolated(attack); expect(r.status).toBe(1); expect(r.stderr).toContain('"denied":1'); });
-  it("package contains exactly its allowlisted bundle provenance and notices", () => {
+  it("package contains exactly its allowlisted bundle provenance and notices", async () => {
+    const c = await candidateForTests();
     const files = c.packed.files.map((f: { path: string }) => f.path).sort();
     // Must match NON_RELEASE_MARKER written by buildCandidate in scripts/build-evidence-pack.mjs: only a fixture build packs the marker.
     expect(files).toEqual(["LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "dist/check-evidence-pack-artifact.js", "dist/provenance.json", "dist/verify-evidence-pack.js", "package.json", ...(c.fixture ? ["dist/NON_RELEASE"] : [])].sort());
@@ -99,7 +102,7 @@ describe("packed recipient consumer", () => {
 });
 
 it("synthetic fixture creates advances and exports through one isolated producer bundle", async () => {
-  c ??= await candidateForTests();
+  c ??= await functionalCandidateForTests();
   mkdirSync("/tmp/v70", { recursive: true, mode: 0o700 }); const root = "/tmp/v70/test-" + randomUUID(); mkdirSync(root, { mode: 0o700 });
   const script = join(c.tree, "server/evidence-pack-dist/evidence-pack-drill-fixture.js");
   const run = (args: string[]) => spawnSync(process.execPath, [script, args[0], "--root", root, ...args.slice(1)], { encoding: "utf8", timeout: TIMEOUT_MS, env: { ...process.env, HOME: root + "/home" } });
@@ -186,7 +189,7 @@ it("public procedure supplies complete synthetic pins and platform bounds", () =
 const PUBLIC_TEXT_FORBIDDEN = /\.(?:[cm]?[jt]s|py):\d+|#L\d+|defect|bypass|drill passed/i;
 it.each(["example.py:12", "example.ts:12", "example#L12"])("documentation anchor guard recognizes %s", anchor => { expect(anchor).toMatch(PUBLIC_TEXT_FORBIDDEN); });
 it("isolation refuses value lookup output even with the permitted executable", async () => {
-  c ??= await candidateForTests();
+  c ??= await functionalCandidateForTests();
   const { METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT } = await import("../../src/evidence-pack/snapshot-offline-cli.js");
   const attack = `import cp from "node:child_process"; cp.spawnSync("/usr/bin/xattr", ["-s", "-p", "com.apple.provenance", process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/key"], {env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:["ignore","pipe","ignore"]});`;
   const result = isolated(attack); expect(result.status).toBe(C.EXIT_FAIL); expect(result.stderr).toContain('"denied":1');
@@ -208,7 +211,7 @@ printf reached`;
 });
 
 it.each([false, true])("isolation refuses legacy exporter argv with writable %s", async writable => {
-  c ??= await candidateForTests();
+  c ??= await functionalCandidateForTests();
   const { METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT, LINUX_METADATA_PROGRAM } = await import("../../src/evidence-pack/snapshot-offline-cli.js");
   for (const [command, prefix] of [["/usr/bin/xattr", []], ["/usr/bin/xattr", ["-p", "com.apple.provenance"]], ["python3", ["-c", LINUX_METADATA_PROGRAM]]] as const) {
     const attack = `import cp from "node:child_process"; cp.execFile(${JSON.stringify(command)}, [...${JSON.stringify(prefix)}, process.env.EVIDENCE_PACK_ISOLATION_ROOT+"/key"], {env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:"ignore"}, () => {});`;
@@ -218,7 +221,7 @@ it.each([false, true])("isolation refuses legacy exporter argv with writable %s"
 }, 120_000);
 
 it.each([false, true])("isolation refuses synchronous legacy exporter argv with closed options and writable %s", async writable => {
-  c ??= await candidateForTests();
+  c ??= await functionalCandidateForTests();
   const { METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT, LINUX_METADATA_PROGRAM } = await import("../../src/evidence-pack/snapshot-offline-cli.js");
   // Each row uses an admitted subprocess key and the closed listing options, so only the exact argv shape can refuse it.
   const closed = `{env:{LC_ALL:"C"},shell:false,timeout:${METADATA_TIMEOUT_MS},maxBuffer:${METADATA_OUTPUT_LIMIT},stdio:["ignore","pipe","ignore"]}`;

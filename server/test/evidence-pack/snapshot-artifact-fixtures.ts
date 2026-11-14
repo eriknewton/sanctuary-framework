@@ -4,9 +4,9 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { spawnSync } from "node:child_process";
-import { digest, ARTIFACT_FILES, MAX_MANIFEST_BYTES, parseManifest, requireValid, memberRows, parseArchive, type ArtifactMode, type Candidate, type ArtifactManifest } from "../../src/evidence-pack/artifact-policy.mjs";
+import { digest, ARTIFACT_FILES, MAX_MANIFEST_BYTES, parseManifest, requireValid, memberRows, memberMode, parseArchive, type ArtifactMode, type Candidate, type ArtifactManifest } from "../../src/evidence-pack/artifact-policy.mjs";
 // @ts-expect-error Node build script deliberately has no TypeScript wrapper.
-import { prepareFixtureCandidate, candidateForTests, buildCandidate, checkerArgs, installCandidate } from "../../scripts/build-evidence-pack.mjs";
+import { prepareFixtureCandidate, candidateForTests, buildCandidate, checkerArgs, installCandidate, checkDescriptor } from "../../scripts/build-evidence-pack.mjs";
 export const ROOT = resolve("..");
 const tempParent = mkdtempSync(join(tmpdir(), "artifact-witness-"));
 export const scratch = () => mkdtempSync(join(tempParent, "case-"));
@@ -71,4 +71,26 @@ export function malformed(s: Sample): Buffer[] {
   const base = JSON.parse(s.manifest.toString()) as ArtifactManifest;
   const variants: unknown[] = [null, { ...base, extra: true }, { ...base, members: [null] }, { ...base, members: [{ ...base.members[0], sha256: undefined }] }, { ...base, members: [base.members[0], ...base.members] }, { ...base, members: base.members.map((row, i) => i ? row : { ...row, size_bytes: Number.MAX_SAFE_INTEGER + 1 }) }, { ...base, members: base.members.map((row, i) => i ? row : { ...row, type: 7 }) }, { ...base, mode: false }];
   return [...variants.map(v => Buffer.from(JSON.stringify(v))), Buffer.from(s.manifest.toString().replace('"format":', '"format":"duplicate","format":'))];
+}
+
+let releasePolicyControl: Promise<Awaited<ReturnType<typeof candidateForTests>>> | undefined;
+/** Build a separate synthetic installation through the checked artifact path, leaving the marked candidate intact. */
+export function prepareReleasePolicyControl() {
+  releasePolicyControl ??= (async () => {
+    const c = await candidateForTests();
+    const input = sample(c.artifactDir, c.checker, c.tree, c.archive, c.metadata, c.command);
+    const tree = buildRoot(input), artifactDir = join(scratch(), "release-policy-control");
+    await buildCandidate(buildArgs(input, artifactDir, "release"), tree, c.receipt.source_revision);
+    const checked = checkDescriptor(artifactDir), bins = installCandidate(artifactDir);
+    return { ...c, ...bins, root: artifactDir, tree, artifactDir, receipt: checked.receipt,
+      tarball: join(artifactDir, ARTIFACT_FILES.tarball),
+      packed: { files: checked.members.map((row: { path: string; size_bytes: number }) => ({ path: row.path.slice("package/".length), size: row.size_bytes, mode: memberMode(row.path) })) },
+      fixture: false, non_release: false, synthetic: true, authenticated_release: false };
+  })();
+  return releasePolicyControl;
+}
+/** Workflow release candidates are exercised directly; fixture candidates get an explicit separate control. */
+export async function functionalCandidateForTests() {
+  const c = await candidateForTests();
+  return c.fixture ? prepareReleasePolicyControl() : c;
 }

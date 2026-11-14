@@ -150,3 +150,11 @@ Supply explicit `--artifact-dir` and `--artifact-mode` arguments to the candidat
 Before installation or upload, run `node server/scripts/build-evidence-pack.mjs --check-descriptor <artifact-directory>`. Install only its fixed `candidate.tgz`, offline with scripts disabled. The shipped `check-evidence-pack-artifact` checks the same pair against independently supplied digest and revision pins. Fixture-policy success is non-release evidence. Neither the process nor its receipt authenticates a publisher.
 
 The artifact path still needs native Darwin and Node 24 drills. No native Darwin result is asserted here; existing snapshot and isolation bounds remain unchanged.
+
+## Installed classification drill
+
+Use a disposable installation and independently pinned artifact bytes. Retain the marked fixture artifact for carriage and refusal checks; its verifier must exit 1 with empty stdout for snapshot verification, help and version. A regular marker prints `NON_RELEASE: this verifier package is not a release artifact.` with one final LF. An unavailable observation prints `PACKAGE_MARKER_UNAVAILABLE: verifier package classification could not be established.` with one final LF. A missing result is refusal, not an empty successful verification.
+
+Run functional PASS, PARTIAL and FAIL checks against a separate marker-free release-policy control built and installed through the artifact checker. Label this control synthetic and unauthenticated; it is not the uploaded fixture. Using the fixture for those checks now yields a package refusal before any snapshot result. Keep the marked artifact and its descriptor intact.
+
+Record native Darwin and Node 24 outcomes separately from Linux results. Classification adds no interpreter requirement. Absence is a point-in-time observation under a trusted installation with no concurrent package writers; it does not authenticate the publisher or later package contents. No additional native Darwin results are claimed here.

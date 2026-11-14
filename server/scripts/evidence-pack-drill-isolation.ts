@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { installInMemoryKeychainStore } from "../test/setup/keychain-memory-store.js";
 import { execKeychain } from "../src/wrap/keychain-exec.js";
 import { LINUX_METADATA_PROGRAM, METADATA_TIMEOUT_MS, METADATA_OUTPUT_LIMIT } from "../src/evidence-pack/snapshot-metadata.js";
+import { NON_RELEASE_MARKER } from "../src/evidence-pack/artifact-policy.mjs";
 import { OS_ATTACHED_METADATA } from "../src/evidence-pack/snapshot-contract.js";
 const NORMAL_EXIT = 0, DENIED_EXIT = 1;
 let installed = false;
@@ -45,7 +46,9 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
     }
   }
   const home = process.env.HOME ? resolved(resolve(process.env.HOME)) : undefined;
-  let denied = 0, enumerations = 0;
+  let denied = 0, enumerations = 0, markerObservations = 0;
+  // Must match snapshot-package-marker.ts: only exact no-follow observations, never marker content or ancestors.
+  const markerPaths = new Set([dirname(dirname(bundle)), join(dirname(bundle), NON_RELEASE_MARKER)]);
   const deny = (): never => { denied++; throw new Error("Evidence drill isolation denied I/O"); };
   const inside = (path: string) => path === root || path.startsWith(root + sep);
   const pathOf = (value: unknown) => value instanceof URL ? fileURLToPath(value) : Buffer.isBuffer(value) ? value.toString() : typeof value === "string" ? value : undefined;
@@ -75,7 +78,18 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
   // Every path-taking read, listing or observer entry point is mediated; a missing one lets a bundle read outside the root while the drill still reports zero denials.
   const reads = ["readFile", "open", "opendir", "readdir", "stat", "lstat", "statfs", "realpath", "readlink", "access", "exists", "createReadStream", "openAsBlob", "watch", "watchFile"];
   const writes = ["writeFile", "appendFile", "mkdir", "mkdtemp", "rm", "rmdir", "unlink", "rename", "copyFile", "cp", "symlink", "link", "chmod", "lchmod", "chown", "lchown", "utimes", "lutimes", "truncate", "createWriteStream"];
-  for (const object of [fs, fsp]) for (const key of reads) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => { check(args[0]); if (key === "open" && !writable) { const flags = args[1]; if (typeof flags === "string" ? flags !== "r" : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC)) !== 0) deny(); } return original(...args); });
+  for (const object of [fs, fsp]) for (const key of reads) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => {
+    const path = pathOf(args[0]);
+    if (object === fs && key === "lstat" && suffix === "Sync" && path !== undefined && markerPaths.has(path)) {
+      const options = args[1];
+      if (!options || typeof options !== "object" || Object.getPrototypeOf(options) !== Object.prototype || Object.keys(options).length !== 1 || !Object.hasOwn(options, "bigint") || !("bigint" in options) || options.bigint !== true) return deny();
+      markerObservations++; return original(...args);
+    }
+    // A canonicalization failure is a counted denial, never a raw filesystem error.
+    let marked: boolean;
+    try { marked = path !== undefined && markerPaths.has(resolved(resolve(path))); } catch { return deny(); }
+    if (marked) return deny();
+    check(args[0]); if (key === "open" && !writable) { const flags = args[1]; if (typeof flags === "string" ? flags !== "r" : typeof flags === "number" && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_TRUNC)) !== 0) deny(); } return original(...args); });
   // Glob lists options.cwd or the process directory and accepts pattern arrays, so no single-path check can bound it; the verifier never globs, so every form is refused.
   for (const object of [fs, fsp]) for (const suffix of ["", "Sync"]) wrap(object, "glob" + suffix, () => deny());
   for (const object of [fs, fsp]) for (const key of writes) for (const suffix of ["", "Sync"]) wrap(object, key + suffix, (original, args) => { check(args[0], true); if (["rename", "copyFile", "cp", "symlink", "link"].includes(key)) check(args[1], true); return original(...args); });
@@ -100,7 +114,7 @@ export function installIsolation(rootPath: string, bundlePath: string, writable 
   for (const object of [dns, dns.promises]) for (const key of Object.keys(object)) if (typeof (object as unknown as Record<string, unknown>)[key] === "function") wrap(object, key, () => deny());
   globalThis.fetch = async () => deny();
   syncBuiltinESMExports();
-  process.on("exit", () => { process.stderr.write(JSON.stringify({ isolation: true, denied, enumerations }) + "\n"); if (denied) process.exitCode = DENIED_EXIT; });
+  process.on("exit", () => { process.stderr.write(JSON.stringify({ isolation: true, denied, enumerations, markerObservations }) + "\n"); if (denied) process.exitCode = DENIED_EXIT; });
 }
 // The preload is opt-in and the production verifier never imports this harness.
 if (process.env.EVIDENCE_PACK_ISOLATION_ROOT && process.env.EVIDENCE_PACK_ISOLATION_BUNDLE) installIsolation(process.env.EVIDENCE_PACK_ISOLATION_ROOT, process.env.EVIDENCE_PACK_ISOLATION_BUNDLE);
