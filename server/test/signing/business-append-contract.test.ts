@@ -1,7 +1,7 @@
 // fail-before-exempt: shared native corpus and append shape parity exercise new pure foundations.
 import {it, expect} from "vitest";
 import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
-import {APPEND_CONTRACT, appendShape, envelopeSizeAdmitted, parseBusinessEnvelope, parseBusinessEvent, deliveryIdentity} from "../../src/signing/business-append-contract.js";
+import {APPEND_CONTRACT, appendShape, envelopeSizeAdmitted, parseBusinessEnvelope, parseBusinessEvent, parseBusinessEventBytes, deliveryIdentity} from "../../src/signing/business-append-contract.js";
 import {initialLifecycle, lifecycleStep} from "../../src/signing/business-join-lifecycle.js";
 import {canonicalBytes} from "../../src/signing/contract.js";
 import {validateBusinessRecord} from "../../src/signing/linux-business-records.js";
@@ -48,4 +48,16 @@ it.each(APPEND_CONTRACT.ack_vectors)("shared ACK $id", row => {
 it.each(APPEND_CONTRACT.event_vectors)("shared event $id", row => {
   if(row.accepted) expect(parseBusinessEvent(row.value).identity).toEqual(deliveryIdentity(bytes,record));
   else expect(()=>parseBusinessEvent(row.value)).toThrow();
+});
+
+it("serialized business events reject duplicate wrapper keys before normalization", () => {
+  const event=APPEND_CONTRACT.event_vectors[0].value;
+  const bytes=canonicalBytes(event);
+  expect(parseBusinessEventBytes(bytes).identity).toEqual(deliveryIdentity(canonicalBytes(record),record));
+  const duplicate=Buffer.from(Buffer.from(bytes).toString().replace('"critical":true','"critical":true,"critical":true'));
+  expect(()=>parseBusinessEventBytes(duplicate)).toThrow();
+});
+
+it("checkpoint shapes share complete bounded nested tables without granting authority", () => {
+  for(const row of APPEND_CONTRACT.checkpoint_vectors) expect(appendShape("checkpoint",row.value),row.id).toBe(row.accepted);
 });

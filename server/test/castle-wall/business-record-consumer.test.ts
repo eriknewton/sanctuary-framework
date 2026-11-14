@@ -1,5 +1,10 @@
-// fail-before-exempt: shared native records and an isolated durable sink exercise the new business consumer.
+// fail-before-exempt: shared native records, legacy verification and an isolated durable sink exercise the new business consumer.
 import {it, expect, vi} from "vitest";
+import {ed25519} from "@noble/curves/ed25519";
+import {producerSigningBytes, verifyProducerSignature} from "../../src/castle-wall/runtime/producer-signature.js";
+import {buildCriticalEnvelopeFromDrainEvent} from "../../src/castle-wall/runtime/linux-audit-drain.js";
+import {CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1} from "../../src/castle-wall/constants.js";
+import type {AuditDrainEvent} from "../../src/castle-wall/ipc/messages.js";
 import {mkdtempSync, writeFileSync, openSync, fsyncSync, closeSync, renameSync, readFileSync, unlinkSync, rmdirSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
@@ -63,14 +68,24 @@ it.each([
 });
 it("the real consumer reaches the bounded parser before acceptance",async()=>{
   const spy=vi.spyOn(append,"parseBusinessEvent");
-  try{await (await create()).accept(event());expect(spy).toHaveBeenCalledTimes(1);}finally{spy.mockRestore();}
+  try{const consumer=await create();await consumer.accept(event());expect(spy).toHaveBeenCalledTimes(1);
+    await expect(consumer.accept(canonicalBytes(event()))).resolves.toEqual({version:1,identity:append.deliveryIdentity(canonicalBytes(first.records[0]),first.records[0])});}finally{spy.mockRestore();}
 });
 it("trusted mode preserves legacy calls and never selects raw fallback from a business event",async()=>{
   let calls=0;
-  const legacy=await createBusinessRecordConsumer({kind:"Legacy",async consume(){calls++;}});
-  const raw={seq:1,critical:false,event_canonical_json:"{}",producer_signature_b64url:"raw",producer_key_id:"legacy"};
+  const captured=Date.now();
+  const seed=new Uint8Array(32).fill(8),publicKey=Buffer.from(ed25519.getPublicKey(seed)).toString("base64url");
+  const canonical=Buffer.from(canonicalBytes({operation:"egress_blocked",layer:"l1",identity_id:"agent",result:"blocked",timestamp:new Date(captured).toISOString(),details:{agent_id:"agent"}})).toString();
+  const raw:AuditDrainEvent={seq:1,captured_at_unix_ms:captured,prior_sha256_hex:null,critical:true,event_canonical_json:canonical,producer_signature_b64url:Buffer.from(ed25519.sign(producerSigningBytes(canonical,captured,1),seed)).toString("base64url"),producer_key_id:CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1};
+  const legacy=await createBusinessRecordConsumer({kind:"Legacy",async consume(value){
+    calls++;
+    const built=buildCriticalEnvelopeFromDrainEvent(value as AuditDrainEvent,async()=>{});
+    expect(built.kind).toBe("ok");
+    if(built.kind!=="ok" || !built.envelope.producer) throw Error("LEGACY_WRAPPER");
+    expect(verifyProducerSignature(built.envelope.producer,publicKey)).toEqual({ok:true});
+  }});
   await legacy.accept(raw);expect(calls).toBe(1);
-  await expect(legacy.accept(event())).rejects.toThrow("BUSINESS_IN_LEGACY");expect(calls).toBe(1);
+  await expect(legacy.accept({...raw,business_envelope:event().business_envelope})).rejects.toThrow("BUSINESS_IN_LEGACY");expect(calls).toBe(1);
   await expect((await create()).accept(raw)).rejects.toThrow();expect(calls).toBe(1);
 });
 it("forty held sink completions preserve one delivery and do not advance early",async()=>{

@@ -14,6 +14,19 @@ fn corpus() -> Value {
 #[test]
 fn shared_identity_and_lifecycle_vectors() {
     let data = contract::contract().unwrap();
+    // Must match the shared data pin consumed by TS, without reading native source text.
+    assert_eq!(
+        data["limits"],
+        json!({"d_undrained_max":castle_wall_daemon::business_profile::drain_store::D_UNDRAINED_MAX,"join_history_max":castle_wall_daemon::business_profile::records::JOIN_HISTORY_MAX})
+    );
+    for row in data["checkpoint_vectors"].as_array().unwrap() {
+        assert_eq!(
+            contract::shape("checkpoint", &row["value"]),
+            row["accepted"].as_bool().unwrap(),
+            "{}",
+            row["id"]
+        );
+    }
     for row in data["identity_vectors"].as_array().unwrap() {
         assert_eq!(
             contract::shape("identity", &row["value"]),
@@ -42,6 +55,10 @@ fn shared_identity_and_lifecycle_vectors() {
             row["id"]
         );
     }
+    let bytes = castle_wall_daemon::smb::jcs::encode(&data["event_vectors"][0]["value"]).unwrap();
+    assert!(contract::event_bytes(bytes.as_bytes()).is_some());
+    let duplicate = bytes.replace("\"critical\":true", "\"critical\":true,\"critical\":true");
+    assert!(contract::event_bytes(duplicate.as_bytes()).is_none());
     for row in data["lifecycle_vectors"].as_array().unwrap() {
         let mut state = join_lifecycle::initial();
         for step in row["steps"].as_array().unwrap() {

@@ -2,7 +2,7 @@ import {z} from "zod";
 import {canonicalBytes} from "../../signing/contract.js";
 import {BUSINESS_PIN_FIELDS, verifyIndexedRecord, type BusinessPin, type OuterRecordIndex} from "../../linux-business/producer-custody.js";
 import {joinStateValid, verifyBusinessJoin, type JoinState, type JoinRecord} from "../../signing/record-joins.js";
-import {envelopeSizeAdmitted, parseBusinessEvent, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-contract.js";
+import {envelopeSizeAdmitted, parseBusinessEvent, parseBusinessEventBytes, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-contract.js";
 
 export interface DurableBusinessAcceptance {
   envelope: Uint8Array;
@@ -67,7 +67,7 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
       if(busy) throw Error("BUSINESS_BUSY");
       busy=true;
       try {
-        const {record,bytes,identity}=parseBusinessEvent(event);
+        const {record,bytes,identity}=event instanceof Uint8Array ? parseBusinessEventBytes(event) : parseBusinessEvent(event);
         if(!authentic(record)) throw Error("BUSINESS_AUTH");
         if(last && equal(last.identity,identity)) {
           if(!sameEnvelope(last.envelope,bytes)) throw Error("BUSINESS_REPLAY");
