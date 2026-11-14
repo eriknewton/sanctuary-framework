@@ -1,6 +1,8 @@
+// fail-before-exempt: round-one append generator freshness checks read native output and execute repository generators;
 // fail-before-exempt: the changed assertions read server/tsup.config.ts and castle-wall-daemon sources, which verify-fail-before does not revert (it reverts server/src only); the full suite at head checks them.
 import {describe,it,expect} from "vitest";
-import {readFileSync,readdirSync} from "node:fs";
+import {readFileSync,readdirSync,mkdtempSync,writeFileSync,unlinkSync,rmdirSync} from "node:fs";
+import {tmpdir} from "node:os";
 import {resolve,join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {execFileSync} from "node:child_process";
@@ -12,6 +14,7 @@ describe("isolated K1 boundaries",()=>{
   it("generated Rust matches the full TS role, schema and constant sets",()=>{
     expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-record-signer-contract.mjs"),"--check"])).not.toThrow();
     expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-drain-contract.mjs"),"--check"])).not.toThrow();
+    expect(()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check"])).not.toThrow();
     const rust=readFileSync(join(root,"castle-wall-daemon/src/business_profile/signer_contract.rs"),"utf8");
     const rows=[...rust.matchAll(/\("([^"]+)", "([^"]+)", (\d+)\)/g)].map(match=>({role:match[1],domain:JSON.parse('"'+match[2]+'"'),envelope_max_bytes:Number(match[3])}));
     expect(ROLE_REGISTRY.every(row => Object.isFrozen(row.record_kinds))).toBe(true);
@@ -92,4 +95,16 @@ it("documents the message bound and scalar and signature derivations", () => {
   expect(contract).toContain("SIGNER_PREIMAGE_MAX_BYTES + SIGNER_DOMAIN_MAX_BYTES");
   expect(contract).toContain("ceil(64 * 8 / 6) = 86");
   expect(readFileSync(join(root, "server/src/signing/strict-verifier.ts"), "utf8")).toContain("2^252 + 27742317777372353535851937790883648493");
+});
+
+it("append generator refuses a stale derived bound table",()=>{
+  const directory=mkdtempSync(join(tmpdir(),"append-freshness-")),candidate=join(directory,"constants.rs");
+  try {
+    const generated=readFileSync(join(root,"castle-wall-daemon/src/business_profile/append_contract_constants.rs"),"utf8");
+    writeFileSync(candidate,generated);
+    const check=()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check","--check-file",candidate],{stdio:"pipe"});
+    expect(check).not.toThrow();
+    writeFileSync(candidate,generated.replace(/(CONSERVATIVE_ENVELOPE_MAX_BYTES: usize = )(\d+)/,(_all,prefix,n)=>prefix+(Number(n)+1)));
+    expect(check).toThrow("append contract differs");
+  } finally {unlinkSync(candidate);rmdirSync(directory);}
 });
