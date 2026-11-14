@@ -162,7 +162,7 @@ impl BudgetSnapshot {
         (now_ms < deadline).then_some(deadline)
     }
     /// One snapshot opens at most one window. Preventing re-admission after a
-    /// deadline is the 2e2 caller's obligation.
+    /// deadline is the K1c-2e2 caller's obligation.
     pub fn begin_append(self, now_ms: u64, caller_deadline: u64) -> Option<AppendWindow> {
         let deadline_ms = self.append_deadline(now_ms, caller_deadline)?;
         Some(AppendWindow {

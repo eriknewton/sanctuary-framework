@@ -70,7 +70,7 @@ it.each([
   ["noncritical",(v:Record<string,unknown>)=>{v.critical=false;}],
 ] as const)("refuses business representation %s",async(_name,change)=>{
   const consumer=await create(),v=event();change(v);
-  await expect(consumer.accept(v)).rejects.toThrow();expect(consumer.committedState()).toEqual(first.initial);
+  await expect(consumer.accept(v)).rejects.toThrow(/^BUSINESS_[A-Z_]+$/);expect(consumer.committedState()).toEqual(first.initial);
 });
 it("the real consumer reaches the bounded parser before acceptance",async()=>{
   const spy=vi.spyOn(append,"parseBusinessEvent");
@@ -92,7 +92,7 @@ it("trusted mode preserves legacy calls and never selects raw fallback from a bu
   }});
   await legacy.accept(raw);expect(calls).toBe(1);
   await expect(legacy.accept({...raw,business_envelope:event().business_envelope})).rejects.toThrow(/^BUSINESS_IN_LEGACY$/);expect(calls).toBe(1);
-  await expect((await create()).accept(raw)).rejects.toThrow();expect(calls).toBe(1);
+  await expect((await create()).accept(raw)).rejects.toThrow(/^BUSINESS_[A-Z_]+$/);expect(calls).toBe(1);
 });
 it("forty held sink completions preserve one delivery and do not advance early",async()=>{
   for(let wave=0;wave<40;wave++){
@@ -118,7 +118,7 @@ it("lost acknowledgement retains exact pending bytes and permits identical repla
 });
 it("a substituted sink result cannot advance state or acknowledge delivery",async()=>{
   const sink=new MemorySink();sink.persist=async value=>({...value,identity:{...value.identity,envelope_sha256:"sha256:"+"f".repeat(64)}});
-  const consumer=await create(sink);await expect(consumer.accept(event())).rejects.toThrow();expect(consumer.committedState()).toEqual(first.initial);
+  const consumer=await create(sink);await expect(consumer.accept(event())).rejects.toThrow(/^BUSINESS_[A-Z_]+$/);expect(consumer.committedState()).toEqual(first.initial);
 });
 it("isolated atomic disk sink reads exact bytes back and recovers the last delivery",async()=>{
   const root=mkdtempSync(join(tmpdir(),"business-sink-")),path=join(root,"acceptance.json"),stage=join(root,"staging.json");
@@ -207,7 +207,8 @@ it.each(["malformed","noncanonical","duplicate-key"])("legacy refuses %s seriali
   const consume=vi.fn(async()=>{}),consumer=await createBusinessRecordConsumer({kind:"Legacy",consume});
   const text=Buffer.from(canonicalBytes(event())).toString();
   const serialized=variant==="malformed" ? text.slice(0,-1) : variant==="noncanonical" ? JSON.stringify(event(),null,2) : text.replace('"critical":true','"critical":true,"critical":true');
-  for(const input of [serialized,Buffer.from(serialized),new Uint8Array(Buffer.from(serialized))]) {
+  const reparented=Object.setPrototypeOf(new Uint8Array(Buffer.from(serialized)),Object.prototype);
+  for(const input of [serialized,Buffer.from(serialized),new Uint8Array(Buffer.from(serialized)),reparented]) {
     await expect(consumer.accept(input)).rejects.toThrow(/^BUSINESS_IN_LEGACY$/);
     expect(consume).not.toHaveBeenCalled();
   }
@@ -245,7 +246,7 @@ it("business refuses both distinct strings merged by lossy UTF-8 conversion",asy
   } finally {spy.mockRestore();}
 });
 it("lost ACK followed by a grant change refuses startup without changing storage",async()=>{
-  // 2e2 must reconcile lost-ACK evidence across grant rollover before startup can proceed.
+  // K1c-2e2 must reconcile lost-ACK evidence across grant rollover before startup can proceed.
   const sink=new MemorySink(),persist=sink.persist.bind(sink);
   sink.persist=async value=>{await persist(value);throw Error("lost");};
   const consumer=await create(sink);

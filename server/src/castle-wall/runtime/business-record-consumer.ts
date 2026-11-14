@@ -45,6 +45,8 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
     return {committedState:()=>null,pendingDelivery:()=>null,async accept(event) {
       // Legacy drain callers supply plain objects, never serialized input.
       if (event === null || typeof event !== "object" || (Object.getPrototypeOf(event) !== Object.prototype && Object.getPrototypeOf(event) !== null)) throw Error("BUSINESS_IN_LEGACY");
+      // A byte view or other built-in re-parented onto Object.prototype is still not a plain object.
+      if (ArrayBuffer.isView(event) || Object.prototype.toString.call(event) !== "[object Object]") throw Error("BUSINESS_IN_LEGACY");
       if ("business_envelope" in event && event.business_envelope !== null && event.business_envelope !== undefined) throw Error("BUSINESS_IN_LEGACY");
       await mode.consume(event);
     }};

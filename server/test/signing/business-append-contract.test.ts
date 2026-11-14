@@ -78,6 +78,9 @@ it("lifecycle refuses a table entry with no implemented transition",async()=>{
     return {...original,APPEND_CONTRACT:cloned};
   });
   try {
+    const mocked=await import("../../src/signing/business-append-contract.js");
+    // The injected entry must be visible, or the first table guard would refuse before the default arm.
+    expect(Object.hasOwn(mocked.APPEND_CONTRACT.lifecycle,"Future")).toBe(true);
     const {lifecycleStep:step}=await import("../../src/signing/business-join-lifecycle.js");
     const state=initialLifecycle();expect(step(state,{type:"Future"})).toEqual({accepted:false,state});
   } finally {vi.doUnmock("../../src/signing/business-append-contract.js");vi.resetModules();}
@@ -92,7 +95,7 @@ it("the exported append contract is frozen at every object and array",()=>{
   expect(()=>{(APPEND_CONTRACT.lifecycle as Record<string,string[]>).Future=[];}).toThrow(TypeError);
   expect(()=>{APPEND_CONTRACT.lifecycle.SignAdmitted.push("authority");}).toThrow(TypeError);
 });
-it("the oversized lifecycle envelope isolates the byte cap with a full-width signature",()=>{
+it("the oversized lifecycle envelope keeps a full-width signature and exceeds the byte cap",()=>{
   const record=APPEND_CONTRACT.lifecycle_events["oversize-envelope"].record;
   expect(record.outer.signature).toHaveLength(86);
   expect(canonicalBytes(record)).toHaveLength(4097);

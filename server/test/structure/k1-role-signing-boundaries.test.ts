@@ -111,5 +111,14 @@ it("append generator refuses a stale derived bound table",()=>{
 
 it("Linux CI runs only the append budget ownership doctests",()=>{
   const workflow=readFileSync(join(root,".github/workflows/castle-wall-linux.yml"),"utf8");
-  expect(workflow).toContain("        run: cargo test --locked --doc --features test-isolation business_profile::append_budget\n");
+  // The whole step is pinned through the next step's name, so a dropped count check or an added skip fails here.
+  expect(workflow).toContain([
+    "      - name: Check append budget ownership doctests",
+    "        working-directory: castle-wall-daemon",
+    "        # The grep refuses a run that selected or compiled fewer than both doctests: a filter that matches nothing,",
+    "        # or a fence changed to ignore, would otherwise pass with the ownership proof never checked.",
+    "        run: cargo test --locked --doc --features test-isolation business_profile::append_budget 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 2 passed; 0 failed; 0 ignored;'",
+    "",
+    "      - name: cargo clippy (warnings as errors)",
+  ].join("\n"));
 });
