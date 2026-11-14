@@ -873,9 +873,9 @@ fn serve<P: SignerPort, R: Reconciler>(
             let end = exchange_deadline(clock, u64::MAX)?;
             let binding = WallMainBinding::capture(
                 fd.as_raw_fd(),
-                &config.value,
+                &config.value.wall_policy(),
                 bus,
-                expect,
+                expect.peer_uid,
                 owner,
                 end.clone(),
             )?;

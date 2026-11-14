@@ -1,5 +1,5 @@
 //! The wall imports this codec; must match the K1c-2e wall side.
-use super::{records, signer_client, signer_contract::*, signer_service};
+use super::{frame, records, signer_client, signer_contract::*, signer_service};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -109,21 +109,13 @@ fn payload_length(value: &Value, field: &str, max: usize) -> Result<usize> {
 }
 /// Decode only the direction selected before receipt, retaining the immutable payload slice.
 pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Result<Frame<'a>> {
-    // Directional caps bound work before any JSON is parsed.
-    if packet.len() < LENGTH_BYTES || packet.len() > direction.cap() {
-        return Err(Refusal::Length);
-    }
-    let length = u32::from_be_bytes(
-        packet[..LENGTH_BYTES]
-            .try_into()
-            .map_err(|_| Refusal::Length)?,
-    ) as usize;
-    let end = LENGTH_BYTES.checked_add(length).ok_or(Refusal::Length)?;
-    if length > WRITER_HEADER_MAX_BYTES || end > packet.len() {
-        return Err(Refusal::Length);
-    }
-    let value = signer_service::canonical(&packet[LENGTH_BYTES..end], WRITER_HEADER_MAX_BYTES)
-        .map_err(|_| Refusal::Canonical)?;
+    // Must match frame::split; signer_service retains its frozen canonical prefix behavior.
+    let (value, payload) =
+        frame::split(packet, WRITER_HEADER_MAX_BYTES, direction.cap()).map_err(|e| match e {
+            frame::Refusal::Length => Refusal::Length,
+            frame::Refusal::Canonical => Refusal::Canonical,
+        })?;
+    let end = packet.len() - payload.len();
     if value["v"] != 1 || value["protocol"] != WRITER_PROTOCOL {
         return Err(Refusal::Schema);
     }

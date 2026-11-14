@@ -13,7 +13,7 @@ import { canonicalBytes, ROLE_REGISTRY, ROLE_SIGNATURE_SCHEME } from "../../src/
 import { RelayClient } from "./k1-relay-client.js";
 import type { SigningGrant } from "../../src/signing/record-signer.js";
 // Must match the Linux workflow build steps: one target root contains debug and release artifacts.
-export function nativeBinary(profile: "debug" | "release", name: "signer" | "unlock" | "writer"): string {
+export function nativeBinary(profile: "debug" | "release", name: "signer" | "unlock" | "writer" | "drain"): string {
   const root = process.env.SANCTUARY_K1_TEST_BINARIES;
   if (!root) throw new Error("K1_NATIVE_BINARIES_REQUIRED: set SANCTUARY_K1_TEST_BINARIES to the harness target directory");
   const path = join(root, profile, `sanctuary-business-${name}`);

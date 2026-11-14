@@ -190,17 +190,20 @@ jobs:
       - name: Build dedicated native writer witness harness
         working-directory: castle-wall-daemon
         run: |
-          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer
-          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain
           echo "SANCTUARY_K1_TEST_BINARIES=$RUNNER_TEMP/k1-target" >> "$GITHUB_ENV"
 
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
-        # 20 = about 6x the longest observed run of this step (165 to 188 s over
-        # the last seven runs, 2026-09-27), leaving room for a cold-cache rebuild.
+        # 35 = this step's 13.4 min on main (run 43545385001, 2026-11-14) plus the
+        # 5.5 min K1c-2d2 drain suite, about 1.8x that 19 min for a cold-cache
+        # rebuild. The earlier 20 (6x the 165 to 188 s observed 2026-09-27) was
+        # outgrown as the business-profile suites landed: a run that times out
+        # here reads as a failure with no failing test in the log.
         # Without a bound a hung or OOM-thrashing suite holds the job to the
         # 360-minute default and the leftover-state refusal below never runs.
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: |
           # Run all tests including Linux-gated integration tests.
           # NFQUEUE and nftables tests need root.
@@ -242,7 +245,7 @@ jobs:
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
-                       linux_business_profile_selection linux_business_drain_store linux_business_signer_client linux_business_writer_protocol linux_business_writer_peer linux_business_writer_loss linux_business_writer_unit linux_business_writer_bus_replies confined_agent_id test_isolation_gate; do
+                       linux_business_profile_selection linux_business_drain_store linux_business_drain linux_business_reconciliation linux_business_signer_client linux_business_writer_protocol linux_business_writer_peer linux_business_writer_loss linux_business_writer_unit linux_business_writer_bus_replies confined_agent_id test_isolation_gate; do
           # suite-list-end: body through `done` must match WORKFLOW_SUITE_RAN_LOOP_BODY in castle-wall-daemon/tests/test_isolation_gate.rs
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"
@@ -252,7 +255,10 @@ jobs:
           # Every suite that ran must also have REPORTED a result line. A binary
           # that aborted (SIGSEGV, a panic in a harness thread, an OOM kill) prints
           # `Running tests/<suite>.rs` and then dies without `test result:`, which
-          # the presence-grep alone would accept.
+          # the presence-grep alone would accept. A test that runs another libtest
+          # binary as a child must discard that child's stdout, or its summary adds
+          # an extra result line here (must match the transport driver spawn in
+          # castle-wall-daemon/tests/linux_business_drain.rs).
           started=$(grep -cE "^[[:space:]]*Running " cargo-test.plain.log || true)
           finished=$(grep -cE "^test result: ok\." cargo-test.plain.log || true)
           if [ "$started" != "$finished" ]; then

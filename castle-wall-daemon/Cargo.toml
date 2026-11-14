@@ -262,3 +262,22 @@ required-features = ["test-isolation", "user-manager-witness"]
 name = "linux_business_drain_store"
 path = "tests/linux_business_drain_store.rs"
 required-features = ["test-isolation"]
+
+[[bin]]
+name = "sanctuary-business-drain"
+path = "src/bin/sanctuary-business-drain.rs"
+
+[[bin]]
+name = "drain-actor"
+path = "tests/helpers/drain-actor.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_business_drain"
+path = "tests/linux_business_drain.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_business_reconciliation"
+path = "tests/linux_business_reconciliation.rs"
+required-features = ["test-isolation"]
