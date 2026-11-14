@@ -1,10 +1,17 @@
+// fail-before-exempt: metadata reader and child deadline witnesses exercise the harness and driver outside server/src.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+
+// Observe the actual child options while still spawning and reaping every child.
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
 
 const SERVER = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const DRIVER = 'server/scripts/promise-hygiene/run.mjs';
@@ -30,7 +37,8 @@ let environment: NodeJS.ProcessEnv;
 const journal = new Map<string, { text?: Buffer; link?: string }>();
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const read = (name: string) => readFileSync(join(root, name), 'utf8');
-const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' } }).trim();
 function snapshot(file: string): { text?: Buffer; link?: string } {
   // One call decides link, file or absent; no separate existence check that could go stale.
   try { return { link: readlinkSync(file) }; } catch (error) {
@@ -94,7 +102,7 @@ function refuse(reason: string) {
 }
 function commit(message = 'fixture edit') {
   git('add', '-A');
-  git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', message);
+  git('commit', '--allow-empty', '-qm', message);
   return git('rev-parse', 'HEAD');
 }
 function anchor(message = 'fixture seed') {
@@ -105,13 +113,13 @@ function anchor(message = 'fixture seed') {
   put(POLICY, read(POLICY).replace(/SEED_DIGEST = '[a-f0-9]+'/u, `SEED_DIGEST = '${hash(JSON.stringify(JSON.parse(read(BASELINE))))}'`)
     .replace(/SEED_SOURCE_DIGEST = '[a-f0-9]+'/u, `SEED_SOURCE_DIGEST = '${source}'`));
   git('add', '-A');
-  const initial = git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit-tree', git('write-tree'), '-m', message);
+  const initial = git('commit-tree', git('write-tree'), '-m', message);
   git('update-ref', 'HEAD', initial); return initial;
 }
 function pr(labeled = false, base = seedCommit) {
   const candidate = commit();
   const tree = git('rev-parse', 'HEAD^{tree}');
-  const merge = git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit-tree', tree, '-p', base, '-p', candidate, '-m', 'synthetic merge');
+  const merge = git('commit-tree', tree, '-p', base, '-p', candidate, '-m', 'synthetic merge');
   git('update-ref', 'HEAD', merge);
   put('event.json', JSON.stringify({ pull_request: { base: { sha: base }, labels: labeled ? [{ name: LABEL }] : [] } }));
   environment.GITHUB_ACTIONS = 'true'; environment.GITHUB_EVENT_NAME = 'pull_request'; environment.GITHUB_EVENT_PATH = join(root, 'event.json');
@@ -278,7 +286,7 @@ describe('trusted transitions', () => {
   for (const labeled of [false, true]) fixtureCase(`requires external authorization to initialize with label ${labeled}`, () => {
     git('update-index', '--force-remove', BASELINE);
     const tree = git('write-tree');
-    const emptyBase = git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit-tree', tree, '-m', 'before checker');
+    const emptyBase = git('commit-tree', tree, '-m', 'before checker');
     pr(labeled, emptyBase);
     if (labeled) accept('INITIAL_SEED'); else refuse('initialization requires reanchor label');
   });
@@ -418,4 +426,118 @@ describe('callback and clause identities', () => {
   fixtureCase('enforces bounded source inventory', () => { put(POLICY, read(POLICY).replace('MAX_SOURCE_FILES = 4096', 'MAX_SOURCE_FILES = 1')); refuse('source manifest size refused'); });
   fixtureCase('enforces bounded baseline inventory', () => { put(POLICY, read(POLICY).replace('MAX_BASELINE_ENTRIES = 16384', 'MAX_BASELINE_ENTRIES = 1')); refuse('entry cap'); });
   fixtureCase('keeps callback index and invocation kind in the identity', () => { expect(read(FINGERPRINT)).toContain('callback.parent.arguments.indexOf(callback)'); expect(read(FINGERPRINT)).toContain("? 'new' : 'call'"); });
+});
+
+// Execute the exact private helper in a child so a blocking open has a reaped deadline.
+// Wrappers schedule real filesystem changes and count actual reads, never fabricated stats.
+function metadataWitness(setup: string, shortReads = false, name = 'metadata-witness', timeout = COMMAND_TIMEOUT) {
+  const script = `
+    import * as fs from 'node:fs';
+    import path from 'node:path';
+    import { MAX_METADATA_BYTES } from './${POLICY}';
+    const source = fs.readFileSync('./${DRIVER}', 'utf8');
+    const body = source.slice(source.indexOf('function insist('), source.indexOf('function readJson('));
+    const metadataName = ${JSON.stringify(name)};
+    const filename = path.resolve(metadataName);
+    const original = Buffer.from('original bytes');
+    let afterStat = () => {};
+    let bytesRead = 0, descriptor, closed = false, statSize;
+    const bindings = {
+      constants: fs.constants, path, MAX_METADATA_BYTES,
+      openSync(...args) { descriptor = fs.openSync(...args); return descriptor; },
+      fstatSync(fd) { const stat = fs.fstatSync(fd); statSize = stat.size; afterStat(); return stat; },
+      readFileSync(...args) { const bytes = fs.readFileSync(...args); bytesRead += bytes.length; return bytes; },
+      readSync(fd, buffer, offset, length, position) {
+        const count = fs.readSync(fd, buffer, offset, ${shortReads ? 'Math.min(length, 3)' : 'length'}, position);
+        bytesRead += count; return count;
+      },
+      closeSync(fd) { fs.closeSync(fd); closed = true; }
+    };
+    ${setup}
+    const readMetadata = new Function(...Object.keys(bindings), body + '; return readMetadata;')(...Object.values(bindings));
+    let value, error;
+    try { value = readMetadata(process.cwd(), metadataName).toString('hex'); }
+    catch (caught) { error = caught.message; }
+    let descriptorClosed = false;
+    if (descriptor !== undefined) {
+      try { fs.fstatSync(descriptor); } catch (caught) { descriptorClosed = caught.code === 'EBADF'; }
+    }
+    console.log(JSON.stringify({value, error, bytesRead, statSize, closed, descriptorClosed, cap: MAX_METADATA_BYTES}));
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: root, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: BUFFER_BYTES,
+  });
+  expect(result.error, `${result.stdout}${result.stderr}`).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+  const measured = JSON.parse(result.stdout);
+  expect(measured.closed).toBe(true);
+  expect(measured.descriptorClosed).toBe(true);
+  return measured;
+}
+
+describe.skipIf(process.platform !== 'linux')('bounded metadata descriptor reads', () => {
+  fixtureCase('gives ordinary metadata children the harness 60 second budget', () => {
+    remember('metadata-witness');
+    metadataWitness('fs.writeFileSync(filename, original);');
+    expect(vi.mocked(spawnSync).mock.lastCall?.[2]).toMatchObject({
+      timeout: COMMAND_TIMEOUT, killSignal: 'SIGKILL',
+    });
+  });
+  fixtureCase('allows a non-FIFO metadata child to finish beyond 1500 ms', () => {
+    remember('metadata-witness');
+    const measured = metadataWitness(`
+      fs.writeFileSync(filename, original);
+      // Deliberately cross the FIFO deadline without depending on runner load.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1700);
+    `);
+    expect(measured.error).toBeUndefined();
+    expect(measured.value).toBe(Buffer.from('original bytes').toString('hex'));
+  });
+  fixtureCase('bounds actual bytes read when metadata grows after real fstat', () => {
+    remember('metadata-witness');
+    const measured = metadataWitness(`
+      fs.writeFileSync(filename, '{}');
+      afterStat = () => fs.truncateSync(filename, MAX_METADATA_BYTES * 2);
+    `);
+    expect(measured.statSize).toBe(2);
+    expect(measured.error).toBe('metadata size refused');
+    expect(measured.bytesRead).toBeLessThanOrEqual(measured.cap + 1);
+    expect(measured.bytesRead).toBe(measured.cap + 1);
+  });
+  fixtureCase('refuses a FIFO without a writer by type before the deadline', () => {
+    remember('metadata-witness');
+    execFileSync('mkfifo', [join(root, 'metadata-witness')]);
+    // Only the writerless FIFO needs a short deadline to catch a blocking open; 10 s leaves room for a slow child start.
+    const measured = metadataWitness('', false, 'metadata-witness', 10000);
+    expect(vi.mocked(spawnSync).mock.lastCall?.[2]).toMatchObject({ timeout: 10000, killSignal: 'SIGKILL' });
+    expect(measured.error).toBe('metadata type refused: metadata-witness');
+    expect(measured.bytesRead).toBe(0);
+  });
+  fixtureCase('refuses a directory with the metadata type label', () => {
+    const measured = metadataWitness("fs.mkdirSync(filename, {recursive: true});", false, 'metadata-directory');
+    expect(measured.error).toBe('metadata type refused: metadata-directory');
+    expect(measured.bytesRead).toBe(0);
+    // Leave the empty fixture directory in place, as elsewhere in this harness.
+  });
+  for (const replacement of ['rename', 'symlink']) fixtureCase(`reads original bytes after a scheduled ${replacement} swap`, () => {
+    const name = 'metadata-witness';
+    remember(name); remember(name + '.original'); remember(name + '.replacement');
+    const measured = metadataWitness(`
+      fs.writeFileSync(filename, original);
+      fs.writeFileSync(filename + '.replacement', 'replacement bytes');
+      afterStat = () => {
+        fs.renameSync(filename, filename + '.original');
+        ${replacement === 'rename' ? "fs.renameSync(filename + '.replacement', filename);" : "fs.symlinkSync(filename + '.replacement', filename);"}
+      };
+    `);
+    expect(measured.error).toBeUndefined();
+    expect(measured.value).toBe(Buffer.from('original bytes').toString('hex'));
+  });
+  fixtureCase('preserves all metadata bytes across short descriptor reads', () => {
+    remember('metadata-witness');
+    const measured = metadataWitness('fs.writeFileSync(filename, original);', true);
+    expect(measured.error).toBeUndefined();
+    expect(measured.value).toBe(Buffer.from('original bytes').toString('hex'));
+    expect(measured.bytesRead).toBe(Buffer.byteLength('original bytes'));
+  });
 });

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Focused parser/decision tests; real dpkg/systemd acceptance runs in CI."""
+# // fail-before-exempt: planted Rust source copies exercise the source guard outside server/src.
 
 import json
 import io
@@ -359,11 +360,12 @@ class GuardTests(unittest.TestCase):
 
     def constants_copy(self, mutate=None):
         crate = Path(__file__).resolve().parent.parent.parent
-        with tempfile.TemporaryDirectory() as tmp:
-            copy = Path(tmp) / "castle-wall-daemon"
-            for rel in ("packaging/ubuntu/assert-source-constants.py", "packaging/ubuntu/lifecycle-guard.py",
-                        "systemd/sanctuary-castle-wall.service", "systemd/sanctuary-agent@.service",
-                        "src/config.rs", "src/ownership_journal.rs", "src/runtime_lock.rs", "src/nftables.rs"):
+        files = ("packaging/ubuntu/assert-source-constants.py", "packaging/ubuntu/lifecycle-guard.py",
+                 "systemd/sanctuary-castle-wall.service", "systemd/sanctuary-agent@.service",
+                 "src/config.rs", "src/ownership_journal.rs", "src/runtime_lock.rs", "src/nftables.rs")
+        with tempfile.TemporaryDirectory(prefix="source-constants-") as temporary:
+            copy = Path(temporary) / "castle-wall-daemon"
+            for rel in files:
                 (copy / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(crate / rel, copy / rel)
             if mutate:
@@ -407,6 +409,214 @@ class GuardTests(unittest.TestCase):
                 result = self.constants_copy(mutate)
                 self.assertNotEqual(result.returncode, 0, f"{name} was accepted")
                 self.assertIn(message, result.stderr)
+
+    def test_source_constants_active_rust(self):
+        for directory, root, prefix in (("runtime_dir", "RAW_RUNTIME_ROOT", "/run"),
+                                        ("state_dir", "RAW_STATE_ROOT", "/var/lib")):
+            derivation = f"let {directory} = PathBuf::from({root}).join(&fortress_id);"
+            declaration = f'pub const {root}: &str = "{prefix}/sanctuary";'
+            cases = {
+                "raw constant shadow": (derivation, f'const r#{root}: &str = "/tmp/wrong";\n        ' + derivation),
+                "tuple shadow": (derivation, derivation + f'\n        let ({directory},) = ({directory}.join("/tmp/wrong"),);'),
+                "commented constant": (declaration, '/*\n' + declaration + f'\n*/\npub const r#{root}: &str = "/tmp/wrong";'),
+                "commented derivation": (derivation, '/*\n' + derivation + f'\n*/\n        let ({directory},) = (PathBuf::from("/tmp/wrong"),);'),
+                "struct pattern": (derivation, derivation + f'\n        let Paths {{ {directory}, .. }} = paths;'),
+                "renamed struct pattern": (derivation, derivation + f'\n        let Paths {{ path: {directory}, .. }} = paths;'),
+                "slice pattern": (derivation, derivation + f'\n        let [{directory}] = paths;'),
+                "if let": (derivation, derivation + f'\n        if let Some({directory}) = paths {{ consume({directory}); }}'),
+                "plain if let": (derivation, 'if\n        ' + derivation[:-1] + ' { }'),
+                "match arm": (derivation, derivation + f'\n        match paths {{ Some({directory}) => consume({directory}), _ => () }}'),
+                "closure parameter": (derivation, derivation + f'\n        let closure = |{directory}| {directory};'),
+                "raw binding": (derivation, derivation + f'\n        let r#{directory} = PathBuf::from("/tmp/wrong");'),
+                "ordinary constant shadow": (derivation, f'const {root}: &str = "/tmp/wrong";\n        ' + derivation),
+                "cfg duplicate": (declaration, declaration + '\n#[cfg(test)]\n' + declaration),
+                "line commented derivation": (derivation, '// ' + derivation),
+            }
+            for name, (old, new) in cases.items():
+                with self.subTest(directory=directory, name=name):
+                    result = self.constants_copy(lambda c: self.replace_once(c / "src/config.rs", old, new))
+                    self.assertNotEqual(result.returncode, 0, f"{name} was accepted")
+                    self.assertIn("guard source parity refused:", result.stderr)
+            harmless = [
+                f"// let {directory} holds the fortress directory.\n        ",
+                f"/* outer /* nested */ let {directory}; const {root}: &str = \"/tmp/wrong\"; */\n        ",
+                f'let note = "// /* let {directory}; const {root} */";\n        ',
+                f'let note = r###"/* let {directory}; \" // const {root}"###;\n        ',
+                "let slash = '/'; let quote = '\\''; let star = '*';\n        ",
+            ]
+            for note in harmless:
+                with self.subTest(directory=directory, harmless=note):
+                    result = self.constants_copy(lambda c: self.replace_once(c / "src/config.rs", derivation, note + derivation))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            with self.subTest(directory=directory, name="raw identifiers are equivalent"):
+                def raw_identifiers(c):
+                    config = c / "src/config.rs"
+                    config.write_text(re.sub(r"\b(" + directory + "|" + root + r")\b", r"r#\1", config.read_text()))
+                result = self.constants_copy(raw_identifiers)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assert_constants_config(self, text, accepted):
+        result = self.constants_copy(lambda c: (c / "src/config.rs").write_text(text))
+        if accepted:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0, "planted Rust was accepted")
+            self.assertIn("guard source parity refused:", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def source_config(self):
+        return (Path(__file__).resolve().parent.parent.parent / "src/config.rs").read_text()
+
+    def test_source_constants_r1_unterminated_literals_and_declarations(self):
+        original = self.source_config()
+        for literal in ('"', 'b"', 'c"', "'", "b'", '"dangling\\', "'\\", "'unclosed", "b'unclosed"):
+            with self.subTest(literal=literal):
+                self.assert_constants_config(original + "\nconst UNUSED: &str = " + literal, False)
+        for name in ("RAW_RUNTIME_ROOT", "RAW_STATE_ROOT"):
+            for tail in (": &str =", ': &str = "unfinished', ': &str = "/run/sanctuary"'):
+                with self.subTest(name=name, tail=tail):
+                    # Keep earlier checks intact, then truncate at this declaration.
+                    start = original.index("pub const " + name)
+                    self.assert_constants_config(original[:start] + "pub const " + name + tail, False)
+        self.assert_constants_config(original + "\nfn lifetime<'a>(x: &'a str) -> &'a str { 'label: loop { break 'label; } x }\n", True)
+
+    def test_source_constants_r2_non_ascii_only_in_comments_and_literals(self):
+        original = self.source_config()
+        for codepoint in (0x200e, 0x200f, 0x85, 0x2028, 0x2029, 0xe9):
+            char = chr(codepoint)
+            for name in ("RAW_RUNTIME_ROOT", "RAW_STATE_ROOT"):
+                with self.subTest(codepoint=hex(codepoint), name=name):
+                    self.assert_constants_config(original + f'\nconst{char}{name}: &str = "/tmp/wrong";\n', False)
+            with self.subTest(codepoint=hex(codepoint), position="unrelated code"):
+                self.assert_constants_config(original + f"\nfn unused{char}() {{}}\n", False)
+            with self.subTest(codepoint=hex(codepoint), position="comments and literals"):
+                self.assert_constants_config(original + f'''\n// {char}
+/* outer /* {char} */ comment */
+const NOTE: &str = "{char}";
+const RAW_NOTE: &str = r###"{char}"###;
+const LETTER: char = '{char}';
+''', True)
+
+    @staticmethod
+    def binding_plants(name):
+        return {
+            "const": f'const {name}: &str = "/tmp/wrong";',
+            "static": f'static {name}: &str = "/tmp/wrong";',
+            "static mut": f'static mut {name}: &str = "/tmp/wrong";',
+            "let mut": f"let mut {name} = wrong;",
+            "tuple": f"let (_, {name}) = wrong;",
+            "struct shorthand": f"let Paths {{ {name}, .. }} = wrong;",
+            "struct renamed": f"let Paths {{ path: {name}, .. }} = wrong;",
+            "slice": f"let [_, {name}, ..] = wrong;",
+            "ref at": f"let ref {name} @ _ = wrong;",
+            "uninitialized": f"let ({name},);",
+            "if let": f"if let Some({name}) = wrong {{}}",
+            "while let": f"while let Some({name}) = wrong {{}}",
+            "struct": f"struct {name};",
+            "enum": f"enum {name} {{ Wrong }}",
+            "union": f"union {name} {{ wrong: u8 }}",
+            "type": f"type {name} = u8;",
+            "fn": f"fn {name}() {{}}",
+            "mod": f"mod {name} {{}}",
+            "trait": f"trait {name} {{}}",
+            "macro_rules": f"macro_rules! {name} {{ () => {{}}; }}",
+            "use alias": f"use std::env::consts::OS as {name};",
+            "grouped use alias": f"use std::env::consts::{{OS as {name}}};",
+            "function parameter": f"fn helper({name}: &str) {{}}",
+            "function tuple parameter": f"fn helper((_, {name}): (u8, &str)) {{}}",
+            "function struct parameter": f"fn helper(Paths {{ path: {name} }}: Paths) {{}}",
+            "function slice parameter": f"fn helper([{name}]: [u8; 1]) {{}}",
+            "function qualified pattern": f"fn helper(paths::One({name}): Paths) {{}}",
+            "closure": f"let closure = |{name}| 0;",
+            "closure tuple": f"let closure = move |(_, {name}): (u8, &str)| 0;",
+            "closure struct": f"let closure = |Paths {{ path: {name} }}| 0;",
+            "closure qualified pattern": f"let closure = |paths::One({name})| 0;",
+            "closure field": f"let holder = Holder {{ callback: |{name}| 0 }};",
+            "nested empty closure": f"let closure = || |{name}| 0;",
+            "nested closure": f"let closure = |x| |{name}| 0;",
+            "match": f"match wrong {{ Some({name}) => (), _ => () }}",
+            "match guarded": f"match wrong {{ _ => (), Some({name}) if ready => (), _ => () }}",
+            "match after block": f"match wrong {{ None => {{}} Some({name}) => (), _ => () }}",
+            "match after if block": f"match wrong {{ None => if ready {{}} else {{}} Some({name}) => (), _ => () }}",
+            "match struct guarded": f"match wrong {{ Paths {{ path: {name} }} if ready => (), _ => () }}",
+            "match slice": f"match wrong {{ [{name}, ..] => (), _ => () }}",
+            "match alternative": f"match wrong {{ Some({name}) | Other({name}) => (), _ => () }}",
+        }
+
+    def test_source_constants_r3_root_bindings(self):
+        original = self.source_config()
+        anchor = "let fortress_id = fortress_id.into();"
+        for name in ("RAW_RUNTIME_ROOT", "RAW_STATE_ROOT"):
+            for form, plant in self.binding_plants(name).items():
+                with self.subTest(name=name, form=form):
+                    self.assert_constants_config(original.replace(anchor, anchor + "\n" + plant), False)
+            with self.subTest(name=name, form="ordinary uses"):
+                self.assert_constants_config(original.replace(anchor, anchor + f'''
+let copy = {name}; consume(&{name}); let path = {name}.to_string();
+let closure = || {name}; let bits = flag | {name};
+match value {{ _ if {name}.is_empty() => consume({name}), _ => () }}
+'''), True)
+
+    def test_source_constants_r4_directory_function_scope(self):
+        original = self.source_config()
+        for name, root in (("runtime_dir", "RAW_RUNTIME_ROOT"), ("state_dir", "RAW_STATE_ROOT")):
+            derivation = f"let {name} = PathBuf::from({root}).join(&fortress_id);"
+            accepted = {
+                "borrow": f"let _ = &{name};",
+                "as_path": f"let _ = {name}.as_path();",
+                "argument": f"consume(&{name});",
+                "closure capture": f"let capture = || consume(&{name});",
+                "match body": f"match value {{ _ => consume(&{name}) }}",
+                "match guard": f"match value {{ _ if {name}.exists() => (), _ => () }}",
+                "match block guard": f"match value {{ _ if {{ {name}.exists() }} && ready => (), _ => () }}",
+            }
+            for form, plant in accepted.items():
+                with self.subTest(name=name, form=form):
+                    self.assert_constants_config(original.replace(derivation, derivation + "\n" + plant), True)
+            with self.subTest(name=name, form="attributes"):
+                self.assert_constants_config(original.replace(derivation, "#[allow(unused_variables)]\n#[allow(unused)] " + derivation), True)
+            for form, plant in {
+                "other parameter": f"fn helper({name}: &std::path::Path) {{ consume({name}); }}",
+                "other local": f"fn helper() {{ let {name} = wrong; consume({name}); }}",
+                "other identical derivation": f"fn helper(fortress_id: String) {{ {derivation} }}",
+                "nested other function": f"fn helper({name}: &str) {{ let {name} = wrong; }}",
+            }.items():
+                with self.subTest(name=name, form=form):
+                    config = original.replace(derivation, derivation + plant) if form.startswith("nested") else original + plant
+                    self.assert_constants_config(config, True)
+            for form, plant in self.binding_plants(name).items():
+                if form.startswith("function"):
+                    continue  # A nested function's parameters belong to that other function.
+                with self.subTest(name=name, shadow=form):
+                    self.assert_constants_config(original.replace(derivation, derivation + "\n" + plant), False)
+            with self.subTest(name=name, shadow="derivation function parameter"):
+                self.assert_constants_config(original.replace("fortress_id: impl Into<String>",
+                                                            f"fortress_id: impl Into<String>, {name}: &str"), False)
+
+    def test_source_constants_r6_copy_cleanup(self):
+        for outcome in ("success", "refusal", "mutation error", "child error"):
+            with self.subTest(outcome=outcome):
+                roots = []
+
+                def mutate(copy):
+                    roots.append(copy.parent)
+                    if outcome == "refusal":
+                        (copy / "src/config.rs").write_text("")
+                    if outcome == "mutation error":
+                        raise RuntimeError("mutation witness")
+
+                if outcome == "mutation error":
+                    with self.assertRaisesRegex(RuntimeError, "mutation witness"):
+                        self.constants_copy(mutate)
+                elif outcome == "child error":
+                    with patch.object(subprocess, "run", side_effect=OSError("child witness")):
+                        with self.assertRaisesRegex(OSError, "child witness"):
+                            self.constants_copy(mutate)
+                else:
+                    result = self.constants_copy(mutate)
+                    self.assertEqual(result.returncode == 0, outcome == "success")
+                self.assertEqual(len(roots), 1)
+                self.assertFalse(roots[0].exists(), f"temporary tree leaked after {outcome}: {roots[0]}")
 
     # ---- TB11: the archive assertion over a synthetic package --------------
 
