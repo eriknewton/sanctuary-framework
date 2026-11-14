@@ -1422,7 +1422,10 @@ fn transport_rights_truncation_and_passed_socket_refuse_before_decode() {
     let _guard = isolation::guard();
     for mode in ["rights", "truncated", "passed", "duplicates"] {
         let mut f = Fixture::new();
-        let executable = std::env::current_exe().unwrap();
+        // In root CI the driver execs as capability-free root, which cannot search a 0750 runner home, so it runs a private copy outside the build tree.
+        let copy_dir = tempfile::TempDir::new().unwrap();
+        let executable = copy_dir.path().join("drain-transport-driver");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let mut config: Value =
             serde_json::from_slice(&fs::read(f.root.join("config.json")).unwrap()).unwrap();
         if mode != "duplicates" {
