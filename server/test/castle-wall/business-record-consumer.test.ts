@@ -1,4 +1,6 @@
 // fail-before-exempt: shared native records, legacy verification and an isolated durable sink exercise the new business consumer.
+// W-TS-SCHEMA
+// W-ENVELOPE-CAP
 import {it, expect, vi} from "vitest";
 import {ed25519} from "@noble/curves/ed25519";
 import {producerSigningBytes, verifyProducerSignature} from "../../src/castle-wall/runtime/producer-signature.js";

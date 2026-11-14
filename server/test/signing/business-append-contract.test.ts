@@ -1,4 +1,7 @@
 // fail-before-exempt: shared native corpus and append shape parity exercise new pure foundations.
+// W-PROVENANCE
+// W-ENVELOPE-CAP
+// W-JOIN-LIFECYCLE
 import {it, expect} from "vitest";
 import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
 import {APPEND_CONTRACT, appendShape, envelopeSizeAdmitted, parseBusinessEnvelope, parseBusinessEvent, parseBusinessEventBytes, deliveryIdentity} from "../../src/signing/business-append-contract.js";

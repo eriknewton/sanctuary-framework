@@ -1,4 +1,8 @@
 // fail-before-exempt: shared append contracts and native budget boundaries are new isolated entrypoints.
+// W-PROVENANCE
+// W-LEASE-ADMISSION
+// W-ENVELOPE-CAP
+// W-JOIN-LIFECYCLE
 #![cfg(target_os = "linux")]
 mod isolation;
 use castle_wall_daemon::business_profile::{
