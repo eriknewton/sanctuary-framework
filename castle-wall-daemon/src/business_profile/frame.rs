@@ -6,6 +6,20 @@ pub enum Refusal {
     Length,
     Canonical,
 }
+/// Strict canonical JSON shared by frame headers and drain payloads.
+/// The frozen signer helper remains the independent parity control.
+pub fn canonical(bytes: &[u8], cap: usize) -> Result<Value, Refusal> {
+    let value = crate::smb::strict_json::parse(bytes, cap).map_err(|_| Refusal::Canonical)?;
+    // Preserve duplicate evidence and reject alternate encoding before normalization.
+    if crate::smb::jcs::encode(&value)
+        .map_err(|_| Refusal::Canonical)?
+        .as_bytes()
+        != bytes
+    {
+        return Err(Refusal::Canonical);
+    }
+    serde_json::from_slice(bytes).map_err(|_| Refusal::Canonical)
+}
 /// Must match writer_protocol::decode and the retained prefix in signer_service::decode.
 pub fn split(
     packet: &[u8],
@@ -25,20 +39,7 @@ pub fn split(
         return Err(Refusal::Length);
     }
     let bytes = &packet[LENGTH_BYTES..end];
-    let value =
-        crate::smb::strict_json::parse(bytes, header_max).map_err(|_| Refusal::Canonical)?;
-    // Exact canonical bytes reject duplicate keys and alternate encodings before either protocol interprets authority.
-    if crate::smb::jcs::encode(&value)
-        .map_err(|_| Refusal::Canonical)?
-        .as_bytes()
-        != bytes
-    {
-        return Err(Refusal::Canonical);
-    }
-    Ok((
-        serde_json::from_slice(bytes).map_err(|_| Refusal::Canonical)?,
-        &packet[end..],
-    ))
+    Ok((canonical(bytes, header_max)?, &packet[end..]))
 }
 
 #[cfg(test)]

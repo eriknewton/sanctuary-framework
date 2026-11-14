@@ -26,6 +26,22 @@ fn shared_identity_and_lifecycle_vectors() {
             row["accepted"].as_bool().unwrap()
         );
     }
+    for row in data["ack_vectors"].as_array().unwrap() {
+        assert_eq!(
+            contract::shape("ack", &row["value"]),
+            row["accepted"].as_bool().unwrap(),
+            "{}",
+            row["id"]
+        );
+    }
+    for row in data["event_vectors"].as_array().unwrap() {
+        assert_eq!(
+            contract::event(&row["value"]).is_some(),
+            row["accepted"].as_bool().unwrap(),
+            "{}",
+            row["id"]
+        );
+    }
     for row in data["lifecycle_vectors"].as_array().unwrap() {
         let mut state = join_lifecycle::initial();
         for step in row["steps"].as_array().unwrap() {
@@ -48,7 +64,9 @@ fn shared_identity_and_lifecycle_vectors() {
 #[test]
 fn envelope_caps_and_provenance_boundary() {
     assert_eq!(contract::PRODUCER_ENVELOPE_MAX_BYTES, 4096);
-    assert!(contract::ENVELOPE_BRANCH_BOUNDS.iter().all(|bound| *bound <= contract::PRODUCER_ENVELOPE_MAX_BYTES));
+    assert!(contract::ENVELOPE_BRANCH_BOUNDS
+        .iter()
+        .all(|bound| *bound <= contract::PRODUCER_ENVELOPE_MAX_BYTES));
     assert_eq!(
         contract::ENVELOPE_BRANCH_BOUNDS.len(),
         serde_json::from_str::<Value>(records_schema::SCHEMA_AST).unwrap()["record"]["branches"]
@@ -90,17 +108,18 @@ fn three_admission_predicates_and_absolute_completion() {
     assert!(finish_admitted(FINISH_MS + seal + 1, seal));
     assert!(admit(input(300000, FINISH_MS + seal), 13).is_none());
     assert!(admit(input(300000, FINISH_MS + seal + 1), 13).is_some());
-    assert!(admit(input(299999, 300000), 13).is_none());
-    assert!(admit(input(300000, 300000), 13).is_some());
-    assert!(admit(input(300001, 300000), 13).is_some());
-    assert!(admit(input(300000, 300000), 14).is_none());
-    let snap = admit(input(300000, 300000), 13).unwrap();
-    assert_eq!(snap.append_deadline(239000, 300000), Some(240000));
-    let mut late = input(300000, 300000);
-    late.observed_ms = 239001;
-    assert!(snap.recheck(late, 999, 240000));
+    assert!(admit(input(299999, 240000), 13).is_none());
+    assert!(admit(input(300000, 240000), 13).is_some());
+    assert!(admit(input(300001, 240000), 13).is_some());
+    // Isolate the cap with all remaining budget predicates satisfied.
+    assert!(admit(input(304000, 240000), 14).is_none());
+    let snap = admit(input(300000, 240000), 13).unwrap();
+    assert_eq!(snap.append_deadline(179000, 240000), Some(180000));
+    let mut late = input(300000, 240000);
+    late.observed_ms = 179001;
+    assert!(snap.recheck(late, 999, 180000));
     late.producer.grant = [2; 16];
-    assert!(!snap.recheck(late, 999, 240000));
+    assert!(!snap.recheck(late, 999, 180000));
     assert_eq!(snap.append_deadline(0, 4000), Some(4000));
     let mut cuts = CutObligation::default();
     assert!(cuts.retain([1; 16], 1));

@@ -2,7 +2,7 @@ import {z} from "zod";
 import {canonicalBytes} from "../../signing/contract.js";
 import {BUSINESS_PIN_FIELDS, verifyIndexedRecord, type BusinessPin, type OuterRecordIndex} from "../../linux-business/producer-custody.js";
 import {joinStateValid, verifyBusinessJoin, type JoinState, type JoinRecord} from "../../signing/record-joins.js";
-import {parseBusinessEvent, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-contract.js";
+import {envelopeSizeAdmitted, parseBusinessEvent, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-contract.js";
 
 export interface DurableBusinessAcceptance {
   envelope: Uint8Array;
@@ -25,9 +25,9 @@ const sameEnvelope = (a: Uint8Array,b: Uint8Array) => Buffer.from(a).equals(Buff
 const copy = (value: DurableBusinessAcceptance): DurableBusinessAcceptance => structuredClone(value);
 const equalAcceptance = (a: DurableBusinessAcceptance,b: DurableBusinessAcceptance) => sameEnvelope(a.envelope,b.envelope) && equal(a.identity,b.identity) && equal(a.projection,b.projection) && equal(a.checkpoint,b.checkpoint);
 /** Mode and pins are supplied by trusted composition, never selected by event fields. */
-export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<{accept(event: unknown): Promise<BusinessDeliveryAck | void>; committedState(): JoinState | null}> {
+export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<{accept(event: unknown): Promise<BusinessDeliveryAck | void>; committedState(): JoinState | null; pendingDelivery(): BusinessDeliveryIdentity | null}> {
   if (mode.kind === "Legacy") {
-    return {committedState:()=>null,async accept(event) {
+    return {committedState:()=>null,pendingDelivery:()=>null,async accept(event) {
       if (event !== null && typeof event === "object" && "business_envelope" in event && event.business_envelope !== null && event.business_envelope !== undefined) throw Error("BUSINESS_IN_LEGACY");
       await mode.consume(event);
     }};
@@ -41,6 +41,7 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
     return verifyIndexedRecord(canonicalBytes(record.body),record.outer.signature as string,pin,record.outer as unknown as OuterRecordIndex,z.unknown(),record.body.record_kind as string);
   }
   function validateStored(stored: DurableBusinessAcceptance): void {
+    if (!envelopeSizeAdmitted(stored.envelope.byteLength)) throw Error("BUSINESS_DURABLE_STATE");
     const {record,bytes}=parseBusinessEnvelope(Buffer.from(stored.envelope).toString("base64url"));
     if (!authentic(record) || !equal(deliveryIdentity(bytes,record),stored.identity) || !equal(projectBusinessRecord(record),stored.projection) || !joinStateValid(stored.checkpoint) || stored.checkpoint.anchor.sequence !== stored.identity.sequence || stored.checkpoint.anchor.commitment !== stored.identity.commitment) throw Error("BUSINESS_DURABLE_STATE");
   }
@@ -60,6 +61,7 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
   let pending: DurableBusinessAcceptance | null=null;
   return {
     committedState:()=>structuredClone(committed),
+    pendingDelivery:()=>pending ? structuredClone(pending.identity) : null,
     async accept(event) {
       // One owned operation includes sink completion, preventing overlapping state advances.
       if(busy) throw Error("BUSINESS_BUSY");

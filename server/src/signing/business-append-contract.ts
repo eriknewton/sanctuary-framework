@@ -28,7 +28,7 @@ export function appendShape(name: "identity" | "ack" | "event", value: unknown):
       case "nullable_hex": if (v === null) return true;
         return typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
       case "hex": return typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
-      case "text": return typeof v === "string" && v.length <= PRODUCER_ENVELOPE_MAX_BYTES;
+      case "text": return typeof v === "string" && Buffer.byteLength(v, "utf8") <= PRODUCER_ENVELOPE_MAX_BYTES;
       case "base64": return typeof v === "string" && v.length <= ENVELOPE_BASE64_MAX && /^[A-Za-z0-9_-]+$/.test(v);
       case "identity": return appendShape("identity", v);
       default: return v === token;

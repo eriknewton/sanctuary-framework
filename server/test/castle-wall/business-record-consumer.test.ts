@@ -89,6 +89,7 @@ it("lost acknowledgement retains exact pending bytes and permits identical repla
   sink.persist=async value=>{const durable=await persist(value);if(lost){lost=false;throw Error("lost");}return durable;};
   const consumer=await create(sink);
   await expect(consumer.accept(event())).rejects.toThrow("lost");expect(consumer.committedState()).toEqual(first.initial);
+  expect(consumer.pendingDelivery()).toEqual(append.deliveryIdentity(canonicalBytes(first.records[0]),first.records[0]));
   const next=corpus.cases.find(row=>row.id==="ingress-accept")!.records[1];
   await expect(consumer.accept(event(next))).rejects.toThrow("BUSINESS_HELD");
   const restarted=await create(sink);expect(restarted.committedState()).toEqual(first.expect.final_state);

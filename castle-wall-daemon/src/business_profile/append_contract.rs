@@ -44,7 +44,7 @@ pub fn shape(name: &str, value: &Value) -> bool {
                     .unwrap_or(false),
                 Some("text") => v
                     .as_str()
-                    .map(|s| s.chars().count() <= PRODUCER_ENVELOPE_MAX_BYTES)
+                    .map(|s| s.len() <= PRODUCER_ENVELOPE_MAX_BYTES)
                     .unwrap_or(false),
                 Some("base64") => v
                     .as_str()

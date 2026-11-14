@@ -59,15 +59,7 @@ pub struct Frame<'a> {
     pub operation: Operation<'a>,
 }
 pub fn canonical(bytes: &[u8], cap: usize) -> Result<Value, Refusal> {
-    let value = crate::smb::strict_json::parse(bytes, cap).map_err(|_| Refusal::Canonical)?;
-    if crate::smb::jcs::encode(&value)
-        .map_err(|_| Refusal::Canonical)?
-        .as_bytes()
-        != bytes
-    {
-        return Err(Refusal::Canonical);
-    }
-    serde_json::from_slice(bytes).map_err(|_| Refusal::Canonical)
+    frame::canonical(bytes, cap).map_err(|_| Refusal::Canonical)
 }
 fn hex_text(s: &str, length: usize) -> bool {
     s.len() == length

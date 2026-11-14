@@ -41,3 +41,11 @@ it.each(APPEND_CONTRACT.lifecycle_vectors)("shared lifecycle $id", row => {
     state=result.state;
   }
 });
+
+it.each(APPEND_CONTRACT.ack_vectors)("shared ACK $id", row => {
+  expect(appendShape("ack",row.value)).toBe(row.accepted);
+});
+it.each(APPEND_CONTRACT.event_vectors)("shared event $id", row => {
+  if(row.accepted) expect(parseBusinessEvent(row.value).identity).toEqual(deliveryIdentity(bytes,record));
+  else expect(()=>parseBusinessEvent(row.value)).toThrow();
+});
