@@ -33,7 +33,8 @@ pub fn shape(name: &str, value: &Value) -> bool {
                     .as_str()
                     .map(super::drain_protocol::digest)
                     .unwrap_or(false),
-                Some("hex") => v
+                Some("nullable_hex") if v.is_null() => true,
+                Some("hex" | "nullable_hex") => v
                     .as_str()
                     .map(|s| {
                         s.len() == 64

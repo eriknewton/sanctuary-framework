@@ -25,6 +25,8 @@ export function appendShape(name: "identity" | "ack" | "event", value: unknown):
     switch (token) {
       case "safe": case "positive": return typeof v === "number" && Number.isSafeInteger(v) && v >= (token === "positive" ? 1 : 0);
       case "digest": return digest(v);
+      case "nullable_hex": if (v === null) return true;
+        return typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
       case "hex": return typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
       case "text": return typeof v === "string" && v.length <= PRODUCER_ENVELOPE_MAX_BYTES;
       case "base64": return typeof v === "string" && v.length <= ENVELOPE_BASE64_MAX && /^[A-Za-z0-9_-]+$/.test(v);

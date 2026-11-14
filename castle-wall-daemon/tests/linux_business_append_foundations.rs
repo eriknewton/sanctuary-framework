@@ -48,7 +48,7 @@ fn shared_identity_and_lifecycle_vectors() {
 #[test]
 fn envelope_caps_and_provenance_boundary() {
     assert_eq!(contract::PRODUCER_ENVELOPE_MAX_BYTES, 4096);
-    assert!(contract::CONSERVATIVE_ENVELOPE_MAX_BYTES <= contract::PRODUCER_ENVELOPE_MAX_BYTES);
+    assert!(contract::ENVELOPE_BRANCH_BOUNDS.iter().all(|bound| *bound <= contract::PRODUCER_ENVELOPE_MAX_BYTES));
     assert_eq!(
         contract::ENVELOPE_BRANCH_BOUNDS.len(),
         serde_json::from_str::<Value>(records_schema::SCHEMA_AST).unwrap()["record"]["branches"]

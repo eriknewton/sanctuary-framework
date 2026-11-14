@@ -5,7 +5,7 @@
   "event": {
     "seq": "safe",
     "captured_at_unix_ms": "safe",
-    "prior_sha256_hex": "hex",
+    "prior_sha256_hex": "nullable_hex",
     "event_canonical_json": "text",
     "critical": true,
     "business_envelope": "base64",
