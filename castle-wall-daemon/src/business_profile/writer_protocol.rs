@@ -14,7 +14,8 @@ pub fn canonical_deadline(text: &str) -> Option<u64> {
 pub const WRITER_PROTOCOL: &str = "sanctuary.business-writer.v1";
 pub const LENGTH_BYTES: usize = 4; // u32be header length.
 pub const WRITER_HEADER_MAX_BYTES: usize = SIGNER_HEADER_MAX_BYTES;
-pub const WRITER_ENVELOPE_MAX_BYTES: usize = 4096; // Design envelope, including wrapper.
+// Must match the shared append contract, including the complete envelope wrapper.
+pub const WRITER_ENVELOPE_MAX_BYTES: usize = super::append_contract::PRODUCER_ENVELOPE_MAX_BYTES;
 pub const WRITER_STATUS_MAX_BYTES: usize = 4096; // Design STATUS payload cap.
 pub const WRITER_SIGN_PACKET_MAX_BYTES: usize =
     LENGTH_BYTES + WRITER_HEADER_MAX_BYTES + SIGNER_PREIMAGE_MAX_BYTES;

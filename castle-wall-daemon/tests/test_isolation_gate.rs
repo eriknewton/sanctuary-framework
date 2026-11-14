@@ -1,3 +1,4 @@
+// fail-before-exempt: register the isolated append foundations target in the exact feature gate.
 // fail-before-exempt: Extend the exact gated and executed target registry for the two isolated drain suites.
 //! Structural guard: every integration target that can reach a HOST-GLOBAL
 //! object must be gated behind `required-features = ["test-isolation"]`.
@@ -615,6 +616,7 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
         "linux_business_drain_store",
         "linux_business_drain",
         "linux_business_reconciliation",
+        "linux_business_append_foundations",
         "linux_business_signer_client",
         "linux_business_writer_protocol",
         "linux_business_writer_peer",

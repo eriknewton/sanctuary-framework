@@ -400,3 +400,10 @@ pub mod drain_protocol;
 pub mod drain_service;
 #[cfg(target_os = "linux")]
 pub mod frame;
+
+#[cfg(target_os = "linux")]
+pub mod append_budget;
+#[cfg(target_os = "linux")]
+pub mod append_contract;
+#[cfg(target_os = "linux")]
+pub mod join_lifecycle;

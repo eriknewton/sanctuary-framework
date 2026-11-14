@@ -1,0 +1,129 @@
+//! Pure admission ceilings. Admission never constructs an effect permit or freezes a body.
+use super::{drain_protocol::D_REQUEST_DEADLINE_MS, signer_contract::*};
+pub const FINISH_SECONDS: u64 = 2 * 3 * 4 + 30 + 60;
+pub const FINISH_MS: u64 = FINISH_SECONDS * 1000;
+pub const GRANT_FLOW_CAP: u64 = ((UNLOCK_TTL_MAX_SECONDS as u64 - H_LEASE_REQUEST_SECONDS as u64)
+    * 1000
+    / (SIGNER_REQUEST_DEADLINE_MS + LINUX_RECORD_DURABILITY_DEADLINE_MS) as u64
+    - FINAL_CONTROL_RECORDS as u64)
+    / 2;
+pub const APPEND_BUDGET_MS: u64 = 3 * D_REQUEST_DEADLINE_MS as u64
+    + SIGNER_REQUEST_DEADLINE_MS as u64
+    + LINUX_RECORD_DURABILITY_DEADLINE_MS as u64;
+const _: () = assert!(GRANT_FLOW_CAP == 13 && FINISH_SECONDS == 114 && APPEND_BUDGET_MS == 5000);
+pub fn seal_ms(flows: u64) -> Option<u64> {
+    flows
+        .checked_mul(2)?
+        .checked_add(FINAL_CONTROL_RECORDS as u64)?
+        .checked_mul((SIGNER_REQUEST_DEADLINE_MS + LINUX_RECORD_DURABILITY_DEADLINE_MS) as u64)
+}
+/// Extracted because the residency inequality dominates this strict predicate.
+pub fn finish_admitted(remaining_ms: u64, seal: u64) -> bool {
+    FINISH_MS
+        .checked_add(seal)
+        .map(|minimum| remaining_ms > minimum)
+        .unwrap_or(false)
+}
+/// Producer expiry comes from the independently authenticated S grant.
+#[derive(Clone, Copy, Debug)]
+pub struct ProducerExpiry {
+    pub grant: [u8; 16],
+    pub at_ms: u64,
+}
+/// H expiry comes from the independent H lease observation, never a candidate body.
+#[derive(Clone, Copy, Debug)]
+pub struct HExpiry {
+    pub at_ms: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct RecheckInputs {
+    pub observed_ms: u64,
+    pub producer: ProducerExpiry,
+    pub h: HExpiry,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct BudgetSnapshot {
+    grant: [u8; 16],
+    producer_expiry: u64,
+    h_expiry: u64,
+    seal: u64,
+    observed_ms: u64,
+}
+pub fn admit(input: RecheckInputs, flows: u64) -> Option<BudgetSnapshot> {
+    if flows > GRANT_FLOW_CAP {
+        return None;
+    }
+    let seal = seal_ms(flows)?;
+    let producer = input.producer.at_ms.checked_sub(input.observed_ms)?;
+    let h = input.h.at_ms.checked_sub(input.observed_ms)?;
+    // Each independent clock obligation must fit; equality is closed for finish.
+    if !finish_admitted(producer, seal)
+        || !finish_admitted(h, seal)
+        || producer < (H_LEASE_REQUEST_SECONDS as u64 * 1000).checked_add(seal)?
+    {
+        return None;
+    }
+    Some(BudgetSnapshot {
+        grant: input.producer.grant,
+        producer_expiry: input.producer.at_ms,
+        h_expiry: input.h.at_ms,
+        seal,
+        observed_ms: input.observed_ms,
+    })
+}
+impl BudgetSnapshot {
+    pub fn append_deadline(&self, now_ms: u64, caller_deadline: u64) -> Option<u64> {
+        if now_ms < self.observed_ms {
+            return None;
+        }
+        let deadline = now_ms
+            .checked_add(APPEND_BUDGET_MS)?
+            .min(caller_deadline)
+            .min(self.producer_expiry.checked_sub(self.seal)?)
+            .min(self.h_expiry.checked_sub(self.seal)?);
+        (now_ms < deadline).then_some(deadline)
+    }
+    pub fn recheck(&self, input: RecheckInputs, remaining_cost: u64, append_deadline: u64) -> bool {
+        // Completion consumes the original absolute snapshot, never a fresh lease.
+        input.observed_ms >= self.observed_ms
+            && input.producer.grant == self.grant
+            && input.producer.at_ms == self.producer_expiry
+            && input.h.at_ms == self.h_expiry
+            && input.observed_ms < append_deadline
+            && input
+                .observed_ms
+                .checked_add(remaining_cost)
+                .map(|end| {
+                    end <= append_deadline && end < self.producer_expiry && end < self.h_expiry
+                })
+                .unwrap_or(false)
+    }
+}
+#[derive(Default, Debug)]
+pub struct CutObligation {
+    owned: Option<([u8; 16], u64)>,
+}
+impl CutObligation {
+    pub fn retain(&mut self, grant: [u8; 16], unresolved: u64) -> bool {
+        if unresolved == 0 {
+            return false;
+        }
+        match self.owned {
+            None => {
+                self.owned = Some((grant, unresolved));
+                true
+            }
+            Some((owner, count)) if owner == grant => match count.checked_add(unresolved) {
+                Some(next) => {
+                    self.owned = Some((owner, next));
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+    pub fn pending(&self) -> Option<([u8; 16], u64)> {
+        self.owned
+    }
+}

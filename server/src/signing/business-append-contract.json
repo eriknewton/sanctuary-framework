@@ -1,0 +1,1223 @@
+{
+  "version": 1,
+  "contract": "Must match append_contract.rs and business-append-contract.ts. Correlation identity is not authentication. The record schema owns signed bodies.",
+  "envelope_max_bytes": 4096,
+  "event": {
+    "seq": "safe",
+    "captured_at_unix_ms": "safe",
+    "prior_sha256_hex": "hex",
+    "event_canonical_json": "text",
+    "critical": true,
+    "business_envelope": "base64",
+    "producer_signature_b64url": null,
+    "producer_key_id": null
+  },
+  "identity": {
+    "version": 1,
+    "sequence": "positive",
+    "commitment": "digest",
+    "envelope_sha256": "digest"
+  },
+  "ack": {
+    "version": 1,
+    "identity": "identity"
+  },
+  "projection": {
+    "kind": "record_kind",
+    "identity_id": "identity_id",
+    "machine_id": "machine_id",
+    "boot_id": "boot_id",
+    "activation_id": "activation_id",
+    "lease_id": "lease_id",
+    "generation": "generation",
+    "sequence": "sequence",
+    "prior_commitment": "prior_commitment",
+    "captured_at_unix_ms": "captured_at_unix_ms",
+    "captured_at_boottime_ns": "captured_at_boottime_ns",
+    "payload": "payload"
+  },
+  "checkpoint": {
+    "version": 1,
+    "session_id": "id",
+    "request_id": "id",
+    "nonce": "id",
+    "status_digest": "digest",
+    "observed_boottime_ns": "u64",
+    "fortress_id": "id",
+    "enrollment_revision": "safe",
+    "d_observation": "observation",
+    "wal_checkpoint": "wal_checkpoint"
+  },
+  "lifecycle": {
+    "Checkpoint": [
+      "checkpoint"
+    ],
+    "SignAdmitted": [
+      "record"
+    ],
+    "Signed": [
+      "identity"
+    ],
+    "Committed": [
+      "identity",
+      "checkpoint"
+    ],
+    "LostOrUnmatched": [],
+    "NextGrant": []
+  },
+  "schedules": [
+    [
+      "Checkpoint",
+      "SignAdmitted",
+      "Signed",
+      "LostOrUnmatched",
+      "NextGrant",
+      "SignAdmitted"
+    ],
+    [
+      "Checkpoint",
+      "SignAdmitted",
+      "Signed",
+      "Committed",
+      "Committed"
+    ],
+    [
+      "Checkpoint",
+      "SignAdmitted",
+      "LostOrUnmatched",
+      "Checkpoint"
+    ]
+  ],
+  "identity_vectors": [
+    {
+      "id": "valid",
+      "value": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "envelope_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "accepted": true
+    },
+    {
+      "id": "invalid-version",
+      "value": {
+        "version": 2,
+        "sequence": 1,
+        "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "envelope_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "accepted": false
+    },
+    {
+      "id": "invalid-sequence",
+      "value": {
+        "version": 1,
+        "sequence": 0,
+        "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "envelope_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "accepted": false
+    },
+    {
+      "id": "invalid-commitment",
+      "value": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "GENESIS",
+        "envelope_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "accepted": false
+    },
+    {
+      "id": "invalid-envelope_sha256",
+      "value": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "envelope_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "accepted": false
+    },
+    {
+      "id": "invalid-extra",
+      "value": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "envelope_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "extra": 0
+      },
+      "accepted": false
+    }
+  ],
+  "lifecycle_states": {
+    "initial": {
+      "committed": null,
+      "provisional": null,
+      "tombstone": null,
+      "needs_checkpoint": true
+    },
+    "ready": {
+      "committed": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 0,
+          "commitment": "GENESIS",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "0"
+        },
+        "flow_state": {
+          "history": []
+        }
+      },
+      "provisional": null,
+      "tombstone": null,
+      "needs_checkpoint": false
+    },
+    "pending": {
+      "committed": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 0,
+          "commitment": "GENESIS",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "0"
+        },
+        "flow_state": {
+          "history": []
+        }
+      },
+      "provisional": {
+        "state": {
+          "pin": {
+            "role": "extension:linux-business-producer-v0",
+            "epoch": 1,
+            "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+            "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+            "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "grant": {
+            "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "expires_ns": "1000000000000"
+          },
+          "policy": {
+            "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "agent_uids": [
+              1000
+            ],
+            "vendors": [
+              {
+                "address": "203.0.113.1",
+                "port": 443
+              }
+            ]
+          },
+          "anchor": {
+            "sequence": 1,
+            "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+            "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "captured_at_boottime_ns": "100"
+          },
+          "flow_state": {
+            "history": [
+              {
+                "body": {
+                  "signature_scheme": "ed25519-k1-role-v1",
+                  "role": "extension:linux-business-producer-v0",
+                  "record_kind": "open",
+                  "epoch": 1,
+                  "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+                  "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "generation": 0,
+                  "sequence": 1,
+                  "prior_commitment": "GENESIS",
+                  "captured_at_unix_ms": 1,
+                  "captured_at_boottime_ns": "100",
+                  "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "payload": {
+                    "context": {
+                      "flow": {
+                        "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "ct_zone": 0,
+                        "ct_id": 1,
+                        "open_sequence": 1
+                      },
+                      "original": {
+                        "family": "ipv4",
+                        "protocol": "tcp",
+                        "src_ip": "192.0.2.10",
+                        "dst_ip": "192.0.2.1",
+                        "src_port": 50000,
+                        "dst_port": 8080
+                      },
+                      "reply": {
+                        "family": "ipv4",
+                        "protocol": "tcp",
+                        "src_ip": "192.0.2.1",
+                        "dst_ip": "192.0.2.10",
+                        "src_port": 8080,
+                        "dst_port": 50000
+                      },
+                      "netns_inode": "1",
+                      "socket_cookie": "1",
+                      "actor_uid": 1000
+                    },
+                    "edge": "agent_endpoint",
+                    "listener": {
+                      "uid": 2000,
+                      "cookie": "1",
+                      "netns_inode": "1",
+                      "address": "192.0.2.1",
+                      "port": 8080,
+                      "endpoint_generation": 0
+                    },
+                    "origin_link_sequence": null,
+                    "rule": "listener_open",
+                    "reason": "reserved",
+                    "effect": "NOT_STARTED"
+                  }
+                },
+                "outer": {
+                  "sequence": 1,
+                  "prior_commitment": "GENESIS",
+                  "captured_at_unix_ms": 1,
+                  "captured_at_boottime_ns": "100",
+                  "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "generation": 0,
+                  "signature": "qNfq3XMgYHbgPJDwXVe8FgXHIxKbNOu9AeBU-ZPMIsVGWnK65f-l61yIWpjhgPm-T16zO4SQKUnXv4PixGHMDQ"
+                }
+              }
+            ]
+          }
+        },
+        "identity": {
+          "version": 1,
+          "sequence": 1,
+          "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+          "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+        },
+        "signed": false
+      },
+      "tombstone": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+        "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+      },
+      "needs_checkpoint": false
+    },
+    "signed": {
+      "committed": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 0,
+          "commitment": "GENESIS",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "0"
+        },
+        "flow_state": {
+          "history": []
+        }
+      },
+      "provisional": {
+        "state": {
+          "pin": {
+            "role": "extension:linux-business-producer-v0",
+            "epoch": 1,
+            "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+            "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+            "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "grant": {
+            "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "expires_ns": "1000000000000"
+          },
+          "policy": {
+            "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "agent_uids": [
+              1000
+            ],
+            "vendors": [
+              {
+                "address": "203.0.113.1",
+                "port": 443
+              }
+            ]
+          },
+          "anchor": {
+            "sequence": 1,
+            "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+            "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "captured_at_boottime_ns": "100"
+          },
+          "flow_state": {
+            "history": [
+              {
+                "body": {
+                  "signature_scheme": "ed25519-k1-role-v1",
+                  "role": "extension:linux-business-producer-v0",
+                  "record_kind": "open",
+                  "epoch": 1,
+                  "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+                  "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "generation": 0,
+                  "sequence": 1,
+                  "prior_commitment": "GENESIS",
+                  "captured_at_unix_ms": 1,
+                  "captured_at_boottime_ns": "100",
+                  "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "payload": {
+                    "context": {
+                      "flow": {
+                        "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "ct_zone": 0,
+                        "ct_id": 1,
+                        "open_sequence": 1
+                      },
+                      "original": {
+                        "family": "ipv4",
+                        "protocol": "tcp",
+                        "src_ip": "192.0.2.10",
+                        "dst_ip": "192.0.2.1",
+                        "src_port": 50000,
+                        "dst_port": 8080
+                      },
+                      "reply": {
+                        "family": "ipv4",
+                        "protocol": "tcp",
+                        "src_ip": "192.0.2.1",
+                        "dst_ip": "192.0.2.10",
+                        "src_port": 8080,
+                        "dst_port": 50000
+                      },
+                      "netns_inode": "1",
+                      "socket_cookie": "1",
+                      "actor_uid": 1000
+                    },
+                    "edge": "agent_endpoint",
+                    "listener": {
+                      "uid": 2000,
+                      "cookie": "1",
+                      "netns_inode": "1",
+                      "address": "192.0.2.1",
+                      "port": 8080,
+                      "endpoint_generation": 0
+                    },
+                    "origin_link_sequence": null,
+                    "rule": "listener_open",
+                    "reason": "reserved",
+                    "effect": "NOT_STARTED"
+                  }
+                },
+                "outer": {
+                  "sequence": 1,
+                  "prior_commitment": "GENESIS",
+                  "captured_at_unix_ms": 1,
+                  "captured_at_boottime_ns": "100",
+                  "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "generation": 0,
+                  "signature": "qNfq3XMgYHbgPJDwXVe8FgXHIxKbNOu9AeBU-ZPMIsVGWnK65f-l61yIWpjhgPm-T16zO4SQKUnXv4PixGHMDQ"
+                }
+              }
+            ]
+          }
+        },
+        "identity": {
+          "version": 1,
+          "sequence": 1,
+          "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+          "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+        },
+        "signed": true
+      },
+      "tombstone": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+        "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+      },
+      "needs_checkpoint": false
+    },
+    "lost": {
+      "committed": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 0,
+          "commitment": "GENESIS",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "0"
+        },
+        "flow_state": {
+          "history": []
+        }
+      },
+      "provisional": null,
+      "tombstone": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+        "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+      },
+      "needs_checkpoint": true
+    },
+    "committed": {
+      "committed": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 1,
+          "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "100"
+        },
+        "flow_state": {
+          "history": [
+            {
+              "body": {
+                "signature_scheme": "ed25519-k1-role-v1",
+                "role": "extension:linux-business-producer-v0",
+                "record_kind": "open",
+                "epoch": 1,
+                "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+                "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "generation": 0,
+                "sequence": 1,
+                "prior_commitment": "GENESIS",
+                "captured_at_unix_ms": 1,
+                "captured_at_boottime_ns": "100",
+                "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "payload": {
+                  "context": {
+                    "flow": {
+                      "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "ct_zone": 0,
+                      "ct_id": 1,
+                      "open_sequence": 1
+                    },
+                    "original": {
+                      "family": "ipv4",
+                      "protocol": "tcp",
+                      "src_ip": "192.0.2.10",
+                      "dst_ip": "192.0.2.1",
+                      "src_port": 50000,
+                      "dst_port": 8080
+                    },
+                    "reply": {
+                      "family": "ipv4",
+                      "protocol": "tcp",
+                      "src_ip": "192.0.2.1",
+                      "dst_ip": "192.0.2.10",
+                      "src_port": 8080,
+                      "dst_port": 50000
+                    },
+                    "netns_inode": "1",
+                    "socket_cookie": "1",
+                    "actor_uid": 1000
+                  },
+                  "edge": "agent_endpoint",
+                  "listener": {
+                    "uid": 2000,
+                    "cookie": "1",
+                    "netns_inode": "1",
+                    "address": "192.0.2.1",
+                    "port": 8080,
+                    "endpoint_generation": 0
+                  },
+                  "origin_link_sequence": null,
+                  "rule": "listener_open",
+                  "reason": "reserved",
+                  "effect": "NOT_STARTED"
+                }
+              },
+              "outer": {
+                "sequence": 1,
+                "prior_commitment": "GENESIS",
+                "captured_at_unix_ms": 1,
+                "captured_at_boottime_ns": "100",
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "generation": 0,
+                "signature": "qNfq3XMgYHbgPJDwXVe8FgXHIxKbNOu9AeBU-ZPMIsVGWnK65f-l61yIWpjhgPm-T16zO4SQKUnXv4PixGHMDQ"
+              }
+            }
+          ]
+        }
+      },
+      "provisional": null,
+      "tombstone": null,
+      "needs_checkpoint": false
+    }
+  },
+  "lifecycle_events": {
+    "checkpoint": {
+      "type": "Checkpoint",
+      "checkpoint": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 0,
+          "commitment": "GENESIS",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "0"
+        },
+        "flow_state": {
+          "history": []
+        }
+      }
+    },
+    "admit": {
+      "type": "SignAdmitted",
+      "record": {
+        "body": {
+          "signature_scheme": "ed25519-k1-role-v1",
+          "role": "extension:linux-business-producer-v0",
+          "record_kind": "open",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "sequence": 1,
+          "prior_commitment": "GENESIS",
+          "captured_at_unix_ms": 1,
+          "captured_at_boottime_ns": "100",
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "payload": {
+            "context": {
+              "flow": {
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "ct_zone": 0,
+                "ct_id": 1,
+                "open_sequence": 1
+              },
+              "original": {
+                "family": "ipv4",
+                "protocol": "tcp",
+                "src_ip": "192.0.2.10",
+                "dst_ip": "192.0.2.1",
+                "src_port": 50000,
+                "dst_port": 8080
+              },
+              "reply": {
+                "family": "ipv4",
+                "protocol": "tcp",
+                "src_ip": "192.0.2.1",
+                "dst_ip": "192.0.2.10",
+                "src_port": 8080,
+                "dst_port": 50000
+              },
+              "netns_inode": "1",
+              "socket_cookie": "1",
+              "actor_uid": 1000
+            },
+            "edge": "agent_endpoint",
+            "listener": {
+              "uid": 2000,
+              "cookie": "1",
+              "netns_inode": "1",
+              "address": "192.0.2.1",
+              "port": 8080,
+              "endpoint_generation": 0
+            },
+            "origin_link_sequence": null,
+            "rule": "listener_open",
+            "reason": "reserved",
+            "effect": "NOT_STARTED"
+          }
+        },
+        "outer": {
+          "sequence": 1,
+          "prior_commitment": "GENESIS",
+          "captured_at_unix_ms": 1,
+          "captured_at_boottime_ns": "100",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "signature": "qNfq3XMgYHbgPJDwXVe8FgXHIxKbNOu9AeBU-ZPMIsVGWnK65f-l61yIWpjhgPm-T16zO4SQKUnXv4PixGHMDQ"
+        }
+      }
+    },
+    "signed": {
+      "type": "Signed",
+      "identity": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+        "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+      }
+    },
+    "commit": {
+      "type": "Committed",
+      "identity": {
+        "version": 1,
+        "sequence": 1,
+        "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+        "envelope_sha256": "sha256:56f40e90458de279d05d947a54548f2692184886d51aa2bfc2c371e600d4fa72"
+      },
+      "checkpoint": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 1,
+          "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "100"
+        },
+        "flow_state": {
+          "history": [
+            {
+              "body": {
+                "signature_scheme": "ed25519-k1-role-v1",
+                "role": "extension:linux-business-producer-v0",
+                "record_kind": "open",
+                "epoch": 1,
+                "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+                "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "generation": 0,
+                "sequence": 1,
+                "prior_commitment": "GENESIS",
+                "captured_at_unix_ms": 1,
+                "captured_at_boottime_ns": "100",
+                "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "payload": {
+                  "context": {
+                    "flow": {
+                      "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "ct_zone": 0,
+                      "ct_id": 1,
+                      "open_sequence": 1
+                    },
+                    "original": {
+                      "family": "ipv4",
+                      "protocol": "tcp",
+                      "src_ip": "192.0.2.10",
+                      "dst_ip": "192.0.2.1",
+                      "src_port": 50000,
+                      "dst_port": 8080
+                    },
+                    "reply": {
+                      "family": "ipv4",
+                      "protocol": "tcp",
+                      "src_ip": "192.0.2.1",
+                      "dst_ip": "192.0.2.10",
+                      "src_port": 8080,
+                      "dst_port": 50000
+                    },
+                    "netns_inode": "1",
+                    "socket_cookie": "1",
+                    "actor_uid": 1000
+                  },
+                  "edge": "agent_endpoint",
+                  "listener": {
+                    "uid": 2000,
+                    "cookie": "1",
+                    "netns_inode": "1",
+                    "address": "192.0.2.1",
+                    "port": 8080,
+                    "endpoint_generation": 0
+                  },
+                  "origin_link_sequence": null,
+                  "rule": "listener_open",
+                  "reason": "reserved",
+                  "effect": "NOT_STARTED"
+                }
+              },
+              "outer": {
+                "sequence": 1,
+                "prior_commitment": "GENESIS",
+                "captured_at_unix_ms": 1,
+                "captured_at_boottime_ns": "100",
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "generation": 0,
+                "signature": "qNfq3XMgYHbgPJDwXVe8FgXHIxKbNOu9AeBU-ZPMIsVGWnK65f-l61yIWpjhgPm-T16zO4SQKUnXv4PixGHMDQ"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "lost": {
+      "type": "LostOrUnmatched"
+    },
+    "grant": {
+      "type": "NextGrant"
+    },
+    "reconcile": {
+      "type": "Checkpoint",
+      "checkpoint": {
+        "pin": {
+          "role": "extension:linux-business-producer-v0",
+          "epoch": 1,
+          "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+          "public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+          "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": {
+          "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "expires_ns": "1000000000000"
+        },
+        "policy": {
+          "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "agent_uids": [
+            1000
+          ],
+          "vendors": [
+            {
+              "address": "203.0.113.1",
+              "port": 443
+            }
+          ]
+        },
+        "anchor": {
+          "sequence": 1,
+          "commitment": "sha256:1063907021ec21766587e1f275a6b3ca3cc25cdea83d35c5d4290046e3b8605f",
+          "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "generation": 0,
+          "captured_at_boottime_ns": "100"
+        },
+        "flow_state": {
+          "history": [
+            {
+              "body": {
+                "signature_scheme": "ed25519-k1-role-v1",
+                "role": "extension:linux-business-producer-v0",
+                "record_kind": "open",
+                "epoch": 1,
+                "kid": "k1:sha256:00c480a557f21423875d652079e0035a6cffb063574eebb886bf43fdd05e2977",
+                "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "generation": 0,
+                "sequence": 1,
+                "prior_commitment": "GENESIS",
+                "captured_at_unix_ms": 1,
+                "captured_at_boottime_ns": "100",
+                "policy_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "payload": {
+                  "context": {
+                    "flow": {
+                      "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "ct_zone": 0,
+                      "ct_id": 1,
+                      "open_sequence": 1
+                    },
+                    "original": {
+                      "family": "ipv4",
+                      "protocol": "tcp",
+                      "src_ip": "192.0.2.10",
+                      "dst_ip": "192.0.2.1",
+                      "src_port": 50000,
+                      "dst_port": 8080
+                    },
+                    "reply": {
+                      "family": "ipv4",
+                      "protocol": "tcp",
+                      "src_ip": "192.0.2.1",
+                      "dst_ip": "192.0.2.10",
+                      "src_port": 8080,
+                      "dst_port": 50000
+                    },
+                    "netns_inode": "1",
+                    "socket_cookie": "1",
+                    "actor_uid": 1000
+                  },
+                  "edge": "agent_endpoint",
+                  "listener": {
+                    "uid": 2000,
+                    "cookie": "1",
+                    "netns_inode": "1",
+                    "address": "192.0.2.1",
+                    "port": 8080,
+                    "endpoint_generation": 0
+                  },
+                  "origin_link_sequence": null,
+                  "rule": "listener_open",
+                  "reason": "reserved",
+                  "effect": "NOT_STARTED"
+                }
+              },
+              "outer": {
+                "sequence": 1,
+                "prior_commitment": "GENESIS",
+                "captured_at_unix_ms": 1,
+                "captured_at_boottime_ns": "100",
+                "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "lease_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "generation": 0,
+                "signature": "qNfq3XMgYHbgPJDwXVe8FgXHIxKbNOu9AeBU-ZPMIsVGWnK65f-l61yIWpjhgPm-T16zO4SQKUnXv4PixGHMDQ"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "lifecycle_vectors": [
+    {
+      "id": "lost-next-grant",
+      "steps": [
+        [
+          "checkpoint",
+          true,
+          "ready"
+        ],
+        [
+          "admit",
+          true,
+          "pending"
+        ],
+        [
+          "signed",
+          true,
+          "signed"
+        ],
+        [
+          "lost",
+          true,
+          "lost"
+        ],
+        [
+          "grant",
+          true,
+          "lost"
+        ],
+        [
+          "admit",
+          false,
+          "lost"
+        ],
+        [
+          "checkpoint",
+          false,
+          "lost"
+        ],
+        [
+          "reconcile",
+          true,
+          "committed"
+        ]
+      ]
+    },
+    {
+      "id": "commit-once",
+      "steps": [
+        [
+          "checkpoint",
+          true,
+          "ready"
+        ],
+        [
+          "admit",
+          true,
+          "pending"
+        ],
+        [
+          "commit",
+          false,
+          "pending"
+        ],
+        [
+          "signed",
+          true,
+          "signed"
+        ],
+        [
+          "signed",
+          false,
+          "signed"
+        ],
+        [
+          "commit",
+          true,
+          "committed"
+        ],
+        [
+          "commit",
+          false,
+          "committed"
+        ]
+      ]
+    }
+  ]
+}
