@@ -19,7 +19,14 @@ export const BUSINESS_ENCODING_WIDTHS = Object.freeze({
 });
 // Must match SAFE_INTEGER in business_profile/append_contract.rs.
 const BUSINESS_SAFE_INTEGER = SAFE_INTEGER;
-export const APPEND_CONTRACT = data;
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+export const APPEND_CONTRACT = deepFreeze(data);
 export const PRODUCER_ENVELOPE_MAX_BYTES = data.envelope_max_bytes;
 export const ENVELOPE_BASE64_MAX = Math.ceil(PRODUCER_ENVELOPE_MAX_BYTES * 8 / 6);
 export interface BusinessDeliveryIdentity {version: 1; sequence: number; commitment: string; envelope_sha256: string;}
@@ -71,7 +78,7 @@ export function parseBusinessEnvelope(encoded: string): {bytes: Uint8Array; reco
   // Check encoded length before Buffer allocation, then canonical round trip.
   if (typeof encoded !== "string" || encoded.length > ENVELOPE_BASE64_MAX) throw Error("BUSINESS_ENVELOPE");
   const bytes = decodeCanonical(encoded);
-  // The encoded cap already implies decoded bytes <= 4096; the strict parser shares that cap.
+  // The encoded cap already implies decoded bytes <= PRODUCER_ENVELOPE_MAX_BYTES; the strict parser shares that cap.
   const v = parseStrict(bytes, PRODUCER_ENVELOPE_MAX_BYTES);
   if (!object(v) || !same(Object.keys(v).sort(), ["body", "outer"]) || !validateBusinessRecord(v.body) || !object(v.outer) || !Buffer.from(canonicalBytes(v)).equals(Buffer.from(bytes))) throw Error("BUSINESS_ENVELOPE");
   const body = v.body as Record<string, Json>, outer = v.outer;

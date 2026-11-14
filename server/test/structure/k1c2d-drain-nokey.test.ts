@@ -1,4 +1,4 @@
-// fail-before-exempt: round-one parser reachability adds the exact canonical-frame edge; the complete frame source remains audited below.
+// fail-before-exempt: parser reachability includes the exact canonical-frame edge; the complete frame source remains audited below.
 // fail-before-exempt: New drain production reachability and debug/release artifact witnesses read native sources and harness binaries.
 import { expect, it } from "vitest";
 import { readFileSync } from "node:fs";

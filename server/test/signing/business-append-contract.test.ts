@@ -1,4 +1,4 @@
-// fail-before-exempt: round-one lifecycle, projection and boundary assertions consume shared native corpus and contract vectors.
+// fail-before-exempt: lifecycle, immutable contract, projection and boundary assertions consume shared native corpus and contract vectors.
 // W-PROVENANCE
 // W-ENVELOPE-CAP
 // W-JOIN-LIFECYCLE
@@ -69,10 +69,33 @@ it("checkpoint shapes share complete bounded nested tables without granting auth
 it.each(["constructor","__proto__","toString"])("lifecycle refuses inherited event name %s",type=>{
   const state=initialLifecycle();expect(lifecycleStep(state,{type})).toEqual({accepted:false,state});
 });
-it("lifecycle refuses a table entry with no implemented transition",()=>{
-  const table=APPEND_CONTRACT.lifecycle as Record<string,string[]>;table.Future=[];
-  try {const state=initialLifecycle();expect(lifecycleStep(state,{type:"Future"})).toEqual({accepted:false,state});}
-  finally {delete table.Future;}
+it("lifecycle refuses a table entry with no implemented transition",async()=>{
+  vi.resetModules();
+  vi.doMock("../../src/signing/business-append-contract.js",async importOriginal=>{
+    const original=await importOriginal<typeof import("../../src/signing/business-append-contract.js")>();
+    const cloned=structuredClone(original.APPEND_CONTRACT);
+    (cloned.lifecycle as Record<string,string[]>).Future=[];
+    return {...original,APPEND_CONTRACT:cloned};
+  });
+  try {
+    const {lifecycleStep:step}=await import("../../src/signing/business-join-lifecycle.js");
+    const state=initialLifecycle();expect(step(state,{type:"Future"})).toEqual({accepted:false,state});
+  } finally {vi.doUnmock("../../src/signing/business-append-contract.js");vi.resetModules();}
+});
+it("the exported append contract is frozen at every object and array",()=>{
+  function check(value:unknown):void {
+    if(value===null || typeof value!=="object") return;
+    expect(Object.isFrozen(value)).toBe(true);
+    for(const child of Object.values(value)) check(child);
+  }
+  check(APPEND_CONTRACT);
+  expect(()=>{(APPEND_CONTRACT.lifecycle as Record<string,string[]>).Future=[];}).toThrow(TypeError);
+  expect(()=>{APPEND_CONTRACT.lifecycle.SignAdmitted.push("authority");}).toThrow(TypeError);
+});
+it("the oversized lifecycle envelope isolates the byte cap with a full-width signature",()=>{
+  const record=APPEND_CONTRACT.lifecycle_events["oversize-envelope"].record;
+  expect(record.outer.signature).toHaveLength(86);
+  expect(canonicalBytes(record)).toHaveLength(4097);
 });
 
 it("real envelope parser checks 4097 before decode and admits 4096 to decoding",()=>{

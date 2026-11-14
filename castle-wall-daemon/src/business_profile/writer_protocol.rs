@@ -408,6 +408,7 @@ pub fn envelope(body: &[u8], signature: &[u8; SIGNATURE_BYTES]) -> Result<Vec<u8
     // applies even to a schema-shaped candidate whose string field is too wide.
     let value = super::frame::canonical(body, super::records_schema::MAX_BYTES)
         .map_err(|_| Refusal::Canonical)?;
+    // Envelope also covers a non-object body or a missing outer-index key.
     // Must match the outer-index rule in records::advance.
     let mut outer = serde_json::Map::new();
     for key in LINUX_FIELDS

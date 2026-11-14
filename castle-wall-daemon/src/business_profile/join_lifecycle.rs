@@ -43,9 +43,9 @@ pub fn step(state: &Value, event: &Value) -> Option<Value> {
                 return None;
             }
             let record = &event["record"];
-            let result = records::advance(&state["committed"], record).ok()?;
             let bytes = crate::smb::jcs::encode(record).ok()?;
             let identity = append_contract::identity(bytes.as_bytes())?;
+            let result = records::advance(&state["committed"], record).ok()?;
             next["provisional"] = json!({"state":result,"identity":identity,"signed":false});
             next["tombstone"] = identity;
         }
@@ -76,4 +76,23 @@ pub fn step(state: &Value, event: &Value) -> Option<Value> {
         _ => return None,
     }
     Some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_width_refuses_before_history_advance() {
+        let contract = append_contract::contract().unwrap();
+        let ready = &contract["lifecycle_states"]["ready"];
+        let valid = &contract["lifecycle_events"]["admit"];
+        let mut invalid = valid.clone();
+        invalid["record"]["outer"]["signature"] = json!("A");
+        records::ADVANCE_CALLS.with(|calls| calls.set(0));
+        assert!(step(ready, &invalid).is_none());
+        records::ADVANCE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        assert!(step(ready, valid).is_some());
+        records::ADVANCE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
 }
