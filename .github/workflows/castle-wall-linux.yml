@@ -176,6 +176,10 @@ jobs:
         # under a second parallel run; failure mode seen: an unrelated owner-deadline test timed out in this step.
         run: cargo test --locked --features legacy-raw-producer --test integration_producer_sig_cross_lang && cargo test --locked --features legacy-raw-producer --lib ipc::producer_sig::tests::replayed_signature_fails_against_different_seq -- --exact 2>&1 | tee /dev/stderr | grep -q "test result. ok. 1 passed"
 
+      - name: Check append budget ownership doctests
+        working-directory: castle-wall-daemon
+        run: cargo test --locked --doc --features test-isolation business_profile::append_budget
+
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

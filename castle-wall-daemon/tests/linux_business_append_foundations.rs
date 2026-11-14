@@ -1,4 +1,4 @@
-// fail-before-exempt: round-one shared vectors, checked corpus and ownership witnesses read native and shared contract inputs.
+// fail-before-exempt: shared vectors, checked corpus and isolated expiry constructors read native and shared contract inputs.
 // W-PROVENANCE
 // W-LEASE-ADMISSION
 // W-ENVELOPE-CAP
@@ -120,10 +120,10 @@ fn input(p: u64, h: u64) -> RecheckInputs {
     observed_input(0, [1; 16], p, h)
 }
 fn observed_input(now: u64, grant: [u8; 16], p: u64, h: u64) -> RecheckInputs {
-    RecheckInputs::checked(
+    RecheckInputs::checked_for_test(
         now,
-        ProducerExpiry::checked(grant, p, now).unwrap(),
-        HExpiry::checked(h, now).unwrap(),
+        ProducerExpiry::checked_for_test(grant, p, now).unwrap(),
+        HExpiry::checked_for_test(h, now).unwrap(),
     )
     .unwrap()
 }
@@ -156,12 +156,12 @@ fn three_admission_predicates_and_absolute_completion() {
             .deadline_ms(),
         4000
     );
-    assert!(ProducerExpiry::checked([1; 16], 1, 1).is_none());
-    assert!(HExpiry::checked(1, 1).is_none());
-    assert!(RecheckInputs::checked(
+    assert!(ProducerExpiry::checked_for_test([1; 16], 1, 1).is_none());
+    assert!(HExpiry::checked_for_test(1, 1).is_none());
+    assert!(RecheckInputs::checked_for_test(
         240000,
-        ProducerExpiry::checked([1; 16], 300000, 0).unwrap(),
-        HExpiry::checked(240000, 0).unwrap()
+        ProducerExpiry::checked_for_test([1; 16], 300000, 0).unwrap(),
+        HExpiry::checked_for_test(240000, 0).unwrap()
     )
     .is_none());
     let mut cuts = CutObligation::default();

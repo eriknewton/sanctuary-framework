@@ -1,4 +1,4 @@
-// fail-before-exempt: round-one append generator freshness checks read native output and execute repository generators;
+// fail-before-exempt: append generator freshness and ownership CI assertions read native output, the Linux workflow and repository generators;
 // fail-before-exempt: the changed assertions read server/tsup.config.ts and castle-wall-daemon sources, which verify-fail-before does not revert (it reverts server/src only); the full suite at head checks them.
 import {describe,it,expect} from "vitest";
 import {readFileSync,readdirSync,mkdtempSync,writeFileSync,unlinkSync,rmdirSync} from "node:fs";
@@ -107,4 +107,9 @@ it("append generator refuses a stale derived bound table",()=>{
     writeFileSync(candidate,generated.replace(/(CONSERVATIVE_ENVELOPE_MAX_BYTES: usize = )(\d+)/,(_all,prefix,n)=>prefix+(Number(n)+1)));
     expect(check).toThrow("append contract differs");
   } finally {unlinkSync(candidate);rmdirSync(directory);}
+});
+
+it("Linux CI runs only the append budget ownership doctests",()=>{
+  const workflow=readFileSync(join(root,".github/workflows/castle-wall-linux.yml"),"utf8");
+  expect(workflow).toContain("        run: cargo test --locked --doc --features test-isolation business_profile::append_budget\n");
 });

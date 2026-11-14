@@ -42,11 +42,18 @@ pub struct RecheckInputs {
     h: HExpiry,
 }
 /// An admission snapshot can be consumed by only one append window.
-/// ```compile_fail
+/// ```compile_fail,E0382
 /// use castle_wall_daemon::business_profile::append_budget::BudgetSnapshot;
 /// fn retry(snapshot: BudgetSnapshot) {
 ///     let _first = snapshot.begin_append(0, 10000);
 ///     let _second = snapshot.begin_append(4000, 10000);
+/// }
+/// ```
+/// A snapshot cannot be cloned to open another window.
+/// ```compile_fail,E0599
+/// use castle_wall_daemon::business_profile::append_budget::BudgetSnapshot;
+/// fn duplicate(snapshot: BudgetSnapshot) {
+///     let _copy = snapshot.clone();
 /// }
 /// ```
 #[derive(Debug)]
@@ -57,21 +64,62 @@ pub struct BudgetSnapshot {
     seal: u64,
     observed_ms: u64,
 }
+// Ambiguous trait selection is a compile-time assertion, including on Rust 1.75.
+// Each bound must remain absent from the owned admission snapshot.
+const _: fn() = || {
+    trait AmbiguousIfClone<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    struct Cloned;
+    impl<T: ?Sized + Clone> AmbiguousIfClone<Cloned> for T {}
+    let _ = <BudgetSnapshot as AmbiguousIfClone<_>>::check;
+
+    trait AmbiguousIfCopy<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+    struct Copied;
+    impl<T: ?Sized + Copy> AmbiguousIfCopy<Copied> for T {}
+    let _ = <BudgetSnapshot as AmbiguousIfCopy<_>>::check;
+};
 impl ProducerExpiry {
+    /// Isolated fixture access to the same expiry checks used by composition.
+    #[cfg(any(test, feature = "test-isolation"))]
+    pub fn checked_for_test(grant: [u8; 16], at_ms: u64, observed_ms: u64) -> Option<Self> {
+        Self::checked(grant, at_ms, observed_ms)
+    }
     /// Composition supplies the authenticated producer grant and its absolute expiry.
-    pub fn checked(grant: [u8; 16], at_ms: u64, observed_ms: u64) -> Option<Self> {
+    #[cfg_attr(not(any(test, feature = "test-isolation")), allow(dead_code))]
+    pub(crate) fn checked(grant: [u8; 16], at_ms: u64, observed_ms: u64) -> Option<Self> {
         (at_ms > observed_ms).then_some(Self { grant, at_ms })
     }
 }
 impl HExpiry {
+    /// Isolated fixture access to the same expiry checks used by composition.
+    #[cfg(any(test, feature = "test-isolation"))]
+    pub fn checked_for_test(at_ms: u64, observed_ms: u64) -> Option<Self> {
+        Self::checked(at_ms, observed_ms)
+    }
     /// Composition supplies the independently observed H lease's absolute expiry.
-    pub fn checked(at_ms: u64, observed_ms: u64) -> Option<Self> {
+    #[cfg_attr(not(any(test, feature = "test-isolation")), allow(dead_code))]
+    pub(crate) fn checked(at_ms: u64, observed_ms: u64) -> Option<Self> {
         (at_ms > observed_ms).then_some(Self { at_ms })
     }
 }
 impl RecheckInputs {
+    /// Isolated fixture access to the same expiry checks used by composition.
+    #[cfg(any(test, feature = "test-isolation"))]
+    pub fn checked_for_test(
+        observed_ms: u64,
+        producer: ProducerExpiry,
+        h: HExpiry,
+    ) -> Option<Self> {
+        Self::checked(observed_ms, producer, h)
+    }
     /// Refuse expired observations before they can enter admission or completion.
-    pub fn checked(observed_ms: u64, producer: ProducerExpiry, h: HExpiry) -> Option<Self> {
+    #[cfg_attr(not(any(test, feature = "test-isolation")), allow(dead_code))]
+    pub(crate) fn checked(observed_ms: u64, producer: ProducerExpiry, h: HExpiry) -> Option<Self> {
         (observed_ms < producer.at_ms && observed_ms < h.at_ms).then_some(Self {
             observed_ms,
             producer,
@@ -113,7 +161,8 @@ impl BudgetSnapshot {
             .min(self.h_expiry.checked_sub(self.seal)?);
         (now_ms < deadline).then_some(deadline)
     }
-    /// Freeze one append deadline so a retry cannot begin a new budget window.
+    /// One snapshot opens at most one window. Preventing re-admission after a
+    /// deadline is the 2e2 caller's obligation.
     pub fn begin_append(self, now_ms: u64, caller_deadline: u64) -> Option<AppendWindow> {
         let deadline_ms = self.append_deadline(now_ms, caller_deadline)?;
         Some(AppendWindow {
