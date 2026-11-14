@@ -65,7 +65,7 @@ jobs:
       - name: Test packed candidate on Node 22
         working-directory: server
         run: |
-          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-cli.test.ts test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-provenance.test.ts test/evidence-pack/snapshot-acceptance.test.ts test/evidence-pack/snapshot-mutations.test.ts test/structure/snapshot-verifier-import-graph.test.ts test/structure/publish-workflow-signing-gate.test.ts
+          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-cli.test.ts test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-installed-marker.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-provenance.test.ts test/evidence-pack/snapshot-acceptance.test.ts test/evidence-pack/snapshot-mutations.test.ts test/structure/snapshot-verifier-import-graph.test.ts test/structure/publish-workflow-signing-gate.test.ts
           node ../scripts/check-release-action-pins.mjs
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -73,9 +73,9 @@ jobs:
       - name: Check identical candidate on Node 24
         run: |
           node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact
-          /tmp/c13/artifact/installed/node_modules/.bin/verify-evidence-pack --version
+          # M2 uses candidateForTests / functionalCandidateForTests: fixture version refuses; the separate control retains exact version bytes.
           cd server
-          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
+          env -u SANCTUARY_SOURCE_SHA npx vitest run test/evidence-pack/snapshot-artifact.test.ts test/evidence-pack/snapshot-installed-marker.test.ts test/evidence-pack/snapshot-packed.test.ts test/evidence-pack/snapshot-acceptance.test.ts
       - name: Recheck artifact before upload
         run: |
           node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact

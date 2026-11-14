@@ -4,8 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, rename
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-// @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
-import { candidateForTests } from "../../scripts/build-evidence-pack.mjs";
+import { functionalCandidateForTests } from "./snapshot-artifact-fixtures.js";
 import { fixture, refreshFiles, resignManifest, resignCheckpoint, NOW, syncAudit, syncTransparency, descriptorBytes, trustRow, identity, replaceFile, capturedFile, type Fixture } from "./snapshot-fixtures.js";
 import { verifySnapshotAudit } from "../../src/evidence-pack/snapshot-nested.js";
 import { validateSnapshotPins } from "../../src/evidence-pack/snapshot-trust.js";
@@ -14,7 +13,7 @@ import { computeAuditEntryHash, computeAuditRoot } from "../../src/audit/chain.j
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
 let command: string;
 const CHILD_TIMEOUT_MS = 30_000;
-beforeAll(async () => { command = (await candidateForTests()).command; }, 120_000);
+beforeAll(async () => { command = (await functionalCandidateForTests()).command; }, 120_000);
 function delivery(f: Fixture) {
   const root = mkdtempSync(join(tmpdir(), "recipient-")), pack = join(root, "pack"); mkdirSync(pack);
   for (const file of f.capture.files) writeFileSync(join(pack, Buffer.from(file.name).toString()), file.bytes);

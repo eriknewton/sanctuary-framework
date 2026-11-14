@@ -44,7 +44,7 @@ function workflowPlan(text: string) {
   const check = "node server/scripts/build-evidence-pack.mjs --check-descriptor /tmp/c13/artifact";
   for (const position of [positions[1]!, positions[4]!, positions[5]!]) expect(steps[position]!.run).toContain(check);
   expect(steps[positions[2]!]!.run).toContain("node server/scripts/build-evidence-pack.mjs --install-candidate /tmp/c13/artifact");
-  for (const position of [positions[3]!, positions[4]!]) expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-artifact.test.ts");
+  for (const position of [positions[3]!, positions[4]!]) { expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-artifact.test.ts"); expect(steps[position]!.run).toContain("test/evidence-pack/snapshot-installed-marker.test.ts"); }
   const upload = steps.findIndex(s => s.uses?.startsWith("actions/upload-artifact@")); expect(upload).toBeGreaterThan(positions[5]!);
   expect(steps[upload]!.with!["if-no-files-found"]).toBe("error");
   const uploadPaths = steps[upload]!.with!.path!.trim().split(/\s+/).sort();
