@@ -83,7 +83,15 @@ impl BudgetSnapshot {
             .min(self.h_expiry.checked_sub(self.seal)?);
         (now_ms < deadline).then_some(deadline)
     }
-    pub fn recheck(&self, input: RecheckInputs, remaining_cost: u64, append_deadline: u64) -> bool {
+    /// Freeze one append deadline so a retry cannot begin a new budget window.
+    pub fn begin_append(&self, now_ms: u64, caller_deadline: u64) -> Option<AppendWindow> {
+        Some(AppendWindow {
+            snapshot: *self,
+            started_ms: now_ms,
+            deadline_ms: self.append_deadline(now_ms, caller_deadline)?,
+        })
+    }
+    fn recheck(&self, input: RecheckInputs, remaining_cost: u64, append_deadline: u64) -> bool {
         // Completion consumes the original absolute snapshot, never a fresh lease.
         input.observed_ms >= self.observed_ms
             && input.producer.grant == self.grant
@@ -97,6 +105,24 @@ impl BudgetSnapshot {
                     end <= append_deadline && end < self.producer_expiry && end < self.h_expiry
                 })
                 .unwrap_or(false)
+    }
+}
+/// One owned append's absolute budget, created only by initial clamping.
+#[derive(Debug)]
+pub struct AppendWindow {
+    snapshot: BudgetSnapshot,
+    started_ms: u64,
+    deadline_ms: u64,
+}
+impl AppendWindow {
+    pub fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
+    }
+    pub fn recheck(&self, input: RecheckInputs, remaining_cost: u64) -> bool {
+        input.observed_ms >= self.started_ms
+            && self
+                .snapshot
+                .recheck(input, remaining_cost, self.deadline_ms)
     }
 }
 #[derive(Default, Debug)]

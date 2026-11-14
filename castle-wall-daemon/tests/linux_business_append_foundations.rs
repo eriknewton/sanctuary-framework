@@ -117,9 +117,14 @@ fn three_admission_predicates_and_absolute_completion() {
     assert_eq!(snap.append_deadline(179000, 240000), Some(180000));
     let mut late = input(300000, 240000);
     late.observed_ms = 179001;
-    assert!(snap.recheck(late, 999, 180000));
+    let window = snap.begin_append(179000, 240000).unwrap();
+    assert_eq!(window.deadline_ms(), 180000);
+    assert!(window.recheck(late, 999));
+    let mut expired = late;
+    expired.observed_ms = 180000;
+    assert!(!window.recheck(expired, 0));
     late.producer.grant = [2; 16];
-    assert!(!snap.recheck(late, 999, 180000));
+    assert!(!window.recheck(late, 999));
     assert_eq!(snap.append_deadline(0, 4000), Some(4000));
     let mut cuts = CutObligation::default();
     assert!(cuts.retain([1; 16], 1));
