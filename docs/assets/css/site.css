@@ -4,6 +4,33 @@
    Author: Erik Newton
    ============================================================ */
 
+/* ---------- Fonts ----------
+   Self-hosted so the site loads nothing from a third party (the privacy page
+   says so). Same variable latin-subset files as the dashboard: must match
+   server/assets/fonts/ and the weight ranges in server/scripts/build-design-fonts.mjs.
+   SIL OFL texts travel beside the files in /assets/fonts/. */
+@font-face {
+  font-family: 'Manrope';
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url('../fonts/Manrope-wght.latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('../fonts/SpaceGrotesk-wght.latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Roboto Mono';
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url('../fonts/RobotoMono-wght.latin.woff2') format('woff2');
+}
+
 /* ---------- Tokens ---------- */
 :root {
   /* Surface hierarchy (dark-only) */
