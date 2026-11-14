@@ -1,4 +1,4 @@
-// fail-before-exempt: shared native records, legacy verification and an isolated durable sink exercise the new business consumer.
+// fail-before-exempt: round-one consumer recovery and exact-refusal assertions read the manifest-checked native corpus, outside server/src.
 // W-TS-SCHEMA
 // W-ENVELOPE-CAP
 import {it, expect, vi} from "vitest";
@@ -18,7 +18,7 @@ import * as append from "../../src/signing/business-append-contract.js";
 import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
 const corpus=loadCheckedCorpus("record_join_vectors.json") as {cases:Array<{id:string;initial:JoinState;records:JoinRecord[];expect:{accepted_prefix:number;refusal_code:string|null;final_state:JoinState}}>};
 const first=corpus.cases[0];
-const pin=(state=first.initial)=>({...state.pin,...state.grant}) as unknown as BusinessPin;
+const pin=(state=first.initial)=>({...state?.pin,...state?.grant}) as unknown as BusinessPin;
 const event=(record=first.records[0])=>({seq:100,captured_at_unix_ms:record.body.captured_at_unix_ms,prior_sha256_hex:null,event_canonical_json:Buffer.from(canonicalBytes(record.body)).toString(),critical:true,business_envelope:Buffer.from(canonicalBytes(record)).toString("base64url"),producer_signature_b64url:null,producer_key_id:null});
 class MemorySink implements BusinessDurableSink {
   value:DurableBusinessAcceptance|null=null;
@@ -44,13 +44,17 @@ it("whole positive corpus preserves signed projections, identities and join chec
 });
 it("whole invalid corpus refuses the first unaccepted record without advancing",async()=>{
   for(const row of corpus.cases.filter(row=>row.expect.refusal_code!==null)){
-    let consumer;
-    try{consumer=await create(new MemorySink(),row.initial);}catch{continue;}
+    if(row.expect.refusal_code==="INPUT") {
+      await expect(create(new MemorySink(),row.initial),row.id).rejects.toThrow("BUSINESS_PIN");
+      continue;
+    }
+    const consumer=await create(new MemorySink(),row.initial);
     for(let i=0;i<row.expect.accepted_prefix;i++)await consumer.accept(event(row.records[i]));
     const before=consumer.committedState();
-    let candidate:unknown;
-    try{candidate=event(row.records[row.expect.accepted_prefix]);}catch{candidate=null;}
-    await expect(consumer.accept(candidate),row.id).rejects.toThrow();
+    const record=row.records[row.expect.accepted_prefix];
+    const candidate=record ? event(record) : null;
+    const code=!record ? "BUSINESS_EVENT" : ["SCHEMA","OUTER"].includes(row.expect.refusal_code!) ? "BUSINESS_ENVELOPE" : ["subject-activation_id-refuse","subject-machine_id-refuse"].includes(row.id) ? "BUSINESS_AUTH" : "BUSINESS_JOIN";
+    await expect(consumer.accept(candidate),row.id).rejects.toThrow(code);
     expect(consumer.committedState(),row.id).toEqual(before);
   }
 });
@@ -126,4 +130,61 @@ it("isolated atomic disk sink reads exact bytes back and recovers the last deliv
   }};
   try{await (await create(sink)).accept(event());const bytes=readFileSync(path);const restarted=await create(sink);await restarted.accept(event());expect(readFileSync(path)).toEqual(bytes);expect(restarted.committedState()).toEqual(first.expect.final_state);}
   finally{for(const p of [stage,path]){try{unlinkSync(p);}catch{}}rmdirSync(root);}
+});
+
+it.each(["object","bytes","buffer","string"])("legacy refuses strict business event in %s form",async form=>{
+  const consume=vi.fn(async()=>{}), consumer=await createBusinessRecordConsumer({kind:"Legacy",consume});
+  const bytes=canonicalBytes(event());
+  const value=form==="object"?event():form==="string"?Buffer.from(bytes).toString():form==="buffer"?Buffer.from(bytes):new Uint8Array(bytes);
+  await expect(consumer.accept(value)).rejects.toThrow("BUSINESS_IN_LEGACY");
+  expect(consume).not.toHaveBeenCalled();
+});
+it("pending delivery excludes the last recorded replay",async()=>{
+  const sink=new MemorySink(),consumer=await create(sink);
+  await consumer.accept(event());const committed=consumer.committedState();
+  const next=corpus.cases.find(row=>row.id==="ingress-accept")!.records[1];
+  const persist=sink.persist.bind(sink);sink.persist=async()=>{throw Error("held");};
+  await expect(consumer.accept(event(next))).rejects.toThrow("held");
+  const pending=consumer.pendingDelivery();
+  await expect(consumer.accept(event())).rejects.toThrow("BUSINESS_HELD");
+  expect(consumer.pendingDelivery()).toEqual(pending);expect(consumer.committedState()).toEqual(committed);
+  sink.persist=persist;await consumer.accept(event(next));expect(consumer.pendingDelivery()).toBeNull();
+});
+it.each(["projection","identity","anchor","two ahead","unjoined"])("startup refuses inconsistent durable %s",async variant=>{
+  const sink=new MemorySink(),consumer=await create(sink);await consumer.accept(event());
+  let start=first.initial;
+  if(variant==="projection") sink.value!.projection.sequence=99;
+  if(variant==="identity") sink.value!.identity.envelope_sha256="sha256:"+"f".repeat(64);
+  if(variant==="anchor") sink.value!.checkpoint.anchor.commitment="sha256:"+"f".repeat(64);
+  if(variant==="two ahead") await consumer.accept(event(corpus.cases.find(row=>row.id==="ingress-accept")!.records[1]));
+  if(variant==="unjoined") {start=structuredClone(first.initial);start.policy.policy_digest="sha256:"+"f".repeat(64);}
+  await expect(create(sink,start)).rejects.toThrow("BUSINESS_DURABLE_STATE");
+});
+it("different authentic bytes at the accepted sequence never receive its recorded ACK",async()=>{
+  const sink=new MemorySink(),consumer=await create(sink);await consumer.accept(event());
+  const changed=corpus.cases.find(row=>row.id==="activation-start-accept")!.records[0];
+  expect(changed.body.sequence).toBe(first.records[0].body.sequence);
+  expect(canonicalBytes(changed)).not.toEqual(canonicalBytes(first.records[0]));
+  await expect(consumer.accept(event(changed))).rejects.toThrow("BUSINESS_REPLAY");
+  expect(consumer.committedState()).toEqual(first.expect.final_state);
+});
+it("self-consistent prior readback cannot acknowledge a new delivery",async()=>{
+  const sink=new MemorySink(),consumer=await create(sink);await consumer.accept(event());
+  const prior=structuredClone(sink.value!);sink.persist=async()=>structuredClone(prior);
+  await expect(consumer.accept(event(corpus.cases.find(row=>row.id==="ingress-accept")!.records[1]))).rejects.toThrow("BUSINESS_PERSISTENCE");
+  expect(consumer.committedState()).toEqual(prior.checkpoint);expect(consumer.pendingDelivery()!.sequence).toBe(2);
+});
+it("grant rollover recovers the acceptance pin and replays only recorded old bytes",async()=>{
+  const prior=corpus.cases.find(row=>row.id==="allowance-origin-accept")!,rollover=corpus.cases.find(row=>row.id==="rollover-accept")!;
+  const sink=new MemorySink(),consumer=await create(sink,prior.initial);
+  for(const record of prior.records) await consumer.accept(event(record));
+  const recorded=structuredClone(sink.value!),lastEvent=event(prior.records.at(-1)!);
+  expect(recorded.checkpoint.anchor).toEqual(rollover.initial.anchor);
+  const restarted=await create(sink,rollover.initial);
+  expect(restarted.committedState()).toEqual(rollover.initial);
+  await expect(restarted.accept(lastEvent)).resolves.toEqual({version:1,identity:recorded.identity});
+  expect(sink.value).toEqual(recorded);
+  await expect(restarted.accept(event(prior.records[0]))).rejects.toThrow("BUSINESS_AUTH");
+  await expect(consumer.accept(event(rollover.records[0]))).rejects.toThrow("BUSINESS_AUTH");
+  await restarted.accept(event(rollover.records[0]));expect(restarted.committedState()).toEqual(rollover.expect.final_state);
 });
