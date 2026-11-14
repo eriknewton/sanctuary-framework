@@ -1,3 +1,4 @@
+import {types} from "node:util";
 import {z} from "zod";
 import {canonicalBytes} from "../../signing/contract.js";
 import {BUSINESS_PIN_FIELDS, verifyIndexedRecord, type BusinessPin, type OuterRecordIndex} from "../../linux-business/producer-custody.js";
@@ -39,14 +40,15 @@ const parseInput = (event: unknown) => {
   }
   return parseBusinessEventBytes(Buffer.from(event,"utf8"));
 };
+// Every engine brand check Node exposes; a plain event object carries none of them.
+const BUILT_IN_BRANDS = Object.values(types).filter((check): check is (value: unknown) => boolean => typeof check === "function");
 /** Mode and pins are supplied by trusted composition, never selected by event fields. */
 export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<{accept(event: unknown): Promise<BusinessDeliveryAck | void>; committedState(): JoinState | null; pendingDelivery(): BusinessDeliveryIdentity | null}> {
   if (mode.kind === "Legacy") {
     return {committedState:()=>null,pendingDelivery:()=>null,async accept(event) {
       // Legacy drain callers supply plain objects, never serialized input.
       if (event === null || typeof event !== "object" || (Object.getPrototypeOf(event) !== Object.prototype && Object.getPrototypeOf(event) !== null)) throw Error("BUSINESS_IN_LEGACY");
-      // A byte view or other built-in re-parented onto Object.prototype is still not a plain object.
-      if (ArrayBuffer.isView(event) || Object.prototype.toString.call(event) !== "[object Object]") throw Error("BUSINESS_IN_LEGACY");
+      if (Array.isArray(event) || BUILT_IN_BRANDS.some(brand => brand(event)) || Object.prototype.toString.call(event) !== "[object Object]") throw Error("BUSINESS_IN_LEGACY");
       if ("business_envelope" in event && event.business_envelope !== null && event.business_envelope !== undefined) throw Error("BUSINESS_IN_LEGACY");
       await mode.consume(event);
     }};
