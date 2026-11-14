@@ -27,27 +27,54 @@ pub fn finish_admitted(remaining_ms: u64, seal: u64) -> bool {
 /// Producer expiry comes from the independently authenticated S grant.
 #[derive(Clone, Copy, Debug)]
 pub struct ProducerExpiry {
-    pub grant: [u8; 16],
-    pub at_ms: u64,
+    grant: [u8; 16],
+    at_ms: u64,
 }
 /// H expiry comes from the independent H lease observation, never a candidate body.
 #[derive(Clone, Copy, Debug)]
 pub struct HExpiry {
-    pub at_ms: u64,
+    at_ms: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct RecheckInputs {
-    pub observed_ms: u64,
-    pub producer: ProducerExpiry,
-    pub h: HExpiry,
+    observed_ms: u64,
+    producer: ProducerExpiry,
+    h: HExpiry,
 }
-#[derive(Clone, Copy, Debug)]
+/// An admission snapshot can be consumed by only one append window.
+/// ```compile_fail
+/// use castle_wall_daemon::business_profile::append_budget::BudgetSnapshot;
+/// fn retry(snapshot: BudgetSnapshot) {
+///     let _first = snapshot.begin_append(0, 10000);
+///     let _second = snapshot.begin_append(4000, 10000);
+/// }
+/// ```
+#[derive(Debug)]
 pub struct BudgetSnapshot {
     grant: [u8; 16],
     producer_expiry: u64,
     h_expiry: u64,
     seal: u64,
     observed_ms: u64,
+}
+impl ProducerExpiry {
+    /// Composition supplies the authenticated producer grant and its absolute expiry.
+    pub fn checked(grant: [u8; 16], at_ms: u64, observed_ms: u64) -> Option<Self> {
+        (at_ms > observed_ms).then_some(Self { grant, at_ms })
+    }
+}
+impl HExpiry {
+    /// Composition supplies the independently observed H lease's absolute expiry.
+    pub fn checked(at_ms: u64, observed_ms: u64) -> Option<Self> {
+        (at_ms > observed_ms).then_some(Self { at_ms })
+    }
+}
+impl RecheckInputs {
+    /// Refuse expired observations before they can enter admission or completion.
+    pub fn checked(observed_ms: u64, producer: ProducerExpiry, h: HExpiry) -> Option<Self> {
+        (observed_ms < producer.at_ms && observed_ms < h.at_ms)
+            .then_some(Self { observed_ms, producer, h })
+    }
 }
 pub fn admit(input: RecheckInputs, flows: u64) -> Option<BudgetSnapshot> {
     if flows > GRANT_FLOW_CAP {
@@ -72,7 +99,7 @@ pub fn admit(input: RecheckInputs, flows: u64) -> Option<BudgetSnapshot> {
     })
 }
 impl BudgetSnapshot {
-    pub fn append_deadline(&self, now_ms: u64, caller_deadline: u64) -> Option<u64> {
+    fn append_deadline(&self, now_ms: u64, caller_deadline: u64) -> Option<u64> {
         if now_ms < self.observed_ms {
             return None;
         }
@@ -84,11 +111,12 @@ impl BudgetSnapshot {
         (now_ms < deadline).then_some(deadline)
     }
     /// Freeze one append deadline so a retry cannot begin a new budget window.
-    pub fn begin_append(&self, now_ms: u64, caller_deadline: u64) -> Option<AppendWindow> {
+    pub fn begin_append(self, now_ms: u64, caller_deadline: u64) -> Option<AppendWindow> {
+        let deadline_ms = self.append_deadline(now_ms, caller_deadline)?;
         Some(AppendWindow {
-            snapshot: *self,
+            snapshot: self,
             started_ms: now_ms,
-            deadline_ms: self.append_deadline(now_ms, caller_deadline)?,
+            deadline_ms,
         })
     }
     fn recheck(&self, input: RecheckInputs, remaining_cost: u64, append_deadline: u64) -> bool {
