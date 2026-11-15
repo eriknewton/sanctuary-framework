@@ -39,3 +39,14 @@ it("all existing caller policies remain byte-identical after admission",async()=
   for(const row of corpus.cases){if(row.expect.refusal_code==="INPUT")continue;const before=canonicalBytes(row.initial);expect(joinStateValid(row.initial)).toBe(true);expect((await create(row.initial)).committedState()).toEqual(row.initial);expect(canonicalBytes(row.initial)).toEqual(before);}
   for(const v of Object.values(APPEND_CONTRACT.lifecycle_states)){for(const s of [v.committed,"provisional" in v && v.provisional ? v.provisional.state:null])if(s)expect(joinStateValid(s)).toBe(true);}
 });
+
+it("refuses original noncanonical join number bytes before value admission",async()=>{
+  const joins=await import("../../src/signing/record-joins.js");
+  const vectors=JSON.parse(readFileSync(new URL("../../../castle-wall-daemon/tests/fixtures/join-raw-numbers.json",import.meta.url),"utf8")) as Array<{id:string;raw:string;valid:boolean}>;
+  for(const row of vectors) {
+    // The base has only value admission; preserve its actual parse-then-predicate behavior for fail-before.
+    const parser=(joins as Partial<typeof joins>).parseJoinState;
+    const accepted=parser ? parser(Buffer.from(row.raw)) !== null : joins.joinStateValid(JSON.parse(row.raw));
+    expect(accepted,row.id).toBe(row.valid);
+  }
+});

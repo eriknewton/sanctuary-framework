@@ -17,6 +17,17 @@ pub fn decode(bytes: &[u8]) -> Option<Value> {
     Some(body)
 }
 
+/// Parse original join-state bytes; this pure boundary grants no checkpoint authority.
+pub fn decode_join_state(bytes: &[u8]) -> Option<Value> {
+    let state = crate::smb::strict_json::parse(bytes, bytes.len()).ok()?;
+    // Must match parseJoinState in record-joins.ts: raw canonical equality precedes value admission.
+    if crate::smb::jcs::encode(&state).ok()?.as_bytes() != bytes {
+        return None;
+    }
+    let state: Value = serde_json::from_slice(bytes).ok()?;
+    join_state_valid(&state).then_some(state)
+}
+
 /// Must match BUSINESS_PIN_FIELDS in producer-custody.ts and verify_pin_fields in closure_vectors.json: the one business verify contract binds the enrolled subject and the grant's activation, lease and generation.
 pub const VERIFY_PIN_FIELDS: &[&str] = &[
     "role",
@@ -521,6 +532,21 @@ mod bounded_tests {
     use super::super::{append_contract, join_lifecycle};
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn raw_join_numbers_refuse_before_admission() {
+        let rows: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/join-raw-numbers.json"))
+                .unwrap();
+        for row in rows.as_array().unwrap() {
+            assert_eq!(
+                decode_join_state(row["raw"].as_str().unwrap().as_bytes()).is_some(),
+                row["valid"].as_bool().unwrap(),
+                "raw number boundary {}",
+                row["id"]
+            );
+        }
+    }
 
     #[test]
     fn shared_bounded_join_paths() {

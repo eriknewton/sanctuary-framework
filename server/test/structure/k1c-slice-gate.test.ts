@@ -73,6 +73,7 @@ const expectedImports={
   ],
   "signing/record-joins.ts": [
     "../linux-business/producer-custody.js",
+    "../smb/parse-strict.js",
     "./contract.js",
     "./join-state-contract.json",
     "./linux-business-records.js",

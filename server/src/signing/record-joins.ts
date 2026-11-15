@@ -1,3 +1,4 @@
+import {parseStrict} from "../smb/parse-strict.js";
 import { z } from "zod";
 import { verifyIndexedRecord, type BusinessPin, type OuterRecordIndex } from "../linux-business/producer-custody.js";
 import type { RolePin } from "./strict-verifier.js";
@@ -46,7 +47,8 @@ export function joinOuterValid(record: JoinRecord): boolean {
 const U64_MAX = 18446744073709551615n; // 2^64 - 1.
 const isObject = (v: unknown): v is ObjectValue => v !== null && typeof v === "object" && !Array.isArray(v);
 const exactKeys = (v: unknown, keys: readonly string[]): v is ObjectValue => isObject(v) && Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
-const safeU64 = (v: unknown): boolean => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+// Must match records.rs safe_u64: negative zero is a float in the native JSON model.
+const safeU64 = (v: unknown): boolean => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && !Object.is(v, -0);
 // Must match state_token in records.rs: each token admits one exact representation.
 const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
   role: v => ROLE_REGISTRY.some(entry => entry.role === v),
@@ -73,6 +75,15 @@ export function joinStateValid(state: unknown): state is JoinState {
   const schema = JOIN_STATE_SCHEMA as Record<string, Record<string, string>>;
   return exactKeys(state, Object.keys(schema)) && Object.entries(schema).every(([name, fields]) =>
     exactKeys(state[name], Object.keys(fields)) && Object.entries(fields).every(([key, token]) => STATE_TOKENS[token]((state[name] as ObjectValue)[key])));
+}
+/** Parse original join-state bytes without normalizing number spellings into trusted integers. */
+export function parseJoinState(bytes: Uint8Array): JoinState | null {
+  try {
+    const state = parseStrict(bytes, bytes.byteLength);
+    // Must match records.rs decode_join_state: raw canonical equality precedes value admission.
+    if (!Buffer.from(canonicalBytes(state)).equals(Buffer.from(bytes))) return null;
+    return joinStateValid(state) ? state : null;
+  } catch { return null; }
 }
 const get = (value: Json | undefined, path: string): Json | undefined => {
   for (const key of path.split(".")) {

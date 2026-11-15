@@ -63,3 +63,10 @@ it("keeps every exported state field table immutable",()=>{
   expect(Object.isFrozen(JOIN_STATE_SCHEMA)).toBe(true);
   expect(Object.values(JOIN_STATE_SCHEMA).every(fields=>Object.isFrozen(fields))).toBe(true);
 });
+
+it("refuses negative zero in UID and port value admission",()=>{
+  const uid=seed();uid.policy.agent_uids=[-0];
+  const port=seed();port.policy.vendors=[{address:"1.2.3.4",port:-0}];
+  expect(joinStateValid(uid),"negative-zero UID").toBe(false);
+  expect(joinStateValid(port),"negative-zero port").toBe(false);
+});
