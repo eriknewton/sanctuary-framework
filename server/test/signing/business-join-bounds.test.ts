@@ -32,12 +32,13 @@ it("bounds newly advanced signatures as well as seeded history",()=>{
 
 it("accepts maximal canonical policies and every registered pin role unchanged",async()=>{
   const {ROLE_REGISTRY}=await import("../../src/signing/contract.js");
+  const {BUSINESS_SCHEMA_AST}=await import("../../src/signing/linux-business-records.js");
   const {JOIN_HISTORY_MAX,POLICY_AGENT_UIDS_MAX,POLICY_VENDORS_MAX}=await import("../../src/signing/record-joins.js");
   for(const {role} of ROLE_REGISTRY){
     const state=seed();state.pin.role=role;
     state.flow_state.history=Array.from({length:JOIN_HISTORY_MAX},()=>record());
     state.policy.agent_uids=Array.from({length:POLICY_AGENT_UIDS_MAX},(_,i)=>Number.MAX_SAFE_INTEGER-POLICY_AGENT_UIDS_MAX+1+i);
-    state.policy.vendors=Array.from({length:POLICY_VENDORS_MAX},(_,i)=>({address:"255.255.255.255",port:65535-POLICY_VENDORS_MAX+1+i})); // Maximal IPv4 octets and u16 port domain.
+    state.policy.vendors=Array.from({length:POLICY_VENDORS_MAX},(_,i)=>({address:"255.255.255.255",port:BUSINESS_SCHEMA_AST.definitions.Port.max-POLICY_VENDORS_MAX+1+i})); // Maximal IPv4 octets and u16 port domain.
     const before=structuredClone(state);
     expect(joinStateValid(state)).toBe(true);
     const consumer=await createBusinessRecordConsumer({kind:"Business",pin:{...state.pin,...state.grant} as unknown as BusinessPin,committed_state:state,durable_sink:sink});
