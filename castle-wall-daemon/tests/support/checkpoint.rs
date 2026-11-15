@@ -867,9 +867,46 @@ fn second_accept_during_reread_is_terminal_before_binding() {
     accepting_serve_fixture(false, true, true, false, false);
 }
 
+// The existing one-test child-driver pattern (also used by wal_nits) keeps the
+// scripted peer in a separate process without adding a standalone test case.
+fn checkpoint_signer_child(root: &std::path::Path) {
+    use castle_wall_daemon::business_profile::{signer_peer, signer_service};
+    use std::{fs, os::fd::AsRawFd};
+    // Check the post-exec principal too: no capability can return across exec.
+    signer_peer::empty_capabilities(unsafe { libc::getpid() }, false).unwrap();
+    let view: Value = serde_json::from_slice(&fs::read(root.join("signer-view")).unwrap()).unwrap();
+    let reply = signer_service::encode(&view, &[]).unwrap();
+    // Bind in the child: SO_PEERCRED must name this dropped principal, not the parent.
+    let listener = signer_peer::listen(&root.join("signer")).unwrap();
+    fs::write(root.join("signer-ready"), b"ready").unwrap();
+    let mut poll = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+    let socket = signer_peer::accept(listener.as_raw_fd()).unwrap();
+    poll.fd = socket.as_raw_fd();
+    loop {
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        let Ok(packet) =
+            signer_peer::receive(socket.as_raw_fd(), wire::WRITER_SIGN_PACKET_MAX_BYTES)
+        else {
+            break;
+        };
+        if packet.bytes.is_empty() {
+            break;
+        }
+        assert_eq!(packet.bytes, b"{\"op\":\"STATUS\"}");
+        if signer_peer::send(socket.as_raw_fd(), &reply, &[]).is_err() {
+            break;
+        }
+    }
+}
+
 #[test]
 fn shared_run_refuses_every_checkpoint_opcode() {
-    use castle_wall_daemon::business_profile::{signer_peer, signer_service};
+    use castle_wall_daemon::business_profile::signer_peer;
     use sha2::{Digest, Sha256};
     use std::{
         fs,
@@ -880,9 +917,20 @@ fn shared_run_refuses_every_checkpoint_opcode() {
                 process::CommandExt,
             },
         },
-        sync::{atomic::AtomicBool, Arc},
-        time::Duration,
+        time::{Duration, Instant},
     };
+    const SIGNER_CHILD: &str = "K1_CHECKPOINT_SIGNER_CHILD";
+    if let Some(root) = std::env::var_os(SIGNER_CHILD) {
+        checkpoint_signer_child(std::path::Path::new(&root));
+        return;
+    }
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     for part in [false, true] {
         let bus = bus_fixture::Fixture::new();
         let root = bus.root.path();
@@ -903,48 +951,39 @@ fn shared_run_refuses_every_checkpoint_opcode() {
         let mut view = f.view.lock().unwrap().clone();
         view.state = "LOCKED".into();
         let s_path = root.join("signer");
-        let s_listener = signer_peer::listen(&s_path).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
-        let s_thread = std::thread::spawn(move || {
-            let socket = loop {
-                if stopping.load(Ordering::SeqCst) {
-                    return;
-                }
-                if let Ok(s) = signer_peer::accept(s_listener.as_raw_fd()) {
-                    break s;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            };
-            while !stopping.load(Ordering::SeqCst) {
-                let mut poll = libc::pollfd {
-                    fd: socket.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut poll, 1, 10) } != 1 {
-                    continue;
-                }
-                let Ok(packet) =
-                    signer_peer::receive(socket.as_raw_fd(), wire::WRITER_SIGN_PACKET_MAX_BYTES)
-                else {
-                    break;
-                };
-                if packet.bytes.is_empty() {
-                    break;
-                }
-                assert_eq!(packet.bytes, b"{\"op\":\"STATUS\"}");
-                if signer_peer::send(
-                    socket.as_raw_fd(),
-                    &signer_service::encode(&serde_json::to_value(&view).unwrap(), &[]).unwrap(),
-                    &[],
-                )
-                .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        fs::write(root.join("signer-view"), serde_json::to_vec(&view).unwrap()).unwrap();
+        // Match linux_business_signer_client::capability_dropped_exe: root CI's
+        // dropped child cannot exec through the runner's home. Both images and
+        // every fixture path live under this test-owned temp root instead.
+        let signer_image = root.join("signer-child");
+        fs::copy(std::env::current_exe().unwrap(), &signer_image).unwrap();
+        fs::set_permissions(&signer_image, fs::Permissions::from_mode(0o700)).unwrap();
+        // Hash the large test image before starting the child's bounded accept wait.
+        let signer_hash = hex::encode(Sha256::digest(fs::read(&signer_image).unwrap()));
+        let mut signer_command = std::process::Command::new(&signer_image);
+        signer_command
+            .args([
+                "--exact",
+                "checkpoint::shared_run_refuses_every_checkpoint_opcode",
+                "--test-threads=1",
+            ])
+            .env(SIGNER_CHILD, root)
+            .current_dir(root)
+            // CI counts libtest summaries, so only the parent may print one.
+            .stdout(std::process::Stdio::null());
+        unsafe {
+            signer_command.pre_exec(signer_peer::drop_capabilities);
+        }
+        let mut signer = Child(signer_command.spawn().unwrap());
+        let end = Instant::now() + Duration::from_secs(5);
+        while !root.join("signer-ready").exists() {
+            assert!(
+                signer.0.try_wait().unwrap().is_none(),
+                "signer child exited"
+            );
+            assert!(Instant::now() < end, "signer child readiness timeout");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let listener_path = root.join("records");
         let listener = signer_peer::listen(&listener_path).unwrap();
         fs::set_permissions(&listener_path, fs::Permissions::from_mode(0o660)).unwrap();
@@ -956,7 +995,7 @@ fn shared_run_refuses_every_checkpoint_opcode() {
         let config_path = bus.config_path();
         let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
         config["writer_sha256"] = json!(hex::encode(Sha256::digest(fs::read(&image).unwrap())));
-        config["signer"] = json!({"uid":uid,"gid":gid,"executable_sha256":hex::encode(Sha256::digest(fs::read("/proc/self/exe").unwrap())),"cgroup":fs::read_to_string("/proc/self/cgroup").unwrap().trim()});
+        config["signer"] = json!({"uid":uid,"gid":gid,"executable_sha256":signer_hash,"cgroup":fs::read_to_string(format!("/proc/{}/cgroup", signer.0.id())).unwrap().trim()});
         fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         let status = root.join("status");
         fs::write(&status,"CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n").unwrap();
@@ -980,7 +1019,7 @@ fn shared_run_refuses_every_checkpoint_opcode() {
         fs::set_permissions(&seam, fs::Permissions::from_mode(0o600)).unwrap();
         let raw = listener.as_raw_fd();
         let mut command = std::process::Command::new("/usr/bin/python3");
-        command.env_clear();
+        command.env_clear().current_dir(root);
         command.args(["-c","import os,sys; os.environ['LISTEN_PID']=str(os.getpid()); os.execve(sys.argv[1],sys.argv[1:],os.environ)"]).arg(&image);
         command
             .args(["--test-writer", seam.to_str().unwrap()])
@@ -996,13 +1035,6 @@ fn shared_run_refuses_every_checkpoint_opcode() {
                 }
                 Ok(())
             });
-        }
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
         }
         let mut child = Child(command.spawn().unwrap());
         let mut text = [0; 1024];
@@ -1076,8 +1108,7 @@ fn shared_run_refuses_every_checkpoint_opcode() {
             "shared run chooses terminal Refuse for every checkpoint opcode"
         );
         assert!(!child.0.wait().unwrap().success());
-        stop.store(true, Ordering::SeqCst);
-        s_thread.join().unwrap();
+        assert!(signer.0.wait().unwrap().success(), "signer STATUS loop");
     }
 }
 
