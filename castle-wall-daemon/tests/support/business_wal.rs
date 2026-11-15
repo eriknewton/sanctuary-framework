@@ -232,8 +232,12 @@ fn exact_bytes_two_facts_and_checkpoint_survive_both_release_orders() {
             wal.persist_d_fact(seq, authenticated_original(&envelope))
                 .unwrap();
         } else {
-            wal.persist_ts_fact(seq, sink.deliver(&envelope).unwrap())
-                .unwrap();
+            wal.persist_ts_fact(
+                seq,
+                sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+                    .unwrap(),
+            )
+            .unwrap();
         }
         assert!(
             matches!(wal.compact_one(), Ok(false)),
@@ -244,8 +248,12 @@ fn exact_bytes_two_facts_and_checkpoint_survive_both_release_orders() {
         let mut wal = f.open(false).unwrap();
         if d_first {
             assert_eq!(wal.next_delivery().unwrap().unwrap().1, envelope);
-            wal.persist_ts_fact(seq, sink.deliver(&envelope).unwrap())
-                .unwrap();
+            wal.persist_ts_fact(
+                seq,
+                sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+                    .unwrap(),
+            )
+            .unwrap();
         } else {
             wal.persist_d_fact(seq, authenticated_original(&envelope))
                 .unwrap();
@@ -279,7 +287,11 @@ fn delivery_cursor_waits_for_fact_and_checkpoint_readback() {
             assert_eq!(wal.next_delivery().unwrap().unwrap().1, first);
             f.fault(fault.0, fault.1);
             assert!(wal
-                .persist_ts_fact(BusinessSequence(1), sink.deliver(&first).unwrap())
+                .persist_ts_fact(
+                    BusinessSequence(1),
+                    sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+                        .unwrap()
+                )
                 .is_err());
             assert!(
                 wal.next_delivery().is_err(),
@@ -294,8 +306,12 @@ fn delivery_cursor_waits_for_fact_and_checkpoint_readback() {
             if let Some((sequence, envelope)) = wal.next_delivery().unwrap() {
                 if sequence.0 == 1 {
                     assert_eq!(envelope, first);
-                    wal.persist_ts_fact(sequence, sink.deliver(&first).unwrap())
-                        .unwrap();
+                    wal.persist_ts_fact(
+                        sequence,
+                        sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+                            .unwrap(),
+                    )
+                    .unwrap();
                 }
             }
             assert_eq!(
@@ -534,9 +550,10 @@ fn wrong_release_identity_and_unverified_envelope_do_not_publish() {
         "D fact belongs to its exact original"
     );
     let mut sink = sink();
-    sink.deliver(&first).unwrap();
+    sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+        .unwrap();
     assert!(
-        wal.persist_ts_fact(BusinessSequence(1), sink.deliver(&second).unwrap())
+        wal.persist_ts_fact(BusinessSequence(1), sink.deliver(&token_for(1)).unwrap())
             .is_err(),
         "TS fact belongs to its exact original"
     );
@@ -566,8 +583,12 @@ fn compaction_interruption_preserves_released_checkpoint_and_restarts_safely() {
         let mut wal = f.open(true).unwrap();
         let envelope = f.append(&mut wal, 0);
         let mut sink = sink();
-        wal.persist_ts_fact(BusinessSequence(1), sink.deliver(&envelope).unwrap())
-            .unwrap();
+        wal.persist_ts_fact(
+            BusinessSequence(1),
+            sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+                .unwrap(),
+        )
+        .unwrap();
         wal.persist_d_fact(BusinessSequence(1), authenticated_original(&envelope))
             .unwrap();
         let join = wal.committed_join().unwrap();
@@ -610,8 +631,12 @@ fn missing_compacted_checkpoint_never_reconstructs_genesis() {
     let mut wal = f.open(true).unwrap();
     let envelope = f.append(&mut wal, 0);
     let mut sink = sink();
-    wal.persist_ts_fact(BusinessSequence(1), sink.deliver(&envelope).unwrap())
-        .unwrap();
+    wal.persist_ts_fact(
+        BusinessSequence(1),
+        sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+            .unwrap(),
+    )
+    .unwrap();
     wal.persist_d_fact(BusinessSequence(1), authenticated_original(&envelope))
         .unwrap();
     wal.compact_one().unwrap();
@@ -677,7 +702,7 @@ fn sink_adapter_retains_exact_delivery_across_wrong_acknowledgements() {
     }
     let f = Fixture::new();
     let mut wal = f.open(true).unwrap();
-    let first = f.append(&mut wal, 0);
+    f.append(&mut wal, 0);
     let wrong = Arc::new(AtomicBool::new(true));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut adapter = BusinessSinkAdapter::from_trusted_sink(ReplyFault {
@@ -690,14 +715,13 @@ fn sink_adapter_retains_exact_delivery_across_wrong_acknowledgements() {
         calls: calls.clone(),
     });
     assert!(
-        adapter.deliver(&first).is_err(),
+        adapter
+            .deliver(&wal.next_delivery().unwrap().unwrap().1)
+            .is_err(),
         "wrong ACK identity never constructs the sealed TS fact"
     );
     assert!(
-        matches!(
-            adapter.deliver(&canonical(&f.records[1])),
-            Err(Refusal::Held)
-        ),
+        matches!(adapter.deliver(&token_for(1)), Err(Refusal::Held)),
         "pending sink delivery owns exact E"
     );
     assert_eq!(
@@ -706,8 +730,13 @@ fn sink_adapter_retains_exact_delivery_across_wrong_acknowledgements() {
         "changed E cannot reach the trusted sink while owned"
     );
     wrong.store(false, Ordering::SeqCst);
-    wal.persist_ts_fact(BusinessSequence(1), adapter.deliver(&first).unwrap())
-        .unwrap();
+    wal.persist_ts_fact(
+        BusinessSequence(1),
+        adapter
+            .deliver(&wal.next_delivery().unwrap().unwrap().1)
+            .unwrap(),
+    )
+    .unwrap();
     assert!(wal.next_delivery().unwrap().is_none());
 }
 
@@ -720,7 +749,11 @@ fn reconciliation_republishes_exact_bytes_instead_of_trusting_a_later_sync() {
     let mut sink = sink();
     f.fault(WalStep::DirectorySync, 0);
     assert!(wal
-        .persist_ts_fact(BusinessSequence(1), sink.deliver(&envelope).unwrap())
+        .persist_ts_fact(
+            BusinessSequence(1),
+            sink.deliver(&wal.next_delivery().unwrap().unwrap().1)
+                .unwrap()
+        )
         .is_err());
     f.faults.events.lock().unwrap().clear();
     wal.reconcile_publication().unwrap();
@@ -809,18 +842,16 @@ fn forty_uncertain_publications_retain_one_intent_and_every_charge() {
         )
         .is_err());
     let original = fs::read(f.root.path().join("row-00000000000000000001.json")).unwrap();
-    let mut charged = wal.charged_bytes().0;
-    let allocation_charge = charged;
+    let allocation_charge = wal.charged_bytes().0;
     for _ in 0..40 {
         f.fault(WalStep::DirectorySync, 0);
         assert!(wal.reconcile_publication().is_err());
         assert_eq!(wal.state(), WalState::PublicationHeld);
         assert_eq!(
             wal.charged_bytes().0,
-            charged + allocation_charge,
-            "each uncertain replacement remains charged"
+            2 * allocation_charge,
+            "one publication retains at most target plus staging charge"
         );
-        charged = wal.charged_bytes().0;
         assert_eq!(
             fs::read(f.root.path().join("row-00000000000000000001.json")).unwrap(),
             original
@@ -914,7 +945,12 @@ fn maximal_admission_preserves_rewrite_space_through_release() {
         "next admission cannot spend rewrite reserve"
     );
     assert_eq!(
-        wal.persist_ts_fact(BusinessSequence(1), sink().deliver(&envelope).unwrap()),
+        wal.persist_ts_fact(
+            BusinessSequence(1),
+            sink()
+                .deliver(&wal.next_delivery().unwrap().unwrap().1)
+                .unwrap()
+        ),
         Ok(()),
         "TS fact retains rewrite headroom"
     );
@@ -1007,4 +1043,22 @@ fn restart_without_active_intent_allows_the_next_sign_marker() {
         wal.persist_sign_marker(&authenticated_read(reserve.next()), NOW),
         Err(Refusal::Held)
     );
+}
+
+fn token_for(index: usize) -> DeliveryToken {
+    let f = Fixture::new();
+    let mut wal = f.open(true).unwrap();
+    let mut sink = sink();
+    for i in 0..=index {
+        f.append(&mut wal, i);
+        if i < index {
+            let token = wal.next_delivery().unwrap().unwrap().1;
+            wal.persist_ts_fact(
+                BusinessSequence((i + 1) as u64),
+                sink.deliver(&token).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    wal.next_delivery().unwrap().unwrap().1
 }

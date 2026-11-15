@@ -1,9 +1,11 @@
+// fail-before-exempt: maximal raw-parser round trips consume the shared native size fixture.
 // Bounded state admission preserves exact caller policies and retained envelopes.
 // W-JOIN-BOUNDS
 import {it, expect} from "vitest";
 import {readFileSync} from "node:fs";
 import {APPEND_CONTRACT, appendShape, type BusinessDeliveryIdentity} from "../../src/signing/business-append-contract.js";
-import {advance, joinStateValid, JOIN_STATE_SCHEMA, type JoinState, type JoinRecord} from "../../src/signing/record-joins.js";
+import {advance, joinStateValid, parseJoinState, JOIN_STATE_BYTES_MAX, JOIN_STATE_SCHEMA, type JoinState, type JoinRecord} from "../../src/signing/record-joins.js";
+import {canonicalBytes} from "../../src/signing/contract.js";
 import {initialLifecycle, lifecycleStep} from "../../src/signing/business-join-lifecycle.js";
 import {createBusinessRecordConsumer, type BusinessDurableSink} from "../../src/castle-wall/runtime/business-record-consumer.js";
 import type {BusinessPin} from "../../src/linux-business/producer-custody.js";
@@ -40,10 +42,14 @@ it("accepts maximal canonical policies and every registered pin role unchanged (
   const {BUSINESS_SCHEMA_AST}=await import("../../src/signing/linux-business-records.js");
   const {JOIN_HISTORY_MAX}=await import("../../src/signing/record-joins.js");
   for(const {role} of ROLE_REGISTRY){
-    const state=seed();state.pin.role=role;
-    state.flow_state.history=Array.from({length:JOIN_HISTORY_MAX},()=>record());
+    const state=JSON.parse(readFileSync(new URL("../../../castle-wall-daemon/tests/fixtures/maximal-join-state.json",import.meta.url),"utf8")) as JoinState;state.pin.role=role;
+    state.flow_state.history=Array.from({length:JOIN_HISTORY_MAX},()=>structuredClone(state.flow_state.history[0]));
     state.policy.agent_uids=Array.from({length:POLICY_AGENT_UIDS_MAX},(_,i)=>Number.MAX_SAFE_INTEGER-POLICY_AGENT_UIDS_MAX+1+i);
     state.policy.vendors=Array.from({length:POLICY_VENDORS_MAX},(_,i)=>({address:"255.255.255.255",port:BUSINESS_SCHEMA_AST.definitions.Port.max-POLICY_VENDORS_MAX+1+i})); // Maximal IPv4 octets and u16 port domain.
+    const raw=canonicalBytes(state);
+    expect(raw.length).toBeLessThanOrEqual(JOIN_STATE_BYTES_MAX);
+    expect(raw.length).toBeGreaterThan(JOIN_STATE_BYTES_MAX - 6500); // 64 envelopes times 96 conservative bytes, plus registry role widths.
+    expect(parseJoinState(raw)).toEqual(state);
     const before=structuredClone(state);
     expect(joinStateValid(state)).toBe(true);
     const consumer=await createBusinessRecordConsumer({kind:"Business",pin:{...state.pin,...state.grant} as unknown as BusinessPin,committed_state:state,durable_sink:sink});

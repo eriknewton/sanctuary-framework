@@ -184,12 +184,34 @@ impl CheckpointSeed {
 /// This dependency is a trusted durable business sink, not an IPC ACK parser.
 /// It returns only after exact E, projection, join checkpoint and identity are atomically persisted and read back.
 /// Must match BusinessDurableSink in server/src/castle-wall/runtime/business-record-consumer.ts.
-pub trait TrustedBusinessSink: Send {
+mod sink_seal {
+    pub trait Sealed {}
+    // Isolated fixtures supply synthetic durable sinks; installed composition has no implementor yet.
+    #[cfg(feature = "test-isolation")]
+    impl<T> Sealed for T {}
+}
+pub trait TrustedBusinessSink: sink_seal::Sealed + Send {
     fn accept_durably(&mut self, exact_envelope: &[u8]) -> Result<Value>;
 }
 pub struct BusinessSinkAdapter<T: TrustedBusinessSink> {
     sink: T,
     pending: Option<Vec<u8>>,
+}
+/// Only next_delivery mints this read-only capability after durable cursor validation.
+#[derive(Debug)]
+pub struct DeliveryToken {
+    envelope: Vec<u8>,
+}
+impl DeliveryToken {
+    pub fn envelope(&self) -> &[u8] {
+        &self.envelope
+    }
+}
+#[cfg(feature = "test-isolation")]
+impl PartialEq<Vec<u8>> for DeliveryToken {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        &self.envelope == other
+    }
 }
 pub struct TsReleaseFact {
     identity: Identity,
@@ -201,7 +223,9 @@ impl<T: TrustedBusinessSink> BusinessSinkAdapter<T> {
             pending: None,
         }
     }
-    pub fn deliver(&mut self, envelope: &[u8]) -> Result<TsReleaseFact> {
+    pub fn deliver(&mut self, envelope: &DeliveryToken) -> Result<TsReleaseFact> {
+        // The token proves that W's previous delivery fact and cursor were read back.
+        let envelope = envelope.envelope();
         let identity = Identity::from_envelope(envelope)?;
         if self.pending.as_ref().is_some_and(|b| b != envelope) {
             return Err(Refusal::Held);
@@ -760,13 +784,14 @@ impl BusinessWal {
             // does not establish durability of the earlier possibly published directory change.
             let bytes = pending.bytes.clone();
             let pool = pending.pool;
-            self.capacity(allocation(&pending.name), pool)?;
-            self.usage[pool_index(pool)] += allocation(&pending.name);
-            let pending = self.pending.as_mut().ok_or(Refusal::Held)?;
-            pending.old_size = pending
-                .old_size
-                .checked_add(allocation(&pending.name))
-                .ok_or(Refusal::Capacity)?;
+            // A renamed target plus one fixed staging file is the entire physical footprint.
+            // Repeated reconciliation reuses this charge, including after another sync failure.
+            if pending.old_size == 0 {
+                self.capacity(allocation(&pending.name), pool)?;
+                self.usage[pool_index(pool)] += allocation(&pending.name);
+                let pending = self.pending.as_mut().ok_or(Refusal::Held)?;
+                pending.old_size = allocation(&pending.name);
+            }
             self.hooks.before(WalStep::StageCreate)?;
             let mut stage = open_at(
                 &self.root,
@@ -1005,7 +1030,7 @@ impl BusinessWal {
         checkpoint.anchor = expected;
         self.save_checkpoint(checkpoint)
     }
-    pub fn next_delivery(&self) -> Result<Option<(BusinessSequence, Vec<u8>)>> {
+    pub fn next_delivery(&self) -> Result<Option<(BusinessSequence, DeliveryToken)>> {
         self.ready()?;
         let next = self
             .checkpoint
@@ -1024,10 +1049,12 @@ impl BusinessWal {
         let row = self.row(next)?;
         Ok(Some((
             BusinessSequence(next),
-            decode_bytes(
-                row.envelope.as_ref().ok_or(Refusal::Missing)?,
-                writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
-            )?,
+            DeliveryToken {
+                envelope: decode_bytes(
+                    row.envelope.as_ref().ok_or(Refusal::Missing)?,
+                    writer_protocol::WRITER_ENVELOPE_MAX_BYTES,
+                )?,
+            },
         )))
     }
     pub fn persist_ts_fact(

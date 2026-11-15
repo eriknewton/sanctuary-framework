@@ -676,8 +676,21 @@ mod bounded_tests {
                 ..=PORT_MAX)
                 .map(|port| json!({"address":"255.255.255.255","port":port}))
                 .collect::<Vec<_>>());
-            maximum["flow_state"]["history"] = json!(vec![record; JOIN_HISTORY_MAX]);
+            let largest: Value =
+                serde_json::from_str(include_str!("../../tests/fixtures/maximal-join-state.json"))
+                    .unwrap();
+            maximum = largest;
+            maximum["pin"]["role"] = json!(role.0);
             assert!(join_state_valid(&maximum), "maximal state for {}", role.0);
+            let raw = crate::smb::jcs::encode(&maximum).unwrap();
+            assert!(raw.len() <= JOIN_STATE_BYTES_MAX);
+            // 64 envelopes times 96 conservative bytes, plus registry role widths.
+            assert!(raw.len() > JOIN_STATE_BYTES_MAX - 6500);
+            assert_eq!(
+                decode_join_state(raw.as_bytes()),
+                Some(maximum),
+                "maximal raw round trip"
+            );
         }
         assert!(advance(seed, record).is_ok());
         let mut bad = record.clone();

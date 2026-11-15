@@ -215,7 +215,9 @@ struct Recovery {
     locked_after_recovery_at: Option<u64>,
 }
 // Must match the wall-branch deadline pin below. The existing anchored wall window
-// is followed by one relative sleep and one bounded loop pass before the next send.
+// is followed by one relative sleep and one loop pass before the next send. Charging
+// that pass as one watchdog tick is an assumption. The bound tolerates adjudication
+// up to about 510 ms; the 11 ms work-plus-sleep budget is not load-bearing arithmetic.
 pub fn writer_next_request_bound_ns(t0: u64) -> Option<u64> {
     t0.checked_add((WRITER_SIGN_DEADLINE_MAX_MS + 2 * WATCHDOG_TICK_MS as u64) * NS_PER_MS)
 }
@@ -705,9 +707,9 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
         {
             return Ok(None);
         }
-        if self.signer.bind(&candidate.challenge.status.grant).is_err() {
+        if let Err(error) = self.signer.bind(&candidate.challenge.status.grant) {
             self.state = WriterState::Settling;
-            return Ok(None);
+            return Err(Error::Signer(error));
         }
         self.frozen = Some(candidate.challenge.status.clone());
         self.state = WriterState::Granted;
@@ -1502,6 +1504,8 @@ pub mod test_support {
     ) -> Result<Option<Operation>> {
         machine.adjudicate(received)
     }
+    /// Pure machine helper only. Live, accept, tick, session and preemption schedules
+    /// are witnessed by advancing_serve_schedule through serve_accept, not this helper.
     pub fn checkpoint_reread<P: SignerPort, R: Reconciler>(
         machine: &mut WriterMachine<P, R>,
     ) -> Result<Option<Operation>> {

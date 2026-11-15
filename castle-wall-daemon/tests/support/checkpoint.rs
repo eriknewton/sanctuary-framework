@@ -1664,3 +1664,18 @@ fn advancing_serve_defers_query_and_each_part_at_the_last_tick() {
 fn advancing_serve_preempts_adjudication_at_the_real_call_site() {
     advancing_serve_schedule(false, true);
 }
+
+#[test]
+fn checkpoint_bind_failure_is_immediately_terminal() {
+    let (f, mut m, mut v) = fixture();
+    let parts = query(&f, &mut m, &mut v, REQUEST);
+    prepare(&mut m, &parts);
+    support::scripted_signer(&mut m).bind =
+        Box::new(|_| Err(castle_wall_daemon::business_profile::signer_client::Refusal::Grant));
+    assert!(
+        support::checkpoint_reread(&mut m).is_err(),
+        "checkpoint bind failure is terminal at adjudication"
+    );
+    assert_eq!(m.state(), WriterState::Settling);
+    assert!(!support::checkpoint_owned(&m));
+}

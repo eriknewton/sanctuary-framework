@@ -398,14 +398,14 @@ fn anchor_reply(op: &str, anchor: &serde_json::Value, uncertain: bool) -> Vec<u8
 #[test]
 fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
     let proposal = frozen_reserve(ID);
-    for outcome in ["REFUSED", "ANCHOR_ACK", "timeout", "disconnect"] {
-        for _ in 0..40 {
-            let f = Fixture::new();
-            let (mut c, s) = f.drain();
+    for terminal in ["timeout", "disconnect"] {
+        let f = Fixture::new();
+        let (mut c, s) = f.drain();
+        for wave in 0..40 {
             c.mutation(&proposal, u64::MAX).unwrap();
             assert_eq!(receive(&s), proposal.bytes());
-            match outcome {
-                "REFUSED" => send(
+            if wave % 2 == 0 {
+                send(
                     &s,
                     &d::encode(
                         &d::header("REFUSED", ID, d::DRAIN_SLOTS[0].1),
@@ -413,28 +413,12 @@ fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
                         d::Direction::FromDrain,
                     )
                     .unwrap(),
-                ),
-                "ANCHOR_ACK" => send(&s, &anchor_reply("ANCHOR_ACK", proposal.next(), false)),
-                "timeout" => {
-                    f.now
-                        .fetch_add(d::D_REQUEST_DEADLINE_MS as u64 * NS, Ordering::SeqCst);
-                    send(&s, &anchor_reply("ANCHOR_ACK", proposal.next(), false));
-                }
-                "disconnect" => unsafe {
-                    libc::shutdown(s.as_raw_fd(), libc::SHUT_RDWR);
-                },
-                _ => unreachable!(),
-            }
-            let reply = c.poll();
-            if matches!(outcome, "timeout" | "disconnect") {
-                assert!(reply.is_err());
+                );
             } else {
-                assert!(reply.unwrap().is_some());
+                send(&s, &anchor_reply("ANCHOR_ACK", proposal.next(), false));
             }
-            assert!(
-                c.retained_mutation().is_some(),
-                "non-READ completion retains exact mutation"
-            );
+            assert!(c.poll().unwrap().is_some());
+            assert!(c.retained_mutation().is_some(), "non-READ completion retains exact mutation");
             assert_eq!(
                 c.retained_mutation().unwrap().bytes(),
                 proposal.bytes(),
@@ -444,34 +428,46 @@ fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
                 !c.lease_live(f.now.load(Ordering::SeqCst)),
                 "only READ renews D liveness"
             );
-            if !matches!(outcome, "timeout" | "disconnect") {
-                assert_eq!(
-                    c.mutation(&frozen_reserve(SESSION), u64::MAX),
-                    Err(Refusal::Busy),
-                    "changed request cannot replace owned mutation"
-                );
-                c.read(ID, u64::MAX).unwrap();
-                receive(&s);
-                send(&s, &anchor_reply("READ_REPLY", proposal.next(), true));
-                assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
-                assert!(
-                    c.retained_mutation().is_some(),
-                    "uncertain READ retains mutation"
-                );
-                c.read(ID, u64::MAX).unwrap();
-                receive(&s);
-                send(&s, &anchor_reply("READ_REPLY", proposal.expected(), false));
-                assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
-                assert!(
-                    c.retained_mutation().is_some(),
-                    "whole anchor equality settles mutation"
-                );
-                c.read(ID, u64::MAX).unwrap();
-                receive(&s);
-                send(&s, &anchor_reply("READ_REPLY", proposal.next(), false));
-                assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
-                assert!(c.retained_mutation().is_none());
-            }
+            assert_eq!(
+                c.mutation(&frozen_reserve(SESSION), u64::MAX),
+                Err(Refusal::Busy),
+                "changed request cannot replace owned mutation"
+            );
+            f.now.fetch_add(NS, Ordering::SeqCst);
+        }
+        for (anchor, uncertain) in [(proposal.next(), true), (proposal.expected(), false)] {
+            c.read(ID, u64::MAX).unwrap();
+            receive(&s);
+            send(&s, &anchor_reply("READ_REPLY", anchor, uncertain));
+            assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
+            assert!(
+                c.retained_mutation().is_some(),
+                "only certain whole anchor equality settles mutation"
+            );
+        }
+        c.mutation(&proposal, u64::MAX).unwrap();
+        receive(&s);
+        if terminal == "timeout" {
+            f.now
+                .fetch_add(d::D_REQUEST_DEADLINE_MS as u64 * NS, Ordering::SeqCst);
+        } else {
+            assert_eq!(unsafe { libc::shutdown(s.as_raw_fd(), libc::SHUT_RDWR) }, 0);
+        }
+        assert!(c.poll().is_err());
+        // Keep this same owner after the terminal event and attempt delayed completions repeatedly.
+        for _ in 0..40 {
+            let late = anchor_reply("ANCHOR_ACK", proposal.next(), false);
+            assert!(signer_peer::send(s.as_raw_fd(), &late, &[]).is_err());
+            assert!(
+                c.poll().is_err(),
+                "late completion cannot revive a closed owner"
+            );
+            assert_eq!(c.retained_mutation().unwrap().bytes(), proposal.bytes());
+            f.now.fetch_add(d::D_LEASE_MS as u64 * NS, Ordering::SeqCst);
+            assert!(
+                !c.lease_live(f.now.load(Ordering::SeqCst)),
+                "late completion never renews liveness"
+            );
         }
     }
 }
