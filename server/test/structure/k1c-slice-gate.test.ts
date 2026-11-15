@@ -1,3 +1,5 @@
+// Pins the shared validation import while retaining the inert dispatch and native byte boundaries.
+// W-JOIN-BOUNDS
 import {it,expect} from "vitest";
 import {readFileSync,readdirSync} from "node:fs";
 import {createHash} from "node:crypto";
@@ -72,6 +74,7 @@ const expectedImports={
   "signing/record-joins.ts": [
     "../linux-business/producer-custody.js",
     "./contract.js",
+    "./join-state-contract.json",
     "./linux-business-records.js",
     "./strict-verifier.js",
     "node:crypto",
