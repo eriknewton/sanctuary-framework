@@ -1,3 +1,4 @@
+// fail-before-exempt: the added indentless-list row is a real-parser row, which runs only where SANCTUARY_HERMES_PYTHON is set, so in CI this file passes against pre-fix source by construction. The scanner behaviour it covers is pinned fail-before in hermes-posture-plan.test.ts and hermes-yaml-injection.test.ts.
 // Real-parser continuing and changed-removal rows require SANCTUARY_HERMES_PYTHON.
 // Refusal, write order, rollback, and dispatcher rows use a controlled parser executor
 // and always run. All files and the relay socket live under a temporary HOME.
