@@ -214,6 +214,63 @@ struct Recovery {
     closed_by_recovery: bool,
     locked_after_recovery_at: Option<u64>,
 }
+// Must match the wall-branch deadline pin below. The existing anchored wall window
+// is followed by one relative sleep and one loop pass before the next send. Charging
+// that pass as one watchdog tick is an assumption. The bound tolerates adjudication
+// up to about 510 ms; the 11 ms work-plus-sleep budget is not load-bearing arithmetic.
+pub fn writer_next_request_bound_ns(t0: u64) -> Option<u64> {
+    t0.checked_add((WRITER_SIGN_DEADLINE_MAX_MS + 2 * WATCHDOG_TICK_MS as u64) * NS_PER_MS)
+}
+// The measured worst case at the B0 caps is 291,059 ns (40 prepared candidates, optimized build).
+// Round that work term up to whole milliseconds; the measurement is pinned by adjudication_work_measurement.
+// The additional watchdog tick charges the existing relative sleep.
+const CHECKPOINT_ADJUDICATION_WORK_MS: u64 = 1;
+pub const CHECKPOINT_ADJUDICATION_BUDGET_MS: u64 =
+    CHECKPOINT_ADJUDICATION_WORK_MS + WATCHDOG_TICK_MS as u64;
+const _: () = assert!(CHECKPOINT_ADJUDICATION_BUDGET_MS < WRITER_HEARTBEAT_MS);
+pub(crate) enum CheckpointMode {
+    Refuse,
+    #[cfg(feature = "test-isolation")]
+    Accept,
+}
+#[derive(Clone)]
+struct Challenge {
+    session: String,
+    request: String,
+    nonce: String,
+    issued: u64,
+    status: StatusReply,
+    part_deadline: Option<u64>,
+}
+struct CheckpointCandidate {
+    report: super::append_checkpoint::Candidate,
+    challenge: Challenge,
+    digest: String,
+    hashes: Vec<String>,
+}
+enum CheckpointStage {
+    Digest(super::append_checkpoint::Transfer, String),
+    Parse(Vec<u8>, Vec<String>, String),
+    Predicate(super::append_checkpoint::Candidate, Vec<String>, String),
+}
+struct CheckpointReplay {
+    session: String,
+    request: String,
+    digest: String,
+    hashes: Vec<String>,
+    status: StatusReply,
+    expires: u64,
+    next: usize,
+    last: u64,
+}
+#[derive(Default)]
+struct Checkpoint {
+    challenge: Option<Challenge>,
+    transfer: Option<super::append_checkpoint::Transfer>,
+    stage: Option<CheckpointStage>,
+    replay: Option<CheckpointReplay>,
+}
+
 /// The production transition to WallBound is private to the authenticated run loop.
 pub struct WriterMachine<P: SignerPort, R: Reconciler> {
     signer: P,
@@ -229,6 +286,10 @@ pub struct WriterMachine<P: SignerPort, R: Reconciler> {
     last_status: u64,
     fortress: String,
     revision: u64,
+    /// state_AWAITING_REREAD owns the first heartbeat after checkpoint admission.
+    awaiting_reread: Option<u64>,
+    checkpoint_candidate: Option<CheckpointCandidate>,
+    checkpoint: Checkpoint,
 }
 impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
     fn new(
@@ -255,6 +316,9 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
             last_status: bootstrapped_at,
             fortress,
             revision,
+            awaiting_reread: None,
+            checkpoint_candidate: None,
+            checkpoint: Checkpoint::default(),
         }
     }
     pub fn state(&self) -> WriterState {
@@ -532,7 +596,271 @@ impl<P: SignerPort, R: Reconciler> WriterMachine<P, R> {
     fn sent_verified(&mut self) {
         self.state = WriterState::Granted;
     }
+    fn heartbeat_due_within(&self, budget_ms: u64) -> Result<bool> {
+        Ok(self.now()?.saturating_sub(self.last_status)
+            >= WRITER_HEARTBEAT_MS.saturating_sub(budget_ms) * NS_PER_MS)
+    }
+    fn checkpoint_adjudication_ready(&mut self) -> Result<bool> {
+        if self.heartbeat_due_within(CHECKPOINT_ADJUDICATION_BUDGET_MS)? {
+            self.checkpoint_cancel();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+    fn wall_deadline(&self, now: u64) -> Result<u64> {
+        Ok(now
+            .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
+            .ok_or(Error::Deadline)?
+            .min(
+                self.last_status
+                    .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
+                    .ok_or(Error::Deadline)?,
+            )
+            .min(self.expiry()?))
+    }
+    fn checkpoint_cancel(&mut self) {
+        self.checkpoint_candidate = None;
+        self.awaiting_reread = None;
+        self.checkpoint.challenge = None;
+        self.checkpoint.transfer = None;
+        self.checkpoint.stage = None;
+    }
+    fn checkpoint_stage(&mut self) -> Result<()> {
+        use super::append_checkpoint as cp;
+        let now = self.now()?;
+        if self.checkpoint.challenge.as_ref().is_some_and(|c| {
+            now.saturating_sub(c.issued) >= cp::CHECKPOINT_CHALLENGE_MS * NS_PER_MS
+                || c.part_deadline.is_some_and(|end| now >= end)
+        }) {
+            self.checkpoint_cancel();
+            return Ok(());
+        }
+        // A bounded stage starts only with a complete watchdog tick before STATUS is due.
+        if self.heartbeat_due_within(WATCHDOG_TICK_MS as u64)? {
+            return Ok(());
+        }
+        let Some(stage) = self.checkpoint.stage.take() else {
+            return Ok(());
+        };
+        let next = (|| -> cp::Result<Option<CheckpointStage>> {
+            match stage {
+                CheckpointStage::Digest(transfer, digest) => {
+                    let (bytes, hashes) = transfer.finish()?;
+                    Ok(Some(CheckpointStage::Parse(bytes, hashes, digest)))
+                }
+                CheckpointStage::Parse(bytes, hashes, digest) => Ok(Some(
+                    CheckpointStage::Predicate(cp::Candidate::parse(&bytes)?, hashes, digest),
+                )),
+                CheckpointStage::Predicate(report, hashes, digest) => {
+                    let mut challenge =
+                        self.checkpoint.challenge.take().ok_or(cp::Refusal::Echo)?;
+                    report.echo(&challenge.session, &challenge.request, &challenge.nonce)?;
+                    report.consistent(&challenge.status, &self.fortress, self.revision)?;
+                    if self.state != WriterState::WallBound {
+                        return Err(cp::Refusal::Observation);
+                    }
+                    // Receipt is dated only after digest, raw parse and ordinary predicate admission.
+                    let received = now;
+                    challenge.part_deadline = None;
+                    self.checkpoint_candidate = Some(CheckpointCandidate {
+                        report,
+                        challenge,
+                        digest,
+                        hashes,
+                    });
+                    self.awaiting_reread = Some(received);
+                    Ok(None)
+                }
+            }
+        })();
+        match next {
+            Ok(stage) => {
+                self.checkpoint.stage = stage;
+                if self.awaiting_reread.is_some() {
+                    self.awaiting_reread = Some(self.now()?);
+                }
+            }
+            Err(_) => self.checkpoint_cancel(),
+        }
+        Ok(())
+    }
+    fn adjudicate(&mut self, received_at: u64) -> Result<Option<Operation>> {
+        let candidate = self.checkpoint_candidate.take();
+        self.checkpoint_cancel();
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        if self.state != WriterState::WallBound
+            || self.last_status < received_at
+            || candidate.challenge.status != self.latest
+        {
+            return Ok(None);
+        }
+        let now = self.now()?;
+        // The same final sample gates freshness and eligibility immediately before binding.
+        // The candidate never enters reconciled, so an ordinary heartbeat cannot consume it later.
+        if candidate
+            .report
+            .fresh(candidate.challenge.issued, now)
+            .is_err()
+            || !self.eligible(&candidate.challenge.status, now)
+        {
+            return Ok(None);
+        }
+        if let Err(error) = self.signer.bind(&candidate.challenge.status.grant) {
+            self.state = WriterState::Settling;
+            return Err(Error::Signer(error));
+        }
+        self.frozen = Some(candidate.challenge.status.clone());
+        self.state = WriterState::Granted;
+        let ack = Operation::CheckpointAck {
+            request_id: candidate.challenge.request.clone(),
+            checkpoint_digest: candidate.digest.clone(),
+        };
+        self.checkpoint.replay = Some(CheckpointReplay {
+            session: candidate.challenge.session,
+            request: candidate.challenge.request,
+            digest: candidate.digest,
+            hashes: candidate.hashes,
+            status: candidate.challenge.status,
+            expires: candidate
+                .challenge
+                .issued
+                .saturating_add(super::append_checkpoint::CHECKPOINT_CHALLENGE_MS * NS_PER_MS),
+            next: 0,
+            last: now,
+        });
+        Ok(Some(ack))
+    }
+    #[cfg(feature = "test-isolation")]
+    fn checkpoint_packet(
+        &mut self,
+        session: &str,
+        op: &Operation,
+        payload: &[u8],
+        packet: &[u8],
+    ) -> Result<Option<(Operation, Vec<u8>)>> {
+        use super::append_checkpoint as cp;
+        let now = self.now()?;
+        if let Operation::CheckpointPart(part) = op {
+            // Replay is matched before challenge ownership and cannot consume a newer challenge.
+            if let Some(replay) = &mut self.checkpoint.replay {
+                if part.request_id == replay.request {
+                    if session != replay.session
+                        || replay.hashes.get(part.part_index) != Some(&cp::digest(packet))
+                    {
+                        return Err(Error::State);
+                    }
+                    if now >= replay.expires
+                        || (replay.next > 0
+                            && now.saturating_sub(replay.last)
+                                >= cp::CHECKPOINT_PART_SILENCE_MS * NS_PER_MS)
+                        || part.part_index != replay.next
+                    {
+                        replay.next = 0;
+                        return Ok(None);
+                    }
+                    replay.next += 1;
+                    replay.last = now;
+                    if replay.next == replay.hashes.len() {
+                        replay.next = 0;
+                        return Ok(Some((
+                            Operation::CheckpointAck {
+                                request_id: replay.request.clone(),
+                                checkpoint_digest: replay.digest.clone(),
+                            },
+                            Vec::new(),
+                        )));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        let result = (|| -> cp::Result<Option<(Operation, Vec<u8>)>> {
+            match op {
+                Operation::CheckpointQuery { request_id } => {
+                    if self.checkpoint.challenge.is_some()
+                        || self.checkpoint_candidate.is_some()
+                        || self.checkpoint.stage.is_some()
+                    {
+                        return Err(cp::Refusal::Order);
+                    }
+                    let mut nonce = [0; SESSION_ID_BYTES];
+                    OsRng
+                        .try_fill_bytes(&mut nonce)
+                        .map_err(|_| cp::Refusal::Observation)?;
+                    let nonce = hex::encode(nonce);
+                    let status = self.latest.clone();
+                    let payload = cp::status_bytes(&status)?;
+                    self.checkpoint.challenge = Some(Challenge {
+                        session: session.into(),
+                        request: request_id.clone(),
+                        nonce: nonce.clone(),
+                        issued: now,
+                        status,
+                        part_deadline: None,
+                    });
+                    Ok(Some((
+                        Operation::CheckpointChallenge {
+                            request_id: request_id.clone(),
+                            nonce,
+                            issued_boottime_ns: now,
+                        },
+                        payload,
+                    )))
+                }
+                Operation::CheckpointPart(part) => {
+                    let c = self
+                        .checkpoint
+                        .challenge
+                        .as_mut()
+                        .ok_or(cp::Refusal::Echo)?;
+                    if c.session != session
+                        || c.request != part.request_id
+                        || c.nonce != part.nonce
+                        || now.saturating_sub(c.issued) >= cp::CHECKPOINT_CHALLENGE_MS * NS_PER_MS
+                        || c.part_deadline.is_some_and(|end| now >= end)
+                        || self.checkpoint.stage.is_some()
+                    {
+                        return Err(cp::Refusal::Echo);
+                    }
+                    if self.checkpoint.transfer.is_none() {
+                        self.checkpoint.transfer = Some(cp::Transfer::begin(part, now)?);
+                    }
+                    c.part_deadline = Some(
+                        now.checked_add(cp::CHECKPOINT_PART_SILENCE_MS * NS_PER_MS)
+                            .ok_or(cp::Refusal::Expired)?,
+                    );
+                    if self
+                        .checkpoint
+                        .transfer
+                        .as_mut()
+                        .ok_or(cp::Refusal::Order)?
+                        .push(part, payload, packet, now)?
+                    {
+                        let transfer = self.checkpoint.transfer.take().ok_or(cp::Refusal::Order)?;
+                        self.checkpoint.stage = Some(CheckpointStage::Digest(
+                            transfer,
+                            part.checkpoint_digest.clone(),
+                        ));
+                    }
+                    Ok(None)
+                }
+                _ => Err(cp::Refusal::Order),
+            }
+        })();
+        match result {
+            Ok(reply) => Ok(reply),
+            Err(_) => {
+                self.checkpoint_cancel();
+                Ok(None)
+            }
+        }
+    }
+
     pub fn settle(&mut self) {
+        self.checkpoint_cancel();
+        self.checkpoint.replay = None;
         self.state = WriterState::Settling;
         self.signer.close_and_settle();
         self.state = WriterState::Stopped;
@@ -790,6 +1118,7 @@ pub fn run<P: SignerPort, R: Reconciler, N: Notifier>(
         &deps.expectations,
         deps.paths.owner,
         &deps.clock,
+        CheckpointMode::Refuse,
     );
     // a writer exit with a live wall restarts nothing; the wall stays fail-closed until an operator restarts the wall unit, which starts a fresh writer.
     let _ = deps.notifier.notify(STOP_STATUS);
@@ -841,7 +1170,9 @@ struct Wall {
     binding: WallMainBinding,
     handshake: Handshake,
     session: String,
+    deferred_checkpoint: Option<signer_peer::Packet>,
 }
+#[allow(clippy::too_many_arguments)]
 fn serve<P: SignerPort, R: Reconciler>(
     machine: &mut WriterMachine<P, R>,
     config: &HeldConfig,
@@ -850,157 +1181,349 @@ fn serve<P: SignerPort, R: Reconciler>(
     expect: &ListenerExpectations,
     owner: u32,
     clock: &Clock,
+    mode: CheckpointMode,
 ) -> Result<()> {
     // One bound wall plus a terminal second accept implements the connection cap in writer_protocol.
     const _: () = assert!(writer_protocol::WRITER_CONNECTIONS_MAX == 2);
-    // Synchronous SIGN owns the only work slot; serve retains no queue between iterations.
+    // Synchronous SIGN owns the only work slot; no SIGN work is queued.
+    // One whole checkpoint packet may be retained solely across the heartbeat guard.
     const _: () = assert!(writer_protocol::WRITER_WORK_MAX == 1);
     const _: () = assert!(writer_protocol::WRITER_QUEUE_MAX == 0);
-    let mut wall: Option<Wall> = None;
-    loop {
-        machine.tick()?;
-        if let Some(w) = &wall {
-            if !w.binding.live() {
-                return Err(Error::Peer(writer_peer::Error::Process));
-            }
-        }
-        if readable(listener.as_raw_fd()) {
-            let fd = accepted(listener.as_raw_fd())?;
-            // A second accept is terminal even while the original wall remains alive and its socket stays open.
-            if wall.is_some() {
-                return Err(Error::State);
-            }
-            let end = exchange_deadline(clock, u64::MAX)?;
-            let binding = WallMainBinding::capture(
-                fd.as_raw_fd(),
-                &config.value.wall_policy(),
-                bus,
-                expect.peer_uid,
-                owner,
-                end.clone(),
-            )?;
-            signer_peer::passcred(fd.as_raw_fd())?;
-            let mut bytes = [0; SESSION_ID_BYTES];
-            OsRng.try_fill_bytes(&mut bytes).map_err(|_| Error::Io)?;
-            let session = hex::encode(bytes);
-            let mut handshake = Handshake::new(session.clone())?;
-            signer_peer::send(fd.as_raw_fd(), &handshake.hello()?, &[])?;
-            loop {
-                end.check()?;
-                if !binding.live() {
+    let outcome = (|| {
+        let mut wall: Option<Wall> = None;
+        loop {
+            machine.tick()?;
+            if let Some(w) = &wall {
+                if !w.binding.live() {
                     return Err(Error::Peer(writer_peer::Error::Process));
                 }
-                if readable(listener.as_raw_fd()) {
-                    let _second = accepted(listener.as_raw_fd())?;
+            }
+            if readable(listener.as_raw_fd()) {
+                let fd = accepted(listener.as_raw_fd())?;
+                // A second accept is terminal even while the original wall remains alive and its socket stays open.
+                if wall.is_some() {
                     return Err(Error::State);
                 }
-                if readable(fd.as_raw_fd()) {
-                    let packet = writer_protocol::receive(fd.as_raw_fd(), Direction::ToWriter)?;
-                    binding.packet(&packet)?;
-                    binding.revalidate(bus, end.clone())?;
-                    handshake.receive(&packet.bytes)?;
+                let end = exchange_deadline(clock, u64::MAX)?;
+                let binding = WallMainBinding::capture(
+                    fd.as_raw_fd(),
+                    &config.value.wall_policy(),
+                    bus,
+                    expect.peer_uid,
+                    owner,
+                    end.clone(),
+                )?;
+                signer_peer::passcred(fd.as_raw_fd())?;
+                let mut bytes = [0; SESSION_ID_BYTES];
+                OsRng.try_fill_bytes(&mut bytes).map_err(|_| Error::Io)?;
+                let session = hex::encode(bytes);
+                let mut handshake = Handshake::new(session.clone())?;
+                signer_peer::send(fd.as_raw_fd(), &handshake.hello()?, &[])?;
+                loop {
                     end.check()?;
-                    break;
+                    if !binding.live() {
+                        return Err(Error::Peer(writer_peer::Error::Process));
+                    }
+                    if readable(listener.as_raw_fd()) {
+                        let _second = accepted(listener.as_raw_fd())?;
+                        return Err(Error::State);
+                    }
+                    if readable(fd.as_raw_fd()) {
+                        let packet = writer_protocol::receive(fd.as_raw_fd(), Direction::ToWriter)?;
+                        binding.packet(&packet)?;
+                        binding.revalidate(bus, end.clone())?;
+                        handshake.receive(&packet.bytes)?;
+                        end.check()?;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS as u64));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS as u64));
+                machine.bind_wall();
+                wall = Some(Wall {
+                    fd,
+                    binding,
+                    handshake,
+                    session,
+                    deferred_checkpoint: None,
+                });
             }
-            machine.bind_wall();
-            wall = Some(Wall {
-                fd,
-                binding,
-                handshake,
-                session,
-            });
-        }
-        if machine.heartbeat_due()? {
-            machine.heartbeat()?;
-        }
-        if let Some(w) = &mut wall {
-            if readable(w.fd.as_raw_fd()) {
-                let packet = writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?;
-                let frame = w.handshake.receive(&packet.bytes)?;
-                w.binding.packet(&packet)?;
-                let now = clock()?;
-                if let Operation::Sign(h) = &frame.operation {
-                    let admission = canonical_deadline(&h.deadline_boottime_ns)
-                        .ok_or(Error::Deadline)
-                        .and_then(|deadline| {
-                            WriterMachine::<P, R>::admit_deadline(deadline, now, machine.expiry()?)
-                        });
-                    if let Err(e) = admission {
-                        // REFUSED goes out after packet-credential binding and before that packet's bus revalidation, and carries only the caller's own id.
-                        let _ = send(
-                            w.fd.as_raw_fd(),
-                            &w.session,
-                            &Operation::Refused {
-                                request_id: h.request_id.clone(),
-                            },
-                            &[],
-                        );
-                        return Err(e);
+            if machine.awaiting_reread.is_some() || machine.heartbeat_due()? {
+                machine.heartbeat()?;
+                if machine
+                    .checkpoint
+                    .replay
+                    .as_ref()
+                    .is_some_and(|r| r.status != machine.latest)
+                {
+                    machine.checkpoint.replay = None;
+                }
+                if let Some(received_at) = machine.awaiting_reread.take() {
+                    // Must match writer_next_request_bound_ns and the wall deadline below.
+                    // Preemption performs no adjudication or send, preserving the slow heartbeat path.
+                    if machine.checkpoint_adjudication_ready()? {
+                        let w = wall.as_ref().ok_or(Error::State)?;
+                        // These terminal session checks precede the pure adjudication, after the blocking reread.
+                        if !w.binding.live() {
+                            return Err(Error::Peer(writer_peer::Error::Process));
+                        }
+                        if readable(listener.as_raw_fd()) {
+                            return Err(Error::State);
+                        }
+                        machine.tick()?;
+                        if machine
+                            .checkpoint_candidate
+                            .as_ref()
+                            .map_or(true, |c| c.challenge.session != w.session)
+                        {
+                            return Err(Error::State);
+                        }
+                        if let Some(ack) = machine.adjudicate(received_at)? {
+                            send(w.fd.as_raw_fd(), &w.session, &ack, &[])?;
+                        }
                     }
                 }
-                // Packet admission follows a heartbeat check: now - last_status < WRITER_HEARTBEAT_MS.
-                // Anchoring to both clocks retains at least WRITER_SIGN_DEADLINE_MAX_MS - WRITER_HEARTBEAT_MS
-                // of bus budget; the next heartbeat leaves inside SIGNER_IDLE_DEADLINE_MS of the last exchange.
-                // The caller deadline never selects this local identity window.
-                let end = now
-                    .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
-                    .ok_or(Error::Deadline)?
-                    .min(
-                        machine
-                            .last_status
-                            .checked_add(WRITER_SIGN_DEADLINE_MAX_MS * NS_PER_MS)
-                            .ok_or(Error::Deadline)?,
-                    )
-                    .min(machine.expiry()?);
-                w.binding
-                    .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
-                match frame.operation {
-                    Operation::Status { request_id } => send(
-                        w.fd.as_raw_fd(),
-                        &w.session,
-                        &Operation::StatusReply { request_id },
-                        &machine.status_payload().encode()?,
-                    )?,
-                    Operation::Sign(header) => {
-                        let request_id = header.request_id.clone();
-                        let result = machine.sign(header, frame.payload, |end| {
-                            w.binding
-                                .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
-                            Ok(())
-                        });
-                        match result {
-                            Ok(body) => {
-                                send(
-                                    w.fd.as_raw_fd(),
+            }
+            if let Some(w) = &mut wall {
+                machine.checkpoint_stage()?;
+                if machine.awaiting_reread.is_none()
+                    && (w.deferred_checkpoint.is_some() || readable(w.fd.as_raw_fd()))
+                {
+                    if w.deferred_checkpoint.is_some()
+                        && machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)?
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            WATCHDOG_TICK_MS as u64,
+                        ));
+                        continue;
+                    }
+                    let packet = match w.deferred_checkpoint.take() {
+                        Some(packet) => packet,
+                        None => writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?,
+                    };
+                    let frame = w.handshake.receive(&packet.bytes)?;
+                    w.binding.packet(&packet)?;
+                    let now = clock()?;
+                    if let Operation::Sign(h) = &frame.operation {
+                        let admission = canonical_deadline(&h.deadline_boottime_ns)
+                            .ok_or(Error::Deadline)
+                            .and_then(|deadline| {
+                                WriterMachine::<P, R>::admit_deadline(
+                                    deadline,
+                                    now,
+                                    machine.expiry()?,
+                                )
+                            });
+                        if let Err(e) = admission {
+                            // REFUSED goes out after packet-credential binding and before that packet's bus revalidation, and carries only the caller's own id.
+                            let _ = send(
+                                w.fd.as_raw_fd(),
+                                &w.session,
+                                &Operation::Refused {
+                                    request_id: h.request_id.clone(),
+                                },
+                                &[],
+                            );
+                            return Err(e);
+                        }
+                    }
+                    // Must match writer_next_request_bound_ns and its adjudication-site pin.
+                    // Packet admission follows a heartbeat check: now - last_status < WRITER_HEARTBEAT_MS.
+                    // Anchoring to both clocks retains at least WRITER_SIGN_DEADLINE_MAX_MS - WRITER_HEARTBEAT_MS
+                    // of bus budget; the next heartbeat leaves inside SIGNER_IDLE_DEADLINE_MS of the last exchange.
+                    // The caller deadline never selects this local identity window.
+                    let end = machine.wall_deadline(now)?;
+                    w.binding
+                        .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
+                    let checkpoint_op = matches!(
+                        frame.operation,
+                        Operation::CheckpointQuery { .. } | Operation::CheckpointPart(_)
+                    );
+                    if checkpoint_op {
+                        match mode {
+                            CheckpointMode::Refuse => return Err(Error::State),
+                            #[cfg(feature = "test-isolation")]
+                            CheckpointMode::Accept => {
+                                // Authenticated W checkpoint bytes carry no authority until adjudication.
+                                // Keep the whole packet and partial transfer while a due S heartbeat takes priority.
+                                if machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)? {
+                                    w.deferred_checkpoint = Some(packet);
+                                } else if let Some((op, payload)) = machine.checkpoint_packet(
                                     &w.session,
-                                    &Operation::Verified { request_id },
-                                    &body,
-                                )?;
-                                machine.sent_verified();
-                            }
-                            Err(e) => {
-                                let _ = send(
-                                    w.fd.as_raw_fd(),
-                                    &w.session,
-                                    &Operation::Refused { request_id },
-                                    &[],
-                                );
-                                return Err(e);
+                                    &frame.operation,
+                                    frame.payload,
+                                    &packet.bytes,
+                                )? {
+                                    send(w.fd.as_raw_fd(), &w.session, &op, &payload)?;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    WATCHDOG_TICK_MS as u64,
+                                ));
+                                continue;
                             }
                         }
                     }
-                    _ => return Err(Error::State),
+                    if machine.checkpoint.transfer.is_some() || machine.checkpoint.stage.is_some() {
+                        machine.checkpoint_cancel();
+                        return Err(Error::State);
+                    }
+                    match frame.operation {
+                        Operation::Status { request_id } => send(
+                            w.fd.as_raw_fd(),
+                            &w.session,
+                            &Operation::StatusReply { request_id },
+                            &machine.status_payload().encode()?,
+                        )?,
+                        Operation::Sign(header) => {
+                            let request_id = header.request_id.clone();
+                            let result = machine.sign(header, frame.payload, |end| {
+                                w.binding
+                                    .revalidate(bus, Deadline::new(clock.clone(), end)?)?;
+                                Ok(())
+                            });
+                            match result {
+                                Ok(body) => {
+                                    send(
+                                        w.fd.as_raw_fd(),
+                                        &w.session,
+                                        &Operation::Verified { request_id },
+                                        &body,
+                                    )?;
+                                    machine.sent_verified();
+                                }
+                                Err(e) => {
+                                    let _ = send(
+                                        w.fd.as_raw_fd(),
+                                        &w.session,
+                                        &Operation::Refused { request_id },
+                                        &[],
+                                    );
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        _ => return Err(Error::State),
+                    }
                 }
             }
+            std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS as u64));
         }
-        std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_TICK_MS as u64));
-    }
+    })();
+    // One teardown covers every question-mark and explicit terminal return in serve.
+    machine.checkpoint_cancel();
+    machine.checkpoint.replay = None;
+    outcome
 }
 #[cfg(feature = "test-isolation")]
 pub mod test_support {
     use super::*;
+    /// Isolated acceptance reaches the same serve loop without an installed accepting constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_accept<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+        config: &HeldConfig,
+        bus: &BusTarget,
+        listener: &OwnedFd,
+        expect: &ListenerExpectations,
+        owner: u32,
+        clock: &Clock,
+    ) -> Result<()> {
+        serve(
+            machine,
+            config,
+            bus,
+            listener,
+            expect,
+            owner,
+            clock,
+            CheckpointMode::Accept,
+        )
+    }
+    pub fn checkpoint_packet<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+        session: &str,
+        packet: &[u8],
+    ) -> Result<Option<(Operation, Vec<u8>)>> {
+        let frame = writer_protocol::decode(packet, Direction::ToWriter, session)?;
+        machine.checkpoint_packet(session, &frame.operation, frame.payload, packet)
+    }
+    pub fn scripted_signer<R: Reconciler>(
+        machine: &mut WriterMachine<ScriptedSigner, R>,
+    ) -> &mut ScriptedSigner {
+        &mut machine.signer
+    }
+    pub fn checkpoint_identity<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+        fortress: String,
+        revision: u64,
+    ) {
+        machine.fortress = fortress;
+        machine.revision = revision;
+    }
+    pub fn checkpoint_step<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+    ) -> Result<()> {
+        machine.checkpoint_stage()
+    }
+    pub fn awaiting<P: SignerPort, R: Reconciler>(machine: &WriterMachine<P, R>) -> Option<u64> {
+        machine.awaiting_reread
+    }
+    pub fn has_candidate<P: SignerPort, R: Reconciler>(machine: &WriterMachine<P, R>) -> bool {
+        machine.checkpoint_candidate.is_some()
+    }
+    pub fn checkpoint_owned<P: SignerPort, R: Reconciler>(m: &WriterMachine<P, R>) -> bool {
+        m.checkpoint_candidate.is_some()
+            || m.awaiting_reread.is_some()
+            || m.checkpoint.challenge.is_some()
+            || m.checkpoint.transfer.is_some()
+            || m.checkpoint.stage.is_some()
+    }
+    pub fn silence_disarmed<P: SignerPort, R: Reconciler>(m: &WriterMachine<P, R>) -> bool {
+        m.checkpoint_candidate
+            .as_ref()
+            .is_some_and(|c| c.challenge.part_deadline.is_none())
+    }
+    pub fn challenge_request<P: SignerPort, R: Reconciler>(
+        m: &WriterMachine<P, R>,
+    ) -> Option<&str> {
+        m.checkpoint.challenge.as_ref().map(|c| c.request.as_str())
+    }
+    pub fn ordinary_reconciliation<P: SignerPort, R: Reconciler>(m: &mut WriterMachine<P, R>) {
+        m.reconciled = Some(m.latest.clone());
+    }
+    pub fn last_status<P: SignerPort, R: Reconciler>(machine: &WriterMachine<P, R>) -> u64 {
+        machine.last_status
+    }
+    pub fn wall_deadline<P: SignerPort, R: Reconciler>(
+        machine: &WriterMachine<P, R>,
+        now: u64,
+    ) -> Result<u64> {
+        machine.wall_deadline(now)
+    }
+    pub fn adjudicate<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+        received: u64,
+    ) -> Result<Option<Operation>> {
+        machine.adjudicate(received)
+    }
+    /// Pure machine helper only. Live, accept, tick, session and preemption schedules
+    /// are witnessed by advancing_serve_schedule through serve_accept, not this helper.
+    pub fn checkpoint_reread<P: SignerPort, R: Reconciler>(
+        machine: &mut WriterMachine<P, R>,
+    ) -> Result<Option<Operation>> {
+        let result = (|| {
+            machine.heartbeat()?;
+            let received = machine.awaiting_reread.take().ok_or(Error::State)?;
+            if !machine.checkpoint_adjudication_ready()? {
+                return Ok(None);
+            }
+            machine.adjudicate(received)
+        })();
+        if result.is_err() {
+            machine.checkpoint_cancel();
+        }
+        result
+    }
+
     /// Typed scripting is confined to writer-state witnesses and is not evidence of client parsing.
     pub type BindScript = Box<dyn FnMut(&CurrentGrantView) -> signer_client::Result<()> + Send>;
     pub type SignScript =

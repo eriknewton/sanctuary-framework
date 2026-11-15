@@ -19,13 +19,40 @@ pub fn decode(bytes: &[u8]) -> Option<Value> {
 
 /// Parse original join-state bytes; this pure boundary grants no checkpoint authority.
 pub fn decode_join_state(bytes: &[u8]) -> Option<Value> {
-    let state = crate::smb::strict_json::parse(bytes, bytes.len()).ok()?;
-    // Must match parseJoinState in record-joins.ts: raw canonical equality precedes value admission.
-    if crate::smb::jcs::encode(&state).ok()?.as_bytes() != bytes {
-        return None;
+    decode_join_state_checked(bytes).ok()
+}
+fn decode_join_state_checked(bytes: &[u8]) -> Result<Value, String> {
+    // Bound original bytes before allocating; canonical equality rejects duplicate keys and alternate spellings.
+    if bytes.len() > JOIN_STATE_BYTES_MAX {
+        return Err("SMB JSON size".into());
     }
-    let state: Value = serde_json::from_slice(bytes).ok()?;
-    join_state_valid(&state).then_some(state)
+    let state: Value = serde_json::from_slice(bytes).map_err(|_| "JOIN_JSON")?;
+    if !join_state_valid(&state) {
+        return Err("JOIN_STATE".into());
+    }
+    // Must match parseJoinState in record-joins.ts: only original canonical bytes admit authority.
+    // Closed join domains contain ASCII keys/strings and unsigned safe integers. Their serde encoding
+    // equals JCS, avoiding general binary64 formatting for every retained history number.
+    if canonical_integer_domain(&state).as_deref() != Some(bytes) {
+        return Err("JOIN_CANONICAL".into());
+    }
+    Ok(state)
+}
+
+/// Canonical serialization for the closed ASCII/integer protocol domain, never arbitrary JSON.
+pub(crate) fn canonical_integer_domain(value: &Value) -> Option<Vec<u8>> {
+    fn admitted(v: &Value) -> bool {
+        match v {
+            Value::Null | Value::Bool(_) => true,
+            Value::Number(n) => n.as_u64().is_some_and(|n| n <= SAFE_INTEGER),
+            Value::String(s) => s.is_ascii(),
+            Value::Array(a) => a.iter().all(admitted),
+            Value::Object(o) => o.iter().all(|(k, v)| k.is_ascii() && admitted(v)),
+        }
+    }
+    admitted(value)
+        .then(|| serde_json::to_vec(value).ok())
+        .flatten()
 }
 
 /// Must match BUSINESS_PIN_FIELDS in producer-custody.ts and verify_pin_fields in closure_vectors.json: the one business verify contract binds the enrolled subject and the grant's activation, lease and generation.
@@ -72,7 +99,9 @@ pub const COUNTER_PERIOD_NS: u64 = 1_000_000_000; // One second in nanoseconds.
 #[rustfmt::skip]
 mod bounded_contract { include!("join_state_contract.rs"); }
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-pub use bounded_contract::{JOIN_STATE_SCHEMA, POLICY_AGENT_UIDS_MAX, POLICY_VENDORS_MAX};
+pub use bounded_contract::{
+    JOIN_STATE_BYTES_MAX, JOIN_STATE_SCHEMA, POLICY_AGENT_UIDS_MAX, POLICY_VENDORS_MAX,
+};
 use bounded_contract::{OUTER_INDEX, PORT_MAX, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
 fn canonical_base64(v: &Value, bytes: usize) -> bool {
     v.as_str().is_some_and(|s| {
@@ -103,6 +132,7 @@ fn lower_hex(s: &str, length: usize) -> bool {
         && s.bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
+// Must match safeU64 in record-joins.ts: as_u64 refuses negative zero and every floating Number.
 fn safe_u64(v: &Value) -> bool {
     v.as_u64().is_some_and(|n| n <= SAFE_INTEGER)
 }
@@ -523,11 +553,40 @@ pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
     Ok(next)
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod bounded_tests {
     use super::super::{append_contract, join_lifecycle};
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn raw_join_byte_cap_precedes_parsing() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/join-byte-boundary.json"))
+                .unwrap();
+        let bytes =
+            vec![b'!'; JOIN_STATE_BYTES_MAX + fixture["over_cap_bytes"].as_u64().unwrap() as usize];
+        assert_eq!(
+            decode_join_state_checked(&bytes).unwrap_err(),
+            "SMB JSON size",
+            "raw join byte gate before parser"
+        );
+        assert!(decode_join_state(&bytes).is_none());
+        let contract = append_contract::contract().unwrap();
+        let state = &contract["lifecycle_states"]["ready"]["committed"];
+        let valid = crate::smb::jcs::encode(state).unwrap();
+        assert!(
+            decode_join_state(valid.as_bytes()).is_some(),
+            "canonical seed positive control"
+        );
+        let bytes = vec![b'!'; JOIN_STATE_BYTES_MAX];
+        assert_ne!(
+            decode_join_state_checked(&bytes).unwrap_err(),
+            "SMB JSON size",
+            "inclusive byte gate control"
+        );
+    }
 
     #[test]
     fn raw_join_numbers_refuse_before_admission() {
@@ -608,7 +667,9 @@ mod bounded_tests {
             }
         }
         for role in super::super::signer_contract::ROLE_REGISTRY {
-            let mut maximum = seed.clone();
+            let mut maximum: Value =
+                serde_json::from_str(include_str!("../../tests/fixtures/maximal-join-state.json"))
+                    .unwrap();
             maximum["pin"]["role"] = json!(role.0);
             maximum["policy"]["agent_uids"] = json!(
                 (SAFE_INTEGER - POLICY_AGENT_UIDS_MAX as u64 + 1..=SAFE_INTEGER)
@@ -618,8 +679,16 @@ mod bounded_tests {
                 ..=PORT_MAX)
                 .map(|port| json!({"address":"255.255.255.255","port":port}))
                 .collect::<Vec<_>>());
-            maximum["flow_state"]["history"] = json!(vec![record; JOIN_HISTORY_MAX]);
             assert!(join_state_valid(&maximum), "maximal state for {}", role.0);
+            let raw = crate::smb::jcs::encode(&maximum).unwrap();
+            assert!(raw.len() <= JOIN_STATE_BYTES_MAX);
+            // 64 envelopes times 96 conservative bytes, plus registry role widths.
+            assert!(raw.len() > JOIN_STATE_BYTES_MAX - 6500);
+            assert_eq!(
+                decode_join_state(raw.as_bytes()),
+                Some(maximum),
+                "maximal raw round trip"
+            );
         }
         assert!(advance(seed, record).is_ok());
         let mut bad = record.clone();

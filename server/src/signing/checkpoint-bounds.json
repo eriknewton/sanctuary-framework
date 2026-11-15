@@ -1,0 +1,9 @@
+{
+  "honest_max_bytes": 243444,
+  "anchor_max_bytes": 1173,
+  "observation_max_bytes": 1326,
+  "retained_row_max_bytes": 116,
+  "part_bytes": 65536,
+  "part_header_max_bytes": 380,
+  "challenge_header_max_bytes": 282
+}

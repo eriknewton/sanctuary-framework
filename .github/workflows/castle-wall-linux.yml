@@ -182,6 +182,12 @@ jobs:
         # or a fence changed to ignore, would otherwise pass with the ownership proof never checked.
         run: cargo test --locked --doc --features test-isolation business_profile::append_budget 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 2 passed; 0 failed; 0 ignored;'
 
+      - name: Check checkpoint mode without isolation
+        working-directory: castle-wall-daemon
+        shell: bash
+        # The exact count keeps the feature-off gate from silently selecting no tests.
+        run: cargo test --locked --test checkpoint_mode_gate 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 2 passed; 0 failed; 0 ignored;'
+
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

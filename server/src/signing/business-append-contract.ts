@@ -1,9 +1,10 @@
 // Must match business_profile/append_contract.rs; shapes and bounds carry no authority.
 import {createHash} from "node:crypto";
 import data from "./business-append-contract.json";
+import checkpointBounds from "./checkpoint-bounds.json";
 import {canonicalBytes, decodeCanonical, LINUX_FIELDS, SIGNER_FRAME_MAX_BYTES} from "./contract.js";
 import {BUSINESS_BOUNDS, validateBusinessRecord} from "./linux-business-records.js";
-import {joinCommitment, joinStateValid, type JoinRecord, type Json} from "./record-joins.js";
+import {joinCommitment, joinStateValid, parseJoinState, type JoinRecord, type Json} from "./record-joins.js";
 import {anchorSchema, anchorDigest, ID_HEX_LENGTH, DIGEST_HEX_LENGTH, SAFE_INTEGER} from "../linux-business/activation-anchor.js";
 import {parseStrict} from "../smb/parse-strict.js";
 
@@ -30,6 +31,7 @@ export const APPEND_CONTRACT = deepFreeze(data);
 export const PRODUCER_ENVELOPE_MAX_BYTES = data.envelope_max_bytes;
 export const ENVELOPE_BASE64_MAX = Math.ceil(PRODUCER_ENVELOPE_MAX_BYTES * 8 / 6);
 export interface BusinessDeliveryIdentity {version: 1; sequence: number; commitment: string; envelope_sha256: string;}
+// Must match business_wal.rs persist_ts_fact: W reads back the exact TS fact and delivered cursor before n+1 delivery.
 export interface BusinessDeliveryAck {version: 1; identity: BusinessDeliveryIdentity;}
 export type BusinessVerifiedRecord = Record<keyof typeof data.projection, Json>;
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -39,6 +41,7 @@ const U64_DECIMAL_MAX_BYTES = BUSINESS_ENCODING_WIDTHS.u64;
 const digest = (v: unknown) => typeof v === "string" && new RegExp(`^sha256:[a-f0-9]{${DIGEST_HEX_LENGTH}}$`).test(v);
 /** Shared field tables own exact shapes; these checks confer no authority. */
 export function appendShape(name: "identity" | "ack" | "event" | "checkpoint" | "observation" | "wal_checkpoint" | "retained_original", value: unknown): boolean {
+  try {
   if (!Object.hasOwn(data,name)) return false;
   const fields: Record<string, unknown> = data[name];
   if (!object(value) || Object.keys(value).length !== Object.keys(fields).length) return false;
@@ -72,6 +75,7 @@ export function appendShape(name: "identity" | "ack" | "event" | "checkpoint" | 
   if (value.state === "ABSENT") return value.anchor === null && value.anchor_digest === null && value.latched === false;
   const anchor=anchorSchema.safeParse(value.anchor);
   return anchor.success && value.anchor_digest === anchorDigest(anchor.data) && value.latched === anchor.data.recovery_required;
+  } catch { return false; }
 }
 /** Decode exact E before using any unsigned wrapper field. G5 remains a caller obligation. */
 export function parseBusinessEnvelope(encoded: string): {bytes: Uint8Array; record: JoinRecord} {
@@ -108,4 +112,31 @@ export function parseBusinessEventBytes(bytes: Uint8Array): ReturnType<typeof pa
   const value = parseStrict(bytes, SIGNER_FRAME_MAX_BYTES);
   if (!Buffer.from(canonicalBytes(value)).equals(Buffer.from(bytes))) throw Error("BUSINESS_EVENT_CANONICAL");
   return parseBusinessEvent(value);
+}
+
+/** Must match append_checkpoint::Candidate::parse; raw join bytes retain numeric spelling. */
+export function parseBusinessCheckpoint(bytes: Uint8Array): Record<string, unknown> {
+  const maximum = Math.ceil(checkpointBounds.honest_max_bytes / checkpointBounds.part_bytes) * checkpointBounds.part_bytes;
+  const value = parseStrict(bytes, maximum);
+  if (!Buffer.from(canonicalBytes(value)).equals(Buffer.from(bytes))) throw Error("BUSINESS_CHECKPOINT_CANONICAL");
+  const originalObject = (input: Uint8Array, marker: string): Uint8Array => {
+    const source = Buffer.from(input), token = Buffer.from(marker);
+    const at = source.indexOf(token);
+    if (at < 0) throw Error("BUSINESS_CHECKPOINT");
+    const start = at + token.length - 1;
+    let depth = 0, string = false, escaped = false;
+    for (let i = start; i < source.length; i++) {
+      const b = source[i];
+      if (string) { if (b === 34 && !escaped) string = false; escaped = b === 92 && !escaped; }
+      else if (b === 34) string = true;
+      else if (b === 123) depth++;
+      else if (b === 125 && --depth === 0) return source.subarray(start, i + 1);
+    }
+    throw Error("BUSINESS_CHECKPOINT");
+  };
+  const wal = originalObject(bytes, '"wal_checkpoint":{');
+  const join = parseJoinState(originalObject(wal, '"join_state":{'));
+  if (!appendShape("checkpoint", value) || !object(value) || !object(value.wal_checkpoint)
+      || !same(value.wal_checkpoint.join_state, join)) throw Error("BUSINESS_CHECKPOINT");
+  return value;
 }

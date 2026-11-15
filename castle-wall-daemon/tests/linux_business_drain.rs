@@ -1,3 +1,4 @@
+// fail-before-exempt: authenticated W client primitives are driven through the existing isolated drain actor and actual service.
 // fail-before-exempt: New drain authority, durability and peer witnesses read isolated native artifacts and files; capability setup uses the inherited actor helper.
 #![cfg(target_os = "linux")]
 #[path = "support/drain_run.rs"]
@@ -1756,5 +1757,90 @@ fn drained_original_lost_retry_ack_reconciles_and_conflict_closes_writer() {
         fs::read_to_string(f.root.join("diagnostics.log")).unwrap(),
         "drain authority closed\n",
         "one content-free diagnostic for W closure"
+    );
+}
+
+#[test]
+fn authenticated_client_owns_reserve_until_complete_confirming_read() {
+    use sha2::{Digest, Sha256};
+    let _guard = isolation::guard();
+    let mut f = Fixture::new();
+    f.start();
+    f.prepare();
+    let policy = |name: &str| json!({"uid":unsafe{libc::geteuid()},"gid":unsafe{libc::getegid()},"executable_sha256":hex::encode(Sha256::digest(fs::read(native(name)).unwrap())),"cgroup":fs::read_to_string("/proc/self/cgroup").unwrap()});
+    let writer = policy("sanctuary-business-writer");
+    let drain = policy("sanctuary-business-drain");
+    assert_eq!(f.w.command(json!({"op":"client-connect","root":f.root.join("runtime"),"leaf":"drain.sock","writer":writer,"drain":drain}))["ok"],true);
+    fn poll(actor: &mut Actor) -> Value {
+        let start = Instant::now();
+        loop {
+            let reply = actor.command(json!({"op":"client-poll"}));
+            if reply["kind"] != "pending" {
+                return reply;
+            }
+            assert!(start.elapsed() < Duration::from_millis(WAIT_MS));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let id = "d".repeat(32);
+    assert_eq!(f.w.command(json!({"op":"client-read","id":id}))["ok"], true);
+    let observed = poll(&mut f.w);
+    assert_eq!(observed["kind"], "read");
+    assert_eq!(observed["value"]["anchor"], f.anchor);
+    let body = canonical(&f.body);
+    let digest = packet_digest(&body);
+    let mut next = f.anchor.clone();
+    next["reserved_sequence"] = f.body["sequence"].clone();
+    next["reserved_body_digest"] = json!(digest);
+    let message = json!({"version":1,"op":"RESERVE","request_id":id,"expected":f.anchor,"next":next,"body_digest":digest});
+    let packet = anchor_packet(&message, &[]);
+    assert_eq!(
+        f.w.command(json!({"op":"client-mutation","hex":hex::encode(&packet)}))["ok"],
+        true
+    );
+    let ack = poll(&mut f.w);
+    assert_eq!(ack["kind"], "ack");
+    assert_eq!(
+        ack["held"], true,
+        "ANCHOR_ACK does not settle mutation ownership"
+    );
+    assert_eq!(
+        f.w.command(json!({"op":"client-read","id":"e".repeat(32)}))["ok"],
+        true
+    );
+    let read = poll(&mut f.w);
+    assert_eq!(read["kind"], "read");
+    assert_eq!(read["value"]["anchor"], next);
+    assert_eq!(
+        read["held"], false,
+        "complete certain READ settles the exact proposal"
+    );
+    let envelope = f.signed(&f.body);
+    let record =
+        castle_wall_daemon::business_profile::writer_protocol::decode_envelope(&envelope).unwrap();
+    let mut committed = next.clone();
+    committed["committed_sequence"] = f.body["sequence"].clone();
+    committed["committed_digest"] =
+        json!(castle_wall_daemon::business_profile::records::join_commitment(&record).unwrap());
+    committed["reserved_body_digest"] = Value::Null;
+    let message = json!({"version":1,"op":"COMMIT","request_id":"f".repeat(32),"expected":next,"next":committed,"body_digest":digest});
+    assert_eq!(
+        f.w.command(
+            json!({"op":"client-mutation","hex":hex::encode(anchor_packet(&message,&envelope))})
+        )["ok"],
+        true
+    );
+    assert_eq!(poll(&mut f.w)["kind"], "ack");
+    assert_eq!(
+        f.w.command(
+            json!({"op":"client-original","id":"a".repeat(32),"hex":hex::encode(&envelope)})
+        )["ok"],
+        true
+    );
+    let released = poll(&mut f.w);
+    assert_eq!(released["kind"], "released");
+    assert_eq!(
+        released["identity"],
+        castle_wall_daemon::business_profile::append_contract::identity(&envelope).unwrap()
     );
 }

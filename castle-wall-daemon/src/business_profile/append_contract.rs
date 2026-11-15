@@ -13,10 +13,12 @@ pub fn contract() -> Option<Value> {
     serde_json::from_str(CONTRACT).ok()
 }
 pub fn shape(name: &str, value: &Value) -> bool {
-    let Some(contract) = contract() else {
+    // Closed shared schema data is immutable; parsing it once keeps each bounded stage independent of schema-loading work.
+    static SHAPES: std::sync::OnceLock<Option<Value>> = std::sync::OnceLock::new();
+    let Some(contract) = SHAPES.get_or_init(contract).as_ref() else {
         return false;
     };
-    shape_with(name, value, &contract)
+    shape_with(name, value, contract)
 }
 fn shape_with(name: &str, value: &Value, contract: &Value) -> bool {
     let Some(fields) = contract[name].as_object() else {

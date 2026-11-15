@@ -1,3 +1,4 @@
+// fail-before-exempt: isolated actor commands exercise authenticated W client primitives against the actual drain service.
 // fail-before-exempt: New isolated native actor and capability-drop launcher; the drain entrypoint is absent at the base.
 //! Test-only real socket principal; stdin commands never exist in a shipped service.
 #[cfg(target_os = "linux")]
@@ -32,6 +33,15 @@ fn execute() -> std::io::Result<()> {
         return Err(refused());
     }
     let mut socket: Option<OwnedFd> = None;
+    use castle_wall_daemon::business_profile::append_clients as clients;
+    struct ClientHooks;
+    impl clients::ClientHooks for ClientHooks {
+        fn before_send(&mut self) -> clients::Result<()> {
+            Ok(())
+        }
+        fn closed(&mut self) {}
+    }
+    let mut client: Option<clients::DrainClient> = None;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut stdout = std::io::stdout().lock();
@@ -50,6 +60,43 @@ fn execute() -> std::io::Result<()> {
         let command: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| refused())?;
         let result = (|| -> std::io::Result<serde_json::Value> {
             match command["op"].as_str().ok_or_else(refused)? {
+                "client-connect" => {
+                    socket=None;
+                    let root=clients::HeldSocketRoot::checked(std::fs::File::open(command["root"].as_str().ok_or_else(refused)?)?,unsafe{libc::geteuid()}).map_err(|_|refused())?;
+                    let pins=clients::ServerPins {
+                        writer:serde_json::from_value(command["writer"].clone()).map_err(|_|refused())?,
+                        drain:serde_json::from_value(command["drain"].clone()).map_err(|_|refused())?,
+                    };
+                    client=Some(clients::DrainClient::connect(&root,command["leaf"].as_str().ok_or_else(refused)?,pins,
+                        std::sync::Arc::new(castle_wall_daemon::business_profile::signer_watchdog::boottime_ns),Box::new(ClientHooks)).map_err(|_|refused())?);
+                    Ok(serde_json::json!({"ok":true}))
+                }
+                "client-read" => {
+                    client.as_mut().ok_or_else(refused)?.read(command["id"].as_str().ok_or_else(refused)?,u64::MAX).map_err(|_|refused())?;
+                    Ok(serde_json::json!({"ok":true}))
+                }
+                "client-mutation" => {
+                    let proposal=clients::FrozenMutation::checked(hex::decode(command["hex"].as_str().ok_or_else(refused)?).map_err(|_|refused())?).map_err(|_|refused())?;
+                    client.as_mut().ok_or_else(refused)?.mutation(&proposal,u64::MAX).map_err(|_|refused())?;
+                    Ok(serde_json::json!({"ok":true}))
+                }
+                "client-original" => {
+                    let bytes=hex::decode(command["hex"].as_str().ok_or_else(refused)?).map_err(|_|refused())?;
+                    client.as_mut().ok_or_else(refused)?.original(command["id"].as_str().ok_or_else(refused)?,&bytes,u64::MAX).map_err(|_|refused())?;
+                    Ok(serde_json::json!({"ok":true}))
+                }
+                "client-poll" => {
+                    let c=client.as_mut().ok_or_else(refused)?;
+                    let reply=c.poll().map_err(|_|refused())?;
+                    let held=c.retained_mutation().is_some();
+                    Ok(match reply {
+                        None=>serde_json::json!({"kind":"pending","held":held}),
+                        Some(clients::DrainReply::Read(o))=>serde_json::json!({"kind":"read","value":o.value(),"observed":o.observed(),"held":held}),
+                        Some(clients::DrainReply::Acknowledged(a))=>serde_json::json!({"kind":"ack","value":a,"held":held}),
+                        Some(clients::DrainReply::Released(f))=>serde_json::json!({"kind":"released","identity":f.identity(),"held":held}),
+                        Some(clients::DrainReply::Refused)=>serde_json::json!({"kind":"refused","held":held}),
+                    })
+                }
                 "connect" => {
                     socket = Some(signer_peer::connect(std::path::Path::new(
                         command["path"].as_str().ok_or_else(refused)?,
@@ -57,6 +104,7 @@ fn execute() -> std::io::Result<()> {
                     Ok(serde_json::json!({"ok":true}))
                 }
                 "close" => {
+                    client = None;
                     socket = None;
                     Ok(serde_json::json!({"ok":true}))
                 }

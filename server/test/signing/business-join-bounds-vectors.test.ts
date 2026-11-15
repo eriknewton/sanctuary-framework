@@ -1,10 +1,10 @@
-// fail-before-exempt: shared native fixture vectors exercise both language validators and existing corpus compatibility.
+// fail-before-exempt: changed byte-cap and domain assertions consume shared native fixture vectors outside server/src.
 // Bounded state admission and durable reload preserve the shared representation.
 // W-JOIN-BOUNDS
 import {readFileSync} from "node:fs";
-import {it,expect} from "vitest";
+import {it,expect,vi} from "vitest";
 import {APPEND_CONTRACT,appendShape,type BusinessDeliveryIdentity} from "../../src/signing/business-append-contract.js";
-import {advance,joinStateValid,type JoinState,type JoinRecord} from "../../src/signing/record-joins.js";
+import {advance,joinStateValid,parseJoinState,JOIN_STATE_BYTES_MAX,type JoinState,type JoinRecord} from "../../src/signing/record-joins.js";
 import {initialLifecycle,lifecycleStep,type JoinLifecycleState} from "../../src/signing/business-join-lifecycle.js";
 import {createBusinessRecordConsumer,type BusinessDurableSink,type DurableBusinessAcceptance} from "../../src/castle-wall/runtime/business-record-consumer.js";
 import type {BusinessPin} from "../../src/linux-business/producer-custody.js";
@@ -41,12 +41,9 @@ it("all existing caller policies remain byte-identical after admission",async()=
 });
 
 it("refuses original noncanonical join number bytes before value admission",async()=>{
-  const joins=await import("../../src/signing/record-joins.js");
   const vectors=JSON.parse(readFileSync(new URL("../../../castle-wall-daemon/tests/fixtures/join-raw-numbers.json",import.meta.url),"utf8")) as Array<{id:string;raw:string;valid:boolean}>;
   for(const row of vectors) {
-    // The base has only value admission; preserve its actual parse-then-predicate behavior for fail-before.
-    const parser=(joins as Partial<typeof joins>).parseJoinState;
-    const accepted=parser ? parser(Buffer.from(row.raw)) !== null : joins.joinStateValid(JSON.parse(row.raw));
+    const accepted=parseJoinState(Buffer.from(row.raw)) !== null;
     expect(accepted,row.id).toBe(row.valid);
   }
 });
@@ -63,4 +60,17 @@ it("refuses every malformed lifecycle wrapper from the shared vectors",()=>{
     expect.soft(()=>{accepted=lifecycleStep(state,{type:"NextGrant"}).accepted;},row.id).not.toThrow();
     expect.soft(accepted,row.id).toBe(false);
   }
+});
+
+it("raw join cap refuses before UTF-8 decoding with an inclusive control",()=>{
+  const fixture=JSON.parse(readFileSync(new URL("../../../castle-wall-daemon/tests/fixtures/join-byte-boundary.json",import.meta.url),"utf8")) as {over_cap_bytes:number;fill:string};
+  expect(parseJoinState(canonicalBytes(seed()))).toEqual(seed());
+  const bytes=Buffer.alloc(JOIN_STATE_BYTES_MAX+fixture.over_cap_bytes,fixture.fill);
+  const spy=vi.spyOn(TextDecoder.prototype,"decode");
+  try {
+    expect(parseJoinState(bytes)).toBeNull();
+    expect(spy,"raw join byte gate before UTF-8").not.toHaveBeenCalled();
+    expect(parseJoinState(bytes.subarray(0,JOIN_STATE_BYTES_MAX))).toBeNull();
+    expect(spy,"inclusive byte gate control").toHaveBeenCalledOnce();
+  } finally {spy.mockRestore();}
 });
