@@ -201,6 +201,24 @@ describe("planHermesYamlInjection (pure)", () => {
     expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(/block-sequence/);
   });
 
+  it("refuses a column-0 continuation line inside an MCP entry instead of leaving its tail behind", () => {
+    const existing = 'mcp_servers:\n  sanctuary:\n    command: "a\n- b"\n    args: []\n  weather:\n    command: w\n';
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(HermesYamlUnsupportedError);
+  });
+
+  it("refuses a list item after the empty flow mcp_servers with an accurate message", () => {
+    expect(() => planHermesYamlInjection("mcp_servers: {}\n- weather\n", ENTRY)).toThrow(/followed by a list item/);
+  });
+
+  it("replaces the sanctuary entry when mcp_servers sits between indentless lists", () => {
+    const existing = 'toolsets:\n- web\nmcp_servers:\n  sanctuary:\n    command: "old"\n  weather:\n    command: w\ncommand_allowlist:\n- execute_code\n';
+    const plan = planHermesYamlInjection(existing, ENTRY);
+    expect(plan.action).toBe("replace-entry");
+    expect(plan.content.startsWith("toolsets:\n- web\nmcp_servers:\n  sanctuary:\n")).toBe(true);
+    expect(plan.content.endsWith("  weather:\n    command: w\ncommand_allowlist:\n- execute_code\n")).toBe(true);
+    expect(plan.content).not.toContain('"old"');
+  });
+
   it("injects next to indentless top-level lists without moving them", () => {
     const existing = "toolsets:\n- web\ncommand_allowlist:\n- execute_code\n";
     const plan = planHermesYamlInjection(existing, ENTRY);

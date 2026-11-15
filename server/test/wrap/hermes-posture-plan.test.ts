@@ -26,6 +26,12 @@ export const refusedShapes = [
   ["plugins indentless sequence", "plugins:\n- enabled\n"],
   ["scalar followed by indentless item", "model: one\n- two\n"],
   ["document is a sequence", "- one\nmemory:\n  provider: old\n"],
+  ["document starts with a bare item", "-\nmemory:\n  provider: old\n"],
+  ["guardrails indentless sequence", "tool_loop_guardrails:\n- hard_stop_enabled\n"],
+  ["anchor followed by indentless item", "toolsets: &a\n- web\n"],
+  ["empty MCP flow followed by item", "mcp_servers: {}\n- weather\n"],
+  ["line separator hides a key", "toolsets:\n- web\u2028memory:\n  provider: old\n"],
+  ["no-break space after a dash", "toolsets:\n-\u00a0web: x\n"],
 ] as const;
 
 describe("Hermes memory YAML planner", () => {

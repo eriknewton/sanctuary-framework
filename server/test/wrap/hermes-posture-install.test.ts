@@ -347,6 +347,8 @@ describe.skipIf(!python)("Hermes installer real-parser continuing paths", () => 
     ["config absent", null],
     ["blocks absent", "model: fixture\n"],
     ["values replaced", "memory:\n  provider: old\n  memory_enabled: true # retain\nplugins:\n  enabled: [other_plugin]\n"],
+    // PyYAML's default dump, which Hermes writes: top-level lists are not indented.
+    ["indentless top-level lists", "fallback_providers:\n- provider: one\n  model: m1\ntoolsets:\n- web\nmemory:\n  provider: ''\ncommand_allowlist:\n- execute_code\n- script execution via heredoc\n"],
   ])("%s and uninstall unchanged", async (_name, original) => {
     if (original !== null) await seed(original);
     await fs.writeFile(join(root, "SOUL.md"), "Original identity.\n");
