@@ -32,6 +32,8 @@ export const refusedShapes = [
   ["empty MCP flow followed by item", "mcp_servers: {}\n- weather\n"],
   ["line separator hides a key", "toolsets:\n- web\u2028memory:\n  provider: old\n"],
   ["no-break space after a dash", "toolsets:\n-\u00a0web: x\n"],
+  ["document start marker", "---\ntoolsets:\n- web\n"],
+  ["document end marker", "toolsets:\n- web\n...\n"],
 ] as const;
 
 describe("Hermes memory YAML planner", () => {
@@ -47,6 +49,7 @@ describe("Hermes memory YAML planner", () => {
     ["MCP header comment", "mcp_servers: # preserved\n  sanctuary:\n    command: old\n", "mcp_servers: {} # preserved\n" + fresh],
     ["other MCP kept", "mcp_servers:\n  sanctuary:\n    command: old\n  weather:\n    command: weather\n", "mcp_servers:\n  weather:\n    command: weather\n" + fresh],
     ["already installed", fresh, fresh],
+    ["indentless item as the last line without a newline", "toolsets:\n- web", "toolsets:\n- web\n" + fresh],
     // PyYAML's default dump, which Hermes writes: top-level lists are not indented.
     ["indentless top-level lists kept", "fallback_providers:\n- provider: one\n  model: m1\n- provider: two\ntoolsets:\n- web\n-\ncommand_allowlist:\n- execute_code # keep\n# between\n- script execution\nmemory:\n  provider: old\n", "fallback_providers:\n- provider: one\n  model: m1\n- provider: two\ntoolsets:\n- web\n-\ncommand_allowlist:\n- execute_code # keep\n# between\n- script execution\nmemory:\n  provider: sanctuary_memory\n  memory_enabled: false\n  user_profile_enabled: false\nplugins:\n  enabled: [sanctuary]\n"],
   ])("%s", (_name, input, expected) => {
