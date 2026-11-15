@@ -1,10 +1,19 @@
 // Must match business_profile/join_lifecycle.rs; shared vectors pin every transition.
 import {advance, joinStateValid, cloneJoinState, plainJoinJson, type JoinRecord, type JoinState} from "./record-joins.js";
-import {APPEND_CONTRACT, deliveryIdentity, parseBusinessEnvelope, type BusinessDeliveryIdentity} from "./business-append-contract.js";
+import {APPEND_CONTRACT, appendShape, deliveryIdentity, parseBusinessEnvelope, type BusinessDeliveryIdentity} from "./business-append-contract.js";
 import {canonicalBytes} from "./contract.js";
 export interface JoinLifecycleState {committed: JoinState | null; provisional: {state: JoinState; identity: BusinessDeliveryIdentity; signed: boolean} | null; tombstone: BusinessDeliveryIdentity | null; needs_checkpoint: boolean;}
 export const initialLifecycle = (): JoinLifecycleState => ({committed: null, provisional: null, tombstone: null, needs_checkpoint: true});
 const equal = (a: unknown,b: unknown) => Buffer.from(canonicalBytes(a)).equals(Buffer.from(canonicalBytes(b)));
+const closed = (value: unknown, keys: string[]): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key=>Object.hasOwn(value,key));
+function lifecycleStateValid(state: unknown): state is JoinLifecycleState {
+  // Must match join_lifecycle.rs state_valid: only explicit null is empty, and closed wrappers bound pass-through copies.
+  if (!closed(state,["committed","provisional","tombstone","needs_checkpoint"]) || typeof state.needs_checkpoint !== "boolean") return false;
+  const identity = (value: unknown) => value === null || appendShape("identity",value);
+  return (state.committed === null || joinStateValid(state.committed)) && identity(state.tombstone) &&
+    (state.provisional === null || (closed(state.provisional,["state","identity","signed"]) &&
+      joinStateValid(state.provisional.state) && identity(state.provisional.identity) && typeof state.provisional.signed === "boolean"));
+}
 /** Pure model. The caller must authenticate checkpoint and commit evidence before submitting events. */
 export function lifecycleStep(state: JoinLifecycleState, event: Record<string, unknown>): {accepted: boolean; state: JoinLifecycleState} {
   const fail = () => ({accepted:false, state});
@@ -15,9 +24,9 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
   const fields = APPEND_CONTRACT.lifecycle[type];
   if (!fields || !equal(Object.keys(event).sort(), ["type",...fields].sort())) return fail();
   // Caller-supplied lifecycle state cannot carry an unbounded checkpoint through a later event.
-  if ((state.committed !== null && !joinStateValid(state.committed)) ||
-      (state.provisional !== null && !joinStateValid(state.provisional.state))) return fail();
+  if (!lifecycleStateValid(state)) return fail();
   const next = structuredClone(state);
+  if (!lifecycleStateValid(next)) return fail();
   switch (type) {
     case "Checkpoint": {
       const checkpoint = cloneJoinState(event.checkpoint);

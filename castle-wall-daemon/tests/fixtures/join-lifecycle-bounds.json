@@ -1,0 +1,72 @@
+[
+  {
+    "id": "missing-committed",
+    "seed": "ready",
+    "path": "committed",
+    "remove": true
+  },
+  {
+    "id": "missing-provisional",
+    "seed": "ready",
+    "path": "provisional",
+    "remove": true
+  },
+  {
+    "id": "missing-tombstone",
+    "seed": "ready",
+    "path": "tombstone",
+    "remove": true
+  },
+  {
+    "id": "missing-needs_checkpoint",
+    "seed": "ready",
+    "path": "needs_checkpoint",
+    "remove": true
+  },
+  {
+    "id": "extra-wrapper",
+    "seed": "ready",
+    "path": "extra",
+    "value": "unretained"
+  },
+  {
+    "id": "wrong-needs-checkpoint",
+    "seed": "ready",
+    "path": "needs_checkpoint",
+    "value": "false"
+  },
+  {
+    "id": "invalid-tombstone",
+    "seed": "ready",
+    "path": "tombstone",
+    "value": {
+      "extra": "unretained"
+    }
+  },
+  {
+    "id": "extra-provisional",
+    "seed": "pending",
+    "path": "provisional.extra",
+    "value": "unretained"
+  },
+  {
+    "id": "missing-provisional-identity",
+    "seed": "pending",
+    "path": "provisional.identity",
+    "remove": true
+  },
+  {
+    "id": "invalid-provisional-identity",
+    "seed": "pending",
+    "path": "provisional.identity",
+    "value": {
+      "extra": "unretained"
+    }
+  },
+  {
+    "id": "invalid-provisional-signed",
+    "seed": "pending",
+    "path": "provisional.signed",
+    "value": "false"
+  }
+]

@@ -5,6 +5,26 @@ use serde_json::{json, Value};
 pub fn initial() -> Value {
     json!({"committed":null,"provisional":null,"tombstone":null,"needs_checkpoint":true})
 }
+fn closed(value: &Value, keys: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+    })
+}
+fn state_valid(state: &Value) -> bool {
+    // Must match lifecycleStateValid in business-join-lifecycle.ts: only explicit null is empty, and closed wrappers bound pass-through copies.
+    let identity = |value: &Value| value.is_null() || append_contract::shape("identity", value);
+    closed(
+        state,
+        &["committed", "provisional", "tombstone", "needs_checkpoint"],
+    ) && state["needs_checkpoint"].is_boolean()
+        && (state["committed"].is_null() || records::join_state_valid(&state["committed"]))
+        && identity(&state["tombstone"])
+        && (state["provisional"].is_null()
+            || (closed(&state["provisional"], &["state", "identity", "signed"])
+                && records::join_state_valid(&state["provisional"]["state"])
+                && identity(&state["provisional"]["identity"])
+                && state["provisional"]["signed"].is_boolean()))
+}
 pub fn step(state: &Value, event: &Value) -> Option<Value> {
     let contract = append_contract::contract()?;
     let kind = event["type"].as_str()?;
@@ -18,10 +38,7 @@ pub fn step(state: &Value, event: &Value) -> Option<Value> {
         return None;
     }
     // Must match lifecycleStep: pass-through events validate retained state before cloning.
-    if (!state["committed"].is_null() && !records::join_state_valid(&state["committed"]))
-        || (!state["provisional"].is_null()
-            && !records::join_state_valid(&state["provisional"]["state"]))
-    {
+    if !state_valid(state) {
         return None;
     }
     let mut next = state.clone();
@@ -88,6 +105,34 @@ pub fn step(state: &Value, event: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_closed_lifecycle_wrappers() {
+        let rows: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/join-lifecycle-bounds.json"
+        ))
+        .unwrap();
+        let contract = append_contract::contract().unwrap();
+        for row in rows.as_array().unwrap() {
+            let mut state = contract["lifecycle_states"][row["seed"].as_str().unwrap()].clone();
+            let keys: Vec<_> = row["path"].as_str().unwrap().split('.').collect();
+            let mut parent = &mut state;
+            for key in &keys[..keys.len() - 1] {
+                parent = &mut parent[*key];
+            }
+            let key = keys[keys.len() - 1];
+            if row["remove"] == true {
+                parent.as_object_mut().unwrap().remove(key);
+            } else {
+                parent[key] = row["value"].clone();
+            }
+            assert!(
+                step(&state, &json!({"type":"NextGrant"})).is_none(),
+                "closed lifecycle {}",
+                row["id"]
+            );
+        }
+    }
 
     #[test]
     fn signature_width_refuses_before_history_advance() {
