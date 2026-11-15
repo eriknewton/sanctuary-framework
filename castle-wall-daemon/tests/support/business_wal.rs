@@ -1,3 +1,4 @@
+// fail-before-exempt: maximal allocation and restart witnesses use native isolated WAL files and authenticated fixture observations.
 // fail-before-exempt: isolated disk publication and release witnesses consume native authenticated clients and shared signed vectors.
 // W-WAL-STORE
 // W-TS-SCHEMA
@@ -809,13 +810,14 @@ fn forty_uncertain_publications_retain_one_intent_and_every_charge() {
         .is_err());
     let original = fs::read(f.root.path().join("row-00000000000000000001.json")).unwrap();
     let mut charged = wal.charged_bytes().0;
+    let allocation_charge = charged;
     for _ in 0..40 {
         f.fault(WalStep::DirectorySync, 0);
         assert!(wal.reconcile_publication().is_err());
         assert_eq!(wal.state(), WalState::PublicationHeld);
         assert_eq!(
             wal.charged_bytes().0,
-            charged + original.len() as u64,
+            charged + allocation_charge,
             "each uncertain replacement remains charged"
         );
         charged = wal.charged_bytes().0;
@@ -834,7 +836,7 @@ fn forty_uncertain_publications_retain_one_intent_and_every_charge() {
             .is_err());
     }
     wal.reconcile_publication().unwrap();
-    assert_eq!(wal.charged_bytes().0, original.len() as u64);
+    assert_eq!(wal.charged_bytes().0, allocation_charge);
     assert!(
         wal.freeze_body(
             &canonical(&f.records[0]["body"]),
@@ -849,5 +851,141 @@ fn forty_uncertain_publications_retain_one_intent_and_every_charge() {
     assert_eq!(
         fs::read(f.root.path().join("row-00000000000000000001.json")).unwrap(),
         original
+    );
+}
+
+#[test]
+fn maximal_admission_preserves_rewrite_space_through_release() {
+    use castle_wall_daemon::business_profile::{
+        activation_anchor, drain_protocol, records, records_schema, writer_protocol,
+    };
+    // Same independent wire bounds as the generated row and checkpoint contracts.
+    let row_max = (2 * 4 * drain_protocol::D_REQUEST_MAX_BYTES.div_ceil(3)
+        + 4 * records_schema::MAX_BYTES.div_ceil(3)
+        + 4 * writer_protocol::WRITER_ENVELOPE_MAX_BYTES.div_ceil(3)
+        + 32 * 128) as u64;
+    let checkpoint_max = (4 * records::JOIN_STATE_BYTES_MAX.div_ceil(3)
+        + activation_anchor::MAX_BYTES
+        + 32 * 128) as u64;
+    let f = Fixture::new();
+    let mut wal = f.open(true).unwrap();
+    test_support::accounting(
+        &mut wal,
+        BUSINESS_WAL_MAX_BYTES - 2 * row_max,
+        checkpoint_max,
+        0,
+    );
+    let reserve = f.begin(&mut wal, 0);
+    assert_eq!(
+        wal.charged_bytes().0,
+        BUSINESS_WAL_MAX_BYTES - row_max,
+        "admission reserves the complete row footprint"
+    );
+    wal.persist_sign_marker(&authenticated_read(reserve.next()), NOW)
+        .unwrap();
+    let envelope = canonical(&f.records[0]);
+    assert_eq!(
+        wal.freeze_envelope(&envelope),
+        Ok(()),
+        "signed E has guaranteed custody headroom"
+    );
+    let identity = append_contract::identity(&envelope).unwrap();
+    let mut next = reserve.next().clone();
+    next["committed_sequence"] = identity["sequence"].clone();
+    next["committed_digest"] = identity["commitment"].clone();
+    next["reserved_body_digest"] = Value::Null;
+    let commit = mutation(
+        json!({"version":1,"op":"COMMIT","request_id":"e".repeat(32),"expected":reserve.next(),"next":next,"body_digest":digest(&canonical(&f.records[0]["body"]))}),
+        &envelope,
+    );
+    wal.freeze_commit(&commit).unwrap();
+    wal.confirm_commit(&authenticated_read(commit.next()))
+        .unwrap();
+    let next_reserve = f.reserve(&wal, 1);
+    assert_eq!(
+        wal.freeze_body(
+            &canonical(&f.records[1]["body"]),
+            &next_reserve,
+            DEADLINE,
+            EXPIRY,
+            Pool::Ordinary
+        ),
+        Err(Refusal::Capacity),
+        "next admission cannot spend rewrite reserve"
+    );
+    assert_eq!(
+        wal.persist_ts_fact(BusinessSequence(1), sink().deliver(&envelope).unwrap()),
+        Ok(()),
+        "TS fact retains rewrite headroom"
+    );
+    assert_eq!(
+        wal.persist_d_fact(BusinessSequence(1), authenticated_original(&envelope)),
+        Ok(()),
+        "D fact retains rewrite headroom"
+    );
+    drop(wal);
+    let reopened = test_support::reopen_accounted(
+        f.root.path(),
+        unsafe { libc::geteuid() },
+        Box::new(f.faults.clone()),
+        [BUSINESS_WAL_MAX_BYTES - 2 * row_max, 0],
+    );
+    assert!(
+        reopened.is_ok(),
+        "near-full restart retains one maximal staging allocation"
+    );
+    let mut wal = reopened.unwrap();
+    // Try another admission at the boundary before restarting again, with the same occupied pools.
+    let _admitted = wal.freeze_body(
+        &canonical(&f.records[1]["body"]),
+        &next_reserve,
+        DEADLINE,
+        EXPIRY,
+        Pool::Ordinary,
+    );
+    drop(wal);
+    assert!(
+        test_support::reopen_accounted(
+            f.root.path(),
+            unsafe { libc::geteuid() },
+            Box::new(f.faults.clone()),
+            [BUSINESS_WAL_MAX_BYTES - 2 * row_max, 0]
+        )
+        .is_ok(),
+        "admission cannot consume near-full restart headroom"
+    );
+}
+
+#[test]
+fn admission_retains_near_full_restart_headroom() {
+    use castle_wall_daemon::business_profile::{drain_protocol, records_schema, writer_protocol};
+    let row_max = (2 * 4 * drain_protocol::D_REQUEST_MAX_BYTES.div_ceil(3)
+        + 4 * records_schema::MAX_BYTES.div_ceil(3)
+        + 4 * writer_protocol::WRITER_ENVELOPE_MAX_BYTES.div_ceil(3)
+        + 32 * 128) as u64;
+    let f = Fixture::new();
+    let mut wal = f.open(true).unwrap();
+    let control = wal.charged_bytes().1;
+    let occupied = BUSINESS_WAL_MAX_BYTES - 2 * row_max;
+    test_support::accounting(&mut wal, occupied, control, 0);
+    f.append(&mut wal, 0);
+    let reserve = f.reserve(&wal, 1);
+    let _ = wal.freeze_body(
+        &canonical(&f.records[1]["body"]),
+        &reserve,
+        DEADLINE,
+        EXPIRY,
+        Pool::Ordinary,
+    );
+    drop(wal);
+    assert!(
+        test_support::reopen_accounted(
+            f.root.path(),
+            unsafe { libc::geteuid() },
+            Box::new(f.faults.clone()),
+            [occupied, 0]
+        )
+        .is_ok(),
+        "admission cannot consume near-full restart headroom"
     );
 }

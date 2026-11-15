@@ -43,6 +43,21 @@ const ROW_MAX_BYTES: usize = 2 * 4 * drain_protocol::D_REQUEST_MAX_BYTES.div_cei
 // Each separately encoded byte string is rounded independently; unpadded base64 fits the padded bound.
 const CHECKPOINT_MAX_BYTES: usize =
     4 * records::JOIN_STATE_BYTES_MAX.div_ceil(3) + anchor::MAX_BYTES + METADATA_MAX_BYTES;
+// Admission leaves a complete row staging allocation in either pool and a checkpoint
+// staging allocation in Control. Ordinary custody never borrows the control pool.
+const ROW_REWRITE_RESERVE: u64 = ROW_MAX_BYTES as u64;
+const CONTROL_REWRITE_RESERVE: u64 = ROW_REWRITE_RESERVE + CHECKPOINT_MAX_BYTES as u64;
+const _: () = assert!(
+    ROW_REWRITE_RESERVE < BUSINESS_WAL_MAX_BYTES
+        && CONTROL_REWRITE_RESERVE < BUSINESS_WAL_CONTROL_MAX_BYTES
+);
+fn allocation(name: &str) -> u64 {
+    if name == CHECKPOINT {
+        CHECKPOINT_MAX_BYTES as u64
+    } else {
+        ROW_MAX_BYTES as u64
+    }
+}
 const LOCK: &str = "business-wal.lock";
 const CHECKPOINT: &str = "checkpoint.json";
 const STAGING: &str = "publication.stage";
@@ -338,6 +353,15 @@ impl BusinessWal {
         hooks: Box<dyn WalHooks>,
         seed: Option<CheckpointSeed>,
     ) -> Result<Self> {
+        Self::open_accounted(path, owner, hooks, seed, [0, 0])
+    }
+    fn open_accounted(
+        path: &Path,
+        owner: u32,
+        hooks: Box<dyn WalHooks>,
+        seed: Option<CheckpointSeed>,
+        occupied: [u64; 2],
+    ) -> Result<Self> {
         let root = held_root(path, owner)?;
         // Lock acquisition precedes enumeration, staging inspection and checkpoint reads. The inode is never unlinked.
         let (lock, created) =
@@ -375,7 +399,7 @@ impl BusinessWal {
                 originals: None,
                 next_cursor: 1,
             }),
-            usage: [0, 0],
+            usage: occupied,
             entries: 0,
             restarted: !created,
             state: WalState::Ready,
@@ -401,7 +425,7 @@ impl BusinessWal {
                     let bytes = store.read(CHECKPOINT, CHECKPOINT_MAX_BYTES)?;
                     store.checkpoint = unpack(&bytes, CHECKPOINT_MAX_BYTES)?;
                     store.usage[1] = store.usage[1]
-                        .checked_add(bytes.len() as u64)
+                        .checked_add(allocation(CHECKPOINT))
                         .ok_or(Refusal::Capacity)?;
                 }
                 _ => {
@@ -415,7 +439,7 @@ impl BusinessWal {
                     }
                     let index = usize::from(row.control);
                     store.usage[index] = store.usage[index]
-                        .checked_add(bytes.len() as u64)
+                        .checked_add(ROW_MAX_BYTES as u64)
                         .ok_or(Refusal::Capacity)?;
                     store.entries += 1;
                 }
@@ -662,14 +686,17 @@ impl BusinessWal {
     }
     fn publish(&mut self, name: String, bytes: Vec<u8>, pool: Pool) -> Result<()> {
         self.ready()?;
-        self.capacity(bytes.len() as u64, pool)?;
+        self.capacity(allocation(&name), pool)?;
         let old_size = match open_at(&self.root, &name, libc::O_RDONLY) {
-            Ok(f) => private_file(&f, self.owner)?,
+            Ok(f) => {
+                private_file(&f, self.owner)?;
+                allocation(&name)
+            }
             Err(Refusal::Missing) => 0,
             Err(e) => return Err(e),
         };
         // Both the old target and the complete staging allocation are charged before any write.
-        self.usage[pool_index(pool)] += bytes.len() as u64;
+        self.usage[pool_index(pool)] += allocation(&name);
         self.pending = Some(PendingPublication {
             name,
             bytes,
@@ -732,12 +759,12 @@ impl BusinessWal {
             // does not establish durability of the earlier possibly published directory change.
             let bytes = pending.bytes.clone();
             let pool = pending.pool;
-            self.capacity(bytes.len() as u64, pool)?;
-            self.usage[pool_index(pool)] += bytes.len() as u64;
+            self.capacity(allocation(&pending.name), pool)?;
+            self.usage[pool_index(pool)] += allocation(&pending.name);
             let pending = self.pending.as_mut().ok_or(Refusal::Held)?;
             pending.old_size = pending
                 .old_size
-                .checked_add(bytes.len() as u64)
+                .checked_add(allocation(&pending.name))
                 .ok_or(Refusal::Capacity)?;
             self.hooks.before(WalStep::StageCreate)?;
             let mut stage = open_at(
@@ -842,6 +869,17 @@ impl BusinessWal {
         if open_at(&self.root, &row_name(sequence), libc::O_RDONLY).is_ok() {
             return Err(Refusal::Held);
         }
+        // The full intent footprint remains charged until release; no later SIGN completion
+        // or fact publication can compete with a new admission for its staging space.
+        self.capacity(
+            ROW_MAX_BYTES as u64
+                + match pool {
+                    Pool::Ordinary => ROW_REWRITE_RESERVE,
+                    Pool::Control => CONTROL_REWRITE_RESERVE,
+                },
+            pool,
+        )?;
+        self.capacity(CONTROL_REWRITE_RESERVE, Pool::Control)?;
         self.save_row(&row)?;
         self.entries += 1;
         let mut c = self.checkpoint.clone();
@@ -1081,7 +1119,8 @@ impl BusinessWal {
     }
     fn delete_released(&mut self, row: &Row) -> Result<()> {
         let name = row_name(row.sequence);
-        let bytes = self.read(&name, ROW_MAX_BYTES)?.len() as u64;
+        self.read(&name, ROW_MAX_BYTES)?;
+        let bytes = ROW_MAX_BYTES as u64;
         // Any ambiguous deletion retains charges and closes this executor until a locked restart reconciles the directory.
         self.state = WalState::PublicationHeld;
         self.hooks.before(WalStep::Delete)?;
@@ -1117,6 +1156,15 @@ impl BusinessWal {
 #[cfg(feature = "test-isolation")]
 pub mod test_support {
     use super::*;
+    /// Reopen with isolated occupancy representing other retained rows in the same pools.
+    pub fn reopen_accounted(
+        path: &Path,
+        owner: u32,
+        hooks: Box<dyn WalHooks>,
+        occupied: [u64; 2],
+    ) -> Result<BusinessWal> {
+        BusinessWal::open_accounted(path, owner, hooks, None, occupied)
+    }
     /// Isolated accounting boundary stimulus; it cannot select an installed root.
     pub fn accounting(wal: &mut BusinessWal, ordinary: u64, control: u64, entries: usize) {
         wal.usage = [ordinary, control];
