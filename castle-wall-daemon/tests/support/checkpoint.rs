@@ -1,3 +1,4 @@
+// fail-before-exempt: advancing serve schedules use native socket, bus and clock fixtures.
 // fail-before-exempt: isolated checkpoint predicates and scheduling exercise native primitives and shared schema fixtures.
 // W-CHECKPOINT
 use castle_wall_daemon::business_profile::{
@@ -1484,4 +1485,182 @@ fn ack_delivery_failure_is_terminal_after_grant_and_cancels() {
 #[test]
 fn frozen_tick_expiry_while_awaiting_cancels_through_serve() {
     accepting_serve_fixture(false, false, false, false, true);
+}
+
+fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
+    use castle_wall_daemon::business_profile::{
+        signer_peer,
+        writer_peer::{HeldConfig, ListenerExpectations},
+    };
+    use std::{
+        os::{fd::AsRawFd, unix::fs::PermissionsExt},
+        time::Duration,
+    };
+    let (f, mut machine, mut report) = fixture();
+    if last_tick {
+        bounded_ordinary_report(&f, &mut report);
+        machine.heartbeat().unwrap();
+    }
+    let mut bus = bus_fixture::Fixture::new();
+    bus.config.fortress_id = "a".repeat(32);
+    let config = HeldConfig::isolated(&bus.config_path(), unsafe { libc::geteuid() }).unwrap();
+    let path = bus.root.path().join("records");
+    let listener = signer_peer::listen(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let expect = ListenerExpectations::isolated(path.clone(), unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    });
+    let clock = f.clock();
+    // Every phase advances the same clock used by the machine, bus deadlines and S fixture.
+    let pause = || std::thread::sleep(Duration::from_millis(state::BUS_SCHEDULING_SLACK_MS));
+    let last_tick_start = || {
+        let last = *f.status_times.lock().unwrap().last().unwrap();
+        f.now.store(
+            last + (wire::WRITER_HEARTBEAT_MS - 10) * state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
+    };
+    let next_tick = || {
+        pause();
+        f.now.fetch_add(10 * state::NS_PER_MS, Ordering::SeqCst);
+        pause();
+    };
+    std::thread::scope(|scope| {
+        let target = &bus.target;
+        let runner = scope.spawn(move || {
+            let result = support::serve_accept(
+                &mut machine,
+                &config,
+                target,
+                &listener,
+                &expect,
+                unsafe { libc::geteuid() },
+                &clock,
+            );
+            assert!(result.is_err());
+            assert!(!support::checkpoint_owned(&machine));
+        });
+        let socket = signer_peer::connect(&path).unwrap();
+        let hello = wire_receive(socket.as_raw_fd());
+        let n = u32::from_be_bytes(hello[..4].try_into().unwrap()) as usize;
+        let h: Value = serde_json::from_slice(&hello[4..4 + n]).unwrap();
+        let session = h["session_id"].as_str().unwrap();
+        let send = |op: &Operation, body: &[u8]| {
+            signer_peer::send(
+                socket.as_raw_fd(),
+                &wire::encode(Direction::ToWriter, session, op, body).unwrap(),
+                &[],
+            )
+            .unwrap()
+        };
+        send(&Operation::HelloAck, &[]);
+        pause();
+        if last_tick {
+            last_tick_start();
+        }
+        send(
+            &Operation::CheckpointQuery {
+                request_id: REQUEST.into(),
+            },
+            &[],
+        );
+        if last_tick {
+            next_tick();
+        }
+        // A STATUS response provides an observable continuing-session control even if QUERY was lost.
+        send(
+            &Operation::Status {
+                request_id: "c".repeat(32),
+            },
+            &[],
+        );
+        let response = wire_receive(socket.as_raw_fd());
+        let response = wire::decode(&response, Direction::ToWall, session).unwrap();
+        assert!(
+            matches!(response.operation, Operation::CheckpointChallenge { .. }),
+            "last-tick query is deferred intact through the heartbeat"
+        );
+        let Operation::CheckpointChallenge { nonce, .. } = response.operation else {
+            unreachable!()
+        };
+        let status = wire_receive(socket.as_raw_fd());
+        assert!(matches!(
+            wire::decode(&status, Direction::ToWall, session)
+                .unwrap()
+                .operation,
+            Operation::StatusReply { .. }
+        ));
+        report["session_id"] = json!(session);
+        report["request_id"] = json!(REQUEST);
+        report["nonce"] = json!(nonce);
+        report["status_digest"] = json!(cp::digest(response.payload));
+        report["observed_boottime_ns"] = json!(f.now.load(Ordering::SeqCst).to_string());
+        let raw = bytes(&report);
+        for (index, part) in raw.chunks(anchor::MAX_BYTES).enumerate() {
+            if last_tick {
+                last_tick_start();
+            }
+            if slow_reread {
+                f.status_delay
+                    .store(985 * state::NS_PER_MS, Ordering::SeqCst);
+            }
+            send(
+                &Operation::CheckpointPart(cp::Part {
+                    request_id: REQUEST.into(),
+                    nonce: report["nonce"].as_str().unwrap().into(),
+                    part_index: index,
+                    part_count: raw.len().div_ceil(anchor::MAX_BYTES),
+                    total_length: raw.len(),
+                    checkpoint_digest: cp::digest(&raw),
+                }),
+                part,
+            );
+            if last_tick {
+                next_tick();
+            }
+        }
+        pause();
+        f.status_delay.store(0, Ordering::SeqCst);
+        if slow_reread {
+            assert_eq!(
+                f.binds.load(Ordering::SeqCst),
+                0,
+                "serve-site preemption performs no adjudication after a 985 ms reread"
+            );
+        }
+        send(
+            &Operation::Status {
+                request_id: "d".repeat(32),
+            },
+            &[],
+        );
+        let reply = wire_receive(socket.as_raw_fd());
+        let reply = wire::decode(&reply, Direction::ToWall, session).unwrap();
+        if slow_reread {
+            assert!(matches!(reply.operation, Operation::StatusReply { .. }));
+        } else {
+            assert!(
+                matches!(reply.operation, Operation::CheckpointAck { .. }),
+                "all last-tick parts complete without timing cancellation"
+            );
+            assert_eq!(f.binds.load(Ordering::SeqCst), 1);
+            let status = wire_receive(socket.as_raw_fd());
+            assert!(matches!(
+                wire::decode(&status, Direction::ToWall, session)
+                    .unwrap()
+                    .operation,
+                Operation::StatusReply { .. }
+            ));
+        }
+        drop(socket);
+        runner.join().unwrap();
+    });
+}
+#[test]
+fn advancing_serve_defers_query_and_each_part_at_the_last_tick() {
+    advancing_serve_schedule(true, false);
+}
+#[test]
+fn advancing_serve_preempts_adjudication_at_the_real_call_site() {
+    advancing_serve_schedule(false, true);
 }

@@ -1168,6 +1168,7 @@ struct Wall {
     binding: WallMainBinding,
     handshake: Handshake,
     session: String,
+    deferred_checkpoint: Option<signer_peer::Packet>,
 }
 #[allow(clippy::too_many_arguments)]
 fn serve<P: SignerPort, R: Reconciler>(
@@ -1240,6 +1241,7 @@ fn serve<P: SignerPort, R: Reconciler>(
                     binding,
                     handshake,
                     session,
+                    deferred_checkpoint: None,
                 });
             }
             if machine.awaiting_reread.is_some() || machine.heartbeat_due()? {
@@ -1280,8 +1282,21 @@ fn serve<P: SignerPort, R: Reconciler>(
             }
             if let Some(w) = &mut wall {
                 machine.checkpoint_stage()?;
-                if machine.awaiting_reread.is_none() && readable(w.fd.as_raw_fd()) {
-                    let packet = writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?;
+                if machine.awaiting_reread.is_none()
+                    && (w.deferred_checkpoint.is_some() || readable(w.fd.as_raw_fd()))
+                {
+                    if w.deferred_checkpoint.is_some()
+                        && machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)?
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            WATCHDOG_TICK_MS as u64,
+                        ));
+                        continue;
+                    }
+                    let packet = match w.deferred_checkpoint.take() {
+                        Some(packet) => packet,
+                        None => writer_protocol::receive(w.fd.as_raw_fd(), Direction::ToWriter)?,
+                    };
                     let frame = w.handshake.receive(&packet.bytes)?;
                     w.binding.packet(&packet)?;
                     let now = clock()?;
@@ -1325,8 +1340,10 @@ fn serve<P: SignerPort, R: Reconciler>(
                             CheckpointMode::Refuse => return Err(Error::State),
                             #[cfg(feature = "test-isolation")]
                             CheckpointMode::Accept => {
+                                // Authenticated W checkpoint bytes carry no authority until adjudication.
+                                // Keep the whole packet and partial transfer while a due S heartbeat takes priority.
                                 if machine.heartbeat_due_within(WATCHDOG_TICK_MS as u64)? {
-                                    machine.checkpoint_cancel();
+                                    w.deferred_checkpoint = Some(packet);
                                 } else if let Some((op, payload)) = machine.checkpoint_packet(
                                     &w.session,
                                     &frame.operation,

@@ -1,3 +1,4 @@
+// fail-before-exempt: checkpoint timeout and repeated ownership assertions use native authenticated sockets and shared fixtures.
 // fail-before-exempt: authenticated client and WAL fact fixtures use isolated native sockets, process pins and shared data.
 // W-CLIENT-CONTRACT
 // W-CHECKPOINT
@@ -607,4 +608,88 @@ fn writer_waits_for_hello_and_preserves_one_correlated_request() {
             }
         }
     }
+}
+
+#[test]
+fn checkpoint_deadlines_refuse_only_the_checkpoint_and_keep_the_session() {
+    for phase in ["query", "report", "parts", "ack"] {
+        let f = Fixture::new();
+        let (mut c, s) = f.writer();
+        if phase == "query" {
+            c.checkpoint_query(ID, 3000 * NS).unwrap();
+            receive(&s);
+        } else {
+            let mut report =
+                append_contract::contract().unwrap()["checkpoint_vectors"][0]["value"].clone();
+            c.checkpoint_query(ID, 3000 * NS).unwrap();
+            receive(&s);
+            let status=serde_json::from_value::<castle_wall_daemon::business_profile::signer_client::StatusReply>(json!({
+        "op":"STATUS","state":"LOCKED","grant":{"role":report["wal_checkpoint"]["join_state"]["pin"]["role"],
+        "epoch":1,"kid":report["wal_checkpoint"]["join_state"]["pin"]["kid"],"public_key":report["wal_checkpoint"]["join_state"]["pin"]["public_key"],
+        "identity_id":ID,"machine_id":ID,"activation_id":ID,"lease_id":ID,"generation":1},
+        "started_boottime_ns":"0","expires_boottime_ns":"0","boot_id":ID,"anchor_revision":null,"anchor_digest":null})).unwrap();
+            let payload = cp::status_bytes(&status).unwrap();
+            send(
+                &s,
+                &p::encode(
+                    p::Direction::ToWall,
+                    SESSION,
+                    &p::Operation::CheckpointChallenge {
+                        request_id: ID.into(),
+                        nonce: ID.into(),
+                        issued_boottime_ns: NS,
+                    },
+                    &payload,
+                )
+                .unwrap(),
+            );
+            let Some(WriterReply::Challenge(challenge)) = c.poll().unwrap() else {
+                panic!("challenge");
+            };
+            report["session_id"] = json!(challenge.session);
+            report["request_id"] = json!(ID);
+            report["nonce"] = json!(ID);
+            let raw = castle_wall_daemon::smb::jcs::encode(&report)
+                .unwrap()
+                .into_bytes();
+
+            if phase != "report" {
+                c.checkpoint_report(raw).unwrap();
+            }
+            if phase == "ack" {
+                assert!(c.poll().unwrap().is_none());
+                receive(&s);
+            }
+        }
+        f.now
+            .store((cp::CHECKPOINT_CHALLENGE_MS + 1) * NS, Ordering::SeqCst);
+        assert!(
+            matches!(c.poll(), Ok(Some(WriterReply::Refused))),
+            "checkpoint deadline is a checkpoint-only refusal: {phase}"
+        );
+        assert_eq!(
+            f.closes.load(Ordering::SeqCst),
+            0,
+            "checkpoint timeout keeps the session"
+        );
+        c.checkpoint_query(SESSION, u64::MAX).unwrap();
+        let q = receive(&s);
+        assert!(matches!(
+            p::decode(&q, p::Direction::ToWriter, SESSION)
+                .unwrap()
+                .operation,
+            p::Operation::CheckpointQuery { .. }
+        ));
+    }
+    let f = Fixture::new();
+    let (mut c, s) = f.writer();
+    c.status(ID, u64::MAX).unwrap();
+    receive(&s);
+    f.now
+        .store((cp::CHECKPOINT_CHALLENGE_MS + 1) * NS, Ordering::SeqCst);
+    assert!(
+        matches!(c.poll(), Err(Refusal::Deadline)),
+        "ordinary deadline stays terminal"
+    );
+    assert_eq!(f.closes.load(Ordering::SeqCst), 1);
 }
