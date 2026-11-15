@@ -58,6 +58,10 @@ const components = Object.fromEntries(Object.entries(join.state_schema).map(([na
   })))
 ]));
 const joinMaximum = objectBytes(components);
+// The v0 cap is conservative, not attained: 181,481 - 175,337 = 6,144 bytes of slack.
+// All 64 history envelopes use the all-branch bound of 2,757 bytes above, while
+// the largest valid envelope attains 2,661 bytes: 64 * (2,757 - 2,661) = 6,144.
+// The shared maximal-join-state.json fixture attains 175,337 with the longest registered role.
 // Must match JOIN_STATE_BYTES_MAX in records.rs and record-joins.ts; both raw parsers consume this cap.
 if (process.argv.includes('--check')) {
   if (join.join_state_bytes_max !== joinMaximum) throw Error('join byte bound differs');
