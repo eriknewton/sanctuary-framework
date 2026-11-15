@@ -2,8 +2,9 @@ import { z } from "zod";
 import { verifyIndexedRecord, type BusinessPin, type OuterRecordIndex } from "../linux-business/producer-custody.js";
 import type { RolePin } from "./strict-verifier.js";
 import { createHash } from "node:crypto";
-import { canonicalBytes, LINUX_FIELDS } from "./contract.js";
-import { validateBusinessRecord } from "./linux-business-records.js";
+import { canonicalBytes, decodeCanonical, ROLE_REGISTRY } from "./contract.js";
+import joinContract from "./join-state-contract.json";
+import { BUSINESS_SCHEMA_AST, validateBusinessRecord } from "./linux-business-records.js";
 
 // Must match records.rs and all three record_join_vectors.json consumers, including refusal precedence and retained state.
 export const JOIN_HISTORY_MAX = 64; // The design caps retained replay evidence at sixty-four records, with no live eviction.
@@ -17,20 +18,40 @@ export interface JoinState {
 }
 export interface JoinResult { refusal_code: string | null; final_state: JoinState; }
 // Must match JOIN_STATE_SCHEMA in records.rs and state_schema in record_join_vectors.json, which both executors pin as a whole set.
-export const JOIN_STATE_SCHEMA = Object.freeze({
-  pin: {role: "text", epoch: "safe_u64", kid: "text", public_key: "text", identity_id: "id", machine_id: "id"},
-  grant: {boot_id: "id", activation_id: "id", lease_id: "id", generation: "safe_u64", expires_ns: "u64_text"},
-  policy: {policy_digest: "digest", runtime_digest: "digest", config_digest: "digest", agent_uids: "safe_u64_list", vendors: "vendor_list"},
-  anchor: {sequence: "safe_u64", commitment: "commitment", lease_id: "id", generation: "safe_u64", captured_at_boottime_ns: "u64_text"},
-  flow_state: {history: "history"},
-} as const);
+// Shared admission tables stay immutable after import, including nested field maps.
+for (const fields of Object.values(joinContract.state_schema)) Object.freeze(fields);
+Object.freeze(joinContract.outer_index);
+Object.freeze(joinContract);
+export const JOIN_STATE_SCHEMA = Object.freeze(joinContract.state_schema);
+export const POLICY_AGENT_UIDS_MAX = joinContract.policy_agent_uids_max;
+export const POLICY_VENDORS_MAX = joinContract.policy_vendors_max;
+const PORT_MAX = BUSINESS_SCHEMA_AST.definitions.Port.max;
+const OCTET_MAX = BUSINESS_SCHEMA_AST.definitions.U8.max;
+const IPV4_OCTETS = 4; // IPv4 contains four unsigned octets.
+function canonicalBase64(value: unknown, bytes: number): boolean {
+  if (typeof value !== "string" || value.length !== Math.ceil(bytes * 8 / 6)) return false;
+  try { decodeCanonical(value, bytes); return true; } catch { return false; }
+}
+function vendorBefore(a: ObjectValue, b: ObjectValue): boolean {
+  return (a.address as string) < (b.address as string) || (a.address === b.address && (a.port as number) < (b.port as number));
+}
+/** Closed producer index, with body domains supplied by the generated record validator. */
+export function joinOuterValid(record: JoinRecord): boolean {
+  const outer = record.outer;
+  // Must match records.rs outer_valid: retained wrappers cannot carry unbounded unsigned data.
+  return exactKeys(record, ["body", "outer"]) && exactKeys(outer, [...joinContract.outer_index, "signature"]) &&
+    joinContract.outer_index.every(key => outer[key] === record.body[key]) &&
+    canonicalBase64(outer.signature, joinContract.signature_bytes);
+}
 const U64_MAX = 18446744073709551615n; // 2^64 - 1.
 const isObject = (v: unknown): v is ObjectValue => v !== null && typeof v === "object" && !Array.isArray(v);
 const exactKeys = (v: unknown, keys: readonly string[]): v is ObjectValue => isObject(v) && Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
 const safeU64 = (v: unknown): boolean => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 // Must match state_token in records.rs: each token admits one exact representation.
 const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
-  text: v => typeof v === "string",
+  role: v => ROLE_REGISTRY.some(entry => entry.role === v),
+  kid: v => typeof v === "string" && /^k1:sha256:[a-f0-9]{64}$/.test(v),
+  public_key: v => canonicalBase64(v, joinContract.public_key_bytes),
   // Thirty-two lowercase hex digits encode a sixteen-byte identifier; sixty-four encode a SHA-256 digest.
   id: v => typeof v === "string" && /^[a-f0-9]{32}$/.test(v),
   digest: v => typeof v === "string" && /^sha256:[a-f0-9]{64}$/.test(v),
@@ -38,10 +59,14 @@ const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
   safe_u64: safeU64,
   // Canonical decimal text only: no sign, whitespace, radix prefix, leading zero or u64 overflow.
   u64_text: v => typeof v === "string" && /^(0|[1-9][0-9]*)$/.test(v) && BigInt(v) <= U64_MAX,
-  safe_u64_list: v => Array.isArray(v) && v.every(safeU64),
-  vendor_list: v => Array.isArray(v) && v.every(e => exactKeys(e, ["address", "port"]) && typeof e.address === "string" && safeU64(e.port)),
+  // Canonical bounded policies preserve caller bytes and refuse duplicates instead of sorting.
+  safe_u64_list: v => Array.isArray(v) && v.length <= POLICY_AGENT_UIDS_MAX && v.every((e,i) => safeU64(e) && (i === 0 || v[i-1] < e)),
+  vendor_list: v => Array.isArray(v) && v.length <= POLICY_VENDORS_MAX && v.every((e,i) =>
+    exactKeys(e, ["address", "port"]) && typeof e.address === "string" &&
+    e.address.split(".").length === IPV4_OCTETS && e.address.split(".").every(x => /^(0|[1-9][0-9]{0,2})$/.test(x) && Number(x) <= OCTET_MAX) &&
+    safeU64(e.port) && (e.port as number) <= PORT_MAX && (i === 0 || vendorBefore(v[i-1],e))),
   // Retained history holds only bounded, schema-valid records, so history lookups interpret the same values in both executors.
-  history: v => Array.isArray(v) && v.length <= JOIN_HISTORY_MAX && v.every(e => exactKeys(e, ["body", "outer"]) && isObject(e.outer) && validateBusinessRecord(e.body)),
+  history: v => Array.isArray(v) && v.length <= JOIN_HISTORY_MAX && v.every(e => exactKeys(e, ["body", "outer"]) && validateBusinessRecord(e.body) && joinOuterValid(e as unknown as JoinRecord)),
 };
 /** Parse the relying-party join state against the one shared state schema before any record field is read. */
 export function joinStateValid(state: unknown): state is JoinState {
@@ -77,9 +102,7 @@ export function advance(state: JoinState, record: JoinRecord): JoinResult {
     if (!validateBusinessRecord(b)) return fail("SCHEMA");
     const p = b.payload;
     // The outer index must match every indexed signed field so storage cannot relabel an authentic body.
-    const index = LINUX_FIELDS.filter(key => !key.endsWith("_digest"));
-    if (!isObject(record.outer) || !equal(Object.keys(record.outer).sort(), [...index, "machine_id", "signature"].sort()) ||
-        [...index, "machine_id"].some(key => !equal(record.outer[key], b[key]))) return fail("OUTER");
+    if (!joinOuterValid(record)) return fail("OUTER");
     // The enrolled subject and reconciled grant bind the producer rather than trusting its self-description.
     if (["role", "epoch", "kid", "identity_id", "machine_id"].some(key => !equal(b[key], state.pin[key]))) return fail("PIN");
     // Grant identity and expiry bind each record to the relying session.

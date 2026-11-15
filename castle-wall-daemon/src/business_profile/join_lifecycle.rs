@@ -17,6 +17,13 @@ pub fn step(state: &Value, event: &Value) -> Option<Value> {
     {
         return None;
     }
+    // Must match lifecycleStep: pass-through events validate retained state before cloning.
+    if (!state["committed"].is_null() && !records::join_state_valid(&state["committed"]))
+        || (!state["provisional"].is_null()
+            && !records::join_state_valid(&state["provisional"]["state"]))
+    {
+        return None;
+    }
     let mut next = state.clone();
     match kind {
         "Checkpoint" => {

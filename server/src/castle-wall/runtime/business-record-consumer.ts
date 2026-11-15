@@ -53,11 +53,11 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
       await mode.consume(event);
     }};
   }
+  // Bound the caller's checkpoint before cloning it; neither the independent pin
+  // nor the checkpoint may fill a missing field in the other.
+  if (!joinStateValid(mode.committed_state) || BUSINESS_PIN_FIELDS.some(key => mode.pin[key] !== ({...mode.committed_state.pin,...mode.committed_state.grant})[key]) || mode.pin.public_key !== mode.committed_state.pin.public_key) throw Error("BUSINESS_PIN");
   const pin=structuredClone(mode.pin), sink=mode.durable_sink;
   let committed=structuredClone(mode.committed_state);
-  // The explicit enrollment pin and independent checkpoint must agree before
-  // any candidate can be examined. Neither can fill a missing field in the other.
-  if (!joinStateValid(committed) || BUSINESS_PIN_FIELDS.some(key => pin[key] !== ({...committed.pin,...committed.grant})[key]) || pin.public_key !== committed.pin.public_key) throw Error("BUSINESS_PIN");
   function authentic(record: JoinRecord, verifiedPin=pin): boolean {
     return verifyIndexedRecord(canonicalBytes(record.body),record.outer.signature as string,verifiedPin,record.outer as unknown as OuterRecordIndex,z.unknown(),record.body.record_kind as string);
   }

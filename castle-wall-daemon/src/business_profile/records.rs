@@ -58,50 +58,31 @@ pub fn verify(bytes: &[u8], signature: &[u8], pin: &Value, public_key: &[u8]) ->
 pub const JOIN_HISTORY_MAX: usize = 64; // The design retains sixty-four replay records without live eviction.
 pub const COUNTER_PERIOD_NS: u64 = 1_000_000_000; // One second in nanoseconds.
 /// Must match JOIN_STATE_SCHEMA in record-joins.ts and state_schema in record_join_vectors.json, which both executors pin as a whole set.
-pub const JOIN_STATE_SCHEMA: &[(&str, &[(&str, &str)])] = &[
-    (
-        "pin",
-        &[
-            ("role", "text"),
-            ("epoch", "safe_u64"),
-            ("kid", "text"),
-            ("public_key", "text"),
-            ("identity_id", "id"),
-            ("machine_id", "id"),
-        ],
-    ),
-    (
-        "grant",
-        &[
-            ("boot_id", "id"),
-            ("activation_id", "id"),
-            ("lease_id", "id"),
-            ("generation", "safe_u64"),
-            ("expires_ns", "u64_text"),
-        ],
-    ),
-    (
-        "policy",
-        &[
-            ("policy_digest", "digest"),
-            ("runtime_digest", "digest"),
-            ("config_digest", "digest"),
-            ("agent_uids", "safe_u64_list"),
-            ("vendors", "vendor_list"),
-        ],
-    ),
-    (
-        "anchor",
-        &[
-            ("sequence", "safe_u64"),
-            ("commitment", "commitment"),
-            ("lease_id", "id"),
-            ("generation", "safe_u64"),
-            ("captured_at_boottime_ns", "u64_text"),
-        ],
-    ),
-    ("flow_state", &[("history", "history")]),
-];
+#[rustfmt::skip]
+mod bounded_contract { include!("join_state_contract.rs"); }
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+pub use bounded_contract::{JOIN_STATE_SCHEMA, POLICY_AGENT_UIDS_MAX, POLICY_VENDORS_MAX};
+use bounded_contract::{OUTER_INDEX, PORT_MAX, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
+fn canonical_base64(v: &Value, bytes: usize) -> bool {
+    v.as_str().is_some_and(|s| {
+        s.len() == (bytes * 8).div_ceil(6)
+            && URL_SAFE_NO_PAD
+                .decode(s)
+                .is_ok_and(|decoded| decoded.len() == bytes && URL_SAFE_NO_PAD.encode(decoded) == s)
+    })
+}
+/// Closed producer index; the caller first validates the body's generated domains.
+pub fn outer_valid(record: &Value) -> bool {
+    // Must match joinOuterValid in record-joins.ts: retained wrappers cannot carry unbounded unsigned data.
+    record.as_object().is_some_and(|fields| fields.len() == 2)
+        && record["outer"].as_object().is_some_and(|outer| {
+            outer.len() == OUTER_INDEX.len() + 1
+                && OUTER_INDEX.iter().all(|key| {
+                    outer.get(*key).is_some() && outer.get(*key) == record["body"].get(*key)
+                })
+                && canonical_base64(&record["outer"]["signature"], SIGNATURE_BYTES)
+        })
+}
 const SAFE_INTEGER: u64 = 9_007_199_254_740_991; // Largest exact JavaScript integer, 2^53 - 1.
 const ID_HEX_LENGTH: usize = 32; // Sixteen-byte identifiers in lowercase hex.
 const DIGEST_HEX_LENGTH: usize = 64; // SHA-256 digests in lowercase hex.
@@ -116,7 +97,16 @@ fn safe_u64(v: &Value) -> bool {
 /// Must match STATE_TOKENS in record-joins.ts: each token admits one exact representation.
 fn state_token(token: &str, v: &Value) -> bool {
     match token {
-        "text" => v.is_string(),
+        "role" => v.as_str().is_some_and(|s| {
+            super::signer_contract::ROLE_REGISTRY
+                .iter()
+                .any(|entry| entry.0 == s)
+        }),
+        "kid" => v
+            .as_str()
+            .and_then(|s| s.strip_prefix("k1:sha256:"))
+            .is_some_and(|s| lower_hex(s, DIGEST_HEX_LENGTH)),
+        "public_key" => canonical_base64(v, PUBLIC_KEY_BYTES),
         "id" => v.as_str().is_some_and(|s| lower_hex(s, ID_HEX_LENGTH)),
         "digest" => v
             .as_str()
@@ -131,21 +121,34 @@ fn state_token(token: &str, v: &Value) -> bool {
                 && (s == "0" || !s.starts_with('0'))
                 && s.parse::<u64>().is_ok()
         }),
-        "safe_u64_list" => v.as_array().is_some_and(|a| a.iter().all(safe_u64)),
+        // Canonical bounded policies preserve caller bytes and refuse duplicates instead of sorting.
+        "safe_u64_list" => v.as_array().is_some_and(|a| {
+            a.len() <= POLICY_AGENT_UIDS_MAX
+                && a.iter().all(safe_u64)
+                && a.windows(2).all(|w| w[0].as_u64() < w[1].as_u64())
+        }),
         "vendor_list" => v.as_array().is_some_and(|a| {
-            a.iter().all(|e| {
-                e.as_object().is_some_and(|o| o.len() == 2)
-                    && e["address"].is_string()
-                    && safe_u64(&e["port"])
-            })
+            a.len() <= POLICY_VENDORS_MAX
+                && a.iter().all(|e| {
+                    e.as_object().is_some_and(|o| o.len() == 2)
+                        && e["address"].as_str().is_some_and(|s| {
+                            s.parse::<std::net::Ipv4Addr>()
+                                .is_ok_and(|ip| ip.to_string() == s)
+                        })
+                        && e["port"].as_u64().is_some_and(|n| n <= PORT_MAX)
+                })
+                && a.windows(2).all(|w| {
+                    (w[0]["address"].as_str(), w[0]["port"].as_u64())
+                        < (w[1]["address"].as_str(), w[1]["port"].as_u64())
+                })
         }),
         // Retained history holds only bounded, schema-valid records, so history lookups interpret the same values in both executors.
         "history" => v.as_array().is_some_and(|a| {
             a.len() <= JOIN_HISTORY_MAX
                 && a.iter().all(|e| {
                     e.as_object().is_some_and(|o| o.len() == 2)
-                        && e["outer"].is_object()
                         && e.get("body").is_some_and(records_schema::valid)
+                        && outer_valid(e)
                 })
         }),
         _ => false,
@@ -225,17 +228,7 @@ pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
         return Err("SCHEMA");
     }
     // The outer index must match every indexed signed field so storage cannot relabel an authentic body.
-    let mut index: Vec<&str> = super::signer_contract::LINUX_FIELDS
-        .iter()
-        .copied()
-        .filter(|key| !key.ends_with("_digest"))
-        .collect();
-    index.push("machine_id");
-    let outer = record["outer"].as_object().ok_or("OUTER")?;
-    if outer.len() != index.len() + 1
-        || !outer.contains_key("signature")
-        || index.iter().any(|key| outer.get(*key) != b.get(*key))
-    {
+    if !outer_valid(record) {
         return Err("OUTER");
     }
     // The relying party's enrolled subject and grant constrain the producer's self-description.
@@ -521,4 +514,97 @@ pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
         .ok_or("INPUT")?
         .push(record.clone());
     Ok(next)
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::super::{append_contract, join_lifecycle};
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn shared_bounded_join_paths() {
+        let rows: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/join-bounds.json")).unwrap();
+        let contract = append_contract::contract().unwrap();
+        let seed = &contract["lifecycle_states"]["ready"]["committed"];
+        let record = &contract["lifecycle_events"]["admit"]["record"];
+        for row in rows.as_array().unwrap() {
+            let id = row["id"].as_str().unwrap();
+            let valid = row["valid"].as_bool().unwrap();
+            let path = row["path"].as_str().unwrap();
+            let mut state = seed.clone();
+            if path.starts_with("flow_state") {
+                state["flow_state"]["history"] = json!([record]);
+            }
+            let keys: Vec<_> = path.split('.').collect();
+            let mut target = &mut state;
+            for key in keys {
+                target = if let Ok(i) = key.parse::<usize>() {
+                    &mut target[i]
+                } else {
+                    &mut target[key]
+                };
+            }
+            *target = row["value"].clone();
+            assert_eq!(join_state_valid(&state), valid, "state boundary {id}");
+            assert_eq!(
+                join_lifecycle::step(
+                    &join_lifecycle::initial(),
+                    &json!({"type":"Checkpoint","checkpoint":state})
+                )
+                .is_some(),
+                valid,
+                "seed boundary {id}"
+            );
+            let mut lifecycle = join_lifecycle::initial();
+            lifecycle["committed"] = state.clone();
+            assert_eq!(
+                join_lifecycle::step(&lifecycle, &json!({"type":"NextGrant"})).is_some(),
+                valid,
+                "retained boundary {id}"
+            );
+            lifecycle = join_lifecycle::initial();
+            lifecycle["provisional"] = json!({"state":state,"signed":false,"identity":null});
+            assert_eq!(
+                join_lifecycle::step(&lifecycle, &json!({"type":"LostOrUnmatched"})).is_some(),
+                valid,
+                "provisional boundary {id}"
+            );
+            let wal = json!({"committed_sequence":0,"committed_digest":"GENESIS","drained_sequence":0,"drained_digest":"GENESIS","retained_originals":[],"join_state":state,"unresolved_intent":false});
+            assert_eq!(
+                append_contract::shape("wal_checkpoint", &wal),
+                valid,
+                "checkpoint boundary {id}"
+            );
+            if !valid {
+                assert_eq!(
+                    advance(&state, record),
+                    Err("INPUT"),
+                    "advance boundary {id}"
+                );
+            }
+        }
+        for role in super::super::signer_contract::ROLE_REGISTRY {
+            let mut maximum = seed.clone();
+            maximum["pin"]["role"] = json!(role.0);
+            maximum["policy"]["agent_uids"] = json!(
+                (SAFE_INTEGER - POLICY_AGENT_UIDS_MAX as u64 + 1..=SAFE_INTEGER)
+                    .collect::<Vec<_>>()
+            );
+            maximum["policy"]["vendors"] = json!((PORT_MAX - POLICY_VENDORS_MAX as u64 + 1
+                ..=PORT_MAX)
+                .map(|port| json!({"address":"255.255.255.255","port":port}))
+                .collect::<Vec<_>>());
+            maximum["flow_state"]["history"] = json!(vec![record; JOIN_HISTORY_MAX]);
+            assert!(join_state_valid(&maximum), "maximal state for {}", role.0);
+        }
+        assert!(advance(seed, record).is_ok());
+        let mut bad = record.clone();
+        bad["outer"]["signature"] = json!("A");
+        assert_eq!(advance(seed, &bad), Err("OUTER"), "new signature boundary");
+        let mut extra = record.clone();
+        extra["extra"] = json!("x".repeat(8194)); // Survey growth input exceeds two envelope caps.
+        assert_eq!(advance(seed, &extra), Err("OUTER"), "new wrapper boundary");
+    }
 }

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "contract": "Must match records.rs and record-joins.ts through generate-business-append-contract.mjs. Policy caps are versioned v0 admission bounds; values are never normalized or truncated.",
+  "policy_agent_uids_max": 64,
+  "policy_vendors_max": 64,
+  "public_key_bytes": 32,
+  "signature_bytes": 64,
+  "outer_index": [
+    "activation_id",
+    "boot_id",
+    "captured_at_boottime_ns",
+    "captured_at_unix_ms",
+    "generation",
+    "lease_id",
+    "machine_id",
+    "prior_commitment",
+    "sequence"
+  ],
+  "state_schema": {
+    "pin": {
+      "role": "role",
+      "epoch": "safe_u64",
+      "kid": "kid",
+      "public_key": "public_key",
+      "identity_id": "id",
+      "machine_id": "id"
+    },
+    "grant": {
+      "boot_id": "id",
+      "activation_id": "id",
+      "lease_id": "id",
+      "generation": "safe_u64",
+      "expires_ns": "u64_text"
+    },
+    "policy": {
+      "policy_digest": "digest",
+      "runtime_digest": "digest",
+      "config_digest": "digest",
+      "agent_uids": "safe_u64_list",
+      "vendors": "vendor_list"
+    },
+    "anchor": {
+      "sequence": "safe_u64",
+      "commitment": "commitment",
+      "lease_id": "id",
+      "generation": "safe_u64",
+      "captured_at_boottime_ns": "u64_text"
+    },
+    "flow_state": {
+      "history": "history"
+    }
+  }
+}

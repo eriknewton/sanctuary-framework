@@ -12,6 +12,9 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
   if (!Object.hasOwn(APPEND_CONTRACT.lifecycle,type)) return fail();
   const fields = APPEND_CONTRACT.lifecycle[type];
   if (!fields || !equal(Object.keys(event).sort(), ["type",...fields].sort())) return fail();
+  // Caller-supplied lifecycle state cannot carry an unbounded checkpoint through a later event.
+  if ((state.committed !== null && !joinStateValid(state.committed)) ||
+      (state.provisional !== null && !joinStateValid(state.provisional.state))) return fail();
   const next = structuredClone(state);
   switch (type) {
     case "Checkpoint": {
