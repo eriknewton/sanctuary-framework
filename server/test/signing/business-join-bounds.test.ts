@@ -70,3 +70,24 @@ it("refuses negative zero in UID and port value admission",()=>{
   expect(joinStateValid(uid),"negative-zero UID").toBe(false);
   expect(joinStateValid(port),"negative-zero port").toBe(false);
 });
+
+it("refuses holes, extra array properties and accessors without invoking them",async()=>{
+  const malformed: JoinState[]=[];
+  for(const key of ["agent_uids","vendors"]){
+    const state=seed();const list=state.policy[key] as unknown[];list.length++;malformed.push(state);
+    const extra=seed();Object.defineProperty(extra.policy[key],"extra",{value:"unretained",enumerable:true});malformed.push(extra);
+  }
+  const history=seed();history.flow_state.history.length=1;malformed.push(history);
+  const hidden=seed();Object.defineProperty(hidden.policy.agent_uids,"hidden",{value:"unretained"});malformed.push(hidden);
+  const symbol=seed();Object.defineProperty(symbol.pin,Symbol("hidden"),{value:"unretained"});malformed.push(symbol);
+  const exotic=seed();Object.setPrototypeOf(exotic.pin,{unexpected:true});malformed.push(exotic);
+  let calls=0;const getter=seed();const role=getter.pin.role;
+  Object.defineProperty(getter.pin,"role",{enumerable:true,get(){calls++;return calls===1?role:"unregistered";}});malformed.push(getter);
+  for(const [index,state] of malformed.entries()) {
+    expect(joinStateValid(state),`plain JSON row ${index}`).toBe(false);
+    expect(advance(state,record()).refusal_code,`advance row ${index}`).toBe("INPUT");
+    expect(lifecycleStep(initialLifecycle(),{type:"Checkpoint",checkpoint:state}).accepted,`checkpoint row ${index}`).toBe(false);
+    await expect(createBusinessRecordConsumer({kind:"Business",pin:{...seed().pin,...seed().grant} as unknown as BusinessPin,committed_state:state,durable_sink:sink})).rejects.toThrow(/^BUSINESS_PIN$/);
+  }
+  expect(calls,"validation must not invoke accessors").toBe(0);
+});

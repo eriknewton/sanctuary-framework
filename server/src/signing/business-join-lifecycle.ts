@@ -1,5 +1,5 @@
 // Must match business_profile/join_lifecycle.rs; shared vectors pin every transition.
-import {advance, joinStateValid, type JoinRecord, type JoinState} from "./record-joins.js";
+import {advance, joinStateValid, cloneJoinState, plainJoinJson, type JoinRecord, type JoinState} from "./record-joins.js";
 import {APPEND_CONTRACT, deliveryIdentity, parseBusinessEnvelope, type BusinessDeliveryIdentity} from "./business-append-contract.js";
 import {canonicalBytes} from "./contract.js";
 export interface JoinLifecycleState {committed: JoinState | null; provisional: {state: JoinState; identity: BusinessDeliveryIdentity; signed: boolean} | null; tombstone: BusinessDeliveryIdentity | null; needs_checkpoint: boolean;}
@@ -8,6 +8,8 @@ const equal = (a: unknown,b: unknown) => Buffer.from(canonicalBytes(a)).equals(B
 /** Pure model. The caller must authenticate checkpoint and commit evidence before submitting events. */
 export function lifecycleStep(state: JoinLifecycleState, event: Record<string, unknown>): {accepted: boolean; state: JoinLifecycleState} {
   const fail = () => ({accepted:false, state});
+  // Data-only snapshots prevent accessor changes between admission and retained copies.
+  if (!plainJoinJson(state) || !plainJoinJson(event)) return fail();
   const type = event.type as keyof typeof APPEND_CONTRACT.lifecycle;
   if (!Object.hasOwn(APPEND_CONTRACT.lifecycle,type)) return fail();
   const fields = APPEND_CONTRACT.lifecycle[type];
@@ -18,7 +20,7 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
   const next = structuredClone(state);
   switch (type) {
     case "Checkpoint": {
-      const checkpoint = event.checkpoint;
+      const checkpoint = cloneJoinState(event.checkpoint);
       if (!joinStateValid(checkpoint) || state.provisional) return fail();
       // A new checkpoint must account for every owned sequence, not erase it.
       if (state.tombstone && (checkpoint.anchor.sequence !== state.tombstone.sequence || checkpoint.anchor.commitment !== state.tombstone.commitment)) return fail();

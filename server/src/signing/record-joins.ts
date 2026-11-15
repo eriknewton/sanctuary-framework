@@ -1,3 +1,5 @@
+// Must match the types-only worker import pin in k1-release-closure.test.ts; proxy rejection precedes all property traps.
+import {isProxy} from "node:util/types";
 import {parseStrict} from "../smb/parse-strict.js";
 import { z } from "zod";
 import { verifyIndexedRecord, type BusinessPin, type OuterRecordIndex } from "../linux-business/producer-custody.js";
@@ -40,9 +42,37 @@ function vendorBefore(a: ObjectValue, b: ObjectValue): boolean {
 export function joinOuterValid(record: JoinRecord): boolean {
   const outer = record.outer;
   // Must match records.rs outer_valid: retained wrappers cannot carry unbounded unsigned data.
-  return exactKeys(record, ["body", "outer"]) && exactKeys(outer, [...joinContract.outer_index, "signature"]) &&
+  return plainJoinJson(record) && exactKeys(record, ["body", "outer"]) && exactKeys(outer, [...joinContract.outer_index, "signature"]) &&
     joinContract.outer_index.every(key => outer[key] === record.body[key]) &&
     canonicalBase64(outer.signature, joinContract.signature_bytes);
+}
+/** In-memory callers must supply the same data-only trees that a JSON parser produces. */
+export function plainJoinJson(value: unknown, ancestors = new Set<object>()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || isProxy(value) || ancestors.has(value)) return false;
+  const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
+  // Accessors, hidden keys and exotic prototypes cannot survive validation as different retained data.
+  if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) return false;
+  const keys = Reflect.ownKeys(value), descriptors = Object.getOwnPropertyDescriptors(value);
+  // Exactly length indices plus the built-in length property makes arrays dense and closes extra properties.
+  if (array && (keys.length !== value.length + 1 || !Array.from({length:value.length},(_,i)=>String(i)).every(k=>Object.hasOwn(descriptors,k)))) return false;
+  ancestors.add(value);
+  try {
+    return keys.every(key => {
+      if (array && key === "length") return true;
+      const descriptor = typeof key === "string" ? descriptors[key] : undefined;
+      return descriptor !== undefined && descriptor.enumerable === true && Object.hasOwn(descriptor,"value") && plainJoinJson(descriptor.value,ancestors);
+    });
+  } finally { ancestors.delete(value); }
+}
+/** Bound data before allocation, then validate and retain only the isolated snapshot. */
+export function cloneJoinState(value: unknown): JoinState | null {
+  try {
+    if (!joinStateValid(value)) return null;
+    const snapshot: unknown = structuredClone(value);
+    return joinStateValid(snapshot) ? snapshot : null;
+  } catch { return null; }
 }
 const U64_MAX = 18446744073709551615n; // 2^64 - 1.
 const isObject = (v: unknown): v is ObjectValue => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -73,7 +103,7 @@ const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
 /** Parse the relying-party join state against the one shared state schema before any record field is read. */
 export function joinStateValid(state: unknown): state is JoinState {
   const schema = JOIN_STATE_SCHEMA as Record<string, Record<string, string>>;
-  return exactKeys(state, Object.keys(schema)) && Object.entries(schema).every(([name, fields]) =>
+  return plainJoinJson(state) && exactKeys(state, Object.keys(schema)) && Object.entries(schema).every(([name, fields]) =>
     exactKeys(state[name], Object.keys(fields)) && Object.entries(fields).every(([key, token]) => STATE_TOKENS[token]((state[name] as ObjectValue)[key])));
 }
 /** Parse original join-state bytes without normalizing number spellings into trusted integers. */
@@ -106,7 +136,9 @@ export function advance(state: JoinState, record: JoinRecord): JoinResult {
   const fail = (refusal_code: string): JoinResult => ({refusal_code, final_state: state});
   try {
     // Must match records.rs advance: malformed relying-party state refuses before any record field is read, so INPUT precedes SCHEMA.
-    if (!joinStateValid(state)) return fail("INPUT");
+    const snapshot = cloneJoinState(state);
+    if (!snapshot) return fail("INPUT");
+    state = snapshot;
     const b = (isObject(record) ? record.body : undefined) as ObjectValue, history = state.flow_state.history;
     const prior = (sequence: Json | undefined, kind: string) => history.find(r => r.body.sequence === sequence && r.body.record_kind === kind)?.body;
     // Generated validation owns every intra-record predicate before history values are interpreted.

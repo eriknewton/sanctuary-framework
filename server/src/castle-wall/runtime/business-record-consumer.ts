@@ -2,7 +2,7 @@ import {types} from "node:util";
 import {z} from "zod";
 import {canonicalBytes} from "../../signing/contract.js";
 import {BUSINESS_PIN_FIELDS, verifyIndexedRecord, type BusinessPin, type OuterRecordIndex} from "../../linux-business/producer-custody.js";
-import {joinStateValid, verifyBusinessJoin, type JoinState, type JoinRecord} from "../../signing/record-joins.js";
+import {cloneJoinState, verifyBusinessJoin, type JoinState, type JoinRecord} from "../../signing/record-joins.js";
 import {envelopeSizeAdmitted, parseBusinessEvent, parseBusinessEventBytes, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-contract.js";
 
 export interface DurableBusinessAcceptance {
@@ -55,22 +55,28 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
   }
   // Bound the caller's checkpoint before cloning it; neither the independent pin
   // nor the checkpoint may fill a missing field in the other.
-  if (!joinStateValid(mode.committed_state) || BUSINESS_PIN_FIELDS.some(key => mode.pin[key] !== ({...mode.committed_state.pin,...mode.committed_state.grant})[key]) || mode.pin.public_key !== mode.committed_state.pin.public_key) throw Error("BUSINESS_PIN");
+  const checkpoint=cloneJoinState(mode.committed_state);
+  if (!checkpoint || BUSINESS_PIN_FIELDS.some(key => mode.pin[key] !== ({...checkpoint.pin,...checkpoint.grant})[key]) || mode.pin.public_key !== checkpoint.pin.public_key) throw Error("BUSINESS_PIN");
   const pin=structuredClone(mode.pin), sink=mode.durable_sink;
-  let committed=structuredClone(mode.committed_state);
+  let committed=checkpoint;
   function authentic(record: JoinRecord, verifiedPin=pin): boolean {
     return verifyIndexedRecord(canonicalBytes(record.body),record.outer.signature as string,verifiedPin,record.outer as unknown as OuterRecordIndex,z.unknown(),record.body.record_kind as string);
   }
-  function validateStored(stored: DurableBusinessAcceptance): void {
+  function validateStored(stored: DurableBusinessAcceptance): DurableBusinessAcceptance {
     try {
+    // Snapshot the bounded join state before pin reads or signature work, and keep only that snapshot.
+    const checkpoint=cloneJoinState(stored.checkpoint);
+    if (!checkpoint) throw Error("BUSINESS_DURABLE_STATE");
+    stored={...copy(stored),checkpoint};
     if (!envelopeSizeAdmitted(stored.envelope.byteLength)) throw Error("BUSINESS_DURABLE_STATE");
     const {record,bytes}=parseBusinessEnvelope(Buffer.from(stored.envelope).toString("base64url"));
-    if (!stored.pin || BUSINESS_PIN_FIELDS.some(key => stored.pin[key] !== ({...stored.checkpoint.pin,...stored.checkpoint.grant})[key]) || stored.pin.public_key !== stored.checkpoint.pin.public_key || !authentic(record,stored.pin) || !equal(deliveryIdentity(bytes,record),stored.identity) || !equal(projectBusinessRecord(record),stored.projection) || !joinStateValid(stored.checkpoint) || stored.checkpoint.anchor.sequence !== stored.identity.sequence || stored.checkpoint.anchor.commitment !== stored.identity.commitment) throw Error("BUSINESS_DURABLE_STATE");
+    if (!stored.pin || BUSINESS_PIN_FIELDS.some(key => stored.pin[key] !== ({...stored.checkpoint.pin,...stored.checkpoint.grant})[key]) || stored.pin.public_key !== stored.checkpoint.pin.public_key || !authentic(record,stored.pin) || !equal(deliveryIdentity(bytes,record),stored.identity) || !equal(projectBusinessRecord(record),stored.projection) || stored.checkpoint.anchor.sequence !== stored.identity.sequence || stored.checkpoint.anchor.commitment !== stored.identity.commitment) throw Error("BUSINESS_DURABLE_STATE");
+    return stored;
     } catch { throw Error("BUSINESS_DURABLE_STATE"); }
   }
   let last=await sink.load();
   if(last) {
-    validateStored(last);
+    last=validateStored(last);
     // A trusted grant change preserves the accepted anchor and every non-grant field.
     // The stored pin authenticates only the durable acceptance, never a new candidate.
     if(!equal({...last.checkpoint,grant:committed.grant},committed)) {
@@ -106,8 +112,7 @@ export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<
         pending=copy(acceptance);
         // The required trusted sink performs atomic persistence and readback.
         // A throw keeps the same pending E and the old committed state for retry.
-        const durable=await sink.persist(copy(acceptance));
-        validateStored(durable);
+        const durable=validateStored(await sink.persist(copy(acceptance)));
         if(!equalAcceptance(durable,acceptance)) throw Error("BUSINESS_PERSISTENCE");
         last=copy(durable);committed=structuredClone(durable.checkpoint);pending=null;
         return {version:1,identity:structuredClone(durable.identity)};

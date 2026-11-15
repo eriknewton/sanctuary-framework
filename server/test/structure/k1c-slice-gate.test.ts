@@ -79,6 +79,7 @@ const expectedImports={
     "./linux-business-records.js",
     "./strict-verifier.js",
     "node:crypto",
+    "node:util/types",
     "zod"
   ],
   "signing/strict-verifier.ts": [
