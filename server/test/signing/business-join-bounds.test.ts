@@ -1,17 +1,22 @@
 // Bounded state admission preserves exact caller policies and retained envelopes.
 // W-JOIN-BOUNDS
 import {it, expect} from "vitest";
-import {APPEND_CONTRACT, appendShape} from "../../src/signing/business-append-contract.js";
+import {readFileSync} from "node:fs";
+import {APPEND_CONTRACT, appendShape, type BusinessDeliveryIdentity} from "../../src/signing/business-append-contract.js";
 import {advance, joinStateValid, JOIN_STATE_SCHEMA, type JoinState, type JoinRecord} from "../../src/signing/record-joins.js";
 import {initialLifecycle, lifecycleStep} from "../../src/signing/business-join-lifecycle.js";
 import {createBusinessRecordConsumer, type BusinessDurableSink} from "../../src/castle-wall/runtime/business-record-consumer.js";
 import type {BusinessPin} from "../../src/linux-business/producer-custody.js";
+// Positive-control sizes come from the shared maximal vectors, so fail-before never relies on new production exports.
+const policyVectors=JSON.parse(readFileSync(new URL("../../../castle-wall-daemon/tests/fixtures/join-bounds.json",import.meta.url),"utf8")) as Array<{id:string;value:unknown[]}>;
+const POLICY_AGENT_UIDS_MAX=policyVectors.find(row=>row.id==="uids-maximum")!.value.length;
+const POLICY_VENDORS_MAX=policyVectors.find(row=>row.id==="vendors-maximum")!.value.length;
 const seed = () => structuredClone(APPEND_CONTRACT.lifecycle_states.ready.committed) as unknown as JoinState;
 const record = () => structuredClone(APPEND_CONTRACT.lifecycle_events.admit.record) as unknown as JoinRecord;
 const sink: BusinessDurableSink = {async load(){return null;},async persist(v){return v;}};
 it("bounds caller state before consumer construction and lifecycle pass-through",async()=>{
   const valid=seed();
-  const invalid=seed(); invalid.policy.agent_uids=Array.from({length:65},(_,i)=>i); // One above the v0 policy cap.
+  const invalid=seed(); invalid.policy.agent_uids=Array.from({length:POLICY_AGENT_UIDS_MAX+1},(_,i)=>i); // One above the v0 policy cap.
   expect(joinStateValid(valid)).toBe(true);
   expect(joinStateValid(invalid)).toBe(false);
   expect(advance(invalid,record()).refusal_code).toBe("INPUT");
@@ -30,10 +35,10 @@ it("bounds newly advanced signatures as well as seeded history",()=>{
   expect(appendShape("wal_checkpoint",{committed_sequence:0,committed_digest:"GENESIS",drained_sequence:0,drained_digest:"GENESIS",retained_originals:[],join_state:seeded,unresolved_intent:false})).toBe(false);
 });
 
-it("accepts maximal canonical policies and every registered pin role unchanged",async()=>{
+it("accepts maximal canonical policies and every registered pin role unchanged (positive control)",async()=>{
   const {ROLE_REGISTRY}=await import("../../src/signing/contract.js");
   const {BUSINESS_SCHEMA_AST}=await import("../../src/signing/linux-business-records.js");
-  const {JOIN_HISTORY_MAX,POLICY_AGENT_UIDS_MAX,POLICY_VENDORS_MAX}=await import("../../src/signing/record-joins.js");
+  const {JOIN_HISTORY_MAX}=await import("../../src/signing/record-joins.js");
   for(const {role} of ROLE_REGISTRY){
     const state=seed();state.pin.role=role;
     state.flow_state.history=Array.from({length:JOIN_HISTORY_MAX},()=>record());
@@ -52,7 +57,7 @@ it("refuses retained committed state on a lifecycle pass-through",()=>{
 });
 it("refuses retained provisional state before discarding it",()=>{
   const state=seed();state.pin.role="unregistered";
-  expect(lifecycleStep({...initialLifecycle(),provisional:{state,identity:{version:1,sequence:1,commitment:"",envelope_sha256:""},signed:false}},{type:"LostOrUnmatched"}).accepted).toBe(false);
+  expect(lifecycleStep({...initialLifecycle(),provisional:{state,identity:structuredClone(APPEND_CONTRACT.lifecycle_states.pending.provisional.identity) as BusinessDeliveryIdentity,signed:false}},{type:"LostOrUnmatched"}).accepted).toBe(false);
 });
 
 it("refuses unbounded top-level wrapper fields before retaining a new record",()=>{
