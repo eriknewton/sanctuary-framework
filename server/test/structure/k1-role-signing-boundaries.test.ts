@@ -147,3 +147,16 @@ it("join generator refuses a stale derived join file",()=>{
     expect(check).toThrow("join contract differs");
   } finally {unlinkSync(candidate);rmdirSync(directory);}
 });
+
+it("join generator refuses an unbounded state token before emitting a cap",()=>{
+  const directory=mkdtempSync(join(tmpdir(),"join-token-")),candidate=join(directory,"join.json");
+  try {
+    const contract=JSON.parse(readFileSync(join(root,"server/src/signing/join-state-contract.json"),"utf8"));
+    writeFileSync(candidate,JSON.stringify(contract));
+    const check=()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check","--join-contract-file",candidate],{stdio:"pipe"});
+    expect(check).not.toThrow();
+    contract.state_schema.pin.role="unbounded_text";
+    writeFileSync(candidate,JSON.stringify(contract));
+    expect(check).toThrow("unbounded join token");
+  } finally {unlinkSync(candidate);rmdirSync(directory);}
+});
