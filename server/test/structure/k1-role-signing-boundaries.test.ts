@@ -122,3 +122,16 @@ it("Linux CI runs only the append budget ownership doctests",()=>{
     "      - name: cargo clippy (warnings as errors)",
   ].join("\n"));
 });
+
+it.each(["outer_index","signature_bytes"] as const)("join generator refuses producer drift in %s",key=>{
+  const directory=mkdtempSync(join(tmpdir(),"join-producer-")),candidate=join(directory,"join.json");
+  try {
+    const contract=JSON.parse(readFileSync(join(root,"server/src/signing/join-state-contract.json"),"utf8"));
+    writeFileSync(candidate,JSON.stringify(contract));
+    const check=()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check","--join-contract-file",candidate],{stdio:"pipe"});
+    expect(check).not.toThrow();
+    if(key==="outer_index")contract.outer_index.push("future_index");else contract.signature_bytes++;
+    writeFileSync(candidate,JSON.stringify(contract));
+    expect(check).toThrow(key==="outer_index"?"join outer index differs from producer":"join signature width differs from producer");
+  } finally {unlinkSync(candidate);rmdirSync(directory);}
+});

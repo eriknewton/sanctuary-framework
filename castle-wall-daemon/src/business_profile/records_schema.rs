@@ -19,7 +19,8 @@ fn reverse_tuple(a: &Value, b: &Value) -> bool {
     a["family"] == b["family"] && a["protocol"] == b["protocol"] && a["src_ip"] == b["dst_ip"] && a["dst_ip"] == b["src_ip"] && a["src_port"] == b["dst_port"] && a["dst_port"] == b["src_port"]
 }
 fn lower_hex(s: &str, length: usize) -> bool { s.len() == length && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
-fn encoding(v: &Value, kind: &str) -> bool {
+// Must match linux-business-records.ts encoding; records.rs state_token consumes these generated domains.
+pub fn encoding(v: &Value, kind: &str) -> bool {
     let Some(s) = v.as_str() else { return false; };
     match kind {
         "id" => lower_hex(s, 32), // Identifiers encode sixteen bytes as lower hexadecimal.

@@ -7,7 +7,7 @@ import type { RolePin } from "./strict-verifier.js";
 import { createHash } from "node:crypto";
 import { canonicalBytes, decodeCanonical, ROLE_REGISTRY } from "./contract.js";
 import joinContract from "./join-state-contract.json";
-import { BUSINESS_SCHEMA_AST, validateBusinessRecord } from "./linux-business-records.js";
+import { BUSINESS_SCHEMA_AST, encoding, validateBusinessRecord } from "./linux-business-records.js";
 
 // Must match records.rs and all three record_join_vectors.json consumers, including refusal precedence and retained state.
 export const JOIN_HISTORY_MAX = 64; // The design caps retained replay evidence at sixty-four records, with no live eviction.
@@ -29,8 +29,6 @@ export const JOIN_STATE_SCHEMA = Object.freeze(joinContract.state_schema);
 export const POLICY_AGENT_UIDS_MAX = joinContract.policy_agent_uids_max;
 export const POLICY_VENDORS_MAX = joinContract.policy_vendors_max;
 const PORT_MAX = BUSINESS_SCHEMA_AST.definitions.Port.max;
-const OCTET_MAX = BUSINESS_SCHEMA_AST.definitions.U8.max;
-const IPV4_OCTETS = 4; // IPv4 contains four unsigned octets.
 function canonicalBase64(value: unknown, bytes: number): boolean {
   if (typeof value !== "string" || value.length !== Math.ceil(bytes * 8 / 6)) return false;
   try { decodeCanonical(value, bytes); return true; } catch { return false; }
@@ -82,7 +80,8 @@ const safeU64 = (v: unknown): boolean => typeof v === "number" && Number.isSafeI
 // Must match state_token in records.rs: each token admits one exact representation.
 const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
   role: v => ROLE_REGISTRY.some(entry => entry.role === v),
-  kid: v => typeof v === "string" && /^k1:sha256:[a-f0-9]{64}$/.test(v),
+  // Must match encoding in linux-business-records.ts: the record schema owns kid and IPv4 domains.
+  kid: v => encoding(v, "kid"),
   public_key: v => canonicalBase64(v, joinContract.public_key_bytes),
   // Thirty-two lowercase hex digits encode a sixteen-byte identifier; sixty-four encode a SHA-256 digest.
   id: v => typeof v === "string" && /^[a-f0-9]{32}$/.test(v),
@@ -94,8 +93,7 @@ const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
   // Canonical bounded policies preserve caller bytes and refuse duplicates instead of sorting.
   safe_u64_list: v => Array.isArray(v) && v.length <= POLICY_AGENT_UIDS_MAX && v.every((e,i) => safeU64(e) && (i === 0 || v[i-1] < e)),
   vendor_list: v => Array.isArray(v) && v.length <= POLICY_VENDORS_MAX && v.every((e,i) =>
-    exactKeys(e, ["address", "port"]) && typeof e.address === "string" &&
-    e.address.split(".").length === IPV4_OCTETS && e.address.split(".").every(x => /^(0|[1-9][0-9]{0,2})$/.test(x) && Number(x) <= OCTET_MAX) &&
+    exactKeys(e, ["address", "port"]) && encoding(e.address, "ipv4") &&
     safeU64(e.port) && (e.port as number) <= PORT_MAX && (i === 0 || vendorBefore(v[i-1],e))),
   // Retained history holds only bounded, schema-valid records, so history lookups interpret the same values in both executors.
   history: v => Array.isArray(v) && v.length <= JOIN_HISTORY_MAX && v.every(e => exactKeys(e, ["body", "outer"]) && validateBusinessRecord(e.body) && joinOuterValid(e as unknown as JoinRecord)),

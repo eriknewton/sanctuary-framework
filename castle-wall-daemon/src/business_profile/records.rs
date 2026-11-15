@@ -84,6 +84,7 @@ fn canonical_base64(v: &Value, bytes: usize) -> bool {
 }
 /// Closed producer index; the caller first validates the body's generated domains.
 pub fn outer_valid(record: &Value) -> bool {
+    // Body validation plus named outer lookups and exact counts close both wrapper key sets.
     // Must match joinOuterValid in record-joins.ts: retained wrappers cannot carry unbounded unsigned data.
     record.as_object().is_some_and(|fields| fields.len() == 2)
         && record["outer"].as_object().is_some_and(|outer| {
@@ -113,10 +114,8 @@ fn state_token(token: &str, v: &Value) -> bool {
                 .iter()
                 .any(|entry| entry.0 == s)
         }),
-        "kid" => v
-            .as_str()
-            .and_then(|s| s.strip_prefix("k1:sha256:"))
-            .is_some_and(|s| lower_hex(s, DIGEST_HEX_LENGTH)),
+        // Must match records_schema.rs encoding: the record schema owns kid and IPv4 domains.
+        "kid" => records_schema::encoding(v, "kid"),
         "public_key" => canonical_base64(v, PUBLIC_KEY_BYTES),
         "id" => v.as_str().is_some_and(|s| lower_hex(s, ID_HEX_LENGTH)),
         "digest" => v
@@ -142,10 +141,7 @@ fn state_token(token: &str, v: &Value) -> bool {
             a.len() <= POLICY_VENDORS_MAX
                 && a.iter().all(|e| {
                     e.as_object().is_some_and(|o| o.len() == 2)
-                        && e["address"].as_str().is_some_and(|s| {
-                            s.parse::<std::net::Ipv4Addr>()
-                                .is_ok_and(|ip| ip.to_string() == s)
-                        })
+                        && records_schema::encoding(&e["address"], "ipv4")
                         && e["port"].as_u64().is_some_and(|n| n <= PORT_MAX)
                 })
                 && a.windows(2).all(|w| {

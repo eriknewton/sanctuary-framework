@@ -17,7 +17,8 @@ function reverseTuple(a: unknown, b: unknown): boolean {
     field(a,"src_ip") === field(b,"dst_ip") && field(a,"dst_ip") === field(b,"src_ip") &&
     field(a,"src_port") === field(b,"dst_port") && field(a,"dst_port") === field(b,"src_port");
 }
-function encoding(v: unknown, kind: string): boolean {
+/** Generated primitive domains are shared with record-joins.ts STATE_TOKENS; must match records_schema.rs encoding. */
+export function encoding(v: unknown, kind: string): boolean {
   if (typeof v !== "string") return false;
   switch (kind) {
     // Identifiers encode sixteen bytes and SHA-256 digests encode thirty-two bytes.

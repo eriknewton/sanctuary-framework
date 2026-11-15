@@ -3,6 +3,7 @@
 // Versioned v0 policy admission caps, owned by join-state-contract.json.
 pub const POLICY_AGENT_UIDS_MAX: usize = 64;
 pub const POLICY_VENDORS_MAX: usize = 64;
+// Format widths and the port domain come from the producer and record schema, not policy caps.
 pub const PUBLIC_KEY_BYTES: usize = 32;
 pub const SIGNATURE_BYTES: usize = 64;
 pub const PORT_MAX: u64 = 65535;
