@@ -13,7 +13,8 @@ export interface DurableBusinessAcceptance {
   checkpoint: JoinState;
   identity: BusinessDeliveryIdentity;
 }
-/** Trusted composition dependency. persist atomically stores all acceptance fields,
+/** Must match the native TrustedBusinessSink contract in business_profile/business_wal.rs.
+ * Trusted composition dependency. persist atomically stores all acceptance fields,
  * reads them back, and resolves only when durable. Repeating exact bytes is
  * idempotent; a changed delivery at an owned sequence must refuse. */
 export interface BusinessDurableSink {

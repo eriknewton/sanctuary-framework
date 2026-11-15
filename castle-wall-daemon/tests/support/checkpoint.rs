@@ -1110,8 +1110,26 @@ fn adjudication_guards_exclude_competing_refusals() {
                 support::checkpoint_reread(&mut m)
             }
             "silence" => {
-                m.settle();
-                Ok(None)
+                let before = f.now.load(Ordering::SeqCst);
+                // Two elapsed ticks followed by the near-deadline reread cross the old part timer.
+                f.now.fetch_add(20 * state::NS_PER_MS, Ordering::SeqCst);
+                f.status_delay
+                    .store(985 * state::NS_PER_MS, Ordering::SeqCst);
+                let result = support::checkpoint_reread(&mut m);
+                assert!(
+                    f.now.load(Ordering::SeqCst) - before
+                        > cp::CHECKPOINT_PART_SILENCE_MS * state::NS_PER_MS
+                );
+                assert!(
+                    f.now.load(Ordering::SeqCst) - before
+                        < cp::CHECKPOINT_CHALLENGE_MS * state::NS_PER_MS
+                );
+                assert_eq!(
+                    f.binds.load(Ordering::SeqCst),
+                    0,
+                    "slow reread preempts before any age adjudication"
+                );
+                result
             }
             _ => unreachable!(),
         };

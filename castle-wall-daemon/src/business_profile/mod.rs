@@ -413,3 +413,6 @@ pub mod append_checkpoint;
 
 #[cfg(target_os = "linux")]
 pub mod append_clients;
+
+#[cfg(target_os = "linux")]
+pub mod business_wal;

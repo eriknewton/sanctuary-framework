@@ -1,4 +1,5 @@
-// fail-before-exempt: authenticated client primitives use isolated native sockets, process pins and shared fixtures.
+// fail-before-exempt: authenticated client and WAL fact fixtures use isolated native sockets, process pins and shared data.
+// W-CLIENT-CONTRACT
 // W-CHECKPOINT
 use castle_wall_daemon::business_profile::{
     append_checkpoint as cp,
@@ -308,4 +309,302 @@ fn checkpoint_sender_keeps_one_owned_report_until_correlated_ack() {
         .unwrap(),
     );
     assert!(matches!(c.poll().unwrap(),Some(WriterReply::CheckpointAcknowledged(d)) if d==digest));
+}
+
+pub(super) fn authenticated_read(anchor: &serde_json::Value) -> DrainObservation {
+    authenticated_read_flags(anchor, false, false)
+}
+pub(super) fn authenticated_read_flags(
+    anchor: &serde_json::Value,
+    latched: bool,
+    uncertain: bool,
+) -> DrainObservation {
+    let mut anchor = anchor.clone();
+    if latched {
+        anchor["recovery_required"] = json!(true);
+        anchor["recovery_reason"] = json!("integrity");
+        anchor["recovery_revision"] = json!(1);
+    }
+    let anchor = &anchor;
+    let f = Fixture::new();
+    let (mut c, s) = f.drain();
+    c.read(ID, u64::MAX).unwrap();
+    receive(&s);
+    let payload = castle_wall_daemon::smb::jcs::encode(anchor).unwrap();
+    let mut h = d::header("READ_REPLY", ID, d::DRAIN_SLOTS[0].1);
+    h["state"] = json!("PRESENT");
+    h["latched"] = json!(latched);
+    h["uncertain"] = json!(uncertain);
+    h["anchor_digest"] = json!(
+        castle_wall_daemon::business_profile::activation_anchor::anchor_digest(anchor).unwrap()
+    );
+    h["payload_length"] = json!(payload.len());
+    send(
+        &s,
+        &d::encode(&h, payload.as_bytes(), d::Direction::FromDrain).unwrap(),
+    );
+    let Some(DrainReply::Read(observation)) = c.poll().unwrap() else {
+        panic!("correlated READ")
+    };
+    observation
+}
+pub(super) fn authenticated_original(envelope: &[u8]) -> DrainReleaseFact {
+    let f = Fixture::new();
+    let (mut c, s) = f.drain();
+    c.original(ID, envelope, u64::MAX).unwrap();
+    receive(&s);
+    let identity = append_contract::identity(envelope).unwrap();
+    let mut h = d::header("ORIGINAL_ACK", ID, d::DRAIN_SLOTS[0].1);
+    h["sequence"] = identity["sequence"].clone();
+    h["drained_digest"] = identity["commitment"].clone();
+    send(&s, &d::encode(&h, &[], d::Direction::FromDrain).unwrap());
+    let Some(DrainReply::Released(fact)) = c.poll().unwrap() else {
+        panic!("correlated ORIGINAL_ACK")
+    };
+    fact
+}
+
+fn frozen_reserve(id: &str) -> FrozenMutation {
+    let expected = append_contract::contract().unwrap()["checkpoint_vectors"][0]["value"]
+        ["d_observation"]["anchor"]
+        .clone();
+    let mut next = expected.clone();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    next["reserved_sequence"] = json!(1);
+    next["reserved_body_digest"] = json!(digest);
+    let message = json!({"version":1,"op":"RESERVE","request_id":id,"expected":expected,"next":next,"body_digest":digest});
+    let bytes = castle_wall_daemon::smb::jcs::encode(&message).unwrap();
+    let mut header = d::header("ANCHOR", id, d::DRAIN_SLOTS[0].1);
+    header["message_length"] = json!(bytes.len());
+    header["envelope_length"] = json!(0);
+    FrozenMutation::checked(d::encode(&header, bytes.as_bytes(), d::Direction::ToDrain).unwrap())
+        .unwrap()
+}
+fn anchor_reply(op: &str, anchor: &serde_json::Value, uncertain: bool) -> Vec<u8> {
+    let bytes = castle_wall_daemon::smb::jcs::encode(anchor).unwrap();
+    let mut header = d::header(op, ID, d::DRAIN_SLOTS[0].1);
+    header["anchor_digest"] = json!(
+        castle_wall_daemon::business_profile::activation_anchor::anchor_digest(anchor).unwrap()
+    );
+    header["payload_length"] = json!(bytes.len());
+    if op == "READ_REPLY" {
+        header["state"] = json!("PRESENT");
+        header["latched"] = json!(false);
+        header["uncertain"] = json!(uncertain);
+    }
+    d::encode(&header, bytes.as_bytes(), d::Direction::FromDrain).unwrap()
+}
+#[test]
+fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
+    let proposal = frozen_reserve(ID);
+    for outcome in ["REFUSED", "ANCHOR_ACK", "timeout", "disconnect"] {
+        for _ in 0..40 {
+            let f = Fixture::new();
+            let (mut c, s) = f.drain();
+            c.mutation(&proposal, u64::MAX).unwrap();
+            assert_eq!(receive(&s), proposal.bytes());
+            match outcome {
+                "REFUSED" => send(
+                    &s,
+                    &d::encode(
+                        &d::header("REFUSED", ID, d::DRAIN_SLOTS[0].1),
+                        &[],
+                        d::Direction::FromDrain,
+                    )
+                    .unwrap(),
+                ),
+                "ANCHOR_ACK" => send(&s, &anchor_reply("ANCHOR_ACK", proposal.next(), false)),
+                "timeout" => {
+                    f.now
+                        .fetch_add(d::D_REQUEST_DEADLINE_MS as u64 * NS, Ordering::SeqCst);
+                    send(&s, &anchor_reply("ANCHOR_ACK", proposal.next(), false));
+                }
+                "disconnect" => unsafe {
+                    libc::shutdown(s.as_raw_fd(), libc::SHUT_RDWR);
+                },
+                _ => unreachable!(),
+            }
+            let reply = c.poll();
+            if matches!(outcome, "timeout" | "disconnect") {
+                assert!(reply.is_err());
+            } else {
+                assert!(reply.unwrap().is_some());
+            }
+            assert!(
+                c.retained_mutation().is_some(),
+                "non-READ completion retains exact mutation"
+            );
+            assert_eq!(
+                c.retained_mutation().unwrap().bytes(),
+                proposal.bytes(),
+                "non-READ completion retains exact mutation"
+            );
+            assert!(
+                !c.lease_live(f.now.load(Ordering::SeqCst)),
+                "only READ renews D liveness"
+            );
+            if !matches!(outcome, "timeout" | "disconnect") {
+                assert_eq!(
+                    c.mutation(&frozen_reserve(SESSION), u64::MAX),
+                    Err(Refusal::Busy),
+                    "changed request cannot replace owned mutation"
+                );
+                c.read(ID, u64::MAX).unwrap();
+                receive(&s);
+                send(&s, &anchor_reply("READ_REPLY", proposal.next(), true));
+                assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
+                assert!(
+                    c.retained_mutation().is_some(),
+                    "uncertain READ retains mutation"
+                );
+                c.read(ID, u64::MAX).unwrap();
+                receive(&s);
+                send(&s, &anchor_reply("READ_REPLY", proposal.expected(), false));
+                assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
+                assert!(
+                    c.retained_mutation().is_some(),
+                    "whole anchor equality settles mutation"
+                );
+                c.read(ID, u64::MAX).unwrap();
+                receive(&s);
+                send(&s, &anchor_reply("READ_REPLY", proposal.next(), false));
+                assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
+                assert!(c.retained_mutation().is_none());
+            }
+        }
+    }
+}
+#[test]
+fn drain_slots_roles_operations_and_original_facts_are_correlated() {
+    for field in ["role", "operation", "slot"] {
+        let f = Fixture::new();
+        let (mut c, s) = f.drain();
+        c.read(ID, u64::MAX).unwrap();
+        receive(&s);
+        if field == "slot" {
+            assert_eq!(
+                c.read(SESSION, u64::MAX),
+                Err(Refusal::Busy),
+                "one pending D request owns its slot"
+            );
+            send(&s, &read_reply(ID, false, false));
+            assert!(matches!(c.poll().unwrap(), Some(DrainReply::Read(_))));
+        } else {
+            let bytes = if field == "role" {
+                {
+                    let header = d::header("REFUSED", ID, "linux-business-retrospective");
+                    let bytes = castle_wall_daemon::smb::jcs::encode(&header).unwrap();
+                    [&(bytes.len() as u32).to_be_bytes()[..], bytes.as_bytes()].concat()
+                }
+            } else {
+                anchor_reply("ANCHOR_ACK", frozen_reserve(ID).next(), false)
+            };
+            send(&s, &bytes);
+            assert!(c.poll().is_err(), "role and operation bind the D reply");
+        }
+    }
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../src/business_profile/record_join_vectors.json"
+    ))
+    .unwrap();
+    let record = &vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "listener-accept")
+        .unwrap()["records"][0];
+    let envelope = castle_wall_daemon::smb::jcs::encode(record).unwrap();
+    let identity = append_contract::identity(envelope.as_bytes()).unwrap();
+    for field in ["sequence", "commitment", "positive"] {
+        let f = Fixture::new();
+        let (mut c, s) = f.drain();
+        c.original(ID, envelope.as_bytes(), u64::MAX).unwrap();
+        receive(&s);
+        let mut h = d::header("ORIGINAL_ACK", ID, d::DRAIN_SLOTS[0].1);
+        h["sequence"] = if field == "sequence" {
+            json!(2)
+        } else {
+            identity["sequence"].clone()
+        };
+        h["drained_digest"] = if field == "commitment" {
+            json!(format!("sha256:{}", "a".repeat(64)))
+        } else {
+            identity["commitment"].clone()
+        };
+        send(&s, &d::encode(&h, &[], d::Direction::FromDrain).unwrap());
+        if field == "positive" {
+            assert!(matches!(c.poll().unwrap(), Some(DrainReply::Released(_))));
+        } else {
+            assert!(
+                c.poll().is_err(),
+                "ORIGINAL_ACK matches the whole frozen identity"
+            );
+        }
+        assert!(!c.lease_live(NS));
+    }
+}
+#[test]
+fn writer_waits_for_hello_and_preserves_one_correlated_request() {
+    for field in ["hello", "slot", "id", "session"] {
+        let f = Fixture::new();
+        if field == "hello" {
+            let mut c = WriterClient::connect(
+                &f.held,
+                "server",
+                f.pins(),
+                f.clock(),
+                Box::new(Hooks(f.closes.clone())),
+            )
+            .unwrap();
+            let s = signer_peer::accept(f.listener.as_raw_fd()).unwrap();
+            assert!(c.poll().unwrap().is_none());
+            send(
+                &s,
+                &p::encode(
+                    p::Direction::ToWall,
+                    SESSION,
+                    &p::Operation::Refused {
+                        request_id: ID.into(),
+                    },
+                    &[],
+                )
+                .unwrap(),
+            );
+            assert!(
+                c.poll().is_err(),
+                "only P HELLO establishes the writer session"
+            );
+        } else {
+            let (mut c, s) = f.writer();
+            c.status(ID, u64::MAX).unwrap();
+            receive(&s);
+            if field == "slot" {
+                assert_eq!(
+                    c.status(SESSION, u64::MAX),
+                    Err(Refusal::Busy),
+                    "one pending writer request owns its slot"
+                );
+            }
+            send(
+                &s,
+                &p::encode(
+                    p::Direction::ToWall,
+                    if field == "session" { ID } else { SESSION },
+                    &p::Operation::Refused {
+                        request_id: if field == "id" { SESSION } else { ID }.into(),
+                    },
+                    &[],
+                )
+                .unwrap(),
+            );
+            if field == "slot" {
+                assert!(matches!(c.poll().unwrap(), Some(WriterReply::Refused)));
+            } else {
+                assert!(
+                    c.poll().is_err(),
+                    "writer reply uses the captured session and request"
+                );
+            }
+        }
+    }
 }

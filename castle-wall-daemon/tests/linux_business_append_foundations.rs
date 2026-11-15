@@ -1,4 +1,4 @@
-// fail-before-exempt: checkpoint transport, ordinary evidence and schedule witnesses consume native primitives and shared schemas.
+// fail-before-exempt: checkpoint, authenticated clients and isolated WAL publication witnesses consume native primitives and shared schemas.
 // fail-before-exempt: shared vectors, checked corpus and isolated expiry constructors read native and shared contract inputs.
 // W-PROVENANCE
 // W-LEASE-ADMISSION
@@ -237,3 +237,6 @@ mod checkpoint;
 
 #[path = "support/append_clients.rs"]
 mod append_clients;
+
+#[path = "support/business_wal.rs"]
+mod business_wal;
