@@ -31,6 +31,7 @@ export const APPEND_CONTRACT = deepFreeze(data);
 export const PRODUCER_ENVELOPE_MAX_BYTES = data.envelope_max_bytes;
 export const ENVELOPE_BASE64_MAX = Math.ceil(PRODUCER_ENVELOPE_MAX_BYTES * 8 / 6);
 export interface BusinessDeliveryIdentity {version: 1; sequence: number; commitment: string; envelope_sha256: string;}
+// Must match business_wal.rs persist_ts_fact: W reads back the exact TS fact and delivered cursor before n+1 delivery.
 export interface BusinessDeliveryAck {version: 1; identity: BusinessDeliveryIdentity;}
 export type BusinessVerifiedRecord = Record<keyof typeof data.projection, Json>;
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);

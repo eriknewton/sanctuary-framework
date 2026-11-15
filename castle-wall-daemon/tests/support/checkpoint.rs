@@ -1490,12 +1490,15 @@ fn frozen_tick_expiry_while_awaiting_cancels_through_serve() {
 fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
     use castle_wall_daemon::business_profile::{
         signer_peer,
+        signer_watchdog::WATCHDOG_TICK_MS,
         writer_peer::{HeldConfig, ListenerExpectations},
     };
     use std::{
         os::{fd::AsRawFd, unix::fs::PermissionsExt},
         time::Duration,
     };
+    const TICK_MS: u64 = WATCHDOG_TICK_MS as u64;
+    const _: () = assert!(TICK_MS < wire::WRITER_HEARTBEAT_MS);
     let (f, mut machine, mut report) = fixture();
     if last_tick {
         bounded_ordinary_report(&f, &mut report);
@@ -1516,13 +1519,14 @@ fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
     let last_tick_start = || {
         let last = *f.status_times.lock().unwrap().last().unwrap();
         f.now.store(
-            last + (wire::WRITER_HEARTBEAT_MS - 10) * state::NS_PER_MS,
+            last + (wire::WRITER_HEARTBEAT_MS - TICK_MS) * state::NS_PER_MS,
             Ordering::SeqCst,
         );
     };
     let next_tick = || {
         pause();
-        f.now.fetch_add(10 * state::NS_PER_MS, Ordering::SeqCst);
+        f.now
+            .fetch_add(TICK_MS * state::NS_PER_MS, Ordering::SeqCst);
         pause();
     };
     std::thread::scope(|scope| {
@@ -1601,6 +1605,7 @@ fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
                 last_tick_start();
             }
             if slow_reread {
+                // The 1000 ms reply ceiling minus 15 ms is already beyond WRITER_HEARTBEAT_MS.
                 f.status_delay
                     .store(985 * state::NS_PER_MS, Ordering::SeqCst);
             }

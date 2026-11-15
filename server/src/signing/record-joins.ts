@@ -41,11 +41,13 @@ function vendorBefore(a: ObjectValue, b: ObjectValue): boolean {
 }
 /** Closed producer index, with body domains supplied by the generated record validator. */
 export function joinOuterValid(record: JoinRecord): boolean {
+  try {
   const outer = record.outer;
   // Must match records.rs outer_valid: retained wrappers cannot carry unbounded unsigned data.
   return plainJoinJson(record) && exactKeys(record, ["body", "outer"]) && exactKeys(outer, [...joinContract.outer_index, "signature"]) &&
     joinContract.outer_index.every(key => outer[key] === record.body[key]) &&
     canonicalBase64(outer.signature, joinContract.signature_bytes);
+  } catch { return false; }
 }
 /** In-memory callers must supply the same data-only trees that a JSON parser produces. */
 export function plainJoinJson(value: unknown): boolean {

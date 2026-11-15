@@ -18,7 +18,7 @@ use std::{
         unix::fs::PermissionsExt,
     },
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -39,6 +39,7 @@ struct Fixture {
     held: HeldSocketRoot,
     listener: OwnedFd,
     now: Arc<AtomicU64>,
+    clock_fails: Arc<AtomicBool>,
     closes: Arc<AtomicUsize>,
 }
 fn policy() -> PeerPolicy {
@@ -70,12 +71,20 @@ impl Fixture {
             held,
             listener,
             now: Arc::new(AtomicU64::new(NS)),
+            clock_fails: Arc::default(),
             closes: Arc::default(),
         }
     }
     fn clock(&self) -> castle_wall_daemon::business_profile::writer_peer::Clock {
         let n = self.now.clone();
-        Arc::new(move || Ok(n.load(Ordering::SeqCst)))
+        let fails = self.clock_fails.clone();
+        Arc::new(move || {
+            if fails.load(Ordering::SeqCst) {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(n.load(Ordering::SeqCst))
+            }
+        })
     }
     fn pins(&self) -> ServerPins {
         ServerPins {
@@ -418,7 +427,10 @@ fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
                 send(&s, &anchor_reply("ANCHOR_ACK", proposal.next(), false));
             }
             assert!(c.poll().unwrap().is_some());
-            assert!(c.retained_mutation().is_some(), "non-READ completion retains exact mutation");
+            assert!(
+                c.retained_mutation().is_some(),
+                "non-READ completion retains exact mutation"
+            );
             assert_eq!(
                 c.retained_mutation().unwrap().bytes(),
                 proposal.bytes(),
@@ -445,6 +457,8 @@ fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
                 "only certain whole anchor equality settles mutation"
             );
         }
+        let lease_observed = f.now.load(Ordering::SeqCst);
+        f.now.fetch_add(NS, Ordering::SeqCst);
         c.mutation(&proposal, u64::MAX).unwrap();
         receive(&s);
         if terminal == "timeout" {
@@ -454,6 +468,10 @@ fn mutation_ownership_survives_refusal_ack_and_forty_late_waves() {
             assert_eq!(unsafe { libc::shutdown(s.as_raw_fd(), libc::SHUT_RDWR) }, 0);
         }
         assert!(c.poll().is_err());
+        assert!(
+            !c.lease_live(lease_observed + d::D_LEASE_MS as u64 * NS),
+            "terminal completion cannot extend the last READ lease"
+        );
         // Keep this same owner after the terminal event and attempt delayed completions repeatedly.
         for _ in 0..40 {
             let late = anchor_reply("ANCHOR_ACK", proposal.next(), false);
@@ -608,9 +626,17 @@ fn writer_waits_for_hello_and_preserves_one_correlated_request() {
 
 #[test]
 fn checkpoint_deadlines_refuse_only_the_checkpoint_and_keep_the_session() {
-    for phase in ["query", "report", "parts", "ack"] {
+    for phase in [
+        "query",
+        "report",
+        "report-call",
+        "parts",
+        "ack",
+        "clock-error",
+    ] {
         let f = Fixture::new();
         let (mut c, s) = f.writer();
+        let mut local_report = None;
         if phase == "query" {
             c.checkpoint_query(ID, 3000 * NS).unwrap();
             receive(&s);
@@ -649,7 +675,9 @@ fn checkpoint_deadlines_refuse_only_the_checkpoint_and_keep_the_session() {
                 .unwrap()
                 .into_bytes();
 
-            if phase != "report" {
+            if matches!(phase, "report-call" | "clock-error") {
+                local_report = Some(raw);
+            } else if phase != "report" {
                 c.checkpoint_report(raw).unwrap();
             }
             if phase == "ack" {
@@ -659,10 +687,31 @@ fn checkpoint_deadlines_refuse_only_the_checkpoint_and_keep_the_session() {
         }
         f.now
             .store((cp::CHECKPOINT_CHALLENGE_MS + 1) * NS, Ordering::SeqCst);
-        assert!(
-            matches!(c.poll(), Ok(Some(WriterReply::Refused))),
-            "checkpoint deadline is a checkpoint-only refusal: {phase}"
-        );
+        if phase == "clock-error" {
+            f.clock_fails.store(true, Ordering::SeqCst);
+            assert_eq!(
+                c.checkpoint_report(local_report.unwrap()),
+                Err(Refusal::Deadline)
+            );
+            assert_eq!(
+                f.closes.load(Ordering::SeqCst),
+                1,
+                "clock failure stays terminal"
+            );
+            continue;
+        }
+        if let Some(raw) = local_report {
+            assert_eq!(
+                c.checkpoint_report(raw),
+                Err(Refusal::Deadline),
+                "local report expiry refuses only the checkpoint"
+            );
+        } else {
+            assert!(
+                matches!(c.poll(), Ok(Some(WriterReply::Refused))),
+                "checkpoint deadline is a checkpoint-only refusal: {phase}"
+            );
+        }
         assert_eq!(
             f.closes.load(Ordering::SeqCst),
             0,

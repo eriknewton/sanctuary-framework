@@ -132,6 +132,14 @@ impl Identity {
             && drain_protocol::digest(&self.envelope_sha256)
     }
 }
+// BODY_FROZEN, SIGN_MARKED, E_FROZEN and COMMIT_FROZEN are the persisted intent lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentState {
+    BodyFrozen,
+    SignMarked,
+    EnvelopeFrozen,
+    CommitFrozen,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
@@ -151,6 +159,19 @@ struct Row {
     ts_fact: Option<Identity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effect_status: Option<String>,
+}
+impl Row {
+    fn intent_state(&self) -> IntentState {
+        if self.commit.is_some() {
+            IntentState::CommitFrozen
+        } else if self.envelope.is_some() {
+            IntentState::EnvelopeFrozen
+        } else if self.sign_may_have_been_sent {
+            IntentState::SignMarked
+        } else {
+            IntentState::BodyFrozen
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -321,13 +342,21 @@ fn private_file(file: &File, owner: u32) -> Result<u64> {
     }
     Ok(m.len())
 }
+fn set_private_mode(file: &File) -> Result<()> {
+    // Creation mode is independent of the caller's umask before any private-file validation.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+        return Err(Refusal::Io);
+    }
+    Ok(())
+}
 fn open_at(root: &File, leaf: &str, flags: i32) -> Result<File> {
     let leaf = CString::new(leaf).map_err(|_| Refusal::Root)?;
     let fd = unsafe {
         libc::openat(
             root.as_raw_fd(),
             leaf.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            // A non-regular entry must reach the type check without blocking on open.
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             0o600,
         )
     };
@@ -390,7 +419,10 @@ impl BusinessWal {
         // Lock acquisition precedes enumeration, staging inspection and checkpoint reads. The inode is never unlinked.
         let (lock, created) =
             match open_at(&root, LOCK, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) {
-                Ok(file) => (file, true),
+                Ok(file) => {
+                    set_private_mode(&file)?;
+                    (file, true)
+                }
                 Err(_) => (open_at(&root, LOCK, libc::O_RDWR)?, false),
             };
         private_file(&lock, owner)?;
@@ -646,7 +678,10 @@ impl BusinessWal {
                     return Err(Refusal::Conflict);
                 }
             }
-        } else if r.commit.is_some() || r.d_fact.is_some() || r.ts_fact.is_some() {
+        } else if matches!(r.intent_state(), IntentState::CommitFrozen)
+            || r.d_fact.is_some()
+            || r.ts_fact.is_some()
+        {
             return Err(Refusal::Shape);
         }
         Ok(())
@@ -707,6 +742,29 @@ impl BusinessWal {
                 return Err(Refusal::Conflict);
             }
         }
+        // Each persisted cursor names the exact evidence in a retained row, not merely its sequence.
+        if let Some(original) = &self.checkpoint.originals {
+            if original.sequence > released
+                && rows.get(&original.sequence).and_then(|r| r.d_fact.as_ref()) != Some(original)
+            {
+                return Err(Refusal::Conflict);
+            }
+        }
+        if let Some(release) = &self.checkpoint.released {
+            if rows.get(&release.sequence).is_some_and(|r| {
+                r.d_fact.as_ref() != Some(release) || r.ts_fact.as_ref() != Some(release)
+            }) {
+                return Err(Refusal::Conflict);
+            }
+            for cursor in [&self.checkpoint.delivered, &self.checkpoint.originals]
+                .into_iter()
+                .flatten()
+            {
+                if cursor.sequence == release.sequence && cursor != release {
+                    return Err(Refusal::Conflict);
+                }
+            }
+        }
         Ok(())
     }
     fn publish(&mut self, name: String, bytes: Vec<u8>, pool: Pool) -> Result<()> {
@@ -736,6 +794,7 @@ impl BusinessWal {
                 STAGING,
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             )?;
+            set_private_mode(&stage)?;
             private_file(&stage, self.owner)?;
             self.hooks.before(WalStep::Write)?;
             stage
@@ -798,6 +857,7 @@ impl BusinessWal {
                 STAGING,
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             )?;
+            set_private_mode(&stage)?;
             private_file(&stage, self.owner)?;
             self.hooks.before(WalStep::Write)?;
             stage.write_all(&bytes).map_err(|_| Refusal::Io)?;

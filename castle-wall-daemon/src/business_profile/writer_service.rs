@@ -1185,7 +1185,8 @@ fn serve<P: SignerPort, R: Reconciler>(
 ) -> Result<()> {
     // One bound wall plus a terminal second accept implements the connection cap in writer_protocol.
     const _: () = assert!(writer_protocol::WRITER_CONNECTIONS_MAX == 2);
-    // Synchronous SIGN owns the only work slot; serve retains no queue between iterations.
+    // Synchronous SIGN owns the only work slot; no SIGN work is queued.
+    // One whole checkpoint packet may be retained solely across the heartbeat guard.
     const _: () = assert!(writer_protocol::WRITER_WORK_MAX == 1);
     const _: () = assert!(writer_protocol::WRITER_QUEUE_MAX == 0);
     let outcome = (|| {

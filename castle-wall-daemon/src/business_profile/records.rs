@@ -553,7 +553,8 @@ pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
     Ok(next)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
+#[cfg(test)]
 mod bounded_tests {
     use super::super::{append_contract, join_lifecycle};
     use super::*;
@@ -666,7 +667,9 @@ mod bounded_tests {
             }
         }
         for role in super::super::signer_contract::ROLE_REGISTRY {
-            let mut maximum = seed.clone();
+            let mut maximum: Value =
+                serde_json::from_str(include_str!("../../tests/fixtures/maximal-join-state.json"))
+                    .unwrap();
             maximum["pin"]["role"] = json!(role.0);
             maximum["policy"]["agent_uids"] = json!(
                 (SAFE_INTEGER - POLICY_AGENT_UIDS_MAX as u64 + 1..=SAFE_INTEGER)
@@ -676,11 +679,6 @@ mod bounded_tests {
                 ..=PORT_MAX)
                 .map(|port| json!({"address":"255.255.255.255","port":port}))
                 .collect::<Vec<_>>());
-            let largest: Value =
-                serde_json::from_str(include_str!("../../tests/fixtures/maximal-join-state.json"))
-                    .unwrap();
-            maximum = largest;
-            maximum["pin"]["role"] = json!(role.0);
             assert!(join_state_valid(&maximum), "maximal state for {}", role.0);
             let raw = crate::smb::jcs::encode(&maximum).unwrap();
             assert!(raw.len() <= JOIN_STATE_BYTES_MAX);

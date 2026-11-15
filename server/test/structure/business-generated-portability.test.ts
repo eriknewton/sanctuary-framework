@@ -24,5 +24,5 @@ it("ungated generated includes name only portable module paths", () => {
   expect(read("append_checkpoint.rs")).toContain('include!("checkpoint_bounds.rs")');
 });
 it("Linux bounded fixtures have a matching test module gate", () => {
-  expect(read("records.rs")).toMatch(/#\[cfg\(all\(test, target_os = "linux"\)\)\]\s*mod bounded_tests/);
+  expect(read("records.rs")).toMatch(/#\[cfg\(target_os = "linux"\)\]\s*#\[cfg\(test\)\]\s*mod bounded_tests/);
 });

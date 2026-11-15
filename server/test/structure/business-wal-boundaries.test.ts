@@ -27,3 +27,18 @@ it("late waves carry one client across repetitions", () => {
   expect(schedule.indexOf("let (mut c, s) = f.drain()")).toBeLessThan(schedule.indexOf("for wave in 0..40"));
   expect(schedule).toContain("late completion cannot revive a closed owner");
 });
+it("serve preemption coverage reaches an advancing live fixture", () => {
+  const source = read("tests/support/checkpoint.rs");
+  const start = source.indexOf("fn advancing_serve_schedule(");
+  expect(start, "advancing real-serve coverage exists").toBeGreaterThanOrEqual(0);
+  const schedule = source.slice(start, source.indexOf("fn checkpoint_bind_failure", start));
+  expect(schedule).toContain("support::serve_accept(");
+  expect(schedule).toContain("f.now.store(");
+  expect(schedule).toContain("985 * state::NS_PER_MS");
+});
+it("the anchored bound states its loop assumption and work tolerance", () => {
+  const source = read("src/business_profile/writer_service.rs");
+  expect(source).toContain("one watchdog tick is an assumption");
+  expect(source).toContain("about 510 ms");
+  expect(source).toContain("11 ms work-plus-sleep budget is not load-bearing");
+});

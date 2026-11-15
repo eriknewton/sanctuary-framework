@@ -1062,3 +1062,6 @@ fn token_for(index: usize) -> DeliveryToken {
     }
     wal.next_delivery().unwrap().unwrap().1
 }
+
+#[path = "wal_nits.rs"]
+mod nits;

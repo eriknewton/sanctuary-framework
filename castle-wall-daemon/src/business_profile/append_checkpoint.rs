@@ -119,6 +119,8 @@ impl Candidate {
         }
         Ok(())
     }
+    // observed_boottime_ns is W's self-report, not a measurement by P. P verifies
+    // only issued <= observed <= now and the 1,000 ms age before consuming freshness.
     pub fn fresh(&self, issued: u64, now: u64) -> Result<()> {
         if now
             .checked_sub(issued)

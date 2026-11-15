@@ -612,7 +612,14 @@ impl WriterClient {
         let Some((WriterPending::Report(challenge), end)) = self.pending.take() else {
             return Err(Refusal::Busy);
         };
-        if self.connection.now()? >= end {
+        let now = match self.connection.now() {
+            Ok(now) => now,
+            Err(error) => {
+                self.connection.close();
+                return Err(error);
+            }
+        };
+        if now >= end {
             return Err(Refusal::Deadline);
         }
         let result = (|| {
@@ -656,7 +663,7 @@ impl WriterClient {
             return Ok(None);
         };
         if self.connection.now()? >= *end {
-            // Q59 has no checkpoint refusal opcode. Expiry disposes only this checkpoint;
+            // The checkpoint protocol has no refusal opcode. Expiry disposes only this checkpoint;
             // authenticated session, STATUS and SIGN deadlines retain their terminal meaning.
             if matches!(
                 pending,
