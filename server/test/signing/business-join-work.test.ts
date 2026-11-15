@@ -34,6 +34,12 @@ for(const [name,entry] of Object.entries(entries)) {
     // Ten thousand levels exceeds the native stack; forty shared levels would imply a trillion visits.
     const invalid={...seed(),extra:nested(kind==="deep" ? 10_000 : 40,kind==="shared")};
     expect(entry(seed())).toBe(true);
+    if (kind === "shared") {
+      // Fail before exponential stress on an old traversal, using the same entry point.
+      const aliased=seed(), record=structuredClone(APPEND_CONTRACT.lifecycle_events.admit.record);
+      aliased.flow_state.history=[record,record] as unknown as JoinState["flow_state"]["history"];
+      expect(entry(aliased),"alias refusal before exponential stress").toBe(false);
+    }
     const started=performance.now();
     let accepted: boolean | undefined;
     expect(()=>{accepted=entry(invalid);}).not.toThrow();
