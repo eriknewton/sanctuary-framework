@@ -989,3 +989,22 @@ fn admission_retains_near_full_restart_headroom() {
         "admission cannot consume near-full restart headroom"
     );
 }
+
+#[test]
+fn restart_without_active_intent_allows_the_next_sign_marker() {
+    let f = Fixture::new();
+    let mut wal = f.open(true).unwrap();
+    f.append(&mut wal, 0);
+    drop(wal);
+    let mut wal = f.open(false).unwrap();
+    let reserve = f.begin(&mut wal, 1);
+    assert_eq!(
+        wal.persist_sign_marker(&authenticated_read(reserve.next()), NOW),
+        Ok(()),
+        "a body frozen in this process may mark its first SIGN after restart"
+    );
+    assert_eq!(
+        wal.persist_sign_marker(&authenticated_read(reserve.next()), NOW),
+        Err(Refusal::Held)
+    );
+}

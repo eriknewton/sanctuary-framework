@@ -229,7 +229,7 @@ pub struct BusinessWal {
     checkpoint: Checkpoint,
     usage: [u64; 2],
     entries: usize,
-    restarted: bool,
+    opened_active: Option<u64>,
     state: WalState,
     pending: Option<PendingPublication>,
 }
@@ -401,7 +401,7 @@ impl BusinessWal {
             }),
             usage: occupied,
             entries: 0,
-            restarted: !created,
+            opened_active: None,
             state: WalState::Ready,
             pending: None,
         };
@@ -461,6 +461,7 @@ impl BusinessWal {
         store.capacity(0, Pool::Ordinary)?;
         store.capacity(0, Pool::Control)?;
         store.validate_rows(&rows)?;
+        store.opened_active = store.checkpoint.active;
         if !created {
             // A later fsync of an old inode cannot clear an earlier writeback error. Restart
             // republishes the validated exact bytes through fresh staging before exposing any cursor.
@@ -899,8 +900,8 @@ impl BusinessWal {
             drain_protocol::D_REQUEST_MAX_BYTES,
         )?)
         .map_err(|_| Refusal::Shape)?;
-        // A restart never authorizes SIGN for a reservation, including a stored never-sent marker.
-        if self.restarted || row.sign_may_have_been_sent {
+        // Only the intent outstanding at open is restart-frozen; new live appends retain first-SIGN authority.
+        if self.opened_active == Some(row.sequence) || row.sign_may_have_been_sent {
             return Err(Refusal::Held);
         }
         if now >= writer_protocol::canonical_deadline(&row.append_deadline).ok_or(Refusal::Shape)?
