@@ -3,6 +3,12 @@
 // Versioned v0 policy admission caps, owned by join-state-contract.json.
 pub const POLICY_AGENT_UIDS_MAX: usize = 64;
 pub const POLICY_VENDORS_MAX: usize = 64;
+// Derived from the closed state schema, scalar encodings, bounded policies and complete envelopes.
+pub const JOIN_STATE_BYTES_MAX: usize = 181481;
+const _: () = assert!(JOIN_STATE_BYTES_MAX == 1126 +
+    (2 + (POLICY_AGENT_UIDS_MAX - 1) + POLICY_AGENT_UIDS_MAX * 16) +
+    (2 + (POLICY_VENDORS_MAX - 1) + POLICY_VENDORS_MAX * 42) +
+    (2 + (super::JOIN_HISTORY_MAX - 1) + super::JOIN_HISTORY_MAX * super::super::append_contract::CONSERVATIVE_ENVELOPE_MAX_BYTES));
 // Format widths and the port domain come from the producer and record schema, not policy caps.
 pub const PUBLIC_KEY_BYTES: usize = 32;
 pub const SIGNATURE_BYTES: usize = 64;

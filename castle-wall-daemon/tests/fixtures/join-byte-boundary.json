@@ -1,0 +1,6 @@
+{
+  "id": "raw-join-one-byte-over-cap",
+  "over_cap_bytes": 1,
+  "fill": "!",
+  "expect": "SMB JSON size"
+}

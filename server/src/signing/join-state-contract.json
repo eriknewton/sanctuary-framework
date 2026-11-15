@@ -49,5 +49,6 @@
     "flow_state": {
       "history": "history"
     }
-  }
+  },
+  "join_state_bytes_max": 181481
 }

@@ -19,13 +19,20 @@ pub fn decode(bytes: &[u8]) -> Option<Value> {
 
 /// Parse original join-state bytes; this pure boundary grants no checkpoint authority.
 pub fn decode_join_state(bytes: &[u8]) -> Option<Value> {
-    let state = crate::smb::strict_json::parse(bytes, bytes.len()).ok()?;
+    decode_join_state_checked(bytes).ok()
+}
+fn decode_join_state_checked(bytes: &[u8]) -> Result<Value, String> {
+    // Bound the original bytes before UTF-8 decoding or allocating the state tree.
+    let state = crate::smb::strict_json::parse(bytes, JOIN_STATE_BYTES_MAX)?;
     // Must match parseJoinState in record-joins.ts: raw canonical equality precedes value admission.
-    if crate::smb::jcs::encode(&state).ok()?.as_bytes() != bytes {
-        return None;
+    if crate::smb::jcs::encode(&state)?.as_bytes() != bytes {
+        return Err("JOIN_CANONICAL".into());
     }
-    let state: Value = serde_json::from_slice(bytes).ok()?;
-    join_state_valid(&state).then_some(state)
+    let state: Value = serde_json::from_slice(bytes).map_err(|_| "JOIN_JSON")?;
+    if !join_state_valid(&state) {
+        return Err("JOIN_STATE".into());
+    }
+    Ok(state)
 }
 
 /// Must match BUSINESS_PIN_FIELDS in producer-custody.ts and verify_pin_fields in closure_vectors.json: the one business verify contract binds the enrolled subject and the grant's activation, lease and generation.
@@ -72,7 +79,9 @@ pub const COUNTER_PERIOD_NS: u64 = 1_000_000_000; // One second in nanoseconds.
 #[rustfmt::skip]
 mod bounded_contract { include!("join_state_contract.rs"); }
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-pub use bounded_contract::{JOIN_STATE_SCHEMA, POLICY_AGENT_UIDS_MAX, POLICY_VENDORS_MAX};
+pub use bounded_contract::{
+    JOIN_STATE_BYTES_MAX, JOIN_STATE_SCHEMA, POLICY_AGENT_UIDS_MAX, POLICY_VENDORS_MAX,
+};
 use bounded_contract::{OUTER_INDEX, PORT_MAX, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
 fn canonical_base64(v: &Value, bytes: usize) -> bool {
     v.as_str().is_some_and(|s| {
@@ -103,6 +112,7 @@ fn lower_hex(s: &str, length: usize) -> bool {
         && s.bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
+// Must match safeU64 in record-joins.ts: as_u64 refuses negative zero and every floating Number.
 fn safe_u64(v: &Value) -> bool {
     v.as_u64().is_some_and(|n| n <= SAFE_INTEGER)
 }
@@ -528,6 +538,34 @@ mod bounded_tests {
     use super::super::{append_contract, join_lifecycle};
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn raw_join_byte_cap_precedes_parsing() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/join-byte-boundary.json"))
+                .unwrap();
+        let bytes =
+            vec![b'!'; JOIN_STATE_BYTES_MAX + fixture["over_cap_bytes"].as_u64().unwrap() as usize];
+        assert_eq!(
+            decode_join_state_checked(&bytes).unwrap_err(),
+            "SMB JSON size",
+            "raw join byte gate before parser"
+        );
+        assert!(decode_join_state(&bytes).is_none());
+        let contract = append_contract::contract().unwrap();
+        let state = &contract["lifecycle_states"]["ready"]["committed"];
+        let valid = crate::smb::jcs::encode(state).unwrap();
+        assert!(
+            decode_join_state(valid.as_bytes()).is_some(),
+            "canonical seed positive control"
+        );
+        let bytes = vec![b'!'; JOIN_STATE_BYTES_MAX];
+        assert_ne!(
+            decode_join_state_checked(&bytes).unwrap_err(),
+            "SMB JSON size",
+            "inclusive byte gate control"
+        );
+    }
 
     #[test]
     fn raw_join_numbers_refuse_before_admission() {

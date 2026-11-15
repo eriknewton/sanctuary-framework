@@ -29,6 +29,8 @@ Object.freeze(joinContract);
 export const JOIN_STATE_SCHEMA = Object.freeze(joinContract.state_schema);
 export const POLICY_AGENT_UIDS_MAX = joinContract.policy_agent_uids_max;
 export const POLICY_VENDORS_MAX = joinContract.policy_vendors_max;
+// Must match records.rs JOIN_STATE_BYTES_MAX; the generator derives this from every admitted field.
+export const JOIN_STATE_BYTES_MAX = joinContract.join_state_bytes_max;
 const PORT_MAX = BUSINESS_SCHEMA_AST.definitions.Port.max;
 function canonicalBase64(value: unknown, bytes: number): boolean {
   if (typeof value !== "string" || value.length !== Math.ceil(bytes * 8 / 6)) return false;
@@ -115,7 +117,7 @@ export function joinStateValid(state: unknown): state is JoinState {
 /** Parse original join-state bytes without normalizing number spellings into trusted integers. */
 export function parseJoinState(bytes: Uint8Array): JoinState | null {
   try {
-    const state = parseStrict(bytes, bytes.byteLength);
+    const state = parseStrict(bytes, JOIN_STATE_BYTES_MAX);
     // Must match records.rs decode_join_state: raw canonical equality precedes value admission.
     if (!Buffer.from(canonicalBytes(state)).equals(Buffer.from(bytes))) return null;
     return joinStateValid(state) ? state : null;
