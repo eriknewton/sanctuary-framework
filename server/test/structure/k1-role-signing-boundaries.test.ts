@@ -1,3 +1,4 @@
+// fail-before-exempt: pin the feature-off checkpoint CI invocation and its exact executed case count.
 // fail-before-exempt: changed byte-bound derivation assertions execute the repository generator and inspect native generated output.
 // fail-before-exempt: the changed assertions read server/tsup.config.ts and castle-wall-daemon sources, which verify-fail-before does not revert (it reverts server/src only); the full suite at head checks them.
 import {describe,it,expect} from "vitest";
@@ -119,7 +120,7 @@ it("Linux CI runs only the append budget ownership doctests",()=>{
     "        # or a fence changed to ignore, would otherwise pass with the ownership proof never checked.",
     "        run: cargo test --locked --doc --features test-isolation business_profile::append_budget 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 2 passed; 0 failed; 0 ignored;'",
     "",
-    "      - name: cargo clippy (warnings as errors)",
+    "      - name: Check checkpoint mode without isolation",
   ].join("\n"));
 });
 
@@ -159,4 +160,19 @@ it("join generator refuses an unbounded state token before emitting a cap",()=>{
     writeFileSync(candidate,JSON.stringify(contract));
     expect(check).toThrow("unbounded join token");
   } finally {unlinkSync(candidate);rmdirSync(directory);}
+});
+
+it("Linux CI runs checkpoint mode checks without isolation",()=>{
+  const workflow=readFileSync(new URL("../../../.github/workflows/castle-wall-linux.yml",import.meta.url),"utf8");
+  const begin=workflow.indexOf("      - name: Check checkpoint mode without isolation");
+  expect(begin).toBeGreaterThan(0);
+  const end=workflow.indexOf("      - name:",begin+1);
+  expect(workflow.slice(begin,end)).toBe([
+    "      - name: Check checkpoint mode without isolation",
+    "        working-directory: castle-wall-daemon",
+    "        shell: bash",
+    "        # The exact count keeps the feature-off gate from silently selecting no tests.",
+    "        run: cargo test --locked --test checkpoint_mode_gate 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 2 passed; 0 failed; 0 ignored;'",
+    "", "",
+  ].join("\n"));
 });

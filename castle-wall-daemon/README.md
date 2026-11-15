@@ -2,6 +2,8 @@
 
 The business record, activation anchor and protocol modules are public in the daemon crate but unused by boot.
 
+The business append client primitives authenticate P and D independently. Checkpoints use bounded parts and the original join-state bytes. An accepting serve seam exists only with `test-isolation`; the shared writer `run()` selects `CheckpointMode::Refuse`. These primitives support isolated composition, with installed checkpoint acceptance deferred.
+
 For one release, manifest verification accepts the exact legacy
 `castle-wall:<base64url(public-key)>` signing-key ID for the pinned key. New
 manifests always use the canonical 16-character SHA-256 fingerprint; legacy

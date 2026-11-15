@@ -407,3 +407,9 @@ pub mod append_budget;
 pub mod append_contract;
 #[cfg(target_os = "linux")]
 pub mod join_lifecycle;
+
+#[cfg(target_os = "linux")]
+pub mod append_checkpoint;
+
+#[cfg(target_os = "linux")]
+pub mod append_clients;

@@ -67,13 +67,34 @@ impl Direction {
 }
 #[derive(Debug)]
 pub enum Operation {
+    CheckpointQuery {
+        request_id: String,
+    },
+    CheckpointChallenge {
+        request_id: String,
+        nonce: String,
+        issued_boottime_ns: u64,
+    },
+    CheckpointPart(super::append_checkpoint::Part),
+    CheckpointAck {
+        request_id: String,
+        checkpoint_digest: String,
+    },
     Hello,
     HelloAck,
-    Status { request_id: String },
-    StatusReply { request_id: String },
+    Status {
+        request_id: String,
+    },
+    StatusReply {
+        request_id: String,
+    },
     Sign(signer_service::Header),
-    Verified { request_id: String },
-    Refused { request_id: String },
+    Verified {
+        request_id: String,
+    },
+    Refused {
+        request_id: String,
+    },
 }
 #[derive(Debug)]
 pub struct Frame<'a> {
@@ -128,6 +149,96 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
     }
     let op = value["op"].as_str().ok_or(Refusal::Schema)?;
     let (operation, payload_len, fields): (Operation, usize, &[&str]) = match (direction, op) {
+        (Direction::ToWriter, "CHECKPOINT_QUERY") => (
+            Operation::CheckpointQuery {
+                request_id: request(&value)?,
+            },
+            0,
+            &["request_id"],
+        ),
+        (Direction::ToWriter, "CHECKPOINT_PART") => {
+            let part = super::append_checkpoint::Part {
+                request_id: request(&value)?,
+                nonce: value["nonce"]
+                    .as_str()
+                    .filter(|s| id(s))
+                    .ok_or(Refusal::Schema)?
+                    .to_owned(),
+                part_index: payload_length(
+                    &value,
+                    "part_index",
+                    super::append_checkpoint::CHECKPOINT_PARTS_MAX,
+                )?,
+                part_count: payload_length(
+                    &value,
+                    "part_count",
+                    super::append_checkpoint::CHECKPOINT_PARTS_MAX,
+                )?,
+                total_length: payload_length(
+                    &value,
+                    "total_length",
+                    super::append_checkpoint::CHECKPOINT_MAX_BYTES,
+                )?,
+                checkpoint_digest: value["checkpoint_digest"]
+                    .as_str()
+                    .ok_or(Refusal::Schema)?
+                    .to_owned(),
+            };
+            let length = payload_length(
+                &value,
+                "payload_length",
+                super::activation_anchor::MAX_BYTES,
+            )?;
+            if !part.valid(length) {
+                return Err(Refusal::Schema);
+            }
+            (
+                Operation::CheckpointPart(part),
+                length,
+                &[
+                    "request_id",
+                    "nonce",
+                    "part_index",
+                    "part_count",
+                    "total_length",
+                    "checkpoint_digest",
+                    "payload_length",
+                ],
+            )
+        }
+        (Direction::ToWall, "CHECKPOINT_CHALLENGE") => (
+            Operation::CheckpointChallenge {
+                request_id: request(&value)?,
+                nonce: value["nonce"]
+                    .as_str()
+                    .filter(|s| id(s))
+                    .ok_or(Refusal::Schema)?
+                    .to_owned(),
+                issued_boottime_ns: value["issued_boottime_ns"]
+                    .as_str()
+                    .and_then(canonical_deadline)
+                    .ok_or(Refusal::Schema)?,
+            },
+            payload_length(&value, "payload_length", WRITER_STATUS_MAX_BYTES)?,
+            &[
+                "request_id",
+                "nonce",
+                "issued_boottime_ns",
+                "payload_length",
+            ],
+        ),
+        (Direction::ToWall, "CHECKPOINT_ACK") => (
+            Operation::CheckpointAck {
+                request_id: request(&value)?,
+                checkpoint_digest: value["checkpoint_digest"]
+                    .as_str()
+                    .filter(|s| super::drain_protocol::digest(s))
+                    .ok_or(Refusal::Schema)?
+                    .to_owned(),
+            },
+            0,
+            &["request_id", "checkpoint_digest"],
+        ),
         (Direction::ToWall, "HELLO") => (Operation::Hello, 0, &[]),
         (Direction::ToWriter, "HELLO_ACK") => (Operation::HelloAck, 0, &[]),
         (Direction::ToWriter, "STATUS") => (
@@ -196,9 +307,18 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
             let size = header.preimage_length;
             (Operation::Sign(header), size, fields)
         }
-        (_, "HELLO" | "HELLO_ACK" | "SIGN" | "VERIFIED" | "REFUSED") => {
-            return Err(Refusal::Direction)
-        }
+        (
+            _,
+            "HELLO"
+            | "HELLO_ACK"
+            | "SIGN"
+            | "VERIFIED"
+            | "REFUSED"
+            | "CHECKPOINT_QUERY"
+            | "CHECKPOINT_PART"
+            | "CHECKPOINT_CHALLENGE"
+            | "CHECKPOINT_ACK",
+        ) => return Err(Refusal::Direction),
         _ => return Err(Refusal::Schema),
     };
     if !exact(&value, fields) {
@@ -209,6 +329,12 @@ pub fn decode<'a>(packet: &'a [u8], direction: Direction, session: &str) -> Resu
         return Err(Refusal::Length);
     }
     match &operation {
+        Operation::CheckpointChallenge { .. } => {
+            let status = frame::canonical(&packet[end..], WRITER_STATUS_MAX_BYTES)
+                .map_err(|_| Refusal::Canonical)?;
+            let framed = signer_service::encode(&status, &[]).map_err(|_| Refusal::Schema)?;
+            signer_client::parse_status_packet(&framed).map_err(|_| Refusal::Schema)?;
+        }
         Operation::StatusReply { .. } => {
             StatusPayload::decode(&packet[end..])?;
         }
@@ -231,6 +357,33 @@ pub fn encode(
 ) -> Result<Vec<u8>> {
     let mut value = json!({"v": 1, "protocol": WRITER_PROTOCOL, "session_id": session});
     let (op, request_id) = match operation {
+        Operation::CheckpointQuery { request_id } => ("CHECKPOINT_QUERY", Some(request_id)),
+        Operation::CheckpointPart(part) => {
+            value["nonce"] = json!(part.nonce);
+            value["part_index"] = json!(part.part_index);
+            value["part_count"] = json!(part.part_count);
+            value["total_length"] = json!(part.total_length);
+            value["checkpoint_digest"] = json!(part.checkpoint_digest);
+            value["payload_length"] = json!(payload.len());
+            ("CHECKPOINT_PART", Some(&part.request_id))
+        }
+        Operation::CheckpointChallenge {
+            request_id,
+            nonce,
+            issued_boottime_ns,
+        } => {
+            value["nonce"] = json!(nonce);
+            value["issued_boottime_ns"] = json!(issued_boottime_ns.to_string());
+            value["payload_length"] = json!(payload.len());
+            ("CHECKPOINT_CHALLENGE", Some(request_id))
+        }
+        Operation::CheckpointAck {
+            request_id,
+            checkpoint_digest,
+        } => {
+            value["checkpoint_digest"] = json!(checkpoint_digest);
+            ("CHECKPOINT_ACK", Some(request_id))
+        }
         Operation::Hello => ("HELLO", None),
         Operation::HelloAck => ("HELLO_ACK", None),
         Operation::Status { request_id } => ("STATUS", Some(request_id)),
@@ -304,7 +457,13 @@ impl Handshake {
             (HandshakeState::AwaitingAck, Operation::HelloAck) => {
                 self.state = HandshakeState::Established
             }
-            (HandshakeState::Established, Operation::Status { .. } | Operation::Sign(_)) => {}
+            (
+                HandshakeState::Established,
+                Operation::Status { .. }
+                | Operation::Sign(_)
+                | Operation::CheckpointQuery { .. }
+                | Operation::CheckpointPart(_),
+            ) => {}
             _ => return Err(Refusal::Handshake),
         }
         Ok(frame)

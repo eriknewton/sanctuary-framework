@@ -22,17 +22,37 @@ pub fn decode_join_state(bytes: &[u8]) -> Option<Value> {
     decode_join_state_checked(bytes).ok()
 }
 fn decode_join_state_checked(bytes: &[u8]) -> Result<Value, String> {
-    // Bound the original bytes before UTF-8 decoding or allocating the state tree.
-    let state = crate::smb::strict_json::parse(bytes, JOIN_STATE_BYTES_MAX)?;
-    // Must match parseJoinState in record-joins.ts: raw canonical equality precedes value admission.
-    if crate::smb::jcs::encode(&state)?.as_bytes() != bytes {
-        return Err("JOIN_CANONICAL".into());
+    // Bound original bytes before allocating; canonical equality rejects duplicate keys and alternate spellings.
+    if bytes.len() > JOIN_STATE_BYTES_MAX {
+        return Err("SMB JSON size".into());
     }
     let state: Value = serde_json::from_slice(bytes).map_err(|_| "JOIN_JSON")?;
     if !join_state_valid(&state) {
         return Err("JOIN_STATE".into());
     }
+    // Must match parseJoinState in record-joins.ts: only original canonical bytes admit authority.
+    // Closed join domains contain ASCII keys/strings and unsigned safe integers. Their serde encoding
+    // equals JCS, avoiding general binary64 formatting for every retained history number.
+    if canonical_integer_domain(&state).as_deref() != Some(bytes) {
+        return Err("JOIN_CANONICAL".into());
+    }
     Ok(state)
+}
+
+/// Canonical serialization for the closed ASCII/integer protocol domain, never arbitrary JSON.
+pub(crate) fn canonical_integer_domain(value: &Value) -> Option<Vec<u8>> {
+    fn admitted(v: &Value) -> bool {
+        match v {
+            Value::Null | Value::Bool(_) => true,
+            Value::Number(n) => n.as_u64().is_some_and(|n| n <= SAFE_INTEGER),
+            Value::String(s) => s.is_ascii(),
+            Value::Array(a) => a.iter().all(admitted),
+            Value::Object(o) => o.iter().all(|(k, v)| k.is_ascii() && admitted(v)),
+        }
+    }
+    admitted(value)
+        .then(|| serde_json::to_vec(value).ok())
+        .flatten()
 }
 
 /// Must match BUSINESS_PIN_FIELDS in producer-custody.ts and verify_pin_fields in closure_vectors.json: the one business verify contract binds the enrolled subject and the grant's activation, lease and generation.
