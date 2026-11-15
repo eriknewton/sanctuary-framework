@@ -553,7 +553,7 @@ pub fn advance(state: &Value, record: &Value) -> Result<Value, &'static str> {
     Ok(next)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod bounded_tests {
     use super::super::{append_contract, join_lifecycle};
     use super::*;

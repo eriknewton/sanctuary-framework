@@ -82,10 +82,11 @@ pub const POLICY_AGENT_UIDS_MAX: usize = ${join.policy_agent_uids_max};
 pub const POLICY_VENDORS_MAX: usize = ${join.policy_vendors_max};
 // Derived from the closed state schema, scalar encodings, bounded policies and complete envelopes.
 pub const JOIN_STATE_BYTES_MAX: usize = ${joinMaximum};
+// Fixed schema bytes, safe-integer digits, vendor object bytes, and generated all-branch envelope bytes.
 const _: () = assert!(JOIN_STATE_BYTES_MAX == ${joinMaximum-tokenBounds.history-tokenBounds.safe_u64_list-tokenBounds.vendor_list} +
     (2 + (POLICY_AGENT_UIDS_MAX - 1) + POLICY_AGENT_UIDS_MAX * ${scalarBounds.safe_u64}) +
     (2 + (POLICY_VENDORS_MAX - 1) + POLICY_VENDORS_MAX * ${vendorBytes}) +
-    (2 + (super::JOIN_HISTORY_MAX - 1) + super::JOIN_HISTORY_MAX * super::super::append_contract::CONSERVATIVE_ENVELOPE_MAX_BYTES));
+    (2 + (super::JOIN_HISTORY_MAX - 1) + super::JOIN_HISTORY_MAX * ${maximum}));
 // Format widths and the port domain come from the producer and record schema, not policy caps.
 pub const PUBLIC_KEY_BYTES: usize = ${join.public_key_bytes};
 pub const SIGNATURE_BYTES: usize = ${join.signature_bytes};
