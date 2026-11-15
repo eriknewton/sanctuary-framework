@@ -56,5 +56,6 @@ pub const OUTER_INDEX: &[&str] = &[${join.outer_index.map(JSON.stringify).join('
 pub const JOIN_STATE_SCHEMA: &[(&str, &[(&str, &str)])] = &[${Object.entries(join.state_schema).map(([name,fields]) => `(${JSON.stringify(name)}, &[${Object.entries(fields).map(([k,v])=>`(${JSON.stringify(k)}, ${JSON.stringify(v)})`).join(', ')}])`).join(', ')}];
 `;
 const joinPath = new URL('castle-wall-daemon/src/business_profile/join_state_contract.rs',root);
-if (process.argv.includes('--check')) { if (readFileSync(joinPath,'utf8') !== joinBytes) throw Error('join contract differs'); }
+const joinCheckCandidate = process.argv.includes('--check-join-file') ? process.argv[process.argv.indexOf('--check-join-file') + 1] : joinPath;
+if (process.argv.includes('--check')) { if (readFileSync(joinCheckCandidate,'utf8') !== joinBytes) throw Error('join contract differs'); }
 else writeFileSync(joinPath,joinBytes);

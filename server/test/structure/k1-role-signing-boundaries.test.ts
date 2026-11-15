@@ -135,3 +135,15 @@ it.each(["outer_index","signature_bytes"] as const)("join generator refuses prod
     expect(check).toThrow(key==="outer_index"?"join outer index differs from producer":"join signature width differs from producer");
   } finally {unlinkSync(candidate);rmdirSync(directory);}
 });
+
+it("join generator refuses a stale derived join file",()=>{
+  const directory=mkdtempSync(join(tmpdir(),"join-freshness-")),candidate=join(directory,"join.rs");
+  try {
+    const generated=readFileSync(join(root,"castle-wall-daemon/src/business_profile/join_state_contract.rs"),"utf8");
+    writeFileSync(candidate,generated);
+    const check=()=>execFileSync(process.execPath,[join(root,"scripts/generate-business-append-contract.mjs"),"--check","--check-join-file",candidate],{stdio:"pipe"});
+    expect(check).not.toThrow();
+    writeFileSync(candidate,generated.replace(/(POLICY_VENDORS_MAX: usize = )(\d+)/,(_all,prefix,n)=>prefix+(Number(n)+1)));
+    expect(check).toThrow("join contract differs");
+  } finally {unlinkSync(candidate);rmdirSync(directory);}
+});
