@@ -196,6 +196,18 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses an indentless block-sequence mcp_servers instead of reading it as empty", () => {
+    const existing = ["mcp_servers:", "- name: weather", '  command: "uvx"', ""].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(/block-sequence/);
+  });
+
+  it("injects next to indentless top-level lists without moving them", () => {
+    const existing = "toolsets:\n- web\ncommand_allowlist:\n- execute_code\n";
+    const plan = planHermesYamlInjection(existing, ENTRY);
+    expect(plan.action).toBe("add-key");
+    expect(plan.content.startsWith(existing + "mcp_servers:\n  sanctuary:\n")).toBe(true);
+  });
+
   it("refuses the block-sequence form even when comments precede the first item (D4 P2-1)", () => {
     const existing = [
       "mcp_servers:",
