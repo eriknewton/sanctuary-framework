@@ -1,6 +1,7 @@
 // Must match the types-only worker import pin in k1-release-closure.test.ts; proxy rejection precedes all property traps.
 import {isProxy} from "node:util/types";
 import {parseStrict} from "../smb/parse-strict.js";
+import {bound} from "../smb/constants.js";
 import { z } from "zod";
 import { verifyIndexedRecord, type BusinessPin, type OuterRecordIndex } from "../linux-business/producer-custody.js";
 import type { RolePin } from "./strict-verifier.js";
@@ -45,24 +46,29 @@ export function joinOuterValid(record: JoinRecord): boolean {
     canonicalBase64(outer.signature, joinContract.signature_bytes);
 }
 /** In-memory callers must supply the same data-only trees that a JSON parser produces. */
-export function plainJoinJson(value: unknown, ancestors = new Set<object>()): boolean {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value !== "object" || isProxy(value) || ancestors.has(value)) return false;
-  const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
-  // Accessors, hidden keys and exotic prototypes cannot survive validation as different retained data.
-  if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) return false;
-  const keys = Reflect.ownKeys(value), descriptors = Object.getOwnPropertyDescriptors(value);
-  // Exactly length indices plus the built-in length property makes arrays dense and closes extra properties.
-  if (array && (keys.length !== value.length + 1 || !Array.from({length:value.length},(_,i)=>String(i)).every(k=>Object.hasOwn(descriptors,k)))) return false;
-  ancestors.add(value);
-  try {
+export function plainJoinJson(value: unknown): boolean {
+  const seen = new Set<object>();
+  const maximumDepth = bound("JSON_MAX_DEPTH");
+  function visit(value: unknown, depth: number): boolean {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+    if (typeof value === "number") return Number.isFinite(value);
+    // Must match parseStrict in smb/parse-strict.ts: only containers count toward zero-based depth.
+    if (typeof value !== "object" || depth > maximumDepth || isProxy(value) || seen.has(value)) return false;
+    // JSON cannot express aliases; retaining every visited object bounds shared-child work to one visit.
+    seen.add(value);
+    const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
+    // Accessors, hidden keys and exotic prototypes cannot survive validation as different retained data.
+    if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) return false;
+    const keys = Reflect.ownKeys(value), descriptors = Object.getOwnPropertyDescriptors(value);
+    // Exactly length indices plus the built-in length property makes arrays dense and closes extra properties.
+    if (array && (keys.length !== value.length + 1 || !Array.from({length:value.length},(_,i)=>String(i)).every(k=>Object.hasOwn(descriptors,k)))) return false;
     return keys.every(key => {
       if (array && key === "length") return true;
       const descriptor = typeof key === "string" ? descriptors[key] : undefined;
-      return descriptor !== undefined && descriptor.enumerable === true && Object.hasOwn(descriptor,"value") && plainJoinJson(descriptor.value,ancestors);
+      return descriptor !== undefined && descriptor.enumerable === true && Object.hasOwn(descriptor,"value") && visit(descriptor.value,depth+1);
     });
-  } finally { ancestors.delete(value); }
+  }
+  return visit(value, 0);
 }
 /** Bound data before allocation, then validate and retain only the isolated snapshot. */
 export function cloneJoinState(value: unknown): JoinState | null {
@@ -100,9 +106,11 @@ const STATE_TOKENS: Record<string, (v: unknown) => boolean> = {
 };
 /** Parse the relying-party join state against the one shared state schema before any record field is read. */
 export function joinStateValid(state: unknown): state is JoinState {
+  try {
   const schema = JOIN_STATE_SCHEMA as Record<string, Record<string, string>>;
   return plainJoinJson(state) && exactKeys(state, Object.keys(schema)) && Object.entries(schema).every(([name, fields]) =>
     exactKeys(state[name], Object.keys(fields)) && Object.entries(fields).every(([key, token]) => STATE_TOKENS[token]((state[name] as ObjectValue)[key])));
+  } catch { return false; }
 }
 /** Parse original join-state bytes without normalizing number spellings into trusted integers. */
 export function parseJoinState(bytes: Uint8Array): JoinState | null {

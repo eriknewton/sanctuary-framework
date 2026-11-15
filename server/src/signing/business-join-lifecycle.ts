@@ -17,6 +17,7 @@ function lifecycleStateValid(state: unknown): state is JoinLifecycleState {
 /** Pure model. The caller must authenticate checkpoint and commit evidence before submitting events. */
 export function lifecycleStep(state: JoinLifecycleState, event: Record<string, unknown>): {accepted: boolean; state: JoinLifecycleState} {
   const fail = () => ({accepted:false, state});
+  try {
   // Data-only snapshots prevent accessor changes between admission and retained copies.
   if (!plainJoinJson(state) || !plainJoinJson(event)) return fail();
   const type = event.type as keyof typeof APPEND_CONTRACT.lifecycle;
@@ -44,7 +45,8 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
       const result = advance(state.committed, record);
       if (result.refusal_code) return fail();
       const identity = deliveryIdentity(canonicalBytes(record), record);
-      next.provisional={state:result.final_state,identity,signed:false};next.tombstone=identity; break;
+      // Each retained identity is independent, matching a JSON round trip with no shared references.
+      next.provisional={state:result.final_state,identity,signed:false};next.tombstone=structuredClone(identity); break;
     }
     case "Signed":
       if (!state.provisional || state.provisional.signed || !equal(state.provisional.identity,event.identity)) return fail();
@@ -57,4 +59,5 @@ export function lifecycleStep(state: JoinLifecycleState, event: Record<string, u
     default: return fail();
   }
   return {accepted:true,state:next};
+  } catch { return fail(); }
 }

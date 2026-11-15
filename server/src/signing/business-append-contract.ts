@@ -39,6 +39,7 @@ const U64_DECIMAL_MAX_BYTES = BUSINESS_ENCODING_WIDTHS.u64;
 const digest = (v: unknown) => typeof v === "string" && new RegExp(`^sha256:[a-f0-9]{${DIGEST_HEX_LENGTH}}$`).test(v);
 /** Shared field tables own exact shapes; these checks confer no authority. */
 export function appendShape(name: "identity" | "ack" | "event" | "checkpoint" | "observation" | "wal_checkpoint" | "retained_original", value: unknown): boolean {
+  try {
   if (!Object.hasOwn(data,name)) return false;
   const fields: Record<string, unknown> = data[name];
   if (!object(value) || Object.keys(value).length !== Object.keys(fields).length) return false;
@@ -72,6 +73,7 @@ export function appendShape(name: "identity" | "ack" | "event" | "checkpoint" | 
   if (value.state === "ABSENT") return value.anchor === null && value.anchor_digest === null && value.latched === false;
   const anchor=anchorSchema.safeParse(value.anchor);
   return anchor.success && value.anchor_digest === anchorDigest(anchor.data) && value.latched === anchor.data.recovery_required;
+  } catch { return false; }
 }
 /** Decode exact E before using any unsigned wrapper field. G5 remains a caller obligation. */
 export function parseBusinessEnvelope(encoded: string): {bytes: Uint8Array; record: JoinRecord} {
