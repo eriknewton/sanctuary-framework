@@ -197,7 +197,8 @@ function reverseTuple(a: unknown, b: unknown): boolean {
     field(a,"src_ip") === field(b,"dst_ip") && field(a,"dst_ip") === field(b,"src_ip") &&
     field(a,"src_port") === field(b,"dst_port") && field(a,"dst_port") === field(b,"src_port");
 }
-function encoding(v: unknown, kind: string): boolean {
+/** Generated primitive domains are shared with record-joins.ts STATE_TOKENS; must match records_schema.rs encoding. */
+export function encoding(v: unknown, kind: string): boolean {
   if (typeof v !== "string") return false;
   switch (kind) {
     // Identifiers encode sixteen bytes and SHA-256 digests encode thirty-two bytes.
@@ -233,7 +234,8 @@ fn reverse_tuple(a: &Value, b: &Value) -> bool {
     a["family"] == b["family"] && a["protocol"] == b["protocol"] && a["src_ip"] == b["dst_ip"] && a["dst_ip"] == b["src_ip"] && a["src_port"] == b["dst_port"] && a["dst_port"] == b["src_port"]
 }
 fn lower_hex(s: &str, length: usize) -> bool { s.len() == length && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
-fn encoding(v: &Value, kind: &str) -> bool {
+// Must match linux-business-records.ts encoding; records.rs state_token consumes these generated domains.
+pub fn encoding(v: &Value, kind: &str) -> bool {
     let Some(s) = v.as_str() else { return false; };
     match kind {
         "id" => lower_hex(s, 32), // Identifiers encode sixteen bytes as lower hexadecimal.

@@ -9,7 +9,8 @@ test("worker closure excludes secret observers and credential injection",()=>{
   const worker=readFileSync("dist/k1/signing-worker.cjs","utf8");
   expect(worker.includes("__testObserveSecretBuffer")).toBe(false);expect(worker).not.toContain("--test-service");
   const imports=[...new Set([...worker.matchAll(/require\(["']([^"']+)["']\)/g)].map(match=>match[1]))].sort();
-  expect(imports).toEqual(["node:async_hooks","node:crypto","node:fs","node:tty"]);
+  // Must match record-joins.ts: the types-only import refuses proxies without exposing inspection helpers.
+  expect(imports).toEqual(["node:async_hooks","node:crypto","node:fs","node:tty","node:util/types"]);
   const source=readFileSync("src/signing/worker.ts","utf8");expect(source).not.toContain("process.env");expect(source).not.toContain("process.argv");
 });
 it("Linux only: pinned runtime disables SIGUSR1 inspector",()=>{expect(()=>execFileSync(process.execPath,["--disable-sigusr1","--no-addons","-e","process.kill(process.pid, 'SIGUSR1'); setTimeout(() => process.exit(require('node:inspector').url() ? 1 : 0), 25)"],{env:{VITEST:"true"},timeout:2000})).not.toThrow();});

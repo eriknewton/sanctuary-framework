@@ -3,10 +3,10 @@
   "schema_digest": "sha256:0f12e24e3fe7a550b53b190b2d080b1164db72a7f085da752bec713fd067dc5a",
   "state_schema": {
     "pin": {
-      "role": "text",
+      "role": "role",
       "epoch": "safe_u64",
-      "kid": "text",
-      "public_key": "text",
+      "kid": "kid",
+      "public_key": "public_key",
       "identity_id": "id",
       "machine_id": "id"
     },

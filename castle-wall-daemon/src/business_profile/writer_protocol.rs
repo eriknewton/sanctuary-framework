@@ -409,7 +409,7 @@ pub fn envelope(body: &[u8], signature: &[u8; SIGNATURE_BYTES]) -> Result<Vec<u8
     let value = super::frame::canonical(body, super::records_schema::MAX_BYTES)
         .map_err(|_| Refusal::Canonical)?;
     // Envelope also covers a non-object body or a missing outer-index key.
-    // Must match the outer-index rule in records::advance.
+    // Must match OUTER_INDEX and SIGNATURE_BYTES in join_state_contract.rs; generate-business-append-contract.mjs checks producer equality.
     let mut outer = serde_json::Map::new();
     for key in LINUX_FIELDS
         .iter()
