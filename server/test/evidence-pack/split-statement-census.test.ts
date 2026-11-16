@@ -131,9 +131,9 @@ it.each([
 }));
 
 it.each([
- ["acquire",`.audit-write.lock.acquire.${process.pid}.0.${"ab".repeat(A.AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes)}.tmp`,"excluded"],
+ ["acquire",`.audit-write.lock.acquire.${process.pid}.0.${"ab".repeat(A.AUDIT_RAW_NAME_GRAMMARS.auditAcquire.nonceBytes)}.tmp`,"excluded"],
  ["claim",`.audit-write.lock.claim.${process.pid}.${"ab".repeat(A.AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes)}.tomb`,"excluded"],
- ["evidence",`.audit-write.lock.evidence.${process.pid}.${"ab".repeat(A.AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes)}.tomb`,"incident"],
+ ["evidence",`.audit-write.lock.evidence.${process.pid}.${"ab".repeat(A.AUDIT_RAW_NAME_GRAMMARS.auditEvidence.nonceBytes)}.tomb`,"incident"],
 ])("producer grammar %s",(_label,rawName,disposition)=>withStore(async s=>{
  await writeFile(join(s.state,A.AUDIT_NAMESPACE,rawName),"synthetic residue");
  expect(producerRawSourceName(A.AUDIT_NAMESPACE,rawName),"producer recognized").toBe(disposition);

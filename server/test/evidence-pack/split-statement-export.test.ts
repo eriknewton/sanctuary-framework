@@ -99,7 +99,7 @@ it.each(["pin","capture","key"])("uses the declared split failure schema for %s"
 }));
 
 it("retained producer incident stays partial",()=>withExport(async x=>{
- const name=`.audit-write.lock.evidence.${process.pid}.${"ab".repeat(AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes)}.tomb`;
+ const name=`.audit-write.lock.evidence.${process.pid}.${"ab".repeat(AUDIT_RAW_NAME_GRAMMARS.auditEvidence.nonceBytes)}.tomb`;
  await writeFile(join(x.state,"_audit",name),"synthetic incident");
  expect(await exportSnapshot(x.options,x.deps),"incident export PARTIAL").toBe(10);
  const {verified}=await result(x);
