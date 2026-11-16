@@ -129,3 +129,36 @@ it("projection vectors cover the entire schema kind set and permit unknown",()=>
   const unknown=APPEND_CONTRACT.projection_vectors.find(row=>row.id==="permit-unknown")!;
   expect(unknown.record.body.payload).toMatchObject({type:"permit",outcome:"unknown",effect:"EFFECT_UNKNOWN"});
 });
+
+it("pure wire exports exactly match the complete compatibility surface", async () => {
+  const wire = await import("../../src/signing/business-append-wire.js");
+  const compatibility = await import("../../src/signing/business-append-contract.js");
+  const {readFileSync} = await import("node:fs");
+  const definitions = readFileSync("src/signing/business-append-wire.ts", "utf8");
+  const reexports = readFileSync("src/signing/business-append-contract.ts", "utf8");
+  const names = [...definitions.matchAll(/export (?:const|interface|type|function) (\w+)/g)].map(m => m[1]).sort();
+  const aliases = [...reexports.matchAll(/export \{(?:type )?(\w+)\} from "\.\/business-append-wire.js"/g)].map(m => m[1]).sort();
+  expect(aliases).toEqual(names);
+  expect(Object.keys(compatibility).filter(k => !["appendShape", "parseBusinessCheckpoint"].includes(k)).sort()).toEqual(Object.keys(wire).sort());
+  for (const name of Object.keys(wire) as Array<keyof typeof wire>) expect(compatibility[name]).toBe(wire[name]);
+});
+
+it("pure wire preserves every shared identity ACK event and envelope outcome", async () => {
+  const wire = await import("../../src/signing/business-append-wire.js");
+  const outcome = (run: () => unknown) => {try {return run();} catch (error) {return {error: (error as Error).message};}};
+  for (const name of ["identity", "ack", "event"] as const) {
+    for (const vector of APPEND_CONTRACT[`${name}_vectors`]) expect(wire.appendWireShape(name, vector.value)).toBe(appendShape(name, vector.value));
+  }
+  for (const vector of APPEND_CONTRACT.event_vectors) expect(outcome(() => wire.parseBusinessEvent(vector.value))).toEqual(outcome(() => parseBusinessEvent(vector.value)));
+  for (const entry of corpus.cases) for (const envelope of entry.records) {
+    const encoded = Buffer.from(canonicalBytes(envelope)).toString("base64url");
+    expect(outcome(() => wire.parseBusinessEnvelope(encoded))).toEqual(outcome(() => parseBusinessEnvelope(encoded)));
+  }
+});
+
+it("wire and anchor scalar bounds match as a complete set", async () => {
+  const wire = await import("../../src/signing/business-append-wire.js");
+  const anchor = await import("../../src/linux-business/activation-anchor.js");
+  expect({ID_HEX_LENGTH: wire.ID_HEX_LENGTH, DIGEST_HEX_LENGTH: wire.DIGEST_HEX_LENGTH, SAFE_INTEGER: wire.SAFE_INTEGER}, "complete wire scalar bounds")
+    .toEqual({ID_HEX_LENGTH: anchor.ID_HEX_LENGTH, DIGEST_HEX_LENGTH: anchor.DIGEST_HEX_LENGTH, SAFE_INTEGER: anchor.SAFE_INTEGER});
+});

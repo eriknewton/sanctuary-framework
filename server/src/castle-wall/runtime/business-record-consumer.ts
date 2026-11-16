@@ -3,7 +3,7 @@ import {z} from "zod";
 import {canonicalBytes} from "../../signing/contract.js";
 import {BUSINESS_PIN_FIELDS, verifyIndexedRecord, type BusinessPin, type OuterRecordIndex} from "../../linux-business/producer-custody.js";
 import {cloneJoinState, verifyBusinessJoin, type JoinState, type JoinRecord} from "../../signing/record-joins.js";
-import {envelopeSizeAdmitted, parseBusinessEvent, parseBusinessEventBytes, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-contract.js";
+import {envelopeSizeAdmitted, parseBusinessEvent, parseBusinessEventBytes, parseBusinessEnvelope, deliveryIdentity, projectBusinessRecord, type BusinessDeliveryAck, type BusinessDeliveryIdentity, type BusinessVerifiedRecord} from "../../signing/business-append-wire.js";
 
 export interface DurableBusinessAcceptance {
   /** Enrollment and grant verified at acceptance; never authority for new candidates. */
@@ -43,7 +43,11 @@ const parseInput = (event: unknown) => {
 };
 // Node's value-type predicates; plain event data matches none of them.
 const BUILT_IN_BRANDS = Object.values(types).filter((check): check is (value: unknown) => boolean => typeof check === "function");
-/** Mode and pins are supplied by trusted composition, never selected by event fields. */
+/** Mode and pins are supplied by trusted composition, never selected by event fields.
+ * TS does not authenticate the daemon. Acceptance rests on the pinned signature
+ * and committed join; must match IpcClient.completeHandshake in ipc-client.ts.
+ * Must match BusinessDelivery in business_profile/business_delivery.rs: the
+ * token stays outside the WAL slot until this sink returns durable readback. */
 export async function createBusinessRecordConsumer(mode: ConsumerMode): Promise<{accept(event: unknown): Promise<BusinessDeliveryAck | void>; committedState(): JoinState | null; pendingDelivery(): BusinessDeliveryIdentity | null}> {
   if (mode.kind === "Legacy") {
     return {committedState:()=>null,pendingDelivery:()=>null,async accept(event) {

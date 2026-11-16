@@ -6,7 +6,7 @@ use castle_wall_daemon::business_profile::{
     signer_contract,
     writer_protocol::{self as wire, Direction, Operation},
     writer_service::{
-        self as service, test_support as support, ClosedReconciler, WriterMachine, WriterState,
+        self as service, test_support as support, DrainReconciler, WriterMachine, WriterState,
     },
 };
 use serde_json::{json, Value};
@@ -15,13 +15,13 @@ use std::sync::atomic::Ordering;
 mod state;
 const SESSION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REQUEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-type Machine = WriterMachine<support::ScriptedSigner, ClosedReconciler>;
+type Machine = WriterMachine<support::ScriptedSigner, DrainReconciler>;
 fn bytes(v: &Value) -> Vec<u8> {
     castle_wall_daemon::smb::jcs::encode(v)
         .unwrap()
         .into_bytes()
 }
-fn fixture() -> (state::Fixture, Machine, Value) {
+pub(super) fn fixture() -> (state::Fixture, Machine, Value) {
     let f = state::Fixture::new();
     let mut v = append_contract::contract().unwrap()["checkpoint_vectors"][0]["value"].clone();
     let mut g = v["wal_checkpoint"]["join_state"]["pin"].clone();
@@ -31,7 +31,7 @@ fn fixture() -> (state::Fixture, Machine, Value) {
     f.view.lock().unwrap().grant = serde_json::from_value(g).unwrap();
     let mut m = WriterMachine::isolated(
         f.signer(),
-        ClosedReconciler::production(),
+        DrainReconciler::production(cp::OrdinaryCheckpointProvider::production()),
         "a".repeat(32),
         f.clock(),
     )
@@ -608,17 +608,65 @@ fn adjudication_work_measurement() {
 
 #[path = "writer_bus.rs"]
 mod bus_fixture;
-fn wire_receive(fd: i32) -> Vec<u8> {
-    let mut p = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+const FIXTURE_STARTUP_MS: u64 = 10_000;
+const FIXTURE_OPERATION_MS: u64 = cp::CHECKPOINT_CHALLENGE_MS;
+fn fixture_poll_retry(
+    end: std::time::Instant,
+    mut poll: impl FnMut(i32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    loop {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        match poll(left.as_millis().max(1).min(i32::MAX as u128) as i32) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+fn fixture_poll(fd: i32, budget_ms: u64) {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    fixture_poll_retry(end, |timeout| {
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut p, 1, timeout) } {
+            1 => Ok(()),
+            0 => Err(std::io::ErrorKind::TimedOut.into()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    })
+    .expect("bounded fixture receive");
+}
+#[test]
+fn fixture_poll_retries_interruption_without_renewing_the_absolute_deadline() {
+    let mut calls = 0;
+    fixture_poll_retry(
+        std::time::Instant::now() + std::time::Duration::from_millis(FIXTURE_OPERATION_MS),
+        |_| {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, 3, "interruption retains one bounded poll");
+    let deadline = std::time::Instant::now();
     assert_eq!(
-        unsafe { libc::poll(&mut p, 1, 3000) },
-        1,
-        "bounded fixture receive"
+        fixture_poll_retry(deadline, |_| panic!("expired poll cannot run"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
     );
+}
+fn wire_receive(fd: i32) -> Vec<u8> {
+    fixture_poll(fd, FIXTURE_OPERATION_MS);
     castle_wall_daemon::business_profile::signer_peer::receive(
         fd,
         wire::WRITER_REPLY_PACKET_MAX_BYTES,
@@ -633,12 +681,26 @@ fn accepting_serve_fixture(
     ack_failure: bool,
     expiry: bool,
 ) {
+    accepting_serve_case(partial, held, second, ack_failure, expiry, None);
+}
+#[allow(clippy::too_many_arguments)]
+fn accepting_serve_case(
+    partial: bool,
+    held: bool,
+    second: bool,
+    ack_failure: bool,
+    expiry: bool,
+    supplied: Option<(state::Fixture, Machine, Value, bool)>,
+) {
     use castle_wall_daemon::business_profile::{
         signer_peer,
         writer_peer::{HeldConfig, ListenerExpectations},
     };
     use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
-    let (f, mut machine, mut report) = fixture();
+    let (f, mut machine, mut report, expect_grant) = supplied.unwrap_or_else(|| {
+        let (f, m, report) = fixture();
+        (f, m, report, true)
+    });
     if partial {
         bounded_ordinary_report(&f, &mut report);
         machine.heartbeat().unwrap();
@@ -760,6 +822,48 @@ fn accepting_serve_fixture(
         &[],
     )
     .unwrap();
+    if !expect_grant {
+        std::thread::sleep(std::time::Duration::from_millis(
+            state::BUS_SCHEDULING_SLACK_MS,
+        ));
+        signer_peer::send(
+            socket.as_raw_fd(),
+            &wire::encode(
+                Direction::ToWriter,
+                session,
+                &Operation::Status {
+                    request_id: "d".repeat(32),
+                },
+                &[],
+            )
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+        let reply = wire_receive(socket.as_raw_fd());
+        assert!(
+            matches!(
+                wire::decode(&reply, Direction::ToWall, session)
+                    .unwrap()
+                    .operation,
+                Operation::StatusReply { .. }
+            ),
+            "null S checkpoint produces no acceptance ACK"
+        );
+        assert_eq!(
+            f.binds.load(Ordering::SeqCst),
+            0,
+            "null S checkpoint produces no grant"
+        );
+        assert_eq!(
+            f.signs.load(Ordering::SeqCst),
+            0,
+            "null S checkpoint produces no effect"
+        );
+        drop(socket);
+        runner.join().unwrap();
+        return;
+    }
     if expiry {
         runner.join().unwrap();
         assert_eq!(
@@ -807,7 +911,7 @@ fn accepting_serve_fixture(
             None
         };
         if !second {
-            f.view.lock().unwrap().state = "LOCKED".into();
+            f.view.lock().unwrap().anchor_digest = Some(format!("sha256:{}", "e".repeat(64)));
         }
         release_tx.send(()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -873,22 +977,17 @@ fn checkpoint_signer_child(root: &std::path::Path) {
     use castle_wall_daemon::business_profile::{signer_peer, signer_service};
     use std::{fs, os::fd::AsRawFd};
     // Check the post-exec principal too: no capability can return across exec.
-    signer_peer::empty_capabilities(unsafe { libc::getpid() }, false).unwrap();
+    signer_peer::empty_capabilities(unsafe { libc::getpid() }, unsafe { libc::geteuid() } == 0)
+        .unwrap();
     let view: Value = serde_json::from_slice(&fs::read(root.join("signer-view")).unwrap()).unwrap();
     let reply = signer_service::encode(&view, &[]).unwrap();
     // Bind in the child: SO_PEERCRED must name this dropped principal, not the parent.
     let listener = signer_peer::listen(&root.join("signer")).unwrap();
     fs::write(root.join("signer-ready"), b"ready").unwrap();
-    let mut poll = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+    fixture_poll(listener.as_raw_fd(), FIXTURE_STARTUP_MS);
     let socket = signer_peer::accept(listener.as_raw_fd()).unwrap();
-    poll.fd = socket.as_raw_fd();
     loop {
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        fixture_poll(socket.as_raw_fd(), FIXTURE_OPERATION_MS);
         let Ok(packet) =
             signer_peer::receive(socket.as_raw_fd(), wire::WRITER_SIGN_PACKET_MAX_BYTES)
         else {
@@ -902,6 +1001,26 @@ fn checkpoint_signer_child(root: &std::path::Path) {
             break;
         }
     }
+}
+
+#[test]
+#[ignore = "private child driver invoked by the checkpoint parent"]
+fn checkpoint_status_child() {
+    use castle_wall_daemon::business_profile::signer_peer;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    assert!(std::env::args().any(|arg| arg == "--ignored"));
+    let mut parent = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
+    parent
+        .set_read_timeout(Some(std::time::Duration::from_millis(FIXTURE_STARTUP_MS)))
+        .unwrap();
+    let mut token = [0; 32];
+    parent.read_exact(&mut token).unwrap();
+    assert!(token.iter().any(|b| *b != 0));
+    signer_peer::drop_capabilities().unwrap();
+    parent.write_all(&token).unwrap();
+    let root = std::env::var_os("K1_CHECKPOINT_SIGNER_CHILD").unwrap();
+    checkpoint_signer_child(std::path::Path::new(&root));
 }
 
 #[test]
@@ -920,10 +1039,6 @@ fn shared_run_refuses_every_checkpoint_opcode() {
         time::{Duration, Instant},
     };
     const SIGNER_CHILD: &str = "K1_CHECKPOINT_SIGNER_CHILD";
-    if let Some(root) = std::env::var_os(SIGNER_CHILD) {
-        checkpoint_signer_child(std::path::Path::new(&root));
-        return;
-    }
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -956,32 +1071,118 @@ fn shared_run_refuses_every_checkpoint_opcode() {
         // dropped child cannot exec through the runner's home. Both images and
         // every fixture path live under this test-owned temp root instead.
         let signer_image = root.join("signer-child");
-        fs::copy(std::env::current_exe().unwrap(), &signer_image).unwrap();
+        fs::copy("/proc/self/exe", &signer_image).unwrap();
         fs::set_permissions(&signer_image, fs::Permissions::from_mode(0o700)).unwrap();
         // Hash the large test image before starting the child's bounded accept wait.
         let signer_hash = hex::encode(Sha256::digest(fs::read(&signer_image).unwrap()));
+        use std::io::{Read, Write};
+        let (mut parent_handshake, child_handshake) =
+            std::os::unix::net::UnixStream::pair().unwrap();
+        parent_handshake
+            .set_read_timeout(Some(Duration::from_millis(FIXTURE_STARTUP_MS)))
+            .unwrap();
+        let handshake_fd = child_handshake.as_raw_fd();
+        let last_cap: i32 = fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!((0..64).contains(&last_cap));
+        let signer_stderr = root.join("signer-stderr");
         let mut signer_command = std::process::Command::new(&signer_image);
         signer_command
             .args([
                 "--exact",
-                "checkpoint::shared_run_refuses_every_checkpoint_opcode",
+                "checkpoint::checkpoint_status_child",
+                "--nocapture",
+                "--ignored",
                 "--test-threads=1",
             ])
             .env(SIGNER_CHILD, root)
             .current_dir(root)
             // CI counts libtest summaries, so only the parent may print one.
-            .stdout(std::process::Stdio::null());
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&signer_stderr).unwrap());
         unsafe {
-            signer_command.pre_exec(signer_peer::drop_capabilities);
+            signer_command.pre_exec(move || {
+                // Match signer_peer's Linux v3 ABI; every pre-exec operation uses stack
+                // storage and syscalls only. The child rechecks the resulting principal.
+                #[repr(C)]
+                struct CapHeader {
+                    version: u32,
+                    pid: i32,
+                }
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct CapData {
+                    effective: u32,
+                    permitted: u32,
+                    inheritable: u32,
+                }
+                const CAPABILITY_VERSION_3: u32 = 0x20080522;
+                for cap in 0..=last_cap {
+                    let present = libc::prctl(libc::PR_CAPBSET_READ, cap);
+                    if present < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if present == 1 && libc::prctl(libc::PR_CAPBSET_DROP, cap) != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if uid == 0 || error.raw_os_error() != Some(libc::EPERM) {
+                            return Err(error);
+                        }
+                    }
+                }
+                let header = CapHeader {
+                    version: CAPABILITY_VERSION_3,
+                    pid: 0,
+                };
+                let data = [CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                }; 2];
+                if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) != 0
+                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Only allocation-free descriptor operations follow the capability drop.
+                if libc::dup2(handshake_fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         let mut signer = Child(signer_command.spawn().unwrap());
-        let end = Instant::now() + Duration::from_secs(5);
+        drop(child_handshake);
+        let mut token = [0u8; 32];
+        fs::File::open("/dev/urandom")
+            .unwrap()
+            .read_exact(&mut token)
+            .unwrap();
+        parent_handshake.write_all(&token).unwrap();
+        let mut echoed = [0u8; 32];
+        parent_handshake
+            .read_exact(&mut echoed)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "child handshake: {error}; {}",
+                    fs::read_to_string(&signer_stderr).unwrap()
+                )
+            });
+        assert_eq!(echoed, token, "private child handshake");
+        let end = Instant::now() + Duration::from_millis(FIXTURE_STARTUP_MS);
         while !root.join("signer-ready").exists() {
             assert!(
                 signer.0.try_wait().unwrap().is_none(),
-                "signer child exited"
+                "signer child exited: {}",
+                fs::read_to_string(&signer_stderr).unwrap()
             );
-            assert!(Instant::now() < end, "signer child readiness timeout");
+            assert!(
+                Instant::now() < end,
+                "signer child readiness timeout: {}",
+                fs::read_to_string(&signer_stderr).unwrap()
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         let listener_path = root.join("records");
@@ -1018,6 +1219,7 @@ fn shared_run_refuses_every_checkpoint_opcode() {
             "listener":{"path":listener_path,"owner":uid,"group":gid,"peer_uid":uid},"artifact_owner":uid,"library_owner":uid,"signer_socket":s_path})).unwrap()).unwrap();
         fs::set_permissions(&seam, fs::Permissions::from_mode(0o600)).unwrap();
         let raw = listener.as_raw_fd();
+        let writer_stderr = root.join("writer-stderr");
         let mut command = std::process::Command::new("/usr/bin/python3");
         command.env_clear().current_dir(root);
         command.args(["-c","import os,sys; os.environ['LISTEN_PID']=str(os.getpid()); os.execve(sys.argv[1],sys.argv[1:],os.environ)"]).arg(&image);
@@ -1027,7 +1229,7 @@ fn shared_run_refuses_every_checkpoint_opcode() {
             .env("LISTEN_FDNAMES", "records")
             .env("NOTIFY_SOCKET", &notify_path)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(fs::File::create(&writer_stderr).unwrap());
         unsafe {
             command.pre_exec(move || {
                 if libc::dup2(raw, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
@@ -1038,7 +1240,12 @@ fn shared_run_refuses_every_checkpoint_opcode() {
         }
         let mut child = Child(command.spawn().unwrap());
         let mut text = [0; 1024];
-        let n = notify.recv(&mut text).unwrap();
+        let n = notify.recv(&mut text).unwrap_or_else(|error| {
+            panic!(
+                "writer notification: {error}; {}",
+                fs::read_to_string(&writer_stderr).unwrap()
+            )
+        });
         assert_eq!(
             &text[..n],
             b"READY=1\nSTATUS=writer closed",
@@ -1082,12 +1289,7 @@ fn shared_run_refuses_every_checkpoint_opcode() {
             &[],
         )
         .unwrap();
-        let mut closing = libc::pollfd {
-            fd: socket.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut closing, 1, 3000) }, 1);
+        fixture_poll(socket.as_raw_fd(), FIXTURE_OPERATION_MS);
         let mut byte = 0u8;
         assert_eq!(
             unsafe {
@@ -1101,14 +1303,23 @@ fn shared_run_refuses_every_checkpoint_opcode() {
             0,
             "Refuse emits no checkpoint frame"
         );
-        let n = notify.recv(&mut text).unwrap();
+        let n = notify.recv(&mut text).unwrap_or_else(|error| {
+            panic!(
+                "writer notification: {error}; {}",
+                fs::read_to_string(&writer_stderr).unwrap()
+            )
+        });
         assert_eq!(
             &text[..n],
             service::STOP_STATUS.as_bytes(),
             "shared run chooses terminal Refuse for every checkpoint opcode"
         );
         assert!(!child.0.wait().unwrap().success());
-        assert!(signer.0.wait().unwrap().success(), "signer STATUS loop");
+        assert!(
+            signer.0.wait().unwrap().success(),
+            "signer STATUS loop: {}",
+            fs::read_to_string(&signer_stderr).unwrap()
+        );
     }
 }
 
@@ -1518,7 +1729,7 @@ fn frozen_tick_expiry_while_awaiting_cancels_through_serve() {
     accepting_serve_fixture(false, false, false, false, true);
 }
 
-fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
+fn advancing_serve_schedule(last_tick: bool, slow_reread: bool, hold_ms: u64) {
     use castle_wall_daemon::business_profile::{
         signer_peer,
         signer_watchdog::WATCHDOG_TICK_MS,
@@ -1573,7 +1784,11 @@ fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
                 &clock,
             );
             assert!(result.is_err());
-            assert!(!support::checkpoint_owned(&machine));
+            assert!(
+                !support::checkpoint_owned(&machine),
+                "completed heartbeat closure disposes every checkpoint owner"
+            );
+            result
         });
         let socket = signer_peer::connect(&path).unwrap();
         let hello = wire_receive(socket.as_raw_fd());
@@ -1593,6 +1808,8 @@ fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
         if last_tick {
             last_tick_start();
         }
+        f.status_delay
+            .store(hold_ms * state::NS_PER_MS, Ordering::SeqCst);
         send(
             &Operation::CheckpointQuery {
                 request_id: REQUEST.into(),
@@ -1609,6 +1826,74 @@ fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
             },
             &[],
         );
+        if hold_ms > 0 {
+            pause();
+            let mut readiness = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let available = unsafe { libc::poll(&mut readiness, 1, 0) };
+            let second = signer_peer::connect(&path);
+            let outcome = runner.join().unwrap();
+            assert!(
+                hold_ms == 980 || second.is_ok(),
+                "heartbeat pass cannot retain the wall session: {outcome:?}"
+            );
+            assert_eq!(
+                available, 1,
+                "held query and STATUS progress after the completed heartbeat"
+            );
+            if hold_ms == 980 {
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(
+                            castle_wall_daemon::business_profile::writer_service::Error::Peer(
+                                castle_wall_daemon::business_profile::writer_peer::Error::Deadline
+                            )
+                        )
+                    ),
+                    "expired STATUS admission closes with a typed deadline: {outcome:?}"
+                );
+                let bytes = wire_receive(socket.as_raw_fd());
+                let response = wire::decode(&bytes, Direction::ToWall, session).unwrap();
+                assert!(
+                    matches!(response.operation, Operation::CheckpointChallenge { .. }),
+                    "held query is processed after the completed heartbeat"
+                );
+                let mut tail = [0u8; 1];
+                assert_eq!(
+                    unsafe {
+                        libc::recv(
+                            socket.as_raw_fd(),
+                            tail.as_mut_ptr().cast(),
+                            tail.len(),
+                            libc::MSG_DONTWAIT,
+                        )
+                    },
+                    0,
+                    "deadline closure sends no ACK or further response"
+                );
+                assert_eq!(
+                    f.binds.load(Ordering::SeqCst),
+                    0,
+                    "deadline closure grants no authority or effect"
+                );
+                return;
+            }
+            for challenge in [true, false] {
+                let bytes = wire_receive(socket.as_raw_fd());
+                let response = wire::decode(&bytes, Direction::ToWall, session).unwrap();
+                assert_eq!(
+                    matches!(response.operation, Operation::CheckpointChallenge { .. }),
+                    challenge,
+                    "held query precedes STATUS response"
+                );
+            }
+            assert_eq!(f.binds.load(Ordering::SeqCst), 0);
+            return;
+        }
         let response = wire_receive(socket.as_raw_fd());
         let response = wire::decode(&response, Direction::ToWall, session).unwrap();
         assert!(
@@ -1689,16 +1974,16 @@ fn advancing_serve_schedule(last_tick: bool, slow_reread: bool) {
             ));
         }
         drop(socket);
-        runner.join().unwrap();
+        let _ = runner.join().unwrap();
     });
 }
 #[test]
 fn advancing_serve_defers_query_and_each_part_at_the_last_tick() {
-    advancing_serve_schedule(true, false);
+    advancing_serve_schedule(true, false, 0);
 }
 #[test]
 fn advancing_serve_preempts_adjudication_at_the_real_call_site() {
-    advancing_serve_schedule(false, true);
+    advancing_serve_schedule(false, true, 0);
 }
 
 #[test]
@@ -1714,4 +1999,291 @@ fn checkpoint_bind_failure_is_immediately_terminal() {
     );
     assert_eq!(m.state(), WriterState::Settling);
     assert!(!support::checkpoint_owned(&m));
+}
+
+#[test]
+fn real_null_status_refuses_genesis_and_settled_with_populated_controls() {
+    use castle_wall_daemon::business_profile::signer_client::StatusReply;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new(root.join("../server/node_modules/.bin/tsx"))
+        .arg(root.join("tests/helpers/checkpoint-status.ts"))
+        .current_dir(root.join("../server"))
+        .env("VITEST", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "real S fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let real: StatusReply = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(real.state, "UNLOCKED");
+    for settled in [false, true] {
+        for populated in [false, true] {
+            let f = state::Fixture::new();
+            let mut report =
+                append_contract::contract().unwrap()["checkpoint_vectors"][0]["value"].clone();
+            let g = serde_json::to_value(&real.grant).unwrap();
+            for key in [
+                "role",
+                "epoch",
+                "kid",
+                "public_key",
+                "identity_id",
+                "machine_id",
+            ] {
+                report["wal_checkpoint"]["join_state"]["pin"][key] = g[key].clone();
+            }
+            for key in ["activation_id", "lease_id", "generation"] {
+                report["wal_checkpoint"]["join_state"]["grant"][key] = g[key].clone();
+            }
+            for key in ["role", "machine_id", "activation_id"] {
+                report["d_observation"]["anchor"][key] = g[key].clone();
+            }
+            report["d_observation"]["anchor"]["generation_high_water"] = g["generation"].clone();
+            report["d_observation"]["anchor"]["boot_id"] = json!(real.boot_id);
+            let join = &mut report["wal_checkpoint"]["join_state"];
+            join["grant"]["boot_id"] = json!(real.boot_id);
+            join["grant"]["expires_ns"] = json!(real.expires_boottime_ns);
+            join["anchor"]["lease_id"] = g["lease_id"].clone();
+            join["anchor"]["generation"] = g["generation"].clone();
+            if settled {
+                let commitment = format!("sha256:{}", "b".repeat(64));
+                for key in [
+                    "reserved_sequence",
+                    "committed_sequence",
+                    "drained_sequence",
+                ] {
+                    report["d_observation"]["anchor"][key] = json!(1);
+                }
+                for key in ["committed_sequence", "drained_sequence"] {
+                    report["wal_checkpoint"][key] = json!(1);
+                }
+                for key in ["committed_digest", "drained_digest"] {
+                    report["d_observation"]["anchor"][key] = json!(commitment);
+                    report["wal_checkpoint"][key] = json!(commitment);
+                }
+                report["wal_checkpoint"]["join_state"]["anchor"]["sequence"] = json!(1);
+                report["wal_checkpoint"]["join_state"]["anchor"]["commitment"] = json!(commitment);
+            }
+            let digest = anchor::anchor_digest(&report["d_observation"]["anchor"]).unwrap();
+            report["d_observation"]["anchor_digest"] = json!(digest);
+            let mut status = real.clone();
+            if populated {
+                status.anchor_revision = Some(1);
+                status.anchor_digest = Some(digest);
+            }
+            let now = real.started_boottime_ns.parse::<u64>().unwrap();
+            f.now.store(now, Ordering::SeqCst);
+            *f.view.lock().unwrap() = status.clone();
+            f.view.lock().unwrap().state = "LOCKED".into();
+            let mut machine = WriterMachine::isolated(
+                f.signer(),
+                DrainReconciler::production(cp::OrdinaryCheckpointProvider::production()),
+                real.boot_id.clone(),
+                f.clock(),
+            )
+            .unwrap();
+            support::checkpoint_identity(&mut machine, "a".repeat(32), 1);
+            *f.view.lock().unwrap() = status;
+            machine.heartbeat().unwrap();
+            accepting_serve_case(
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some((f, machine, report, populated)),
+            );
+        }
+    }
+}
+
+#[test]
+fn measured_heartbeat_hold_exempts_silence_but_never_age_or_lifetime() {
+    for elapsed_ms in [
+        cp::CHECKPOINT_AGE_MS,
+        cp::CHECKPOINT_AGE_MS + 1,
+        cp::CHECKPOINT_CHALLENGE_MS,
+    ] {
+        let (f, mut machine, mut report) = fixture();
+        bounded_ordinary_report(&f, &mut report);
+        machine.heartbeat().unwrap();
+        let parts = query(&f, &mut machine, &mut report, REQUEST);
+        assert!(parts.len() > 1);
+        support::checkpoint_packet(&mut machine, SESSION, &parts[0]).unwrap();
+        const HOLD_MS: u64 = 980;
+        f.now.store(
+            state::NOW + (elapsed_ms - HOLD_MS) * state::NS_PER_MS,
+            Ordering::SeqCst,
+        );
+        f.status_delay
+            .store(HOLD_MS * state::NS_PER_MS, Ordering::SeqCst);
+        support::checkpoint_heartbeat(&mut machine).unwrap();
+        f.status_delay.store(0, Ordering::SeqCst);
+        // One completed heartbeat allows the held transfer to make progress on this pass.
+        support::checkpoint_step_after_heartbeat(&mut machine).unwrap();
+        for part in &parts[1..] {
+            support::checkpoint_packet(&mut machine, SESSION, part).unwrap();
+        }
+        machine.heartbeat().unwrap();
+        for _ in 0..3 {
+            support::checkpoint_step(&mut machine).unwrap();
+        }
+        let granted = if support::awaiting(&machine).is_some() {
+            support::checkpoint_reread(&mut machine).unwrap().is_some()
+        } else {
+            false
+        };
+        assert_eq!(
+            granted,
+            elapsed_ms == cp::CHECKPOINT_AGE_MS,
+            "only measured heartbeat silence is exempt; original age and challenge govern"
+        );
+        assert_eq!(f.binds.load(Ordering::SeqCst), usize::from(granted));
+    }
+}
+
+#[test]
+fn ordinary_checkpoint_refusal_matrix_reaches_the_real_serve_consumer() {
+    for case in [
+        "absent",
+        "reservation",
+        "intent",
+        "recovery",
+        "retired",
+        "uncertain",
+        "wal-ahead",
+        "d-ahead",
+        "missing-head",
+        "gap",
+        "pin",
+        "lease",
+        "fortress",
+        "revision",
+        "superseded",
+    ] {
+        let (f, mut m, mut report) = fixture();
+        let commitment = format!("sha256:{}", "b".repeat(64));
+        if matches!(case, "wal-ahead" | "missing-head" | "gap") {
+            let count = if case == "gap" { 2 } else { 1 };
+            report["wal_checkpoint"]["committed_sequence"] = json!(count);
+            report["wal_checkpoint"]["committed_digest"] = json!(commitment);
+            report["wal_checkpoint"]["join_state"]["anchor"]["sequence"] = json!(count);
+            report["wal_checkpoint"]["join_state"]["anchor"]["commitment"] = json!(commitment);
+            if case != "missing-head" {
+                report["wal_checkpoint"]["retained_originals"] = json!((1..=count).map(|sequence| json!({"sequence":sequence + i32::from(case == "gap"), "commitment":commitment})).collect::<Vec<_>>());
+            }
+        }
+        if matches!(case, "d-ahead" | "missing-head" | "gap") {
+            let count = if case == "gap" { 2 } else { 1 };
+            report["d_observation"]["anchor"]["reserved_sequence"] = json!(count);
+            report["d_observation"]["anchor"]["committed_sequence"] = json!(count);
+            report["d_observation"]["anchor"]["committed_digest"] = json!(commitment);
+        }
+        match case {
+            "absent" => {
+                report["d_observation"]["state"] = json!("ABSENT");
+                report["d_observation"]["anchor"] = Value::Null;
+            }
+            "reservation" => {
+                report["d_observation"]["anchor"]["reserved_sequence"] = json!(1);
+                report["d_observation"]["anchor"]["reserved_body_digest"] = json!(commitment);
+            }
+            "intent" => report["wal_checkpoint"]["unresolved_intent"] = json!(true),
+            "recovery" => {
+                report["d_observation"]["anchor"]["recovery_required"] = json!(true);
+                report["d_observation"]["anchor"]["recovery_reason"] = json!("restart");
+                report["d_observation"]["anchor"]["recovery_revision"] = json!(1);
+                report["d_observation"]["latched"] = json!(true);
+            }
+            "retired" => report["d_observation"]["anchor"]["retired"] = json!(true),
+            "uncertain" => report["d_observation"]["uncertain"] = json!(true),
+            "pin" => {
+                report["wal_checkpoint"]["join_state"]["pin"]["machine_id"] = json!("e".repeat(32))
+            }
+            "lease" => {
+                report["wal_checkpoint"]["join_state"]["grant"]["lease_id"] = json!("e".repeat(32));
+                report["wal_checkpoint"]["join_state"]["anchor"]["lease_id"] =
+                    json!("e".repeat(32));
+            }
+            "fortress" => report["fortress_id"] = json!("e".repeat(32)),
+            "revision" => report["enrollment_revision"] = json!(2),
+            "superseded" => report["d_observation"]["anchor"]["generation_high_water"] = json!(1),
+            _ => (),
+        }
+        let digest = anchor::anchor_digest(&report["d_observation"]["anchor"]);
+        report["d_observation"]["anchor_digest"] = json!(digest);
+        if let Some(digest) = digest {
+            f.view.lock().unwrap().anchor_digest = Some(digest);
+        }
+        m.heartbeat().unwrap();
+        // Every negative reaches the ordinary predicate with a structurally valid report.
+        assert!(
+            cp::Candidate::parse(&bytes(&report)).is_ok(),
+            "ordinary negative has valid shape: {case}"
+        );
+        accepting_serve_case(
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some((f, m, report, false)),
+        );
+    }
+}
+
+#[test]
+fn held_query_replays_after_a_240ms_heartbeat_and_status_continues() {
+    // Independent sessions keep each report within its original challenge lifetime.
+    for _ in 0..3 {
+        advancing_serve_schedule(true, false, 240);
+    }
+}
+
+#[test]
+fn heartbeat_hold_never_renews_an_issued_challenge_for_a_fresh_report() {
+    let (f, mut machine, mut report) = fixture();
+    bounded_ordinary_report(&f, &mut report);
+    machine.heartbeat().unwrap();
+    query(&f, &mut machine, &mut report, REQUEST);
+    const HOLD_MS: u64 = 980;
+    let observed = state::NOW + (cp::CHECKPOINT_CHALLENGE_MS - HOLD_MS) * state::NS_PER_MS;
+    f.now.store(observed, Ordering::SeqCst);
+    machine.heartbeat().unwrap();
+    report["observed_boottime_ns"] = json!(observed.to_string());
+    let parts = packets(&report);
+    support::checkpoint_packet(&mut machine, SESSION, &parts[0]).unwrap();
+    f.status_delay
+        .store(HOLD_MS * state::NS_PER_MS, Ordering::SeqCst);
+    support::checkpoint_heartbeat(&mut machine).unwrap();
+    f.status_delay.store(0, Ordering::SeqCst);
+    support::checkpoint_step_after_heartbeat(&mut machine).unwrap();
+    for part in &parts[1..] {
+        support::checkpoint_packet(&mut machine, SESSION, part).unwrap();
+    }
+    machine.heartbeat().unwrap();
+    for _ in 0..3 {
+        support::checkpoint_step(&mut machine).unwrap();
+    }
+    let ack = if support::awaiting(&machine).is_some() {
+        support::checkpoint_reread(&mut machine).unwrap()
+    } else {
+        None
+    };
+    assert!(
+        ack.is_none(),
+        "original challenge deadline refuses a fresh report after heartbeat hold"
+    );
+    assert_eq!(f.binds.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn held_query_after_980ms_heartbeat_closes_and_disposes_ownership() {
+    const SLOW_HEARTBEAT_MS: u64 = 980;
+    const PASSES: usize = 3;
+    for _ in 0..PASSES {
+        advancing_serve_schedule(true, false, SLOW_HEARTBEAT_MS);
+    }
 }

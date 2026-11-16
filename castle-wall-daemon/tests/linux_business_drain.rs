@@ -1,4 +1,4 @@
-// fail-before-exempt: authenticated W client primitives are driven through the existing isolated drain actor and actual service.
+// fail-before-exempt: authenticated W client ownership and confirming-READ barriers use the isolated drain actor and actual service.
 // fail-before-exempt: New drain authority, durability and peer witnesses read isolated native artifacts and files; capability setup uses the inherited actor helper.
 #![cfg(target_os = "linux")]
 #[path = "support/drain_run.rs"]
@@ -1830,7 +1830,20 @@ fn authenticated_client_owns_reserve_until_complete_confirming_read() {
         )["ok"],
         true
     );
-    assert_eq!(poll(&mut f.w)["kind"], "ack");
+    let ack = poll(&mut f.w);
+    assert_eq!(ack["kind"], "ack");
+    assert_eq!(ack["held"], true, "COMMIT ACK retains mutation ownership");
+    assert_eq!(
+        f.w.command(json!({"op":"client-read","id":"b".repeat(32)}))["ok"],
+        true
+    );
+    let read = poll(&mut f.w);
+    assert_eq!(read["kind"], "read");
+    assert_eq!(read["value"]["anchor"], committed);
+    assert_eq!(
+        read["held"], false,
+        "confirming COMMIT READ permits ORIGINAL"
+    );
     assert_eq!(
         f.w.command(
             json!({"op":"client-original","id":"a".repeat(32),"hex":hex::encode(&envelope)})

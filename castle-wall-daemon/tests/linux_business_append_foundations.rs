@@ -1,4 +1,4 @@
-// fail-before-exempt: checkpoint, authenticated clients and isolated WAL publication witnesses consume native primitives and shared schemas.
+// fail-before-exempt: native cursor release and complete Business event field parity consume shared schemas and isolated WAL primitives.
 // fail-before-exempt: shared vectors, checked corpus and isolated expiry constructors read native and shared contract inputs.
 // W-PROVENANCE
 // W-LEASE-ADMISSION
@@ -7,7 +7,8 @@
 #![cfg(target_os = "linux")]
 mod isolation;
 use castle_wall_daemon::business_profile::{
-    append_budget::*, append_contract as contract, join_lifecycle, records_schema, writer_protocol,
+    append_budget::*, append_contract as contract, join_lifecycle, records_schema,
+    signer_contract::H_LEASE_REQUEST_SECONDS, writer_protocol,
 };
 use serde_json::{json, Value};
 #[path = "support/checked_corpus.rs"]
@@ -128,6 +129,78 @@ fn observed_input(now: u64, grant: [u8; 16], p: u64, h: u64) -> RecheckInputs {
     )
     .unwrap()
 }
+
+#[test]
+fn paired_snapshot_and_append_start_lower_bounds() {
+    let start = APPEND_BUDGET_MS;
+    let producer_end =
+        start + H_LEASE_REQUEST_SECONDS as u64 * 1000 + seal_ms(GRANT_FLOW_CAP).unwrap();
+    let h_end = producer_end;
+    let window = admit(
+        observed_input(start, [1; 16], producer_end, h_end),
+        GRANT_FLOW_CAP,
+    )
+    .unwrap()
+    .begin_append(start, producer_end)
+    .unwrap();
+    assert!(window.recheck(observed_input(start, [1; 16], producer_end, h_end), 0));
+    assert!(
+        !window.recheck(observed_input(start - 1, [1; 16], producer_end, h_end), 0),
+        "paired lower bounds reject an observation before the shared origin"
+    );
+}
+
+#[test]
+fn paired_freshness_constructors_and_original_window() {
+    let seal = seal_ms(GRANT_FLOW_CAP).unwrap();
+    let admitted_end = H_LEASE_REQUEST_SECONDS as u64 * 1000 + seal;
+    // This component observes window/input construction, before completion recheck or any permit.
+    let candidate = |now, producer_end, h_end| {
+        let snapshot = admit(input(producer_end, h_end), GRANT_FLOW_CAP)?;
+        let window = snapshot.begin_append(now, now + APPEND_BUDGET_MS)?;
+        let producer = ProducerExpiry::checked_for_test([1; 16], producer_end, now)?;
+        let h = HExpiry::checked_for_test(h_end, now)?;
+        let observed = RecheckInputs::checked_for_test(now, producer, h)?;
+        Some((window, observed))
+    };
+    assert!(candidate(0, admitted_end, admitted_end).is_some());
+    for (producer_end, h_end) in [
+        (admitted_end, admitted_end + APPEND_BUDGET_MS),
+        (admitted_end + APPEND_BUDGET_MS, admitted_end),
+        (admitted_end, admitted_end),
+    ] {
+        assert!(
+            candidate(admitted_end, producer_end, h_end).is_none(),
+            "paired freshness and original window reject expired construction"
+        );
+    }
+}
+
+#[test]
+fn paired_remaining_expiries_and_seal_clamp() {
+    let seal = seal_ms(GRANT_FLOW_CAP).unwrap();
+    let admitted_end = H_LEASE_REQUEST_SECONDS as u64 * 1000 + seal;
+    let remaining = APPEND_BUDGET_MS / 2;
+    let completes = |now, producer_end, h_end| {
+        admit(input(producer_end, h_end), GRANT_FLOW_CAP)
+            .unwrap()
+            .begin_append(now, now + APPEND_BUDGET_MS)
+            .is_some_and(|window| {
+                window.recheck(observed_input(now, [1; 16], producer_end, h_end), remaining)
+            })
+    };
+    assert!(completes(0, admitted_end, admitted_end));
+    for (producer_end, h_end) in [
+        (admitted_end, admitted_end + APPEND_BUDGET_MS),
+        (admitted_end + APPEND_BUDGET_MS, admitted_end),
+        (admitted_end, admitted_end),
+    ] {
+        assert!(
+            !completes(admitted_end - remaining, producer_end, h_end),
+            "paired remaining expiry and seal clamp reject completion at expiry"
+        );
+    }
+}
 #[test]
 fn three_admission_predicates_and_absolute_completion() {
     let seal = seal_ms(GRANT_FLOW_CAP).unwrap();
@@ -147,7 +220,14 @@ fn three_admission_predicates_and_absolute_completion() {
     assert_eq!(window.deadline_ms(), 180000);
     assert!(window.recheck(late, 999));
     let expired = observed_input(180000, [1; 16], 300000, 240000);
-    assert!(!window.recheck(expired, 0));
+    assert!(
+        !window.recheck(expired, 0),
+        "completion cannot reset the original append end"
+    );
+    assert!(
+        !window.recheck(late, 1000),
+        "remaining confirming READ cost consumes the original append window"
+    );
     assert!(!window.recheck(observed_input(179001, [2; 16], 300000, 240000), 999));
     assert_eq!(
         admit(input(300000, 240000), 13)
@@ -240,3 +320,16 @@ mod append_clients;
 
 #[path = "support/business_wal.rs"]
 mod business_wal;
+
+#[test]
+fn business_event_fields_match_complete_wire_contract() {
+    let data = contract::contract().unwrap();
+    let value = &data["event_vectors"][0]["value"];
+    let event: castle_wall_daemon::ipc::messages::BusinessDrainEvent =
+        serde_json::from_value(value.clone()).unwrap();
+    let encoded = serde_json::to_value(event).unwrap();
+    let fields: std::collections::BTreeSet<_> = encoded.as_object().unwrap().keys().collect();
+    let schema: std::collections::BTreeSet<_> = data["event"].as_object().unwrap().keys().collect();
+    assert_eq!(fields, schema, "complete Rust Business event field parity");
+    assert_eq!(&encoded, value, "all event fields retain their wire values");
+}

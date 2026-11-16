@@ -7,7 +7,7 @@ fn execute() -> std::io::Result<()> {
         signer_watchdog::boottime_ns,
         writer_peer::{BusTarget, HeldConfig, ListenerExpectations},
         writer_service::{
-            self, Activation, ClientSignerPort, ClosedReconciler, ClosurePaths, Dependencies,
+            self, Activation, ClientSignerPort, ClosurePaths, Dependencies, DrainReconciler,
             Notifier, SystemNotifier,
         },
     };
@@ -35,10 +35,14 @@ fn execute() -> std::io::Result<()> {
             return Err(refused());
         }
         Ok(Dependencies {
+            #[cfg(feature = "test-isolation")]
+            test_entry: None,
             // run invokes this only after closure and activation admission, immediately before start.
             bootstrap: Box::new(move || Ok(ClientSignerPort::bootstrap(policy)?)),
-            // Must match test_isolation_gate::writer_execute_composes_the_closed_reconciler.
-            reconciler: ClosedReconciler::production(),
+            // Must match test_isolation_gate::writer_execute_composes_the_ordinary_reconciler.
+            reconciler: DrainReconciler::production(
+                castle_wall_daemon::business_profile::append_checkpoint::OrdinaryCheckpointProvider::production(),
+            ),
             notifier: SystemNotifier,
             config,
             bus: BusTarget::production(),

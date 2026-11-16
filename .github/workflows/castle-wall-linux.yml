@@ -206,16 +206,43 @@ jobs:
           CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain --bin castle-wall-daemon
           echo "SANCTUARY_K1_TEST_BINARIES=$RUNNER_TEMP/k1-target" >> "$GITHUB_ENV"
 
+      - name: Exercise isolated signed append composition
+        working-directory: castle-wall-daemon
+        run: cargo test --locked --features test-isolation --test linux_business_signed_append real_wall_writer_drain_commit_and_original_with_synthetic_signer 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'
+
+      - name: Exercise unprivileged Business peer admission
+        working-directory: castle-wall-daemon
+        run: cargo test --locked --features test-isolation --lib business_peer_gate_precedes_challenge_and_equal_uid_reaches_status -- --ignored 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'
+
+      - name: Exercise unprivileged Business durable delivery
+        working-directory: castle-wall-daemon
+        run: |
+          cargo test --locked --features test-isolation --test linux_business_signed_append business_ipc_durable_ts_fact_after_real_d_original -- --ignored 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'
+          cargo test --locked --features test-isolation --test linux_business_signed_append signed_append::business_ -- --ignored --test-threads=1 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 7 passed; 0 failed; 0 ignored;'
+          cargo test --locked --features test-isolation --test linux_business_signed_append signed_append::delivery_ -- --include-ignored --test-threads=1 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 4 passed; 0 failed; 0 ignored;'
+
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
-        # 35 = this step's 13.4 min on main (run 43545385001, 2026-11-14) plus the
-        # 5.5 min K1c-2d2 drain suite, about 1.8x that 19 min for a cold-cache
-        # rebuild. The earlier 20 (6x the 165 to 188 s observed 2026-09-27) was
-        # outgrown as the business-profile suites landed: a run that times out
-        # here reads as a failure with no failing test in the log.
+        # 43 = 1.8x (the cold-cache allowance this bound has always carried) the
+        # CI-scaled serial time of this step without the signed append suite.
+        # Measured serially on a 4-CPU build box on 2026-11-16: this step's
+        # command took 2405.6 s, of which the signed append suite took
+        # 1362.5 s, leaving 1043.1 s of tests plus a 34.2 s cold build
+        # (17.95 min). The same box ran the parent revision's step in 861.0 s
+        # (14.35 min); this step's earlier bound derived 18.9 min on CI for
+        # that set (both figures carried from that bound: 13.4 min on main, run
+        # 43545385001, plus the 5.5 min K1c-2d2 drain suite), so CI is taken as
+        # 18.9 / 14.35 = 1.32x the box. That ratio is high, because the box
+        # runs unprivileged and its kernel suites fail fast.
+        # 17.95 x 1.32 x 1.8 = 42.65, rounded up. The full command, 40.09 min
+        # of tests plus the 0.57 min build, 40.66 x 1.32 x 1.8 = 96.61 min,
+        # would exceed the 60-minute ceiling for one step, so the signed
+        # append suite runs in its own bounded step
+        # below. A run that times out here reads as a failure with no failing
+        # test in the log.
         # Without a bound a hung or OOM-thrashing suite holds the job to the
         # 360-minute default and the leftover-state refusal below never runs.
-        timeout-minutes: 35
+        timeout-minutes: 43
         run: |
           # Run all tests including Linux-gated integration tests.
           # NFQUEUE and nftables tests need root.
@@ -236,8 +263,14 @@ jobs:
           # someone deleting that block, and so the step reads correctly in
           # isolation. Must match the `defaults:` block at the top of this file.
           set -o pipefail
+          # Every case of the signed append suite is skipped here: its
+          # `signed_append::` and `settlement_call_sites::` modules are the
+          # whole binary. The next step runs it once in full under its own
+          # bound and exact count (must match "Signed append suite, as root"
+          # below). The suite still builds and reports a result line here, so
+          # the presence and result checks below keep their meaning.
           sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --all-targets --features test-isolation --color never \
-            -- --test-threads=1 2>&1 | tee cargo-test.log
+            -- --test-threads=1 --skip signed_append:: --skip settlement_call_sites:: 2>&1 | tee cargo-test.log
           # Two DIFFERENT questions, both required:
           #   1. did cargo exit 0?  -> `pipefail` above
           #   2. did every intended suite actually BUILD and RUN?
@@ -257,7 +290,7 @@ jobs:
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
-                       linux_business_profile_selection linux_business_drain_store linux_business_drain linux_business_reconciliation linux_business_append_foundations linux_business_signer_client linux_business_writer_protocol linux_business_writer_peer linux_business_writer_loss linux_business_writer_unit linux_business_writer_bus_replies confined_agent_id test_isolation_gate; do
+                       linux_business_profile_selection linux_business_drain_store linux_business_drain linux_business_reconciliation linux_business_append_foundations linux_business_signed_append linux_business_signer_client linux_business_writer_protocol linux_business_writer_peer linux_business_writer_loss linux_business_writer_unit linux_business_writer_bus_replies confined_agent_id test_isolation_gate; do
           # suite-list-end: body through `done` must match WORKFLOW_SUITE_RAN_LOOP_BODY in castle-wall-daemon/tests/test_isolation_gate.rs
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"
@@ -287,6 +320,36 @@ jobs:
           # Linux lifecycle tests may skip explicitly on ad-hoc unprivileged
           # hosts, but this job promises root/CAP_NET_ADMIN and must fail if that
           # precondition disappears rather than producing a false green.
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
+      - name: Signed append suite, as root (serial)
+        working-directory: castle-wall-daemon
+        # 55 = 1.8x (the cold-cache allowance of the step above) the CI-scaled
+        # serial time of this suite, by the same rule as that step. Three idle
+        # serial runs on the build box took 1352.1, 1362.5 and 1364.1 s; the
+        # largest is 22.74 min, and 22.74 x 1.32 (the CI-to-box ratio derived
+        # in the step above) x 1.8 = 54.03, rounded up. A run of the same suite
+        # while a full Vitest run shared the box took 1791.5 s (29.9 min),
+        # inside this bound. The step runs after the step above, so the suite
+        # binary is already built and the 1.8x allowance is margin here.
+        timeout-minutes: 55
+        run: |
+          # Same shape as the step above: root, serial, privileged expectation.
+          # The step above skips every case of this suite (must match its
+          # two `--skip` filters), so each case runs exactly once, here. The
+          # exact count proves the whole suite ran. The full output goes to
+          # signed-append-test.log beside the step above's log, and the evidence
+          # upload below retains it on failure too (must match its `path:` list).
+          set -o pipefail
+          sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation --color never --test linux_business_signed_append \
+            -- --test-threads=1 2>&1 | tee signed-append-test.log
+          grep -Eq '^test result. ok. 388 passed; 0 failed; 10 ignored;' signed-append-test.log || {
+            echo "FAIL: the signed append suite did not report exactly 388 passed, 0 failed, 10 ignored"
+            exit 1
+          }
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
           SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
 
       - name: Prove real systemd start-limit case ran without a fixture skip
@@ -460,6 +523,7 @@ jobs:
           path: |
             castle-wall-daemon/cargo-test.log
             castle-wall-daemon/cargo-test.plain.log
+            castle-wall-daemon/signed-append-test.log
             castle-wall-daemon/systemd-start-limit-focused.log
             castle-wall-daemon/agent-unit-premises-focused.log
             castle-wall-daemon/agent-unit-tb10-focused.log

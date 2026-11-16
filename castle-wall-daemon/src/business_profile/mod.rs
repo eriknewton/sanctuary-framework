@@ -416,3 +416,18 @@ pub mod append_clients;
 
 #[cfg(target_os = "linux")]
 pub mod business_wal;
+
+#[cfg(target_os = "linux")]
+pub mod wal_executor;
+
+#[cfg(target_os = "linux")]
+pub mod effect_permit;
+
+#[cfg(target_os = "linux")]
+pub mod append_actor;
+
+#[cfg(target_os = "linux")]
+pub mod compose;
+
+#[cfg(target_os = "linux")]
+pub mod business_delivery;

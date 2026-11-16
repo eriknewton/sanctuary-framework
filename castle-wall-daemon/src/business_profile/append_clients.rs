@@ -8,6 +8,7 @@ use super::{
     writer_protocol as p,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io,
@@ -52,10 +53,15 @@ impl HeldSocketRoot {
         }
         Ok(Self { directory, owner })
     }
-    fn connect(&self, leaf: &str, policy: &PeerPolicy) -> Result<(OwnedFd, Peer)> {
+    fn connect(
+        &self,
+        leaf: &str,
+        policy: &PeerPolicy,
+    ) -> Result<(OwnedFd, Peer, File, File, String)> {
         if leaf.is_empty() || leaf.contains('/') || leaf == "." || leaf == ".." {
             return Err(Refusal::Root);
         }
+        let name_text = leaf.to_owned();
         let path = format!("/proc/self/fd/{}/{}", self.directory.as_raw_fd(), leaf);
         let name = std::ffi::CString::new(leaf).map_err(|_| Refusal::Root)?;
         let raw = unsafe {
@@ -83,7 +89,97 @@ impl HeldSocketRoot {
         if before.dev() != after.dev() || before.ino() != after.ino() {
             return Err(Refusal::Root);
         }
-        Ok((socket, peer))
+        Ok((
+            socket,
+            peer,
+            leaf,
+            self.directory.try_clone().map_err(|_| Refusal::Root)?,
+            name_text,
+        ))
+    }
+}
+#[cfg(feature = "test-isolation")]
+#[derive(Clone, Copy)]
+pub(super) enum TransportObservation {
+    Process,
+    Device,
+    Inode,
+    Liveness,
+}
+#[cfg(feature = "test-isolation")]
+pub(super) fn record_observed_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Bounded protocol bytes are captured once at the actual send boundary, before peer refusal can mask them.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(super::custody::PRIVATE_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .write_all(bytes)
+}
+/// Sealed isolated settlement observations preserve the real authenticated socket exchange.
+#[cfg(feature = "test-isolation")]
+pub struct SettlementFixture {
+    kind: SettlementKind,
+    observed: std::path::PathBuf,
+    audit: File,
+}
+#[cfg(feature = "test-isolation")]
+#[derive(serde::Deserialize)]
+enum SettlementKind {
+    Observe,
+    DrainedOnly,
+    Authority,
+}
+#[cfg(feature = "test-isolation")]
+impl SettlementFixture {
+    /// Load one bounded private selector and exclusively create its bounded send audit.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let bytes = super::custody::read_pinned(
+            path,
+            unsafe { libc::geteuid() },
+            super::custody::CONFIG_MAX_BYTES,
+            super::custody::PRIVATE_MODE,
+        )?;
+        let kind = serde_json::from_slice(&bytes).map_err(|_| super::custody::refused())?;
+        let audit = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(super::custody::PRIVATE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path.with_extension("sends"))?;
+        Ok(Self {
+            kind,
+            observed: path.with_extension("observed"),
+            audit,
+        })
+    }
+    fn observe(&self, observation: &mut DrainObservation) -> Result<()> {
+        let Some(anchor) = observation.anchor.as_mut() else {
+            return Ok(());
+        };
+        if anchor["reserved_body_digest"].is_string()
+            && !matches!(self.kind, SettlementKind::Observe)
+        {
+            match self.kind {
+                SettlementKind::DrainedOnly => {
+                    anchor["drained_digest"] = json!(format!("sha256:{}", "a".repeat(64)))
+                }
+                SettlementKind::Authority => {
+                    anchor["recovery_required"] = json!(true);
+                    observation.latched = true;
+                }
+                SettlementKind::Observe => {}
+            }
+            if !self.observed.exists() {
+                record_observed_bytes(&self.observed, b"decoded authenticated READ")
+                    .map_err(|_| Refusal::Transport)?;
+            }
+        }
+        Ok(())
     }
 }
 struct Connection {
@@ -91,6 +187,16 @@ struct Connection {
     peer: Peer,
     clock: Clock,
     hooks: Box<dyn ClientHooks>,
+    held_socket: File,
+    held_directory: File,
+    leaf: String,
+    policy: PeerPolicy,
+    #[cfg(feature = "test-isolation")]
+    observation: std::cell::Cell<Option<TransportObservation>>,
+    #[cfg(feature = "test-isolation")]
+    send_observer: Option<std::path::PathBuf>,
+    #[cfg(feature = "test-isolation")]
+    settlement_audit: Option<File>,
 }
 impl Connection {
     fn new(
@@ -100,13 +206,85 @@ impl Connection {
         clock: Clock,
         hooks: Box<dyn ClientHooks>,
     ) -> Result<Self> {
-        let (socket, peer) = root.connect(leaf, policy)?;
+        let (socket, peer, held_socket, held_directory, leaf) = root.connect(leaf, policy)?;
         Ok(Self {
             socket: Some(socket),
             peer,
             clock,
             hooks,
+            held_socket,
+            held_directory,
+            leaf,
+            policy: policy.clone(),
+            #[cfg(feature = "test-isolation")]
+            observation: std::cell::Cell::new(None),
+            #[cfg(feature = "test-isolation")]
+            send_observer: None,
+            #[cfg(feature = "test-isolation")]
+            settlement_audit: None,
         })
+    }
+    fn reconnect(&mut self) -> Result<()> {
+        self.close();
+        let root = HeldSocketRoot::checked(
+            self.held_directory.try_clone().map_err(|_| Refusal::Root)?,
+            self.held_directory
+                .metadata()
+                .map_err(|_| Refusal::Root)?
+                .uid(),
+        )?;
+        let (socket, peer, held_socket, _, _) = root.connect(&self.leaf, &self.policy)?;
+        let original = self.held_socket.metadata().map_err(|_| Refusal::Root)?;
+        let current = held_socket.metadata().map_err(|_| Refusal::Root)?;
+        // Reconnect authenticates the same pinned endpoint; replacing its held inode requires a new composition.
+        if original.dev() != current.dev() || original.ino() != current.ino() {
+            return Err(Refusal::Root);
+        }
+        self.socket = Some(socket);
+        self.peer = peer;
+        Ok(())
+    }
+    fn recheck(&self) -> Result<()> {
+        // Kernel process liveness and the held socket inode independently bind every post-wait use.
+        #[cfg(feature = "test-isolation")]
+        let observation = self.observation.take();
+        let process_live = self.peer.live();
+        #[cfg(feature = "test-isolation")]
+        let process_live =
+            process_live && !matches!(observation, Some(TransportObservation::Process));
+        if !process_live {
+            return Err(Refusal::Peer);
+        }
+        let before = self.held_socket.metadata().map_err(|_| Refusal::Root)?;
+        let after = std::fs::symlink_metadata(format!(
+            "/proc/self/fd/{}/{}",
+            self.held_directory.as_raw_fd(),
+            self.leaf
+        ))
+        .map_err(|_| Refusal::Root)?;
+        let (device, inode) = (after.dev(), after.ino());
+        #[cfg(feature = "test-isolation")]
+        let (device, inode) = (
+            device ^ u64::from(matches!(observation, Some(TransportObservation::Device))),
+            inode ^ u64::from(matches!(observation, Some(TransportObservation::Inode))),
+        );
+        if before.dev() != device || before.ino() != inode {
+            return Err(Refusal::Root);
+        }
+        let mut readiness = libc::pollfd {
+            fd: self.fd()?,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut readiness, 1, 0) };
+        #[cfg(feature = "test-isolation")]
+        if matches!(observation, Some(TransportObservation::Liveness)) {
+            readiness.revents |= libc::POLLHUP;
+        }
+        if polled < 0 || readiness.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(Refusal::Transport);
+        }
+        Ok(())
     }
     fn now(&self) -> Result<u64> {
         (self.clock)().map_err(|_| Refusal::Deadline)
@@ -123,7 +301,30 @@ impl Connection {
         }
     }
     fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        #[cfg(feature = "test-isolation")]
+        if let Some(audit) = &mut self.settlement_audit {
+            use std::io::Write;
+            // The isolated audit has a fixed one-megabyte ceiling and records only bounded request identities.
+            const AUDIT_MAX: u64 = 1024 * 1024;
+            if audit.metadata().map_err(|_| Refusal::Transport)?.len() >= AUDIT_MAX {
+                return Err(Refusal::Transport);
+            }
+            let frame = d::decode(bytes, d::Direction::ToDrain).map_err(|_| Refusal::Protocol)?;
+            let operation = match frame.operation {
+                d::Operation::Anchor { ref message, .. } => {
+                    message["op"].as_str().ok_or(Refusal::Protocol)?
+                }
+                d::Operation::Read => "READ",
+                d::Operation::Original { .. } => "ORIGINAL",
+                _ => "other",
+            };
+            writeln!(audit, "{}", json!({"op":operation,"id":frame.request_id,"sha256":hex::encode(Sha256::digest(bytes))})).map_err(|_| Refusal::Transport)?;
+        }
         self.hooks.before_send()?;
+        #[cfg(feature = "test-isolation")]
+        if let Some(path) = self.send_observer.take() {
+            record_observed_bytes(&path, bytes).map_err(|_| Refusal::Transport)?;
+        }
         if !self.peer.live() {
             return Err(Refusal::Peer);
         }
@@ -218,11 +419,72 @@ impl DrainObservation {
         !self.latched && !self.uncertain && self.anchor.as_ref() == Some(&proposal.next)
     }
     pub fn ordinary_room(&self) -> bool {
+        // Must match drain_service::process RECORD_COMMIT: count committed minus drained before COMMIT; RESERVE adds no pending head.
+        // Changing either side's reservation accounting reopens the no-renewal proof.
         !self.latched
             && !self.uncertain
             && self
                 .pending()
                 .is_some_and(|n| n < drain_store::D_UNDRAINED_MAX as u64)
+    }
+}
+/// A bounded diagnostic identifies retained settlement evidence without exposing B or E.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitHold {
+    pub sequence: u64,
+    pub reserve_sha256: String,
+    pub commit_sha256: String,
+    pub reason: &'static str,
+    pub stage: &'static str,
+}
+impl CommitHold {
+    /// A fresh authenticated observation classifies a changed predecessor only while B's reservation remains.
+    pub(crate) fn changed_predecessor(
+        observation: &DrainObservation,
+        reserve: &FrozenMutation,
+        commit: &FrozenMutation,
+        body: &[u8],
+        stage: &'static str,
+    ) -> Option<Self> {
+        let anchor = observation.anchor.as_ref()?;
+        let reserved = anchor["committed_sequence"].as_u64()?.checked_add(1)?;
+        // D's authenticated reservation must still name W's exact frozen B; a consumed reservation is settlement.
+        if observation.uncertain
+            || anchor == commit.expected()
+            || anchor["reserved_sequence"].as_u64() != Some(reserved)
+            || anchor["reserved_body_digest"]
+                != format!("sha256:{}", hex::encode(Sha256::digest(body)))
+        {
+            return None;
+        }
+        let mut without_drain = anchor.clone();
+        without_drain["drained_sequence"] = commit.expected()["drained_sequence"].clone();
+        without_drain["drained_digest"] = commit.expected()["drained_digest"].clone();
+        let reason = if !observation.latched && &without_drain == commit.expected() {
+            "invariant breach (unreachable by construction)"
+        } else {
+            "superseding authority, owner 2g"
+        };
+        Some(Self::new(reserve, commit, reason, stage))
+    }
+    pub(crate) fn new(
+        reserve: &FrozenMutation,
+        commit: &FrozenMutation,
+        reason: &'static str,
+        stage: &'static str,
+    ) -> Self {
+        Self {
+            sequence: commit.next()["committed_sequence"].as_u64().unwrap_or(0),
+            reserve_sha256: hex::encode(Sha256::digest(reserve.bytes())),
+            commit_sha256: hex::encode(Sha256::digest(commit.bytes())),
+            reason,
+            stage,
+        }
+    }
+}
+impl std::fmt::Display for CommitHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "COMMIT held; effects disabled; {}; sequence={}; reserve_sha256={}; commit_sha256={}; proof_stage={}", self.reason, self.sequence, self.reserve_sha256, self.commit_sha256, self.stage)
     }
 }
 /// Exact request bytes remain owned across refused delivery and observation-only reconciliation.
@@ -295,14 +557,64 @@ enum DrainPending {
     Mutation(String),
     Original(String, Value),
 }
+/// Isolated reserve replies retain transport authentication and change only the decoded observation.
+#[cfg(feature = "test-isolation")]
+pub(super) enum ReserveReplyObservation {
+    Refused,
+    Missing,
+    WrongId,
+    Uncertain,
+    Superseding,
+}
 /// One request owns its reply slot. Any transport ambiguity closes that connection without claiming mutation failure.
 pub struct DrainClient {
     connection: Connection,
     pending: Option<(DrainPending, u64)>,
     lease_at: Option<u64>,
     retained_mutation: Option<FrozenMutation>,
+    #[cfg(feature = "test-isolation")]
+    reserve_observation: Option<(ReserveReplyObservation, Option<std::path::PathBuf>)>,
+    #[cfg(feature = "test-isolation")]
+    settlement_fixture: Option<SettlementFixture>,
 }
 impl DrainClient {
+    /// Install an isolated decoded observation plus a bounded observer at the actual W send boundary.
+    #[cfg(feature = "test-isolation")]
+    pub fn settlement_fixture_for_test(&mut self, fixture: SettlementFixture) -> Result<()> {
+        self.connection.settlement_audit =
+            Some(fixture.audit.try_clone().map_err(|_| Refusal::Transport)?);
+        self.settlement_fixture = Some(fixture);
+        Ok(())
+    }
+    #[cfg(feature = "test-isolation")]
+    pub(super) fn send_observer_for_test(&mut self, path: std::path::PathBuf) {
+        self.connection.send_observer = Some(path);
+    }
+    // AppendActor installs this only from its sealed private fixture loader.
+    #[cfg(feature = "test-isolation")]
+    pub(super) fn reserve_reply_for_test(
+        &mut self,
+        observation: ReserveReplyObservation,
+        path: Option<std::path::PathBuf>,
+    ) {
+        self.reserve_observation = Some((observation, path));
+    }
+    /// Reauthenticate a disconnected session without discarding the exact possibly committed mutation.
+    pub fn reconnect(&mut self) -> Result<()> {
+        self.connection.reconnect()?;
+        self.pending = None;
+        self.lease_at = None;
+        Ok(())
+    }
+    // The actor supplies one typed observation only after its sealed fixture selects this wait.
+    #[cfg(feature = "test-isolation")]
+    pub(super) fn transport_observation_for_test(&self, observation: TransportObservation) {
+        self.connection.observation.set(Some(observation));
+    }
+    /// Recheck independently held process and socket identities without waiting for peer traffic.
+    pub fn recheck_transport(&self) -> Result<()> {
+        self.connection.recheck()
+    }
     pub fn connect(
         root: &HeldSocketRoot,
         leaf: &str,
@@ -317,6 +629,10 @@ impl DrainClient {
             pending: None,
             lease_at: None,
             retained_mutation: None,
+            #[cfg(feature = "test-isolation")]
+            reserve_observation: None,
+            #[cfg(feature = "test-isolation")]
+            settlement_fixture: None,
         })
     }
     fn begin(&mut self, bytes: &[u8], pending: DrainPending, limit: u64) -> Result<()> {
@@ -369,6 +685,10 @@ impl DrainClient {
         self.retained_mutation.as_ref()
     }
     pub fn original(&mut self, id: &str, envelope: &[u8], limit: u64) -> Result<()> {
+        // A drain under a frozen COMMIT would stale its predecessor, and no proved renewal exists.
+        if self.retained_mutation.is_some() {
+            return Err(Refusal::Busy);
+        }
         let identity = append_contract::identity(envelope).ok_or(Refusal::Protocol)?;
         let mut h = d::header("ORIGINAL", id, d::DRAIN_SLOTS[0].1);
         h["sequence"] = identity["sequence"].clone();
@@ -404,6 +724,58 @@ impl DrainClient {
         };
         let reply =
             d::decode(&packet.bytes, d::Direction::FromDrain).map_err(|_| Refusal::Protocol)?;
+        #[cfg(feature = "test-isolation")]
+        let reply = {
+            let mut reply = reply;
+            let reserve = self
+                .retained_mutation
+                .as_ref()
+                .is_some_and(|m| m.next()["reserved_body_digest"].is_string());
+            let applicable = reserve
+                && self
+                    .reserve_observation
+                    .as_ref()
+                    .is_some_and(|(kind, _)| match kind {
+                        ReserveReplyObservation::Uncertain
+                        | ReserveReplyObservation::Superseding => {
+                            matches!(pending, DrainPending::Read(_))
+                        }
+                        _ => matches!(pending, DrainPending::Mutation(_)),
+                    });
+            if applicable {
+                let (kind, path) = self.reserve_observation.take().ok_or(Refusal::Protocol)?;
+                if let Some(path) = path {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(super::custody::PRIVATE_MODE)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(path)
+                        .map_err(|_| Refusal::Transport)?;
+                }
+                match kind {
+                    ReserveReplyObservation::Refused => reply.operation = d::Operation::Refused,
+                    ReserveReplyObservation::Missing => return Ok(None),
+                    ReserveReplyObservation::WrongId => reply.request_id = "f".repeat(32),
+                    ReserveReplyObservation::Uncertain => {
+                        if let d::Operation::ReadReply { uncertain, .. } = &mut reply.operation {
+                            *uncertain = true;
+                        }
+                    }
+                    ReserveReplyObservation::Superseding => {
+                        if let d::Operation::ReadReply {
+                            anchor: Some(anchor),
+                            ..
+                        } = &mut reply.operation
+                        {
+                            anchor["generation"] = json!(u64::MAX);
+                        }
+                    }
+                }
+            }
+            reply
+        };
         let request = match pending {
             DrainPending::Read(id) | DrainPending::Mutation(id) | DrainPending::Original(id, _) => {
                 id
@@ -432,6 +804,14 @@ impl DrainClient {
                 if observation.anchor.is_some() && observation.pending().is_none() {
                     return Err(Refusal::Protocol);
                 }
+                #[cfg(feature = "test-isolation")]
+                let observation = {
+                    let mut observation = observation;
+                    if let Some(fixture) = &self.settlement_fixture {
+                        fixture.observe(&mut observation)?;
+                    }
+                    observation
+                };
                 DrainReply::Read(observation)
             }
             (DrainPending::Mutation(_), d::Operation::AnchorAck { anchor }) => {
@@ -488,7 +868,11 @@ enum WriterPending {
     Hello,
     Status(String),
     Sign(String, Vec<u8>),
-    Query(String, u64),
+    Query {
+        request: String,
+        sent: u64,
+        limit: u64,
+    },
     Report(CheckpointChallenge),
     Parts {
         challenge: CheckpointChallenge,
@@ -504,8 +888,21 @@ pub struct WriterClient {
     session: Option<String>,
     pending: Option<(WriterPending, u64)>,
     checkpoint_enabled: bool,
+    checkpoint_ends: Option<u64>,
 }
 impl WriterClient {
+    pub(crate) fn status_pending(&self) -> bool {
+        matches!(self.pending, Some((WriterPending::Status(_), _)))
+    }
+    // The actor supplies one typed observation only after its sealed fixture selects this wait.
+    #[cfg(feature = "test-isolation")]
+    pub(super) fn transport_observation_for_test(&self, observation: TransportObservation) {
+        self.connection.observation.set(Some(observation));
+    }
+    /// Recheck independently held process and socket identities without waiting for peer traffic.
+    pub fn recheck_transport(&self) -> Result<()> {
+        self.connection.recheck()
+    }
     pub fn connect(
         root: &HeldSocketRoot,
         leaf: &str,
@@ -526,6 +923,7 @@ impl WriterClient {
             session: None,
             pending: Some((WriterPending::Hello, end)),
             checkpoint_enabled,
+            checkpoint_ends: None,
         })
     }
     pub fn session(&self) -> Option<&str> {
@@ -596,13 +994,26 @@ impl WriterClient {
         if !self.checkpoint_enabled {
             return Err(Refusal::Transport);
         }
+        if self.pending.is_some() {
+            return Err(Refusal::Busy);
+        }
+        let sent = self.connection.now()?;
+        // Must match writer_service::writer_next_request_bound_ns: W cannot wait beyond P's next request bound.
+        let query_end = super::writer_service::writer_next_request_bound_ns(sent)
+            .ok_or(Refusal::Deadline)?
+            .min(limit);
+        self.checkpoint_ends = None;
         self.begin(
             p::Operation::CheckpointQuery {
                 request_id: id.into(),
             },
             &[],
-            WriterPending::Query(id.into(), limit),
-            limit,
+            WriterPending::Query {
+                request: id.into(),
+                sent,
+                limit,
+            },
+            query_end,
         )
     }
     pub fn checkpoint_report(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -620,6 +1031,10 @@ impl WriterClient {
             }
         };
         if now >= end {
+            // An early caller cancellation cannot leave P holding a challenge on a reusable session.
+            if self.checkpoint_ends.map_or(true, |expires| now < expires) {
+                self.connection.close();
+            }
             return Err(Refusal::Deadline);
         }
         let result = (|| {
@@ -662,20 +1077,50 @@ impl WriterClient {
             self.connection.idle()?;
             return Ok(None);
         };
-        if self.connection.now()? >= *end {
-            // The checkpoint protocol has no refusal opcode. Expiry disposes only this checkpoint;
-            // authenticated session, STATUS and SIGN deadlines retain their terminal meaning.
+        // Read at most one authenticated frame before considering checkpoint expiry. Late frames
+        // are terminal; only an empty socket after P's known lifetime permits session reuse.
+        let received = if matches!(
+            pending,
+            WriterPending::Query { .. }
+                | WriterPending::Ack(..)
+                | WriterPending::Report(_)
+                | WriterPending::Parts { .. }
+        ) {
+            self.connection
+                .poll(u64::MAX, p::WRITER_REPLY_PACKET_MAX_BYTES)?
+        } else {
+            None
+        };
+        let now = self.connection.now()?;
+        if now >= *end {
+            if received.is_some() {
+                return Err(Refusal::Deadline);
+            }
+            // The checkpoint protocol has no refusal opcode. Only a known, ended challenge
+            // can be forgotten without leaving P and W with different session ownership.
             if matches!(
                 pending,
-                WriterPending::Query(..)
+                WriterPending::Query { .. }
                     | WriterPending::Report(_)
                     | WriterPending::Parts { .. }
                     | WriterPending::Ack(..)
             ) {
+                if self.checkpoint_ends.map_or(true, |expires| now < expires) {
+                    return Err(Refusal::Deadline);
+                }
                 self.pending = None;
+                self.checkpoint_ends = None;
                 return Ok(Some(WriterReply::Refused));
             }
             return Err(Refusal::Deadline);
+        }
+        if received.is_some()
+            && matches!(
+                pending,
+                WriterPending::Report(_) | WriterPending::Parts { .. }
+            )
+        {
+            return Err(Refusal::Correlation);
         }
         if let WriterPending::Report(_) = pending {
             return Ok(None);
@@ -737,10 +1182,16 @@ impl WriterClient {
             }
             return Ok(None);
         }
-        let Some(packet) = self
-            .connection
-            .poll(*end, p::WRITER_REPLY_PACKET_MAX_BYTES)?
-        else {
+        let packet = if matches!(
+            pending,
+            WriterPending::Query { .. } | WriterPending::Ack(..)
+        ) {
+            received
+        } else {
+            self.connection
+                .poll(*end, p::WRITER_REPLY_PACKET_MAX_BYTES)?
+        };
+        let Some(packet) = packet else {
             return Ok(None);
         };
         if matches!(pending, WriterPending::Hello) {
@@ -776,10 +1227,10 @@ impl WriterClient {
         let frame = p::decode(&packet.bytes, p::Direction::ToWall, session)
             .map_err(|_| Refusal::Protocol)?;
         let request = match pending {
-            WriterPending::Status(id)
-            | WriterPending::Sign(id, _)
-            | WriterPending::Query(id, _)
-            | WriterPending::Ack(id, _) => id.clone(),
+            WriterPending::Status(id) | WriterPending::Sign(id, _) | WriterPending::Ack(id, _) => {
+                id.clone()
+            }
+            WriterPending::Query { request, .. } => request.clone(),
             _ => return Err(Refusal::Held),
         };
         let reply = match frame.operation {
@@ -821,7 +1272,7 @@ impl WriterClient {
                 request_id,
                 nonce,
                 issued_boottime_ns,
-            } if request_id == request && matches!(pending, WriterPending::Query(..)) => {
+            } if request_id == request && matches!(pending, WriterPending::Query { .. }) => {
                 let value = frame::canonical(frame.payload, p::WRITER_STATUS_MAX_BYTES)
                     .map_err(|_| Refusal::Protocol)?;
                 let encoded =
@@ -829,16 +1280,24 @@ impl WriterClient {
                 let status = super::signer_client::parse_status_packet(&encoded)
                     .map_err(|_| Refusal::Protocol)?;
                 let now = self.connection.now()?;
-                let WriterPending::Query(_, limit) = pending else {
+                let WriterPending::Query { sent, limit, .. } = pending else {
                     return Err(Refusal::Held);
                 };
-                let expires = issued_boottime_ns
-                    .checked_add(cp::CHECKPOINT_CHALLENGE_MS * NS_PER_MS)
-                    .ok_or(Refusal::Deadline)?
-                    .min(*limit);
-                if issued_boottime_ns > now || now >= expires {
+                // An authenticated issue time is still bounded by W's own send/receive interval.
+                if issued_boottime_ns < *sent || issued_boottime_ns > now {
                     return Err(Refusal::Deadline);
                 }
+                let challenge_end = issued_boottime_ns
+                    .checked_add(cp::CHECKPOINT_CHALLENGE_MS * NS_PER_MS)
+                    .ok_or(Refusal::Deadline)?;
+                let expires = issued_boottime_ns
+                    .checked_add(cp::CHECKPOINT_ACK_MS * NS_PER_MS)
+                    .ok_or(Refusal::Deadline)?
+                    .min(*limit);
+                if now >= expires {
+                    return Err(Refusal::Deadline);
+                }
+                self.checkpoint_ends = Some(challenge_end);
                 let challenge = CheckpointChallenge {
                     session: session.clone(),
                     request: request_id,
