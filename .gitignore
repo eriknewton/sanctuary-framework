@@ -108,3 +108,6 @@ castle-wall-daemon/mutants.out.old/
 server/.lease-guard-*
 
 server/evidence-pack-dist/
+
+# Run-local synthetic evidence and work roots.
+.scratch/

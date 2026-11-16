@@ -504,6 +504,20 @@ const FILESYSTEM_LOCK_HOOK_KEYS = [
   "__testCloseNamespaceCapability",
 ] as const;
 
+// Must match excludedRawSourceName in audit/split-evidence-registry.ts.
+// Must match SOURCE_RAW_NAME_PRODUCERS in audit/split-evidence-registry.ts.
+/** Raw compare-replace lock suffix shared with the evidence source inventory. */
+/** Nonce byte width shared by producer names and their inventory patterns. */
+export const FILESYSTEM_STORAGE_CLAIM_NONCE_BYTES = 8;
+// Must match SOURCE_RAW_NAME_PRODUCERS in audit/split-evidence-registry.ts.
+/** Complete filesystem lock and claim grammars for source inventory consumers. */
+export const FILESYSTEM_RAW_NAME_GRAMMARS = {
+  storageClaim:{scope:"namespace",disposition:"excluded",suffix:".claim",nonceBytes:FILESYSTEM_STORAGE_CLAIM_NONCE_BYTES,pattern:new RegExp("^\\..+\\.enc\\.[0-9]+\\.[0-9a-f]{"+(FILESYSTEM_STORAGE_CLAIM_NONCE_BYTES*2)+"}\\.claim$")},
+  storageCompareReplace:{scope:"namespace",disposition:"excluded",suffix:".compare-replace.lock",pattern:/^\..+\.enc\.compare-replace\.lock$/},
+} as const; // Two hex digits per nonce byte.
+
+export const FILESYSTEM_STORAGE_COMPARE_REPLACE_LOCK_SUFFIX = FILESYSTEM_RAW_NAME_GRAMMARS.storageCompareReplace.suffix;
+export const FILESYSTEM_STORAGE_CLAIM_SUFFIX = FILESYSTEM_RAW_NAME_GRAMMARS.storageClaim.suffix;
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities, StrictDurabilityStorageCapabilities {
   private basePath: string;
   /**
@@ -1067,7 +1081,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const dirPath = dirname(filePath);
     const stagedPath = join(
       dirPath,
-      `.${basename(filePath)}.${process.pid}.${Buffer.from(randomBytes(8)).toString("hex")}.claim`,
+      `.${basename(filePath)}.${process.pid}.${Buffer.from(randomBytes(FILESYSTEM_STORAGE_CLAIM_NONCE_BYTES)).toString("hex")}${FILESYSTEM_STORAGE_CLAIM_SUFFIX}`,
     );
 
     // Stage bytes with the backend's normal custody discipline, then publish
@@ -1159,7 +1173,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
     const filePath = this.entryPath(namespace, key);
     const dirPath = dirname(filePath);
-    const lockName = `.${basename(filePath)}.compare-replace.lock`;
+    const lockName = `.${basename(filePath)}${FILESYSTEM_STORAGE_COMPARE_REPLACE_LOCK_SUFFIX}`;
     // Even an absent comparison creates lock parents, so strict setup cannot wait for a matching row.
     // Owner mode may not create parents, so its strict comparison syncs an existing chain and refuses a missing one with a typed code.
     const directoryIdentity = !strictDurability ? undefined

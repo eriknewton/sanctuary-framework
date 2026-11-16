@@ -216,8 +216,11 @@ export interface TransparencyVerifyReport {
   not_checked: string[];
 }
 
+/** Composed verifiers replace this scope note only when they independently check the delivered audit windows. */
+// Must match verifySplitTransparency in evidence-pack/split-statement-nested.ts; other offline limits remain applicable.
+export const TRANSPARENCY_AUDIT_CONTENTS_NOT_CHECKED = "audit-log contents: the Merkle root binds the log's hash chain but the offline verifier cannot recompute it without host access to the log (run with --against-log on the fortress host)";
 const OFFLINE_NOT_CHECKED = [
-  "audit-log contents: the Merkle root binds the log's hash chain but the offline verifier cannot recompute it without host access to the log (run with --against-log on the fortress host)",
+  TRANSPARENCY_AUDIT_CONTENTS_NOT_CHECKED,
   "completeness: an operator who stops publishing checkpoints truncates the visible chain; only counter continuity across independently obtained checkpoints detects this",
   "binary identity: daemon.version and daemon.binary_sha256 are self-reported by the emitting process; compare binary_sha256 against a published release hash for the named version",
   "policy semantics: policy hashes prove the policy did not change between checkpoints with equal hashes; they do not reveal or prove what the policy allows or blocks",
@@ -363,9 +366,34 @@ export interface VerifyTransparencyOptions {
   allowPartial?: boolean;
 }
 
-export function verifyTransparencyCheckpoints(
+/** V0 retains the global audit-head rule while sharing the signature/counter primitive. */
+export function verifyTransparencyCheckpoints(input: unknown, opts: VerifyTransparencyOptions = {}): TransparencyVerifyReport {
+  return verifyTransparencySequence(input, opts, globalAuditHeads);
+}
+
+/** Verify signatures, counters, key/fortress consistency and genesis; callers must separately verify audit subjects. */
+export function verifyTransparencyCounterChain(input: unknown, opts: VerifyTransparencyOptions = {}): TransparencyVerifyReport {
+  // This primitive supplies no audit-head conclusion; B must match verifySplitTransparency in evidence-pack/split-statement-nested.ts.
+  return verifyTransparencySequence(input, opts, () => []);
+}
+function globalAuditHeads(prev: VerifierCheckpointRecord, curr: VerifierCheckpointRecord): TransparencyFinding[] {
+    // Rollback signal inside the covered audit window: the log head must
+    // never move backwards between consecutive checkpoints.
+    if (curr.audit.highest_sequence < prev.audit.highest_sequence) {
+      return [{
+        kind: "counter_rollback",
+        counter: curr.counter,
+        expected: `audit highest_sequence >= ${prev.audit.highest_sequence}`,
+        actual: curr.audit.highest_sequence,
+        message: `checkpoint counter ${curr.counter}: audit log head moved backwards (${prev.audit.highest_sequence} -> ${curr.audit.highest_sequence}); log truncation or state rollback between checkpoints`,
+      }];
+    }
+    return [];
+}
+function verifyTransparencySequence(
   input: unknown,
-  opts: VerifyTransparencyOptions = {}
+  opts: VerifyTransparencyOptions,
+  auditHeads: (prev: VerifierCheckpointRecord, curr: VerifierCheckpointRecord) => TransparencyFinding[]
 ): TransparencyVerifyReport {
   const findings: TransparencyFinding[] = [];
 
@@ -471,17 +499,7 @@ export function verifyTransparencyCheckpoints(
         });
       }
     }
-    // Rollback signal inside the covered audit window: the log head must
-    // never move backwards between consecutive checkpoints.
-    if (curr.audit.highest_sequence < prev.audit.highest_sequence) {
-      findings.push({
-        kind: "counter_rollback",
-        counter: curr.counter,
-        expected: `audit highest_sequence >= ${prev.audit.highest_sequence}`,
-        actual: curr.audit.highest_sequence,
-        message: `checkpoint counter ${curr.counter}: audit log head moved backwards (${prev.audit.highest_sequence} -> ${curr.audit.highest_sequence}); log truncation or state rollback between checkpoints`,
-      });
-    }
+    findings.push(...auditHeads(prev, curr));
     if (curr.fortress_id !== prev.fortress_id) {
       findings.push({
         kind: "fortress_id_mismatch",

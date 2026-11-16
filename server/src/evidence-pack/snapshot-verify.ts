@@ -1,6 +1,8 @@
 /** Pure verification of captured bytes and adapter observations, with no ambient lookup. */
 import { verify } from "../core/identity.js";
 import * as C from "./snapshot-contract.js";
+import * as B from "./split-statement-contract.js";
+import { verifySplitStatement, authenticateSplitBytes } from "./split-statement-verify.js";
 import { validateSnapshotPins, bindSnapshotTrust, type SnapshotPins } from "./snapshot-trust.js";
 import { verifySnapshotAudit, verifySnapshotTransparency, absentOutcome, joinSnapshotVerdict } from "./snapshot-nested.js";
 function sameStat(a: C.CapturedStat, b: C.CapturedStat): boolean { return C.canonicalSnapshotJSON(a) === C.canonicalSnapshotJSON(b); }
@@ -26,10 +28,28 @@ function checkType(file: C.CapturedFile): void {
   checkMetadata(file.metadata);
 }
 export interface CandidateDescriptor { candidateDescriptorBytes: Uint8Array; keysAuthenticated: false }
-export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifierSourceRevision: string): C.VerificationResult {
+/** A recipient declaring the B descriptor format receives the B result schema. */
+export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins & { format: typeof B.TRUST_FORMAT }, verifierSourceRevision: string): B.Result;
+/** Existing V0 consumers retain their closed result contract; format selection is explicit at the adapter. */
+export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins, verifierSourceRevision: string): C.VerificationResult;
+export function verifySnapshot(capture: C.CapturedSnapshot, pins: SnapshotPins & { format?: typeof B.TRUST_FORMAT }, verifierSourceRevision: string): C.VerificationResult | B.Result {
+  if (pins.format === B.TRUST_FORMAT) return verifySplitStatement(capture, pins, verifierSourceRevision).result;
   return inspectSnapshot(capture, pins, verifierSourceRevision, false) as C.VerificationResult;
 }
+/** The independently supplied descriptor selects the protocol; delivery bytes cannot downgrade it. */
+export function verifySnapshotByFormat(capture: C.CapturedSnapshot, pins: SnapshotPins, revision: string): C.VerificationResult | B.Result {
+  let value: unknown;
+  try { value = C.parseSnapshotJSON(pins.descriptorBytes, C.MAX_TRUST_BYTES); }
+  catch { return verifySnapshot(capture, pins, revision); }
+  if (value !== null && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).format === B.TRUST_FORMAT) return verifySnapshot(capture, { ...pins, format: B.TRUST_FORMAT }, revision);
+  return verifySnapshot(capture, pins, revision);
+}
 export function authenticateSnapshotBytes(capture: C.CapturedSnapshot, packKey: string, expectedManifestDigest: string, sourceRevision: string): CandidateDescriptor {
+  const manifestBytes = capture.files.find(f => fileName(f) === C.MANIFEST_FILENAME)?.bytes;
+  if (manifestBytes) {
+    const envelope = C.parseSnapshotJSON(manifestBytes, C.MAX_MANIFEST_BYTES);
+    if (envelope !== null && typeof envelope === "object" && !Array.isArray(envelope) && (envelope as Record<string, unknown>).format === B.FORMAT) return authenticateSplitBytes(capture, packKey, expectedManifestDigest);
+  }
   const delivered = capture.files.find(f => fileName(f) === C.TRUST_FILENAME)?.bytes;
   C.requireSnapshot(delivered, C.HARD.file_set_mismatch);
   // Candidate keys support schema checks only and never become recipient authority or a nested PASS.
