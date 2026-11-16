@@ -148,7 +148,7 @@ export function signSplit(s: {f:ReturnType<typeof fixture>;files:Map<string,Uint
   s.pins.expectedManifestDigest=C.manifestDigest(s.files.get(C.MANIFEST_FILENAME)!);
 }
 
-import {mkdir,mkdtemp,readdir,lstat,unlink,rmdir} from "node:fs/promises";
+import {mkdir,mkdtemp,readdir,lstat,unlink,rmdir,open as openForInventory} from "node:fs/promises";import {constants as inventoryFs} from "node:fs";
 import {resolve,join,dirname} from "node:path";
 import {FilesystemStorage} from "../../src/storage/filesystem.js";
 import {AuditLog,__testSetAuditWriterUidForRole} from "../../src/operational/audit-log.js";
@@ -242,7 +242,7 @@ async function splitFixtureExtent(storage:FilesystemStorage,namespace:string){
 /** Compare every ordinary fixture file before and after a source-root replacement. */
 export async function splitFixtureByteInventory(root:string){
   const directories=[root],files:Record<string,string>={};
-  for(let i=0;i<directories.length;i++)for(const name of await readdir(directories[i])){const path=join(directories[i],name),meta=await lstat(path);if(meta.isDirectory()&&!meta.isSymbolicLink())directories.push(path);else if(meta.isFile())files[path.slice(root.length+1)]=createHash("sha256").update(await readFile(path)).digest("hex");}
+  for(let i=0;i<directories.length;i++)for(const name of await readdir(directories[i])){const path=join(directories[i],name);const handle=await openForInventory(path,inventoryFs.O_RDONLY|inventoryFs.O_NOFOLLOW|inventoryFs.O_NONBLOCK).catch((error:NodeJS.ErrnoException)=>{if(error.code==="ELOOP"||error.code==="ENXIO"||error.code==="EOPNOTSUPP")return null;throw error;});if(!handle)continue;try{const meta=await handle.stat();if(meta.isDirectory())directories.push(path);else if(meta.isFile())files[path.slice(root.length+1)]=createHash("sha256").update(await handle.readFile()).digest("hex");}finally{await handle.close();}} // One no-follow descriptor is both checked and read, so a link or a file swapped in after its check is never hashed; links and sockets are skipped as before.
   return Object.fromEntries(Object.entries(files).sort(([a],[b])=>a<b?-1:1));
 }
 /** Real custody, migration, writers, scheduled emission, shutdown and registered export; only native startup is replaced. */
