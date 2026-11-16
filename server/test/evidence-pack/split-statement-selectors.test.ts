@@ -98,7 +98,10 @@ it.each(["empty daemon directories","boundary file","established marker"])("sele
  const code=await exportSnapshot(options,deps as unknown as typeof exportDependencies);
  expect(exportPhases,"fixed evidence export selects split").toContain("CLASSIFY");
  expect([C.EXIT_FAIL,C.EXIT_PARTIAL],"fixed evidence export never PASS").toContain(code);
- if(code===C.EXIT_PARTIAL){
+ // A refusal exit does not by itself prove no pack was committed, so any delivered manifest is verified as a recipient would.
+ const delivered=await readFile(join(options.output,C.MANIFEST_FILENAME)).then(()=>true,(error:NodeJS.ErrnoException)=>{expect(error.code,"fixed evidence refusal delivers no manifest").toBe("ENOENT");return false;});
+ expect(code!==C.EXIT_PARTIAL||delivered,"fixed evidence PARTIAL delivers its manifest").toBe(true);
+ if(delivered){
   const pins={packKey:signer.public_key,descriptorBytes:await readFile(join(options.output,C.TRUST_FILENAME)),expectedManifestDigest:C.manifestDigest(await readFile(join(options.output,C.MANIFEST_FILENAME)))};
   const result=verifySnapshotByFormat(await captureSnapshotDirectory(options.output,pins.packKey,pins.expectedManifestDigest),pins,SOURCE);
   expect(result.accepted,"fixed evidence recipient never accepted").toBe(false);

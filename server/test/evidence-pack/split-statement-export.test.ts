@@ -1,5 +1,6 @@
 // Candidate-only delivery checks; production entry witnesses are maintained separately.
 // fail-before-exempt: imports evidence-pack/split-statement-contract.js, which base lacks, so this candidate-only file cannot collect on base.
+import {AUDIT_RAW_NAME_GRAMMARS} from "../../src/operational/audit-log.js";
 import {describe,it,expect} from "vitest";
 import {readFile,writeFile,lstat} from "node:fs/promises";
 import {join} from "node:path";
@@ -98,7 +99,7 @@ it.each(["pin","capture","key"])("uses the declared split failure schema for %s"
 }));
 
 it("retained producer incident stays partial",()=>withExport(async x=>{
- const name=`.audit-write.lock.evidence.${process.pid}.${"ab".repeat(12 /* Producer nonce bytes. */)}.tomb`;
+ const name=`.audit-write.lock.evidence.${process.pid}.${"ab".repeat(AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes)}.tomb`;
  await writeFile(join(x.state,"_audit",name),"synthetic incident");
  expect(await exportSnapshot(x.options,x.deps),"incident export PARTIAL").toBe(10);
  const {verified}=await result(x);
