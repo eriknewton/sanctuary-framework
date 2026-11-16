@@ -7,6 +7,12 @@
     "homepage": "https://github.com/eriknewton/sanctuary-framework"
   },
   "license": "Apache-2.0",
+  "homepage": "https://sanctuaryprotocol.ai",
+  "repository": "https://github.com/eriknewton/sanctuary-framework",
+  "documentationUrl": "https://github.com/eriknewton/sanctuary-framework/blob/main/plugin/README.md",
+  "supportUrl": "https://github.com/eriknewton/sanctuary-framework/issues",
+  "privacyPolicyUrl": "https://sanctuaryprotocol.ai/privacy",
+  "termsOfServiceUrl": "https://sanctuaryprotocol.ai/terms",
   "keywords": [
     "security",
     "egress-control",
