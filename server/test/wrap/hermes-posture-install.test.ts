@@ -1,3 +1,4 @@
+// fail-before-exempt: the added indentless-list row is a real-parser row, which runs only where SANCTUARY_HERMES_PYTHON is set, so in CI this file passes against pre-fix source by construction. The scanner behaviour it covers is pinned fail-before in hermes-posture-plan.test.ts and hermes-yaml-injection.test.ts.
 // Real-parser continuing and changed-removal rows require SANCTUARY_HERMES_PYTHON.
 // Refusal, write order, rollback, and dispatcher rows use a controlled parser executor
 // and always run. All files and the relay socket live under a temporary HOME.
@@ -347,6 +348,8 @@ describe.skipIf(!python)("Hermes installer real-parser continuing paths", () => 
     ["config absent", null],
     ["blocks absent", "model: fixture\n"],
     ["values replaced", "memory:\n  provider: old\n  memory_enabled: true # retain\nplugins:\n  enabled: [other_plugin]\n"],
+    // PyYAML's default dump, which Hermes writes: top-level lists are not indented.
+    ["indentless top-level lists", "fallback_providers:\n- provider: one\n  model: m1\ntoolsets:\n- web\nmemory:\n  provider: ''\ncommand_allowlist:\n- execute_code\n- script execution via heredoc\n"],
   ])("%s and uninstall unchanged", async (_name, original) => {
     if (original !== null) await seed(original);
     await fs.writeFile(join(root, "SOUL.md"), "Original identity.\n");

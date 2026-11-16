@@ -22,6 +22,18 @@ export const refusedShapes = [
   ["enabled anchor", "plugins:\n  enabled: &items [other]\n"],
   ["disabled sanctuary", "plugins:\n  disabled: [sanctuary]\n"],
   ["hard stop", "tool_loop_guardrails:\n  hard_stop_enabled: true\n"],
+  ["memory indentless sequence", "memory:\n- provider\n"],
+  ["plugins indentless sequence", "plugins:\n- enabled\n"],
+  ["scalar followed by indentless item", "model: one\n- two\n"],
+  ["document is a sequence", "- one\nmemory:\n  provider: old\n"],
+  ["document starts with a bare item", "-\nmemory:\n  provider: old\n"],
+  ["guardrails indentless sequence", "tool_loop_guardrails:\n- hard_stop_enabled\n"],
+  ["anchor followed by indentless item", "toolsets: &a\n- web\n"],
+  ["empty MCP flow followed by item", "mcp_servers: {}\n- weather\n"],
+  ["line separator hides a key", "toolsets:\n- web\u2028memory:\n  provider: old\n"],
+  ["no-break space after a dash", "toolsets:\n-\u00a0web: x\n"],
+  ["document start marker", "---\ntoolsets:\n- web\n"],
+  ["document end marker", "toolsets:\n- web\n...\n"],
 ] as const;
 
 describe("Hermes memory YAML planner", () => {
@@ -37,6 +49,9 @@ describe("Hermes memory YAML planner", () => {
     ["MCP header comment", "mcp_servers: # preserved\n  sanctuary:\n    command: old\n", "mcp_servers: {} # preserved\n" + fresh],
     ["other MCP kept", "mcp_servers:\n  sanctuary:\n    command: old\n  weather:\n    command: weather\n", "mcp_servers:\n  weather:\n    command: weather\n" + fresh],
     ["already installed", fresh, fresh],
+    ["indentless item as the last line without a newline", "toolsets:\n- web", "toolsets:\n- web\n" + fresh],
+    // PyYAML's default dump, which Hermes writes: top-level lists are not indented.
+    ["indentless top-level lists kept", "fallback_providers:\n- provider: one\n  model: m1\n- provider: two\ntoolsets:\n- web\n-\ncommand_allowlist:\n- execute_code # keep\n# between\n- script execution\nmemory:\n  provider: old\n", "fallback_providers:\n- provider: one\n  model: m1\n- provider: two\ntoolsets:\n- web\n-\ncommand_allowlist:\n- execute_code # keep\n# between\n- script execution\nmemory:\n  provider: sanctuary_memory\n  memory_enabled: false\n  user_profile_enabled: false\nplugins:\n  enabled: [sanctuary]\n"],
   ])("%s", (_name, input, expected) => {
     const result = plan(input);
     expect(result.content).toBe(expected);
@@ -44,6 +59,13 @@ describe("Hermes memory YAML planner", () => {
   });
   it.each(refusedShapes)("refuses %s", (_name, input) => {
     expect(() => plan(input)).toThrow();
+  });
+  it("indentless lists never become top-level keys and removal restores them byte for byte", () => {
+    const original = "toolsets:\n- web\n- terminal\nmemory:\n  provider: old\nmcp_servers:\n  sanctuary:\n    command: old\ncommand_allowlist:\n- execute_code\n";
+    const result = plan(original);
+    expect(result.before.top).toEqual(["toolsets", "memory", "mcp_servers", "command_allowlist"]);
+    expect(planHermesMemoryRevert(result.content, original, result.content).content)
+      .toBe("toolsets:\n- web\n- terminal\nmemory:\n  provider: old\nmcp_servers: {}\ncommand_allowlist:\n- execute_code\n");
   });
   it("records removed MCP bytes including their terminating newline", () => {
     expect(plan("mcp_servers:\n  sanctuary:\n    command: old\n").removedMcp)

@@ -131,10 +131,36 @@ function isBlankOrComment(line: string): boolean {
 }
 
 /**
+ * A column-0 block-sequence item (`- value` or a bare `-`), the form PyYAML
+ * uses for a list under a top-level key. A `---` or `...` document marker is
+ * not an item.
+ */
+function isIndentlessItem(line: string): boolean {
+  // Only YAML's own separators follow the dash; JavaScript's wider \s would
+  // let a non-breaking space pass for one.
+  return /^-([ \t\r]|$)/.test(line);
+}
+
+/**
+ * YAML breaks lines at U+0085, U+2028 and U+2029 as well as at newline, but
+ * these scanners split on newline only, so a key after such a character would
+ * be invisible to them. Refuse the file rather than read it differently from
+ * PyYAML.
+ */
+function refuseForeignLineBreaks(lines: string[]): void {
+  if (lines.some(line => /[\u0085\u2028\u2029]/.test(line))) {
+    throw new HermesYamlUnsupportedError(
+      "config.yaml contains a Unicode line separator this tool cannot safely edit; refusing to edit."
+    );
+  }
+}
+
+/**
  * Locate the top-level `mcp_servers:` block and its entries.
  * Returns null when the key is absent; throws on unsupported shapes.
  */
 function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
+  refuseForeignLineBreaks(lines);
   let keyLine = -1;
   let remainder = "";
   for (let i = 0; i < lines.length; i++) {
@@ -168,16 +194,27 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
     }
   }
 
-  // Block extent: indented lines, blank lines, and column-0 comments all
-  // belong to the block region; the first column-0 non-comment content
-  // line ends it.
+  // Block extent: indented lines, blank lines, column-0 comments and
+  // column-0 `-` items all belong to the block region; the first other
+  // column-0 content line ends it. An indentless item is kept in the region
+  // so the block-sequence refusal below sees it, rather than the block
+  // reading as empty and an entry being merged into a sequence.
   let blockEnd = keyLine + 1;
   while (blockEnd < lines.length) {
     const line = lines[blockEnd]!;
-    if (line.trim() !== "" && indentOf(line) === 0 && !line.trimStart().startsWith("#")) {
+    if (line.trim() !== "" && indentOf(line) === 0 && !line.trimStart().startsWith("#") &&
+        !isIndentlessItem(line)) {
       break;
     }
     blockEnd++;
+  }
+
+  // A column-0 item after the empty flow form is not YAML at all; say so
+  // rather than give block-sequence advice.
+  if (flowEmpty && lines.slice(keyLine + 1, blockEnd).some(isIndentlessItem)) {
+    throw new HermesYamlUnsupportedError(
+      "config.yaml mcp_servers: {} is followed by a list item; refusing to edit."
+    );
   }
 
   // Block-SEQUENCE form (`mcp_servers:\n  - name: weather`): upstream
@@ -197,6 +234,15 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
       );
     }
     break;
+  }
+
+  // Inside a block mapping a column-0 item can only be the continuation of a
+  // multi-line quoted scalar. entryEnd cannot see that continuation, so a
+  // replace would leave its tail behind as YAML Hermes cannot load; refuse.
+  if (lines.slice(keyLine + 1, blockEnd).some(isIndentlessItem)) {
+    throw new HermesYamlUnsupportedError(
+      "config.yaml mcp_servers has a column-0 line inside an entry this tool cannot safely edit; refusing to edit."
+    );
   }
 
   // Entries: the first indented `name:` line fixes the entry indent; only
@@ -522,17 +568,36 @@ function splitPostureLine(line: string): Omit<PostureField, "start" | "end"> {
   return { key: match[2] ?? match[3] ?? match[4]!, prefix: match[1]!, token, suffix: parts[1]!.slice(token.length) + parts[2]! };
 }
 function postureBlocks(lines: string[]): Map<string, PostureBlock> {
+  refuseForeignLineBreaks(lines);
   const blocks = new Map<string, PostureBlock>();
+  // Lines before this index already belong to an earlier block.
+  let consumed = 0;
   for (let start = 0; start < lines.length; start++) {
     const line = lines[start]!;
-    if (isBlankOrComment(line) || indentOf(line) !== 0) continue;
+    if (start < consumed || isBlankOrComment(line) || indentOf(line) !== 0) continue;
     const head = splitPostureLine(line);
     if (blocks.has(head.key)) return postureRefuse();
     let end = start + 1;
-    while (end < lines.length && (isBlankOrComment(lines[end]!) || indentOf(lines[end]!) > 0)) end++;
+    // PyYAML, and so Hermes, writes a top-level list without indenting it
+    // (`toolsets:\n- web`), so a column-0 `-` item continues the key above
+    // it. It belongs to that key's block and is never itself a key.
+    let indentlessItems = false;
+    while (end < lines.length) {
+      const next = lines[end]!;
+      if (isBlankOrComment(next) || indentOf(next) > 0) { end++; continue; }
+      if (!isIndentlessItem(next)) break;
+      indentlessItems = true;
+      end++;
+    }
+    // Only an empty value can open a block sequence; `key: value` followed
+    // by a column-0 item is a shape this scanner does not model, so refuse.
+    if (indentlessItems && head.token !== "") return postureRefuse();
     const block: PostureBlock = { start, end, fields: [], indent: POSTURE_INDENT };
     blocks.set(head.key, block);
+    consumed = end;
     if (!POSTURE_KEYS.includes(head.key)) continue;
+    // A managed block must be a mapping; a sequence there is never edited.
+    if (indentlessItems) return postureRefuse();
     if (head.token !== "" && !/^\{\s*\}$/.test(head.token)) return postureRefuse();
     const content = lines.slice(start + 1, end).filter(line => !isBlankOrComment(line));
     if (content.length) block.indent = indentOf(content[0]!);
