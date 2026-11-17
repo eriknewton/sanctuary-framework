@@ -278,7 +278,13 @@ for f in "${staged_ts_files[@]}"; do
 done
 
 set +e
-related_output=$(cd server && npx vitest related --run "${abs_staged_files[@]}" 2>&1 \
+# Git exports GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE (the REAL repository) to
+# hooks; a test that spawns git would then act on the real repository (seen
+# 2026-11-17: core.bare=true written into the shared .git/config). Unset them
+# for vitest only, AFTER every git call this hook itself needs. Must match
+# GIT_REDIRECT_ENV_KEYS in server/test/setup/git-env-scrub.ts (the setup file
+# is the primary guard; this is defence in depth).
+related_output=$(cd server && unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX && npx vitest related --run "${abs_staged_files[@]}" 2>&1 \
   | node ../scripts/redact-test-output.mjs)
 related_exit=$?
 set -e

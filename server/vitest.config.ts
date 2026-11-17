@@ -39,7 +39,9 @@ export async function acquireMasterWriteBarrier(...args: Parameters<typeof acqui
     // isolating. The second setup file makes `homedir()` follow the thread's
     // env, as it does in a process. See test/setup/homedir-follows-env.ts and
     // register row TEST-ISOLATION-SINGLE-WORKER-01.
-    setupFiles: ["./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts", "./test/setup/master-write-leases.ts", "./test/setup/selector-roots-isolation.ts"],
+    // git-env-scrub.ts stays FIRST: it clears GIT_DIR and friends that a git hook exports, so no test
+    // spawns git against the real repository. Witness: test/structure/git-env-scrub.test.ts.
+    setupFiles: ["./test/setup/git-env-scrub.ts", "./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts", "./test/setup/master-write-leases.ts", "./test/setup/selector-roots-isolation.ts"],
     // Stack order runs the guard after every afterAll, but before beforeAll-returned cleanups, file-scoped fixture teardown and the file's own aroundAll teardown, none of which current tests use.
     sequence: { setupFiles: "list", hooks: "stack" },
     // Leaves a marker directory at the package root for the whole run. setupFiles
