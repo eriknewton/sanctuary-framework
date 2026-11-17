@@ -13,9 +13,8 @@
   <meta property="og:url" content="{{ page.url | absolute_url }}">
   <meta property="og:site_name" content="Sanctuary Protocol">
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+  <!-- Self-hosted fonts: the site loads nothing from third parties (footer promise on docs/index.html). -->
+  <link rel="stylesheet" href="{{ '/assets/home/fonts.css' | relative_url }}">
 
   <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
 

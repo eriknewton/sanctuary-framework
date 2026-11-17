@@ -7,7 +7,7 @@ layout: null
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sanctuary: your AI should answer to you</title>
-<meta name="description" content="Open-source software that keeps your AI agent answerable to you: you hold its keys and memory, it connects only where a policy you signed allows, and it keeps a record you can check. Works today on macOS and on Ubuntu 24.04 (x86-64).">
+<meta name="description" content="Open-source software that keeps your AI agent answerable to you: keys and memory on your machine, connection rules you sign, approvals for the actions you choose, and a record you can check. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64), the latter through the separate Castle Wall Linux package.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#FFFFFF">
 <link rel="canonical" href="https://sanctuaryprotocol.ai/">
@@ -188,7 +188,8 @@ h2 { font: 700 44px/1.1 var(--display); letter-spacing: -.025em; max-width: 22ch
 .row h3 { font: 700 32px/1.15 var(--display); letter-spacing: -.02em; margin-bottom: 14px; }
 .row p { color: var(--ink-2); font-size: 18px; }
 .row .shot figcaption { text-align: left; margin-left: 0; font-size: 14px; }
-.row .shot.narrow img { max-width: 440px; }
+.row .shot.narrow img { max-width: min(440px, 100%); }
+.row > * { min-width: 0; }
 .row.wide { grid-template-columns: 1fr; gap: 28px; }
 .row.wide .txt { max-width: 640px; }
 .diff { display: grid; grid-template-columns: repeat(2, 1fr); gap: 40px 64px; margin-top: 48px; }
@@ -198,9 +199,12 @@ h2 { font: 700 44px/1.1 var(--display); letter-spacing: -.025em; max-width: 22ch
 .status { display: grid; grid-template-columns: 1.2fr 1fr; gap: 56px; align-items: start; }
 .status-line { font: 600 26px/1.3 var(--display); letter-spacing: -.01em; margin-bottom: 14px; }
 .status p.more-p { color: var(--ink-2); }
-.plats { border: 1px solid var(--rule); border-radius: 12px; background: #fff; }
-.plats li { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--rule); font-size: 15px; }
-.plats li:last-child { border-bottom: 0; }
+.plats { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid var(--rule); border-radius: 12px; background: #fff; font-size: 15px; }
+.plats th, .plats td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+.plats thead th { font: 500 11px/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+.plats tbody th { font-weight: 600; }
+.plats tbody tr:last-child th, .plats tbody tr:last-child td { border-bottom: 0; }
+@media (max-width: 520px) { .plats th, .plats td { padding: 10px 8px; } .plats .chip { font-size: 10px; padding: 0 6px; } }
 .trust { display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; margin-top: 40px; }
 .trust li { border-top: 2px solid var(--ink); padding-top: 16px; color: var(--ink-2); font-size: 15px; }
 .trust b { display: block; color: var(--ink); font: 600 17px/1.3 var(--display); margin-bottom: 6px; }
@@ -231,13 +235,13 @@ Sanctuary</a>
 <main id="main">
 <section class="hero"><div class="wrap">
   <h1>Your AI should answer to you. <span>Only you.</span></h1>
-  <p class="lede">AI agents are starting to act with your data, your keys, your money and your name, on systems someone else controls. Sanctuary is the open-source ground they stand on: you hold the keys and the memory, nothing leaves without your signed say-so, and every action leaves a record you can prove.</p>
+  <p class="lede">AI agents are starting to act with your data, your keys, your money and your name, on systems someone else controls. Sanctuary is the open-source ground they stand on: keys and memory that stay on your machine, connection rules you sign, a human yes for the actions you choose, and a record you can check.</p>
   <p class="actions"><a class="btn primary" href="#h-start">Install</a><a class="btn ghost" href="#h-answer">How it works</a></p>
 </div></section>
 
 <div class="stage"><div class="wrap">
-  <figure class="shot"><img src="/assets/home/console-approvals.png" width="2400" height="1267" alt="The Sanctuary console's Approvals screen in its light theme. A queue lists two held requests from demo agents, a Tier 1 state export and a Tier 2 state write, each waiting for a decision, with Allow once and Deny buttons. A side panel explains what the selected request wants to do and why it is held." loading="lazy"><figcaption>The console's Approvals screen. An agent asked to export stored data; the request waits until you allow or deny it, and the decision goes into your record.</figcaption></figure>
-  <p class="provenance">Real captures of the Sanctuary console, recorded 2026-11-17 from a development build (v1.9.0-rc.4) running seeded demo data, not a live user's machine.</p>
+  <figure class="shot"><img src="/assets/home/console-approvals-hero.png" width="2400" height="964" alt="The Sanctuary console's Approvals screen in its light theme. A queue lists two held requests from demo agents, a Tier 1 state export and a Tier 2 state write, each waiting for a decision, with Allow once and Deny buttons. A side panel explains what the selected request wants to do and why it is held." loading="eager"><figcaption>The console's Approvals screen. An agent asked to export stored data; the request waits until you allow or deny it, and the decision goes into your record.</figcaption></figure>
+  <p class="provenance">Real captures of the Sanctuary console, which ships in the 1.9.0 preview, not yet in the stable release. Recorded 2026-11-17 from a development build (v1.9.0-rc.4) running seeded demo data, not a live user's machine, and cropped to fit.</p>
 </div></div>
 
 <section class="s" aria-labelledby="h-problem"><div class="wrap split">
@@ -251,8 +255,8 @@ Sanctuary</a>
   <ul class="promises">
 <li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="7.5" cy="12" r="3.75"/><path d="M11.25 12H21M17.5 12v3.25M21 12v2.5"/></svg></span><p class="label">Keys</p><h3>You hold the keys.</h3><p>Your agent's keys are made on your machine and locked under your passphrase, and the project keeps no copy.</p></li>
 <li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="2.5"/><path d="M5 6v12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg></span><p class="label">Memory</p><h3>You keep the memory.</h3><p>What your agent stores stays encrypted on your machine, readable only with your keys.</p></li>
-<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 12h11M11 8.5l3.5 3.5-3.5 3.5"/><path d="M19.5 5v14" stroke-width="2.25"/></svg></span><p class="label">Connections</p><h3>You decide what leaves.</h3><p>Your agent connects only where a policy you signed allows, and actions that cannot be undone wait for your yes.</p></li>
-<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="9.5" width="5" height="5" rx="1"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><rect x="16.5" y="9.5" width="5" height="5" rx="1"/><path d="M7.5 12h2M14.5 12h2"/></svg></span><p class="label">Record</p><h3>You can prove what happened.</h3><p>Sanctuary writes what your agent does through it into a chained record, built so that a changed or missing entry shows when you check.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 12h11M11 8.5l3.5 3.5-3.5 3.5"/><path d="M19.5 5v14" stroke-width="2.25"/></svg></span><p class="label">Connections</p><h3>You decide where it connects.</h3><p>With the wall armed on macOS or Ubuntu 24.04, your agent's account connects only where a policy you signed allows. Actions you mark for approval wait for your yes.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="9.5" width="5" height="5" rx="1"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><rect x="16.5" y="9.5" width="5" height="5" rx="1"/><path d="M7.5 12h2M14.5 12h2"/></svg></span><p class="label">Record</p><h3>You can check what happened.</h3><p>Sanctuary writes what your agent does through it into a hash-chained record. Checking that record for tampering is still rated partial.</p></li>
 </ul>
   <div class="bound"><p class="label">Where these stop today</p><p>The connection rules cover a separate account you create for the agent, and decide where it may connect, not what an allowed connection carries. The approval step covers only tool calls that go through Sanctuary, so a harness's own built-in tools skip it, and whatever the agent sends to its AI model can be seen by that model's provider.</p></div>
 </div></section>
@@ -261,11 +265,11 @@ Sanctuary</a>
   <p class="label eyebrow">See it</p>
   <h2 id="h-see" style="margin-bottom:64px">You stay in the loop, and you can check the record.</h2>
   <div class="row">
-    <div class="txt"><h3>Nothing irreversible happens without your yes.</h3><p>When an agent asks to do something you marked as needing approval, Sanctuary holds it and tells you what it wants and why it stopped. You allow it once or deny it, and that choice is written down.</p></div>
+    <div class="txt"><h3>Actions you mark for approval wait for your yes.</h3><p>When an agent asks, through Sanctuary, to do something your policy marks for approval, Sanctuary holds it and shows you what it wants and why it stopped. You allow it once or deny it, and the decision is recorded.</p></div>
     <figure class="shot narrow"><img src="/assets/home/detail-approval-drawer.png" width="843" height="898" alt="Detail of a held request: Tier 1, waiting. What it wants to do: export state as a portable bundle. Why it is held: your operator policy lists this operation as Tier 1, so it always asks for approval." loading="lazy"><figcaption>Each held request says what the agent wants to do and why it was stopped.</figcaption></figure>
   </div>
   <div class="row wide">
-    <div class="txt"><h3>Check the record yourself.</h3><p>Every entry is chained to the one before it, so a changed or missing entry shows up when the record is checked.</p></div>
+    <div class="txt"><h3>Check the record yourself.</h3><p>Each entry is chained to the one before it, and the console checks the chain and reports what it finds. This check is still rated partial; the evidence page says what it covers.</p></div>
     <figure class="shot"><img src="/assets/home/detail-chain-verified.png" width="2331" height="220" alt="Detail of the record check: Chain verified. Routine entries verified clean; 0 integrity findings for the whole chain." loading="lazy"><figcaption>The record check, as the console shows it.</figcaption></figure>
   </div>
 </div></section>
@@ -273,18 +277,18 @@ Sanctuary</a>
 <section class="s tint" id="layers" aria-labelledby="h-diff"><div class="wrap">
   <p class="label eyebrow">Why it is different</p>
   <h2 id="h-diff">It sits beneath the agent, on ground you own.</h2>
-  <dl class="diff"><div><dt>Below the agent</dt><dd>Your operating system enforces the connection rules, underneath the agent, so an agent that has been tricked cannot switch them off.</dd></div><div><dt>On your own machine</dt><dd>It runs on hardware you control. There is nothing to sign up for and no account with us.</dd></div><div><dt>No vendor in the middle</dt><dd>No company holds your keys or a copy of what you store, the author included.</dd></div><div><dt>Open source</dt><dd>Every line is public under Apache-2.0, so you, or anyone you trust, can read what it does.</dd></div></dl>
+  <dl class="diff"><div><dt>Below the agent</dt><dd>On macOS and Ubuntu 24.04, your operating system enforces the connection rules underneath the agent, so an agent that has been tricked cannot switch them off.</dd></div><div><dt>On your own machine</dt><dd>It runs on hardware you control. There is nothing to sign up for and no account with us.</dd></div><div><dt>No vendor in the middle</dt><dd>No company holds your keys or a copy of what you store, the author included.</dd></div><div><dt>Open source</dt><dd>Every line is public under Apache-2.0, so you, or anyone you trust, can read what it does.</dd></div></dl>
 </div></section>
 
 <section class="s" aria-labelledby="h-status"><div class="wrap status">
-  <div><p class="label eyebrow" id="h-status">Where it runs</p><p class="status-line">Works today on macOS and on Ubuntu 24.04 (x86-64). Other Linux and Windows are not yet supported.</p><p class="more-p">On Ubuntu, the connection rules come as a separate package, Castle Wall Linux. Some parts are still partial, among them checking the record from another machine and moving memory off a Mac. The Evidence page shows what is proven, on which build, and what is not proven yet.</p><a class="more" href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">See the evidence</a></div>
-  <ul class="plats"><li><span>macOS</span><span class="chip good"><i></i>WORKS TODAY</span></li><li><span>Ubuntu 24.04</span><span class="chip good"><i></i>WORKS TODAY</span></li><li><span>Other Linux</span><span class="chip neutral"><i></i>NOT YET SUPPORTED</span></li><li><span>Windows</span><span class="chip neutral"><i></i>NOT YET SUPPORTED</span></li><li><span>Checking the record from another machine</span><span class="chip warn"><i></i>PARTIAL</span></li><li><span>Moving memory off a Mac</span><span class="chip warn"><i></i>PARTIAL</span></li></ul>
+  <div><p class="label eyebrow">Where it runs</p><h2 class="status-line" id="h-status">Keys, approvals and the record run on macOS and Linux. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64). Windows is not yet supported.</h2><p class="more-p">The macOS proof covers one host and one OS version: a signed policy that allows and denies per agent account and survives reboots, not a per-rule, per-flow log. On Ubuntu the connection rules come as the separate Castle Wall Linux 0.1.0-1 pre-release, proven on fresh installs. The record's tamper check, checking it from another machine, and taking your data with you are still partial. The evidence page shows what is proven, on which build, and what is not.</p><a class="more" href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">See the evidence</a></div>
+  <table class="plats"><thead><tr><th scope="col">Platform</th><th scope="col">Keys, approvals, record</th><th scope="col">Connection rules</th></tr></thead><tbody><tr><th scope="row">macOS</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip good"><i></i>PROVEN</span></td></tr><tr><th scope="row">Ubuntu 24.04 (x86-64)</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip good"><i></i>PROVEN</span></td></tr><tr><th scope="row">Other Linux</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip neutral"><i></i>NOT PROVEN</span></td></tr><tr><th scope="row">Windows</th><td><span class="chip neutral"><i></i>NOT YET</span></td><td><span class="chip neutral"><i></i>NOT YET</span></td></tr></tbody></table>
 </div></section>
 
 <section class="s tint" aria-labelledby="h-trust"><div class="wrap">
   <p class="label eyebrow">Trust</p>
   <h2 id="h-trust">Things you can check yourself.</h2>
-  <ul class="trust"><li><b>Open source</b><span>Apache-2.0. <a href="https://github.com/eriknewton/sanctuary-framework">Read the code on GitHub</a>.</span></li><li><b>Signed releases</b><span>The npm package is signed and carries a provenance record. <a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Check a release yourself</a>.</span></li><li><b>A public Internet-Draft</b><span>The author's proposal for how agents record what they agreed, <a href="https://datatracker.ietf.org/doc/draft-newton-agreement-evidence/">draft-newton-agreement-evidence-01</a>, posted at the IETF on 2026-11-17.</span></li><li><b>An honest status table</b><span>Every claim, with what is not proven beside it. <a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Read the table</a>.</span></li></ul>
+  <ul class="trust"><li><b>Open source</b><span>Apache-2.0. <a href="https://github.com/eriknewton/sanctuary-framework">Read the code on GitHub</a>.</span></li><li><b>Signed releases</b><span>The npm package is signed and carries a provenance record. <a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Check a release yourself</a>.</span></li><li><b>A public Internet-Draft</b><span>A proposal for how agents record what they agreed, co-written by the author, <a href="https://datatracker.ietf.org/doc/draft-newton-agreement-evidence/">draft-newton-agreement-evidence-01</a>, posted at the IETF in November 2026.</span></li><li><b>An honest status table</b><span>Every claim, with what is not proven beside it. <a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Read the table</a>.</span></li></ul>
 </div></section>
 
 <section class="s" id="quickstart" aria-labelledby="h-start"><div class="wrap"><span id="harnesses"></span>
