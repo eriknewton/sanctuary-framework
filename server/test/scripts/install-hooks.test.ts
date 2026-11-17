@@ -9,6 +9,7 @@ import {
   backupExistingForeignHook,
   MARKER_LINE,
 } from "../../scripts/install-hooks.js";
+import { scrubGitRedirectEnv } from "../setup/git-env-scrub.js";
 
 describe("install-hooks resolveHooksDir", () => {
   let tmpRoot: string;
@@ -85,18 +86,8 @@ describe("install-hooks resolveHooksDir", () => {
     //      directory is its own top level. If that assertion ever fails, the
     //      test aborts instead of mutating whatever repo it actually found.
     const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const key of [
-      "GIT_DIR",
-      "GIT_COMMON_DIR",
-      "GIT_WORK_TREE",
-      "GIT_INDEX_FILE",
-      "GIT_OBJECT_DIRECTORY",
-      "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-      "GIT_NAMESPACE",
-      "GIT_PREFIX",
-    ]) {
-      delete env[key];
-    }
+    // One list: scripts/git-redirect-env-keys.json via test/setup/git-env-scrub.ts.
+    scrubGitRedirectEnv(env);
     env.GIT_CONFIG_GLOBAL = "/dev/null";
     env.GIT_CONFIG_SYSTEM = "/dev/null";
     const git = (args: string[], cwd: string) =>
@@ -124,6 +115,46 @@ describe("install-hooks resolveHooksDir", () => {
     // to /private/var/..., and git returns the resolved form.
     const result = fs.realpathSync(path.dirname(resolveHooksDir(wt)));
     expect(result).toBe(fs.realpathSync(path.join(mainRepo, ".git")));
+  });
+
+  // Wired consumer of scripts/git-redirect-env-keys.json in install-hooks.js:
+  // an inherited runtime config (both the GIT_CONFIG_PARAMETERS form and a
+  // numbered GIT_CONFIG_KEY_<n> pair) setting core.hooksPath must not steer
+  // the answer. The global test setup already cleared these from process.env,
+  // so they are re-seeded here to reach resolveHooksDir's own scrub.
+  it("ignores an inherited runtime core.hooksPath when asking git", () => {
+    const repo = path.join(tmpRoot, "repo");
+    fs.mkdirSync(repo);
+    const initEnv: NodeJS.ProcessEnv = { ...process.env };
+    scrubGitRedirectEnv(initEnv);
+    initEnv.GIT_CONFIG_GLOBAL = "/dev/null";
+    initEnv.GIT_CONFIG_SYSTEM = "/dev/null";
+    execFileSync("git", ["init", "--quiet"], { cwd: repo, stdio: "ignore", env: initEnv });
+    const injectedParam = path.join(tmpRoot, "injected-by-parameters");
+    const injectedNumbered = path.join(tmpRoot, "injected-by-numbered-pair");
+    const seeded: Record<string, string> = {
+      GIT_CONFIG_PARAMETERS: `'core.hookspath=${injectedParam}'`,
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.hooksPath",
+      GIT_CONFIG_VALUE_0: injectedNumbered,
+    };
+    // Precondition: git really honors the seeded config, so a pass below is the scrub's doing.
+    const steered = execFileSync("git", ["rev-parse", "--git-path", "hooks"], {
+      cwd: repo, encoding: "utf8", env: { ...initEnv, ...seeded },
+    }).trim();
+    expect([injectedParam, injectedNumbered]).toContain(steered);
+    const saved = Object.fromEntries(Object.keys(seeded).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, seeded);
+    try {
+      const result = resolveHooksDir(repo);
+      expect(result).not.toBe(injectedParam);
+      expect(result).not.toBe(injectedNumbered);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 
   it("throws when the root has no .git entry", () => {

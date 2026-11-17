@@ -277,14 +277,36 @@ for f in "${staged_ts_files[@]}"; do
   abs_staged_files+=("$repo_root/$f")
 done
 
-set +e
 # Git exports GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE (the REAL repository) to
-# hooks; a test that spawns git would then act on the real repository (seen
-# 2026-11-17: core.bare=true written into the shared .git/config). Unset them
-# for vitest only, AFTER every git call this hook itself needs. Must match
-# GIT_REDIRECT_ENV_KEYS in server/test/setup/git-env-scrub.ts (the setup file
-# is the primary guard; this is defence in depth).
-related_output=$(cd server && unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX && npx vitest related --run "${abs_staged_files[@]}" 2>&1 \
+# hooks, and a developer shell can add GIT_CONFIG, GIT_CONFIG_PARAMETERS or
+# numbered GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> pairs; a test that spawns git
+# would then act on the real repository or config (seen 2026-11-17:
+# core.bare=true written into the shared .git/config). scrub_git_redirect_env
+# runs INSIDE the command-substitution subshell below, so it clears them for
+# vitest only and cannot affect any git call this hook itself makes. The fixed
+# names and the numbered pattern must match keys and numberedKeyPattern in
+# server/scripts/git-redirect-env-keys.json (the setup file
+# server/test/setup/git-env-scrub.ts loads that list and is the primary guard;
+# this is defence in depth). server/test/structure/git-env-scrub.test.ts pins
+# both lines by full-set equality and runs the function.
+GIT_REDIRECT_ENV_KEYS=(GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_SHALLOW_FILE GIT_GRAFT_FILE)
+GIT_REDIRECT_NUMBERED_KEY_RE='^GIT_CONFIG_(KEY|VALUE)_[0-9]+$'
+scrub_git_redirect_env() {
+  local name
+  for name in "${GIT_REDIRECT_ENV_KEYS[@]}"; do
+    unset "$name"
+  done
+  # compgen -e lists exported NAMES only, one per line, so a multi-line value
+  # cannot be misread as a name (parsing `env` output could).
+  for name in $(compgen -e); do
+    if [[ "$name" =~ $GIT_REDIRECT_NUMBERED_KEY_RE ]]; then
+      unset "$name"
+    fi
+  done
+}
+
+set +e
+related_output=$(cd server && scrub_git_redirect_env && npx vitest related --run "${abs_staged_files[@]}" 2>&1 \
   | node ../scripts/redact-test-output.mjs)
 related_exit=$?
 set -e

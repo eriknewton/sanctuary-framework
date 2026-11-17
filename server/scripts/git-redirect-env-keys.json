@@ -1,0 +1,21 @@
+{
+  "$comment": "The one list of git environment variables that redirect which repository, config file, or object graph git acts on. A process inherits them from a git hook (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE) or from a developer shell; clearing them makes git resolve state from cwd and the normal default config only. GIT_CEILING_DIRECTORIES is deliberately absent: it only restricts discovery. Loaded by server/test/setup/git-env-scrub.ts and server/scripts/install-hooks.js. Bash copies (.githooks/pre-commit, scripts/verify-fail-before-self-test.sh) must match keys and numberedKeyPattern exactly; server/test/structure/git-env-scrub.test.ts pins both by full-set equality and by running them. numberedKeyPattern matches the GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> pairs that GIT_CONFIG_COUNT enables; it is POSIX ERE so bash [[ =~ ]] and JavaScript RegExp read it identically.",
+  "keys": [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE"
+  ],
+  "numberedKeyPattern": "^GIT_CONFIG_(KEY|VALUE)_[0-9]+$"
+}

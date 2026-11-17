@@ -25,7 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
-import { GIT_REDIRECT_ENV_KEYS } from "../setup/git-env-scrub.js";
+import { scrubGitRedirectEnv } from "../setup/git-env-scrub.js";
 import { fileURLToPath } from "node:url";
 
 const HOOK_PATH = resolve(
@@ -66,10 +66,8 @@ function gitEnv(): NodeJS.ProcessEnv {
   // The keychain chokepoint refuses inside any child that inherits VITEST;
   // test/wrap/keychain-exec-guard.test.ts requires every spawned env to carry it.
   env.VITEST = process.env.VITEST ?? "true";
-  // Must match GIT_REDIRECT_ENV_KEYS in test/setup/git-env-scrub.ts (imported, one list).
-  for (const key of GIT_REDIRECT_ENV_KEYS) {
-    delete env[key];
-  }
+  // One list: scripts/git-redirect-env-keys.json via test/setup/git-env-scrub.ts.
+  scrubGitRedirectEnv(env);
   env.GIT_CONFIG_GLOBAL = "/dev/null";
   env.GIT_CONFIG_SYSTEM = "/dev/null";
   return env;

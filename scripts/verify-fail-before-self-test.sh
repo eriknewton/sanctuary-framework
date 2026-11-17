@@ -4,21 +4,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERIFY_SCRIPT="$SCRIPT_DIR/verify-fail-before.sh"
 
-GIT_ENV_KEYS=(
-  GIT_DIR
-  GIT_COMMON_DIR
-  GIT_WORK_TREE
-  GIT_INDEX_FILE
-  GIT_OBJECT_DIRECTORY
-  GIT_ALTERNATE_OBJECT_DIRECTORIES
-  GIT_NAMESPACE
-  GIT_PREFIX
-)
+# Git redirect variables a fixture git call must not inherit (a hook or a
+# developer shell can aim git at the real repository or config). The fixed
+# names and the numbered pattern must match keys and numberedKeyPattern in
+# server/scripts/git-redirect-env-keys.json; server/test/structure/
+# git-env-scrub.test.ts pins both lines by full-set equality and runs the
+# function. Callers run it inside a subshell, then point GIT_CONFIG_GLOBAL and
+# GIT_CONFIG_SYSTEM at /dev/null for the fixture.
+GIT_REDIRECT_ENV_KEYS=(GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_SHALLOW_FILE GIT_GRAFT_FILE)
+GIT_REDIRECT_NUMBERED_KEY_RE='^GIT_CONFIG_(KEY|VALUE)_[0-9]+$'
+scrub_git_redirect_env() {
+  local name
+  for name in "${GIT_REDIRECT_ENV_KEYS[@]}"; do
+    unset "$name"
+  done
+  # compgen -e lists exported NAMES only, so a multi-line value cannot be
+  # misread as a name.
+  for name in $(compgen -e); do
+    if [[ "$name" =~ $GIT_REDIRECT_NUMBERED_KEY_RE ]]; then
+      unset "$name"
+    fi
+  done
+}
 
 clean_git() (
-  for key in "${GIT_ENV_KEYS[@]}"; do
-    unset "$key"
-  done
+  scrub_git_redirect_env
   export GIT_CONFIG_GLOBAL=/dev/null
   export GIT_CONFIG_SYSTEM=/dev/null
   git -C "$@"
@@ -160,9 +170,7 @@ run_verify() {
   local base_ref="${2:-HEAD~1}"
   set +e
   (
-    for key in "${GIT_ENV_KEYS[@]}"; do
-      unset "$key"
-    done
+    scrub_git_redirect_env
     export GIT_CONFIG_GLOBAL=/dev/null
     export GIT_CONFIG_SYSTEM=/dev/null
     export USER=verify-fail-before-test

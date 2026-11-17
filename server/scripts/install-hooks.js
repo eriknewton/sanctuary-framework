@@ -8,6 +8,30 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+// The one list of git redirect variables (AGENTS.md rule 5). Must match the
+// consumers named in git-redirect-env-keys.json's "$comment"; this file loads
+// the JSON rather than restating it. Read at call time from beside this
+// script, so a missing or malformed file throws instead of scrubbing nothing.
+function loadGitRedirectEnvSpec() {
+  const spec = JSON.parse(
+    fs.readFileSync(new URL("./git-redirect-env-keys.json", import.meta.url), "utf8")
+  );
+  if (!Array.isArray(spec.keys) || typeof spec.numberedKeyPattern !== "string") {
+    throw new Error("git-redirect-env-keys.json must carry keys[] and numberedKeyPattern");
+  }
+  return { keys: spec.keys, numbered: new RegExp(spec.numberedKeyPattern, "u") };
+}
+
+// Returns a copy of `env` without any fixed or numbered redirect variable.
+export function withoutGitRedirectEnv(env) {
+  const { keys, numbered } = loadGitRedirectEnvSpec();
+  const out = { ...env };
+  for (const key of Object.keys(out)) {
+    if (keys.includes(key) || numbered.test(key)) delete out[key];
+  }
+  return out;
+}
+
 // Resolve the hooks directory git will ACTUALLY execute from.
 //
 // This is subtler than it looks and the original implementation got it wrong in
@@ -32,27 +56,20 @@ export function resolveHooksDir(root) {
     throw new Error(`Not a git repository: ${root}`);
   }
 
+  // Computed OUTSIDE the try below: an unreadable list must throw here, not be
+  // swallowed by the "git unavailable" catch.
+  // Scrub the repo-scoping GIT_* variables before asking git anything. When
+  // this runs inside a git hook (or any git-invoked subprocess) those are set
+  // and point at the INVOKING repository, so an inherited GIT_DIR would make
+  // `rev-parse` answer for the wrong repo entirely while looking perfectly
+  // healthy; an inherited runtime config (GIT_CONFIG_PARAMETERS or a
+  // GIT_CONFIG_KEY_<n> pair setting core.hooksPath) would do the same to the
+  // hooks path. We want the answer for `root` under its normal config and
+  // nothing else, so the resolution must be driven by cwd alone. Other GIT_*
+  // vars (GIT_EXEC_PATH, GIT_SSH) are left intact: they configure how git
+  // runs, not which repository or config it targets.
+  const env = withoutGitRedirectEnv(process.env);
   try {
-    // Scrub the repo-scoping GIT_* variables before asking git anything. When
-    // this runs inside a git hook (or any git-invoked subprocess) those are set
-    // and point at the INVOKING repository, so an inherited GIT_DIR would make
-    // `rev-parse` answer for the wrong repo entirely while looking perfectly
-    // healthy. We want the answer for `root` and nothing else, so the resolution
-    // must be driven by cwd alone. Other GIT_* vars (GIT_EXEC_PATH, GIT_SSH) are
-    // left intact: they configure how git runs, not which repository it targets.
-    const env = { ...process.env };
-    for (const key of [
-      "GIT_DIR",
-      "GIT_COMMON_DIR",
-      "GIT_WORK_TREE",
-      "GIT_INDEX_FILE",
-      "GIT_OBJECT_DIRECTORY",
-      "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-      "GIT_NAMESPACE",
-      "GIT_PREFIX",
-    ]) {
-      delete env[key];
-    }
     const out = execFileSync("git", ["rev-parse", "--git-path", "hooks"], {
       cwd: root,
       encoding: "utf8",
