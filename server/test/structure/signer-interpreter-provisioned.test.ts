@@ -1,4 +1,4 @@
-// fail-before-exempt: this change witnesses .github/workflows/castle-wall-linux.yml (the root-owned interpreter step before the test-isolation cargo suite), which the server/src rollback never reverts; fail-before was shown by checking out the base workflow file, where the new cargo-job assertion fails.
+// fail-before-exempt: this change witnesses .github/workflows/castle-wall-linux.yml (the root-owned interpreter step and the server build before the test-isolation cargo suite), which the server/src rollback never reverts; fail-before was shown by checking out the base workflow file, where the new cargo-job assertion fails.
 /**
  * Every workflow job that runs the server test suite must first provision the
  * root-owned Node interpreter that the packaged Linux policy signer trusts.
@@ -32,7 +32,7 @@ const PROVISION_COMMAND = 'sudo install -o root -g root -m 0755 "$(command -v no
 // assertion below, which then fails until the job is reviewed and listed.
 const SUITE_COMMAND = /(?:^|[\s;&|(])npm\b[^;&|#]*?\s(?:(?:run|run-script)\s+)?(?:test|tst|t)(?=$|[\s;&|)])/;
 
-type Step = { run?: unknown; if?: unknown };
+type Step = { run?: unknown; if?: unknown; "working-directory"?: unknown };
 type Workflow = { jobs?: Record<string, { steps?: Step[] }> };
 
 /** The executable lines of a step's run script: comment and blank lines removed. */
@@ -103,9 +103,9 @@ describe("packaged signer interpreter is provisioned before every server suite r
   // castle-wall-daemon/tests/helpers/checkpoint-status.ts, which imports test/fixtures/k1-service.ts
   // and hashes /usr/bin/node. PR 1790's hosted run failed one checkpoint test with ENOENT on that
   // path because castle-wall-linux.yml had setup-node but no provisioning step.
-  it("every job running the test-isolation cargo suite provisions the interpreter before it", () => {
+  it("every job running the test-isolation cargo suite provisions the interpreter and builds the server before it", () => {
     const CARGO_ISOLATION = /(?:^|[\s;&|(])cargo\s+test\b.*--features\s+[\w,-]*test-isolation/;
-    const cargoJobs: Array<{ job: string; provisioned: boolean }> = [];
+    const cargoJobs: Array<{ job: string; provisioned: boolean; built: boolean }> = [];
     for (const file of readdirSync(workflowsDir).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"))) {
       const workflow = (loadYaml(readFileSync(join(workflowsDir, file), "utf8")) ?? {}) as Workflow;
       for (const [job, body] of Object.entries(workflow.jobs ?? {})) {
@@ -114,10 +114,14 @@ describe("packaged signer interpreter is provisioned before every server suite r
         if (at < 0) continue;
         const provisioned = steps.slice(0, at).some((s) => s.if === undefined
           && commandLines(s).length === 1 && commandLines(s)[0] === PROVISION_COMMAND);
-        cargoJobs.push({ job: `${file}#${job}`, provisioned });
+        // The fixture also runs the built worker (dist/k1/signing-worker.cjs), so an unconditional server build
+        // must precede the cargo step; PR 1790's second hosted run failed with ENOENT on that file.
+        const built = steps.slice(0, at).some((s) => s.if === undefined && s["working-directory"] === "server"
+          && commandLines(s).length === 1 && commandLines(s)[0] === "npm run build");
+        cargoJobs.push({ job: `${file}#${job}`, provisioned, built });
       }
     }
-    expect(cargoJobs).toEqual([{ job: "castle-wall-linux.yml#castle-wall-linux-integration", provisioned: true }]);
+    expect(cargoJobs).toEqual([{ job: "castle-wall-linux.yml#castle-wall-linux-integration", provisioned: true, built: true }]);
     expect(readFileSync(join(repoRoot, "castle-wall-daemon", "tests", "helpers", "checkpoint-status.ts"), "utf8"))
       .toContain("server/test/fixtures/k1-service.js");
   });

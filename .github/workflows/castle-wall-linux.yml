@@ -117,6 +117,14 @@ jobs:
           npm ci --prefix server --ignore-scripts
           bash scripts/smb/release-hook-scan.sh
 
+      - name: Build the server for the real-signer checkpoint fixture
+        # Must match the dist/k1/signing-worker.cjs path in server/test/fixtures/k1-service.ts
+        # and the build pin in server/test/structure/signer-interpreter-provisioned.test.ts.
+        # Seen from outside when missing: the cargo step fails one checkpoint test with
+        # "ENOENT ... open '.../server/dist/k1/signing-worker.cjs'" while every other suite passes.
+        working-directory: server
+        run: npm run build
+
       - name: Verify nft binary available
         run: |
           which nft
