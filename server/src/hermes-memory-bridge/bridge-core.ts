@@ -95,6 +95,15 @@ export interface HermesBridgeAuditRecord {
   readonly reason?: string;
 }
 
+/**
+ * The audit principal string the bridge writes as `agent_id` for one agent id.
+ * One source for the bridge's own rows and for every reader that matches them.
+ */
+export function hermesBridgeAuditPrincipal(agentId: string): string {
+  // Must match the agent: form of callerIdentity in server/src/router.ts.
+  return `agent:${agentId}`;
+}
+
 export interface HermesBridgeCorePorts {
   readonly writeFrame: (input: NodeToRelayInput) => void;
   /**
@@ -797,8 +806,7 @@ export class HermesBridgeCore {
 
   private auditPrincipal(): { agent_id: string; requester_verified: false } {
     return {
-      // Must match the agent: form of callerIdentity in server/src/router.ts.
-      agent_id: `agent:${this.ports.agentId}`,
+      agent_id: hermesBridgeAuditPrincipal(this.ports.agentId),
       // The agent id is relay-pinned and uid-checked; the calling process, session and turn are not verified.
       requester_verified: false,
     };

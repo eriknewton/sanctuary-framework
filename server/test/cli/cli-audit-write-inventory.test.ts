@@ -66,6 +66,22 @@ describe("CLI audit-write inventory", () => {
     expect(taskCreate!.classification).toBe("mutator");
   });
 
+  it("classifies the hermes owner verbs: delete audits, report and show are read-only", () => {
+    const entries = loadInventory();
+    const byName = new Map(entries.map((entry) => [entry.subcommand, entry]));
+    expect(byName.get("sanctuary hermes memory-delete")).toMatchObject({ classification: "mutator", audits_currently: true,
+      file_path: "src/cli/hermes-memory.ts" });
+    for (const verb of ["memory-report", "memory-show"]) {
+      expect(byName.get(`sanctuary hermes ${verb}`)).toMatchObject({ classification: "read-only", audits_currently: null,
+        file_path: "src/cli/hermes-memory.ts" });
+    }
+    const hermes = entries.filter((entry) => entry.subcommand.startsWith("sanctuary hermes "));
+    expect(hermes.map((entry) => entry.subcommand).sort()).toEqual([
+      "sanctuary hermes memory-delete", "sanctuary hermes memory-report", "sanctuary hermes memory-show",
+    ]);
+    expect(hermes.every((entry) => !entry.notes.includes("review needed"))).toBe(true);
+  });
+
   it("classifies sanctuary did-web rotate-key as mutator with audit", () => {
     const entries = loadInventory();
     const rotateKey = entries.find(

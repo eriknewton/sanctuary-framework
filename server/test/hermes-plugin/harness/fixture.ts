@@ -19,6 +19,7 @@ import { AuditLog } from "../../../src/operational/audit-log.js";
 import { memoryProvenancePublicKeyFingerprint } from "../../../src/sdw/memory-provenance-bad-signers.js";
 import { SdwDocumentCorpusStore, padChunkOrdinal } from "../../../src/sdw/document-corpus-store.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
+import type { StorageBackend } from "../../../src/storage/interface.js";
 import { persistUserProvidedPassphrase } from "../../../src/wrap/passphrase.js";
 const PASS = "correct horse battery staple hermes";
 const encoder = new TextEncoder();
@@ -26,14 +27,16 @@ const cleanups: Array<() => Promise<void>> = [];
 let fortressCounter = 0;
 const run = promisify(execFile);
 export type Fixture = Awaited<ReturnType<typeof startFixture>>;
-export async function startFixture() {
+// A caller may wrap the bridge's own storage (for example to hold it); the fixture's audit and corpus reads stay unwrapped.
+export async function startFixture(options: { wrapStorage?: (storage: StorageBackend) => StorageBackend } = {}) {
   const close = async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); };
   try {
     const seed = await seededFortress("plugin");
     const pair = await socketPair();
     const ready = readNodeFrame(pair.relay);
     const shell = await runHermesBridgeProcess({ env: seed.env, relaySocketFactory: () => pair.shell,
-      storageFor: path => new FilesystemStorage(join(path, "state")), uid: process.getuid?.() ?? 0 });
+      storageFor: path => (options.wrapStorage ?? (storage => storage))(new FilesystemStorage(join(path, "state"))),
+      uid: process.getuid?.() ?? 0 });
     cleanups.push(async () => { shell.signalStop("SIGTERM"); await shell.exited; });
     expect(await ready).toEqual({ type: "ready" });
     const storage = new FilesystemStorage(join(seed.fortressDir, "state"));
@@ -117,6 +120,7 @@ export async function startFixture() {
         }
         return texts.join("");
       },
+      documentTags: async (id: string) => (await corpus.getDocument(id))?.tags ?? [],
       session: async (interpreter: string, scenario: string): Promise<Record<string, any>> => {
         const home = await tempHome("session");
         const { stdout } = await run(interpreter, ["-I", "-B", resolve("../hermes-plugin/tests/harness/drive_hermes.py"),

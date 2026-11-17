@@ -7,6 +7,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RECALL_PREFETCH_BUDGET_MS } from "../../src/hermes-memory-bridge/recall.js";
+import { hermesBridgePassageTextDigest } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { startFixture, type Fixture } from "./harness/fixture.js";
 
 const python = process.env.SANCTUARY_HERMES_PYTHON;
@@ -17,6 +18,12 @@ const digest = (text: string) => createHash("sha256").update(text).digest("hex")
 const refusal = { outcome: "unavailable", message: "This is not available yet; nothing was done." };
 const denied = { outcome: "denied", message: "Request denied." };
 const runsRequired = 5; // Five independent cold processes are the timing sample.
+// Must match FACT, ASSISTANT_TOKEN and TOOL_TOKEN in hermes-plugin/tests/harness/drive_hermes.py.
+const captureFact = "FYI, the Lisbon demo for Jamie is set for Thursday at 3pm.";
+const assistantToken = "assistant-token-5f1c";
+const toolToken = "tool-token-9b3e";
+// Must match CAPTURE_TAG in hermes-plugin/sanctuary_memory/__init__.py.
+const captureTag = "turn-capture";
 const assertNoSessionSearch = (report: Record<string, unknown>) => {
   expect(Array.isArray(report.executed_tools)).toBe(true);
   expect(report.executed_tools).not.toContain("session_search");
@@ -78,6 +85,58 @@ describe.skipIf(!python)("Hermes persistent memory through the installed plugin 
     }
     console.info("Cold recall measurements:", JSON.stringify({ runs }));
 
+    // A plain fact with no save wording is saved by completed-turn capture, with no remember call.
+    const captured = await fixture.session(python!, "capture");
+    expect(captured.capture_prompt).toBe(true);
+    expect(captured.executed_tools).toContain("read_file");
+    expect(captured.executed_tools).not.toContain("remember");
+    expect(captured.turns.fact.flushed).toBe(true);
+    // The assistant reply and the tool result reached the model but never a capture frame.
+    expect(captured.tool_token_reached_model).toBe(true);
+    expect(captured.insert_lines_text).toContain(captureFact);
+    expect(captured.insert_lines_text).not.toContain(assistantToken);
+    expect(captured.insert_lines_text).not.toContain(toolToken);
+    expect(captured.turns.fact.inserts).toEqual([{ text: captureFact, taint: "user_content", tags: [captureTag] }]);
+    // A quoted reply, an @ expansion and an interrupted turn are never captured.
+    expect(captured.expanded_has_marker).toBe(true);
+    for (const label of ["reply_quote", "at_reference", "interrupted"]) {
+      expect(captured.turns[label].flushed, label).toBe(true);
+      expect(captured.turns[label].inserts, label).toEqual([]);
+    }
+    expect(captured.turns.interrupted.interrupted).toBe(true);
+    const captureRows = (await fixture.audit()).filter(row => row.details?.text_sha256 === hermesBridgePassageTextDigest(captureFact));
+    expect(captureRows.map(row => row.details?.kind)).toEqual(["insert_admitted"]);
+    const capturedPassage = String(captureRows[0]!.details!.passage_id);
+    const capturedDocument = String(captureRows[0]!.details!.document_id);
+    expect(await fixture.document(capturedDocument)).toBe(captureFact);
+    expect(await fixture.documentTags(capturedDocument)).toEqual([captureTag]);
+    // Scoped to this capture's own entry: from its admission on, no refusal or unconfirmed row names that entry and no latch
+    // row exists. Entry ids are numbered per bridge process, so rows are read from the admission onward, never before it.
+    const captureEntry = String(captureRows[0]!.details!.entryId);
+    expect(captureEntry).toMatch(/^hermes-entry-/);
+    const auditAfterCapture = await fixture.audit();
+    const admittedAt = auditAfterCapture.findIndex(row => row.details?.kind === "insert_admitted" &&
+      row.details?.text_sha256 === hermesBridgePassageTextDigest(captureFact));
+    expect(admittedAt).toBeGreaterThanOrEqual(0);
+    const sinceCapture = auditAfterCapture.slice(admittedAt);
+    expect(sinceCapture.filter(row => row.details?.entryId === captureEntry).map(row => row.details?.kind)).toEqual(["insert_admitted"]);
+    expect(sinceCapture.filter(row => row.details?.kind === "latch")).toEqual([]);
+
+    // A fresh process recalls the captured fact through Sanctuary, not session search; the question itself is not captured.
+    const recalledCapture = await fixture.session(python!, "capture-recall");
+    expect(recalledCapture.turns.question.inserts).toEqual([]);
+    expect(recalledCapture.fact_reached_model).toBe(true);
+    assertNoSessionSearch(recalledCapture);
+    const captureRecall = (await fixture.audit()).filter(row => row.details?.kind === "memory_recall" && (row.details?.passage_ids as string[]).includes(capturedPassage));
+    expect(captureRecall).toHaveLength(1);
+    expect(captureRecall[0]!.details!.truncated).toBe(false);
+
+    // A cron-platform agent with memory on neither captures nor is told it does.
+    const cron = await fixture.session(python!, "capture-cron");
+    expect(cron.turns.cron.flushed).toBe(true);
+    expect(cron.turns.cron.inserts).toEqual([]);
+    expect(cron.capture_prompt).toBe(false);
+
     for (const interpreter of [python!, ...(python019 ? [python019] : [])]) {
       if (interpreter === python019) {
         const report = await fixture.session(interpreter, "loading");
@@ -121,5 +180,5 @@ describe.skipIf(!python)("Hermes persistent memory through the installed plugin 
         await writeFile(join(process.env.SANCTUARY_PLUGIN_EVIDENCE_DIR, "directive-orders.json"), JSON.stringify(observations));
       }
     }
-  }, 240_000); // Two Hermes versions and independent cold processes share a four-minute outer bound.
+  }, 420_000); // Two Hermes versions, independent cold processes and three capture sessions share a seven-minute outer bound.
 });

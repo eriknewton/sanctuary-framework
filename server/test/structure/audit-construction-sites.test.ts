@@ -10,6 +10,8 @@ const sourceRoot = fileURLToPath(new URL("../../src/", import.meta.url));
 const reviewedFiles = [
   "cli/audit-chain-repair-plan.ts",
   "cli/castle-wall.ts",
+  // The hermes owner verbs' declared read-only reader reports chain findings instead of throwing them.
+  "cli/hermes-memory.ts",
   "operational/audit-store-split.ts",
   "wrap/cli.ts",
   "wrap/init.ts",

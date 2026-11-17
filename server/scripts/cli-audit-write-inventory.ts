@@ -235,6 +235,11 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "castle-wall reset-full": { classification: "mutator", auditOverride: false, notes: "unloads the bound launchd job, removes fortress supervision counter and temp state, then bootstraps" },
   "castle-wall full-status": { classification: "read-only", auditOverride: false, notes: "reads the fortress supervision counter and bound launchd job" },
 
+  // ---- hermes owner verbs (cli/hermes-memory.ts; run with the memory relay stopped) ----
+  "hermes memory-report": { classification: "read-only", notes: "read-only reader over ReadOnlyStorageGuard and a readOnly AuditLog; --out writes one new 0600 report file outside the fortress" },
+  "hermes memory-show":   { classification: "read-only", notes: "read-only reader over ReadOnlyStorageGuard; terminal output only" },
+  "hermes memory-delete": { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical hermes_memory_owner_delete intent row before deletePassage, then one terminal outcome row" },
+
   // ---- exit ----
   "exit export":        { classification: "mutator", auditOverride: true, notes: "AuditLog.append in exit export handler" },
   "exit verify":        { classification: "read-only" },
@@ -289,6 +294,7 @@ function deriveParentCommand(filePath: string): string | null {
   if (base.endsWith("cli/reset-passphrase")) return "reset-passphrase";
   if (base.endsWith("cli/audit-chain-export")) return "audit-chain";
   if (base.endsWith("cli/audit-chain-verify")) return "audit-chain";
+  if (base.endsWith("cli/hermes-memory")) return "hermes";
   if (base.endsWith("exit/cli")) return "exit";
   if (base.endsWith("honeypot/cli")) return "honeypot";
   if (base.endsWith("templates/cli")) return "template";

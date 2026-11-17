@@ -3,6 +3,7 @@ import { lstat, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { CUSTODY_RELEASE_FAILURE_MESSAGE } from "./custody-release-message.js";
 import { consumeFlagValue } from "./argv.js";
+import { isSshSession } from "./ssh-session.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import {
   CUSTODY_WRITE_LOCK_NAMESPACE, MASTER_ROTATION_BARRIER_NAME,
@@ -26,8 +27,14 @@ import { CrossProcessLockError, withExclusiveMasterRotationBarrier } from "../st
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { EXIT_IMPORT_JOURNAL_NAMESPACE, hasInterruptedExitImport } from "../storage/exit-import-journal.js";
 import { ReadOnlyStorageGuard } from "../storage/read-only-guard.js";
+import { resolveHostLocalBootCredential } from "../wrap/custody-credential.js";
 
-const HELP = "Usage: sanctuary hermes recover-save --fortress <dir> [--apply] [--passphrase <value>] [--json]\nReport an unfinished save; --apply keeps a verified save or rolls back an unpublished save.\n";
+const HELP = "Usage: sanctuary hermes recover-save --fortress <dir> [--apply] [--passphrase <value>] [--json]\n" +
+  "Report an unfinished save; --apply keeps a verified save or rolls back an unpublished save.\n" +
+  "Without --passphrase, SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY it opens the fortress with this Mac's keychain item\n" +
+  "or stored passphrase; a recovery key offered beside one of those is refused.\n" +
+  "Over SSH it never asks the keychain, whose prompt would wait on the Mac's screen: give one of those sources,\n" +
+  "or run it at the Mac's own keyboard. Over SSH a recovery key is used as given, without that refusal.\n";
 const UNCLASSIFIED = "The save could not be classified and nothing was changed.";
 
 // Sixteen examined entries bound both nested causes and wide aggregates, including repeated references.
@@ -140,21 +147,54 @@ export async function runHermesRecoverSave(options: {
     // A missing or unsafe fortress must refuse before lock resolution can create its namespace.
     const meta = await lstat(storage.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE));
     if (!meta.isDirectory() || meta.isSymbolicLink()) throw new Error(UNCLASSIFIED);
-    // The existing exclusive side excludes all lifetime bridge leases and blocks new admission through recovery.
+    // The existing exclusive side excludes all lifetime bridge leases and blocks new admission through recovery;
+    // without kernel coordinates it would exclude nothing, so admission must be kernel-backed.
     return await withExclusiveMasterRotationBarrier(storage, CUSTODY_WRITE_LOCK_NAMESPACE,
       MASTER_ROTATION_BARRIER_NAME, () => recordCallbackReturn(async () => {
         // Admission is the barrier running this callback; anything thrown after it is not a custody refusal.
         admitted = true;
         const readonlyStorage = new ReadOnlyStorageGuard(storage);
         const credential = passphrase.value ?? env.SANCTUARY_PASSPHRASE;
-        if (!credential && !env.SANCTUARY_RECOVERY_KEY) {
-          err.write("Recovery requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n");
-          return 1;
+        let source: { passphrase: string } | { recoveryKey: string } | { keychainKey: Uint8Array };
+        if (credential) source = { passphrase: credential };
+        else if (isSshSession(env)) {
+          // Over SSH the keychain resolver is never called, so an explicit source behaves exactly as before
+          // host-local custody existed. The both-offered refusal needs that resolver and is skipped here: over
+          // SSH a recovery key in the environment is used without checking for a host-local credential beside it.
+          if (!env.SANCTUARY_RECOVERY_KEY) {
+            err.write("Over SSH, recover-save needs --passphrase, SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY; " +
+              "run it at the Mac's own keyboard to use this Mac's keychain item or stored passphrase. Nothing was changed.\n");
+            return 1;
+          }
+          source = { recoveryKey: env.SANCTUARY_RECOVERY_KEY };
+        } else {
+          // Same custody steps as the hermes owner verbs: host-local sources only, never a mint.
+          const resolved = await resolveHostLocalBootCredential({ storage: readonlyStorage, storagePath, home: env.HOME });
+          const hostLocal = resolved.kind === "keychain-key" || resolved.kind === "passphrase";
+          if (resolved.kind === "virgin") {
+            err.write("This fortress has no custody to open; nothing was changed.\n");
+            return 1;
+          }
+          if (hostLocal && env.SANCTUARY_RECOVERY_KEY) {
+            // Two offered sources are ambiguous custody; refuse rather than choose one.
+            if (resolved.kind === "keychain-key") resolved.key.fill(0);
+            err.write("A keychain item or stored passphrase already opens this fortress; unset SANCTUARY_RECOVERY_KEY. Nothing was changed.\n");
+            return 1;
+          }
+          if (env.SANCTUARY_RECOVERY_KEY) source = { recoveryKey: env.SANCTUARY_RECOVERY_KEY };
+          else if (resolved.kind === "keychain-key") source = { keychainKey: resolved.key };
+          else if (resolved.kind === "passphrase") source = { passphrase: resolved.value };
+          else {
+            err.write("Recovery requires this Mac's keychain item or stored passphrase, SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n");
+            return 1;
+          }
         }
-        const masterKey = await unlockExistingMasterReadOnly(readonlyStorage, {
-          ...(credential ? { passphrase: credential } : { recoveryKey: env.SANCTUARY_RECOVERY_KEY! }),
-          storagePathHint: storagePath,
-        });
+        let masterKey: Uint8Array;
+        try {
+          masterKey = await unlockExistingMasterReadOnly(readonlyStorage, { ...source, storagePathHint: storagePath });
+        } finally {
+          if ("keychainKey" in source) source.keychainKey.fill(0);
+        }
         try {
           const auditLog = new AuditLog(storage, masterKey);
           if (apply) {
@@ -220,7 +260,7 @@ export async function runHermesRecoverSave(options: {
           out.write(json ? JSON.stringify({ state, outcome, records_removed: removed }) + "\n" : `${state}; ${outcome}; records removed: ${removed}.\n`);
           return 0;
         } finally { masterKey.fill(0); }
-      }), { timeoutMs: 0 }); // Zero wait: an active writer is an immediate refusal, never an invitation to run beside it.
+      }), { timeoutMs: 0, requireKernelAdmission: true }); // Zero wait: an active writer is an immediate refusal, never an invitation to run beside it.
   } catch (cause) {
     // Admission diagnostics have no audit authority and must not label post-admission failures, in report or apply mode, as refusals.
     if (!admitted) {

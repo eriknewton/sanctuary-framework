@@ -47,9 +47,14 @@ def main():
         if not line.strip():
             continue
         record({"insert_bytes": "memory_insert" in line})
+        if scenario.get("record_lines"):
+            record({"line": line})
         request = json.loads(line)
         method = request["method"]
-        record({"method": method, "name": request.get("params", {}).get("name"), "id": request.get("id")})
+        arguments = request.get("params", {}).get("arguments") or {}
+        # Tags and taint are labels, never content, so recording them keeps the log free of private text.
+        record({"method": method, "name": request.get("params", {}).get("name"), "id": request.get("id"),
+                "tags": arguments.get("tags"), "taint": arguments.get("taint")})
         if method == "notifications/initialized":
             continue
         if method == "initialize":
@@ -64,6 +69,15 @@ def main():
             steps = scenario.get("steps", [])
             step = steps[min(index, len(steps) - 1)] if steps else {}
             index += 1
+            name = request["params"].get("name")
+            if name in scenario.get("replies", {}):
+                step = {"value": scenario["replies"][name]}
+            # The first tagged insert across every spawn stalls once; the marker file outlives the killed process.
+            stall = scenario.get("tagged_stall")
+            if stall and arguments.get("tags") and not Path(stall["marker"]).exists():
+                Path(stall["marker"]).write_text("stalled")
+                time.sleep(stall["seconds"])
+                record({"replied": request["id"], "after_stall": True})
             if step.get("delay"):
                 time.sleep(step["delay"])
             action = step.get("action")
