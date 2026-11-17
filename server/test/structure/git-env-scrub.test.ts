@@ -21,16 +21,17 @@ const repoRoot = path.resolve(serverDir, "..");
 const SETUP_ENTRY = "./test/setup/git-env-scrub.ts";
 const cleanup: string[] = [];
 
-function cleanEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+/** The parent environment (VITEST included) minus git's redirect variables, with no user or system git config. */
+function cleanEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
   for (const k of GIT_REDIRECT_ENV_KEYS) delete env[k];
   return env;
 }
 function git(args: string[], cwd: string): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", env: cleanEnv() }).trim();
+  return execFileSync("git", args, { cwd, encoding: "utf8", env: cleanEnv(process.env) }).trim();
 }
 function bare(repo: string): string {
-  const r = spawnSync("git", ["config", "--get", "core.bare"], { cwd: repo, encoding: "utf8", env: cleanEnv() });
+  const r = spawnSync("git", ["config", "--get", "core.bare"], { cwd: repo, encoding: "utf8", env: cleanEnv(process.env) });
   return r.stdout.trim();
 }
 
