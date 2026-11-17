@@ -1,3 +1,4 @@
+// fail-before-exempt: this change witnesses .github/workflows/castle-wall-linux.yml (the root-owned interpreter step before the test-isolation cargo suite), which the server/src rollback never reverts; fail-before was shown by checking out the base workflow file, where the new cargo-job assertion fails.
 /**
  * Every workflow job that runs the server test suite must first provision the
  * root-owned Node interpreter that the packaged Linux policy signer trusts.
