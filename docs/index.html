@@ -7,14 +7,14 @@ layout: null
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sanctuary: your AI should answer to you</title>
-<meta name="description" content="Open-source software that keeps your AI agent answerable to you: keys and memory on your machine, connection rules you sign, approvals for the actions you choose, and a record you can check. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64), the latter through the separate Castle Wall Linux package.">
+<meta name="description" content="Open-source software that keeps your AI agent answerable to you: keys on your machine, encrypted storage for what it keeps through Sanctuary, connection rules you sign, approvals for the actions you choose, and a record you can check. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64), the latter through the separate Castle Wall Linux package.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#FFFFFF">
 <link rel="canonical" href="https://sanctuaryprotocol.ai/">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, with keys only you hold. Enforcement is proven on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven for the separate Castle Wall Linux package; Windows is roadmapped. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Open-source software that keeps your AI agent answerable to you: keys on your machine, encrypted storage for what it keeps through Sanctuary, connection rules you sign, approvals for the actions you choose, and a record you can check. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64), the latter through the separate Castle Wall Linux package. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -235,7 +235,7 @@ Sanctuary</a>
 <main id="main">
 <section class="hero"><div class="wrap">
   <h1>Your AI should answer to you. <span>Only you.</span></h1>
-  <p class="lede">AI agents are starting to act with your data, your keys, your money and your name, on systems someone else controls. Sanctuary is the open-source ground they stand on: keys and memory that stay on your machine, connection rules you sign, a human yes for the actions you choose, and a record you can check.</p>
+  <p class="lede">AI agents are starting to act with your data, your keys, your money and your name, on systems someone else controls. Sanctuary is the open-source ground they stand on: keys that stay on your machine, encrypted storage for what it keeps through Sanctuary, connection rules you sign, a human yes for the actions you choose, and a record you can check.</p>
   <p class="actions"><a class="btn primary" href="#h-start">Install</a><a class="btn ghost" href="#h-answer">How it works</a></p>
 </div></section>
 
@@ -246,7 +246,7 @@ Sanctuary</a>
 
 <section class="s" aria-labelledby="h-problem"><div class="wrap split">
   <div><p class="label eyebrow">The problem</p><h2 id="h-problem">One bad web page can turn your agent against you.</h2></div>
-  <div class="prose"><p>Say you give an assistant your email, your files, your logins and a card for paying bills. It answers mail, sorts documents and pays what is due while you get on with your day.</p><p>Then it opens a page someone wrote for it, with instructions hidden in the text: send these files here, use the card, say nothing. The agent cannot tell those words from yours, so it does what they say, with everything you trusted it to hold.</p><p class="turn">A safeguard inside the agent holds only while the agent stays on your side. A safeguard run by some company asks you to trust that company. Sanctuary puts yours on your own machine, where the agent cannot talk its way past it.</p></div>
+  <div class="prose"><p>Say you give an assistant your email, your files, your logins and a card for paying bills. It answers mail, sorts documents and pays what is due while you get on with your day.</p><p>Then it opens a page someone wrote for it, with instructions hidden in the text: send these files here, use the card, say nothing. The agent cannot tell those words from yours, so it does what they say, with everything you trusted it to hold.</p><p class="turn">A safeguard inside the agent holds only while the agent stays on your side. A safeguard run by some company asks you to trust that company. Sanctuary puts yours on your own machine, below the agent, where it does not depend on the agent's cooperation.</p></div>
 </div></section>
 
 <section class="s tint" aria-labelledby="h-answer"><div class="wrap">
@@ -254,8 +254,8 @@ Sanctuary</a>
   <h2 id="h-answer">Four promises, kept on your machine.</h2>
   <ul class="promises">
 <li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="7.5" cy="12" r="3.75"/><path d="M11.25 12H21M17.5 12v3.25M21 12v2.5"/></svg></span><p class="label">Keys</p><h3>You hold the keys.</h3><p>Your agent's keys are made on your machine and locked under your passphrase, and the project keeps no copy.</p></li>
-<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="2.5"/><path d="M5 6v12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg></span><p class="label">Memory</p><h3>You keep the memory.</h3><p>What your agent stores stays encrypted on your machine, readable only with your keys.</p></li>
-<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 12h11M11 8.5l3.5 3.5-3.5 3.5"/><path d="M19.5 5v14" stroke-width="2.25"/></svg></span><p class="label">Connections</p><h3>You decide where it connects.</h3><p>With the wall armed on macOS or Ubuntu 24.04, your agent's account connects only where a policy you signed allows. Actions you mark for approval wait for your yes.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="2.5"/><path d="M5 6v12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5"/></svg></span><p class="label">Memory</p><h3>You keep the memory.</h3><p>What your agent stores through Sanctuary is encrypted at rest on your machine, readable only with your keys. Files it writes by other means are outside that.</p></li>
+<li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 12h11M11 8.5l3.5 3.5-3.5 3.5"/><path d="M19.5 5v14" stroke-width="2.25"/></svg></span><p class="label">Connections</p><h3>You decide where it connects.</h3><p>With the wall armed on macOS or Ubuntu 24.04, a policy you signed allows or refuses each destination for the agent's own account. Actions you mark for approval wait for your yes.</p></li>
 <li><span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="9.5" width="5" height="5" rx="1"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><rect x="16.5" y="9.5" width="5" height="5" rx="1"/><path d="M7.5 12h2M14.5 12h2"/></svg></span><p class="label">Record</p><h3>You can check what happened.</h3><p>Sanctuary writes what your agent does through it into a hash-chained record. Checking that record for tampering is still rated partial.</p></li>
 </ul>
   <div class="bound"><p class="label">Where these stop today</p><p>The connection rules cover a separate account you create for the agent, and decide where it may connect, not what an allowed connection carries. The approval step covers only tool calls that go through Sanctuary, so a harness's own built-in tools skip it, and whatever the agent sends to its AI model can be seen by that model's provider.</p></div>
@@ -270,18 +270,18 @@ Sanctuary</a>
   </div>
   <div class="row wide">
     <div class="txt"><h3>Check the record yourself.</h3><p>Each entry is chained to the one before it, and the console checks the chain and reports what it finds. This check is still rated partial; the evidence page says what it covers.</p></div>
-    <figure class="shot"><img src="/assets/home/detail-chain-verified.png" width="2331" height="220" alt="Detail of the record check: Chain verified. Routine entries verified clean; 0 integrity findings for the whole chain." loading="lazy"><figcaption>The record check, as the console shows it.</figcaption></figure>
+    <figure class="shot"><picture><source media="(max-width: 600px)" srcset="/assets/home/detail-chain-verified-sm.png"><img src="/assets/home/detail-chain-verified.png" width="2331" height="220" alt="Detail of the record check: Chain verified. Routine entries verified clean; 0 integrity findings for the whole chain." loading="lazy"></picture><figcaption>The record check, as the console shows it.</figcaption></figure>
   </div>
 </div></section>
 
 <section class="s tint" id="layers" aria-labelledby="h-diff"><div class="wrap">
   <p class="label eyebrow">Why it is different</p>
   <h2 id="h-diff">It sits beneath the agent, on ground you own.</h2>
-  <dl class="diff"><div><dt>Below the agent</dt><dd>On macOS and Ubuntu 24.04, your operating system enforces the connection rules underneath the agent, so an agent that has been tricked cannot switch them off.</dd></div><div><dt>On your own machine</dt><dd>It runs on hardware you control. There is nothing to sign up for and no account with us.</dd></div><div><dt>No vendor in the middle</dt><dd>No company holds your keys or a copy of what you store, the author included.</dd></div><div><dt>Open source</dt><dd>Every line is public under Apache-2.0, so you, or anyone you trust, can read what it does.</dd></div></dl>
+  <dl class="diff"><div><dt>Below the agent</dt><dd>On macOS and Ubuntu 24.04, with the wall armed, your operating system enforces the connection rules underneath the agent, so they do not depend on the agent's cooperation.</dd></div><div><dt>On your own machine</dt><dd>It runs on hardware you control. There is nothing to sign up for and no account with us.</dd></div><div><dt>No vendor in the middle</dt><dd>No company holds your keys or a copy of what you store, the author included.</dd></div><div><dt>Open source</dt><dd>Every line is public under Apache-2.0, so you, or anyone you trust, can read what it does.</dd></div></dl>
 </div></section>
 
 <section class="s" aria-labelledby="h-status"><div class="wrap status">
-  <div><p class="label eyebrow">Where it runs</p><h2 class="status-line" id="h-status">Keys, approvals and the record run on macOS and Linux. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64). Windows is not yet supported.</h2><p class="more-p">The macOS proof covers one host and one OS version: a signed policy that allows and denies per agent account and survives reboots, not a per-rule, per-flow log. On Ubuntu the connection rules come as the separate Castle Wall Linux 0.1.0-1 pre-release, proven on fresh installs. The record's tamper check, checking it from another machine, and taking your data with you are still partial. The evidence page shows what is proven, on which build, and what is not.</p><a class="more" href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">See the evidence</a></div>
+  <div><p class="label eyebrow">Where it runs</p><h2 class="status-line" id="h-status">Keys, approvals and the record run on macOS and Linux. The connection rules are proven on macOS and on Ubuntu 24.04 (x86-64). Windows is not yet supported.</h2><p class="more-p">The macOS proof covers one host and one OS version: a signed policy that allows and denies per agent account and survives attended reboot cycles, not a per-rule, per-flow log; unattended reboot survival is unproven. On Ubuntu the connection rules come as the separate Castle Wall Linux 0.1.0-1 pre-release, proven on fresh installs with a test program; real agent harnesses, injected faults and some rule forms are not yet proven there. The record's tamper check, checking it from another machine, and taking your data with you are still partial. The evidence page shows what is proven, on which build, and what is not.</p><a class="more" href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">See the evidence</a></div>
   <table class="plats"><thead><tr><th scope="col">Platform</th><th scope="col">Keys, approvals, record</th><th scope="col">Connection rules</th></tr></thead><tbody><tr><th scope="row">macOS</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip good"><i></i>PROVEN</span></td></tr><tr><th scope="row">Ubuntu 24.04 (x86-64)</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip good"><i></i>PROVEN</span></td></tr><tr><th scope="row">Other Linux</th><td><span class="chip good"><i></i>RUNS</span></td><td><span class="chip neutral"><i></i>NOT PROVEN</span></td></tr><tr><th scope="row">Windows</th><td><span class="chip neutral"><i></i>NOT YET</span></td><td><span class="chip neutral"><i></i>NOT YET</span></td></tr></tbody></table>
 </div></section>
 
