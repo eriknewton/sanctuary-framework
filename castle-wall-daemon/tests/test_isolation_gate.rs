@@ -1090,6 +1090,23 @@ fn gated_field_preserves_the_following_production_implementation() {
 }
 
 #[test]
+fn real_signer_checkpoint_status_runs_unprivileged_with_exact_count() {
+    // Must match the #[ignore] in tests/support/checkpoint.rs: the root suite skips the case, so this step is its only run.
+    let workflow =
+        std::fs::read_to_string(crate_root().join("../.github/workflows/castle-wall-linux.yml"))
+            .unwrap();
+    let command = "        run: cargo test --locked --features test-isolation --test linux_business_append_foundations checkpoint::real_null_status_refuses_genesis_and_settled_with_populated_controls -- --ignored 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'\n";
+    assert_eq!(workflow.matches(command).count(), 1);
+    let at = workflow.find(command).unwrap();
+    let step = &workflow[workflow[..at].rfind("      - name: ").unwrap()..at];
+    assert!(
+        !step.contains("sudo"),
+        "the real signer checkpoint status step must not run as root"
+    );
+    assert!(step.contains("working-directory: castle-wall-daemon"));
+}
+
+#[test]
 fn signed_append_workflow_selection_has_exact_count() {
     let workflow =
         std::fs::read_to_string(crate_root().join("../.github/workflows/castle-wall-linux.yml"))

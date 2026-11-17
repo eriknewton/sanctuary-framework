@@ -2002,6 +2002,10 @@ fn checkpoint_bind_failure_is_immediately_terminal() {
 }
 
 #[test]
+// Must match the "Exercise the real signer checkpoint status, unprivileged" step in .github/workflows/castle-wall-linux.yml.
+// The fixture signer runs as the invoking user; as root it applies the production host and ownership checks, which a
+// hosted runner does not meet, so the root suite skips this case and the unprivileged step runs it with an exact count.
+#[ignore = "run unprivileged by its own castle-wall-linux step"]
 fn real_null_status_refuses_genesis_and_settled_with_populated_controls() {
     use castle_wall_daemon::business_profile::signer_client::StatusReply;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

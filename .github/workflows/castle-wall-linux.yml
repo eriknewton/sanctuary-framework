@@ -251,6 +251,14 @@ jobs:
           cargo test --locked --features test-isolation --test linux_business_signed_append signed_append::business_ -- --ignored --test-threads=1 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 7 passed; 0 failed; 0 ignored;'
           cargo test --locked --features test-isolation --test linux_business_signed_append signed_append::delivery_ -- --include-ignored --test-threads=1 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 4 passed; 0 failed; 0 ignored;'
 
+      - name: Exercise the real signer checkpoint status, unprivileged
+        working-directory: castle-wall-daemon
+        # Must match the #[ignore] on real_null_status_refuses_genesis_and_settled_with_populated_controls
+        # in castle-wall-daemon/tests/support/checkpoint.rs. The fixture signer runs as the invoking user here;
+        # under the root suite it applies the production host and ownership checks, which a hosted runner
+        # does not meet. Seen from outside when run as root: "fixture service not ready: K1_REFUSED".
+        run: cargo test --locked --features test-isolation --test linux_business_append_foundations checkpoint::real_null_status_refuses_genesis_and_settled_with_populated_controls -- --ignored 2>&1 | tee /dev/stderr | grep -Eq '^test result. ok. 1 passed; 0 failed; 0 ignored;'
+
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
         # 43 = 1.8x (the cold-cache allowance this bound has always carried) the
