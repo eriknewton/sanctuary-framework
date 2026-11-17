@@ -579,7 +579,7 @@ async function promptRecoveryKey(stdin: RawModeStdin, err: Writer, timeoutMs: nu
 async function composeOwnerAdapter(
   storage: StorageBackend, masterKey: Uint8Array, fortressId: string, ownerRef: string, identities: IdentityManager,
 ): Promise<SdwMemoryBackendAdapter> {
-  let adapter: SdwMemoryBackendAdapter | undefined;
+  let adapter: SdwMemoryBackendAdapter | undefined = undefined;
   // Same composition as the bridge; only the standard mode differs, so verification uses the bridge's signer set.
   const composed = await composeHermesMemoryAdapterOptions({
     storage, masterKey, fortressId, ownerRef, identityManager: identities,
