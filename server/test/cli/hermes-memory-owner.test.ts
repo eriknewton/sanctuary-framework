@@ -678,8 +678,14 @@ describe("hermes owner verbs: memory-report", () => {
     const target = join(reports, "report.json");
     const ok = await runVerb(f, ["memory-report", "--since", f.since, "--out", target]);
     expect(ok.code, ok.err).toBe(0);
-    expect((await stat(target)).mode & 0o777).toBe(0o600);
-    expect(JSON.parse(await readFile(target, "utf8")).report).toBe("sanctuary hermes memory-report");
+    // One open handle for the mode check and the read, so both observe the same file.
+    const written = await open(target, "r");
+    try {
+      expect((await written.stat()).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await written.readFile("utf8")).report).toBe("sanctuary hermes memory-report");
+    } finally {
+      await written.close();
+    }
     const loose = join(f.root, "loose");
     await mkdir(loose, { mode: 0o755 });
     await chmod(loose, 0o755);

@@ -1,3 +1,4 @@
+// fail-before-exempt: this change witnesses completed-turn capture in the Python plugin under hermes-plugin/, outside server/src, so the src rollback cannot revert it. Fail-before was shown against the base plugin, where the capture never reaches the bridge and the test times out.
 // One insert at a time per bridge process: while a completed-turn capture is still being written, including after its
 // caller gave up, a deliberate remember is answered unavailable at once, and a remember after the capture settles is saved.
 // The real provider, client, shim class and bridge run against temporary storage; only Python's standard library is used.

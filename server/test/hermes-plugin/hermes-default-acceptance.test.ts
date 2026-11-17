@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds capture assertions for the Python plugin under hermes-plugin/, outside server/src; the file skips in CI without an installed Hermes interpreter. Fail-before was shown against the base plugin with an interpreter set, which fails at the missing capture row.
 // These checks run only when SANCTUARY_HERMES_PYTHON names an installed Hermes interpreter.
 // CI without Hermes skips them; installed Linux and Mac environments can run them.
 // The production bridge and shim class run against temporary storage and a framing relay.

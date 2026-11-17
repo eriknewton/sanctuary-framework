@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds a case for the hermes owner verbs, which reads server/scripts/cli-audit-write-inventory.output.json; that inventory sits outside server/src, so the src rollback cannot revert it. Fail-before was shown against the base inventory, which lists no hermes verbs.
 /**
  * Tests for the CLI audit-write completeness inventory script.
  *
