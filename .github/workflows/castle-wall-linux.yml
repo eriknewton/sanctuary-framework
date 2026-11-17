@@ -201,10 +201,23 @@ jobs:
 
       - name: Build dedicated native writer witness harness
         working-directory: castle-wall-daemon
+        # The signed append graphs run writer-standin and drain-actor as peer
+        # processes. Before the handshake, the in-process wall hashes each
+        # peer's executable, and the writer refuses a wall that has not answered
+        # within WRITER_HANDSHAKE_DEADLINE_MS (250 ms). The test profile builds
+        # both actors unoptimized with full debug info: writer-standin measured
+        # 38 MB, and hashing it took 1.18 s on a 4-CPU box, so the writer timed
+        # out and no SIGN was admitted. Built here with the native binaries
+        # (opt-level 1, no debug info) it measured 2.9 MB and hashed in 88 to
+        # 102 ms on the same box. The variables pass
+        # these builds to every later step, the same actor builds the signed
+        # append suite's serial timings below were measured with.
         run: |
-          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain --bin castle-wall-daemon
+          CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -j 2 --features test-isolation --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain --bin castle-wall-daemon --bin writer-standin --bin drain-actor
           CARGO_TARGET_DIR="$RUNNER_TEMP/k1-target" cargo build --locked -j 2 --release --bin sanctuary-business-signer --bin sanctuary-business-unlock --bin sanctuary-business-writer --bin sanctuary-business-drain --bin castle-wall-daemon
           echo "SANCTUARY_K1_TEST_BINARIES=$RUNNER_TEMP/k1-target" >> "$GITHUB_ENV"
+          echo "WRITER_TEST_HELPER=$RUNNER_TEMP/k1-target/debug/writer-standin" >> "$GITHUB_ENV"
+          echo "DRAIN_TEST_ACTOR=$RUNNER_TEMP/k1-target/debug/drain-actor" >> "$GITHUB_ENV"
 
       - name: Exercise isolated signed append composition
         working-directory: castle-wall-daemon
@@ -228,13 +241,13 @@ jobs:
         # Measured serially on a 4-CPU build box on 2026-11-16: this step's
         # command took 2405.6 s, of which the signed append suite took
         # 1362.5 s, leaving 1043.1 s of tests plus a 34.2 s cold build
-        # (17.95 min). The same box ran the parent revision's step in 861.0 s
+        # (17.96 min). The same box ran the parent revision's step in 861.0 s
         # (14.35 min); this step's earlier bound derived 18.9 min on CI for
         # that set (both figures carried from that bound: 13.4 min on main, run
         # 43545385001, plus the 5.5 min K1c-2d2 drain suite), so CI is taken as
         # 18.9 / 14.35 = 1.32x the box. That ratio is high, because the box
         # runs unprivileged and its kernel suites fail fast.
-        # 17.95 x 1.32 x 1.8 = 42.65, rounded up. The full command, 40.09 min
+        # 17.96 x 1.32 x 1.8 = 42.67, rounded up. The full command, 40.09 min
         # of tests plus the 0.57 min build, 40.66 x 1.32 x 1.8 = 96.61 min,
         # would exceed the 60-minute ceiling for one step, so the signed
         # append suite runs in its own bounded step
@@ -337,7 +350,9 @@ jobs:
           # Same shape as the step above: root, serial, privileged expectation.
           # The step above skips every case of this suite (must match its
           # two `--skip` filters), so each case runs exactly once, here. The
-          # exact count proves the whole suite ran. The full output goes to
+          # exact count proves the whole suite ran: 388 passed + 10 ignored =
+          # 398, the binary's full test list (396 `signed_append::` + 2
+          # `settlement_call_sites::`). The full output goes to
           # signed-append-test.log beside the step above's log, and the evidence
           # upload below retains it on failure too (must match its `path:` list).
           set -o pipefail

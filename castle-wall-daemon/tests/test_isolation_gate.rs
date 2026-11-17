@@ -133,6 +133,8 @@ fn all_isolation_targets() -> BTreeSet<String> {
 /// out of reach, as is YAML-parse validity (separate workflow work). A
 /// step-level `if:` or `continue-on-error:` on the root step, or either key on
 /// its job, is refused by signed_append_workflow_selection_has_exact_count.
+/// So is a `needs:` key on the job: a skipped dependency skips the job, and a
+/// skipped job reads as passing for a required check.
 fn workflow_suite_targets() -> BTreeSet<String> {
     let workflow_path = repo_root().join(".github/workflows/castle-wall-linux.yml");
     let workflow = std::fs::read_to_string(workflow_path).expect("read Linux workflow");
@@ -1103,9 +1105,11 @@ fn signed_append_workflow_selection_has_exact_count() {
         &workflow[start..start + 1 + rest.find("\n      - name: ").unwrap_or(rest.len())]
     };
     let root = step("cargo test (lib + integration, as root for kernel access)");
+    // Both physical lines are pinned: a positional filter on the first line
+    // would drop root cases while every suite still prints its result line.
     assert!(
         root.contains(
-            "-- --test-threads=1 --skip signed_append:: --skip settlement_call_sites:: 2>&1 | tee cargo-test.log"
+            "sudo -E env \"PATH=$PATH\" CARGO_TERM_COLOR=never cargo test --locked --all-targets --features test-isolation --color never \\\n            -- --test-threads=1 --skip signed_append:: --skip settlement_call_sites:: 2>&1 | tee cargo-test.log\n"
         ),
         "root step skips only the separately bounded signed append cases"
     );
@@ -1130,8 +1134,54 @@ fn signed_append_workflow_selection_has_exact_count() {
         ["signed_append::", "settlement_call_sites::"],
         "root step skips exactly the two signed append suite modules"
     );
-    assert!(
-        root.contains("timeout-minutes: 43\n"),
+    // Keys and values are read from a block's own lines at its indent, so a
+    // comment line or a key nested deeper (such as under `with:`) is never one
+    // of them. Each key and value is normalised first: surrounding spaces and
+    // one pair of quotes are YAML spellings of the same scalar.
+    let normalised = |text: &str| -> String {
+        let text = text.trim();
+        for quote in ['"', '\''] {
+            if let Some(inner) = text
+                .strip_prefix(quote)
+                .and_then(|rest| rest.strip_suffix(quote))
+            {
+                return inner.to_string();
+            }
+        }
+        text.to_string()
+    };
+    let entries = |block: &str, indent: usize| -> Vec<(String, String)> {
+        let pad = " ".repeat(indent);
+        block
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.strip_prefix(pad.as_str()))
+            .filter(|rest| !rest.starts_with([' ', '#']))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(key, value)| {
+                let value = value.split(" #").next().unwrap_or_default();
+                (normalised(key), normalised(value))
+            })
+            .collect()
+    };
+    let keys = |block: &str, indent: usize| -> Vec<String> {
+        entries(block, indent)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    };
+    // Every occurrence is returned, so a repeated key cannot hide behind the
+    // expected one.
+    let values = |block: &str, key: &str| -> Vec<String> {
+        entries(block, 8)
+            .into_iter()
+            .filter(|(name, _)| name == key)
+            .map(|(_, value)| value)
+            .collect()
+    };
+    assert_eq!(
+        values(root, "timeout-minutes"),
+        ["43"],
         "root step keeps its derived bound"
     );
     let suite = step("Signed append suite, as root (serial)");
@@ -1140,29 +1190,52 @@ fn signed_append_workflow_selection_has_exact_count() {
     assert!(suite.contains("          grep -Eq '^test result. ok. 388 passed; 0 failed; 10 ignored;' signed-append-test.log || {\n            echo \"FAIL: the signed append suite did not report exactly 388 passed, 0 failed, 10 ignored\"\n            exit 1\n          }\n"),
         "signed append step requires the exact count from its evidence log");
     let upload = step("Retain Linux integration and real-systemd evidence logs");
+    let upload_paths: Vec<&str> = upload
+        .split_once("\n          path: |\n")
+        .map(|(_, list)| {
+            list.lines()
+                .take_while(|line| line.starts_with("            "))
+                .map(str::trim)
+                .filter(|path| !path.starts_with('#'))
+                .collect()
+        })
+        .unwrap_or_default();
     assert!(
-        upload.contains("        if: always()\n")
-            && upload.contains("\n            castle-wall-daemon/cargo-test.log\n")
-            && upload.contains("\n            castle-wall-daemon/signed-append-test.log\n"),
+        upload_paths.contains(&"castle-wall-daemon/cargo-test.log")
+            && upload_paths.contains(&"castle-wall-daemon/signed-append-test.log"),
         "evidence upload retains the signed append root log"
     );
-    assert!(
-        suite.contains("timeout-minutes: 55\n"),
+    // Each log is written relative to its step's working directory, so the
+    // uploaded path must be that directory joined to the log name.
+    for (block, log) in [(root, "cargo-test.log"), (suite, "signed-append-test.log")] {
+        let directories = values(block, "working-directory");
+        let resolved: Vec<String> = directories
+            .iter()
+            .map(|directory| format!("{directory}/{log}"))
+            .collect();
+        assert!(
+            resolved.len() == 1 && upload_paths.contains(&resolved[0].as_str()),
+            "evidence upload path resolves under the step's working directory: {resolved:?} in {upload_paths:?}"
+        );
+    }
+    assert_eq!(
+        values(suite, "working-directory"),
+        ["castle-wall-daemon"],
+        "signed append step runs in the daemon crate"
+    );
+    assert_eq!(
+        values(upload, "if"),
+        ["always()"],
+        "evidence upload runs after a failed, timed-out or cancelled step"
+    );
+    assert_eq!(
+        values(suite, "timeout-minutes"),
+        ["55"],
         "signed append step keeps its derived bound"
     );
     assert!(suite.contains("SANCTUARY_EXPECT_PRIVILEGED_LINUX: \"1\""));
     // A step-level condition or error override would let either half stop
     // gating while every text pin above still passes.
-    let keys = |block: &str, indent: usize| -> Vec<String> {
-        let pad = " ".repeat(indent);
-        block
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.strip_prefix(pad.as_str()))
-            .filter(|rest| !rest.starts_with([' ', '#']))
-            .filter_map(|rest| rest.split_once(':').map(|(key, _)| key.to_string()))
-            .collect()
-    };
     for (name, block) in [("root", root), ("signed append", suite)] {
         let step_keys = keys(block, 8);
         assert!(
@@ -1188,6 +1261,12 @@ fn signed_append_workflow_selection_has_exact_count() {
                 .iter()
                 .any(|key| key == "if" || key == "continue-on-error"),
         "Linux integration job carries no condition or error override: {job_keys:?}"
+    );
+    // A skipped dependency skips this job, and a skipped job reads as passing
+    // for a required check, so the job depends on no other job.
+    assert!(
+        !job_keys.iter().any(|key| key == "needs"),
+        "Linux integration job depends on no other job: {job_keys:?}"
     );
     assert!(
         workflow
