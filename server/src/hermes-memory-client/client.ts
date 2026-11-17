@@ -150,6 +150,9 @@ export class HermesMemoryClient {
     if (this.silent || this.state === "CLOSED") return;
     // During drain, one terminal slot is reused only after delivery; buffered IDs remain readable.
     if (this.current() === "DRAINING" && this.outputs.length > 0) return;
+    // No input is consumed while the initialize reply is undelivered, because the client's acknowledgement
+    // legitimately follows that reply; the write callback's wake() resumes reading in AWAIT_INITIALIZED.
+    if (this.current() === "INITIALIZE_OUTPUT") return;
     if (this.inputOffset >= this.inputTail.length) {
       const maximum = this.current() === "DRAINING" ? this.drainReadRemaining : P.MAX_STDIO_LINE_BYTES;
       const available = Math.min(maximum, this.ports.input.readableLength);
