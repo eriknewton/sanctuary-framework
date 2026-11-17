@@ -51,8 +51,16 @@ export function releasePrivateTmpdir(): void {
   rmSync(root, { recursive: true, force: true });
 }
 
+/**
+ * Vitest 4 runs a beforeAll-returned cleanup under the hook's own timeout (default 10 s). Removing a
+ * root that holds a built evidence pack (about 1.2 GB measured for snapshot-artifact) took longer than
+ * that on a hosted runner, so the teardown failed the file with "Hook timed out in 10000ms" although
+ * every test passed. 120_000 = 12 x the 10 s default, headroom over the slowest observed removal.
+ */
+const CLEANUP_TIMEOUT_MS = 120_000;
+
 try {
-  beforeAll(() => releasePrivateTmpdir);
+  beforeAll(() => releasePrivateTmpdir, CLEANUP_TIMEOUT_MS);
 } catch {
   // A dynamic import from inside a running test cannot register a hook; fall back to process exit.
   process.once("exit", releasePrivateTmpdir);
