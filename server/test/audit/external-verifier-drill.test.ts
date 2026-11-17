@@ -14,6 +14,7 @@
  */
 // fail-before-exempt: this change makes the rotated export a signed positive compatibility fixture that passes on both revisions; the regression coverage for the unsigned-checkpoint verdict lives in the CLI signature-coverage test.
 
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, expect, it, beforeEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { Writable } from "node:stream";

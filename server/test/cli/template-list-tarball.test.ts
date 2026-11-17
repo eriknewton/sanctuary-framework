@@ -2,6 +2,7 @@
  * v1.2.1 (Finding HHH): verify dist/templates/ ships in the npm artifact.
  * Runs `npm pack`, extracts, and confirms template directories exist.
  */
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { describe, it, expect } from "vitest";
 import { execSync } from "node:child_process";
 import { mkdtemp, rm, readdir } from "node:fs/promises";

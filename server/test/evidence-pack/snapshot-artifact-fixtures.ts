@@ -1,4 +1,5 @@
 /** Helpers only: archive mutations preserve unrelated outer pins so each witness reaches its intended boundary. */
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, cpSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
