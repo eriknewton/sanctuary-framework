@@ -100,6 +100,15 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Provision the root-owned workstation signer interpreter
+        # Must match fixtureNode in server/test/fixtures/k1-service.ts.
+        # The cargo suite's real-signer checkpoint fixture (checkpoint.rs, via
+        # tests/helpers/checkpoint-status.ts) pins node at this fixed root-owned path;
+        # setup-node's tool cache is runner-writable, so its symlink cannot carry key custody.
+        # Seen from outside when missing: the cargo step fails one checkpoint test with
+        # "ENOENT ... open '/usr/bin/node'" while every other suite passes.
+        run: sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node
+
       - name: Scan SMB release artifacts for test hooks
         env:
           SMB_RELEASE_HOOK_SCAN: "1"

@@ -21,7 +21,7 @@ const repoRoot = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 const workflowsDir = join(repoRoot, ".github", "workflows");
 
 // Must match the run line of the "Provision the root-owned workstation signer
-// interpreter" step in ci.yml, test-baseline-guard.yml and publish-on-tag.yml.
+// interpreter" step in ci.yml, test-baseline-guard.yml, publish-on-tag.yml and castle-wall-linux.yml.
 const PROVISION_COMMAND = 'sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node';
 
 // The full suite is npm's `test` script however it is spelled: `npm test`, the
@@ -97,6 +97,29 @@ describe("packaged signer interpreter is provisioned before every server suite r
       expect(result[0].provisioned).toBe(expected);
     });
   }
+
+  // The Rust daemon's test-isolation cargo suite reaches the same fixture: checkpoint.rs runs
+  // castle-wall-daemon/tests/helpers/checkpoint-status.ts, which imports test/fixtures/k1-service.ts
+  // and hashes /usr/bin/node. PR 1790's hosted run failed one checkpoint test with ENOENT on that
+  // path because castle-wall-linux.yml had setup-node but no provisioning step.
+  it("every job running the test-isolation cargo suite provisions the interpreter before it", () => {
+    const CARGO_ISOLATION = /(?:^|[\s;&|(])cargo\s+test\b.*--features\s+[\w,-]*test-isolation/;
+    const cargoJobs: Array<{ job: string; provisioned: boolean }> = [];
+    for (const file of readdirSync(workflowsDir).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"))) {
+      const workflow = (loadYaml(readFileSync(join(workflowsDir, file), "utf8")) ?? {}) as Workflow;
+      for (const [job, body] of Object.entries(workflow.jobs ?? {})) {
+        const steps = body?.steps ?? [];
+        const at = steps.findIndex((s) => commandLines(s).some((l) => CARGO_ISOLATION.test(l)));
+        if (at < 0) continue;
+        const provisioned = steps.slice(0, at).some((s) => s.if === undefined
+          && commandLines(s).length === 1 && commandLines(s)[0] === PROVISION_COMMAND);
+        cargoJobs.push({ job: `${file}#${job}`, provisioned });
+      }
+    }
+    expect(cargoJobs).toEqual([{ job: "castle-wall-linux.yml#castle-wall-linux-integration", provisioned: true }]);
+    expect(readFileSync(join(repoRoot, "castle-wall-daemon", "tests", "helpers", "checkpoint-status.ts"), "utf8"))
+      .toContain("server/test/fixtures/k1-service.js");
+  });
 
   it("a named subset script is not the suite", () => {
     expect(auditWorkflow(`jobs:\n  t:\n    steps:\n      - run: npm run test:security\n`)).toEqual([]);
