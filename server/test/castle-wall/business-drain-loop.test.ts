@@ -18,15 +18,15 @@ class Sink implements BusinessDurableSink {
   load=async()=>structuredClone(this.value);
   persist=vi.fn(async(value:DurableBusinessAcceptance)=>{this.value=structuredClone(value);return structuredClone(value);});
 }
-async function cycle(events:unknown[], initial=first.initial, sink=new Sink()) {
+async function cycle(events:unknown[], initial=first.initial, sink=new Sink(), {waitForCompletion=true}={}) {
   const acks=vi.fn(async()=>{}), errors:Error[]=[];let timer:(()=>void)|null=null;
   let finish:()=>void=()=>{};let done=new Promise<void>(r=>{finish=r;});
   const handle=startLinuxAuditDrainLoop({businessDrainRequest:async()=>({event:events.shift()??null,error:null}),sendBusinessAck:acks} as unknown as IpcClient,null,{
     mode:{kind:"Business",pin:{...initial.pin,...initial.grant} as unknown as BusinessPin,committed_state:initial,durable_sink:sink},
     onDrainFault:error=>errors.push(error),setTimer:cb=>{timer=cb;finish();return 1;},clearTimer:()=>{},
   });
-  await done;
-  return {handle,acks,errors,sink,next:async()=>{done=new Promise<void>(r=>{finish=r;});timer!();await done;}};
+  if(waitForCompletion) await done;
+  return {handle,acks,errors,sink,done,next:async()=>{done=new Promise<void>(r=>{finish=r;});timer!();await done;}};
 }
 it("delivers every shared positive record kind and projection through the live loop",async()=>{
   const seen=new Set<string>();
@@ -59,9 +59,16 @@ it("keeps the ACK behind an unresolved durable sink operation",async()=>{
   const sink=new Sink();let release!:(v:DurableBusinessAcceptance)=>void;let entered!:(v:DurableBusinessAcceptance)=>void;
   const started=new Promise<DurableBusinessAcceptance>(r=>{entered=r;});
   sink.persist.mockImplementationOnce(value=>{entered(value);return new Promise(r=>{release=r;});});
-  const running=cycle([event(first.records[0])],first.initial,sink);const value=await started;
-  expect(sink.value).toBeNull();release(value);const c=await running;
-  try {expect(c.acks).toHaveBeenCalledTimes(1);}finally{await c.handle.stop();}
+  const c=await cycle([event(first.records[0])],first.initial,sink,{waitForCompletion:false});
+  const value=await started;
+  try {
+    // A check-phase turn drains promise continuations while persistence stays unresolved.
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    expect(c.acks).not.toHaveBeenCalled();
+    expect(sink.value).toBeNull();
+    release(value);await c.done;
+    expect(c.acks).toHaveBeenCalledTimes(1); // One ACK for the single delivered record.
+  } finally {release(value);await c.handle.stop();}
 });
 it("refuses wrong lease and impostor signatures with no acceptance change",async()=>{
   for(const change of ["signature","wrong-key","lease","sequence","body"]){
