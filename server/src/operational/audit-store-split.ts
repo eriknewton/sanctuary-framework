@@ -12,7 +12,7 @@
  * (Erik-ratified Option A) for the full decision record.
  *
  * This module owns:
- *   - the daemon's OWN root-owned audit namespace (`_audit-daemon`), reached
+ *   - the daemon's separate audit namespace (`_audit-daemon`), reached
  *     via a thin `StorageBackend` remapping wrapper so `operational/audit-log.ts`
  *     itself needs no namespace-parameterization surgery;
  *   - the one-time, idempotent, crash-safe migration that seals an existing
@@ -59,15 +59,17 @@ import {
 // import it from this module.
 export type { SealedRegionVerdict } from "./audit-log.js";
 
-/** The root daemon's own audit namespace. Independently tamper-evident from
- * the operator's `_audit` chain, root-owned (0700-class: whichever uid
- * creates the directory owns it, which is always root once a daemon runs
- * against a fortress, since this namespace's FIRST writer is always the
- * migration, which only ever runs from the root daemon startup path). */
+/** Use this namespace to identify the daemon chain separately from `_audit`.
+ * Ownership follows the backend's create-owner policy: the macOS root daemon
+ * can create files as the fortress owner; the Linux root daemon uses process
+ * ownership. Inspect actual readability instead of inferring it from the
+ * namespace or from the daemon's uid. */
+// Must match CHAIN_NAMESPACES in audit/split-evidence-registry.ts; read-only evidence keeps these sequence spaces separate.
 export const AUDIT_DAEMON_NAMESPACE = "_audit-daemon";
 /** The daemon chain's own checkpoint/rotation-anchor namespace, mirroring
  * `AUDIT_CHECKPOINT_NAMESPACE` in audit-log.ts one-for-one so the daemon's
  * own rotation/checkpoint machinery never collides with the operator's. */
+// Must match CHAIN_NAMESPACES in audit/split-evidence-registry.ts; read-only evidence keeps these sequence spaces separate.
 export const AUDIT_DAEMON_CHECKPOINT_NAMESPACE = "_audit-daemon_checkpoints";
 /** The daemon chain's own `_meta` remap. `AuditLog` reads/writes exactly one
  * plaintext key here (`audit-head-anchor-established-v1`, the "has this
@@ -77,6 +79,7 @@ export const AUDIT_DAEMON_CHECKPOINT_NAMESPACE = "_audit-daemon_checkpoints";
  * must NEVER be reachable through this adapter, so this gets its own
  * dedicated, fully isolated namespace rather than passing `_meta` through
  * unmapped. */
+// Must match CHAIN_NAMESPACES in audit/split-evidence-registry.ts; read-only evidence keeps these sequence spaces separate.
 export const AUDIT_DAEMON_META_NAMESPACE = "_audit-daemon_meta";
 
 /**
@@ -128,20 +131,12 @@ function remapNamespace(namespace: string): string {
 }
 
 /**
- * Thin `StorageBackend` wrapper that transparently redirects the two
- * namespaces `AuditLog` touches (`_audit`, `_audit_checkpoints`) onto the
- * daemon's own (`_audit-daemon`, `_audit-daemon_checkpoints`), delegating
- * everything else to the real underlying `FilesystemStorage`. This lets a
- * SECOND, fully independent `AuditLog` instance exist against the exact same
- * fortress without any change to `AuditLog`'s own namespace handling: the
- * class always thinks it is writing `_audit`; this wrapper is the only thing
- * that knows the daemon's entries actually land under `_audit-daemon`.
- *
- * Because the wrapped `FilesystemStorage.write`/`writeDurable` create their
- * namespace directory with the OS default owner (the calling process's uid),
- * every file this adapter's `AuditLog` produces on an armed box is
- * root-owned: the daemon process only ever constructs this adapter when it
- * is itself running as root (see `cli/castle-wall.ts`'s daemon command).
+ * Use this `StorageBackend` for a separate daemon `AuditLog` on the same
+ * fortress. It remaps `_audit`, `_audit_checkpoints`, and `_meta` onto
+ * `_audit-daemon`, `_audit-daemon_checkpoints`, and `_audit-daemon_meta`.
+ * Other namespaces are refused so this log cannot reach operator state
+ * through the adapter. Ownership remains the wrapped `FilesystemStorage`'s
+ * create-owner policy; selecting a namespace does not establish file custody.
  */
 // Exported (not just used internally by `createDaemonAuditLog`) so the
 // namespace-remap defense-in-depth guard is directly unit-testable without
@@ -587,6 +582,18 @@ export function errnoAccessReason(err: unknown): "privilege" | "io" {
  * from {@link verifyFortressAuditFullPicture} (which now calls it) so there is
  * ONE definition, not two that can drift.
  */
+/** Decide migration presence from bounded observations; raw presence cannot be erased by a parser result. */
+export function splitMigrationEvidence(evidence: { rawBoundaryPresent: boolean; parsedBoundaryPresent: boolean; establishedMarkerPresent: boolean }): boolean {
+  // Must match classifySplitSource in evidence-pack/split-statement-census.ts; any positive signal keeps split selection sticky.
+  return evidence.rawBoundaryPresent || evidence.parsedBoundaryPresent || evidence.establishedMarkerPresent;
+}
+/** Apply the existing resolver's presence meanings to an already bounded observation. */
+export function observedDaemonPresence(observation: { kind: "absent" | "non-directory" | "accessible" | "unreadable"; migration: boolean; reason: "privilege" | "io" }): DaemonStorePresence {
+  if (observation.kind === "accessible") return { kind: "accessible" };
+  if (observation.kind === "unreadable") return { kind: "present_unreadable", reason: observation.reason };
+  return observation.migration ? { kind: "missing" } : { kind: "absent" };
+}
+
 export async function daemonMigrationEstablished(
   storage: FilesystemStorage,
   masterKey: Uint8Array
@@ -613,9 +620,9 @@ export async function daemonMigrationEstablished(
   // boundary on an armed box is itself a fail-closed signal, so a subsequently
   // deleted daemon store must read as `missing`, never `absent`. Only a
   // genuinely `absent` boundary falls through to the marker.
-  if (boundary.status !== "absent") return true;
+  if (splitMigrationEvidence({rawBoundaryPresent:false,parsedBoundaryPresent:boundary.status !== "absent",establishedMarkerPresent:false})) return true;
   // A corrupted/unreadable marker is still migration evidence (fail closed).
-  return (await readAuditStoreSplitEstablishedMarker(storage, macKey)) !== "absent";
+  return splitMigrationEvidence({rawBoundaryPresent:false,parsedBoundaryPresent:false,establishedMarkerPresent:(await readAuditStoreSplitEstablishedMarker(storage, macKey)) !== "absent"});
 }
 
 /** The marker-aware daemon-store presence verdict. See {@link resolveDaemonStorePresence}. */
@@ -652,9 +659,7 @@ export async function resolveDaemonStorePresence(
 ): Promise<DaemonStorePresence> {
   const dirPath = storage.namespacePath(AUDIT_DAEMON_NAMESPACE);
   const absentOrMissing = async (): Promise<DaemonStorePresence> =>
-    (await daemonMigrationEstablished(storage, masterKey))
-      ? { kind: "missing" }
-      : { kind: "absent" };
+    observedDaemonPresence({kind:"absent",migration:await daemonMigrationEstablished(storage, masterKey),reason:"io"});
   let stats;
   try {
     stats = await stat(dirPath);
