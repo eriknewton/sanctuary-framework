@@ -36,3 +36,5 @@ export * from "./full-supervision-state.js";
 export * from "./full-supervision-exit.js";
 
 export * from "./macos-flow-coalescing.js";
+
+export {createBusinessDurableSink, BUSINESS_SNAPSHOT_MAX_BYTES} from "./business-durable-sink.js";

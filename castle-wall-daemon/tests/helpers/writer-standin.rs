@@ -1,3 +1,4 @@
+// fail-before-exempt: isolated composed peer modes use real framing and the shared provisional join model.
 //! Isolation-only signer and wall actors; the wall uses the production writer codec.
 use castle_wall_daemon::business_profile::{
     signer_peer, signer_service,
@@ -161,11 +162,167 @@ fn signer(root: &Path, bounded: bool) {
         thread::sleep(Duration::from_millis(10));
     }
 }
+fn composed_signer(root: &Path) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use castle_wall_daemon::business_profile::{
+        append_contract, join_lifecycle, signer_client::StatusReply, signer_contract,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    signer_peer::drop_capabilities().unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("peers.json")).unwrap()).unwrap();
+    let view: StatusReply = serde_json::from_value(fixture["status"].clone()).unwrap();
+    let mut model = join_lifecycle::step(
+        &join_lifecycle::initial(),
+        &serde_json::json!({"type":"Checkpoint","checkpoint":fixture["join"]}),
+    )
+    .unwrap();
+    let key = SigningKey::from_bytes(&[7; 32]); // Public synthetic fixture key.
+    let listener = signer_peer::listen(&root.join("signer")).unwrap();
+    let fd = loop {
+        if let Ok(fd) = signer_peer::accept(listener.as_raw_fd()) {
+            break fd;
+        }
+        thread::sleep(Duration::from_millis(1));
+    };
+    let mut first = true;
+    loop {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 100) } != 1 {
+            continue;
+        }
+        let Ok(packet) = signer_peer::receive(
+            fd.as_raw_fd(),
+            writer_protocol::WRITER_SIGN_PACKET_MAX_BYTES,
+        ) else {
+            break;
+        };
+        if packet.bytes.is_empty() {
+            break;
+        }
+        let response = if packet.bytes == b"{\"op\":\"STATUS\"}" {
+            let mut status = view.clone();
+            if first {
+                status.state = "LOCKED".into();
+                status.started_boottime_ns = "0".into();
+                status.expires_boottime_ns = "0".into();
+                first = false;
+            }
+            serde_json::to_value(status).unwrap()
+        } else {
+            let (header, body) = signer_service::decode(&packet.bytes).unwrap();
+            let signature = key
+                .sign(&[signer_contract::ROLE_REGISTRY[0].1.as_bytes(), body].concat())
+                .to_bytes();
+            let envelope = writer_protocol::envelope(body, &signature).unwrap();
+            let record: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+            let identity = append_contract::identity(&envelope).unwrap();
+            model = join_lifecycle::step(
+                &model,
+                &serde_json::json!({"type":"SignAdmitted","record":record}),
+            )
+            .unwrap();
+            model = join_lifecycle::step(
+                &model,
+                &serde_json::json!({"type":"Signed","identity":identity}),
+            )
+            .unwrap();
+            fs::write(
+                root.join("join-model.json"),
+                serde_json::to_vec(&model).unwrap(),
+            )
+            .unwrap();
+            serde_json::json!({"op":"SIGNED","request_id":header.request_id,"kid":view.grant.kid,"signature":URL_SAFE_NO_PAD.encode(signature)})
+        };
+        if signer_peer::send(
+            fd.as_raw_fd(),
+            &signer_service::encode(&response, &[]).unwrap(),
+            &[],
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+}
+fn composed_writer(root: &Path) {
+    use castle_wall_daemon::business_profile::{
+        append_checkpoint, writer_peer,
+        writer_service::{self, ClientSignerPort, DrainReconciler, WriterMachine},
+    };
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    signer_peer::drop_capabilities().unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("peers.json")).unwrap()).unwrap();
+    let owner = unsafe { libc::geteuid() };
+    let group = unsafe { libc::getegid() };
+    let path = root.join("writer");
+    let listener = signer_peer::listen(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    let held = writer_peer::HeldConfig::isolated(
+        Path::new(fixture["writer_config"].as_str().unwrap()),
+        owner,
+    )
+    .unwrap();
+    let bus = serde_json::from_value(fixture["bus"].clone()).unwrap();
+    let now = fixture["clock_boottime_ns"].as_u64().unwrap();
+    let clock_path = root.join("writer-clock");
+    let clock: writer_peer::Clock = Arc::new(move || {
+        if clock_path.exists() {
+            fs::read_to_string(&clock_path)?
+                .parse()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))
+        } else {
+            Ok(now)
+        }
+    });
+    let signer = ClientSignerPort::bootstrap_at_with_clock(
+        &root.join("signer"),
+        serde_json::from_value(fixture["peer_policy"].clone()).unwrap(),
+        clock.clone(),
+    )
+    .unwrap();
+    let mut machine = WriterMachine::isolated(
+        signer,
+        DrainReconciler::production(append_checkpoint::OrdinaryCheckpointProvider::production()),
+        fixture["boot"].as_str().unwrap().into(),
+        clock.clone(),
+    )
+    .unwrap();
+    writer_service::test_support::checkpoint_identity(
+        &mut machine,
+        fixture["fortress"].as_str().unwrap().into(),
+        1,
+    );
+    if let Some(path) = fixture["verified_reply"].as_str() {
+        writer_service::test_support::test_entry_dependencies(
+            &mut machine,
+            writer_service::load_test_entry_dependencies(Path::new(path)).unwrap(),
+        );
+    }
+    machine.heartbeat().unwrap();
+    fs::write(root.join("writer-ready"), b"ready").unwrap();
+    let _ = writer_service::test_support::serve_accept(
+        &mut machine,
+        &held,
+        &bus,
+        &listener,
+        &writer_peer::ListenerExpectations::isolated(path, owner, group),
+        owner,
+        &clock,
+    );
+}
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert_eq!(args.len(), 4);
     let root = Path::new(&args[2]);
     match args[1].as_str() {
+        "composed-signer" => composed_signer(root),
+        "composed-writer" => composed_writer(root),
         "signer" => signer(root, args[3] == "bounded"),
         "wall" => wall(root, &args[3]),
         "before-writer" => {

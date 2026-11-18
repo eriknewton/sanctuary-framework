@@ -13,7 +13,7 @@ import {createBusinessRecordConsumer, type BusinessDurableSink, type DurableBusi
 import {BUSINESS_PIN_FIELDS, type BusinessPin} from "../../src/linux-business/producer-custody.js";
 import {canonicalBytes} from "../../src/signing/contract.js";
 import {type JoinRecord, type JoinState} from "../../src/signing/record-joins.js";
-import * as append from "../../src/signing/business-append-contract.js";
+import * as append from "../../src/signing/business-append-wire.js";
 import {loadCheckedCorpus} from "../fixtures/business-corpus.js";
 const corpus=loadCheckedCorpus("record_join_vectors.json") as {cases:Array<{id:string;initial:JoinState;records:JoinRecord[];expect:{accepted_prefix:number;refusal_code:string|null;final_state:JoinState}}>};
 const first=corpus.cases[0];

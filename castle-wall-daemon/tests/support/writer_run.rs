@@ -366,6 +366,8 @@ pub fn scenario(case: &str) {
     let closed_reconciliation = case == "inert";
     let reconciliation_calls = state.reconciles.clone();
     let deps = Dependencies {
+        #[cfg(feature = "test-isolation")]
+        test_entry: None,
         bootstrap,
         reconciler: test_support::TestReconciler {
             reconcile: Box::new(move |e| {

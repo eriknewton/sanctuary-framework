@@ -369,9 +369,9 @@ class EntryTests(unittest.TestCase):
         with patch.object(c, "resolve_command", return_value=[sys.executable]), patch.object(c, "get_client", side_effect=AssertionError("spawn")):
             self.assertTrue(self.provider.is_available())
 
-    def test_save_hooks_are_noops_and_shutdown_shared(self):
+    def test_other_hooks_are_noops_and_shutdown_shared(self):
+        # Completed-turn capture has its own tests in test_capture.py; every other hook stays a no-op.
         with patch.object(c, "get_client", side_effect=AssertionError("implicit save")) as shared:
-            self.provider.sync_turn("user", "assistant")
             self.provider.queue_prefetch("query")
             self.provider.on_memory_write("add", "memory", "text")
             self.assertEqual(self.provider.on_pre_compress([]), "")

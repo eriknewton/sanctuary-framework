@@ -466,6 +466,38 @@ it("oversizeTruncatedIdGetsOnlyNoIdDiagnostic", async () => {
   } finally { await f.stop(); }
 });
 
+it("initializedAckDuringInitializeReplyWriteIsNotRefused", async () => {
+  // Fault schedule: the initialize reply's stdout write callback is held; notifications/initialized arrives on
+  // stdin while it is held (the client acts on the reply bytes before the shim's write completes); then release.
+  const f = fixture(); try {
+    await f.reply({ protocol_version: P.RELAY_VERSION, server_name: "sanctuary-hermes-memory-bridge" });
+    f.options.stall = true;
+    await f.send({ jsonrpc: "2.0", method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "fixture", version: "1" } }, id: 0 });
+    f.options.stall = false;
+    expect(f.completions, "initializedAckDuringInitializeReplyWriteIsNotRefused").toHaveLength(1);
+    await f.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    expect(f.frames.some(frame => frame.type === "shutdown"), "initializedAckDuringInitializeReplyWriteIsNotRefused").toBe(false);
+    f.completions.shift()!(); await f.pump();
+    await f.send({ jsonrpc: "2.0", method: "tools/list", id: 1 });
+    expect(f.frames.at(-1)!.type, "initializedAckDuringInitializeReplyWriteIsNotRefused").toBe("tools_list");
+    await f.reply(HERMES_TOOLS_LIST_PAYLOAD);
+    expect(f.responses().map(row => row.id)).toEqual([0, 1]);
+    expect(f.responses().at(-1).result.tools.map((t: any) => t.name), "initializedAckDuringInitializeReplyWriteIsNotRefused").toEqual(P.TOOL_NAMES);
+    expect(f.closed()).toBe(false);
+  } finally { await f.stop(); }
+});
+it("initializedAckBeforeInitializeStillDrainsInvalid", async () => {
+  // Positive control: an acknowledgement with no initialize request at all is out of order and still refused.
+  const f = fixture(); try {
+    await f.reply({ protocol_version: P.RELAY_VERSION, server_name: "sanctuary-hermes-memory-bridge" });
+    await f.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    expect(f.frames.at(-1)!.type, "initializedAckBeforeInitializeStillDrainsInvalid").toBe("shutdown");
+    expect(f.frames.some(frame => frame.type === "tools_list")).toBe(false);
+    expect(f.lines, "initializedAckBeforeInitializeStillDrainsInvalid").toHaveLength(0);
+    expect(f.closed(), "initializedAckBeforeInitializeStillDrainsInvalid").toBe(true);
+  } finally { await f.stop(); }
+});
+
 it("unfinishedCallWriteHasBoundedSettlement", async () => {
   const f = fixture({ holdCall: true }); try {
     await f.initialize(); await f.call(1); await f.advance(P.SHIM_CALL_DEADLINE_MS);
