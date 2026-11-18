@@ -32,7 +32,7 @@ describe("install-hooks resolveHooksDir", () => {
   // REGRESSION (2026-07-18): a worktree must resolve to the COMMON hooks dir,
   // never the per-worktree one. Git executes hooks from the common git dir, so
   // installing into `<main>/.git/worktrees/<name>/hooks` writes a file that is
-  // never run — install-hooks reported success while leaving the worktree
+  // never run: install-hooks reported success while leaving the worktree
   // unguarded. The previous version of this test asserted the per-worktree path
   // and so pinned the bug in place.
   it("follows commondir to the shared hooks dir when .git is a file (worktree checkout)", () => {
