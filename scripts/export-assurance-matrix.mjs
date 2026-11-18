@@ -300,11 +300,13 @@ function build(stamp) {
   // substring below, so a URL change in the README is the only way to change it.
   const repository = "https://github.com/eriknewton/sanctuary-framework";
   const homepage = "https://sanctuaryprotocol.ai";
-  // All three commands are copied from the README's Quickstart section, which
-  // lists install, verify and uninstall as adjacent lines; each is matched by
-  // its verb so a reordering of the block cannot swap them. A missing line fails
+  // All three commands are copied from the README: install and verify from its
+  // Quickstart section, uninstall from its own Uninstall section, so an agent
+  // following the Quickstart in order never reaches the removal command. Each is
+  // matched by its verb so a reordering cannot swap them. A missing line fails
   // the export rather than falling back to a typed command.
   const QUICKSTART_RE = /^## Quickstart\s*$/;
+  const UNINSTALL_RE = /^## Uninstall\s*$/;
   const install = readmeSectionCommand(
     readmeText,
     QUICKSTART_RE,
@@ -319,7 +321,7 @@ function build(stamp) {
   );
   const uninstall = readmeSectionCommand(
     readmeText,
-    QUICKSTART_RE,
+    UNINSTALL_RE,
     /^npx -y @sanctuary-framework\/mcp-server uninstall\s*$/,
     "uninstall command",
   );
