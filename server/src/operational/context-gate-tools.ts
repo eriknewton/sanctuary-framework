@@ -208,7 +208,7 @@ export function createContextGateTools(
     {
       name: "context_gate_set_policy",
       description:
-        "Create a stored policy from provider and field rules. Requires operator approval. Rules allow, redact, hash, deny, or mark fields for summarization; redaction takes precedence. The policy applies only where filtering is invoked and does not itself intercept arbitrary egress.",
+        "Create a stored context-gating policy. Tier 1: requires operator approval. Each rule names a provider category and the field patterns to allow, redact, hash, or mark for summarization. Redact wins over the other three. A field not matched by the selected provider rule, or with no applicable provider rule, gets default_action: redact (the default) or deny, which blocks the whole request. A stored policy takes effect only where filtering is invoked. It does not itself intercept egress.",
       inputSchema: {
         type: "object",
         properties: {
@@ -359,7 +359,7 @@ export function createContextGateTools(
     {
       name: "context_gate_apply_template",
       description:
-        "Create a stored context-gating policy from a named starter template. Requires operator approval. Summarization rules produce a marker, not a summary. Review and customize the policy before using its output; applying a template does not itself intercept arbitrary egress.",
+        "Create a stored context-gating policy from the starter template named by template_id. Tier 1: requires operator approval. Fields a template marks for summarization are replaced with the literal [SUMMARIZE]; no summary is written. Review and adjust the policy before relying on it. A stored policy takes effect only where filtering is invoked. It does not itself intercept egress.",
       inputSchema: {
         type: "object",
         properties: {
@@ -490,7 +490,7 @@ export function createContextGateTools(
     {
       name: "context_gate_filter",
       description:
-        "Apply an existing context-gating policy to supplied context for a provider category. Returns filtered output and field decisions, or a blocked result. Summarization produces a marker, not a summary. Review output before transmission; filtering does not guarantee safe disclosure or intercept arbitrary egress.",
+        "Apply an existing context-gating policy to a context object for one provider category. Policies are created by the operator; find a policy_id with context_gate_list_policies. Returns blocked: true when a field falls to a deny default or the configured privacy filter fails closed. Otherwise returns safe_context (the filtered object), per-field decisions and audit hashes. Redacted fields become [REDACTED], hashed fields a [HASH:digest] token, and fields marked for summarization the literal [SUMMARIZE]; no summary is written. safe_context is a field name, not a guarantee: review it before sending. This tool filters only what you pass in and does not intercept outbound traffic. Use before sending context to a remote provider.",
       inputSchema: {
         type: "object",
         properties: {

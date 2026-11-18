@@ -86,7 +86,7 @@ export const COOPERATIVE_CAPABILITIES: readonly CapabilityEntry[] = [
   },
   {
     tool: COOPERATIVE_TOOL_NAMES.auditSearch,
-    does: "Full-text searches your own audit history (own-signed scope only), verified against the audit chain.",
+    does: "Searches selected fields of your own recent audit entries (own-signed scope only) and labels each match with the chain verification that was possible. Not a complete history search.",
     when: "You need to find when a past operation ran and its result.",
   },
 ] as const;
@@ -348,7 +348,7 @@ export function buildServerInstructions(): string {
     "",
     "Start here:",
     `- Unsure which tool fits? Call ${COOPERATIVE_TOOL_NAMES.help} with a free-text intent.`,
-    `- Want the full catalog again mid-session? Call ${COOPERATIVE_TOOL_NAMES.capabilities}.`,
+    `- Want this cooperative catalog again mid-session? Call ${COOPERATIVE_TOOL_NAMES.capabilities}.`,
     "",
     "Cooperative tools:",
   ];

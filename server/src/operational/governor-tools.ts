@@ -25,7 +25,7 @@ export function createGovernorTools(
     {
       name: "governor_status",
       description:
-        "Return Call Governor counters and configured volume, rate, duplicate, and lifetime limits for proxied upstream calls. Use to inspect consumption and remaining limits. These counters and limits do not cover all Sanctuary tools.",
+        "Return Call Governor state for proxied upstream tool calls: volume and lifetime counters with their limits, per-tool rate counts, duplicate-cache size, and whether the lifetime hard stop is active. Use to check consumption before a long run of proxied calls. The governor covers proxied upstream calls only, not Sanctuary's own tools.",
       inputSchema: {
         type: "object",
         properties: {},

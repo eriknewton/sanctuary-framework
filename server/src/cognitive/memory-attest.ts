@@ -75,7 +75,7 @@ export function createMemoryAttestTools(
     {
       name: "memory_attest",
       description:
-        "Sign a caller-reported memory operation, provider, and content hash using an available local identity. Returns a signed assertion and records audit metadata without memory content. The signature authenticates the local signer's assertion, not provider execution or the supplied hash's correspondence to content.",
+        "Sign a self-reported record of a memory operation on any memory provider: the operation, the provider name and a content hash you supply (never raw content), signed with identity_id or the primary identity. Returns attestation_id, the signed payload, the signature and the public key, and writes an audit entry without memory content. The signature proves which local identity made the report. It does not prove the provider performed the operation or that the hash matches any content. Use after a memory operation when you want a signed, self-reported trail.",
       inputSchema: {
         type: "object",
         properties: {

@@ -822,7 +822,8 @@ export async function createSanctuaryServer(options?: {
         "not_yet_walled means this vault has not been put on this machine's " +
         "Castle Wall, whatever the machine's own enforcement state is, so do " +
         "not read a healthy wall runtime as protection for this vault. " +
-        "The castle_wall_liveness field is the evaluator's wall, agent and coverage verdict at report time, not a continuously fresh badge.",
+        "The castle_wall_liveness field is the evaluator's wall, agent and coverage verdict at report time, not a continuously fresh badge. " +
+        "The include_hardware, include_software and include_network arguments are accepted and currently have no effect; the full report is always returned.",
       inputSchema: {
         type: "object",
         properties: {
@@ -949,7 +950,7 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_audit_log",
-      description: "Query audit entries for the bound session identity, filtered by since, layer, operation_type, and limit. Returns a fixed safe view with timestamp, operation, result, and has_details. Requires session identity binding; without it, returns no entries. An empty result does not prove no activity.",
+      description: "Query audit entries recorded under your own bound session identity, filtered by since, layer, operation_type and limit. Use to inspect operations you performed. Each entry is a fixed safe view: timestamp, operation, result, has_details. System and gate entries are never returned. Needs a session identity bound when the server is launched; without one the result is empty, so an empty result is not proof of no activity.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1069,7 +1070,7 @@ export async function createSanctuaryServer(options?: {
               // tools were just corrected to stop claiming.
               "S4.1_earned_reputation": "partial",
               "S4.2_participant_owned": "partial",
-              "S4.5_sybil_resistance": "basic",
+              "S4.5_sybil_resistance": "documented",
               "S4.7_trust_bootstrapping": "partial",
             },
           },
@@ -1083,8 +1084,8 @@ export async function createSanctuaryServer(options?: {
         limitations: [
           "Cognitive sovereignty provides local identity signing and encrypted state; hardware-backed key custody and complete state integrity and portability are not proven.",
           "Operational isolation reports process-level evidence; confidential execution in a TEE is not established.",
-          "Selective disclosure provides hash commitments, Pedersen commitments, knowledge proofs, and range proofs; these do not authenticate real-world assertions or provide general-purpose proof systems.",
-          "Verifiable reputation provides local escrow-intent records; these do not custody collateral or establish Sybil resistance.",
+          "Selective disclosure exposes tools for hash commitments, Pedersen commitments, proofs of knowledge and range proofs. These do not show that a committed value is true, and no general-purpose proof system is offered.",
+          "Verifiable reputation records are locally signed and self-held. Escrow entries are local intent records that hold no collateral, and Sybil resistance is not established.",
           "Spec license: CC-BY-4.0 | Code license: Apache-2.0",
         ],
       });

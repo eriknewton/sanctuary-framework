@@ -887,7 +887,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.help,
-      description: "Map a free-text intent to tool guidance and, where available, a runnable example. Returns guidance and an audit reference; sensitive-request guidance stays coarse and never reveals policy internals. Use sanctuary_capabilities for the introductory cooperative catalog and MCP tools/list for the advertised tool catalog.",
+      description: "Given a free-text intent (for example \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, with a runnable example for ordinary requests. Evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) return intent_class \"evaluate\" with a guidance string and the related read-only tools. Guidance for sensitive or gated requests is deliberately coarse and never reveals policy internals. Returns the guidance plus an audit_ref. For the start-here catalog of cooperative tools call sanctuary_capabilities; the complete advertised tool list is MCP tools/list.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -1126,7 +1126,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.auditSearch,
-      description: "Search selected fields in a bounded window of recent audit entries for the bound session identity, with a capped number of matches. Requires a session identity. Returns full-chain or post-split verification labels according to the available evidence and refuses integrity findings. Results are not a complete history search.",
+      description: "Search your own recent audit entries for a text match. Scope is always own_signed and a bound session identity is required. Only the operation name and a small allowlist of detail fields are searched, over a bounded window of your most recent entries, and the number of matches is capped, so this is not a complete history search. Each match gives timestamp, operation, result, and a verification label saying whether the full chain or only its post-split part was verified. Refuses when the audit chain reports integrity findings. Use to find when a recent operation ran and how it ended.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -1211,7 +1211,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.compoundExecute,
-      description: "Execute a short plan of sanctuary_remember, sanctuary_recall, sanctuary_hide, or sanctuary_forget steps. Requires operator approval under the default policy; applicable steps also require valid plan-bound approvals keyed by step_id. Reserves step approvals before execution. Approval reservation does not guarantee rollback of completed steps.",
+      description: "Execute a short plan of sanctuary_remember, sanctuary_recall, sanctuary_hide and sanctuary_forget steps in order, in one call. Tier 1 under the default policy: requires operator approval for the call itself. Each step is { tool, args } and gets a step_id by position (step-1, step-2, and so on). Every sanctuary_forget step also needs its own operator approval, passed in approvals keyed by step_id and bound to this exact plan and step. Step approvals are reserved before any step runs, and if one is missing or does not match, no step runs. Completed steps are not rolled back: if a later step fails, the result is partial_failed with completed_steps and failed_step.",
       tool_class: "write",
       inputSchema: {
         type: "object",

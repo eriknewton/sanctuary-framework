@@ -1256,7 +1256,7 @@ export function createHandshakeTools(
     {
       name: "handshake_status",
       description:
-        "Check an existing handshake session or verify an initiator completion for a pending responder session. Completion verification consumes the session and may record a trust result. Expiry processing can also change session state; this is not a read-only operation.",
+        "Check a handshake session by id. Without a completion, returns its role, state, start time and any recorded result. If you pass an initiator's completion for a pending session this server responded to, the completion is verified once: the session is consumed (completed or failed) and a verified result may be recorded as a peer trust result. Expired sessions are swept or marked expired during the call. Not read-only.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1390,7 +1390,7 @@ export function createHandshakeTools(
     {
       name: "handshake_exchange",
       description:
-        "Verify a supplied signed counterparty SHR, generate a local SHR, and return a signed exchange artifact using an available local identity. May record a structural preview. This call does not establish live peer key control or liveness; use the nonce-based handshake protocol for those checks.",
+        "Verify a counterparty's signed SHR, generate this server's SHR, and return a signed attestation artifact in one call, signed with identity_id or the primary identity. The artifact can be shared and checked with handshake_verify_attestation. This is a structural check only: the result always reports trust_tier unverified and liveness_proven false, and it does not make the counterparty a trusted peer. May record an unverified preview entry for the counterparty. To prove key control and liveness, use handshake_initiate, handshake_respond and handshake_complete.",
       inputSchema: {
         type: "object",
         properties: {

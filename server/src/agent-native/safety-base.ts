@@ -48,7 +48,7 @@ export const FIXED_DENIAL_MESSAGE =
  * by intent, tool, or denial reason.
  */
 export const COOPERATIVE_DENIAL_DISCOVERY_HINT =
-  `To find the sanctioned Sanctuary tool for what you need, call ${COOPERATIVE_TOOL_NAMES.help} with your intent, or ${COOPERATIVE_TOOL_NAMES.capabilities} for the full catalog.` as const;
+  `To find the sanctioned Sanctuary tool for what you need, call ${COOPERATIVE_TOOL_NAMES.help} with your intent, or ${COOPERATIVE_TOOL_NAMES.capabilities} for the cooperative tool catalog.` as const;
 
 export function fixedDenial(
   auditRef: string,

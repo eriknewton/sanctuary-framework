@@ -1400,7 +1400,7 @@ export function createCognitiveTools(
 
     {
       name: "identity_list",
-      description: "List managed public identities, optionally filtered by label. Returns labels, DIDs, and public keys without private key material. Does not identify the primary identity.",
+      description: "List this server's managed identities, optionally filtered by a label substring. Returns identity_id, label, DID, public key, key type, key protection and creation time for each, never private key material. Does not say which identity is primary.",
       inputSchema: {
         type: "object",
         properties: {
