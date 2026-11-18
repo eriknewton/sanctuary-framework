@@ -2,7 +2,7 @@ import {requireCliTestRunner} from "../../src/cli/argv.js";
 import {aroundAll} from "vitest";
 import {mkdtempSync, rmSync} from "node:fs";
 import {tmpdir} from "node:os";
-import {join} from "node:path";
+import {basename, join} from "node:path";
 import {installSelectorRootsForTest, isolatedSelectorRoots} from "../../src/linux-business/profile-selection.js";
 
 const key = Symbol.for("sanctuary.test.selector-root-lifetime");
@@ -15,12 +15,17 @@ if (!state[key]) {
 installSelectorRootsForTest(isolatedSelectorRoots(state[key]!), requireCliTestRunner("selectorRoots"));
 
 // Shared setup must not lengthen every test's socket paths by redirecting TMPDIR.
-// Worker shutdown can bypass exit listeners; aroundAll also runs after a throwing file hook.
+// Invariant: aroundAll removes the root after the file body and every file hook, pass or fail.
+// A file that never enters aroundAll (fully skipped, or failed at collection) leaves its root
+// to the exit fallback.
 const root = state[key]!;
+function releaseSelectorRoot(): void {
+  if (state[key] === root) delete state[key];
+  if (!basename(root).startsWith("k1-selector-worker-")) return;
+  rmSync(root, {recursive: true, force: true});
+}
+process.once("exit", releaseSelectorRoot);
 aroundAll(async runSuite => {
   try { await runSuite(); }
-  finally {
-    rmSync(root, {recursive: true, force: true});
-    delete state[key];
-  }
+  finally { releaseSelectorRoot(); }
 });

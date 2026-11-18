@@ -43,7 +43,8 @@ export async function acquireMasterWriteBarrier(...args: Parameters<typeof acqui
     // (GIT_DIR and friends that a git hook exports), so no test spawns git against the real repository
     // or config. Witness: test/structure/git-env-scrub.test.ts.
     setupFiles: ["./test/setup/git-env-scrub.ts", "./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts", "./test/setup/master-write-leases.ts", "./test/setup/selector-roots-isolation.ts"],
-    // Stack order runs the guard after every afterAll, but before beforeAll-returned cleanups, file-scoped fixture teardown and the file's own aroundAll teardown, none of which current tests use.
+    // aroundAll nesting: lease guard outermost, then selector setup, then the file's own hooks.
+    // Teardown runs in reverse nesting order, after afterAll, beforeAll-returned cleanups and file-scoped fixtures.
     sequence: { setupFiles: "list", hooks: "stack" },
     // Leaves a marker directory at the package root for the whole run. setupFiles
     // covers this process and children inherit VITEST by default, but a child

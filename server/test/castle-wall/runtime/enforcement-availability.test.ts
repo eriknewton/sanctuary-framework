@@ -1,6 +1,13 @@
 import "../../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+/**
+ * Parent directory for this file's Unix socket fixture. On macOS the per-user temp directory resolves to
+ * `/private/var/folders/<2>/<30>/T` (56 bytes) and this file's private temp root adds 26 more (separator,
+ * 19-byte prefix, 6 mkdtemp characters; must match `PREFIX` in test/helpers/private-tmpdir.ts), which leaves
+ * too little of `sun_path` for a socket directory, so the fixture sits under `/private/tmp` there. Elsewhere
+ * `tmpdir()` is already the private temp root, so the fixture stays inside it.
+ */
+import { SHORT_SOCKET_TMP_PARENT } from "../../helpers/short-socket-tmp-parent.js";
 import { join } from "node:path";
 import { createServer } from "node:net";
 
@@ -73,14 +80,6 @@ const SIGNED_MANIFEST: SignedManifest = {
 const DARWIN_SUN_PATH_BYTES = 104;
 /** One byte of `sun_path` holds the terminating NUL, which leaves 104 - 1 = 103 bytes for the path itself. */
 const UNIX_SOCKET_PATH_MAX_BYTES = DARWIN_SUN_PATH_BYTES - 1;
-/**
- * Parent directory for this file's Unix socket fixture. On macOS the per-user temp directory resolves to
- * `/private/var/folders/<2>/<30>/T` (56 bytes) and this file's private temp root adds 26 more (separator,
- * 19-byte prefix, 6 mkdtemp characters; must match `PREFIX` in test/helpers/private-tmpdir.ts), which leaves
- * too little of `sun_path` for a socket directory, so the fixture sits under `/private/tmp` there. Elsewhere
- * `tmpdir()` is already the private temp root, so the fixture stays inside it.
- */
-const SHORT_SOCKET_TMP_PARENT = process.platform === "darwin" ? "/private/tmp" : tmpdir();
 
 function makeManifestProvider(): MacOSManifestProvider {
   return {

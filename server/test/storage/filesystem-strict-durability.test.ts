@@ -8,6 +8,7 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { SHORT_SOCKET_TMP_PARENT } from "../helpers/short-socket-tmp-parent.js";
 import { FilesystemStorage, withFilesystemLockTestHooks } from "../../src/storage/filesystem.js";
 import type { NamespaceLockOptions } from "../../src/storage/interface.js";
 import * as sdwWriteGate from "../../src/sdw/write-gate.js";
@@ -120,11 +121,14 @@ vi.mock("node:fs/promises", async (original) => {
   } };
 });
 
-// The shared helper adds a folder level under the macOS per-user temp directory,
-// exceeding the custody socket path cap. Keep all fixtures under one short owned root;
-// removing the parent also catches roots renamed by the directory-swap witnesses.
-const tempRoot = realpathSync(mkdtempSync(join("/tmp", "s1-")));
+// A macOS per-user temp realpath is 56 bytes: /private/var/folders/<2>/<30>/T.
+// A direct runtime root needs 56 + 11 (/s1r-XXXXXX) + 1 (separator) + 47
+// (40 digest characters + .reaper) = 115 bytes, above KERNEL_SOCKET_PATH_MAX_BYTES (100).
+// Under /private/tmp, this file's parent and runtime child need 12 + 10 (/s1-XXXXXX)
+// + 11 + 1 + 47 = 81 bytes. Removing the owned parent includes all fixture children.
+let tempRoot!: string;
 aroundAll(async runSuite => {
+  tempRoot = realpathSync(mkdtempSync(join(SHORT_SOCKET_TMP_PARENT, "s1-")));
   try { await runSuite(); }
   finally { rmSync(tempRoot, { recursive: true, force: true }); }
 });
