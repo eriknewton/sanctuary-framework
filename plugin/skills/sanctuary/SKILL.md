@@ -14,27 +14,40 @@ description: >
 
 # Sanctuary Framework
 
-Sanctuary gives your agent protection it can prove: encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, posture auditing, and a verifiable security posture. The tools in this skill are the Charter layer, the cooperative MCP surface. The Castle Wall (kernel-level egress enforcement) is armed separately and is live on macOS; on Linux it is proven for Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Every capability claim traces to a row in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
+Sanctuary provides cooperative tools for encrypted state, self-custodied identity, selective disclosure, portable reputation, zero-knowledge proofs, federation, posture auditing, and signed posture assertions. The tools in this skill are the Charter layer, the cooperative MCP surface. The Castle Wall (kernel-level egress enforcement) is armed separately and is live on macOS; on Linux it is proven for Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Every capability claim traces to a row in the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
 
-## Install, verify, uninstall
+Software-test evidence and captured operational drills are distinct. Installed enforcement and containment remain partial or unproven unless the relevant matrix row cites a captured drill. SHR signatures authenticate posture assertions; independent runtime protection is unproven by an SHR alone.
+
+## Install and verify
 
 ```bash
 npx -y @sanctuary-framework/mcp-server@1.8.4 protect --claude-code --no-open --no-dashboard
 npx -y @sanctuary-framework/mcp-server@1.8.4 doctor --json
-npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
 ```
 
 `-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal.
 
-Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. With `protect`, the MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping). A plain `npx -y @sanctuary-framework/mcp-server@1.8.4` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. `uninstall` keeps keys, state, and the audit log; `protect --unwrap` restores the original harness configuration. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
+Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. With `protect`, the MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping). A plain `npx -y @sanctuary-framework/mcp-server@1.8.4` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
+
+## Uninstall
+
+Run this only when intentionally removing Sanctuary. It is separate from installation and verification.
+
+```bash
+npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
+```
+
+`uninstall` removes the enforcement footprint and is designed to preserve keys, state, and the audit log. `sanctuary protect --unwrap` restores the backed-up harness configuration. Complete lifecycle preservation and removal remain unproven by a captured lifecycle drill in the Assurance Matrix.
 
 ## Quick Start
 
-Get protected in three steps:
+Inspect cooperative posture and create an identity with the following steps. OS enforcement requires separate installation, arming, and verification.
+
+Use the exact names returned by MCP `tools/list`. The `sanctuary/` prefix throughout this skill is a possible client display namespace; it is not a universal wire prefix.
 
 1. **Audit your posture**: Run `sanctuary/sovereignty_audit` to see your current protection score, gaps, and prioritized recommendations.
 2. **Create your identity**: Run `sanctuary/identity_create` to establish a cryptographic Ed25519 identity. This is your agent's foundation for signing, verification, and non-repudiation.
-3. **Generate your SHR**: Run `sanctuary/shr_generate` to create your first Sovereignty Health Report, a signed, machine-readable proof of your protection capabilities.
+3. **Generate your SHR**: Run `sanctuary/shr_generate` to create your first Sovereignty Health Report, a signed, self-attested posture report. It does not independently prove runtime enforcement.
 
 ## OpenClaw Users
 
@@ -46,11 +59,11 @@ If you're running OpenClaw, Sanctuary adds protections that OpenClaw doesn't pro
 - Local agent execution
 
 **What Sanctuary adds on top:**
-- **Encrypted state**: Your `MEMORY.md`, daily notes, and `.env` secrets are plaintext in OpenClaw. Sanctuary encrypts agent state at rest with AES-256-GCM (Argon2id key derivation).
+- **Encrypted state**: Your `MEMORY.md`, daily notes, and `.env` secrets are plaintext in OpenClaw. Sanctuary encrypts state written into its encrypted stores at rest with AES-256-GCM (Argon2id key derivation).
 - **Cryptographic identity**: OpenClaw has no agent identity. Sanctuary gives your agent an Ed25519 keypair for signing, verification, and handshakes.
 - **Graduated approval**: OpenClaw's `requireApproval` is binary. Sanctuary's three-tier Principal Policy auto-allows routine ops (Tier 3), escalates anomalies (Tier 2), and requires human approval for irreversible ops (Tier 1).
 - **Selective disclosure**: Prove facts about your state without revealing it. SHA-256 + Pedersen commitments, Schnorr ZK proofs, range proofs.
-- **Portable reputation**: Signed EAS-compatible attestations that you own and can export through current paths, with full exit still partial until **IC-07, IC-08, IC-09** close.
+- **Portable reputation**: Signed EAS-compatible attestations that you own and can export through current paths, with complete exit portability still partial; see the Assurance Matrix (**IC-07, IC-08, IC-09**).
 
 **One-command setup:**
 
@@ -103,13 +116,13 @@ the destructive last resort.
 | `sanctuary/state_write` | Write encrypted state (AES-256-GCM, Merkle integrity) |
 | `sanctuary/state_read` | Read and decrypt state with integrity verification |
 | `sanctuary/state_list` | List keys in a namespace (metadata only) |
-| `sanctuary/state_delete` | Securely delete state (overwrite + unlink; Tier 1) |
+| `sanctuary/state_delete` | Delete encrypted state (best-effort overwrite and unlink; physical erasure unproven; Tier 1) |
 | `sanctuary/state_export` | Export all state as encrypted portable bundle (Tier 1) |
 | `sanctuary/state_import` | Import state bundle with conflict resolution (Tier 1) |
 | `sanctuary/shr_generate` | Generate signed, machine-readable Sovereignty Health Report |
 | `sanctuary/shr_verify` | Verify a counterparty's SHR |
 
-Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human. The operator's own policy file decides.
+Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human. Some tiers are configurable. Non-relaxable operations, including raw signing and sensitive disclosure, remain Tier 1 even in an operator-authored policy.
 
 **First use:**
 1. `sanctuary/identity_create`: create your primary identity
@@ -195,7 +208,7 @@ Enable webhook approvals (`webhook.enabled: true`, `webhook.url`, `webhook.secre
 
 ## Architecture
 
-Sanctuary ships as five named mechanisms: **Castle Wall** (the perimeter: OS-level egress enforcement), **Sentinels** (observation, not enforcement), **Charter** (the cooperative MCP surface this skill uses), **Heralds** (recognition by other sovereigns: Concordia receipts and Verascore reputation, both optional), and **Mantle** (install-time binding of the fortress to the operator's machine).
+Sanctuary ships as five named mechanisms: **Castle Wall** (the perimeter: OS-level egress enforcement), **Sentinels** (observation, not enforcement), **Charter** (the cooperative MCP surface this skill uses), **Heralds** (recognition by other sovereigns: Concordia receipts and Verascore reputation, both optional), and **Mantle** (installation and custody records associated with the operator's environment; cryptographic confinement to one machine is unproven).
 
 Within Charter, the tools are grouped in four capability surfaces:
 
