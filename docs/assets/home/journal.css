@@ -98,6 +98,8 @@ img, svg { max-width: 100%; height: auto; display: block; }
 .article blockquote { margin-left: 0; margin-right: 0; padding: 4px 0 4px 20px; border-left: 3px solid var(--indigo); color: var(--ink-2); }
 .article blockquote > * + * { margin-top: 12px; }
 .article hr { border: 0; border-top: 1px solid var(--rule); margin: 48px 0; }
+.article a { overflow-wrap: anywhere; }
+.doc { padding-top: 64px; }
 .article img { border-radius: 12px; border: 1px solid var(--rule-2); }
 .article code { font: 400 .86em/1.5 var(--mono); background: var(--tint); border: 1px solid var(--rule); border-radius: 5px; padding: .08em .35em; overflow-wrap: anywhere; }
 .article pre { padding: 16px 18px; background: var(--tint); border: 1px solid var(--rule-2); border-radius: 10px; overflow-x: auto; font: 400 14px/1.6 var(--mono); }
