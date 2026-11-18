@@ -13,6 +13,7 @@
  * fortress-view source).
  */
 // fail-before-exempt: supplies the required fixture liveness source; existing behavior assertions are unchanged.
+import "../helpers/private-tmpdir.js"; // Must stay the first import: scopes TMPDIR to this file and removes it afterwards.
 import { createFixtureLivenessSource } from "../helpers/fixture-liveness-source.js"; import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
