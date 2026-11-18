@@ -5,8 +5,9 @@
  * escaping, and every arm of the delete continuing-path table.
  */
 import { Server } from "node:net";
-import { chmod, mkdir, open, readdir, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -48,7 +49,7 @@ afterEach(async () => {
 const CLOSING = "The Hermes memory relay is still stopped. Start it with: launchctl kickstart";
 const CLOSING_KEEP_STOPPED = "The Hermes memory relay is still stopped. Leave it stopped until the coordinator has read the memory-report.";
 // A run that stops before reading the audit log cannot rule out an earlier unconfirmed delete.
-const CLOSING_BEFORE_AUDIT_READ = "The Hermes memory relay is still stopped. If an earlier memory-delete said to leave it stopped, leave it stopped until the coordinator has read a memory-report. Otherwise start it with: launchctl kickstart";
+const CLOSING_BEFORE_AUDIT_READ = "The Hermes memory relay is still stopped. The audit record could not be checked. Leave it stopped until the coordinator has read a memory-report.";
 const CLOSING_AFTER_UNCONFIRMED = "The Hermes memory relay is still stopped. An earlier memory-delete was not confirmed, so leave it stopped until the coordinator has read";
 const BARRIER_REFUSAL_START = "Stop the Hermes memory relay first";
 const VERBS = ["memory-report", "memory-show", "memory-delete"] as const;
@@ -133,7 +134,7 @@ describe("hermes owner verbs: refusals", () => {
     expect(run.code).toBe(1);
     expect(run.err).toContain("not root");
     expect(lastLine(run.err).startsWith(CLOSING_BEFORE_AUDIT_READ)).toBe(true);
-    expect(lastLine(run.err)).toContain("gui/0/ai.sanctuaryprotocol.hermes-memory-relay");
+    expect(run.err).not.toContain("launchctl kickstart");
     expect(resolve).not.toHaveBeenCalled();
     expect(await treeHashes(f.fortress)).toEqual(before);
   });
@@ -1391,7 +1392,7 @@ describe("hermes owner verbs: memory-delete", () => {
     expect((await outcomes(f)).map(row => row?.outcome)).toEqual(["intent", "indeterminate"]);
   });
 
-  it("keeps the relay stopped after an unconfirmed delete even when its outcome row cannot be written", async () => {
+  it("keeps unresolved deletes stopped across owner commands R1", async () => {
     const f = await deleteFixture();
     failCorpusDelete(2);
     let rolledBack = false;
@@ -1411,6 +1412,11 @@ describe("hermes owner verbs: memory-delete", () => {
     expect(rolledBack).toBe(true);
     expect(run.err).toContain('The delete outcome "indeterminate" could not be written to the audit log');
     expectRelayKeptStopped(run.err);
+    for (const verb of VERBS) {
+      const later = await runVerb(f, verbArgs(verb), { answer: "no\n" });
+      expect.soft(lastLine(later.err)).toContain(CLOSING_AFTER_UNCONFIRMED);
+      expect.soft(later.err).not.toContain("launchctl kickstart");
+    }
   });
 
   it("a passage with more chunks than one Hermes save can hold is never reported as rolled back", async () => {
@@ -1524,7 +1530,7 @@ describe("hermes owner verbs: memory-delete", () => {
     expect((await outcomes(f)).map(row => row?.outcome)).toEqual(["intent", "indeterminate"]);
   });
 
-  it("an outcome row that cannot be written is named on stderr and not retried", async () => {
+  it("keeps an unsettled delete stopped with its audit diagnostic R1", async () => {
     const f = await deleteFixture();
     const real = AuditLog.prototype.appendCritical;
     let calls = 0;
@@ -1537,6 +1543,12 @@ describe("hermes owner verbs: memory-delete", () => {
     expect(run.err).toContain('The delete outcome "deleted" could not be written to the audit log; it is not retried.');
     expect(run.out).not.toContain("deleted\n");
     expect(calls).toBe(2);
+    vi.restoreAllMocks();
+    expect.soft(lastLine(run.err)).toBe(CLOSING_KEEP_STOPPED);
+    expect.soft(run.err).not.toContain("launchctl kickstart");
+    const later = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect.soft(lastLine(later.err)).toContain(CLOSING_AFTER_UNCONFIRMED);
+    expect.soft(later.err).not.toContain("launchctl kickstart");
   });
 
   it("an intent with no outcome makes the next delete refuse and the report say interrupted", async () => {
@@ -1630,13 +1642,14 @@ describe("hermes owner verbs: closing line after an earlier delete", () => {
     expect(lastLine((await runVerb(f, ["memory-report", "--since", f.since])).err).startsWith(CLOSING)).toBe(true);
   });
 
-  it("a usage error cannot read the audit log, so it gives the start command only on condition", async () => {
+  it("keeps unresolved owner state stopped before audit access R1", async () => {
     const f = await ownerFortress(stack);
     await seedDeleteAttempts(f, [["p1", "indeterminate"]]);
     const err = new TerminalSink();
     expect(await runHermesMemory({ argv: ["memory-report", "--fortress", f.fortress], env: { HOME: f.home }, uid: process.getuid!(),
       ...fixturePackage(f), stderr: err, stdout: new TerminalSink() })).toBe(2);
-    expect(lastLine(err.text)).toBe(`${CLOSING_BEFORE_AUDIT_READ} gui/${process.getuid!()}/ai.sanctuaryprotocol.hermes-memory-relay then run the kit's verify.`);
+    expect(lastLine(err.text)).toBe(CLOSING_BEFORE_AUDIT_READ);
+    expect(err.text).not.toContain("launchctl kickstart");
   });
 });
 
@@ -1656,5 +1669,143 @@ describe("hermes owner verbs: help text", () => {
       expect(HERMES_MEMORY_HELP[verb]).toContain("cannot be\nzeroed inside a JavaScript process");
       expect(HERMES_MEMORY_HELP[verb]).toContain("B_RUNTIME/bin/node B_RUNTIME/pkg/dist/cli.js");
     }
+  });
+});
+
+/** Owner restart advice and report destinations honor checked scope and containment. 1514 */
+describe("owner evidence and destinations 1514", () => {
+  const OWNER_ONLY = 0o700;
+  const OTHER_DOCUMENT = "mem.agent-other.p1";
+  const OWN_DOCUMENT = `mem.${FIXTURE_AGENT_ID}.p1`;
+
+  async function appendOwnerRows(f: OwnerFortress, rows: readonly (readonly [string, OwnerDeleteOutcome])[]) {
+    await withSeedSession(f, async ({ audit }) => {
+      for (const [documentId, outcome] of rows) {
+        await audit.appendCritical({ layer: "l3", operation: HERMES_MEMORY_OWNER_DELETE_OPERATION,
+          identity_id: "operator", result: "success",
+          details: { document_id: documentId, passage_id: "p1", text_sha256: null, outcome } });
+      }
+    });
+  }
+
+  it("settles deletes within their full document and passage scope R3", async () => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, "p1", "owner scope passage");
+    await appendOwnerRows(f, [[OTHER_DOCUMENT, "intent"], [OTHER_DOCUMENT, "indeterminate"]]);
+    const deleted = await runVerb(f, ["memory-delete", "--passage", "p1"], { answer: "DELETE\n" });
+    expect(deleted.code, deleted.err).toBe(0);
+    expect.soft(lastLine(deleted.err)).toContain(CLOSING_AFTER_UNCONFIRMED);
+    expect.soft(deleted.err).not.toContain("launchctl kickstart");
+    const reported = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect.soft(lastLine(reported.err)).toContain(CLOSING_AFTER_UNCONFIRMED);
+    expect.soft(reported.err).not.toContain("launchctl kickstart");
+    expect.soft(report(reported).owner_deletes).toEqual([
+      expect.objectContaining({ document_id: OTHER_DOCUMENT, passage_id: "p1",
+        attempts: [expect.objectContaining({ outcome: "indeterminate" })] }),
+      expect.objectContaining({ document_id: OWN_DOCUMENT, passage_id: "p1",
+        attempts: [expect.objectContaining({ outcome: "deleted" })] }),
+    ]);
+  });
+
+  it("pairs intent and outcome evidence within the same document R3", async () => {
+    const f = await ownerFortress(stack);
+    await appendOwnerRows(f, [[OTHER_DOCUMENT, "intent"], [OWN_DOCUMENT, "deleted"]]);
+    const reported = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect.soft(report(reported).owner_deletes).toEqual([
+      expect.objectContaining({ document_id: OTHER_DOCUMENT,
+        attempts: [expect.objectContaining({ outcome: "interrupted", outcome_at: null })] }),
+    ]);
+    expect.soft(lastLine(reported.err)).toContain(CLOSING_AFTER_UNCONFIRMED);
+    expect.soft(reported.err).not.toContain("launchctl kickstart");
+  });
+
+  it.each([
+    { evidence: "unverified", verified: false, everPruned: false },
+    { evidence: "retention null", verified: true, everPruned: null },
+    { evidence: "retention undefined", verified: true, everPruned: undefined },
+    { evidence: "pruned", verified: true, everPruned: true },
+  ])("uses checked audit evidence for restart advice: $evidence R2a", async ({ verified, everPruned }) => {
+    const f = await ownerFortress(stack);
+    await seedPassage(f, "p1", "audit evidence passage");
+    const realVerdict = AuditLog.prototype.getAuditChainVerdict;
+    vi.spyOn(AuditLog.prototype, "getAuditChainVerdict").mockImplementation(async function(this: AuditLog) {
+      const verdict = await realVerdict.call(this);
+      return verified ? verdict : { ...verdict, status: "findings" };
+    });
+    const realUsage = AuditLog.prototype.getRetentionUsage;
+    vi.spyOn(AuditLog.prototype, "getRetentionUsage").mockImplementation(async function(this: AuditLog) {
+      const usage = await realUsage.call(this);
+      // The runtime reader also accepts records whose retention field is absent.
+      return { ...usage, everPruned } as Awaited<ReturnType<typeof realUsage>>;
+    });
+    for (const verb of VERBS) {
+      const run = await runVerb(f, verbArgs(verb), { answer: "no\n" });
+      if (everPruned === true) {
+        // DEBT(HERMES-OWNER-HOLD-RETENTION)
+        expect.soft(lastLine(run.err)).toContain(CLOSING);
+      } else {
+        expect.soft(lastLine(run.err)).toContain("record could not be checked");
+        expect.soft(lastLine(run.err)).toContain("Leave it stopped");
+        expect.soft(run.err).not.toContain("launchctl kickstart");
+      }
+    }
+  });
+
+  it.each(["fortress", "kit"] as const)("protects all descendant folder names in the %s tree R4", async tree => {
+    const root = await mkdtemp(join(tmpdir(), "owner-destination-"));
+    stack.push(() => rm(root, { recursive: true, force: true }));
+    const home = join(root, "home");
+    const fortress = join(home, "Library", "Application Support", "Sanctuary", "Fortresses", "fortress-owner");
+    await mkdir(join(fortress, "state", CUSTODY_WRITE_LOCK_NAMESPACE), { recursive: true, mode: OWNER_ONLY });
+    // Destination admission precedes custody, so this fixture needs only the owned directory shape.
+    const f: OwnerFortress = { root, home, fortress, storage: new FilesystemStorage(join(fortress, "state")),
+      fortressId: "fortress-owner", since: new Date().toISOString(), bridgeEnv: {} };
+    const kit = join(f.root, "kit");
+    await mkdir(kit, { mode: OWNER_ONLY });
+    const folder = join(tree === "fortress" ? f.fortress : kit, "..reports");
+    await mkdir(folder, { mode: OWNER_ONLY });
+    const beforeFortress = await treeHashes(f.fortress);
+    const beforeKit = await treeHashes(kit);
+    const run = await runVerb(f, ["memory-report", "--out", join(folder, "report.json")]);
+    expect.soft(run.code, run.err).toBe(1);
+    expect.soft(run.err).toContain("inside the fortress or the kit folder");
+    expect.soft(await treeHashes(f.fortress)).toEqual(beforeFortress);
+    expect.soft(await treeHashes(kit)).toEqual(beforeKit);
+  });
+
+  it("protects the home runtime while permitting the home report folder R5", async () => {
+    const f = await ownerFortress(stack);
+    const runtime = join(f.home, "B_RUNTIME");
+    const packageRoot = join(runtime, "pkg");
+    const reports = join(f.home, "hermes-memory-reports");
+    await mkdir(packageRoot, { recursive: true, mode: OWNER_ONLY });
+    await chmod(runtime, OWNER_ONLY);
+    await mkdir(reports, { mode: OWNER_ONLY });
+    const options = { packageRoot, invokedEntry: join(packageRoot, "dist", "cli.js") };
+    const beforeRuntime = await treeHashes(runtime);
+    const beforeFortress = await treeHashes(f.fortress);
+    const refused = await runVerb(f, ["memory-report", "--out", join(runtime, "report.json")], options);
+    expect.soft(refused.code, refused.err).toBe(1);
+    expect.soft(refused.err).toContain("inside the fortress or the kit folder");
+    expect.soft(await treeHashes(runtime)).toEqual(beforeRuntime);
+    const allowed = await runVerb(f, ["memory-report", "--out", join(reports, "report.json")], options);
+    expect(allowed.code, allowed.err).toBe(0);
+    expect(JSON.parse(await readFile(join(reports, "report.json"), "utf8")).report).toBe("sanctuary hermes memory-report");
+    expect(await treeHashes(f.fortress)).toEqual(beforeFortress);
+  });
+
+  it("withholds restart advice until owner audit evidence is available R1", async () => {
+    const out = new TerminalSink();
+    const err = new TerminalSink();
+    const code = await runHermesMemory({ argv: ["memory-report"], stdout: out, stderr: err,
+      packageVersion: FIXTURE_PACKAGE_VERSION, packageRoot: dirname(fileURLToPath(import.meta.url)), invokedEntry: undefined });
+    expect(code).toBe(2);
+    expect.soft(lastLine(err.text)).toBe(CLOSING_BEFORE_AUDIT_READ);
+    expect.soft(err.text).not.toContain("launchctl kickstart");
+  });
+
+  it("describes audit metadata retention limits in delete help R7", () => {
+    expect.soft(HERMES_MEMORY_HELP["memory-delete"]).toContain("under the audit log's retention limits");
+    expect.soft(HERMES_MEMORY_HELP["memory-delete"]).not.toContain("permanently");
   });
 });

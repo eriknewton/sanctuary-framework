@@ -100,11 +100,12 @@ zeroed inside a JavaScript process.
 
 Refusals change nothing: root, an SSH session (the keychain prompt cannot be answered there), a
 fortress your account does not own, a missing fortress (nothing is created), or a prompt left
-unanswered for 120 seconds. The last line always says the Hermes memory relay is still stopped and how to start it,
-except after a delete that may have left the passage half-removed or unconfirmed: then that run, and every later
-run that reads the audit log, says to leave the relay stopped until the coordinator has read a memory-report, and
-steps 5 and 6 wait until then. A usage error or a refusal that stops before the audit log is read gives the start
-command only for when no earlier delete said to leave the relay stopped.
+unanswered for 120 seconds. The last line says how to start the Hermes memory relay only after the audit record
+has been checked and no unresolved delete remains. After a delete that may have left the passage half-removed
+or unconfirmed, that run and every later run that reads the audit log says to leave the relay stopped until
+the coordinator has read a memory-report, and
+steps 5 and 6 wait until then. A usage error or a refusal that stops before the audit log can be checked also
+says to leave the relay stopped.
 `;
 
 const HELP_REPORT = `Usage: sanctuary hermes memory-report --fortress <dir> --agent-id <id> [--since <ISO time>] [--out <file>] [--recovery-key-prompt]
@@ -132,7 +133,7 @@ behind or an earlier delete was interrupted (ask the coordinator, with a memory-
 is unfinished, or no passage with that id exists. Ctrl-C and similar signals are ignored from DELETE
 until the delete returns; a force kill leaves an intent row that the next report and delete call interrupted.
 What delete means: the passage leaves Sanctuary memory and no later recall returns it. These remain:
-  - The audit log keeps its fingerprint, byte length and timestamps permanently.
+  - The audit log keeps its fingerprint, byte length and timestamps under the audit log's retention limits.
   - Hermes's session store keeps the original turn, and every prompt that recall fed it into.
   - Secure overwrite on APFS is not physical erasure; snapshots and backups can keep old blocks, and
     confidentiality rests on encryption.
@@ -231,24 +232,25 @@ export async function runHermesMemory(options: HermesMemoryOptions): Promise<num
     out.write(HELP_HERMES);
     return 0;
   }
-  // A usage error opens no fortress, so it cannot read whether an earlier delete was left unconfirmed:
-  // its closing line gives the start command only on that condition.
-  if (!isOwnerVerb(verb)) { err.write(HELP_HERMES + closingLineUnread(options.uid ?? process.getuid?.())); return 2; }
+  // A usage error has no checked audit evidence, so its closing line keeps the relay stopped.
+  if (!isOwnerVerb(verb)) { err.write(HELP_HERMES + CLOSING_LINE_RECORD_UNCHECKED); return 2; }
   if (options.argv.includes("--help") || options.argv.includes("-h")) {
     out.write(HERMES_MEMORY_HELP[verb]);
     return 0;
   }
   const parsed = parseArgs(verb, options.argv.slice(1));
   if (typeof parsed === "string") {
-    err.write(`Error: ${parsed}\n${HERMES_MEMORY_HELP[verb].split("\n")[0]}\n` + closingLineUnread(options.uid ?? process.getuid?.()));
+    err.write(`Error: ${parsed}\n${HERMES_MEMORY_HELP[verb].split("\n")[0]}\n` + CLOSING_LINE_RECORD_UNCHECKED);
     return 2;
   }
   const uid = options.uid ?? process.getuid?.();
-  const relay: RelayClosing = { auditViewRead: false, thisDeleteUnsafe: false, unconfirmedPassages: new Set(), reportWritten: false };
+  const relay: RelayClosing = { auditViewRead: false, auditRecordUnchecked: false, thisDeleteUnsafe: false, unconfirmedPassages: new Set(), reportWritten: false };
   const code = await runOwnerVerb(parsed, options, uid, relay);
-  err.write(relay.thisDeleteUnsafe ? CLOSING_LINE_KEEP_STOPPED
-    : relay.unconfirmedPassages.size > 0 ? closingLineAfterUnconfirmedDelete(relay.reportWritten)
-      : relay.auditViewRead ? closingLine(uid) : closingLineUnread(uid));
+  // A start command requires checked audit evidence and no unresolved delete in any document scope.
+  err.write(relay.auditRecordUnchecked ? CLOSING_LINE_RECORD_UNCHECKED
+    : relay.thisDeleteUnsafe ? CLOSING_LINE_KEEP_STOPPED
+      : relay.unconfirmedPassages.size > 0 ? closingLineAfterUnconfirmedDelete(relay.reportWritten)
+        : relay.auditViewRead ? closingLine(uid) : CLOSING_LINE_RECORD_UNCHECKED);
   return code;
 }
 
@@ -259,7 +261,8 @@ export async function runHermesMemory(options: HermesMemoryOptions): Promise<num
  */
 interface RelayClosing {
   auditViewRead: boolean;
-  /** This run's own delete ended failed_unrestored or indeterminate. */
+  auditRecordUnchecked: boolean;
+  /** This run's own delete has an unsafe outcome or lacks a confirmed audit append. */
   thisDeleteUnsafe: boolean;
   /** Passages whose latest owner-delete attempt is unconfirmed and that no later attempt removed. */
   unconfirmedPassages: Set<string>;
@@ -276,17 +279,13 @@ function isOwnerVerb(value: string): value is HermesMemoryOwnerVerb {
 const CLOSING_LINE_KEEP_STOPPED = "The Hermes memory relay is still stopped. Leave it stopped until the coordinator has " +
   "read the memory-report.\n";
 
+const CLOSING_LINE_RECORD_UNCHECKED = "The Hermes memory relay is still stopped. The audit record could not be checked. " +
+  "Leave it stopped until the coordinator has read a memory-report.\n";
+
 // Every later run that reads the audit view keeps the relay stopped too, until an unconfirmed delete is cleared.
 function closingLineAfterUnconfirmedDelete(reportWritten: boolean): string {
   return "The Hermes memory relay is still stopped. An earlier memory-delete was not confirmed, so leave it stopped " +
     `until the coordinator has read ${reportWritten ? "this report" : "a memory-report"}.\n`;
-}
-
-// A run that ended before it could read the audit view cannot rule out an unconfirmed delete, so the start
-// command comes only after that condition.
-function closingLineUnread(uid: number | undefined): string {
-  return "The Hermes memory relay is still stopped. If an earlier memory-delete said to leave it stopped, leave it " +
-    `stopped until the coordinator has read a memory-report. Otherwise start it with: ${startCommand(uid)}.\n`;
 }
 
 function closingLine(uid: number | undefined): string {
@@ -414,7 +413,9 @@ async function runOwnerVerb(args: ParsedArgs, options: HermesMemoryOptions, uid:
         const result = await withOwnerCustody({ args, env, err, stdin, storage, storagePath, promptTimeoutMs: options.promptTimeoutMs },
           async (context) => {
             const noteAuditView = (view: AuditView): void => {
-              relay.auditViewRead = true;
+              // Restart advice relies on a verified owner audit chain with known retention state.
+              relay.auditViewRead = view.chainVerified && typeof view.everPruned === "boolean";
+              relay.auditRecordUnchecked = !relay.auditViewRead;
               for (const passageId of unconfirmedDeletePassages(ownerDeleteAttempts(view.entries))) relay.unconfirmedPassages.add(passageId);
             };
             switch (args.verb) {
@@ -441,7 +442,7 @@ async function runOwnerVerb(args: ParsedArgs, options: HermesMemoryOptions, uid:
                 return deletePassage(context, args, { out, err, stdin, signals: options.signals ?? process,
                   promptTimeoutMs: options.promptTimeoutMs ?? OWNER_PROMPT_TIMEOUT_MS, markFinished: () => { finished = true; },
                   noteAuditView, keepRelayStopped: () => { relay.thisDeleteUnsafe = true; },
-                  removed: (passageId) => { relay.unconfirmedPassages.delete(passageId); } });
+                  removed: (documentId, passageId) => { relay.unconfirmedPassages.delete(ownerDeleteIdentity(documentId, passageId)); } });
             }
           });
         // Only a resolved callback separates custody finalization from operation failures, including refusals.
@@ -646,7 +647,9 @@ function ownerDeleteAttempts(entries: readonly AuditEntry[]): OwnerDeleteAttempt
     if (details.outcome !== "intent") continue;
     const next = rows[index + 1];
     const nextDetails = next?.details ?? {};
-    const paired = next !== undefined && nextDetails.outcome !== "intent" && nextDetails.passage_id === details.passage_id;
+    // An outcome settles only the intent for the same document and passage in the owner audit chain.
+    const paired = next !== undefined && nextDetails.outcome !== "intent" && nextDetails.passage_id === details.passage_id &&
+      typeof details.document_id === "string" && nextDetails.document_id === details.document_id;
     attempts.push({
       passage_id: String(details.passage_id),
       document_id: typeof details.document_id === "string" ? details.document_id : null,
@@ -660,17 +663,23 @@ function ownerDeleteAttempts(entries: readonly AuditEntry[]): OwnerDeleteAttempt
 }
 
 /**
- * Passages whose latest owner-delete attempt ended failed_unrestored or indeterminate and that no later attempt
+ * Scoped passages with an interrupted, failed_unrestored or indeterminate delete that no later attempt
  * removed. Only a later "deleted" settles one: not_attempted and failed_restored leave the same uncertain
  * records in place, and a failed_unrestored passage has no document left for a later delete to find.
  */
 function unconfirmedDeletePassages(attempts: readonly OwnerDeleteAttempt[]): Set<string> {
   const unconfirmed = new Set<string>();
   for (const attempt of attempts) {
-    if (attempt.outcome === "failed_unrestored" || attempt.outcome === "indeterminate") unconfirmed.add(attempt.passage_id);
-    else if (attempt.outcome === "deleted") unconfirmed.delete(attempt.passage_id);
+    const identity = ownerDeleteIdentity(attempt.document_id, attempt.passage_id);
+    // Every unresolved intent holds its full owner scope until a recorded delete settles that same identity.
+    if (attempt.outcome === "interrupted" || attempt.outcome === "failed_unrestored" || attempt.outcome === "indeterminate") unconfirmed.add(identity);
+    else if (attempt.outcome === "deleted") unconfirmed.delete(identity);
   }
   return unconfirmed;
+}
+
+function ownerDeleteIdentity(documentId: string | null, passageId: string): string {
+  return JSON.stringify([documentId, passageId]);
 }
 
 type TriState = boolean | "indeterminate";
@@ -806,9 +815,10 @@ async function buildMemoryReport(context: OwnerContext, args: ParsedArgs, runAt:
 function groupAttempts(attempts: readonly OwnerDeleteAttempt[]) {
   const groups = new Map<string, { passage_id: string; document_id: string | null; attempts: Omit<OwnerDeleteAttempt, "passage_id" | "document_id">[] }>();
   for (const { passage_id, document_id, ...attempt } of attempts) {
-    const group = groups.get(passage_id) ?? { passage_id, document_id, attempts: [] };
+    const identity = ownerDeleteIdentity(document_id, passage_id);
+    const group = groups.get(identity) ?? { passage_id, document_id, attempts: [] };
     group.attempts.push(attempt);
-    groups.set(passage_id, group);
+    groups.set(identity, group);
   }
   return [...groups.values()];
 }
@@ -864,7 +874,12 @@ async function hermesKitFolders(packageRoot: string, invokedEntry: string | unde
   const invokedRoot = packageRootFromInvokedEntry(invokedEntry);
   if (invokedRoot !== undefined) roots.push(invokedRoot);
   const kits: string[] = [];
-  for (const kit of roots.map(hermesKitFolder)) kits.push(kit, await realpath(kit).catch(() => kit));
+  for (const root of roots) {
+    // Narrower runtime and package folders remain protected when the kit ancestor is the owner's home.
+    for (const folder of [resolve(root), dirname(resolve(root)), hermesKitFolder(root)]) {
+      kits.push(folder, await realpath(folder).catch(() => folder));
+    }
+  }
   const neverKit: string[] = [sep];
   if (home !== undefined && home !== "") neverKit.push(resolve(home), await realpath(home).catch(() => resolve(home)));
   return [...new Set(kits)].filter(kit => !neverKit.includes(kit));
@@ -872,7 +887,8 @@ async function hermesKitFolders(packageRoot: string, invokedEntry: string | unde
 
 function isInsideOrEqual(path: string, parent: string): boolean {
   const rel = relative(parent, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  // Only a complete parent segment leaves the protected tree; names inside it remain protected.
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 /** Validate --out before custody: a new file in a private, caller-owned folder outside the fortress and the kit folder. */
@@ -1186,7 +1202,7 @@ async function deletePassage(context: OwnerContext, args: ParsedArgs, io: {
   readonly noteAuditView: (view: AuditView) => void;
   readonly keepRelayStopped: () => void;
   /** This passage's delete was confirmed, so an earlier unconfirmed attempt on it no longer holds the relay. */
-  readonly removed: (passageId: string) => void;
+  readonly removed: (documentId: string, passageId: string) => void;
 }): Promise<number> {
   const passageId = args.passage!;
   if (await context.readonlyStorage.read(HERMES_INSERT_INTENT_NAMESPACE, HERMES_INSERT_INTENT_KEY) !== null) {
@@ -1248,6 +1264,8 @@ async function deletePassage(context: OwnerContext, args: ParsedArgs, io: {
       // Audit first: if the intent cannot be recorded, nothing is deleted.
       await row("intent");
     } catch {
+      // An unconfirmed intent append keeps this run stopped even when read-back is unavailable.
+      io.keepRelayStopped();
       io.err.write(await intentAppendFailureMessage(context, passageId) + "\n");
       return 1;
     }
@@ -1262,15 +1280,18 @@ async function deletePassage(context: OwnerContext, args: ParsedArgs, io: {
     }
     // Decided before the outcome row, so the closing line holds even if that row cannot be written.
     if (outcome === "failed_unrestored" || outcome === "indeterminate") io.keepRelayStopped();
-    if (outcome === "deleted") io.removed(passageId);
     io.markFinished();
     try {
       // The outcome row is appended before success is reported, so a printed "deleted" always has its row.
       await row(outcome, category === undefined ? {} : { error_category: category });
     } catch {
+      // A delete without a recorded outcome remains unresolved even if the corpus mutation completed.
+      io.keepRelayStopped();
       io.err.write(`The delete outcome "${outcome}" could not be written to the audit log; it is not retried.\n`);
       return 1;
     }
+    // Only a durable deleted outcome releases the hold for this document and passage.
+    if (outcome === "deleted") io.removed(documentId, passageId);
     const result = OUTCOME_REPORT[outcome](category ?? "error");
     (result.code === 0 ? io.out : io.err).write(result.message + "\n");
     return result.code;

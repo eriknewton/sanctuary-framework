@@ -21,7 +21,7 @@ afterEach(async () => { await runCleanups(stack); });
 const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
 const CLOSING = "The Hermes memory relay is still stopped. Start it with: launchctl kickstart";
 // A run that stops before reading the audit log cannot rule out an earlier unconfirmed delete.
-const CLOSING_BEFORE_AUDIT_READ = "The Hermes memory relay is still stopped. If an earlier memory-delete said to leave it stopped, leave it stopped until the coordinator has read a memory-report. Otherwise start it with: launchctl kickstart";
+const CLOSING_BEFORE_AUDIT_READ = "The Hermes memory relay is still stopped. The audit record could not be checked. Leave it stopped until the coordinator has read a memory-report.";
 const source = (path: string) => new URL(path, import.meta.url).href;
 const OWNER_MODULE = source("../../src/cli/hermes-memory.ts");
 const ADAPTER_MODULE = source("../../src/sdw/adapters/sdw-memory-backend.ts");
