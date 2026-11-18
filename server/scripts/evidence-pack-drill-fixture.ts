@@ -59,6 +59,8 @@ export async function runDrillFixture(argv: string[]): Promise<number> {
     const fortress = join(root, "fortress"), statePath = join(fortress, "synthetic-state.json"); let state: FixtureState;
     if (argv[0] === "create") {
       await mkdir(fortress, { mode: MODE_DIRECTORY });
+      await mkdir(join(fortress, "state", "_meta"), { recursive: true, mode: MODE_DIRECTORY });
+      await writeFile(join(fortress, "state", "_meta", "key-params.enc"), "Synthetic fixture custody marker.\n", { flag: "wx", mode: MODE_FILE });
       const master = randomBytes(C.KEY_BYTES), key = derivePurposeKey(master, "identity-encryption");
       const who = createIdentity("synthetic evidence drill", key, "passphrase").storedIdentity;
       const wrong = createIdentity("synthetic unrelated pin", key, "passphrase").storedIdentity;

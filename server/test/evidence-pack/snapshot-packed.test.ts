@@ -9,7 +9,7 @@ import { spawnSync, execFileSync } from "node:child_process";
 // @ts-expect-error The build script is JavaScript and intentionally has no declaration artifact.
 import { candidateForTests } from "../../scripts/build-evidence-pack.mjs";
 import { functionalCandidateForTests } from "./snapshot-artifact-fixtures.js";
-import { seedExportFortress, fixture, syncAudit } from "./snapshot-fixtures.js";
+import { fixture, syncAudit } from "./snapshot-fixtures.js";
 import { verifyAuditChainContent } from "../../src/cli/audit-chain-verify.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
 let c: Awaited<ReturnType<typeof candidateForTests>>;
@@ -106,7 +106,7 @@ it("synthetic fixture creates advances and exports through one isolated producer
   mkdirSync("/tmp/v70", { recursive: true, mode: 0o700 }); const root = "/tmp/v70/test-" + randomUUID(); mkdirSync(root, { mode: 0o700 });
   const script = join(c.tree, "server/evidence-pack-dist/evidence-pack-drill-fixture.js");
   const run = (args: string[]) => spawnSync(process.execPath, [script, args[0], "--root", root, ...args.slice(1)], { encoding: "utf8", timeout: TIMEOUT_MS, env: { ...process.env, HOME: root + "/home" } });
-  for (const args of [["create"], ["export", "--name", "pack-stale"], ["advance"], ["export", "--name", "pack"], ["export", "--name", "pack-other"]]) { const r = run(args); expect(r.status, r.stderr).toBe(0); expect(r.stderr).toContain('"denied":0'); if (args[0] === "create") await seedExportFortress(join(root, "fortress")); }
+  for (const args of [["create"], ["export", "--name", "pack-stale"], ["advance"], ["export", "--name", "pack"], ["export", "--name", "pack-other"]]) { const r = run(args); expect(r.status, r.stderr).toBe(0); expect(r.stderr).toContain('"denied":0'); }
   expect(run(["create"]).status).toBe(1);
   const tamper = spawnSync("python3", ["scripts/evidence-pack-drill-tamper.py", "--source", join(root, "pack"), "--output", join(root, "tamper")], { encoding: "utf8", timeout: TIMEOUT_MS }); expect(tamper.status, tamper.stderr).toBe(0);
   expect(verifyAuditChainContent(readFileSync(join(root, "tamper/shortened-file", C.AUDIT_FILENAME), "utf8"), { publicKey: readFileSync(join(root, "pack-key.txt"), "utf8").trim() }).verdict).toBe("PASS");

@@ -27,6 +27,7 @@
  *    migration leaves a pure-legacy fortress (no un-unlockable window).
  */
 
+import { CUSTODY_ENVELOPE_KEY, CUSTODY_SENTINEL_KEY, LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY } from "../evidence-pack/existing-fortress.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -153,10 +154,7 @@ const CUSTODY_INSTALL_MODES: ReadonlySet<string> = new Set([
   "legacy-migrated",
 ]);
 
-/** `_meta` key holding the envelope. */
-export const CUSTODY_ENVELOPE_KEY = "custody-envelope";
-/** Plaintext + purpose label for the custody sentinel (see write below). */
-export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
+export { CUSTODY_ENVELOPE_KEY, CUSTODY_SENTINEL_KEY } from "../evidence-pack/existing-fortress.js";
 
 /**
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
@@ -2016,7 +2014,7 @@ async function fortressHasDataBeyondMarkers(
   try {
     const total = await storage.totalSize();
     if (total === 0) return false;
-    const KNOWN_MARKERS = new Set(["key-params", "recovery-key-hash"]);
+    const KNOWN_MARKERS = new Set<string>([LEGACY_PASSPHRASE_KEY, LEGACY_RECOVERY_KEY]);
     const metaEntries = await storage.list("_meta");
     if (metaEntries.some((e) => !KNOWN_MARKERS.has(e.key))) return true;
     const markerBytes = metaEntries.reduce((sum, e) => sum + e.size_bytes, 0);
@@ -2222,6 +2220,7 @@ async function establishMasterUnderBarrier(
       throw error;
     }
   }
+  // Must match FORTRESS_INITIALIZATION_KEYS in ../evidence-pack/existing-fortress.ts; boot authenticates every admitted custody shape.
   const existingEnvelope = await readCustodyEnvelope(opts.storage);
   if (existingEnvelope) {
     const unlocked = await unlockEnvelopeReadOnly(existingEnvelope, opts);
@@ -2362,9 +2361,9 @@ async function establishMasterLocked(
     throw envelopeMissingButSentinelPresent();
   }
 
-  // Inspect legacy markers.
-  const legacyParamsRaw = await storage.read("_meta", "key-params");
-  const legacyHashRaw = await storage.read("_meta", "recovery-key-hash");
+  // Must match FORTRESS_INITIALIZATION_KEYS in ../evidence-pack/existing-fortress.ts; sentinel and legacy reads complete boot admission.
+  const legacyParamsRaw = await storage.read("_meta", LEGACY_PASSPHRASE_KEY);
+  const legacyHashRaw = await storage.read("_meta", LEGACY_RECOVERY_KEY);
 
   if (opts.passphrase !== undefined && legacyParamsRaw) {
     // Legacy passphrase fortress: master = Argon2id(passphrase, key-params).

@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, writeFile, lstat, unlink, rmdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { initializedFortressExists } from "./existing-fortress.js";
+import { initializedFortressExists, FORTRESS_STATE_DIRECTORY } from "./existing-fortress.js";
 import { createSanctuaryServer } from "../index.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { gatherSnapshot, resolveSnapshotTransparencyPin, type SnapshotGather, type CastlePin } from "./snapshot-gather.js";
@@ -37,7 +37,7 @@ type ParametersGather=Parameters<typeof gatherSnapshot>[0];
 /** Production selection requires bounded classification and validation; a positive split choice survives normal shutdown. */
 export async function gatherExportStatement(input:ExportGatherInput):Promise<SnapshotGather|SplitExportGather> {
   // CLASSIFY has no extra V0 lifecycle event: the existing unsplit phase order is a byte-regression contract.
-  const selection=await input.classify(join(input.fortress,"state"),input.source.io,input.signal);
+  const selection=await input.classify(join(input.fortress,FORTRESS_STATE_DIRECTORY),input.source.io,input.signal);
   if(selection.topology==="unsplit")return gatherSnapshot(input);
   await input.phase("CLASSIFY");await input.phase("QUIESCE_EXPORT_INSTANCE");await input.quiesce();
   const identities=new Map(input.identities.map(who=>[who.identity_id,who]));
@@ -55,9 +55,14 @@ export async function gatherExportStatement(input:ExportGatherInput):Promise<Sna
   B.requireSplit(!input.signal.aborted,"io_error");
   return {kind:"split",gathered,pin,fortressId:fortressIdFromStoragePath(input.fortress)};
 }
+/** Open the required filesystem fortress with no first-run custody authority. */
+function openExistingFortress(fortressPath: string): ReturnType<typeof createSanctuaryServer> {
+  return createSanctuaryServer({ existingFortressPath: resolve(fortressPath) });
+}
+
 export interface ExportOptions { fortress: string; output: string; receipt: string; publicKeyFile: string }
 export interface ExportDependencies {
-  boot: typeof createSanctuaryServer;
+  boot: typeof openExistingFortress;
   gather: typeof gatherExportStatement;
   classify:typeof classifySplitTopology;
   source:SplitGatherDependencies;
@@ -72,7 +77,7 @@ export interface ExportDependencies {
 export interface V0ExportDependencies extends Pick<ExportDependencies,"boot"|"runtimeRevision"|"buildRevision"|"phase"|"io"> {
   gather:(input:ParametersGather)=>Promise<SnapshotGather>;
 }
-export const exportDependencies: ExportDependencies = { boot: createSanctuaryServer, gather: gatherExportStatement, classify:classifySplitTopology, source:{io:sourceIO,read:readSplitSource,census:censusSplitSource,validate:validateSplitSource,recheck:recheckSplitSource,budget:()=>new B.Budget()},resolvePin:resolveSnapshotTransparencyPin,signal:()=>new AbortController().signal, runtimeRevision: SNAPSHOT_SOURCE_REVISION, buildRevision: SNAPSHOT_SOURCE_REVISION, phase: async () => {}, io: commandIO };
+export const exportDependencies: ExportDependencies = { boot: openExistingFortress, gather: gatherExportStatement, classify:classifySplitTopology, source:{io:sourceIO,read:readSplitSource,census:censusSplitSource,validate:validateSplitSource,recheck:recheckSplitSource,budget:()=>new B.Budget()},resolvePin:resolveSnapshotTransparencyPin,signal:()=>new AbortController().signal, runtimeRevision: SNAPSHOT_SOURCE_REVISION, buildRevision: SNAPSHOT_SOURCE_REVISION, phase: async () => {}, io: commandIO };
 const FAILED_DESTINATION_MARKER = "EXPORT_FAILED";
 async function reportExportFailure(io: CommandIO, message: string, error: unknown): Promise<void> {
   // Only the closed codes from snapshot-contract.ts may cross the diagnostic boundary because errors can contain private paths.
@@ -80,7 +85,7 @@ async function reportExportFailure(io: CommandIO, message: string, error: unknow
   await io.stderr(`${message}\nEXPORT_FINDING=${code}\n`);
 }
 export async function exportSnapshot(options: ExportOptions, deps: ExportDependencies | V0ExportDependencies = exportDependencies): Promise<number> {
-  let instance: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
+  let instance: Awaited<ReturnType<typeof openExistingFortress>> | undefined;
   let cleanupAttempted = false, stage: string | undefined, committed = false;
   let createdDestination: string | undefined;
   const splitDeps="source" in deps?deps:null;
@@ -92,7 +97,10 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
     C.text(deps.buildRevision, C.REVISION); C.requireSnapshot(deps.runtimeRevision === deps.buildRevision);
     const fortress = resolve(options.fortress);
     // Evidence reads require existing custody markers before boot, credentials, or output effects, and never follow the final root link.
-    C.requireSnapshot(await initializedFortressExists(fortress, false), C.HARD.unsafe_path);
+    if (!(await initializedFortressExists(fortress, false))) {
+      await reportExportFailure(deps.io, "Evidence export requires an initialized fortress. The path must be the fortress directory itself, not a symbolic link.", new C.SnapshotError(C.HARD.unsafe_path));
+      return C.EXIT_FAIL;
+    }
     const output = await canonicalOutput(options.output), receiptPath = await canonicalOutput(options.receipt), keyPath = await canonicalOutput(options.publicKeyFile);
     requireOutside(output, receiptPath); requireOutside(output, keyPath); C.requireSnapshot(receiptPath !== keyPath, C.HARD.unsafe_path);
     for (const path of [output, receiptPath, keyPath]) {
@@ -100,16 +108,16 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     process.env.SANCTUARY_STORAGE_PATH = fortress;
-    await phase("GATHER"); instance = await deps.boot({ existingFortressPath: fortress });
-    // Must match existingFortressPath in ../index.ts; boot binds this path and withholds first-run custody authority.
+    await phase("GATHER"); instance = await deps.boot(fortress);
+    // Must match createSanctuaryServer in ../index.ts; boot binds this path and withholds first-run custody authority.
     C.requireSnapshot(resolve(instance.config.storage_path) === fortress, C.HARD.unsafe_path);
     const signer = instance.identityManager.getDefault(); C.requireSnapshot(signer, C.HARD.pin_invalid);
     const generatedAt = new Date().toISOString(), exportId = randomUUID();
-    // Must match the storage root in src/index.ts because the boot result does not expose its storage object.
+    // Must match FORTRESS_STATE_DIRECTORY in existing-fortress.ts; gathering uses the admitted custody root.
     // V0 reads its roster after gather; B shares one roster first read after normal shutdown in gatherExportStatement.
     let identityRoster: readonly StoredIdentity[] | undefined;
     const readIdentities = () => identityRoster ??= instance!.identityManager.list().map(i => instance!.identityManager.get(i.identity_id)!);
-    const input={storage:new FilesystemStorage(join(fortress,"state")),masterKey:instance.masterKey,fortress,generatedAt,localSign:process.env.SANCTUARY_CASTLE_LOCAL_SIGN==="1"};
+    const input={storage:new FilesystemStorage(join(fortress,FORTRESS_STATE_DIRECTORY)),masterKey:instance.masterKey,fortress,generatedAt,localSign:process.env.SANCTUARY_CASTLE_LOCAL_SIGN==="1"};
     const gathered="source" in deps?await deps.gather({...input,get identities(){return readIdentities();},source:deps.source,classify:deps.classify,resolvePin:deps.resolvePin,signal,phase:async state=>{splitSelected=true;await phase(state);},quiesce:async()=>{cleanupAttempted=true;await instance!.cleanup();B.requireSplit(!signal.aborted,"io_error");}}):await deps.gather(input);
     await phase("BUILD_PUBLIC_TRUST");
     const identities = readIdentities();

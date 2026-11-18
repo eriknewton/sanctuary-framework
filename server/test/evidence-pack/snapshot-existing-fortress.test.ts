@@ -3,13 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { installInMemoryKeychainStore, inMemoryKeychainCalls } from "../setup/keychain-memory-store.js";
 import { SOURCE, exporterFixture } from "./snapshot-fixtures.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
 
 const TEST_TIMEOUT_MS = 60_000;
 const roots: string[] = [];
-beforeEach(() => { installInMemoryKeychainStore(); });
+let store: typeof import("../setup/keychain-memory-store.js");
+beforeEach(async () => {
+  vi.resetModules();
+  store = await import("../setup/keychain-memory-store.js");
+  store.installInMemoryKeychainStore();
+  store.clearInMemoryKeychainStore();
+});
 afterEach(async () => {
   vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.unstubAllGlobals();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -27,6 +32,15 @@ async function inventory(path: string): Promise<unknown> {
     return { ...metadata, entries };
   }
   return { ...metadata, bytes: (await readFile(path)).toString("hex") };
+}
+async function bootOutcome(boot: () => Promise<{ cleanup: () => Promise<void> }>) {
+  try {
+    const instance = await boot();
+    await instance.cleanup();
+    return { completed: true };
+  } catch (error) {
+    return { completed: false, error: (error as Error).message };
+  }
 }
 async function environment() {
   const root = await realpath(await mkdtemp(join(tmpdir(), "snapshot-existing-")));
@@ -50,8 +64,6 @@ describe("CLI existing fortress admission", () => {
       await writeFile(join(destination, "state", "_meta", "custody-envelope.enc"), "synthetic custody marker");
       await symlink(destination, fortress);
     }
-    // Reload the real command entry with this run's build revision and credential store.
-    vi.resetModules(); installInMemoryKeychainStore();
     const entry = await import("../../src/evidence-pack/snapshot-export-cli.js");
     const boot = vi.spyOn(entry.exportDependencies, "boot");
     const exits: number[] = [], stdout: string[] = [], stderr: string[] = [];
@@ -65,9 +77,9 @@ describe("CLI existing fortress admission", () => {
     finally { process.argv = original; }
     expect({
       exits, stderr: stderr.join(""), stdout: stdout.join(""), bootCalls: boot.mock.calls,
-      credentials: inMemoryKeychainCalls(), files: { parent: await inventory(root), target: await inventory(fortress) },
+      credentials: store.inMemoryKeychainCalls(), files: { parent: await inventory(root), target: await inventory(fortress) },
     }).toEqual({
-      exits: [C.EXIT_FAIL], stderr: "Evidence export failed; any failed stage is retained.\nEXPORT_FINDING=unsafe_path\n",
+      exits: [C.EXIT_FAIL], stderr: "Evidence export requires an initialized fortress. The path must be the fortress directory itself, not a symbolic link.\nEXPORT_FINDING=unsafe_path\n",
       stdout: "", bootCalls: [], credentials: [], files: before,
     });
   }, TEST_TIMEOUT_MS);
@@ -79,7 +91,8 @@ it.each(["missing", "empty", "symlink"] as const)("rechecks the %s root at boot 
   vi.stubEnv("SANCTUARY_STORAGE_PATH", x.options.fortress);
   const { createSanctuaryServer } = await import("../../src/index.js");
   const { exportSnapshot } = await import("../../src/evidence-pack/snapshot-export-cli.js");
-  x.deps.boot = createSanctuaryServer;
+  const bootCalls: string[] = [];
+  x.deps.boot = path => { bootCalls.push(path); return createSanctuaryServer({ existingFortressPath: path }); };
   const config = await import("../../src/config.js");
   const configuration = vi.spyOn(config, "loadConfig");
   let before: unknown;
@@ -92,31 +105,62 @@ it.each(["missing", "empty", "symlink"] as const)("rechecks the %s root at boot 
     before = await inventory(x.root);
   };
   const exit = await exportSnapshot(x.options, x.deps);
-  expect({ exit, diagnostic: x.stderr.join(""), files: await inventory(x.root), credentials: inMemoryKeychainCalls(), configuration: configuration.mock.calls }).toEqual({
-    exit: C.EXIT_FAIL, diagnostic: "Evidence export failed; any failed stage is retained.\nEXPORT_FINDING=io_error\n",
+  expect({ exit, bootCalls, diagnostic: x.stderr.join(""), files: await inventory(x.root), credentials: store.inMemoryKeychainCalls(), configuration: configuration.mock.calls }).toEqual({
+    exit: C.EXIT_FAIL, bootCalls: [x.options.fortress], diagnostic: "Evidence export failed; any failed stage is retained.\nEXPORT_FINDING=io_error\n",
     files: before, credentials: [], configuration: [],
   });
 }, TEST_TIMEOUT_MS);
 
-it("existing boot retains no first-run custody authority", async () => {
+it.each(["configuration", "permissions"].flatMap(boundary => ["root", "markers"].map(subject => ({ boundary, subject }))))("existing boot preserves $subject inventory after $boundary", async ({ boundary, subject }) => {
   const { root, fortress } = await environment();
   const metadata = join(fortress, "state", "_meta");
   await mkdir(metadata, { recursive: true });
   await writeFile(join(metadata, "custody-envelope.enc"), "synthetic custody marker");
-  const permissions = await import("../../src/storage/permissions.js");
-  const tighten = permissions.tightenStoragePermissions;
-  vi.spyOn(permissions, "tightenStoragePermissions").mockImplementation(async path => {
-    await tighten(path);
-    await rename(metadata, join(root, "parked-metadata"));
-  });
+  let before: unknown;
+  const park = async () => {
+    await rename(subject === "root" ? fortress : metadata, join(root, `parked-${subject}`));
+    before = { parent: await inventory(root), target: await inventory(fortress) };
+  };
+  if (boundary === "configuration") {
+    const config = await import("../../src/config.js"), load = config.loadConfig;
+    vi.spyOn(config, "loadConfig").mockImplementation(async path => {
+      const result = await load(path); await park(); return result;
+    });
+  } else {
+    const permissions = await import("../../src/storage/permissions.js"), tighten = permissions.tightenStoragePermissions;
+    vi.spyOn(permissions, "tightenStoragePermissions").mockImplementation(async path => {
+      await tighten(path); await park();
+    });
+  }
   const { createSanctuaryServer } = await import("../../src/index.js");
-  let completed = false;
-  try {
-    const server = await createSanctuaryServer({ existingFortressPath: fortress });
-    completed = true; await server.cleanup();
-  } catch { /* Custody without an initialization marker refuses admission. */ }
-  expect({
-    completed, envelope: await inventory(join(metadata, "custody-envelope.enc")),
-    sentinel: await inventory(join(metadata, "custody-sentinel.enc")), audit: await inventory(join(fortress, "state", "_audit")),
-  }).toEqual({ completed: false, envelope: null, sentinel: null, audit: null });
+  const outcome = await bootOutcome(() => createSanctuaryServer({ existingFortressPath: fortress }));
+  expect({ outcome, files: { parent: await inventory(root), target: await inventory(fortress) }, credentials: store.inMemoryKeychainCalls() }).toEqual({
+    outcome: { completed: false, error: "Existing fortress required." }, files: before, credentials: [],
+  });
+}, TEST_TIMEOUT_MS);
+
+it("existing boot compares its required path before loading configuration", async () => {
+  const { root, fortress } = await environment();
+  await mkdir(join(fortress, "state", "_meta"), { recursive: true });
+  await writeFile(join(fortress, "state", "_meta", "key-params.enc"), "synthetic custody marker");
+  const ambient = join(root, "ambient"); await mkdir(ambient);
+  await writeFile(join(ambient, "sanctuary.json"), "synthetic config text");
+  vi.stubEnv("SANCTUARY_STORAGE_PATH", ambient);
+  const config = await import("../../src/config.js"), configuration = vi.spyOn(config, "loadConfig");
+  const { createSanctuaryServer } = await import("../../src/index.js");
+  const before = { parent: await inventory(root), target: await inventory(fortress) };
+  const outcome = await bootOutcome(() => createSanctuaryServer({ existingFortressPath: fortress }));
+  expect({ outcome, files: { parent: await inventory(root), target: await inventory(fortress) }, configuration: configuration.mock.calls, credentials: store.inMemoryKeychainCalls() }).toEqual({
+    outcome: { completed: false, error: "Existing fortress path mismatch." }, files: before, configuration: [], credentials: [],
+  });
+}, TEST_TIMEOUT_MS);
+
+it("the boot credential recorder observes a host-local lookup", async () => {
+  const { fortress } = await environment();
+  await mkdir(join(fortress, "state", "_meta"), { recursive: true });
+  await writeFile(join(fortress, "state", "_meta", "key-params.enc"), "synthetic custody marker");
+  vi.stubEnv("SANCTUARY_PASSPHRASE", "");
+  const { createSanctuaryServer } = await import("../../src/index.js");
+  const outcome = await bootOutcome(() => createSanctuaryServer({ existingFortressPath: fortress }));
+  expect({ completed: outcome.completed, observed: store.inMemoryKeychainCalls().some(([command]) => ["security", "secret-tool"].includes(command)) }).toEqual({ completed: false, observed: true });
 }, TEST_TIMEOUT_MS);

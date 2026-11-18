@@ -44,8 +44,10 @@ it.each(Object.entries(junkNames).flatMap(([label,junk])=>["empty","checkpoint"]
   expect(gathered,"daemon fixed selection").toEqual(shape==="empty"?{kind:"split",stable:true}:{code:"source_control_invalid"});
   const signer=identity(),options={fortress:await realpath(s.fortress),output:join(s.root,`pack-${first}`),receipt:join(s.root,`receipt-${first}.json`),publicKeyFile:join(s.root,`key-${first}.txt`)};
   await seedExportFortress(options.fortress);
- const deps={...exportDependencies,source:{...exportDependencies.source,io},runtimeRevision:SOURCE,buildRevision:SOURCE,boot:async()=>({config:{storage_path:options.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
+ const phases:string[]=[];
+ const deps={...exportDependencies,phase:async(state:string)=>{phases.push(state);},source:{...exportDependencies.source,io},runtimeRevision:SOURCE,buildRevision:SOURCE,boot:async()=>({config:{storage_path:options.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
   const code=await exportSnapshot(options,deps as unknown as typeof exportDependencies);results.push({gathered,code});
+  expect(phases,"daemon export reaches gather").toContain("GATHER");
   expect(code,"daemon export never PASS").not.toBe(C.EXIT_PASS);
   if(code===C.EXIT_PARTIAL){const pins={packKey:signer.public_key,descriptorBytes:await readFile(join(options.output,C.TRUST_FILENAME)),expectedManifestDigest:C.manifestDigest(await readFile(join(options.output,C.MANIFEST_FILENAME)))};const result=verifySnapshotByFormat(await captureSnapshotDirectory(options.output,pins.packKey,pins.expectedManifestDigest),pins,SOURCE);expect([result.status,result.accepted],"daemon recipient never accepted").toEqual(["PARTIAL",false]);}
  }
