@@ -31,7 +31,7 @@ npx -y @sanctuary-framework/mcp-server doctor --json
 
 `protect` backs up the harness configuration to `~/.sanctuary/backup/`, rewrites it (the MCP server entries in the config are rewritten to point at Sanctuary; the harness's own built-in tools are not MCP calls and are not touched; the rewrite is tested on representative harness paths and is not proven for every harness version, per the Assurance Matrix "Agent wrapping" row), generates a passphrase that lives only in the macOS Keychain or Linux Secret Service, and, without `--no-dashboard`, starts the Sovereignty Dashboard on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501). `doctor --json` is a read-only diagnostic of the state directory, identity, principal policy, audit-chain integrity, runtime versions, and Castle Wall status. Every verb and flag in this section is on v1.8.4, the npm `latest` channel.
 
-That one command puts the keys, audit trail, and policy gates around the agent you already use, and the dashboard too unless you pass `--no-dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md).
+That one command puts the keys, audit trail, and policy gates around the agent you already use. `--no-dashboard` skips the dashboard; start it later with `sanctuary dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md).
 
 ## Uninstall
 
@@ -53,7 +53,7 @@ On macOS, the Castle Wall enforces a signed operator policy with a clean per-uid
 
 ## Evidence
 
-- [ASSURANCE_MATRIX.md](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md): every claim, its platform, its evidence, its gap, and the next proof owed.
+- [ASSURANCE_MATRIX.md](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md): each recorded claim, its platform, its evidence, its gap, and the next proof owed.
 - macOS wall drills: [allow/deny](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md), [boot survival](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md), [full scope](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md).
 - Linux wall drill: [install-grade drill, 2026-10-04](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/audit/castle-wall-linux-install-grade-drill-2026-10-04.md).
 - Releases: the current stable release is [v1.8.4](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/releases/v1.8.4.md) on the npm `latest` channel; the opt-in preview is [v1.9.0-rc.4](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/releases/v1.9.0.md) on `next`, and it states no capability beyond the bounded rows of the Assurance Matrix. Full history in [CHANGELOG.md](https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md).
@@ -255,9 +255,9 @@ Sanctuary's enforcement model is the Castle Architecture. Five named mechanisms,
 
 **Heralds: the voice.** How your agent is recognized by other sovereigns. Concordia receipts on cross-castle transactions, Verascore reputation aggregating across operators, cross-castle accountability after the fact, portable reputation across vendor churn. Default off; both compositions are optional, and neither repo imports the other.
 
-**Mantle: installation binding.** No Assurance Matrix row covers Mantle, and the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
+**Mantle: installation binding.** No Assurance Matrix row covers Mantle; on `main` the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
 
-The castle must be both real and usable: enforcement at the wall, prompt approval requests, default-deny outbound with operator-set allow rules, Sentinels that observe, and a cooperative MCP path that stays additive. The runtime sees a normal operating environment with constrained egress; nothing internal is sandboxed.
+The castle must be both real and usable: enforcement at the wall, approval requests when policy requires them, default-deny outbound with operator-set allow rules, Sentinels that observe, and a cooperative MCP path that stays additive. The runtime sees a normal operating environment with constrained egress; nothing internal is sandboxed.
 
 ## Capability surfaces
 
@@ -285,11 +285,9 @@ These are the principles every external communication, every spec, every roadmap
 
 ## Operator experience
 
-Sanctuary lives in your menubar. When your agent wants to do something risky, you get an OS notification. Click, see the request in plain English, approve or deny in five seconds. The agent receives a structured response that surfaces the decision back to you naturally if you missed the notification.
+Sanctuary lives in your menubar. When your agent wants to do something risky, you get an OS notification. Click, see the request in plain English, and approve or deny. The agent receives a structured response that surfaces the decision back to you naturally if you missed the notification.
 
 The dashboard is for setup, inspection, and authenticated operator approvals. It includes the substrate selector, policy editor, audit deep-dive, exit bundle drill, and fortress configuration. The menubar keeps routine status and approval entry points close at hand. Concierge chat is a read-oriented natural-language interface to fortress state: "What's going on?" returns a summary from the audit log; "Why did my Hermes agent stop?" looks up recent gate triggers and explains. It does not approve requests or trigger exports on the operator's behalf.
-
-Use the menubar for routine status and the dashboard for inspection and approvals.
 
 ## Development
 

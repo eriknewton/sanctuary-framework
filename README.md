@@ -14,7 +14,7 @@ Sanctuary is the wall under the agent, imposed by the operating system under a p
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
 ```
 
-That one command puts the keys, audit trail, and policy gates around the agent you already use, and the dashboard too unless you pass `--no-dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md).
+That one command puts the keys, audit trail, and policy gates around the agent you already use. `--no-dashboard` skips the dashboard; start it later with `sanctuary dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md).
 
 ### Summary for agents
 
@@ -71,7 +71,7 @@ The argument for why the two layers are different problems: [Containment is an i
 
 In this order, about an hour:
 
-1. [ASSURANCE_MATRIX.md](ASSURANCE_MATRIX.md). Every claim, its platform, its evidence, its gap, and the next proof owed. Software-test evidence and captured operational drills are distinct; installed enforcement remains partial or unproven without the required captured drill.
+1. [ASSURANCE_MATRIX.md](ASSURANCE_MATRIX.md). Each recorded claim, its platform, its evidence, its gap, and the next proof owed. Software-test evidence and captured operational drills are distinct; installed enforcement remains partial or unproven without the required captured drill.
 2. [SANCTUARY_ARCHITECTURE.md](SANCTUARY_ARCHITECTURE.md). Entry points, data flow, trust model, and the sovereignty properties stated as testable assertions.
 3. [server/src/README.md](server/src/README.md). The maintained module map, what each module owns, and the names that collide.
 4. The macOS wall drills the matrix cites: [allow/deny](docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md), [boot survival](docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md), [full scope](docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md).
@@ -120,6 +120,8 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 **Verify.** `sanctuary doctor --json` is read-only. It prints one JSON object with `storage_path`, `package_version`, and a `checks` array whose entries carry `name`, `status` (`OK`, `WARN`, or `FAIL`), `message`, and `hint`. Healthy: exit code 0 and no check with `"status": "FAIL"`. Failing: exit code 1 and at least one `FAIL` check whose `hint` names the next step; a fortress that has never completed `protect` reports `identity`, `principal policy`, and `audit chain` as `FAIL` with hints that say so, and `state dir` also reads `FAIL` when the directory is absent or is not a directory. What a mistake looks like from the outside: `doctor` pointed at the wrong `--fortress` path reports a healthy runtime and a failing fortress, so read `storage_path` before the checks.
 
+`@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption. From quickstart 0.2.0 (unreleased; 0.1.x publishes on every run) it publishes to verascore.ai only when you choose to: it shows the request and asks first in a terminal, publishes without asking only with `--publish`, and never publishes with `--no-publish` or when run without a terminal. It is not Sanctuary's custody path and is not needed to install Sanctuary.
+
 ## Uninstall
 
 Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
@@ -129,8 +131,6 @@ npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
 `uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
-
-`@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption. From quickstart 0.2.0 (unreleased; 0.1.x publishes on every run) it publishes to verascore.ai only when you choose to: it shows the request and asks first in a terminal, publishes without asking only with `--publish`, and never publishes with `--no-publish` or when run without a terminal. It is not Sanctuary's custody path and is not needed to install Sanctuary.
 
 ---
 
@@ -409,7 +409,7 @@ The CLI accepts its built-in template names and requires a fortress tenant with 
 For `--agent-id`, use the fortress tenant name shown by `sanctuary agents list`. Substitute that name below:
 
 ```bash
-sanctuary template init research-assistant --agent-id <wrapped-agent-id>
+sanctuary template init research-assistant --agent-id <fortress-tenant-name>
 ```
 
 ---
@@ -440,7 +440,7 @@ A fortress has its own custody root. Harness registration, OS-account enforcemen
 
 **Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; complete exit portability remains partial. Default off; both compositions are optional.
 
-**Mantle: installation binding.** No Assurance Matrix row covers Mantle, and the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
+**Mantle: installation binding.** No Assurance Matrix row covers Mantle; on `main` the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
 
 **Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** the source contains hybrid Ed25519 and ML-DSA signing. No Assurance Matrix row covers it, so treat it as unproven in any release. Hardware-backed secure elements are on the roadmap.
 

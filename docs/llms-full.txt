@@ -14,7 +14,7 @@ Sanctuary is the wall under the agent, imposed by the operating system under a p
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
 ```
 
-That one command puts the keys, audit trail, and policy gates around the agent you already use, and the dashboard too unless you pass `--no-dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md).
+That one command puts the keys, audit trail, and policy gates around the agent you already use. `--no-dashboard` skips the dashboard; start it later with `sanctuary dashboard`. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md).
 
 ### Summary for agents
 
@@ -79,6 +79,8 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 **Verify.** `sanctuary doctor --json` is read-only. It prints one JSON object with `storage_path`, `package_version`, and a `checks` array whose entries carry `name`, `status` (`OK`, `WARN`, or `FAIL`), `message`, and `hint`. Healthy: exit code 0 and no check with `"status": "FAIL"`. Failing: exit code 1 and at least one `FAIL` check whose `hint` names the next step; a fortress that has never completed `protect` reports `identity`, `principal policy`, and `audit chain` as `FAIL` with hints that say so, and `state dir` also reads `FAIL` when the directory is absent or is not a directory. What a mistake looks like from the outside: `doctor` pointed at the wrong `--fortress` path reports a healthy runtime and a failing fortress, so read `storage_path` before the checks.
 
+`@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption. From quickstart 0.2.0 (unreleased; 0.1.x publishes on every run) it publishes to verascore.ai only when you choose to: it shows the request and asks first in a terminal, publishes without asking only with `--publish`, and never publishes with `--no-publish` or when run without a terminal. It is not Sanctuary's custody path and is not needed to install Sanctuary.
+
 ## Uninstall
 
 Run this only to remove Sanctuary on purpose. It is not part of installation or verification.
@@ -88,8 +90,6 @@ npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
 `uninstall` removes the enforcement footprint and is designed to preserve fortress state, credentials, recovery material, and the audit log. It refuses `--remove-operator-data` and reports residue requiring operator action. `uninstall` does not restore the harness configuration; `sanctuary protect --unwrap` restores it from the backup. No Assurance Matrix row cites a captured install-and-removal drill, so what uninstall preserves and removes is unproven.
-
-`@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption. From quickstart 0.2.0 (unreleased; 0.1.x publishes on every run) it publishes to verascore.ai only when you choose to: it shows the request and asks first in a terminal, publishes without asking only with `--publish`, and never publishes with `--no-publish` or when run without a terminal. It is not Sanctuary's custody path and is not needed to install Sanctuary.
 
 ---
 
@@ -286,7 +286,7 @@ A fortress has its own custody root. Harness registration, OS-account enforcemen
 
 **Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; complete exit portability remains partial. Default off; both compositions are optional.
 
-**Mantle: installation binding.** No Assurance Matrix row covers Mantle, and the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
+**Mantle: installation binding.** No Assurance Matrix row covers Mantle; on `main` the server reports its status as unknown. `template init` requires a fortress tenant with state or a wrap profile. Cryptographic confinement to one machine is not claimed.
 
 **Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** the source contains hybrid Ed25519 and ML-DSA signing. No Assurance Matrix row covers it, so treat it as unproven in any release. Hardware-backed secure elements are on the roadmap.
 

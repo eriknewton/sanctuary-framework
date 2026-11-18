@@ -126,7 +126,7 @@ export const SERVER_BOUNDS = {
   neverClaimed:
     "No Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail.",
   evidence:
-    `Every claim, its platform and its evidence is a row in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
+    `Recorded claims, with platform and evidence, are rows in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
 } as const;
 
 /** The four bounds sentences as one paragraph, in the order an agent needs them. */

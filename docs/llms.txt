@@ -56,7 +56,7 @@ npx -y @sanctuary-framework/mcp-server uninstall
 
 ## Evidence
 
-- [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md): every claim, its platform, its evidence, its gap, and the next proof owed.
+- [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md): each recorded claim, its platform, its evidence, its gap, and the next proof owed.
 - [Drill records](https://github.com/eriknewton/sanctuary-framework/tree/main/docs/audit): the captured drills the matrix cites.
 - [Release status](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#release-status) and the [CHANGELOG](https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md).
 - [Roadmap](https://github.com/eriknewton/sanctuary-framework/blob/main/ROADMAP.md): what ships today with its bounds, and what is next.
