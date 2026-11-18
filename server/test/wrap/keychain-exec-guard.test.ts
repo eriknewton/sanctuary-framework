@@ -29,7 +29,6 @@ import {
   createTestRunMarkerLifecycle,
   createTestRunMarker,
   MAX_TEST_RUN_AGE_MS,
-  ownsRunToken,
   refreshRunToken,
   removeTestRunMarker,
   RUN_TOKEN_REFRESH_INTERVAL_MS,
@@ -709,61 +708,6 @@ describe("no code path in server/test can reach the real credential binary", () 
       expect(existsSync(marker)).toBe(false);
     } finally {
       lifecycle.teardown();
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  // Overlapping runs launched with the same assigned token id (TEST_RUN_TOKEN_ID_ENV):
-  // the first claim is exclusive, and the losing run never removes or rewrites it.
-  function manualTimers(): { timers: TestRunMarkerTimers; tick(): void } {
-    let callback: (() => void) | undefined;
-    const interval = { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
-    return {
-      timers: {
-        setInterval: vi.fn((cb: () => void) => { callback = cb; return interval; }),
-        clearInterval: vi.fn(),
-      },
-      tick: () => callback?.(),
-    };
-  }
-
-  it("refuses a second run's claim of an assigned token id, and that run's teardown keeps the first owner's token", () => {
-    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
-    const marker = testRunMarkerPath(root);
-    const id = "0f0e0d0c-0b0a-4908-8706-050403020100";
-    const first = { ownerNonce: "first-owner" };
-    const owner = createTestRunMarkerLifecycle(root, id, manualTimers().timers, first);
-    const intruder = createTestRunMarkerLifecycle(root, id, manualTimers().timers, { ownerNonce: "second-owner" });
-    try {
-      owner.setup();
-      expect(() => intruder.setup()).toThrow(/held by another run/);
-      intruder.teardown();
-      expect(ownsRunToken(root, id, first)).toBe(true);
-      expect(existsSync(marker)).toBe(true);
-      owner.teardown();
-      expect(existsSync(marker)).toBe(false);
-    } finally {
-      owner.teardown();
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("never refreshes or removes an assigned token another run re-claimed after it was pruned", () => {
-    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
-    const marker = testRunMarkerPath(root);
-    const id = "1f1e1d1c-1b1a-4918-8716-151413121110";
-    const later = { ownerNonce: "later-owner" };
-    const paused = manualTimers();
-    const pausedRun = createTestRunMarkerLifecycle(root, id, paused.timers, { ownerNonce: "paused-owner" });
-    try {
-      pausedRun.setup();
-      rmSync(join(marker, id)); // pruned while the first run was paused
-      createTestRunMarker(root, id, later); // a later run takes the free name
-      expect(() => paused.tick()).toThrow(/held by another run/);
-      pausedRun.teardown();
-      expect(ownsRunToken(root, id, later)).toBe(true);
-    } finally {
-      pausedRun.teardown();
       rmSync(root, { recursive: true, force: true });
     }
   });

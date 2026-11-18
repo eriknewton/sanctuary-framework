@@ -22,11 +22,11 @@
  *
  * Every child here runs in its own process group and the whole group is
  * SIGKILLed on every exit path (timeout, failure, normal exit, afterAll), so
- * no worker, subshell, git or node descendant outlives the test.
+ * no worker, subshell, git or node descendant outlives the test. A group is
+ * forgotten only once it is known gone; see `killGroup`.
  */
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -38,7 +38,7 @@ import {
   isGitRedirectEnvKey,
   scrubGitRedirectEnv,
 } from "../setup/git-env-scrub.js";
-import { removeTestRunMarker, TEST_RUN_TOKEN_ID_ENV, testRunMarkerPath } from "../setup/test-run-marker.js";
+import { testRunMarkerPath } from "../setup/test-run-marker.js";
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = path.resolve(serverDir, "..");
@@ -123,39 +123,54 @@ function readReport(report: string): ProbeReport {
 }
 
 /**
- * Process groups this file started and has not yet reaped. A detached child
- * leads a new group whose id is its pid, so `kill(-pid)` reaches every
- * descendant (vitest workers, hook subshells, git, the node redactor) even
- * after the leader has exited.
+ * A process group this file started. A detached child leads a new group whose
+ * id is its pid, so `kill(-pgid)` reaches every descendant (vitest workers,
+ * hook subshells, git, the node redactor) even after the leader has exited.
+ * `closeObserved` is set ONLY in the leader's close handler: nothing else may
+ * claim the leader is gone.
  */
-const liveGroups = new Set<number>();
+interface Group { pgid: number; closeObserved: boolean }
+/** Groups not yet known to be gone. */
+const liveGroups = new Map<number, Group>();
+
 /**
- * SIGKILLs a whole group. ESRCH means it is already gone. Once the leader has
- * closed, EPERM means the same thing in practice (macOS reports it for a group
- * left with only exiting members), so it is accepted only then; before that,
- * EPERM could be a live group this process cannot signal, and it throws.
+ * SIGKILLs a whole group, fail closed. ESRCH means no member is left, so the
+ * group is forgotten. EPERM is treated the same way only once the leader's
+ * close was observed (macOS reports it for a group left with only exiting
+ * members); before that it could be a live group this process cannot signal,
+ * so it throws and the group stays tracked. A delivered SIGKILL forgets the
+ * group only if the close was observed; otherwise the leader may still be
+ * exiting and the group stays tracked for its close handler or afterAll.
  */
-function killGroup(pgid: number, leaderClosed: boolean): void {
+function killGroup(group: Group): void {
   try {
-    process.kill(-pgid, "SIGKILL");
+    process.kill(-group.pgid, "SIGKILL");
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ESRCH" && !(leaderClosed && code === "EPERM")) throw err;
+    if (code === "ESRCH" || (code === "EPERM" && group.closeObserved)) {
+      liveGroups.delete(group.pgid);
+      return;
+    }
+    throw err;
   }
-  liveGroups.delete(pgid);
+  if (group.closeObserved) liveGroups.delete(group.pgid);
 }
+
+/** Kill failures from close handlers that ran after their promise settled; afterAll reports them. */
+const lateKillFailures: Error[] = [];
 
 interface GroupRun { status: number | null; signal: NodeJS.Signals | null; error?: Error; timedOut: boolean; out: string }
 
 /**
- * Runs `command` as the leader of its own process group, SIGKILLs the whole
- * group if it outlives `timeoutMs`, and SIGKILLs the group again once the
- * leader has closed, so a backgrounded descendant cannot survive a clean exit
- * either. Failure mode this prevents: a timed-out hook or vitest child whose
+ * Runs `command` as the leader of its own process group. On timeout it
+ * SIGKILLs the group and settles with a timeout error, without claiming the
+ * leader closed; when the leader's close is observed it SIGKILLs the group
+ * again, so a backgrounded descendant cannot survive a clean exit either.
+ * Failure mode this prevents: a timed-out hook or vitest child whose
  * descendants keep running after the suite, holding files and CPU and
  * reading as unrelated flakes in later runs.
  */
-function runInOwnGroup(command: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; onSpawn?: (pgid: number | undefined) => void }): Promise<GroupRun> {
+function runInOwnGroup(command: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }): Promise<GroupRun> {
   return new Promise((resolve) => {
     let out = "";
     let timedOut = false;
@@ -166,64 +181,45 @@ function runInOwnGroup(command: string, args: string[], opts: { cwd: string; env
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const pgid = child.pid;
-    if (pgid !== undefined) liveGroups.add(pgid);
-    opts.onSpawn?.(pgid);
-    const finish = (result: Omit<GroupRun, "timedOut" | "out">) => {
+    const group: Group | undefined = child.pid === undefined ? undefined : { pgid: child.pid, closeObserved: false };
+    if (group) liveGroups.set(group.pgid, group);
+    const settle = (result: Omit<GroupRun, "timedOut" | "out">) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      let killError: Error | undefined;
-      try {
-        if (pgid !== undefined) killGroup(pgid, true);
-      } catch (err) {
-        killError = err as Error;
-      } finally {
-        // Always settle: a kill failure is reported as the run's error, never left unhandled.
-        resolve({ ...result, error: result.error ?? killError, timedOut, out });
-      }
+      resolve({ ...result, timedOut, out });
     };
     const timer = setTimeout(() => {
       timedOut = true;
+      let error = new Error(`timed out after ${opts.timeoutMs} ms; its process group was sent SIGKILL`);
       try {
-        if (pgid !== undefined) killGroup(pgid, false);
+        if (group) killGroup(group);
       } catch (err) {
-        // The group could not be signalled; settle now (afterAll retries the kill).
-        finish({ status: null, signal: null, error: err as Error });
+        error = new Error(`timed out after ${opts.timeoutMs} ms and its process group could not be killed`, { cause: err });
       }
+      settle({ status: null, signal: null, error });
     }, opts.timeoutMs);
     child.stdout.on("data", (d: Buffer) => { out += d.toString("utf8"); });
     child.stderr.on("data", (d: Buffer) => { out += d.toString("utf8"); });
-    child.on("error", (error) => finish({ status: null, signal: null, error }));
-    child.on("close", (status, signal) => finish({ status, signal }));
+    child.on("error", (error) => settle({ status: null, signal: null, error }));
+    child.on("close", (status, signal) => {
+      let killError: Error | undefined;
+      if (group) {
+        group.closeObserved = true;
+        try {
+          killGroup(group);
+        } catch (err) {
+          killError = err as Error;
+          if (settled) lateKillFailures.push(killError);
+        }
+      }
+      settle({ status, signal, error: killError });
+    });
   });
 }
 
-interface ProbeReport { git: string[]; tokenIdEnvSeen?: boolean; tokenPresent?: boolean }
-interface ProbeRun extends GroupRun {
-  victim: string; fixture: string; workerSeen: string[]; mainSeen: string[];
-  /** The worker saw TEST_RUN_TOKEN_ID_ENV (it must not: the marker consumes it in the main process). */
-  workerSawTokenId: boolean;
-  /** The main process found the child's assigned token while the child ran. */
-  tokenPresentDuringRun: boolean;
-  /** The token still existed after the parent's cleanup. */
-  tokenPresentAfterRun: boolean;
-}
-
-/**
- * Assigned child token ids not yet removed, mapped to the child's group.
- * afterAll removes them after killing the groups, so an outer-test timeout
- * (which abandons runProbe before its finally) cannot strand a token for the
- * staleness ceiling.
- */
-const outstandingTokens = new Map<string, number | undefined>();
-function removeChildToken(id: string): void {
-  const pgid = outstandingTokens.get(id);
-  // Never remove the token of a group that may still be alive: it is that run's protection.
-  if (pgid !== undefined && liveGroups.has(pgid)) return;
-  removeTestRunMarker(serverDir, id);
-  outstandingTokens.delete(id);
-}
+interface ProbeReport { git: string[] }
+interface ProbeRun extends GroupRun { victim: string; fixture: string; workerSeen: string[]; mainSeen: string[] }
 
 /** Runs the probes as a child vitest seeded with every MUST_SCRUB and MUST_KEEP name. */
 async function runProbe(withScrub: boolean): Promise<ProbeRun> {
@@ -242,9 +238,16 @@ async function runProbe(withScrub: boolean): Promise<ProbeRun> {
   const realGlobal = [...((config.test?.globalSetup ?? []) as string[])];
   expect(realSetup[0]).toBe(SETUP_ENTRY); // invariant: the worker scrub runs first
   expect(realGlobal[0]).toBe(SETUP_ENTRY); // invariant: the main-process scrub runs first
-  const keep = (e: string) => withScrub || e !== SETUP_ENTRY;
-  const setupFiles = realSetup.filter(keep);
-  const globalSetup = [...realGlobal.filter(keep), MAIN_PROBE];
+  const setupFiles = realSetup.filter((e) => withScrub || e !== SETUP_ENTRY);
+  // The child's globalSetup is ONLY the scrub entry (dropped for fail-before)
+  // and the main-process probe. It deliberately omits test-run-marker.ts, so
+  // the child creates no marker token and a killed child cannot strand one.
+  // Invariant that makes this safe: the PARENT run's own marker token exists
+  // for the child's whole lifetime (this test runs inside the parent run), so
+  // the marker directory src/wrap/keychain-exec.ts checks is present and the
+  // child, which also keeps VITEST and the keychain-fake setup file, still
+  // classifies as under test. Asserted below before every spawn.
+  const globalSetup = [...(withScrub ? [SETUP_ENTRY] : []), MAIN_PROBE];
   const cfg = path.join(tmp, "probe.config.mjs");
   // One thread worker keeps probe execution inside the child's own process group.
   fs.writeFileSync(cfg, `
@@ -253,18 +256,6 @@ export default { ...config, cacheDir: ${JSON.stringify(path.join(tmp, "vite-cach
 `);
   const workerReport = path.join(tmp, "worker-seen.json");
   const mainReport = path.join(tmp, "main-seen.json");
-  // The child's globalSetup (test-run-marker.ts, via the spread real config)
-  // names its marker token with this id, so the parent can delete exactly that
-  // token after the child exits. Must match TEST_RUN_TOKEN_ID_ENV in
-  // test/setup/test-run-marker.ts. Failure mode this prevents: a SIGKILLed
-  // child skips its teardown, its token survives the outer run, and the
-  // checkout keeps reading as "under test" (the CLI refuses keychain work)
-  // until a later run prunes it after the staleness ceiling. Matching by pid
-  // instead would be unsafe: runs in other pid namespaces sharing this
-  // checkout can carry the same pid.
-  const childTokenId = randomUUID();
-  const tokenPath = path.join(testRunMarkerPath(serverDir), childTokenId);
-  outstandingTokens.set(childTokenId, undefined);
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ...seeds(tmp, victim),
@@ -272,28 +263,13 @@ export default { ...config, cacheDir: ${JSON.stringify(path.join(tmp, "vite-cach
     PROBE_REPO: fixture,
     PROBE_REPORT: workerReport,
     PROBE_MAIN_REPORT: mainReport,
-    [TEST_RUN_TOKEN_ID_ENV]: childTokenId,
-    // Read by the main-process probe to witness the assigned token while the child runs.
-    PROBE_TOKEN_PATH: tokenPath,
   };
-  try {
-    const r = await runInOwnGroup(process.execPath, [path.join(serverDir, "node_modules/vitest/vitest.mjs"), "run", "--config", cfg], {
-      cwd: serverDir, env, timeoutMs: childTimeoutMs, onSpawn: (pgid) => outstandingTokens.set(childTokenId, pgid),
-    });
-    // Every exit path below: the group is already killed here, so its exact token can go.
-    // removeTestRunMarker tolerates a token or directory that is already gone (ENOENT).
-    removeChildToken(childTokenId);
-    const worker = readReport(workerReport);
-    const main = readReport(mainReport);
-    return {
-      ...r, victim, fixture, workerSeen: worker.git, mainSeen: main.git,
-      workerSawTokenId: worker.tokenIdEnvSeen ?? true, // a missing report never reads as a pass
-      tokenPresentDuringRun: main.tokenPresent ?? false,
-      tokenPresentAfterRun: fs.existsSync(tokenPath),
-    };
-  } finally {
-    removeChildToken(childTokenId);
-  }
+  const marker = testRunMarkerPath(serverDir);
+  expect(fs.existsSync(marker) && fs.readdirSync(marker).length > 0, `the parent run's marker token must exist in ${marker} before a marker-less child is spawned`).toBe(true);
+  const r = await runInOwnGroup(process.execPath, [path.join(serverDir, "node_modules/vitest/vitest.mjs"), "run", "--config", cfg], {
+    cwd: serverDir, env, timeoutMs: childTimeoutMs,
+  });
+  return { ...r, victim, fixture, workerSeen: readReport(workerReport).git, mainSeen: readReport(mainReport).git };
 }
 
 function expectChildCompleted(r: GroupRun): void {
@@ -301,13 +277,6 @@ function expectChildCompleted(r: GroupRun): void {
   expect(r.error, r.out).toBeUndefined();
   expect(r.signal, r.out).toBeNull();
   expect(r.status, r.out).toBe(0);
-}
-
-/** The child ran under exactly the token the parent assigned, its workers never saw the id, and the parent removed it. */
-function expectExactTokenLifecycle(r: ProbeRun): void {
-  expect(r.tokenPresentDuringRun, "the child's marker token must carry the parent-assigned id while it runs").toBe(true);
-  expect(r.workerSawTokenId, `${TEST_RUN_TOKEN_ID_ENV} must be consumed in the main process, never inherited by a worker`).toBe(false);
-  expect(r.tokenPresentAfterRun, "the parent must remove exactly the child's assigned token after it exits").toBe(false);
 }
 
 /** Non-comment lines of a shipped bash file; comments are never evidence. */
@@ -435,9 +404,17 @@ function dumpedCalls(dump: string): { header: string; names: string[] }[] {
 
 afterAll(() => {
   // Reap any group a failed or interrupted test left, before deleting its files.
-  for (const pgid of [...liveGroups]) killGroup(pgid, true);
-  for (const id of [...outstandingTokens.keys()]) removeChildToken(id);
+  const failures = [...lateKillFailures];
+  for (const group of [...liveGroups.values()]) {
+    try {
+      killGroup(group); // with the close flag it actually has, never assumed
+    } catch (err) {
+      failures.push(err as Error);
+    }
+  }
   for (const d of cleanup) fs.rmSync(d, { recursive: true, force: true });
+  // Reported, never swallowed: a group this file could not kill is a leak the run must show.
+  if (failures.length > 0) throw new AggregateError(failures, `git-env-scrub: ${failures.length} process group kill(s) failed`);
 });
 
 describe("test git-env scrub", () => {
@@ -450,7 +427,6 @@ describe("test git-env scrub", () => {
     expect(MUST_KEEP.filter((k) => isGitRedirectEnvKey(k))).toEqual([]);
     expect(bare(r.fixture)).toBe("true"); // positive control: fixture repo was written
     expect(bare(r.victim)).toBe("false"); // throwaway "real" repo unchanged
-    expectExactTokenLifecycle(r);
   }, probeTestTimeoutMs);
 
   it("fail-before: without the scrub entries every seeded redirect reaches both probes and the victim repo is written", async () => {
@@ -460,7 +436,6 @@ describe("test git-env scrub", () => {
     expect(MUST_SCRUB.filter((k) => !r.mainSeen.includes(k))).toEqual([]);
     expect(bare(r.victim)).toBe("true");
     expect(bare(r.fixture)).toBe("false");
-    expectExactTokenLifecycle(r);
   }, probeTestTimeoutMs);
 
   it("the pre-commit hook defines the scrub once and calls it inside its one vitest launch", () => {

@@ -34,7 +34,6 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
-  readFileSync,
   rmdirSync,
   statSync,
   unlinkSync,
@@ -63,39 +62,7 @@ function packageRoot(): string {
 }
 
 const rootPath = packageRoot();
-/**
- * A parent test that launches a whole child vitest run (which inherits this
- * globalSetup) may assign the child's token name, so that after killing the
- * child it can delete exactly that token and nothing else. Must match
- * TEST_RUN_TOKEN_ID_ENV in test/structure/git-env-scrub.test.ts.
- *
- * Invariant: an assigned id is used only if it is a canonical lowercase UUID
- * (so it is a plain file name, never a path), and it is CONSUMED here:
- * deleted from process.env so this run's workers and descendants do not
- * inherit it. That alone cannot stop two SIBLING runs being launched with the
- * same value, so an assigned token is also CLAIMED: created exclusively
- * (`wx`) and tagged with a per-process owner nonce, and this run refreshes,
- * re-creates or removes it only while the token still carries that nonce
- * (see `RunTokenClaim`). A second run given an id already in use fails at
- * setup and never touches the first run's token. An invalid id fails the run
- * loudly rather than falling back to an unowned name.
- */
-export const TEST_RUN_TOKEN_ID_ENV = "SANCTUARY_TEST_RUN_TOKEN_ID";
-// 36 = the canonical 8-4-4-4-12 hex UUID; fixed counts, so the check is linear.
-const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
-
-function consumeAssignedRunId(): string | undefined {
-  const assigned = process.env[TEST_RUN_TOKEN_ID_ENV];
-  delete process.env[TEST_RUN_TOKEN_ID_ENV];
-  if (assigned === undefined) return undefined;
-  if (!CANONICAL_UUID.test(assigned)) {
-    throw new Error(`test-run-marker: ${TEST_RUN_TOKEN_ID_ENV} must be a canonical lowercase UUID`);
-  }
-  return assigned;
-}
-
-const assignedRunId = consumeAssignedRunId();
-const markerRunId = assignedRunId ?? `${process.pid}-${Date.now()}-${randomUUID()}`;
+const markerRunId = `${process.pid}-${Date.now()}-${randomUUID()}`;
 
 export function testRunMarkerPath(root: string): string {
   return join(root, TEST_RUN_MARKER_FILENAME);
@@ -166,75 +133,17 @@ export function refreshRunToken(root: string, runId: string, nowMs = Date.now())
   }
 }
 
-/**
- * Exclusive ownership of an ASSIGNED token name. The nonce is written into
- * the token, and every later write or removal first checks that the token
- * still carries it, so a token another run holds under the same name is never
- * refreshed, rewritten or deleted by this one.
- */
-export interface RunTokenClaim {
-  ownerNonce: string;
-}
-
-function ownerLine(claim: RunTokenClaim): string {
-  return `owner: ${claim.ownerNonce}\n`;
-}
-
-/** True only if the token exists and carries this claim's nonce. */
-export function ownsRunToken(root: string, runId: string, claim: RunTokenClaim): boolean {
-  try {
-    return readFileSync(join(testRunMarkerPath(root), runId), "utf8").endsWith(ownerLine(claim));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
-  }
-}
-
-function lostClaimError(runId: string): Error {
-  return new Error(
-    `test-run-marker: token ${runId} is held by another run; an assigned ${TEST_RUN_TOKEN_ID_ENV} ` +
-      "must be unique per run, so this run stops rather than share or remove it"
-  );
-}
-
-/**
- * Refreshes a claimed token. A pruned token is re-claimed exclusively; a token
- * now carrying another run's nonce is a lost claim and throws (loud: an
- * unref'd interval throwing fails the vitest run) instead of being touched.
- */
-export function refreshClaimedRunToken(root: string, runId: string, claim: RunTokenClaim, nowMs = Date.now()): void {
-  const seconds = nowMs / 1000;
-  if (ownsRunToken(root, runId, claim)) {
-    utimesSync(join(testRunMarkerPath(root), runId), seconds, seconds);
-    return;
-  }
-  if (existsSync(join(testRunMarkerPath(root), runId))) throw lostClaimError(runId);
-  // Pruned while paused: re-claim, exclusively, so a run that took the name meanwhile wins.
-  createTestRunMarker(root, runId, claim);
-  utimesSync(join(testRunMarkerPath(root), runId), seconds, seconds);
-}
-
-/** Removes a claimed token only while it still carries this claim's nonce. */
-export function removeClaimedRunToken(root: string, runId: string, claim: RunTokenClaim): void {
-  if (ownsRunToken(root, runId, claim)) removeTestRunMarker(root, runId);
-}
-
 export function createTestRunMarkerLifecycle(
   root: string,
   runId: string,
-  timers: TestRunMarkerTimers = realTimers,
-  claim?: RunTokenClaim
+  timers: TestRunMarkerTimers = realTimers
 ): { setup(): void; teardown(): void } {
   let refreshInterval: RefreshInterval | undefined;
-  // Set only once this process has created its claimed token; a failed claim
-  // leaves it false, so teardown cannot remove the holder's token.
-  let acquired = false;
   return {
     setup(): void {
-      createTestRunMarker(root, runId, claim);
-      acquired = true;
+      createTestRunMarker(root, runId);
       refreshInterval = timers.setInterval(
-        () => (claim ? refreshClaimedRunToken(root, runId, claim) : refreshRunToken(root, runId)),
+        () => refreshRunToken(root, runId),
         RUN_TOKEN_REFRESH_INTERVAL_MS
       );
       // An orphaned timer must never keep a completed or failed vitest process
@@ -246,9 +155,7 @@ export function createTestRunMarkerLifecycle(
         timers.clearInterval(refreshInterval);
         refreshInterval = undefined;
       }
-      if (!claim) removeTestRunMarker(root, runId);
-      else if (acquired) removeClaimedRunToken(root, runId, claim);
-      acquired = false;
+      removeTestRunMarker(root, runId);
     },
   };
 }
@@ -262,20 +169,7 @@ export function createTestRunMarkerLifecycle(
 // unmarked run when globalSetup throws.
 const CREATE_ATTEMPTS = 5;
 
-const TOKEN_TEXT =
-  "A vitest run is in progress in this checkout. src/wrap/keychain-exec.ts\n" +
-  "treats this directory's presence as proof that any process loading this package\n" +
-  "belongs to the test run, so the real OS credential binary stays unreachable\n" +
-  "even from a child spawned with a scrubbed environment.\n" +
-  "\n" +
-  "Safe to delete if no test run is active.\n";
-
-/**
- * Creates the marker directory and this run's token. With a `claim`, the token
- * is created exclusively (`wx`) and tagged with the claim's nonce, and an
- * existing token of that name throws instead of being overwritten.
- */
-export function createTestRunMarker(root: string, runId: string, claim?: RunTokenClaim): void {
+export function createTestRunMarker(root: string, runId: string): void {
   const markerPath = testRunMarkerPath(root);
   for (let attempt = 1; ; attempt++) {
     try {
@@ -289,14 +183,19 @@ export function createTestRunMarker(root: string, runId: string, claim?: RunToke
         }
       }
       mkdirSync(markerPath, { mode: 0o700, recursive: true });
-      writeFileSync(join(markerPath, runId), claim ? TOKEN_TEXT + ownerLine(claim) : TOKEN_TEXT, {
-        mode: 0o600,
-        flag: claim ? "wx" : "w",
-      });
+      writeFileSync(
+        join(markerPath, runId),
+        "A vitest run is in progress in this checkout. src/wrap/keychain-exec.ts\n" +
+          "treats this directory's presence as proof that any process loading this package\n" +
+          "belongs to the test run, so the real OS credential binary stays unreachable\n" +
+          "even from a child spawned with a scrubbed environment.\n" +
+          "\n" +
+          "Safe to delete if no test run is active.\n",
+        { mode: 0o600 }
+      );
       break;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (claim && code === "EEXIST") throw lostClaimError(runId);
       if ((code !== "ENOENT" && code !== "EINVAL") || attempt >= CREATE_ATTEMPTS) throw err;
     }
   }
@@ -320,12 +219,7 @@ export function removeTestRunMarker(root: string, runId: string): void {
   }
 }
 
-const lifecycle = createTestRunMarkerLifecycle(
-  rootPath,
-  markerRunId,
-  realTimers,
-  assignedRunId === undefined ? undefined : { ownerNonce: randomUUID() }
-);
+const lifecycle = createTestRunMarkerLifecycle(rootPath, markerRunId);
 
 export function teardown(): void {
   lifecycle.teardown();
