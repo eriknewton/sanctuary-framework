@@ -849,6 +849,19 @@ export async function writeFileCustody(
   await writeFileCustodyWithDurability(path, data, { ...options, strictDurability: options.strictDurability === true });
 }
 
+// Must match SOURCE_RAW_NAME_PRODUCERS and excludedRawSourceName in audit/split-evidence-registry.ts.
+/** Raw atomic staging suffix shared with the evidence source inventory. */
+/** Nonce byte width shared by producer names and their inventory patterns. */
+export const CUSTODY_ATOMIC_WRITE_NONCE_BYTES = 8;
+// Must match SOURCE_RAW_NAME_PRODUCERS in audit/split-evidence-registry.ts.
+/** Complete atomic staging grammar for source inventory consumers. */
+export const CUSTODY_FS_RAW_NAME_GRAMMARS = {
+  custodyStaging:{scope:"namespace",disposition:"excluded",suffix:".tmp",nonceBytes:CUSTODY_ATOMIC_WRITE_NONCE_BYTES,pattern:new RegExp("^\\..+\\.[0-9]+\\.[0-9a-f]{"+(CUSTODY_ATOMIC_WRITE_NONCE_BYTES*2)+"}\\.tmp$")},
+} as const; // Two hex digits per nonce byte.
+
+
+export const CUSTODY_ATOMIC_WRITE_STAGING_SUFFIX = CUSTODY_FS_RAW_NAME_GRAMMARS.custodyStaging.suffix;
+
 // Must match the required strictDurability argument at storage call sites in filesystem.ts and directory-capability-worker.ts.
 export async function writeFileCustodyWithDurability(
   path: string,
@@ -893,7 +906,7 @@ export async function writeFileCustodyWithDurability(
       await verifyParentCustody(path, options.parent);
       const tempPath = join(
         dir,
-        `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+        `.${basename(path)}.${process.pid}.${randomBytes(CUSTODY_ATOMIC_WRITE_NONCE_BYTES).toString("hex")}${CUSTODY_ATOMIC_WRITE_STAGING_SUFFIX}`,
       );
       let handle;
       let directoryHandle;

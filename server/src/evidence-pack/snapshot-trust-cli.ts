@@ -5,6 +5,8 @@ import { basename, dirname, join, resolve, relative, isAbsolute } from "node:pat
 import { authenticateSnapshotBytes } from "./snapshot-verify.js";
 import { verify } from "../core/identity.js";
 import * as C from "./snapshot-contract.js";
+// Both held-file boundaries must match parseManifestEnvelope in snapshot-dispatch.ts before payload reads.
+import * as D from "./snapshot-dispatch.js";
 // Must match the shared held-inode contract in snapshot-metadata.ts so capture cannot consume names from a replacement.
 import { metadataNames } from "./snapshot-metadata.js";
 export const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -68,11 +70,13 @@ export async function captureSnapshotDirectory(path: string, packKey: string, ex
       file.metadata = metadataNames(filePath, process.platform, await fd.stat({ bigint: true })); return file;
     }
     const manifestName = names.find(n => n.equals(Buffer.from(C.MANIFEST_FILENAME))); C.requireSnapshot(manifestName, C.HARD.file_set_mismatch);
-    const mf = await capture(manifestName, C.MAX_MANIFEST_BYTES); const raw = C.parseManifestEnvelope(mf.bytes);
+    const mf = await capture(manifestName, C.MAX_MANIFEST_BYTES); const raw = D.parseManifestEnvelope(mf.bytes);
     // Authenticate names and exact snapshot selection before resolving any manifest-listed file.
-    C.requireSnapshot(verify(C.manifestSigningBytes(raw), C.base64(raw.manifest_signature, C.SIGNATURE_BYTES), C.publicKey(packKey)), C.HARD.manifest_signature_invalid);
+    C.requireSnapshot(verify(D.manifestSigningBytes(raw), C.base64(raw.manifest_signature, C.SIGNATURE_BYTES), C.publicKey(packKey)), C.HARD.manifest_signature_invalid);
     C.requireSnapshot(C.manifestDigest(mf.bytes) === expectedDigest, C.HARD.manifest_digest_mismatch);
-    const manifest = C.parseManifest(raw);
+    const manifest = D.parseManifest(raw);
+    // B charges the complete delivered byte inventory before any payload allocation.
+    if (raw.format !== C.SNAPSHOT_FORMAT) C.cap(mf.bytes.length + manifest.files.reduce((sum, row) => sum + row.size_bytes, 0), C.MAX_PACK_BYTES);
     const expected = [C.MANIFEST_FILENAME, ...manifest.files.map(f => f.filename)].map(n => Buffer.from(n).toString("hex")).sort();
     C.requireSnapshot(JSON.stringify(names.map(n => n.toString("hex")).sort()) === JSON.stringify(expected), C.HARD.file_set_mismatch);
     // Signed row sizes bound allocation before reading, so false small sizes cannot conceal excessive actual bytes.
@@ -117,7 +121,7 @@ export async function runSnapshotTrustCommand(argv: string[], io: CommandIO = co
     const keyText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await readPublicFile(pinPath, C.MAX_TRUST_BYTES));
     const packKey = keyText.endsWith(C.LF) ? keyText.slice(0, -C.LF.length) : keyText; C.publicKey(packKey);
     const capture = await captureSnapshotDirectory(pack, packKey, flags["--expect-manifest-digest"]);
-    const raw = C.parseManifestEnvelope(capture.files.find(f => Buffer.from(f.name).toString() === C.MANIFEST_FILENAME)!.bytes);
+    const raw = D.parseManifestEnvelope(capture.files.find(f => Buffer.from(f.name).toString() === C.MANIFEST_FILENAME)!.bytes);
     const candidate = authenticateSnapshotBytes(capture, packKey, flags["--expect-manifest-digest"], raw.source_revision as string);
     await writeFile(output, candidate.candidateDescriptorBytes, { flag: "wx", mode: PRIVATE_FILE_MODE });
     await io.stdout(`TRUST_DESCRIPTOR_SHA256=${C.manifestDigest(candidate.candidateDescriptorBytes)}\n`); return C.EXIT_PASS;

@@ -66,7 +66,14 @@ const TRANSPARENCY_FLOOR_MAC_DOMAIN =
   "sanctuary.transparency-counter-floor.v1\n";
 const TRANSPARENCY_POLICY_RULES_DOMAIN =
   "sanctuary.transparency.policy-rules.v1";
-const TRANSPARENCY_EMIT_LOCK_FILE = ".transparency-emit.lock";
+// Must match excludedRawSourceName in audit/split-evidence-registry.ts.
+// Must match SOURCE_RAW_NAME_PRODUCERS in audit/split-evidence-registry.ts.
+/** Complete transparency lock grammar for source inventory consumers. */
+export const TRANSPARENCY_RAW_NAME_GRAMMARS = {
+  transparencyEmit:{scope:"transparency",disposition:"excluded",name:".transparency-emit.lock",pattern:/^\.transparency-emit\.lock$/},
+} as const;
+
+export const TRANSPARENCY_EMIT_LOCK_FILE = TRANSPARENCY_RAW_NAME_GRAMMARS.transparencyEmit.name;
 const TRANSPARENCY_EMIT_LOCK_RETRY_MS = 100;
 
 /**
