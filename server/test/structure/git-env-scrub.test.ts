@@ -2,15 +2,18 @@
  * Capability: no test process inherits a git variable that redirects which
  * repository, config file, or object graph git acts on (a git hook exports
  * GIT_DIR pointing at the real repository; a shell can add GIT_CONFIG and
- * runtime config pairs). Witness for the setupFiles entry
- * test/setup/git-env-scrub.ts: a child vitest run, seeded with every variable
- * the guard must clear, runs a probe that reports what it inherited and writes
- * `core.bare=true` from its own fixture repo while GIT_DIR and GIT_CONFIG aim
- * at a throwaway "victim" repo. With the setup file nothing seeded reaches the
- * probe and the fixture repo is written (positive control); with the setup
- * file removed from the child's setupFiles every seeded variable reaches it
- * and the victim is written instead (fail-before). The last two tests pin the
- * two bash copies of the list to scripts/git-redirect-env-keys.json.
+ * runtime config pairs). Witness for test/setup/git-env-scrub.ts, the first
+ * entry of both globalSetup and setupFiles: a child vitest run, seeded with
+ * every variable the guard must clear, runs a globalSetup probe that reports
+ * what the MAIN process still holds and a test probe that reports what a
+ * WORKER inherited and writes `core.bare=true` from its own fixture repo while
+ * GIT_DIR and GIT_CONFIG aim at a throwaway "victim" repo. With the scrub
+ * entries nothing seeded reaches either probe and the fixture repo is written
+ * (positive control); with both entries removed from the child's lists every
+ * seeded variable reaches them and the victim is written instead
+ * (fail-before). The bash copies of the list are pinned to
+ * scripts/git-redirect-env-keys.json statically and by running them, the
+ * pre-commit hook end to end with stub vitest launchers.
  */
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -25,17 +28,21 @@ import {
   isGitRedirectEnvKey,
   scrubGitRedirectEnv,
 } from "../setup/git-env-scrub.js";
+import { removeTestRunMarker, testRunMarkerPath } from "../setup/test-run-marker.js";
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = path.resolve(serverDir, "..");
 const SETUP_ENTRY = "./test/setup/git-env-scrub.ts";
 const PROBE_GLOB = "test/fixtures/git-env-scrub/*.probe.ts";
+const MAIN_PROBE = "./test/fixtures/git-env-scrub/main-process.probe-global.ts";
 const childStartupHeadroomMs = 30_000; // Allow module loading on a loaded runner.
 const childExitHeadroomMs = 10_000; // Allow reporting and worker shutdown after the probe.
 const parentHeadroomMs = 30_000; // Allow the fixture git inits and report reads outside the child budget.
 // One probe test: startup, the config's per-test budget, one hook budget for setup/teardown, then exit.
 const childTimeoutMs = childStartupHeadroomMs + (config.test?.testTimeout ?? childStartupHeadroomMs) + leaseGuardHookTimeoutMs + childExitHeadroomMs;
 const probeTestTimeoutMs = childTimeoutMs + parentHeadroomMs;
+// The hook run does git plumbing and calls stubs only; the same startup and exit headroom bound it.
+const hookTimeoutMs = childStartupHeadroomMs + childExitHeadroomMs;
 const cleanup: string[] = [];
 
 /**
@@ -54,13 +61,13 @@ const MUST_SCRUB = [
 /** Names the guard must leave alone: discovery restriction, and a non-numbered lookalike. */
 const MUST_KEEP = ["GIT_CEILING_DIRECTORIES", "GIT_CONFIG_KEY_X"] as const;
 
-/** Values that keep a leaked redirect aimed at `victim`, so fail-before writes land there. */
-function seeds(tmp: string, victim: string): Record<(typeof MUST_SCRUB)[number] | (typeof MUST_KEEP)[number], string> {
-  const dotGit = path.join(victim, ".git");
+/** Values that keep a leaked redirect aimed at `target`, so fail-before writes land there. */
+function seeds(tmp: string, target: string): Record<(typeof MUST_SCRUB)[number] | (typeof MUST_KEEP)[number], string> {
+  const dotGit = path.join(target, ".git");
   return {
     GIT_DIR: dotGit,
     GIT_COMMON_DIR: dotGit,
-    GIT_WORK_TREE: victim,
+    GIT_WORK_TREE: target,
     GIT_INDEX_FILE: path.join(dotGit, "index"),
     GIT_OBJECT_DIRECTORY: path.join(dotGit, "objects"),
     GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(dotGit, "objects"),
@@ -84,8 +91,8 @@ function seeds(tmp: string, victim: string): Record<(typeof MUST_SCRUB)[number] 
 }
 
 /** The parent environment (VITEST included) minus git's redirect variables, with no user or system git config. */
-function cleanEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+function cleanEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
   scrubGitRedirectEnv(env);
   env.GIT_CONFIG_GLOBAL = "/dev/null";
   env.GIT_CONFIG_SYSTEM = "/dev/null";
@@ -93,54 +100,99 @@ function cleanEnv(): NodeJS.ProcessEnv {
 }
 /** Reads core.bare from the repo's own config file, independent of discovery. */
 function bare(repo: string): string {
-  const r = spawnSync("git", ["config", "--file", path.join(repo, ".git", "config"), "--get", "core.bare"], { encoding: "utf8", env: cleanEnv() });
+  const r = spawnSync("git", ["config", "--file", path.join(repo, ".git", "config"), "--get", "core.bare"], { encoding: "utf8", env: cleanEnv(process.env) });
   return r.stdout.trim();
 }
-
-interface ProbeRun { victim: string; fixture: string; seen: string[]; status: number | null; signal: NodeJS.Signals | null; error?: Error; out: string }
-
-/** Runs the probe as a child vitest seeded with every MUST_SCRUB and MUST_KEEP name. */
-function runProbe(withScrub: boolean): ProbeRun {
+function scratch(): string {
   const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "git-env-scrub-")));
   cleanup.push(tmp);
+  return tmp;
+}
+function readNames(report: string): string[] {
+  return fs.existsSync(report) ? (JSON.parse(fs.readFileSync(report, "utf8")) as string[]) : [];
+}
+
+/**
+ * Removes the run token the child's own globalSetup (test-run-marker.ts, via
+ * the spread real config) wrote into server/.sanctuary-test-run. Must match
+ * the `markerRunId` shape `${pid}-${Date.now()}-${uuid}` in
+ * test/setup/test-run-marker.ts. A token is the child's only if it names the
+ * child's pid AND was minted while the child ran, so the parent run's token
+ * and other runs' tokens are never touched. Failure mode this prevents: a
+ * SIGKILLed child skips its teardown, its token survives the outer run, and
+ * the checkout keeps reading as "under test" (the CLI refuses keychain work)
+ * until a later run prunes it after the staleness ceiling.
+ */
+function reapChildRunToken(pid: number | undefined, startedMs: number, endedMs: number): void {
+  if (!pid) return; // the child never started, so it wrote nothing
+  const markerDir = testRunMarkerPath(serverDir);
+  if (!fs.existsSync(markerDir)) return;
+  for (const token of fs.readdirSync(markerDir)) {
+    const [owner, minted] = token.split("-");
+    if (owner !== String(pid)) continue;
+    const mintedMs = Number(minted);
+    if (!(mintedMs >= startedMs && mintedMs <= endedMs)) continue;
+    removeTestRunMarker(serverDir, token);
+  }
+}
+
+interface ProbeRun {
+  victim: string; fixture: string; workerSeen: string[]; mainSeen: string[];
+  status: number | null; signal: NodeJS.Signals | null; error?: Error; out: string;
+}
+
+/** Runs the probes as a child vitest seeded with every MUST_SCRUB and MUST_KEEP name. */
+function runProbe(withScrub: boolean): ProbeRun {
+  const tmp = scratch();
   const victim = path.join(tmp, "victim");
   const fixture = path.join(tmp, "fixture");
   const home = path.join(tmp, "home");
   fs.mkdirSync(home);
   for (const d of [victim, fixture]) {
     fs.mkdirSync(d);
-    execFileSync("git", ["init", "--quiet"], { cwd: d, env: cleanEnv() });
+    execFileSync("git", ["init", "--quiet"], { cwd: d, env: cleanEnv(process.env) });
   }
-  // The child's setupFiles come from the REAL config; only the fail-before
-  // case removes the scrub entry, and only from this child's copy.
+  // The child's lists come from the REAL config; only the fail-before case
+  // removes the scrub entry, and only from this child's copies.
   const realSetup = [...((config.test?.setupFiles ?? []) as string[])];
-  expect(realSetup[0]).toBe(SETUP_ENTRY); // invariant: the scrub runs first
-  const setupFiles = withScrub ? realSetup : realSetup.filter((e) => e !== SETUP_ENTRY);
+  const realGlobal = [...((config.test?.globalSetup ?? []) as string[])];
+  expect(realSetup[0]).toBe(SETUP_ENTRY); // invariant: the worker scrub runs first
+  expect(realGlobal[0]).toBe(SETUP_ENTRY); // invariant: the main-process scrub runs first
+  const keep = (e: string) => withScrub || e !== SETUP_ENTRY;
+  const setupFiles = realSetup.filter(keep);
+  const globalSetup = [...realGlobal.filter(keep), MAIN_PROBE];
   const cfg = path.join(tmp, "probe.config.mjs");
   // One thread worker confines probe execution to the child process that spawnSync reaps.
   fs.writeFileSync(cfg, `
 import config from ${JSON.stringify(path.join(serverDir, "vitest.config.ts"))};
-export default { ...config, cacheDir: ${JSON.stringify(path.join(tmp, "vite-cache"))}, test: { ...config.test, include: [${JSON.stringify(PROBE_GLOB)}], pool: "threads", maxWorkers: 1, setupFiles: ${JSON.stringify(setupFiles)} } };
+export default { ...config, cacheDir: ${JSON.stringify(path.join(tmp, "vite-cache"))}, test: { ...config.test, include: [${JSON.stringify(PROBE_GLOB)}], pool: "threads", maxWorkers: 1, setupFiles: ${JSON.stringify(setupFiles)}, globalSetup: ${JSON.stringify(globalSetup)} } };
 `);
-  const report = path.join(tmp, "seen.json");
+  const workerReport = path.join(tmp, "worker-seen.json");
+  const mainReport = path.join(tmp, "main-seen.json");
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ...seeds(tmp, victim),
     HOME: home,
     PROBE_REPO: fixture,
-    PROBE_REPORT: report,
+    PROBE_REPORT: workerReport,
+    PROBE_MAIN_REPORT: mainReport,
     // The keychain chokepoint refuses inside any child that inherits VITEST.
     VITEST: "true",
   };
+  const startedMs = Date.now();
   // Thread workers die with the synchronous child, which is reaped even when its timeout fires.
   const r = spawnSync(process.execPath, [path.join(serverDir, "node_modules/vitest/vitest.mjs"), "run", "--config", cfg], {
     cwd: serverDir, encoding: "utf8", env, timeout: childTimeoutMs, killSignal: "SIGKILL",
   });
-  const seen = fs.existsSync(report) ? (JSON.parse(fs.readFileSync(report, "utf8")) as string[]) : [];
-  return { victim, fixture, seen, status: r.status, signal: r.signal, error: r.error, out: `${r.stdout}${r.stderr}` };
+  // On every exit, clean or killed: the child is already reaped here, so its token can go.
+  reapChildRunToken(r.pid, startedMs, Date.now());
+  return {
+    victim, fixture, workerSeen: readNames(workerReport), mainSeen: readNames(mainReport),
+    status: r.status, signal: r.signal, error: r.error, out: `${r.stdout}${r.stderr}`,
+  };
 }
 
-function expectChildCompleted(r: ProbeRun): void {
+function expectChildCompleted(r: { status: number | null; signal: NodeJS.Signals | null; error?: Error; out: string }): void {
   expect(r.error, r.out).toBeUndefined();
   expect(r.signal, r.out).toBeNull();
   expect(r.status, r.out).toBe(0);
@@ -151,30 +203,45 @@ function codeLines(rel: string): string[] {
   return fs.readFileSync(path.join(repoRoot, rel), "utf8").split("\n").filter((l) => !l.trimStart().startsWith("#"));
 }
 
+const KEYS_DEF = `GIT_REDIRECT_ENV_KEYS=(${GIT_REDIRECT_ENV_KEYS.join(" ")})`;
+const RE_DEF = `GIT_REDIRECT_NUMBERED_KEY_RE='${GIT_REDIRECT_NUMBERED_KEY_RE.source}'`;
+const FN_DEF = "scrub_git_redirect_env() {";
+const KEYS_USE = '  for name in "${GIT_REDIRECT_ENV_KEYS[@]}"; do';
+const RE_USE = '    if [[ "$name" =~ $GIT_REDIRECT_NUMBERED_KEY_RE ]]; then';
+const COMPGEN_USE = "  for name in $(compgen -e); do";
+
 /**
- * Pins one bash copy to the shared list: the fixed array and the numbered
- * pattern must equal it exactly, and the shipped function, extracted verbatim
- * and run under `set -euo pipefail`, must clear every MUST_SCRUB name and keep
- * every MUST_KEEP name.
+ * Pins one bash copy to the shared list, using string operations only (exact
+ * line equality, includes, slice), so no quantified pattern runs over the
+ * shipped text and parsing cannot backtrack. Every non-comment line that
+ * names the array, the pattern, the function, or compgen must be one of the
+ * exact expected lines, so an indented or `declare -a` reassignment, a `+=`
+ * append, a second or `function`-keyword definition, or an extra call site
+ * fails. The function, extracted verbatim and run under `set -euo pipefail`,
+ * must clear every MUST_SCRUB name and keep every MUST_KEEP name.
  */
-function expectBashCopyMatches(rel: string): string[] {
+function expectBashCopyMatches(rel: string, callLines: string[]): string[] {
   const lines = codeLines(rel);
-  // String operations only (prefix, suffix, slice, split on spaces): no
-  // quantified pattern runs over the hook text, so parsing cannot backtrack.
-  const arrayPrefix = "GIT_REDIRECT_ENV_KEYS=(";
-  const arrays = lines.filter((l) => l.startsWith(arrayPrefix));
-  expect(arrays, rel).toHaveLength(1);
-  expect(arrays[0].endsWith(")"), rel).toBe(true);
-  const keys = arrays[0].slice(arrayPrefix.length, -1).split(" ").filter(Boolean);
-  expect(keys).toEqual([...GIT_REDIRECT_ENV_KEYS]);
-  const patterns = lines.filter((l) => l.startsWith("GIT_REDIRECT_NUMBERED_KEY_RE="));
-  expect(patterns, rel).toHaveLength(1);
-  expect(patterns[0]).toBe(`GIT_REDIRECT_NUMBERED_KEY_RE='${GIT_REDIRECT_NUMBERED_KEY_RE.source}'`);
-  const start = lines.indexOf("scrub_git_redirect_env() {");
+  const start = lines.indexOf(FN_DEF);
   expect(start, rel).toBeGreaterThanOrEqual(0);
   const end = lines.findIndex((l, i) => i > start && l === "}");
   expect(end, rel).toBeGreaterThan(start);
-  const harness = ["set -euo pipefail", arrays[0], patterns[0], ...lines.slice(start, end + 1), "scrub_git_redirect_env", "compgen -e"].join("\n");
+  const body = lines.slice(start, end + 1);
+  for (const use of [KEYS_USE, RE_USE, COMPGEN_USE]) expect(body, rel).toContain(use);
+  const expectations: [string, string[]][] = [
+    ["GIT_REDIRECT_ENV_KEYS", [KEYS_DEF, KEYS_USE]],
+    ["GIT_REDIRECT_NUMBERED_KEY_RE", [RE_DEF, RE_USE]],
+    ["scrub_git_redirect_env", [FN_DEF, ...callLines]],
+    ["compgen", [COMPGEN_USE]],
+  ];
+  for (const [token, expected] of expectations) {
+    expect(lines.filter((l) => l.includes(token)), `${rel}: every line naming ${token}`).toEqual(expected);
+  }
+  // Definitions precede the function, which precedes every call.
+  expect(lines.indexOf(KEYS_DEF)).toBeLessThan(start);
+  expect(lines.indexOf(RE_DEF)).toBeLessThan(start);
+  for (const call of callLines) expect(lines.indexOf(call)).toBeGreaterThan(end);
+  const harness = ["set -euo pipefail", KEYS_DEF, RE_DEF, ...body, "scrub_git_redirect_env", "compgen -e"].join("\n");
   const tmp = os.tmpdir();
   const out = execFileSync("bash", ["-c", harness], {
     encoding: "utf8",
@@ -186,42 +253,99 @@ function expectBashCopyMatches(rel: string): string[] {
   return lines;
 }
 
+const HOOK = ".githooks/pre-commit";
+const HOOK_CALL = 'related_output=$(cd server && scrub_git_redirect_env && npx vitest related --run "${abs_staged_files[@]}" 2>&1 \\';
+const HOOK_CALL_NEXT = "  | node ../scripts/redact-test-output.mjs)";
+const HOOK_LOG = 'log "Gate 2/2: npx vitest related --run (${#staged_ts_files[@]} staged file(s)) + transform-error scan"';
+
+/** True for a line that could launch vitest in any common spelling (substring checks only). */
+function mayLaunchVitest(l: string): boolean {
+  const t = l.trimStart();
+  return (l.includes("npx ") && l.includes("vitest"))
+    || l.includes(".bin/vitest") || l.includes("vitest.mjs")
+    || l.includes("npm test") || l.includes("npm run test") || l.includes("npm t ") || l.includes("npm exec")
+    || l.includes("pnpm") || l.includes("yarn")
+    || t.startsWith("vitest ") || l.includes("| vitest") || l.includes("&& vitest") || l.includes("; vitest") || l.includes("$(vitest");
+}
+
+/** One launcher stub: records its name, args and every GIT_* name it inherited, then succeeds. */
+const DUMP_STUB = `#!/usr/bin/env bash
+{
+  printf 'CALL %s' "\${0##*/}"; printf ' %s' "$@"; printf '\\n'
+  compgen -e | grep '^GIT_' || true
+  printf 'END\\n'
+} >> "$PROBE_DUMP"
+exit 0
+`;
+
 afterAll(() => {
   for (const d of cleanup) fs.rmSync(d, { recursive: true, force: true });
 });
 
 describe("test git-env scrub", () => {
-  it("with the setup file, no seeded git redirect reaches a test and its git writes stay in its own repo", () => {
+  it("with the scrub entries, no seeded git redirect reaches the main process or a test, and git writes stay in the test's repo", () => {
     const r = runProbe(true);
     expectChildCompleted(r);
-    expect(MUST_SCRUB.filter((k) => r.seen.includes(k))).toEqual([]);
-    expect(MUST_KEEP.filter((k) => !r.seen.includes(k))).toEqual([]);
+    expect(MUST_SCRUB.filter((k) => r.workerSeen.includes(k))).toEqual([]);
+    expect(MUST_SCRUB.filter((k) => r.mainSeen.includes(k))).toEqual([]);
+    expect(MUST_KEEP.filter((k) => !r.workerSeen.includes(k))).toEqual([]);
     expect(MUST_KEEP.filter((k) => isGitRedirectEnvKey(k))).toEqual([]);
     expect(bare(r.fixture)).toBe("true"); // positive control: fixture repo was written
     expect(bare(r.victim)).toBe("false"); // throwaway "real" repo unchanged
   }, probeTestTimeoutMs);
 
-  it("fail-before: without the setup file every seeded redirect reaches the probe and the victim repo is written", () => {
+  it("fail-before: without the scrub entries every seeded redirect reaches both probes and the victim repo is written", () => {
     const r = runProbe(false);
     expectChildCompleted(r);
-    expect(MUST_SCRUB.filter((k) => !r.seen.includes(k))).toEqual([]);
+    expect(MUST_SCRUB.filter((k) => !r.workerSeen.includes(k))).toEqual([]);
+    expect(MUST_SCRUB.filter((k) => !r.mainSeen.includes(k))).toEqual([]);
     expect(bare(r.victim)).toBe("true");
     expect(bare(r.fixture)).toBe("false");
   }, probeTestTimeoutMs);
 
-  it("the pre-commit hook clears the same set inside its one vitest call", () => {
-    const lines = expectBashCopyMatches(".githooks/pre-commit");
-    // A `log "..."` progress message names the command without running it.
-    const vitestCalls = lines.filter((l) => l.includes("npx vitest") && !l.trimStart().startsWith("log "));
-    expect(vitestCalls).toHaveLength(1);
-    // The scrub runs inside the command-substitution subshell, so the hook's own git calls keep their env.
-    expect(vitestCalls[0].startsWith("related_output=$(cd server && scrub_git_redirect_env && npx vitest related ")).toBe(true);
+  it("the pre-commit hook defines the scrub once and calls it inside its one vitest launch", () => {
+    const lines = expectBashCopyMatches(HOOK, [HOOK_CALL]);
+    expect(lines.filter(mayLaunchVitest)).toEqual([HOOK_LOG, HOOK_CALL]);
+    // Exact line equality: nothing chained after the launch, and the scrub runs
+    // inside the command-substitution subshell, so the hook's own git calls keep their env.
+    expect(lines[lines.indexOf(HOOK_CALL) + 1]).toBe(HOOK_CALL_NEXT);
   });
 
-  it("the verify-fail-before self-test clears the same set in both of its git subshells", () => {
-    const lines = expectBashCopyMatches("scripts/verify-fail-before-self-test.sh");
-    // clean_git and run_verify each call it once; no hand-written unset loop remains.
-    expect(lines.filter((l) => l.trim() === "scrub_git_redirect_env")).toHaveLength(2);
+  it("the real pre-commit hook, run with git's hook env and every seeded redirect, launches vitest with none of them", () => {
+    const tmp = scratch();
+    const repo = path.join(tmp, "repo");
+    const bin = path.join(tmp, "bin");
+    const home = path.join(tmp, "home");
+    for (const d of [repo, bin, home, path.join(repo, "server/node_modules/.bin"), path.join(repo, ".githooks"), path.join(repo, "scripts")]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+    execFileSync("git", ["init", "--quiet"], { cwd: repo, env: cleanEnv(process.env) });
+    fs.copyFileSync(path.join(repoRoot, HOOK), path.join(repo, HOOK));
+    fs.copyFileSync(path.join(repoRoot, "scripts/redact-test-output.mjs"), path.join(repo, "scripts/redact-test-output.mjs"));
+    fs.writeFileSync(path.join(repo, "server/staged.ts"), "export const staged = 1;\n");
+    execFileSync("git", ["add", "server/staged.ts"], { cwd: repo, env: cleanEnv(process.env) });
+    // Every launcher spelling routes to the dumping stub, so an unscrubbed extra launch is seen too.
+    for (const stub of [path.join(bin, "npx"), path.join(bin, "npm"), path.join(bin, "vitest"), path.join(bin, "pnpm"), path.join(bin, "yarn"), path.join(repo, "server/node_modules/.bin/vitest")]) {
+      fs.writeFileSync(stub, DUMP_STUB, { mode: 0o755 });
+    }
+    const dump = path.join(tmp, "dump.log");
+    // Seeds aim at the hook's own repo, as git's real hook env does, so the hook's git calls work.
+    const env: NodeJS.ProcessEnv = { ...seeds(tmp, repo), PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, PROBE_DUMP: dump, VITEST: "true" };
+    const r = spawnSync("bash", [path.join(repo, HOOK)], { cwd: repo, encoding: "utf8", env, timeout: hookTimeoutMs, killSignal: "SIGKILL" });
+    expectChildCompleted({ ...r, out: `${r.stdout}${r.stderr}` });
+    const calls = fs.readFileSync(dump, "utf8").split("END\n").filter(Boolean).map((block) => {
+      const [header, ...names] = block.split("\n").filter(Boolean);
+      return { header, names };
+    });
+    // The typecheck gate runs before the scrub, in the hook's own env; every other launch must be clean.
+    const launches = calls.filter((c) => c.header !== "CALL npm run typecheck --silent");
+    expect(launches.map((c) => c.header)).toEqual([`CALL npx vitest related --run ${path.join(repo, "server/staged.ts")}`]);
+    expect(MUST_SCRUB.filter((k) => launches[0].names.includes(k))).toEqual([]);
+    expect(MUST_KEEP.filter((k) => !launches[0].names.includes(k))).toEqual([]);
+  }, hookTimeoutMs + parentHeadroomMs);
+
+  it("the verify-fail-before self-test defines the scrub once and calls it in both git subshells", () => {
+    const lines = expectBashCopyMatches("scripts/verify-fail-before-self-test.sh", ["  scrub_git_redirect_env", "    scrub_git_redirect_env"]);
     expect(lines.filter((l) => l.includes('unset "$key"'))).toEqual([]);
   });
 });

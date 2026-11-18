@@ -62,6 +62,8 @@ function packageRoot(): string {
 }
 
 const rootPath = packageRoot();
+// Must match reapChildRunToken in test/structure/git-env-scrub.test.ts, which
+// identifies a killed child's token by this leading `<pid>-<ms>-` shape.
 const markerRunId = `${process.pid}-${Date.now()}-${randomUUID()}`;
 
 export function testRunMarkerPath(root: string): string {

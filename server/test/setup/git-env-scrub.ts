@@ -15,9 +15,15 @@
  * shared `Sanctuary/.git/config`, after which git failed in every worktree of
  * the checkout, with no test failing.
  *
- * Invariant: this runs first in `setupFiles` (vitest.config.ts), so every
- * test file, and every child it spawns with an inherited environment, starts
- * with these variables absent. Deleting (not pointing at /dev/null) reverts to
+ * Invariant: this file is the FIRST entry of both `globalSetup` and
+ * `setupFiles` in vitest.config.ts. As the first globalSetup entry it clears
+ * the vitest main process before any other globalSetup module runs and before
+ * workers start; as the first setupFiles entry it clears every worker (a
+ * setup file runs in workers only, so neither entry alone covers both). Every
+ * child a test spawns with an inherited environment then starts with these
+ * variables absent. Bound: vitest loads its config file before globalSetup,
+ * so only config evaluation itself still sees them; the config runs no git.
+ * Deleting (not pointing at /dev/null) reverts to
  * the normal shell defaults, because many tests rely on the developer's usual
  * git identity and config; a test that needs no user config sets
  * `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` for its own children after this runs.
@@ -31,31 +37,35 @@
  * in-flight commit's index, so this is accepted rather than special-cased.
  *
  * One source (AGENTS.md rule 5): the list lives in
- * `scripts/git-redirect-env-keys.json`. Consumers: this file (and, through
- * `scrubGitRedirectEnv`, test/scripts/prepush-floor-rules.test.ts,
- * test/scripts/install-hooks.test.ts and test/structure/git-env-scrub.test.ts),
- * scripts/install-hooks.js (loads the JSON directly), and two bash copies that
- * must match it exactly: `.githooks/pre-commit` (`scrub_git_redirect_env`
- * before its one vitest call) and `scripts/verify-fail-before-self-test.sh`.
- * test/structure/git-env-scrub.test.ts pins both bash copies by full-set
- * equality and by running them.
+ * `scripts/git-redirect-env-keys.json`; this file clears BOTH its groups
+ * (`repositoryKeys`, then `configKeys` and the numbered pattern). Consumers:
+ * this file (and, through `scrubGitRedirectEnv`,
+ * test/scripts/prepush-floor-rules.test.ts, test/scripts/install-hooks.test.ts
+ * and test/structure/git-env-scrub.test.ts), scripts/install-hooks.js (loads
+ * the JSON directly and deliberately clears only `repositoryKeys` plus
+ * GIT_CONFIG_PARAMETERS, see there), and two bash copies that must match the
+ * full set exactly: `.githooks/pre-commit` (`scrub_git_redirect_env` before
+ * its one vitest call) and `scripts/verify-fail-before-self-test.sh`.
+ * test/structure/git-env-scrub.test.ts pins both bash copies statically and
+ * by running them (the hook end to end).
  */
 import { readFileSync } from "node:fs";
 
 interface GitRedirectEnvSpec {
-  keys: string[];
-  numberedKeyPattern: string;
+  repositoryKeys: string[];
+  configKeys: string[];
+  numberedConfigKeyPattern: string;
 }
 
 const spec = JSON.parse(
   readFileSync(new URL("../../scripts/git-redirect-env-keys.json", import.meta.url), "utf8"),
 ) as GitRedirectEnvSpec;
 
-/** Fixed names from scripts/git-redirect-env-keys.json `keys`. */
-export const GIT_REDIRECT_ENV_KEYS: readonly string[] = Object.freeze([...spec.keys]);
+/** Fixed names: `repositoryKeys` then `configKeys` from scripts/git-redirect-env-keys.json (the bash copies use this order). */
+export const GIT_REDIRECT_ENV_KEYS: readonly string[] = Object.freeze([...spec.repositoryKeys, ...spec.configKeys]);
 
-/** Numbered names (GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n>) from `numberedKeyPattern`; pattern-matched because <n> is unbounded. */
-export const GIT_REDIRECT_NUMBERED_KEY_RE = new RegExp(spec.numberedKeyPattern, "u");
+/** Numbered names (GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n>) from `numberedConfigKeyPattern`; pattern-matched because <n> is unbounded. */
+export const GIT_REDIRECT_NUMBERED_KEY_RE = new RegExp(spec.numberedConfigKeyPattern, "u");
 
 /** True for every name the scrub removes: a fixed key or a numbered config pair. */
 export function isGitRedirectEnvKey(name: string): boolean {
@@ -68,4 +78,11 @@ export function scrubGitRedirectEnv(env: NodeJS.ProcessEnv = process.env): void 
   }
 }
 
+/** globalSetup entry point: clears the vitest main process (the import below already did; this keeps the module a valid globalSetup). */
+export function setup(): void {
+  scrubGitRedirectEnv();
+}
+
+// Runs on import in both roles, so the scrub precedes anything a later setup
+// module or test file does in this process.
 scrubGitRedirectEnv();

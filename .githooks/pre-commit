@@ -284,12 +284,12 @@ done
 # core.bare=true written into the shared .git/config). scrub_git_redirect_env
 # runs INSIDE the command-substitution subshell below, so it clears them for
 # vitest only and cannot affect any git call this hook itself makes. The fixed
-# names and the numbered pattern must match keys and numberedKeyPattern in
+# names and the numbered pattern must match repositoryKeys then configKeys, and numberedConfigKeyPattern, in
 # server/scripts/git-redirect-env-keys.json (the setup file
 # server/test/setup/git-env-scrub.ts loads that list and is the primary guard;
 # this is defence in depth). server/test/structure/git-env-scrub.test.ts pins
 # both lines by full-set equality and runs the function.
-GIT_REDIRECT_ENV_KEYS=(GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_SHALLOW_FILE GIT_GRAFT_FILE)
+GIT_REDIRECT_ENV_KEYS=(GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM)
 GIT_REDIRECT_NUMBERED_KEY_RE='^GIT_CONFIG_(KEY|VALUE)_[0-9]+$'
 scrub_git_redirect_env() {
   local name
