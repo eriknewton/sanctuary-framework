@@ -208,15 +208,7 @@ export function createContextGateTools(
     {
       name: "context_gate_set_policy",
       description:
-        "Create a context-gating policy that controls what information flows to " +
-        "remote providers (LLM APIs, tool APIs, logging services). " +
-        "Each rule specifies a provider category and which context fields to " +
-        "allow, redact, hash, or flag for summarization. " +
-        "Redact rules take absolute priority — if a field is in both 'allow' and " +
-        "'redact', it is redacted. Default action applies to any field not " +
-        "mentioned in any rule. " +
-        "Use this to prevent your full agent context from being sent to remote " +
-        "LLM providers during inference calls.",
+        "Create a stored policy from provider and field rules. Requires operator approval. Rules allow, redact, hash, deny, or mark fields for summarization; redaction takes precedence. The policy applies only where filtering is invoked and does not itself intercept arbitrary egress.",
       inputSchema: {
         type: "object",
         properties: {
@@ -367,12 +359,7 @@ export function createContextGateTools(
     {
       name: "context_gate_apply_template",
       description:
-        "Apply a starter context-gating template. Available templates: " +
-        "inference-minimal (strictest — only task and query pass through), " +
-        "inference-standard (balanced — adds tool results, summarizes history), " +
-        "logging-strict (redacts all content for telemetry services), " +
-        "tool-api-scoped (allows tool parameters, redacts agent state). " +
-        "Templates are starting points — customize after applying.",
+        "Create a stored context-gating policy from a named starter template. Requires operator approval. Summarization rules produce a marker, not a summary. Review and customize the policy before using its output; applying a template does not itself intercept arbitrary egress.",
       inputSchema: {
         type: "object",
         properties: {
@@ -503,12 +490,7 @@ export function createContextGateTools(
     {
       name: "context_gate_filter",
       description:
-        "Filter agent context through a gating policy before sending to a " +
-        "remote provider. Returns per-field decisions (allow, redact, hash, " +
-        "summarize) and content hashes for the audit trail. " +
-        "Call this BEFORE making any outbound API call to ensure you are only " +
-        "sending the minimum necessary context. " +
-        "The filtered output tells you exactly what can be sent safely.",
+        "Apply an existing context-gating policy to supplied context for a provider category. Returns filtered output and field decisions, or a blocked result. Summarization produces a marker, not a summary. Review output before transmission; filtering does not guarantee safe disclosure or intercept arbitrary egress.",
       inputSchema: {
         type: "object",
         properties: {

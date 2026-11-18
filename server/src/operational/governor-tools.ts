@@ -25,13 +25,7 @@ export function createGovernorTools(
     {
       name: "governor_status",
       description:
-        "View the current Call Governor status including volume counters, " +
-        "per-tool rate counts, duplicate cache size, and lifetime counter. " +
-        "Use this to monitor tool call consumption, detect potential loops, " +
-        "and check how close you are to governance limits. " +
-        "The governor protects against runaway tool calls by enforcing " +
-        "volume limits, rate limits, duplicate detection, and a session " +
-        "lifetime cap.",
+        "Return Call Governor counters and configured volume, rate, duplicate, and lifetime limits for proxied upstream calls. Use to inspect consumption and remaining limits. These counters and limits do not cover all Sanctuary tools.",
       inputSchema: {
         type: "object",
         properties: {},

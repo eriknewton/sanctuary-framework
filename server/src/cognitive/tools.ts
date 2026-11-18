@@ -1400,7 +1400,7 @@ export function createCognitiveTools(
 
     {
       name: "identity_list",
-      description: "List all managed sovereign identities with labels, DIDs, public keys, and which is primary. Read-only; no private key material returned.",
+      description: "List managed public identities, optionally filtered by label. Returns labels, DIDs, and public keys without private key material. Does not identify the primary identity.",
       inputSchema: {
         type: "object",
         properties: {

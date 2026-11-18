@@ -112,7 +112,7 @@
 6	server/src/mesh/lifecycle/file-stores.ts
 2	server/src/mesh/trust-root.ts
 4	server/src/operational/context-gate-recommend.ts
-6	server/src/operational/context-gate-tools.ts
+2	server/src/operational/context-gate-tools.ts
 3	server/src/operational/governor-tools.ts
 1	server/src/operational/hardening-tools.ts
 2	server/src/policy-engine/auto-trigger-ladder.ts

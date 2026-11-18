@@ -82,9 +82,9 @@ describe("manifest honest grades (audit S3)", () => {
     expect(l4["S4.1_earned_reputation"]).toBe("partial");
     expect(l4["S4.7_trust_bootstrapping"]).toBe("partial");
 
-    // Genuinely-full capabilities are untouched (no over-correction).
+    // Encryption is proven; integrity and portable ownership remain partial.
     expect(l1["S1.2_encryption_at_rest"]).toBe("full");
-    expect(l1["S1.3_integrity_verification"]).toBe("full");
-    expect(l4["S4.2_participant_owned"]).toBe("full");
+    expect(l1["S1.3_integrity_verification"]).toBe("partial");
+    expect(l4["S4.2_participant_owned"]).toBe("partial");
   });
 });

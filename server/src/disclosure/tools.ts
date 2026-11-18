@@ -183,9 +183,7 @@ export function createDisclosureTools(
     {
       name: "disclosure_set_policy",
       description:
-        "Define a disclosure policy that controls what an agent will and will not " +
-        "disclose in different interaction contexts. Rules specify which fields may " +
-        "be disclosed, which must be withheld, and which require cryptographic proof.",
+        "Store rules for cooperative disclosure evaluation by interaction context. Rules specify fields to disclose, withhold, or require proof for. Callers must enforce the decisions returned by disclosure_evaluate; storing a policy does not enforce transport behavior.",
       inputSchema: {
         type: "object",
         properties: {

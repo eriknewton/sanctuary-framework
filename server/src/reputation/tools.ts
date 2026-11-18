@@ -930,8 +930,7 @@ export function createReputationTools(
     {
       name: "bootstrap_create_escrow",
       description:
-        "Create an escrow record for trust bootstrapping. " +
-        "Allows new participants with no reputation to transact safely.",
+        "Create an encrypted local escrow-intent record from supplied terms, counterparty DID, and timeout using an available local identity. Returns record identifiers, terms hash, expiry, and status. Does not custody funds, enforce settlement, or guarantee transaction safety.",
       inputSchema: {
         type: "object",
         properties: {

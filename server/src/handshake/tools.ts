@@ -1256,7 +1256,7 @@ export function createHandshakeTools(
     {
       name: "handshake_status",
       description:
-        "Check the state of an in-flight handshake session by id, or (responder side) verify an initiator's completion message. Read-only; returns session phase and, for verification, the validated counterparty SHR result.",
+        "Check an existing handshake session or verify an initiator completion for a pending responder session. Completion verification consumes the session and may record a trust result. Expiry processing can also change session state; this is not a read-only operation.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1390,11 +1390,7 @@ export function createHandshakeTools(
     {
       name: "handshake_exchange",
       description:
-        "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, " +
-        "generates our SHR, and produces a signed attestation artifact, all in a single call. " +
-        "Returns a shareable attestation with human-readable summary. " +
-        "Use this instead of the 4-step handshake protocol when you want a quick, " +
-        "portable sovereignty verification (e.g., for social posting or async exchanges).",
+        "Verify a supplied signed counterparty SHR, generate a local SHR, and return a signed exchange artifact using an available local identity. May record a structural preview. This call does not establish live peer key control or liveness; use the nonce-based handshake protocol for those checks.",
       inputSchema: {
         type: "object",
         properties: {
