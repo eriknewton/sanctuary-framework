@@ -116,3 +116,8 @@ export { exportSnapshot, runSnapshotExportCommand } from "./snapshot-export-cli.
 export { runSnapshotTrustCommand } from "./snapshot-trust-cli.js";
 export { gatherSnapshot } from "./snapshot-gather.js";
 export { SNAPSHOT_EXTENSIONS } from "./snapshot-extensions.js";
+
+// Source gathering remains internal; offline consumers import these pure protocol boundaries.
+export {parseSplitStatement,parseResult as parseSplitVerificationResult,parseReceipt as parseSplitReceipt,renderChains as renderSplitChains} from "./split-statement-contract.js";
+export {verifySplitStatement} from "./split-statement-verify.js";
+export type {VerifiedSplitStatement,SplitVerification} from "./split-statement-verify.js";

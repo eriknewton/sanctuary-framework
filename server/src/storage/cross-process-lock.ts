@@ -2781,7 +2781,7 @@ export function auditGuardDarwinUserTempDir(): Promise<string> {
  * overflow where `/tmp` would not. Must match the socket-path cap enforced at
  * bind time (search KERNEL_SOCKET_PATH_MAX_BYTES).
  */
-function custodyLockRootFits(root: string): boolean {
+export function custodyLockRootFits(root: string): boolean {
   return (
     Buffer.byteLength(root) + 1 + CUSTODY_LOCK_MAX_ENTRY_BYTES <=
     KERNEL_SOCKET_PATH_MAX_BYTES

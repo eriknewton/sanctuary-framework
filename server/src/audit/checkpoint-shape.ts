@@ -122,6 +122,15 @@ export const AUDIT_CHECKPOINT_NAMESPACE_CONTROL_KEYS: readonly string[] = [
   AUDIT_SIGNING_HEAD_KEY,
 ];
 
+/** Persisted producer keys; must match parsePersistedCheckpoint in evidence-pack/split-statement-contract.ts. */
+export const AUDIT_CHECKPOINT_REQUIRED_KEYS = [
+  "schema_version", "checkpoint_kind", "checkpoint_sequence", "from_sequence", "root_hash",
+  "previous_checkpoint_sequence", "signed_at", "signer_kid", "signature", "signature_algorithm",
+  "payload_encoding", "unsigned",
+] as const;
+/** Optional producer fields carry no independent signing authority. */
+export const AUDIT_CHECKPOINT_OPTIONAL_KEYS = ["unsigned_reason", "public_key"] as const;
+
 /** The fields a checkpoint signature ranges over. */
 export interface AuditCheckpointSigningPayload {
   checkpoint_kind: "audit-checkpoint" | "legacy-anchor";

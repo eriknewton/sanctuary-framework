@@ -449,6 +449,20 @@ describe("audit chain constants are shared, not mirrored", () => {
 
   it("the verifier imports them from the zero-import module", () => {
     expect(read(VERIFIER)).toContain("audit/checkpoint-shape.js");
+    // Persisted producer keys are the complete closed split parser contract, not a selected field subset.
+    const split = read("server/src/evidence-pack/split-statement-contract.ts");
+    const arrays = {
+      AUDIT_CHECKPOINT_REQUIRED_KEYS: ["schema_version", "checkpoint_kind", "checkpoint_sequence", "from_sequence", "root_hash", "previous_checkpoint_sequence", "signed_at", "signer_kid", "signature", "signature_algorithm", "payload_encoding", "unsigned"],
+      AUDIT_CHECKPOINT_OPTIONAL_KEYS: ["unsigned_reason", "public_key"],
+    };
+    for (const [name, expected] of Object.entries(arrays)) {
+      const declaration = read(SHAPE).match(new RegExp(`export const ${name} = \\[([\\s\\S]*?)\\] as const`));
+      expect([...((declaration?.[1] ?? "").matchAll(/"([^"]+)"/g))].map(match => match[1]).sort()).toEqual([...expected].sort());
+      expect(split.slice(0, split.indexOf("export { MANIFEST_DOMAIN }"))).toContain(name);
+      expect(split).not.toMatch(new RegExp(`(?:const|let) ${name}\\s*=`));
+    }
+    expect(split.replace(/\s+/g, "")).toContain("C.object(C.parseSnapshotJSON(bytes,C.MAX_JSONL_LINE_BYTES),AUDIT_CHECKPOINT_REQUIRED_KEYS,AUDIT_CHECKPOINT_OPTIONAL_KEYS)");
+
   });
 
   it("the hand-copied canonicalJson bodies are identical", () => {

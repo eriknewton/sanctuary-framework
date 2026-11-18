@@ -10,6 +10,7 @@ const ALLOWED = [
   "core/encoding.ts", "core/encryption.ts", "core/hashing.ts", "core/identity.ts", "core/random.ts", "core/signing-domains.ts", "core/rotation-chain.ts",
   "errors/config-error.ts", "errors/index.ts", "errors/profile-error.ts", "errors/untrusted-diagnostic.ts",
   "evidence-pack/artifact-policy.mjs", "evidence-pack/snapshot-installed-cli.ts", "evidence-pack/snapshot-package-marker.ts", "evidence-pack/snapshot-contract.ts", "evidence-pack/snapshot-metadata.ts", "evidence-pack/snapshot-offline-cli.ts", "evidence-pack/snapshot-extensions.ts", "evidence-pack/snapshot-nested.ts", "evidence-pack/snapshot-trust.ts", "evidence-pack/snapshot-verify.ts",
+  "evidence-pack/snapshot-dispatch.ts", "evidence-pack/split-statement-contract.ts", "evidence-pack/split-statement-nested.ts", "evidence-pack/split-statement-verify.ts",
   "hermes-memory-bridge/constants.ts", "hermes-memory-bridge/strict-json.ts", "lockdown/status.ts", "transparency/checkpoint.ts", "transparency/verify.ts",
 ];
 // Existing audit CLI imports filesystem helpers; the pure entry never calls its I/O functions.

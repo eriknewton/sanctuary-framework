@@ -650,18 +650,23 @@ export const AUDIT_TAIL_CHECKPOINT_MAX_AGE_MS = 10 * 60_000;
 // `maxEntries` test/config still keeps a usable recent window in memory while
 // still bounding growth). The disk remains the source of truth for full reads.
 const MIN_IN_MEMORY_ENTRY_FLOOR = 256;
-const AUDIT_NAMESPACE = "_audit";
-const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
-const AUDIT_META_NAMESPACE = "_meta";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_NAMESPACE = "_audit";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_META_NAMESPACE = "_meta";
 // F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
 // Stored alongside the (optionally-signed) checkpoint records but addressed by a
 // fixed key that does NOT match the `audit-checkpoint-`/`legacy-anchor-` prefixes
 // the checkpoint readers list on, so it never collides with those scans.
-const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
 // AUDIT_HEAD_ANCHOR_KEY ("__head_anchor") is imported from the pure shared
 // `audit/checkpoint-shape.ts` (G1/G5) so this runtime and the raw CLI
 // exporter's control-key allowlist cannot drift.
-const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // F2 Option A (Finding 1, adversarial gate 2026-07-15): an OPERATOR-provenance
 // marker that records "the operator has written at least one POST-SPLIT suffix
 // head anchor (an entry above the sealed tip)". It is a NEW key that no pre-#929
@@ -688,7 +693,8 @@ const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 // operator-writable store; closing it requires boot-anchored / externally-
 // attested state (Secure Enclave / TPM / remote attestation), which is a
 // separate build and out of scope for the mint unblock.
-const AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY =
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY =
   "audit-post-split-suffix-established-v1";
 // AUDIT_ROTATION_ANCHOR_MARKER ("__sanctuary_audit_rotation_anchor_v1") is
 // imported from the pure shared `audit/checkpoint-shape.ts` (re-gate round 3)
@@ -922,8 +928,10 @@ type SigningControlRead<T> =
 // own directory, matching `FilesystemStorageCapabilities.namespacePath`'s
 // documented exception for "callers' own files ... outside the normal
 // encrypted key/value contract."
-const AUDIT_SPLIT_BOUNDARY_DIRNAME = "_audit_migration";
-const AUDIT_SPLIT_BOUNDARY_FILENAME = "boundary-v1.json";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_SPLIT_BOUNDARY_DIRNAME = "_audit_migration";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_SPLIT_BOUNDARY_FILENAME = "boundary-v1.json";
 const AUDIT_SPLIT_BOUNDARY_MARKER = "__sanctuary_audit_store_split_boundary_v1";
 const AUDIT_SPLIT_BOUNDARY_MAC_DOMAIN =
   "sanctuary.audit-store-split-boundary.v1\n";
@@ -952,7 +960,8 @@ const AUDIT_DAEMON_MIGRATION_MARKER_NAMESPACES = [
 // boundary, distinct domain) so it cannot be forged; deletion is the residual
 // the F1/F3 "single deletable file" note already documents (closing it fully
 // needs boot-anchored/externally-attested storage, out of scope).
-const AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY = "audit-store-split-established-v1";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY = "audit-store-split-established-v1";
 const AUDIT_STORE_SPLIT_ESTABLISHED_MARKER =
   "__sanctuary_audit_store_split_established_v1";
 const AUDIT_STORE_SPLIT_ESTABLISHED_MAC_DOMAIN =
@@ -1308,9 +1317,20 @@ export function deriveAuditEpochKeys(masterKey: Uint8Array): {
     epochMacKey: derivePurposeKey(masterKey, AUDIT_EPOCH_MAC_PURPOSE),
   };
 }
-const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
+// Must match sourceKind in audit/split-evidence-registry.ts; source census uses the producer name.
+export const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
-const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
+const AUDIT_LOCK_NONCE_BYTES = 12; // Producer nonce width; each byte encodes as two hexadecimal digits.
+// Must match excludedRawSourceName in audit/split-evidence-registry.ts.
+// Must match SOURCE_RAW_NAME_PRODUCERS in audit/split-evidence-registry.ts.
+/** Complete audit lock name grammar for inventory and residue recovery consumers. */
+export const AUDIT_RAW_NAME_GRAMMARS = {
+  auditWrite: {name:".audit-write.lock",scope:"audit",disposition:"excluded",pattern:/^\.audit-write\.lock$/},
+  auditAcquire: {scope:"audit",disposition:"excluded",infix:".acquire.",suffix:".tmp",nonceBytes:AUDIT_LOCK_NONCE_BYTES,pattern:new RegExp(String.raw`^\.audit-write\.lock\.acquire\.([1-9]\d*)\.[a-z0-9]+\.[a-f0-9]{${AUDIT_LOCK_NONCE_BYTES * 2}}\.tmp$`)},
+  auditClaim: {scope:"audit",disposition:"excluded",infix:".claim.",suffix:".tomb",nonceBytes:AUDIT_LOCK_NONCE_BYTES,pattern:new RegExp(String.raw`^\.audit-write\.lock\.claim\.([1-9]\d*)\.[a-f0-9]{${AUDIT_LOCK_NONCE_BYTES * 2}}\.tomb$`)},
+  auditEvidence: {scope:"audit",disposition:"incident",infix:".evidence.",suffix:".tomb",nonceBytes:AUDIT_LOCK_NONCE_BYTES,pattern:new RegExp(String.raw`^\.audit-write\.lock\.evidence\.([1-9]\d*)\.[a-f0-9]{${AUDIT_LOCK_NONCE_BYTES * 2}}\.tomb$`)},
+} as const;
+export const AUDIT_WRITE_LOCK_FILE = AUDIT_RAW_NAME_GRAMMARS.auditWrite.name;
 // EXPORTED (fix-round-4, MUST-FIX 1 cross-file pin): core/bounded-map.ts's
 // `ON_EVICT_AUDIT_TIMEOUT_MS` derives from this and
 // `DEFAULT_AUDIT_WRITE_LOCK_HOLD_DEADLINE_MS` below — a caller-supplied
@@ -1361,8 +1381,8 @@ let auditLockTempCounter = 0;
 // A crash / kill -9 between `link()` and the `finally` unlink in
 // `atomicAcquireAuditLock` strands one of these; the startup sweep removes only
 // strict-named files whose pid is proven dead, within the process attempt quota.
-const AUDIT_LOCK_ACQUIRE_TEMP_INFIX = ".acquire.";
-const AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX = ".tmp";
+const AUDIT_LOCK_ACQUIRE_TEMP_INFIX = AUDIT_RAW_NAME_GRAMMARS.auditAcquire.infix;
+const AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX = AUDIT_RAW_NAME_GRAMMARS.auditAcquire.suffix;
 
 /** Parse the id-less-stale-lock age bound from config /
  * env, defaulting to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS}. A positive finite
@@ -1920,9 +1940,16 @@ export async function readAuditStoreSplitBoundary(
   } catch {
     return { status: "absent" };
   }
+  return validateAuditStoreSplitBoundaryBytes(raw, macKey);
+}
+
+/** Validate an already captured boundary; callers distinguish a missing file from a present unrecognized record. */
+export function validateAuditStoreSplitBoundaryBytes(raw: Uint8Array, macKey: Uint8Array): AuditStoreSplitBoundaryLoadResult {
+  // Must match validateSplitSource in evidence-pack/split-statement-gather.ts; this entry point cannot reopen a source path.
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw.toString("utf8"));
+    // Preserve the base decoder: a leading BOM remains JSON input and must be rejected.
+    parsed = JSON.parse(Buffer.from(raw).toString("utf8"));
   } catch {
     return { status: "invalid" };
   }
@@ -2075,7 +2102,10 @@ export async function readAuditStoreSplitEstablishedMarker(
  * any key that does not match this shape (e.g. a pre-V2 legacy key), which
  * callers must treat as "not filterable by sequence", never as sequence 0. */
 // Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
-function parseEntryKeySequence(key: string): number | null {
+// Must match sourceKind in audit/split-evidence-registry.ts; pre-V2 keys share this producer prefix.
+export const AUDIT_ENTRY_KEY_PREFIX = "entry-";
+export const AUDIT_CHECKPOINT_KEY_PREFIXES = {"audit-checkpoint":"audit-checkpoint-","legacy-anchor":"legacy-anchor-"} as const;
+export function parseEntryKeySequence(key: string): number | null {
   const match = /^entry-(\d{20})-/.exec(key);
   if (!match) return null;
   const seq = Number(match[1]);
@@ -2090,7 +2120,7 @@ function parseEntryKeySequence(key: string): number | null {
  * UNENCRYPTED key alone, without reading the (possibly root-owned, unreadable)
  * file. */
 // Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
-function parseCheckpointKeySequence(key: string): number | null {
+export function parseCheckpointKeySequence(key: string): number | null {
   const match = /-(\d{20})$/.exec(key);
   if (!match) return null;
   const seq = Number(match[1]);
@@ -2601,6 +2631,59 @@ export class AuditLog {
    * region is immutable post-migration, so a stable fingerprint means the
    * verdict is reusable; any tamper flips the fingerprint and forces a re-walk. */
   private cachedSealedVerdict: { fingerprint: string; verdict: SealedRegionVerdict } | null = null;
+
+  /** Validate one immutable, bounded read set without locks, retries, recovery writes or live-path capabilities. */
+  static async validateCapturedControls(input: {
+    storage: StorageBackend;
+    masterKey: Uint8Array;
+    checkpointPublicKeyResolver: NonNullable<AuditLogConfig["checkpointPublicKeyResolver"]>;
+    admit: () => void;
+    signal: AbortSignal;
+    validateChain: boolean;
+    checkpoints: readonly AuditCheckpointRecord[];
+  }): Promise<{ findings: AuditIntegrityFinding[]; genesis: VerifiedChainItem | null; invalidControl: boolean; unavailableControl: boolean }> {
+    // Must match validateSplitSource in evidence-pack/split-statement-gather.ts: cheap controls precede admission to the bounded chain walk.
+    if (input.signal.aborted || typeof input.checkpointPublicKeyResolver !== "function" ||
+        "namespacePath" in input.storage || "filesystemCapabilities" in input.storage) throw new Error("captured audit input required");
+    const log = new AuditLog(input.storage, input.masterKey, {
+      // Captured validation reports findings directly; retain strict construction for every other audit operation.
+      readOnly: true, consultSplitBoundary: false,
+      checkpointPublicKeyResolver: input.checkpointPublicKeyResolver,
+      trustEmbeddedCheckpointPublicKeys: false,
+    });
+    let genesis: VerifiedChainItem | null = null, invalidControl = false, unavailableControl = false;
+    try {
+      // Envelope validity remains required even when unavailable entries prevent chain linkage checks.
+      const controlChecks = [
+        [AUDIT_HEAD_ANCHOR_KEY, () => log.loadHeadAnchor([])],
+        [AUDIT_ROTATION_ANCHOR_KEY, () => log.loadRotationAnchor([])],
+        [AUDIT_SIGNING_LATCH_V2_KEY, () => log.readSigningLatchV2()],
+        [AUDIT_SIGNING_HEAD_KEY, () => log.readSigningHead()],
+      ] as const;
+      for (const [key, check] of controlChecks) {
+        let raw: Uint8Array | null;
+        try { raw = await input.storage.read(AUDIT_CHECKPOINT_NAMESPACE, key); }
+        catch { unavailableControl = true; continue; }
+        if (raw !== null) invalidControl ||= (await check()).status !== "valid";
+      }
+      if(invalidControl)return {findings:[...log.integrityFindings],genesis,invalidControl,unavailableControl};
+      input.admit();
+      // Every readable original signature is evaluated even if another source scope is unavailable.
+      for (const checkpoint of input.checkpoints) await log.verifyCheckpointRecordSignature(checkpoint, log.integrityFindings);
+      const checkpointFindings = [...log.integrityFindings];
+      // Exactly one existing load pass: immutable captured storage needs no torn-live-read retry.
+      if (input.validateChain) await log.loadPersistedEntries({ onEntry: item => {
+        if (input.signal.aborted) throw new Error("captured audit read cancelled");
+        if (item.sequence === 1) genesis = item;
+      }});
+      if (input.signal.aborted) throw new Error("captured audit read cancelled");
+      return {findings: [...checkpointFindings, ...log.integrityFindings], genesis, invalidControl, unavailableControl};
+    } finally {
+      for (const key of [log.encryptionKey, log.rotationAnchorMacKey, log.headAnchorMacKey,
+        log.signingLatchMacKey, log.signingHeadMacKey, log.epochWrapKey, log.epochMacKey,
+        log.splitBoundaryMacKey, ...(log.epochKeysCache ?? [])]) key.fill(0);
+    }
+  }
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.processExitFence = config?.processExitFence;
@@ -3116,7 +3199,7 @@ export class AuditLog {
           timestamp: normalized.timestamp,
           encrypted_payload_bytes: encryptedPayloadBytes,
         };
-        const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}-${this.instanceKeyNonce}`;
+        const key = `${AUDIT_ENTRY_KEY_PREFIX}${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}-${this.instanceKeyNonce}`;
         const persistedBytes = stringToBytes(JSON.stringify(envelope));
         try {
           this.assertAuditWriteLockActive(signal);
@@ -5384,8 +5467,8 @@ export class AuditLog {
       const dir = dirname(lockPath);
       for (const name of await readdir(dir)) {
         // Must match atomicAcquireAuditLock and state_CLAIMED names below: 24 hex = 12 random bytes. Evidence names from retainEvidence are excluded.
-        const match = /^\.audit-write\.lock\.(?:acquire\.([1-9]\d*)\.[a-z0-9]+\.[a-f0-9]{24}\.tmp|claim\.([1-9]\d*)\.[a-f0-9]{24}\.tomb)$/.exec(name);
-        if (!match || probePidLiveness(Number(match[1] ?? match[2])) !== "dead") continue;
+        const match = AUDIT_RAW_NAME_GRAMMARS.auditAcquire.pattern.exec(name) ?? AUDIT_RAW_NAME_GRAMMARS.auditClaim.pattern.exec(name);
+        if (!match || probePidLiveness(Number(match[1])) !== "dead") continue;
         if (auditLockTempSweepAttempts >= AUDIT_LOCK_TEMP_SWEEP_MAX_ATTEMPTS) {
           if (!auditLockTempSweepCapReported) {
             auditLockTempSweepCapReported = true;
@@ -5440,7 +5523,7 @@ export class AuditLog {
     const tempPath =
       `${lockPath}${AUDIT_LOCK_ACQUIRE_TEMP_INFIX}${process.pid}.` +
       `${(auditLockTempCounter++).toString(36)}.` +
-      `${randomBytes(12).toString("hex")}${AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX}`;
+      `${randomBytes(AUDIT_RAW_NAME_GRAMMARS.auditAcquire.nonceBytes).toString("hex")}${AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX}`;
     let tempCreated = false;
     // Inode identity of the file we publish. `link` is a hard link, so `lockPath`
     // shares the temp's inode: capturing it from the OPEN handle (before close,
@@ -5647,7 +5730,7 @@ export class AuditLog {
     let retainedEvidenceReported = false;
     const retainEvidence = async (tomb: string): Promise<string> => {
       // Must remain excluded by sweepStaleAcquireTempsOnce's strict claim pattern: evidence belongs to the operator even after this pid dies.
-      const evidence = `${lockPath}.evidence.${tomb.slice(`${lockPath}.claim.`.length)}`;
+      const evidence = `${lockPath}${AUDIT_RAW_NAME_GRAMMARS.auditEvidence.infix}${tomb.slice(`${lockPath}${AUDIT_RAW_NAME_GRAMMARS.auditClaim.infix}`.length)}`;
       await rename(tomb, evidence);
       if (!retainedEvidenceReported) {
         retainedEvidenceReported = true;
@@ -5668,7 +5751,7 @@ export class AuditLog {
         if (guarded.verdict === "absent") return true;
         if (guarded.verdict !== "stale") return false;
         // Must match sweepStaleAcquireTempsOnce: 24 hex = 12 random bytes, distinct from acquire temps.
-        const tomb = `${lockPath}.claim.${process.pid}.${randomBytes(12).toString("hex")}.tomb`;
+        const tomb = `${lockPath}${AUDIT_RAW_NAME_GRAMMARS.auditClaim.infix}${process.pid}.${randomBytes(AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes).toString("hex")}${AUDIT_RAW_NAME_GRAMMARS.auditClaim.suffix}`;
         lease.assertHeld();
         await rename(lockPath, tomb);
         const restoreClaim = async (): Promise<void> => {
@@ -5695,7 +5778,7 @@ export class AuditLog {
           lease.assertHeld();
           if (matches) {
             // Keep the verified inode recoverable until guard release succeeds; must match the claim-tomb pattern in sweepStaleAcquireTempsOnce.
-            const recovery = `${lockPath}.claim.${process.pid}.${randomBytes(12).toString("hex")}.tomb`;
+            const recovery = `${lockPath}${AUDIT_RAW_NAME_GRAMMARS.auditClaim.infix}${process.pid}.${randomBytes(AUDIT_RAW_NAME_GRAMMARS.auditClaim.nonceBytes).toString("hex")}${AUDIT_RAW_NAME_GRAMMARS.auditClaim.suffix}`;
             await link(tomb, recovery);
             rollbackTomb = recovery;
             rollbackIdentity = guarded.proven;
@@ -8352,7 +8435,7 @@ export class AuditLog {
           }
         : {}),
     };
-    const key = `${payload.checkpoint_kind}-${String(payload.checkpoint_sequence).padStart(20, "0")}`;
+    const key = `${AUDIT_CHECKPOINT_KEY_PREFIXES[payload.checkpoint_kind]}${String(payload.checkpoint_sequence).padStart(20, "0")}`;
     // Signing can outlive the hold too: expiry before persistence is issued
     // must leave no checkpoint, even when the signer eventually returns.
     if (signal) this.assertAuditWriteLockActive(signal);
@@ -8654,7 +8737,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // Must match the oracle support in audit-log-checkpoint-read-schedule.test.ts.
-function isPersistedAuditEnvelopeV2(
+export function isPersistedAuditEnvelopeV2(
   value: unknown
 ): value is PersistedAuditEnvelopeV2 {
   return (
