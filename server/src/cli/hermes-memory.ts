@@ -101,11 +101,10 @@ zeroed inside a JavaScript process.
 Refusals change nothing: root, an SSH session (the keychain prompt cannot be answered there), a
 fortress your account does not own, a missing fortress (nothing is created), or a prompt left
 unanswered for 120 seconds. The last line says how to start the Hermes memory relay only after the audit record
-has been checked and no unresolved delete remains. After a delete that may have left the passage half-removed
-or unconfirmed, that run and every later run that reads the audit log says to leave the relay stopped until
-the coordinator has read a memory-report, and
-steps 5 and 6 wait until then. A usage error or a refusal that stops before the audit log can be checked also
-says to leave the relay stopped.
+has been checked and no unresolved delete is identified in the retained audit record. After a delete that
+may have left the passage half-removed or unconfirmed, that run and every later run that reads the audit log
+says to leave the relay stopped until the coordinator has read a memory-report, and steps 5 and 6 wait until
+then. A usage error or a refusal that stops before the audit log can be checked also says to leave the relay stopped.
 `;
 
 const HELP_REPORT = `Usage: sanctuary hermes memory-report --fortress <dir> --agent-id <id> [--since <ISO time>] [--out <file>] [--recovery-key-prompt]
@@ -244,28 +243,29 @@ export async function runHermesMemory(options: HermesMemoryOptions): Promise<num
     return 2;
   }
   const uid = options.uid ?? process.getuid?.();
-  const relay: RelayClosing = { auditViewRead: false, auditRecordUnchecked: false, thisDeleteUnsafe: false, unconfirmedPassages: new Set(), reportWritten: false };
+  const relay: RelayClosing = { auditViewRead: false, auditRecordUnchecked: false, thisDeleteUnsafe: false, unconfirmedIdentities: new Set(), reportWritten: false };
   const code = await runOwnerVerb(parsed, options, uid, relay);
   // A start command requires checked audit evidence and no unresolved delete in any document scope.
   err.write(relay.auditRecordUnchecked ? CLOSING_LINE_RECORD_UNCHECKED
     : relay.thisDeleteUnsafe ? CLOSING_LINE_KEEP_STOPPED
-      : relay.unconfirmedPassages.size > 0 ? closingLineAfterUnconfirmedDelete(relay.reportWritten)
+      : relay.unconfirmedIdentities.size > 0 ? closingLineAfterUnconfirmedDelete(relay.reportWritten)
         : relay.auditViewRead ? closingLine(uid) : CLOSING_LINE_RECORD_UNCHECKED);
   return code;
 }
 
 /**
- * What a run's closing line may say, from what the run itself read. The start command is given outright only
- * by a run that read the audit view and found no passage whose latest delete is still unconfirmed; bridge
- * startup never reads delete outcomes, so this line is the only place an unconfirmed delete can stop a restart.
+ * A run gives the start command only with a verified audit view, known retention state, no unresolved
+ * scoped delete identified in that view, and no unsafe or unrecorded delete in this run. Known retention
+ * does not establish complete history (HERMES-OWNER-HOLD-RETENTION). Bridge startup does not read delete
+ * outcomes; this closing advice keeps the owner informed of holds identified by the owner verbs.
  */
 interface RelayClosing {
   auditViewRead: boolean;
   auditRecordUnchecked: boolean;
   /** This run's own delete has an unsafe outcome or lacks a confirmed audit append. */
   thisDeleteUnsafe: boolean;
-  /** Passages whose latest owner-delete attempt is unconfirmed and that no later attempt removed. */
-  unconfirmedPassages: Set<string>;
+  /** Document/passage identities with an unresolved owner-delete attempt and no later recorded delete. */
+  unconfirmedIdentities: Set<string>;
   /** A memory-report run produced its report, so its closing line can point at this report. */
   reportWritten: boolean;
 }
@@ -413,10 +413,10 @@ async function runOwnerVerb(args: ParsedArgs, options: HermesMemoryOptions, uid:
         const result = await withOwnerCustody({ args, env, err, stdin, storage, storagePath, promptTimeoutMs: options.promptTimeoutMs },
           async (context) => {
             const noteAuditView = (view: AuditView): void => {
-              // Restart advice relies on a verified owner audit chain with known retention state.
+              // Restart advice requires a verified chain and known retention; completeness remains HERMES-OWNER-HOLD-RETENTION.
               relay.auditViewRead = view.chainVerified && typeof view.everPruned === "boolean";
               relay.auditRecordUnchecked = !relay.auditViewRead;
-              for (const passageId of unconfirmedDeletePassages(ownerDeleteAttempts(view.entries))) relay.unconfirmedPassages.add(passageId);
+              for (const identity of unconfirmedDeleteIdentities(ownerDeleteAttempts(view.entries))) relay.unconfirmedIdentities.add(identity);
             };
             switch (args.verb) {
               case "memory-report": {
@@ -442,7 +442,7 @@ async function runOwnerVerb(args: ParsedArgs, options: HermesMemoryOptions, uid:
                 return deletePassage(context, args, { out, err, stdin, signals: options.signals ?? process,
                   promptTimeoutMs: options.promptTimeoutMs ?? OWNER_PROMPT_TIMEOUT_MS, markFinished: () => { finished = true; },
                   noteAuditView, keepRelayStopped: () => { relay.thisDeleteUnsafe = true; },
-                  removed: (documentId, passageId) => { relay.unconfirmedPassages.delete(ownerDeleteIdentity(documentId, passageId)); } });
+                  removed: (documentId, passageId) => { relay.unconfirmedIdentities.delete(ownerDeleteIdentity(documentId, passageId)); } });
             }
           });
         // Only a resolved callback separates custody finalization from operation failures, including refusals.
@@ -667,7 +667,7 @@ function ownerDeleteAttempts(entries: readonly AuditEntry[]): OwnerDeleteAttempt
  * removed. Only a later "deleted" settles one: not_attempted and failed_restored leave the same uncertain
  * records in place, and a failed_unrestored passage has no document left for a later delete to find.
  */
-function unconfirmedDeletePassages(attempts: readonly OwnerDeleteAttempt[]): Set<string> {
+function unconfirmedDeleteIdentities(attempts: readonly OwnerDeleteAttempt[]): Set<string> {
   const unconfirmed = new Set<string>();
   for (const attempt of attempts) {
     const identity = ownerDeleteIdentity(attempt.document_id, attempt.passage_id);
@@ -745,8 +745,19 @@ async function buildMemoryReport(context: OwnerContext, args: ParsedArgs, runAt:
     for (const field of REPORT_ROW_FIELDS) if (details[field] !== undefined) row[field] = details[field];
     if (details.kind === "insert_admitted") {
       const later = windowRows.slice(index + 1).map(next => next.details ?? {});
-      const laterFailure = later.some(next => next.kind === "latch" ||
-        ((next.kind === "insert_refused" || next.kind === "insert_unconfirmed") && next.entryId === details.entryId));
+      // Each bridge process issues an entry id once; its next admission bounds terminal correlation to this run.
+      let terminalFailure = false;
+      for (const next of later) {
+        if (next.kind === "insert_admitted" && next.entryId === details.entryId) break;
+        // A terminal row describes only its admitted entry and passage, including when its own admission is absent.
+        if ((next.kind === "insert_refused" || next.kind === "insert_unconfirmed") &&
+            next.entryId === details.entryId && next.passage_id === details.passage_id) {
+          terminalFailure = true;
+          break;
+        }
+      }
+      // A later latch applies to every earlier admission in the window, across entry ids and process runs.
+      const laterFailure = terminalFailure || later.some(next => next.kind === "latch");
       const resaved = later.some(next => next.kind === "insert_admitted" && next.passage_id === details.passage_id);
       const passageId = String(details.passage_id);
       // At most one inspect per admitted passage in the output; a repeated id reuses the first result.
@@ -863,11 +874,10 @@ function packageRootFromInvokedEntry(invokedEntry: string | undefined): string |
 }
 
 /**
- * Every kit folder --out refuses: from the package root as given, from its real path, and from the entry
- * path as invoked, each one both as derived and after realpath. A symlink anywhere in the kit layout can
- * make these differ, and each one may hold the runtime the relay executes, so all of them are refused
- * rather than trusting one resolution. The filesystem root and the owner's home are never a kit folder:
- * refusing either would refuse every --out, including the folder the help tells the owner to create.
+ * --out protects package, runtime and kit folders derived from the given and real package roots and the
+ * invoked package entry, each before and after realpath. Each candidate may hold the relay runtime.
+ * The filesystem root and the owner's home are excluded; narrower package and runtime folders remain
+ * protected, while the owner can create the report folder named in the help.
  */
 async function hermesKitFolders(packageRoot: string, invokedEntry: string | undefined, home: string | undefined): Promise<string[]> {
   const roots = [packageRoot, await realpath(packageRoot).catch(() => packageRoot)];
@@ -1166,16 +1176,20 @@ function trackCorpusMutations(storage: FilesystemStorage, onMutation: () => void
 
 /**
  * memory-delete continuing paths. The outcome after any throw is decided by
- * re-reading the fortress, never from the error type alone.
+ * re-reading the fortress, never from the error type alone. Restart advice requires a verified audit
+ * view with known retention, no unresolved scoped attempt identified in that view, and no hold in this run.
+ * With that evidence, preparation refusals, pre-intent refusals and recorded deleted, not_found,
+ * not_attempted or failed_restored outcomes permit restart advice. Only recorded deleted clears an
+ * earlier hold for its document/passage identity. Retention completeness remains HERMES-OWNER-HOLD-RETENTION.
  *
  * Arm                                   | Outcome row        | Exit and message
  * Writer composition or the raw-record  | none (no intent)   | 1, could not be prepared; nothing was deleted
  *   snapshot throws                     |                    |
  * Intent append throws, re-read finds   | none               | 1, nothing was deleted
- *   no intent row                       |                    |
+ *   no intent row                       |                    |   closing line: keep the relay stopped
  * Intent append throws, re-read finds   | intent only        | 1, recorded as interrupted; stop, coordinator
- *   the intent row                      |                    |
- * Intent append throws, re-read fails   | unknown            | 1, intent may be recorded; coordinator if refused
+ *   the intent row                      |                    |   closing line: keep the relay stopped
+ * Intent append throws, re-read fails   | unknown            | 1, intent may be recorded; closing line: keep the relay stopped
  * Throw after the intent, before any    | not_attempted      | 1, nothing was deleted
  *   corpus mutation, record present     |                    |
  * deletePassage returns true            | deleted            | 0, deleted (row first)
@@ -1189,8 +1203,8 @@ function trackCorpusMutations(storage: FilesystemStorage, onMutation: () => void
  *   difference; or the re-read throws   |                    |   the relay; coordinator with a report;
  *                                       |                    |   closing line: keep the relay stopped
  * Throw before mutation, re-read throws | indeterminate      | same as above
- * Outcome append throws                 | (stderr names it)  | 1
- * Killed before an outcome              | intent only        | next report and delete say interrupted
+ * Outcome append throws                 | (stderr names it)  | 1; closing line: keep the relay stopped
+ * Killed before an outcome              | intent only        | later audit reads identify interrupted and keep the relay stopped
  */
 async function deletePassage(context: OwnerContext, args: ParsedArgs, io: {
   readonly out: Writer;

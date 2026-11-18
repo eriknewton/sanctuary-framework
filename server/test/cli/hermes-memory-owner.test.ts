@@ -5,7 +5,7 @@
  * escaping, and every arm of the delete continuing-path table.
  */
 import { Server } from "node:net";
-import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -461,11 +461,71 @@ describe("hermes owner verbs: memory-report", () => {
       package_version: FIXTURE_PACKAGE_VERSION, chain_head_sequence: expect.any(Number) });
   });
 
+  it.each(["insert_refused", "insert_unconfirmed"] as const)("correlates %s with its admitted passage across runs", async kind => {
+    const f = await ownerFortress(stack);
+    const entryId = "hermes-entry-1";
+    await seedPassage(f, "earlier", "earlier passage");
+    await seedPassage(f, "later", "later passage");
+    await seedBridgeRows(f, [
+      admittedRow("earlier", "earlier passage", entryId),
+      admittedRow("later", "later passage", entryId),
+      { kind, entryId, passage_id: "later" },
+    ]);
+    const run = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect(run.code, run.err).toBe(0);
+    const parsed = report(run);
+    expect(parsed.window.absence_claims_supported).toBe(true);
+    expect(parsed.rows.filter((row: Record<string, any>) => row.kind === "insert_admitted")).toMatchObject([
+      { passage_id: "earlier", present: "present", digest_matches: true, later_failure: false },
+      { passage_id: "later", later_failure: true },
+    ]);
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
+  it.each(["insert_refused", "insert_unconfirmed"] as const)("bounds %s correlation at the next admission of its entry id", async kind => {
+    const f = await ownerFortress(stack);
+    const entryId = "hermes-entry-1";
+    await seedPassage(f, "shared", "shared passage");
+    await seedBridgeRows(f, [
+      admittedRow("shared", "shared passage", entryId),
+      admittedRow("shared", "shared passage", entryId),
+      { kind, entryId, passage_id: "shared" },
+    ]);
+    const run = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect(run.code, run.err).toBe(0);
+    const parsed = report(run);
+    expect(parsed.window.absence_claims_supported).toBe(true);
+    expect(parsed.rows.filter((row: Record<string, any>) => row.kind === "insert_admitted")).toMatchObject([
+      { passage_id: "shared", later_failure: false, resaved: true },
+      { passage_id: "shared", later_failure: true, resaved: false },
+    ]);
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
+  it.each(["insert_refused", "insert_unconfirmed"] as const)("retains unmatched %s rows without assigning them to another passage", async kind => {
+    const f = await ownerFortress(stack);
+    const entryId = "hermes-entry-1";
+    await seedPassage(f, "saved", "saved passage");
+    const terminals = [{ kind, entryId, passage_id: "other" }, { kind, entryId }];
+    await seedBridgeRows(f, [admittedRow("saved", "saved passage", entryId), ...terminals]);
+    const run = await runVerb(f, ["memory-report", "--since", f.since]);
+    expect(run.code, run.err).toBe(0);
+    const parsed = report(run);
+    expect(parsed.window.absence_claims_supported).toBe(true);
+    expect(rowFor(parsed, entryId)).toMatchObject({ passage_id: "saved", later_failure: false });
+    expect(parsed.rows.filter((row: Record<string, any>) => row.kind === kind)).toMatchObject(terminals);
+    for (const row of parsed.rows.filter((row: Record<string, any>) => row.kind === kind)) {
+      expect(row).not.toHaveProperty("later_failure");
+    }
+    expect(lastLine(run.err)).toContain(CLOSING);
+  });
+
   it("marks every earlier admitted row as a later failure after a latch row", async () => {
     const f = await ownerFortress(stack);
     await seedPassage(f, "before", "before latch");
     await seedPassage(f, "after", "after latch");
-    await seedBridgeRows(f, [admittedRow("before", "before latch", "e1"), { kind: "latch", reason: "indeterminate" },
+    await seedBridgeRows(f, [admittedRow("before", "before latch", "e1"), admittedRow("before", "before latch", "e1"),
+      { kind: "latch", reason: "indeterminate" },
       admittedRow("after", "after latch", "e2")]);
     const parsed = report(await runVerb(f, ["memory-report", "--since", f.since]));
     expect(rowFor(parsed, "e1").later_failure).toBe(true);
@@ -1161,6 +1221,8 @@ describe("hermes owner verbs: memory-delete", () => {
     const run = await runVerb(f, ["memory-delete", "--passage", "p1"], { answer: "DELETE\n" });
     expect(run.code).toBe(1);
     expect(run.err).toContain("could not be recorded in the audit log. Nothing was deleted.");
+    expect.soft(lastLine(run.err)).toBe(CLOSING_KEEP_STOPPED);
+    expect.soft(run.out + run.err).not.toContain("launchctl kickstart");
     expect(await docPresent(f)).toBe(true);
   });
 
@@ -1174,6 +1236,8 @@ describe("hermes owner verbs: memory-delete", () => {
     const run = await runVerb(f, ["memory-delete", "--passage", "p1"], { answer: "DELETE\n" });
     expect(run.code).toBe(1);
     expect(run.err).toContain("the intent row is recorded, so this delete is recorded as interrupted. Nothing was deleted.");
+    expect.soft(lastLine(run.err)).toBe(CLOSING_KEEP_STOPPED);
+    expect.soft(run.out + run.err).not.toContain("launchctl kickstart");
     expect(run.err).toContain("bring a memory-report to the coordinator");
     expect(await docPresent(f)).toBe(true);
     expect((await outcomes(f)).map(row => row?.outcome)).toEqual(["intent"]);
@@ -1195,6 +1259,8 @@ describe("hermes owner verbs: memory-delete", () => {
     expect(run.code).toBe(1);
     expect(appendFailed).toBe(true);
     expect(run.err).toContain("the intent may be recorded. Nothing was deleted.");
+    expect.soft(lastLine(run.err)).toBe(CLOSING_KEEP_STOPPED);
+    expect.soft(run.out + run.err).not.toContain("launchctl kickstart");
     expect(await docPresent(f)).toBe(true);
   });
 
@@ -1752,7 +1818,7 @@ describe("owner evidence and destinations 1514", () => {
   });
 
   it.each(["fortress", "kit"] as const)("protects all descendant folder names in the %s tree R4", async tree => {
-    const root = await mkdtemp(join(tmpdir(), "owner-destination-"));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "owner-destination-")));
     stack.push(() => rm(root, { recursive: true, force: true }));
     const home = join(root, "home");
     const fortress = join(home, "Library", "Application Support", "Sanctuary", "Fortresses", "fortress-owner");
