@@ -1,4 +1,4 @@
-// fail-before-exempt: imports audit/split-evidence-source.js, which base lacks and cannot collect.
+// fail-before-exempt: this change only seeds an initialized fortress at its resolved path so the daemon and fixed-evidence exports still run under the export admission check, and asserts the seeded export reaches gather; the admission check is witnessed in snapshot-existing-fortress.test.ts.
 import {expect,it} from "vitest";
 import {mkdir,writeFile,readFile,realpath,symlink} from "node:fs/promises";
 import {join} from "node:path";

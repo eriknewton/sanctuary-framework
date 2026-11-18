@@ -1,4 +1,4 @@
-// fail-before-exempt: version 0 byte regression must pass on base by design; repository-local delivery substitutes only the pinned receipt pack_path in original-source bytes.
+// fail-before-exempt: version 0 byte regression must pass on base by design; this change only seeds an initialized fortress so the regression runs under the export admission check; repository-local delivery substitutes only the pinned receipt pack_path in original-source bytes.
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { computeAuditEntryHash } from "../../src/audit/chain.js";
 import { verifyAuditChainRecords } from "../../src/cli/audit-chain-verify.js";

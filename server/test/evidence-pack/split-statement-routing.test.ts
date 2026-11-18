@@ -1,4 +1,4 @@
-// fail-before-exempt: imports audit/split-evidence-source.js and split-statement-census.js, which base lacks and cannot collect.
+// fail-before-exempt: this change only seeds an initialized fortress at its resolved path so the hidden split export still runs under the export admission check; the admission check is witnessed in snapshot-existing-fortress.test.ts.
 import {expect,it} from "vitest";
 import {mkdir,writeFile,readFile,symlink,realpath,rename,cp} from "node:fs/promises";
 import {join,basename} from "node:path";
