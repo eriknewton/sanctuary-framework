@@ -93,6 +93,8 @@ fn value_options() -> Vec<&'static str> {
     #[cfg(feature = "test-isolation")]
     {
         value_options.push("--test-profile-root");
+        // Must match compose entry and package SEAMS; this option always consumes its root value.
+        value_options.push("--test-business-compose");
         value_options.push("--test-health-interval-ms");
         value_options.push("--test-shutdown-at");
         // LINUX-STOP-PATH-BUDGET-01: the stop-guard deadline and nft-binary seams
@@ -366,8 +368,33 @@ fn run_daemon_main() -> ExitCode {
     let roots = castle_wall_daemon::config::SelectorRoots::production();
     // Continuing path: only legacy selection reaches any route, other isolation strip or argv parser.
     match castle_wall_daemon::config::select_profile(&roots, &[]) {
-        castle_wall_daemon::config::ProfileSelection::LegacyV1(_) => (),
-        castle_wall_daemon::config::ProfileSelection::Business(_) => {
+        castle_wall_daemon::config::ProfileSelection::LegacyV1(_) => {
+            #[cfg(feature = "test-isolation")]
+            if has_structural_flag(&args, "--test-business-compose") {
+                return ExitCode::from(2);
+            }
+        }
+        castle_wall_daemon::config::ProfileSelection::Business(selection) => {
+            #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+            if let Some(index) = args.iter().position(|a| a == "--test-business-compose") {
+                // Only this selected arm can consume the sealed capability into isolated composition.
+                let Some(root) = args.get(index + 1) else {
+                    return ExitCode::from(2);
+                };
+                return match castle_wall_daemon::compose_for_test(
+                    selection,
+                    std::path::Path::new(root),
+                ) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        // SAFETY: isolated composition exposes only its bounded refusal class, without paths or record data.
+                        eprintln!("castle-wall-daemon: isolated composition refused: {error:?}");
+                        ExitCode::from(PROFILE_REFUSED_EXIT)
+                    }
+                };
+            }
+            #[cfg(not(all(target_os = "linux", feature = "test-isolation")))]
+            let _ = selection;
             // SAFETY: stderr is the fixed profile refusal surface.
             eprintln!("castle-wall-daemon: business profile selected; installed business signing is not enabled in this build");
             return ExitCode::from(PROFILE_REFUSED_EXIT);

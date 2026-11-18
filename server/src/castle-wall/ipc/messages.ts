@@ -1,3 +1,4 @@
+import type {BusinessDeliveryAck as DeliveryAck} from "../../signing/business-append-wire.js";
 /**
  * Castle Wall IPC message shapes.
  *
@@ -191,7 +192,15 @@ export type RuntimeHealthToken =
   | "safety_net_recovering";
 
 /** Tagged union of every Castle Wall IPC message body. */
+/** Must match CAP_BUSINESS_DELIVERY in castle-wall-daemon/src/ipc/messages.rs. */
+export const CAP_BUSINESS_DELIVERY = "business_delivery_v1";
+/** Dedicated envelope transport; exact event validation is owned by the shared append contract. */
+export interface BusinessDrainResponse {type:"business_drain_response"; request_id:string; event:unknown|null; error:string|null;}
+export interface BusinessDeliveryAckResponse {type:"business_delivery_ack_response"; request_id:string; ack:DeliveryAck; ok:boolean;}
 export type CastleWallMessage =
+  | {type:"business_drain_request"; request_id:string}
+  | {type:"business_delivery_ack"; request_id:string; ack:DeliveryAck}
+  | BusinessDrainResponse | BusinessDeliveryAckResponse
   | StatusRequest
   | StatusResponse
   | PolicyReloadRequest

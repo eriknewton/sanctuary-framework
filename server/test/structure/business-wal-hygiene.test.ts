@@ -1,4 +1,4 @@
-// fail-before-exempt: invariant-site checks inspect native sources and cross-file contract comments.
+// fail-before-exempt: journal and publication permission guards inspect native creation sites and cross-file contract comments.
 // Native file access and protocol state names preserve explicit contracts.
 // W-WAL-STORE
 import {expect, it} from "vitest";
@@ -15,7 +15,9 @@ it("created private files receive descriptor permissions", () => {
   const s=read("castle-wall-daemon/src/business_profile/business_wal.rs");
   expect(s).toContain("libc::fchmod");
   expect(s).toContain("set_private_mode(&file)?");
-  expect(s.match(/set_private_mode\(&stage\)\?/g)?.length).toBe(2);
+  // Lock plus journal, recovery stage and both publication stage paths form the complete creation set.
+  expect(s.match(/libc::O_CREAT \| libc::O_EXCL/g)?.length).toBe(5);
+  expect(s.match(/set_private_mode\(&stage\)\?/g)?.length).toBe(4);
 });
 it("intent states have explicit protocol names", () => {
   const s=read("castle-wall-daemon/src/business_profile/business_wal.rs");

@@ -126,6 +126,129 @@ pub struct ServerConfig {
     pub drain_recovery_only: Arc<AtomicBool>,
 }
 
+/// Required Business dependencies. The broker identity comes only from validated daemon configuration.
+#[cfg(target_os = "linux")]
+pub struct BusinessIpcConfig {
+    socket_path: PathBuf,
+    trusted_service_uid: u32,
+    fortress_id: String,
+    held_parent: std::fs::File,
+    pub pinned_public_key: Vec<u8>,
+    pub delivery: crate::business_profile::business_delivery::BusinessDeliveryHandle,
+    pub shutdown_flag: Arc<AtomicBool>,
+    pub audit_buffer: Arc<Mutex<AuditRingBuffer>>,
+    pub decision_engine: Arc<DecisionEngine>,
+    pub live_status: Arc<LiveStatus>,
+    pub runtime_health: Arc<RuntimeHealthView>,
+}
+
+#[cfg(target_os = "linux")]
+impl BusinessIpcConfig {
+    /// Keep the validated broker UID and held socket directory bound to this composition.
+    pub fn checked(
+        broker: &crate::config::DaemonConfig,
+        held_parent: std::fs::File,
+        pinned_public_key: Vec<u8>,
+        delivery: crate::business_profile::business_delivery::BusinessDeliveryHandle,
+        lifecycle: BusinessIpcLifecycle,
+    ) -> Result<Self, IpcServerError> {
+        broker
+            .validate_server_profile()
+            .map_err(IpcServerError::ListenerConfig)?;
+        let uid = broker
+            .trusted_service_uid
+            .filter(|uid| *uid != 0)
+            .ok_or_else(|| IpcServerError::ListenerConfig("non-root broker UID required".into()))?;
+        // The configuration validator permits isolated paths; the Business identity requirement still applies there.
+        if pinned_public_key.len() != ed25519_dalek::PUBLIC_KEY_LENGTH {
+            return Err(IpcServerError::ListenerConfig(
+                "consumer key required".into(),
+            ));
+        }
+        let config = Self {
+            socket_path: broker.socket_path.clone(),
+            trusted_service_uid: uid,
+            fortress_id: broker.fortress_id.clone(),
+            held_parent,
+            pinned_public_key,
+            delivery,
+            shutdown_flag: lifecycle.shutdown_flag,
+            audit_buffer: lifecycle.audit_buffer,
+            decision_engine: lifecycle.decision_engine,
+            live_status: lifecycle.live_status,
+            runtime_health: lifecycle.runtime_health,
+        };
+        config.validate_parent()?;
+        Ok(config)
+    }
+    fn validate_parent(&self) -> Result<(), IpcServerError> {
+        let held = self
+            .held_parent
+            .metadata()
+            .map_err(|e| IpcServerError::SocketDir(e.to_string()))?;
+        let parent = self
+            .socket_path
+            .parent()
+            .ok_or_else(|| IpcServerError::SocketDir("parent required".into()))?;
+        let current = std::fs::symlink_metadata(parent)
+            .map_err(|e| IpcServerError::SocketDir(e.to_string()))?;
+        // A held directory pins the composition's socket location across construction and bind.
+        if !self.socket_path.is_absolute()
+            || !held.is_dir()
+            || !current.is_dir()
+            || (held.dev(), held.ino()) != (current.dev(), current.ino())
+            || held.mode() & 0o002 != 0
+        {
+            return Err(IpcServerError::SocketDir(
+                "socket parent changed or unsafe".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared lifecycle observations are required even though Business dispatch has no control mutations.
+#[cfg(target_os = "linux")]
+pub struct BusinessIpcLifecycle {
+    pub shutdown_flag: Arc<AtomicBool>,
+    pub audit_buffer: Arc<Mutex<AuditRingBuffer>>,
+    pub decision_engine: Arc<DecisionEngine>,
+    pub live_status: Arc<LiveStatus>,
+    pub runtime_health: Arc<RuntimeHealthView>,
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl BusinessIpcLifecycle {
+    /// Build isolated status observations without booting any kernel runtime or installed service.
+    pub fn for_isolated_test(fortress: &str, audit_buffer: Arc<Mutex<AuditRingBuffer>>) -> Self {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let decision_engine = Arc::new(DecisionEngine::new_with_mutation_cancel(
+            fortress.into(),
+            None,
+            None,
+            audit_buffer.clone(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        Self {
+            shutdown_flag,
+            audit_buffer,
+            decision_engine,
+            live_status: Arc::new(LiveStatus::activating()),
+            runtime_health: Arc::new(RuntimeHealthView::new()),
+        }
+    }
+}
+
+enum Composition {
+    Legacy,
+    #[cfg(target_os = "linux")]
+    Business(
+        crate::business_profile::business_delivery::BusinessDeliveryHandle,
+        std::fs::File,
+        #[cfg(feature = "test-isolation")] Option<Arc<ProducerSigner>>,
+    ),
+}
+
 /// Errors emitted by the IPC server lifecycle.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcServerError {
@@ -243,6 +366,67 @@ fn remove_owned_socket(path: &PathBuf, identity: (u64, u64)) {
 
 impl IpcServer {
     pub fn start(config: ServerConfig) -> Result<Self, IpcServerError> {
+        Self::start_composed(config, Composition::Legacy)
+    }
+
+    /// Start only the explicit Business composition, using the shared pre-challenge peer gate.
+    #[cfg(target_os = "linux")]
+    pub fn start_business(config: BusinessIpcConfig) -> Result<Self, IpcServerError> {
+        Self::start_business_inner(
+            config,
+            #[cfg(feature = "test-isolation")]
+            None,
+        )
+    }
+
+    /// Isolated call observer supplied separately from the Business configuration.
+    #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+    pub fn start_business_with_probe(
+        config: BusinessIpcConfig,
+        probe: Arc<ProducerSigner>,
+    ) -> Result<Self, IpcServerError> {
+        Self::start_business_inner(config, Some(probe))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_business_inner(
+        config: BusinessIpcConfig,
+        #[cfg(feature = "test-isolation")] probe: Option<Arc<ProducerSigner>>,
+    ) -> Result<Self, IpcServerError> {
+        config.validate_parent()?;
+        let common = ServerConfig {
+            socket_path: config.socket_path,
+            pinned_public_key: config.pinned_public_key,
+            prompt_timeout: HANDSHAKE_TIMEOUT,
+            audit_buffer: config.audit_buffer,
+            daemon_shutdown_request: Arc::new(AtomicBool::new(false)),
+            fatal_control_path: Arc::new(AtomicBool::new(false)),
+            shutdown_flag: config.shutdown_flag,
+            fortress_id: config.fortress_id,
+            decision_engine: config.decision_engine,
+            wal_writer: None,
+            producer_signer: None,
+            live_status: config.live_status,
+            trusted_service_uid: config.trusted_service_uid,
+            runtime_health: config.runtime_health,
+            wal_control_progress: Arc::new(AtomicUsize::new(0)),
+            drain_recovery_only: Arc::new(AtomicBool::new(false)),
+        };
+        Self::start_composed(
+            common,
+            Composition::Business(
+                config.delivery,
+                config.held_parent,
+                #[cfg(feature = "test-isolation")]
+                probe,
+            ),
+        )
+    }
+
+    fn start_composed(
+        config: ServerConfig,
+        composition: Composition,
+    ) -> Result<Self, IpcServerError> {
         let parent = config
             .socket_path
             .parent()
@@ -294,6 +478,7 @@ impl IpcServer {
         let decision_engine = Arc::clone(&config.decision_engine);
         let mutation_cancel = Arc::clone(config.decision_engine.mutation_cancel_flag());
         let server_state = Arc::new(ServerState {
+            composition,
             audit_buffer: config.audit_buffer,
             daemon_shutdown_request: config.daemon_shutdown_request,
             fatal_control_path: config.fatal_control_path,
@@ -359,6 +544,7 @@ impl Drop for IpcServer {
 
 /// Shared between accept loop and per-connection handlers.
 struct ServerState {
+    composition: Composition,
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
     daemon_shutdown_request: Arc<AtomicBool>,
     fatal_control_path: Arc<AtomicBool>,
@@ -592,6 +778,50 @@ fn interrupt_and_join_handlers(handlers: Vec<ConnectionHandler>) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn checked_business_peer(
+    credential: &libc::ucred,
+    length: libc::socklen_t,
+) -> Result<u32, super::auth::AuthError> {
+    // Kernel evidence must contain the complete live peer identity before UID admission or a challenge.
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(super::auth::AuthError::PeerCred(
+            "short peer credential".into(),
+        ));
+    }
+    if credential.pid <= 0 {
+        return Err(super::auth::AuthError::PeerCred("invalid peer pid".into()));
+    }
+    Ok(credential.uid)
+}
+
+#[cfg(target_os = "linux")]
+fn business_peer_uid_for_stream(stream: &UnixStream) -> Result<u32, super::auth::AuthError> {
+    use std::os::fd::AsRawFd;
+    let mut credential = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the borrowed stream stays open and both output buffers cover the supplied length.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(super::auth::AuthError::PeerCred(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    checked_business_peer(&credential, length)
+}
+
 fn run_accept_loop(listener: UnixListener, state: Arc<ServerState>) {
     let mut handlers = Vec::new();
     loop {
@@ -607,7 +837,15 @@ fn run_accept_loop(listener: UnixListener, state: Arc<ServerState>) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     break;
                 }
-                let peer_uid = match peer_uid_for_stream(&stream) {
+                #[cfg(target_os = "linux")]
+                let credentials = if matches!(&state.composition, Composition::Business(..)) {
+                    business_peer_uid_for_stream(&stream)
+                } else {
+                    peer_uid_for_stream(&stream)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let credentials = peer_uid_for_stream(&stream);
+                let peer_uid = match credentials {
                     Ok(uid) => uid,
                     Err(err) => {
                         state.append_audit("ipc_peer_credential_rejected", &err.to_string());
@@ -631,6 +869,8 @@ fn run_accept_loop(listener: UnixListener, state: Arc<ServerState>) {
                 // repeated same-group probes remain rate bounded, but never let
                 // a mismatched kernel UID reach the signing challenge or any
                 // control method even if it possesses the pinned private key.
+                // A relayed key challenge cannot confer release authority across a different kernel UID.
+                // Both constructors must reach this shared gate before perform_handshake.
                 if !admission.trusted {
                     state.append_audit(
                         "ipc_peer_uid_rejected",
@@ -747,6 +987,19 @@ fn handle_connection(mut stream: UnixStream, state: Arc<ServerState>) {
         state.append_audit("ipc_post_handshake_timeout_reset_failed", &err.to_string());
         return;
     }
+    #[cfg(target_os = "linux")]
+    let mut business_session = match &state.composition {
+        Composition::Legacy => None,
+        Composition::Business(delivery, ..) => {
+            if !identity.accepts(crate::ipc::messages::CAP_BUSINESS_DELIVERY) {
+                return;
+            }
+            match delivery.connect() {
+                Ok(session) => Some(session),
+                Err(_) => return,
+            }
+        }
+    };
     let mut drain_state = ConnectionDrainState::default();
     loop {
         if state.shutdown_flag.load(Ordering::SeqCst) {
@@ -760,6 +1013,17 @@ fn handle_connection(mut stream: UnixStream, state: Arc<ServerState>) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     return;
                 }
+                #[cfg(target_os = "linux")]
+                if business_session.is_some()
+                    && crate::smb::strict_json::parse(
+                        body.as_bytes(),
+                        crate::ipc::framing::MAX_INBOUND_BODY_BYTES,
+                    )
+                    .is_err()
+                {
+                    state.append_audit("ipc_message_invalid", "invalid Business JSON");
+                    return;
+                }
                 let envelope = match parse_envelope(&body) {
                     Ok(env) => env,
                     Err(err) => {
@@ -767,6 +1031,18 @@ fn handle_connection(mut stream: UnixStream, state: Arc<ServerState>) {
                         return;
                     }
                 };
+                #[cfg(target_os = "linux")]
+                if let Some(session) = &mut business_session {
+                    if !matches!(envelope.params, IpcMessage::StatusRequest { .. }) {
+                        let Some(reply) = dispatch_business(&envelope, session, &state) else {
+                            return;
+                        };
+                        if write_envelope(&mut stream, &reply).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 match dispatch(&envelope, &state, &identity, &mut drain_state) {
                     Some(reply_envelope) => {
                         if let Err(err) = write_envelope(&mut stream, &reply_envelope) {
@@ -805,10 +1081,17 @@ fn perform_handshake(
             // behavior. A consumer that sees no version/capabilities is talking
             // to a pre-v2 daemon and must not assume any of them.
             protocol_version: Some(crate::ipc::messages::IPC_PROTOCOL_VERSION),
-            capabilities: crate::ipc::messages::CAPABILITIES
-                .iter()
-                .map(|c| (*c).to_string())
-                .collect(),
+            capabilities: {
+                let mut capabilities: Vec<String> = crate::ipc::messages::CAPABILITIES
+                    .iter()
+                    .map(|c| (*c).into())
+                    .collect();
+                #[cfg(target_os = "linux")]
+                if matches!(state.composition, Composition::Business(..)) {
+                    capabilities.push(crate::ipc::messages::CAP_BUSINESS_DELIVERY.into());
+                }
+                capabilities
+            },
         },
     };
     write_envelope(stream, &challenge).map_err(HandshakeError::Io)?;
@@ -1489,12 +1772,82 @@ fn read_one_frame(
 
 /// Dispatch one request envelope; returns Some(reply) for request/response
 /// messages, None for notifications.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+fn business_raw_sign_probe_enabled() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_business(
+    envelope: &MessageEnvelope,
+    session: &mut crate::business_profile::business_delivery::BusinessSession,
+    state: &ServerState,
+) -> Option<MessageEnvelope> {
+    let (suffix, params) = match &envelope.params {
+        IpcMessage::BusinessDrainRequest { request_id } => {
+            let (event, error) = match session.offer() {
+                Ok(event) => (event, None),
+                Err(_) => (None, Some("delivery held".into())),
+            };
+            #[cfg(feature = "test-isolation")]
+            if business_raw_sign_probe_enabled() {
+                if let (Some(event), Composition::Business(_, _, Some(probe))) =
+                    (&event, &state.composition)
+                {
+                    let _ = probe.sign_event(
+                        &event.event_canonical_json,
+                        event.captured_at_unix_ms,
+                        event.seq,
+                    );
+                }
+            }
+            let _ = state;
+            (
+                "business_drain_response",
+                IpcMessage::BusinessDrainResponse {
+                    request_id: request_id.clone(),
+                    event,
+                    error,
+                },
+            )
+        }
+        IpcMessage::BusinessDeliveryAck { request_id, ack } => (
+            "business_delivery_ack_response",
+            IpcMessage::BusinessDeliveryAckResponse {
+                request_id: request_id.clone(),
+                ack: ack.clone(),
+                ok: session.acknowledge(ack).is_ok(),
+            },
+        ),
+        // The Legacy ACK path never reaches a release-fact constructor.
+        _ => return None,
+    };
+    Some(MessageEnvelope {
+        jsonrpc: "2.0".into(),
+        method: format!("{IPC_NAMESPACE}.{suffix}"),
+        params,
+    })
+}
+
 fn dispatch(
     envelope: &MessageEnvelope,
     state: &ServerState,
     peer: &HandshakeIdentity,
     drain_state: &mut ConnectionDrainState,
 ) -> Option<MessageEnvelope> {
+    let _ = &state.composition;
+    #[cfg(target_os = "linux")]
+    if let Composition::Business(_, parent, ..) = &state.composition {
+        // No Legacy method can select Business authority or reach its raw signer.
+        if !matches!(envelope.params, IpcMessage::StatusRequest { .. }) {
+            let _ = parent.metadata();
+            state.append_audit(
+                "ipc_business_method_rejected",
+                "business delivery unavailable",
+            );
+            return None;
+        }
+    }
     if state.drain_recovery_only.load(Ordering::SeqCst) {
         match &envelope.params {
             IpcMessage::StatusRequest { .. }
@@ -1713,7 +2066,12 @@ fn dispatch(
             state.append_audit("ipc_unexpected_audit_emit_direction", "ignored");
             None
         }
-        IpcMessage::AuditDrainResponse { .. } | IpcMessage::AuditDrainAckResponse { .. } => {
+        IpcMessage::BusinessDrainRequest { .. }
+        | IpcMessage::BusinessDrainResponse { .. }
+        | IpcMessage::BusinessDeliveryAck { .. }
+        | IpcMessage::BusinessDeliveryAckResponse { .. }
+        | IpcMessage::AuditDrainResponse { .. }
+        | IpcMessage::AuditDrainAckResponse { .. } => {
             state.append_audit("ipc_unexpected_response_direction", "audit_drain_response");
             None
         }
@@ -1762,6 +2120,7 @@ mod tests {
             Duration::from_secs(86_400),
         )));
         Arc::new(ServerState {
+            composition: Composition::Legacy,
             audit_buffer: Arc::clone(&audit_buffer),
             daemon_shutdown_request: Arc::new(AtomicBool::new(false)),
             fatal_control_path: Arc::new(AtomicBool::new(false)),
@@ -1845,10 +2204,11 @@ mod tests {
                         let nonce: [u8; crate::ipc::auth::CHALLENGE_NONCE_BYTES] = nonce
                             .try_into()
                             .map_err(|_| "challenge nonce has wrong length".to_string())?;
-                        let capabilities: Vec<String> = crate::ipc::messages::CAPABILITIES
+                        let mut capabilities: Vec<String> = crate::ipc::messages::CAPABILITIES
                             .iter()
                             .map(|c| (*c).to_string())
                             .collect();
+                        capabilities.push(crate::ipc::messages::CAP_BUSINESS_DELIVERY.into());
                         let signature = signing.sign(&crate::ipc::auth::handshake_signing_bytes(
                             &nonce,
                             &fortress_id,
@@ -2606,6 +2966,152 @@ mod tests {
                     .contains(&format!("got_uid={peer_uid}"))
         }));
         server.stop_and_join();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn business_peer_credentials_refuse_short_and_nonpositive_pid() {
+        let length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let mut credential = libc::ucred {
+            pid: 1,
+            uid: 1000,
+            gid: 1000,
+        };
+        assert_eq!(checked_business_peer(&credential, length).unwrap(), 1000);
+        assert!(
+            matches!(checked_business_peer(&credential, length - 1), Err(error) if error.to_string().contains("short peer credential")),
+            "short credentials receive a named refusal"
+        );
+        for pid in [0, -1] {
+            credential.pid = pid;
+            assert!(
+                matches!(checked_business_peer(&credential, length), Err(error) if error.to_string().contains("invalid peer pid")),
+                "nonpositive peer pid receives a named refusal"
+            );
+        }
+        let (stream, _other) = UnixStream::pair().unwrap();
+        assert_eq!(business_peer_uid_for_stream(&stream).unwrap(), unsafe {
+            libc::geteuid()
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    fn business_config(dir: &TempDir, key: &SigningKey, uid: u32) -> BusinessIpcConfig {
+        let mut broker = crate::config::DaemonConfig::defaults_for_fortress("deadbeef");
+        broker.linux_runtime_paths = crate::config::LinuxRuntimePaths::isolated_under(dir.path());
+        broker.socket_path = dir.path().join("business.sock");
+        broker.trusted_service_uid = Some(uid);
+        let state = fresh_state("deadbeef", key.verifying_key().to_bytes().to_vec());
+        BusinessIpcConfig::checked(
+            &broker,
+            std::fs::File::open(dir.path()).unwrap(),
+            key.verifying_key().to_bytes().to_vec(),
+            crate::business_profile::business_delivery::BusinessDeliveryHandle::channel().1,
+            BusinessIpcLifecycle {
+                shutdown_flag: state.shutdown_flag.clone(),
+                audit_buffer: state.audit_buffer.clone(),
+                decision_engine: state.decision_engine.clone(),
+                live_status: state.live_status.clone(),
+                runtime_health: state.runtime_health.clone(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "explicit unprivileged Business peer fixture"]
+    fn business_peer_gate_precedes_challenge_and_equal_uid_reaches_status() {
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(
+            uid, 0,
+            "this kernel witness requires an unprivileged test process"
+        );
+        for expected in [uid.checked_add(1).unwrap(), uid] {
+            let dir = TempDir::new().unwrap();
+            let key = SigningKey::generate(&mut OsRng);
+            let config = business_config(&dir, &key, expected);
+            let path = config.socket_path.clone();
+            let audit = config.audit_buffer.clone();
+            let server = IpcServer::start_business(config).unwrap();
+            if expected != uid {
+                let mut stream = UnixStream::connect(path).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                assert_eq!(
+                    stream.read(&mut [0u8; 1]).unwrap(),
+                    0,
+                    "Business mismatched kernel UID receives no challenge"
+                );
+                assert!(audit
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.event_canonical_json.contains("ipc_peer_uid_rejected")));
+            } else {
+                let mut stream = run_handshake_client_thread(path, key, "deadbeef".into())
+                    .join()
+                    .unwrap()
+                    .unwrap();
+                write_envelope(&mut stream, &status_request_envelope()).unwrap();
+                let body = read_one_frame(&mut stream, &mut Vec::new(), Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    parse_envelope(&body).unwrap().params,
+                    IpcMessage::StatusResponse { .. }
+                ));
+            }
+            server.stop_and_join();
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+    #[test]
+    fn genuine_legacy_probe_observes_real_drain_signing() {
+        let root = TempDir::new().unwrap();
+        let selection = match crate::config::select_profile(
+            &crate::config::SelectorRoots::isolated_under(root.path()),
+            &[],
+        ) {
+            crate::config::ProfileSelection::LegacyV1(selection) => selection,
+            other => panic!("isolated Legacy selection: {other:?}"),
+        };
+        let probe = Arc::new(
+            ProducerSigner::load_or_generate(
+                &selection,
+                &root.path().join("probe.key"),
+                &root.path().join("probe.pub"),
+            )
+            .unwrap(),
+        );
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open_with_cap(&root.path().join("legacy.wal"), 1024 * 1024).unwrap(),
+        ));
+        wal.lock()
+            .unwrap()
+            .append_critical("{\"operation\":\"test\"}")
+            .unwrap();
+        let mut state = fresh_state("deadbeef", Vec::new());
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.wal_writer = Some(wal);
+        inner.producer_signer = Some(probe.clone());
+        let IpcMessage::AuditDrainResponse {
+            events,
+            error: None,
+            ..
+        } = handle_audit_drain("probe", None, 1, &state)
+        else {
+            panic!("Legacy drain output");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(events[0].producer_signature_b64url.is_some());
+        assert_eq!(
+            probe.raw_sign_calls_for_test(),
+            1,
+            "genuine Legacy drain reaches production raw signing"
+        );
     }
 
     #[test]
