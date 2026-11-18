@@ -1,3 +1,4 @@
+// fail-before-exempt: This row witnesses the test-side fixture helpers split-statement-inventory.ts and split-statement-dispose.ts under server/test, which this gate does not revert, so it passes on reverted server/src by construction; the helper mutation runs that turn it red are recorded with the review.
 import {expect,it,vi} from "vitest";
 import * as fs from "node:fs/promises";
 import {join,resolve} from "node:path";
