@@ -5,7 +5,7 @@ import { verifyAuditChainRecords } from "../../src/cli/audit-chain-verify.js";
 import { verifyTransparencyCheckpoints } from "../../src/transparency/verify.js";
 import { verifySnapshot } from "../../src/evidence-pack/snapshot-verify.js";
 import * as C from "../../src/evidence-pack/snapshot-contract.js";
-import { SOURCE } from "./snapshot-fixtures.js";
+import { seedExportFortress, SOURCE } from "./snapshot-fixtures.js";
 import { syntheticPrunedUnsplitFixture, UNSPLIT_SHAPE, disposePhysicalFixture } from "./split-statement-fixtures.js";
 
 // This source regression does not substitute for the separately captured V0 byte golden.
@@ -103,6 +103,7 @@ describe.sequential("original V0 byte compatibility", () => {
       const parent=resolve(import.meta.dirname,"../../../.scratch");await mkdir(parent,{recursive:true});
       const runRoot=await mkdtemp(join(parent,"v0-"));
       const options = { fortress: join(runRoot,"fortress"), output: join(runRoot,"pack"), receipt: join(runRoot,"receipt.json"), publicKeyFile: join(runRoot,"pack-key.txt") };
+      await seedExportFortress(options.fortress);
       const identities: StoredIdentity[] = golden.inputs.identities;
       const gathered = { ...sample.gathered, auditBytes: decode(sample.gathered.audit_base64), transparencyBytes: sample.gathered.transparency_base64 === null ? undefined : decode(sample.gathered.transparency_base64) } as SnapshotGather;
       let stdout = "", stderr = ""; const phases: string[] = [];

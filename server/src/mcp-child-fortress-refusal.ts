@@ -1,6 +1,8 @@
-import type { Stats } from "node:fs";
-import { lstat, stat } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
+
+// Must match initializedFortressExists in evidence-pack/existing-fortress.ts; the child retains its root-link policy.
+export { initializedFortressExists as mcpChildFortressExists } from "./evidence-pack/existing-fortress.js";
+import { initializedFortressExists as mcpChildFortressExists } from "./evidence-pack/existing-fortress.js";
 
 import { loadConfig } from "./config.js";
 
@@ -36,46 +38,6 @@ export async function resolveMcpChildFortressPath(): Promise<string> {
   return isAbsolute(config.storage_path)
     ? config.storage_path
     : resolve(process.cwd(), config.storage_path);
-}
-
-export async function mcpChildFortressExists(
-  fortressPath: string,
-): Promise<boolean> {
-  const fortressStats = await statOrMissing(fortressPath);
-  if (!fortressStats?.isDirectory()) return false;
-
-  for (const marker of FORTRESS_INITIALIZATION_MARKERS) {
-    const markerStats = await lstatOrMissing(join(fortressPath, ...marker));
-    if (markerStats?.isFile()) return true;
-  }
-  return false;
-}
-
-const FORTRESS_INITIALIZATION_MARKERS = [
-  ["state", "_meta", "custody-envelope.enc"],
-  ["state", "_meta", "custody-sentinel.enc"],
-  ["state", "_meta", "key-params.enc"],
-  ["state", "_meta", "recovery-key-hash.enc"],
-] as const;
-
-async function statOrMissing(path: string): Promise<Stats | null> {
-  try {
-    return await stat(path);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT" || code === "ENOTDIR") return null;
-    throw err;
-  }
-}
-
-async function lstatOrMissing(path: string): Promise<Stats | null> {
-  try {
-    return await lstat(path);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT" || code === "ENOTDIR") return null;
-    throw err;
-  }
 }
 
 export async function refuseMissingMcpChildFortressOrExit(): Promise<void> {

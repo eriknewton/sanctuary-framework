@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, writeFile, lstat, unlink, rmdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { initializedFortressExists } from "./existing-fortress.js";
 import { createSanctuaryServer } from "../index.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { gatherSnapshot, resolveSnapshotTransparencyPin, type SnapshotGather, type CastlePin } from "./snapshot-gather.js";
@@ -89,14 +90,18 @@ export async function exportSnapshot(options: ExportOptions, deps: ExportDepende
   try {
     // Provenance is fixed by this bundle; runtime equality is a test seam because production uses the same build constant on both sides.
     C.text(deps.buildRevision, C.REVISION); C.requireSnapshot(deps.runtimeRevision === deps.buildRevision);
-    const fortress = resolve(options.fortress), output = await canonicalOutput(options.output), receiptPath = await canonicalOutput(options.receipt), keyPath = await canonicalOutput(options.publicKeyFile);
+    const fortress = resolve(options.fortress);
+    // Evidence reads require existing custody markers before boot, credentials, or output effects, and never follow the final root link.
+    C.requireSnapshot(await initializedFortressExists(fortress, false), C.HARD.unsafe_path);
+    const output = await canonicalOutput(options.output), receiptPath = await canonicalOutput(options.receipt), keyPath = await canonicalOutput(options.publicKeyFile);
     requireOutside(output, receiptPath); requireOutside(output, keyPath); C.requireSnapshot(receiptPath !== keyPath, C.HARD.unsafe_path);
     for (const path of [output, receiptPath, keyPath]) {
       try { await lstat(path); throw new C.SnapshotError(C.HARD.file_set_mismatch); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     process.env.SANCTUARY_STORAGE_PATH = fortress;
-    await phase("GATHER"); instance = await deps.boot({ passphrase: process.env.SANCTUARY_PASSPHRASE });
+    await phase("GATHER"); instance = await deps.boot({ existingFortressPath: fortress });
+    // Must match existingFortressPath in ../index.ts; boot binds this path and withholds first-run custody authority.
     C.requireSnapshot(resolve(instance.config.storage_path) === fortress, C.HARD.unsafe_path);
     const signer = instance.identityManager.getDefault(); C.requireSnapshot(signer, C.HARD.pin_invalid);
     const generatedAt = new Date().toISOString(), exportId = randomUUID();

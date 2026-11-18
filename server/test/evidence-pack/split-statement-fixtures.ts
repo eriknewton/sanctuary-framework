@@ -156,7 +156,7 @@ import {resolve,join,dirname} from "node:path";
 import {FilesystemStorage} from "../../src/storage/filesystem.js";
 import {AuditLog,__testSetAuditWriterUidForRole} from "../../src/operational/audit-log.js";
 import {migrateFortressAuditStoreSplit} from "../../src/operational/audit-store-split.js";
-import {master as fixtureMaster} from "./snapshot-fixtures.js";
+import {seedExportFortress,master as fixtureMaster} from "./snapshot-fixtures.js";
 import {disposePhysicalFixture} from "./split-statement-dispose.js";
 export {disposePhysicalFixture} from "./split-statement-dispose.js";
 /** Production writers and migration in an explicitly assigned disposable root. */
@@ -193,6 +193,7 @@ export async function splitExportFixture(unsignedOperator=false) {
   let signer:StoredIdentity;try{signer=createIdentity("Synthetic split operator",key,"passphrase").storedIdentity;}finally{key.fill(0);}
   const cleanup=async()=>{await disposePhysicalFixture(root);masterKey.fill(0);};
   try {
+    await seedExportFortress(fortress);
     if(!unsignedOperator){await manager.saveNew(signer);await manager.setPrimary(signer.identity_id);}
     const operator=new AuditLog(storage,masterKey);await operator.appendCritical({layer:"l1",operation:"synthetic",identity_id:signer.identity_id,result:"success"});await operator.flush();
     __testSetAuditWriterUidForRole("root_daemon",0); // Native root-role selection is scoped to fixture daemon work.

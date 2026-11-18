@@ -3,7 +3,7 @@ import {expect,it} from "vitest";
 import {mkdir,writeFile,readFile,realpath,symlink} from "node:fs/promises";
 import {join} from "node:path";
 import {physicalSplitFixture} from "./split-statement-fixtures.js";
-import {identity,SOURCE} from "./snapshot-fixtures.js";
+import {seedExportFortress,identity,SOURCE} from "./snapshot-fixtures.js";
 import {sourceIO,type SourceIO} from "../../src/audit/split-evidence-source.js";
 import {CHAIN_NAMESPACES,BOUNDARY,META_CONTROLS} from "../../src/audit/split-evidence-registry.js";
 import {gatherExportStatement,exportSnapshot,exportDependencies} from "../../src/evidence-pack/snapshot-export-cli.js";
@@ -42,8 +42,9 @@ it.each(Object.entries(junkNames).flatMap(([label,junk])=>["empty","checkpoint"]
  for(const first of [true,false]){
   const io=orderedIO(s,junk,first),gathered=await summary(s,io);
   expect(gathered,"daemon fixed selection").toEqual(shape==="empty"?{kind:"split",stable:true}:{code:"source_control_invalid"});
-  const signer=identity(),options={fortress:s.fortress,output:join(s.root,`pack-${first}`),receipt:join(s.root,`receipt-${first}.json`),publicKeyFile:join(s.root,`key-${first}.txt`)};
-  const deps={...exportDependencies,source:{...exportDependencies.source,io},runtimeRevision:SOURCE,buildRevision:SOURCE,boot:async()=>({config:{storage_path:s.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
+  const signer=identity(),options={fortress:await realpath(s.fortress),output:join(s.root,`pack-${first}`),receipt:join(s.root,`receipt-${first}.json`),publicKeyFile:join(s.root,`key-${first}.txt`)};
+  await seedExportFortress(options.fortress);
+ const deps={...exportDependencies,source:{...exportDependencies.source,io},runtimeRevision:SOURCE,buildRevision:SOURCE,boot:async()=>({config:{storage_path:options.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
   const code=await exportSnapshot(options,deps as unknown as typeof exportDependencies);results.push({gathered,code});
   expect(code,"daemon export never PASS").not.toBe(C.EXIT_PASS);
   if(code===C.EXIT_PARTIAL){const pins={packKey:signer.public_key,descriptorBytes:await readFile(join(options.output,C.TRUST_FILENAME)),expectedManifestDigest:C.manifestDigest(await readFile(join(options.output,C.MANIFEST_FILENAME)))};const result=verifySnapshotByFormat(await captureSnapshotDirectory(options.output,pins.packKey,pins.expectedManifestDigest),pins,SOURCE);expect([result.status,result.accepted],"daemon recipient never accepted").toEqual(["PARTIAL",false]);}
@@ -93,8 +94,9 @@ it.each(["empty daemon directories","boundary file","established marker"])("sele
  // The production split lifecycle starts before census can refuse incomplete evidence.
  await gatherExportStatement({...input(s,sourceIO),phase:async state=>{phases.push(state);}}).catch(error=>{expect(error).toBeInstanceOf(B.SplitError);});
  expect(phases,"fixed evidence selects split").toContain("CLASSIFY");
- const signer=identity(),options={fortress:s.fortress,output:join(s.root,"pack"),receipt:join(s.root,"receipt.json"),publicKeyFile:join(s.root,"key.txt")},exportPhases:string[]=[];
- const deps={...exportDependencies,runtimeRevision:SOURCE,buildRevision:SOURCE,phase:async(state:string)=>{exportPhases.push(state);},boot:async()=>({config:{storage_path:s.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
+ const signer=identity(),options={fortress:await realpath(s.fortress),output:join(s.root,"pack"),receipt:join(s.root,"receipt.json"),publicKeyFile:join(s.root,"key.txt")},exportPhases:string[]=[];
+ await seedExportFortress(options.fortress);
+ const deps={...exportDependencies,runtimeRevision:SOURCE,buildRevision:SOURCE,phase:async(state:string)=>{exportPhases.push(state);},boot:async()=>({config:{storage_path:options.fortress},masterKey:s.masterKey,identityManager:{getDefault:()=>signer,list:()=>[signer],get:()=>signer},cleanup:async()=>{}}),io:{stdout:()=>{},stderr:()=>{}}};
  const code=await exportSnapshot(options,deps as unknown as typeof exportDependencies);
  expect(exportPhases,"fixed evidence export selects split").toContain("CLASSIFY");
  // Each shape lacks the migration evidence a split census requires, so the gather refuses before stage or commit.

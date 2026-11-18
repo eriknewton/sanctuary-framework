@@ -73,6 +73,13 @@ export function resignManifest(f: Fixture, signBody = true): void {
 export function replaceFile(f: Fixture, name: string, bytes: Uint8Array): void { f.capture.files = f.capture.files.map(file => Buffer.from(file.name).toString() === name ? capturedFile(name, bytes) : file); }
 export function syncAudit(f: Fixture): void { replaceFile(f, C.AUDIT_FILENAME, auditBytes(f.records)); f.manifest.components.audit = { state: C.COMPONENT.included, filename: C.AUDIT_FILENAME, extent: auditExtent(f.records) }; refreshFiles(f); }
 export function syncTransparency(f: Fixture): void { replaceFile(f, C.TRANSPARENCY_FILENAME, jsonBytes(f.bundle)); f.manifest.components.transparency = { state: C.COMPONENT.included, filename: C.TRANSPARENCY_FILENAME, extent: transparencyExtent(f.bundle) }; refreshFiles(f); }
+/** Give an injected export backend its filesystem admission marker. */
+export async function seedExportFortress(fortress: string): Promise<void> {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  await mkdir(join(fortress, "state", "_meta"), { recursive: true });
+  await writeFile(join(fortress, "state", "_meta", "key-params.enc"), "synthetic legacy marker");
+}
 export async function exporterFixture() {
   const { mkdtemp } = await import("node:fs/promises");
   const { join } = await import("node:path");
@@ -82,6 +89,7 @@ export async function exporterFixture() {
   const { realpath } = await import("node:fs/promises");
   const f = fixture(); const root = await realpath(await mkdtemp(join(tmpdir(), "snapshot-")));
   const options = { fortress: join(root, "fortress"), output: join(root, "pack"), receipt: join(root, "receipt.json"), publicKeyFile: join(root, "key.txt") };
+  await seedExportFortress(options.fortress);
   const states: string[] = [], stdout: string[] = [], stderr: string[] = [];
   const identities = [f.pack, f.audit, f.secondAudit]; let cleanupCount = 0;
   const gathered: import("../../src/evidence-pack/snapshot-gather.js").SnapshotGather = { audit: f.manifest.components.audit, transparency: f.manifest.components.transparency, auditBytes: auditBytes(f.records), transparencyBytes: jsonBytes(f.bundle), transparencyPin: { key: f.transparency.public_key, pathClass: "fortress-local" } };
